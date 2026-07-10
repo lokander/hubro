@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use dioxus::core::{spawn_forever, Task};
 use dioxus::prelude::*;
@@ -63,12 +64,41 @@ pub enum Pane {
     Sql,
 }
 
+/// Minimum age of a parked navigation intent before repeating the action
+/// confirms it. Without a floor, a double-click delivers two identical
+/// attempts ~100 ms apart — parking and immediately "confirming" the
+/// discard the user never read. Repeats inside the floor are ignored (the
+/// original park time is kept, so a deliberate later repeat still confirms).
+const NAV_CONFIRM_MIN_DELAY: Duration = Duration::from_millis(500);
+
 /// A navigation the unsaved-changes guard intercepted (see
 /// [`AppState::nav_guard`]).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct PendingNav {
     pub id: ConnectionId,
     pub action: NavAction,
+    /// When the intent was parked (drives the double-click floor).
+    parked_at: Instant,
+}
+
+impl PendingNav {
+    fn new(id: ConnectionId, action: NavAction) -> Self {
+        PendingNav {
+            id,
+            action,
+            parked_at: Instant::now(),
+        }
+    }
+
+    /// Whether a new attempt repeats this parked intent.
+    fn matches(&self, id: ConnectionId, action: &NavAction) -> bool {
+        self.id == id && self.action == *action
+    }
+
+    /// Whether the intent is old enough for a repeat to confirm it.
+    fn confirmable(&self) -> bool {
+        self.parked_at.elapsed() >= NAV_CONFIRM_MIN_DELAY
+    }
 }
 
 /// The navigations guarded against unsaved staged edits.
@@ -216,9 +246,15 @@ pub struct AppState {
     /// (selecting another table, switching panes, closing the tab) does not
     /// happen immediately: the first attempt parks the intent here and the
     /// grid's Save bar shows a blocking notice; repeating the *same* action
+    /// at least [`NAV_CONFIRM_MIN_DELAY`] later (double-click protection)
     /// discards the affected stage(s) and proceeds. Any other action —
     /// saving, discarding, staging more edits, or a different navigation —
-    /// replaces or clears the parked intent.
+    /// replaces or clears the parked intent. While a save is in flight the
+    /// guarded navigations no-op entirely: discarding then would race the
+    /// running transaction.
+    ///
+    /// Not guarded yet: closing the OS window discards every stage without
+    /// warning — follow-up in FRE-30 (session persistence) / FRE-18.
     pub nav_guard: Signal<Option<PendingNav>>,
     /// Latest free-form SQL result per connection.
     pub sql_runs: Signal<HashMap<ConnectionId, SqlRun>>,
@@ -701,6 +737,7 @@ impl AppState {
     /// Switches a tab between the data browser and the SQL editor. Guarded:
     /// leaving the browser while the selected table has staged edits takes
     /// two attempts (see [`Self::nav_guard`]); the second discards them.
+    /// While that table's save is in flight the switch no-ops.
     pub fn set_pane(mut self, id: ConnectionId, pane: Pane) {
         let (current_pane, selected) = {
             let tab_ui = self.tab_ui.read();
@@ -716,12 +753,10 @@ impl AppState {
         if current_pane == Pane::Browser {
             if let Some(table) = &selected {
                 if self.stage_dirty(id, table) {
-                    let intent = PendingNav {
-                        id,
-                        action: NavAction::SetPane(pane),
-                    };
-                    if self.nav_guard.read().as_ref() != Some(&intent) {
-                        self.nav_guard.set(Some(intent));
+                    if self.stage_saving(id, table) {
+                        return;
+                    }
+                    if !self.nav_guard_allows(id, NavAction::SetPane(pane)) {
                         return;
                     }
                     self.discard_staged(id, table);
@@ -940,7 +975,8 @@ impl AppState {
 
     /// Marks a table as selected in one tab's sidebar. Guarded: switching
     /// away from a table with staged edits takes two attempts (see
-    /// [`Self::nav_guard`]); the second discards them and switches.
+    /// [`Self::nav_guard`]); the second discards them and switches. While
+    /// that table's save is in flight the switch no-ops.
     pub fn select_table(mut self, id: ConnectionId, table: &TableRef) {
         let current = self
             .tab_ui
@@ -952,12 +988,10 @@ impl AppState {
         }
         if let Some(current_table) = &current {
             if self.stage_dirty(id, current_table) {
-                let intent = PendingNav {
-                    id,
-                    action: NavAction::SelectTable(table.clone()),
-                };
-                if self.nav_guard.read().as_ref() != Some(&intent) {
-                    self.nav_guard.set(Some(intent));
+                if self.stage_saving(id, current_table) {
+                    return;
+                }
+                if !self.nav_guard_allows(id, NavAction::SelectTable(table.clone())) {
                     return;
                 }
                 self.discard_staged(id, current_table);
@@ -977,7 +1011,9 @@ impl AppState {
     }
 
     /// Stages a cell edit (FRE-24 pushes edits in through this). Edits
-    /// coalesce per `(row, column)` — the last staged value wins.
+    /// coalesce per `(row, column)` — the last staged value wins. Staging
+    /// is allowed even while a save is in flight; see [`Self::save_staged`]
+    /// for the concurrency contract.
     pub fn stage_cell_edit(
         mut self,
         id: ConnectionId,
@@ -1035,16 +1071,24 @@ impl AppState {
             .cloned()
     }
 
-    /// Discards all staged changes of one table view.
+    /// Discards all staged changes of one table view. Refused (no-op) while
+    /// that table's save is in flight — the running transaction may still
+    /// commit, and "discarded" changes silently landing in the database
+    /// would be worse than a briefly stuck Discard button.
     pub fn discard_staged(mut self, id: ConnectionId, table: &TableRef) {
-        self.nav_guard.set(None);
         let mut staged = self.staged.write();
-        if let Some(tables) = staged.get_mut(&id) {
-            tables.remove(&table.key());
-            if tables.is_empty() {
-                staged.remove(&id);
-            }
+        let Some(tables) = staged.get_mut(&id) else {
+            return;
+        };
+        if tables.get(&table.key()).is_some_and(|stage| stage.saving) {
+            return;
         }
+        tables.remove(&table.key());
+        if tables.is_empty() {
+            staged.remove(&id);
+        }
+        drop(staged);
+        self.nav_guard.set(None);
     }
 
     /// Whether one table view has pending staged changes.
@@ -1056,12 +1100,46 @@ impl AppState {
             .is_some_and(|stage| !stage.is_empty())
     }
 
+    /// Whether one table view has a save in flight.
+    fn stage_saving(&self, id: ConnectionId, table: &TableRef) -> bool {
+        self.staged
+            .read()
+            .get(&id)
+            .and_then(|tables| tables.get(&table.key()))
+            .is_some_and(|stage| stage.saving)
+    }
+
     /// Whether any table of the connection has pending staged changes.
     fn any_stage_dirty(&self, id: ConnectionId) -> bool {
         self.staged
             .read()
             .get(&id)
             .is_some_and(|tables| tables.values().any(|stage| !stage.is_empty()))
+    }
+
+    /// Whether any table of the connection has a save in flight.
+    fn any_stage_saving(&self, id: ConnectionId) -> bool {
+        self.staged
+            .read()
+            .get(&id)
+            .is_some_and(|tables| tables.values().any(|stage| stage.saving))
+    }
+
+    /// Runs the two-step guard for one navigation attempt. Returns `true`
+    /// when the attempt may proceed: the same intent was parked at least
+    /// [`NAV_CONFIRM_MIN_DELAY`] ago. Otherwise parks the intent (first
+    /// attempt or a different action) or ignores it (identical repeat
+    /// inside the double-click floor — the original park time is kept so a
+    /// deliberate later repeat still confirms).
+    fn nav_guard_allows(mut self, id: ConnectionId, action: NavAction) -> bool {
+        let parked = self.nav_guard.read().clone();
+        match parked {
+            Some(nav) if nav.matches(id, &action) => nav.confirmable(),
+            _ => {
+                self.nav_guard.set(Some(PendingNav::new(id, action)));
+                false
+            }
+        }
     }
 
     /// Forces the grid of one table to refetch (used by the grid's Refresh
@@ -1072,9 +1150,17 @@ impl AppState {
     }
 
     /// Applies one table's staged changes in ONE transaction, in the
-    /// background. On success the stage is cleared and the grid refetches;
-    /// on failure the stage stays intact (so the user can fix or discard)
-    /// and the Save bar shows which change failed.
+    /// background. On success the applied changes are removed from the
+    /// stage and the grid refetches; on failure the stage stays intact (so
+    /// the user can fix or discard) and the Save bar shows which change
+    /// failed.
+    ///
+    /// Concurrency contract (FRE-24/25 rely on this): staging MORE changes
+    /// while a save is in flight is allowed — the save snapshots the change
+    /// list up front and, on success, removes exactly that snapshot from
+    /// the stage ([`TableStage::remove_applied`]), so later edits survive
+    /// and keep the Save bar visible. Only a second save and discard are
+    /// blocked while `saving` is set.
     pub fn save_staged(mut self, id: ConnectionId, table: &TableRef) {
         let table_key = table.key();
         // Snapshot the normalized change list and flip the in-flight flag —
@@ -1123,9 +1209,17 @@ impl AppState {
             match result {
                 Ok(_counts) => {
                     {
+                        // Remove exactly the snapshotted changes: anything
+                        // staged after the snapshot survives (and keeps the
+                        // Save bar up) instead of being silently destroyed.
                         let mut staged = self.staged.write();
                         if let Some(tables) = staged.get_mut(&id) {
-                            tables.remove(&table_key);
+                            if let Some(stage) = tables.get_mut(&table_key) {
+                                stage.remove_applied(&changes);
+                                if stage.is_empty() {
+                                    tables.remove(&table_key);
+                                }
+                            }
                             if tables.is_empty() {
                                 staged.remove(&id);
                             }
@@ -1134,18 +1228,22 @@ impl AppState {
                     self.bump_grid_refresh(id, &table_key);
                 }
                 Err(err) => {
-                    // Name the failing change so the user can find it: the
-                    // index points into the same normalized list the stage
-                    // still holds.
-                    let message = match err.change_index.and_then(|i| changes.get(i)) {
-                        Some(change) => format!(
-                            "change {} of {} ({}) failed: {} — nothing was applied",
-                            err.change_index.unwrap_or(0) + 1,
+                    // Name the failing change so the user can find it (for a
+                    // grouped update: the row and its columns).
+                    let message = match (err.change_index, &err.change_summary) {
+                        (Some(index), Some(summary)) => format!(
+                            "change {} of {} ({summary}) failed: {} — nothing was applied",
+                            index + 1,
                             changes.len(),
-                            change.describe(),
                             err.message
                         ),
-                        None => format!("{} — nothing was applied", err.message),
+                        // No index: the transaction itself failed to open or
+                        // commit, so there is no rollback guarantee to claim.
+                        _ => format!(
+                            "{} — the batch may or may not have been applied; \
+                             refresh to see the current state",
+                            err.message
+                        ),
                     };
                     self.fail_save(id, &table_key, message);
                 }
@@ -1168,18 +1266,18 @@ impl AppState {
     ///
     /// Guarded: closing while ANY table of the connection has staged edits
     /// takes two attempts (see [`Self::nav_guard`]) — closing is the one
-    /// navigation that actually destroys them. The notice renders in the
-    /// dirty table's Save bar, so when another pane or tab is in front the
-    /// first click can look inert; the second click still closes. A
-    /// deliberate simplification, kept until a global toast/dialog exists.
+    /// navigation that actually destroys them — and no-ops entirely while a
+    /// save is in flight. The notice renders in the dirty table's Save bar,
+    /// so when another pane or tab is in front the first click can look
+    /// inert; the second click still closes. A deliberate simplification,
+    /// kept until a global toast/dialog exists. (Closing the OS window is
+    /// NOT guarded — follow-up in FRE-30 / FRE-18.)
     pub fn close_connection(mut self, id: ConnectionId) {
         if self.any_stage_dirty(id) {
-            let intent = PendingNav {
-                id,
-                action: NavAction::CloseConnection,
-            };
-            if self.nav_guard.read().as_ref() != Some(&intent) {
-                self.nav_guard.set(Some(intent));
+            if self.any_stage_saving(id) {
+                return;
+            }
+            if !self.nav_guard_allows(id, NavAction::CloseConnection) {
                 return;
             }
         }
@@ -1238,6 +1336,32 @@ pub fn tab_title(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn nav_guard_confirm_needs_a_matching_intent_and_the_time_floor() {
+        // A registry-issued id (ConnectionId is opaque outside db).
+        let mut registry = ConnectionRegistry::default();
+        let pool =
+            DbPool::Sqlite(sqlx::sqlite::SqlitePool::connect_lazy("sqlite::memory:").unwrap());
+        let id = registry.insert("t.db", pool);
+
+        let action = NavAction::CloseConnection;
+        let fresh = PendingNav::new(id, action.clone());
+        assert!(fresh.matches(id, &action));
+        assert!(
+            !fresh.confirmable(),
+            "an immediate identical repeat (double-click) must not confirm"
+        );
+        let aged = PendingNav {
+            parked_at: Instant::now() - NAV_CONFIRM_MIN_DELAY,
+            ..fresh
+        };
+        assert!(aged.confirmable(), "a deliberate later repeat confirms");
+        assert!(
+            !aged.matches(id, &NavAction::SetPane(Pane::Sql)),
+            "a different action never confirms a parked intent"
+        );
+    }
 
     #[test]
     fn tab_title_uses_the_file_name() {
