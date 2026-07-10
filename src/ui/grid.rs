@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use dioxus::prelude::*;
 
 use crate::db::{
@@ -5,16 +7,28 @@ use crate::db::{
     RowIdentity, RowLocator, SortDir, TableKind, TableMeta, Value,
 };
 
+use super::editing::{editor_kind, CellEditor, EditNav, EditorKind};
 use super::stage::TableStage;
 use super::state::{AppState, SchemaLoad, TableRef};
 
 const PAGE_SIZE: u32 = 100;
 
+/// The cell whose in-place editor is open, addressed by row key
+/// ([`RowLocator::key`]) + column name. At most one editor is open per
+/// grid.
+#[derive(Debug, Clone, PartialEq)]
+struct ActiveEdit {
+    row_key: String,
+    column: String,
+}
+
 /// Paged grid for one table: sortable headers, per-column contains/equals
 /// filter, page navigation, row-count indicator, refresh — plus staged-edit
 /// rendering (FRE-14): dirty cells and deletes are tinted, pending inserts
 /// show as phantom rows, and a Save/Discard bar appears while the table's
-/// stage is non-empty.
+/// stage is non-empty. Cells of editable rows open a type-aware in-place
+/// editor (FRE-24, see [`CellEditor`]) on double-click or Enter; commits
+/// only ever stage (never write through).
 ///
 /// Callers key this component by table name, so all hook state here is
 /// per-table and resets when another table is selected. (The refresh nonce
@@ -24,6 +38,10 @@ const PAGE_SIZE: u32 = 100;
 pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let state = use_context::<AppState>();
     let mut page = use_signal(|| 0u64);
+    // Which cell's editor is open. Survives refetches by row key: if the
+    // page shifts under the editor the addressed row simply isn't rendered
+    // and the editor disappears (no stale locator can be committed).
+    let editing = use_signal(|| Option::<ActiveEdit>::None);
     let mut sort = use_signal(|| Option::<(String, SortDir)>::None);
     // The filter inputs are staged locally and only hit the query when
     // applied, so typing doesn't fire a query per keystroke.
@@ -96,8 +114,20 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         (Some(meta), Some(dialect)) => detect_row_identity(meta, dialect),
         _ => None,
     };
-    // Editing (FRE-24+) will consult the same detection; until then the
-    // notice explains up front why these rows will stay read-only.
+    // Per-column editor kind + nullability, from introspection. Cells whose
+    // column is missing here (transient schema/result mismatch) fall back
+    // to a plain text editor on a nullable column.
+    let column_kinds: HashMap<String, (EditorKind, bool)> = table_meta
+        .as_ref()
+        .map(|meta| {
+            meta.columns
+                .iter()
+                .map(|c| (c.name.clone(), (editor_kind(&c.type_name), c.nullable)))
+                .collect()
+        })
+        .unwrap_or_default();
+    // Editing consults the same identity detection: no identity → no
+    // editors; the notice explains up front why the rows are read-only.
     let read_only_notice: Option<&'static str> = match (&table_meta, identity.is_none()) {
         (Some(meta), true) => {
             if meta.kind == TableKind::View {
@@ -130,6 +160,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let refresh_table = table.clone();
     let save_table = table.clone();
     let discard_table = table.clone();
+    let row_table = table.clone();
 
     rsx! {
         div { class: "flex h-full min-h-0 flex-col",
@@ -270,20 +301,19 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                         }
                                     }
                                     tbody {
-                                        for row in rows {
-                                            tr {
-                                                class: if row.deleted {
-                                                    // Pending delete: red tint + strike-through.
-                                                    "border-t border-slate-800/60 bg-red-950/40 line-through decoration-red-400/60"
-                                                } else {
-                                                    "border-t border-slate-800/60 hover:bg-slate-800/30"
-                                                },
-                                                for cell in row.cells {
-                                                    GridCell { value: cell.value, dirty: cell.dirty }
-                                                }
+                                        for (index, row) in rows.into_iter().enumerate() {
+                                            GridRow {
+                                                key: "{row_render_key(&row, index)}",
+                                                id,
+                                                table: row_table.clone(),
+                                                row,
+                                                column_kinds: column_kinds.clone(),
+                                                dialect: dialect.unwrap_or(Dialect::Sqlite),
+                                                editing,
                                             }
                                         }
-                                        // Pending inserts: phantom rows, green tint.
+                                        // Pending inserts: phantom rows, green tint
+                                        // (not editable in place — FRE-25 owns insert UX).
                                         for insert_row in inserts {
                                             tr { class: "border-t border-slate-800/60 bg-emerald-950/40",
                                                 for cell in insert_row {
@@ -342,13 +372,25 @@ fn find_table<'a>(load: Option<&'a SchemaLoad>, table: &TableRef) -> Option<&'a 
 }
 
 /// One cell prepared for rendering.
+#[derive(Debug, Clone, PartialEq)]
 struct CellView {
+    column: String,
     value: Value,
     dirty: bool,
+    /// Row-level editability: the row has a locator, is not pending
+    /// deletion, and this cell's fetched value is not a blob. Column-type
+    /// restrictions (blob-typed columns) apply on top at render time.
+    editable: bool,
 }
 
 /// One fetched row prepared for rendering, staged state applied.
+#[derive(Debug, Clone, PartialEq)]
 struct RowView {
+    /// [`RowLocator::key`] of `locator`, when the row is addressable.
+    key: Option<String>,
+    /// How staged edits address this row (`None` when the table has no
+    /// identity or a key column is missing from the fetched page).
+    locator: Option<RowLocator>,
     deleted: bool,
     cells: Vec<CellView>,
 }
@@ -357,7 +399,7 @@ struct RowView {
 /// the identity's key columns (matched by name against the result), then
 /// substitutes staged cell values (dirty) and flags pending deletes. Rows
 /// whose key columns are missing from the result (transient schema/result
-/// mismatch) render clean — they can't be addressed, so they can't be dirty.
+/// mismatch) render clean and read-only — they can't be addressed.
 fn view_rows(
     result: &QueryResult,
     hidden: usize,
@@ -375,15 +417,10 @@ fn view_rows(
     });
     let mut rows = Vec::with_capacity(result.rows.len());
     for row in &result.rows {
-        let row_key: Option<String> = match (&key_indices, stage) {
-            (Some(indices), Some(_)) => Some(
-                RowLocator {
-                    identity_values: indices.iter().map(|&i| row[i].clone()).collect(),
-                }
-                .key(),
-            ),
-            _ => None,
-        };
+        let locator: Option<RowLocator> = key_indices.as_ref().map(|indices| RowLocator {
+            identity_values: indices.iter().map(|&i| row[i].clone()).collect(),
+        });
+        let row_key: Option<String> = locator.as_ref().map(RowLocator::key);
         let deleted =
             matches!((&row_key, stage), (Some(key), Some(stage)) if stage.is_deleted(key));
         let cells = row
@@ -391,21 +428,36 @@ fn view_rows(
             .enumerate()
             .skip(hidden)
             .map(|(index, value)| {
+                let column = result.columns[index].name.clone();
                 let staged = match (&row_key, stage) {
-                    (Some(key), Some(stage)) => {
-                        stage.edited_value(key, &result.columns[index].name)
-                    }
+                    (Some(key), Some(stage)) => stage.edited_value(key, &column),
                     _ => None,
                 };
                 CellView {
                     dirty: staged.is_some(),
+                    editable: locator.is_some() && !deleted && !matches!(value, Value::Blob(_)),
                     value: staged.unwrap_or(value).clone(),
+                    column,
                 }
             })
             .collect();
-        rows.push(RowView { deleted, cells });
+        rows.push(RowView {
+            key: row_key,
+            locator,
+            deleted,
+            cells,
+        });
     }
     rows
+}
+
+/// Stable list key for one row: the row key when the row is addressable,
+/// else its page position.
+fn row_render_key(row: &RowView, index: usize) -> String {
+    match &row.key {
+        Some(key) => format!("r{key}"),
+        None => format!("i{index}"),
+    }
 }
 
 /// Pending inserts as phantom rows aligned to the visible headers; columns
@@ -427,11 +479,46 @@ fn insert_rows(headers: &[String], stage: Option<&TableStage>) -> Vec<Vec<CellVi
                         .position(|c| c == header)
                         .map(|i| insert.values[i].clone())
                         .unwrap_or(Value::Null);
-                    CellView { value, dirty: true }
+                    CellView {
+                        column: header.clone(),
+                        value,
+                        dirty: true,
+                        editable: false,
+                    }
                 })
                 .collect()
         })
         .collect()
+}
+
+/// Whether a cell may open an editor: the row allows it (locator present,
+/// not deleted, value not a blob) and the column's type is editable
+/// (blob-typed columns are read-only for now).
+fn cell_editable(cell: &CellView, column_kinds: &HashMap<String, (EditorKind, bool)>) -> bool {
+    cell.editable && cell_kind(cell, column_kinds).0 != EditorKind::Blob
+}
+
+/// Editor kind + nullability for one cell; columns missing from the
+/// introspected metadata edit as nullable text.
+fn cell_kind(
+    cell: &CellView,
+    column_kinds: &HashMap<String, (EditorKind, bool)>,
+) -> (EditorKind, bool) {
+    column_kinds
+        .get(&cell.column)
+        .copied()
+        .unwrap_or((EditorKind::Text, true))
+}
+
+/// The editable column after (`+1`) or before (`-1`) `current` in a row's
+/// Tab order; `None` at the row's edge (the editor then just closes).
+fn step_column(columns: &[String], current: &str, delta: i32) -> Option<String> {
+    let position = columns.iter().position(|c| c == current)?;
+    let next = position as i64 + i64::from(delta);
+    if next < 0 {
+        return None;
+    }
+    columns.get(next as usize).cloned()
 }
 
 /// Applies the staged filter inputs and resets to the first page.
@@ -488,9 +575,163 @@ fn GridHeader(
     }
 }
 
-/// One cell: monospace, truncated long text (full value in the tooltip),
-/// NULL and blobs rendered distinctly. A dirty cell (pending staged edit)
-/// shows the *staged* value on an amber tint.
+/// One fetched row: staged tint/strike-through, and one [`GridCellSlot`]
+/// per cell (which renders either the display cell or, for the active
+/// cell, the in-place editor).
+#[component]
+fn GridRow(
+    id: ConnectionId,
+    table: TableRef,
+    row: RowView,
+    column_kinds: HashMap<String, (EditorKind, bool)>,
+    dialect: Dialect,
+    editing: Signal<Option<ActiveEdit>>,
+) -> Element {
+    // This row's Tab order: its editable columns, left to right.
+    let editable_columns: Vec<String> = row
+        .cells
+        .iter()
+        .filter(|cell| cell_editable(cell, &column_kinds))
+        .map(|cell| cell.column.clone())
+        .collect();
+    rsx! {
+        tr {
+            class: if row.deleted {
+                // Pending delete: red tint + strike-through.
+                "border-t border-slate-800/60 bg-red-950/40 line-through decoration-red-400/60"
+            } else {
+                "border-t border-slate-800/60 hover:bg-slate-800/30"
+            },
+            for cell in row.cells.clone() {
+                GridCellSlot {
+                    key: "{cell.column}",
+                    id,
+                    table: table.clone(),
+                    row_key: row.key.clone(),
+                    locator: row.locator.clone(),
+                    kind: cell_kind(&cell, &column_kinds).0,
+                    nullable: cell_kind(&cell, &column_kinds).1,
+                    editable: cell_editable(&cell, &column_kinds),
+                    cell: cell.clone(),
+                    dialect,
+                    editable_columns: editable_columns.clone(),
+                    editing,
+                }
+            }
+        }
+    }
+}
+
+/// One cell of an editable-capable row: the display cell normally, or the
+/// [`CellEditor`] while this cell is the grid's active edit. Commits stage
+/// through [`AppState::stage_cell_edit`] — never the database — and Tab
+/// commits walk `editable_columns`.
+#[component]
+fn GridCellSlot(
+    id: ConnectionId,
+    table: TableRef,
+    row_key: Option<String>,
+    locator: Option<RowLocator>,
+    cell: CellView,
+    kind: EditorKind,
+    nullable: bool,
+    editable: bool,
+    dialect: Dialect,
+    editable_columns: Vec<String>,
+    mut editing: Signal<Option<ActiveEdit>>,
+) -> Element {
+    let state = use_context::<AppState>();
+    let is_active = editable
+        && editing.read().as_ref().is_some_and(|active| {
+            row_key.as_deref() == Some(active.row_key.as_str()) && active.column == cell.column
+        });
+
+    if is_active {
+        // `editable` guarantees the locator and row key exist.
+        let locator = locator.clone().expect("editable cell has a locator");
+        let row_key = row_key.clone().expect("editable cell has a row key");
+        let column = cell.column.clone();
+        let commit_table = table.clone();
+        rsx! {
+            CellEditor {
+                kind,
+                dialect,
+                nullable,
+                initial: cell.value.clone(),
+                on_commit: move |(value, nav): (Option<Value>, EditNav)| {
+                    if let Some(value) = value {
+                        state.stage_cell_edit(id, &commit_table, locator.clone(), &column, value);
+                    }
+                    let next = match nav {
+                        EditNav::Stay => None,
+                        EditNav::Next => step_column(&editable_columns, &column, 1),
+                        EditNav::Prev => step_column(&editable_columns, &column, -1),
+                    };
+                    editing.set(next.map(|column| ActiveEdit {
+                        row_key: row_key.clone(),
+                        column,
+                    }));
+                },
+                on_cancel: move |_| editing.set(None),
+            }
+        }
+    } else {
+        let activate_key = row_key.clone();
+        let column = cell.column.clone();
+        let mut activate = move || {
+            if let Some(row_key) = &activate_key {
+                editing.set(Some(ActiveEdit {
+                    row_key: row_key.clone(),
+                    column: column.clone(),
+                }));
+            }
+        };
+        let mut open_on_enter = activate.clone();
+        // Blob cells (by value or column type) explain why they're locked;
+        // other read-only cells (views, keyless tables) are covered by the
+        // grid-level notice.
+        let blob_locked = kind == EditorKind::Blob || matches!(cell.value, Value::Blob(_));
+        let display = cell.value.display();
+        let tooltip = if blob_locked {
+            "blobs are read-only".to_string()
+        } else {
+            display.clone()
+        };
+        let text = match &cell.value {
+            Value::Null => "font-mono text-xs italic text-slate-600",
+            Value::Blob(_) => "font-mono text-xs text-violet-400",
+            _ => "font-mono text-xs text-slate-200",
+        };
+        let class = if cell.dirty {
+            format!("px-3 py-1 {text} bg-amber-900/40")
+        } else {
+            format!("px-3 py-1 {text}")
+        };
+        rsx! {
+            td {
+                class,
+                // Editable cells are focusable so Enter can open the editor
+                // without a mouse.
+                tabindex: if editable { "0" },
+                ondoubleclick: move |_| {
+                    if editable {
+                        activate();
+                    }
+                },
+                onkeydown: move |evt| {
+                    if editable && evt.key() == Key::Enter {
+                        open_on_enter();
+                    }
+                },
+                div { class: "max-w-md truncate", title: "{tooltip}", "{display}" }
+            }
+        }
+    }
+}
+
+/// One display-only cell (used for pending-insert phantom rows): monospace,
+/// truncated long text (full value in the tooltip), NULL and blobs rendered
+/// distinctly. A dirty cell shows the *staged* value on an amber tint.
 #[component]
 fn GridCell(value: Value, dirty: bool) -> Element {
     let display = value.display();
@@ -628,6 +869,80 @@ mod tests {
         let rows = view_rows(&result, 0, None, Some(&stage));
         assert!(rows.iter().all(|r| !r.deleted));
         assert!(rows.iter().flat_map(|r| r.cells.iter()).all(|c| !c.dirty));
+    }
+
+    #[test]
+    fn editability_needs_a_locator_and_excludes_deletes_and_blobs() {
+        let kinds: HashMap<String, (EditorKind, bool)> = [
+            (
+                "id".to_string(),
+                (EditorKind::Numeric { decimal: false }, false),
+            ),
+            ("title".to_string(), (EditorKind::Text, true)),
+            ("cover".to_string(), (EditorKind::Blob, true)),
+        ]
+        .into_iter()
+        .collect();
+
+        // With an identity, plain cells are editable…
+        let result = two_column_result();
+        let rows = view_rows(&result, 0, Some(&pk_identity()), None);
+        assert!(rows[0].locator.is_some());
+        assert!(cell_editable(&rows[0].cells[1], &kinds));
+        // …a column missing from the metadata falls back to editable text…
+        let (kind, nullable) = cell_kind(&rows[0].cells[1], &HashMap::new());
+        assert_eq!(kind, EditorKind::Text);
+        assert!(nullable);
+        // …but without an identity nothing is.
+        let rows = view_rows(&result, 0, None, None);
+        assert!(rows[0].locator.is_none());
+        assert!(!rows[0].cells[1].editable);
+
+        // Rows pending deletion are not editable.
+        let mut stage = TableStage::default();
+        stage.mark_delete(RowLocator {
+            identity_values: vec![Value::Integer(1)],
+        });
+        let rows = view_rows(&result, 0, Some(&pk_identity()), Some(&stage));
+        assert!(rows[0].deleted);
+        assert!(rows[0].cells.iter().all(|c| !c.editable));
+        assert!(rows[1].cells.iter().all(|c| c.editable));
+
+        // Blob cells (by value) and blob-typed columns are read-only.
+        let blob_result = QueryResult {
+            columns: vec![
+                crate::db::ColumnInfo { name: "id".into() },
+                crate::db::ColumnInfo {
+                    name: "cover".into(),
+                },
+            ],
+            rows: vec![vec![Value::Integer(1), Value::Blob(vec![1, 2])]],
+        };
+        let rows = view_rows(&blob_result, 0, Some(&pk_identity()), None);
+        assert!(!rows[0].cells[1].editable, "blob value cell");
+        let null_blob = QueryResult {
+            rows: vec![vec![Value::Integer(1), Value::Null]],
+            ..blob_result
+        };
+        let rows = view_rows(&null_blob, 0, Some(&pk_identity()), None);
+        assert!(
+            rows[0].cells[1].editable,
+            "row-level check passes for a NULL in a blob column…"
+        );
+        assert!(
+            !cell_editable(&rows[0].cells[1], &kinds),
+            "…but the blob-typed column blocks it"
+        );
+    }
+
+    #[test]
+    fn tab_order_steps_within_the_row_and_stops_at_the_edges() {
+        let columns = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(step_column(&columns, "a", 1), Some("b".into()));
+        assert_eq!(step_column(&columns, "b", -1), Some("a".into()));
+        assert_eq!(step_column(&columns, "c", 1), None);
+        assert_eq!(step_column(&columns, "a", -1), None);
+        assert_eq!(step_column(&columns, "missing", 1), None);
     }
 
     #[test]

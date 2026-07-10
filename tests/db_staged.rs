@@ -14,6 +14,7 @@ use dataview::db::{
     apply_staged, detect_row_identity, DbPool, Dialect, PageRequest, RowIdentity, RowLocator,
     StagedChange, TableMeta, Value,
 };
+use dataview::ui::editing::bool_value;
 
 fn test_url() -> Option<String> {
     match std::env::var("DATAVIEW_PG_TEST_URL") {
@@ -401,6 +402,172 @@ async fn postgres_failure_mid_batch_rolls_everything_back_and_names_the_change()
         .await
         .unwrap();
     assert_eq!(check.rows[0][0], Value::Text("one".into()));
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_bool_checkbox_stages_integers_end_to_end() {
+    // The checkbox editor stages Integer(0/1) on SQLite (bool_value); the
+    // column's numeric affinity stores them as-is.
+    let fixture = FixtureDb::with_sql(
+        "CREATE TABLE flags (id INTEGER PRIMARY KEY, ok BOOLEAN);
+         INSERT INTO flags VALUES (1, 0), (2, 1);",
+    )
+    .await;
+    let pool = fixture.open().await;
+    let tables = pool.introspect().await.unwrap();
+    let flags = find(&tables, None, "flags").clone();
+    let identity = detect_row_identity(&flags, Dialect::Sqlite).unwrap();
+
+    let changes = vec![
+        update(
+            vec![Value::Integer(1)],
+            "ok",
+            bool_value(Dialect::Sqlite, true),
+        ),
+        update(
+            vec![Value::Integer(2)],
+            "ok",
+            bool_value(Dialect::Sqlite, false),
+        ),
+    ];
+    apply_staged(&pool, &flags, &identity, &changes)
+        .await
+        .unwrap();
+
+    let check = pool
+        .query("SELECT ok FROM flags ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(check.rows[0][0], Value::Integer(1));
+    assert_eq!(check.rows[1][0], Value::Integer(0));
+
+    pool.close().await;
+}
+
+/// The FRE-24 coercion path: the editor stages every rich Postgres value as
+/// text (that's how FRE-12 renders them), and the staged SQL builder casts
+/// each bound parameter to its column's introspected type
+/// (`SET "col" = $n::integer`). Without the casts every one of these
+/// updates fails the bind-type check (documented on postgres::bind_params).
+#[tokio::test]
+async fn postgres_staged_text_values_coerce_to_column_types() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    for sql in [
+        "DROP SCHEMA IF EXISTS staged_casts CASCADE",
+        "CREATE SCHEMA staged_casts",
+        "CREATE TABLE staged_casts.typed (
+            id integer PRIMARY KEY,
+            flag boolean,
+            at timestamp,
+            doc jsonb,
+            amount numeric,
+            quantity integer
+        )",
+        "INSERT INTO staged_casts.typed VALUES
+            (1, false, '2000-01-01 00:00:00', '{}', 0, 0)",
+    ] {
+        pool.query(sql).await.unwrap();
+    }
+    let tables = pool.introspect().await.unwrap();
+    let typed = find(&tables, Some("staged_casts"), "typed").clone();
+    let identity = detect_row_identity(&typed, Dialect::Postgres).unwrap();
+
+    let key = vec![Value::Integer(1)];
+    let changes = vec![
+        update(key.clone(), "flag", bool_value(Dialect::Postgres, true)),
+        update(key.clone(), "at", Value::Text("2024-06-01 12:30:45".into())),
+        update(
+            key.clone(),
+            "doc",
+            Value::Text("{\"a\": 1, \"b\": [true, null]}".into()),
+        ),
+        // Exact numeric beyond f64 precision, staged as text by the editor.
+        update(
+            key.clone(),
+            "amount",
+            Value::Text("12345678901234567890.123456789".into()),
+        ),
+        // Integer columns coerce from text too (numeric input normally
+        // stages Integer, but text must also survive the cast).
+        update(key.clone(), "quantity", Value::Text("42".into())),
+    ];
+    let counts = apply_staged(&pool, &typed, &identity, &changes)
+        .await
+        .unwrap();
+    assert_eq!(counts.updated_rows, 1);
+
+    let check = pool
+        .query("SELECT flag, at, doc, amount, quantity FROM staged_casts.typed WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(check.rows[0][0], Value::Text("true".into()));
+    assert_eq!(check.rows[0][1], Value::Text("2024-06-01 12:30:45".into()));
+    // jsonb normalizes; the app renders JSON compactly on read-back.
+    assert_eq!(
+        check.rows[0][2],
+        Value::Text("{\"a\":1,\"b\":[true,null]}".into())
+    );
+    assert_eq!(
+        check.rows[0][3],
+        Value::Text("12345678901234567890.123456789".into())
+    );
+    assert_eq!(check.rows[0][4], Value::Integer(42));
+
+    // Bad text for a typed column fails at save time (the cast reports it)
+    // and rolls back.
+    let bad = vec![update(key, "at", Value::Text("not a date".into()))];
+    let err = apply_staged(&pool, &typed, &identity, &bad)
+        .await
+        .unwrap_err();
+    assert_eq!(err.change_index, Some(0));
+
+    pool.close().await;
+}
+
+/// INSERT values coerce through the same casts (FRE-25 will stage inserts
+/// with text values from the same editors).
+#[tokio::test]
+async fn postgres_staged_text_insert_coerces_to_column_types() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    for sql in [
+        "DROP SCHEMA IF EXISTS staged_cast_insert CASCADE",
+        "CREATE SCHEMA staged_cast_insert",
+        "CREATE TABLE staged_cast_insert.typed (
+            id integer PRIMARY KEY,
+            flag boolean,
+            doc jsonb
+        )",
+    ] {
+        pool.query(sql).await.unwrap();
+    }
+    let tables = pool.introspect().await.unwrap();
+    let typed = find(&tables, Some("staged_cast_insert"), "typed").clone();
+    let identity = detect_row_identity(&typed, Dialect::Postgres).unwrap();
+
+    let changes = vec![StagedChange::Insert {
+        columns: vec!["id".into(), "flag".into(), "doc".into()],
+        values: vec![
+            Value::Text("7".into()),
+            bool_value(Dialect::Postgres, true),
+            Value::Text("[1, 2]".into()),
+        ],
+    }];
+    let counts = apply_staged(&pool, &typed, &identity, &changes)
+        .await
+        .unwrap();
+    assert_eq!(counts.inserted_rows, 1);
+
+    let check = pool
+        .query("SELECT id, flag, doc FROM staged_cast_insert.typed")
+        .await
+        .unwrap();
+    assert_eq!(check.rows[0][0], Value::Integer(7));
+    assert_eq!(check.rows[0][1], Value::Text("true".into()));
+    assert_eq!(check.rows[0][2], Value::Text("[1,2]".into()));
 
     pool.close().await;
 }
