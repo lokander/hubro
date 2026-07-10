@@ -5,6 +5,11 @@ use crate::db::{ConnectionId, Dialect, Value};
 
 use super::state::{AppState, SqlRun};
 
+/// Cap on rendered result rows. The full result still sits in memory until
+/// FRE-33 introduces streaming/limits at the query layer, but the DOM must
+/// not receive a million rows.
+const MAX_RENDERED_ROWS: usize = 500;
+
 /// Messages the CodeMirror bundle sends over the eval channel.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -103,6 +108,11 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
                                 "The statement returned no rows."
                             }
                         } else {
+                            if result.rows.len() > MAX_RENDERED_ROWS {
+                                p { class: "border-b border-amber-900/50 bg-amber-950/30 px-4 py-1.5 text-xs text-amber-300",
+                                    "Showing the first {MAX_RENDERED_ROWS} of {result.rows.len()} rows."
+                                }
+                            }
                             table { class: "w-full border-collapse text-left",
                                 thead { class: "sticky top-0 bg-slate-900",
                                     tr {
@@ -114,7 +124,7 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
                                     }
                                 }
                                 tbody {
-                                    for row in result.rows.iter() {
+                                    for row in result.rows.iter().take(MAX_RENDERED_ROWS) {
                                         tr { class: "border-t border-slate-800/60 hover:bg-slate-800/30",
                                             for value in row.iter() {
                                                 ResultCell { value: value.clone() }
