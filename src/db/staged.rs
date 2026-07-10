@@ -13,6 +13,10 @@
 //! value-aware siblings of `rowkey::update_sql`/`delete_sql` — they must
 //! know the values (not just the columns) so NULLs can be rendered inline
 //! (see [`ParamSql::value_sql`]).
+//!
+//! On Postgres every bound parameter is cast to its column's introspected
+//! type (`SET "col" = $1::integer`) so text-staged values coerce — see
+//! [`cast_target`] for why and when the cast is skipped.
 
 use std::fmt;
 use std::fmt::Write as _;
@@ -382,20 +386,61 @@ impl ParamSql {
     /// column gives it one, so `SET int_col = NULL` and
     /// `INSERT … VALUES (NULL, …)` just work on both backends.
     ///
+    /// On Postgres a non-NULL placeholder carries the column's cast when
+    /// one is known (`$1::integer` — see [`cast_target`]), so text-staged
+    /// values (the editor stages rich Postgres types as text, FRE-24)
+    /// coerce to the column type instead of failing the bind-type check.
+    ///
     /// The same rendering applies in WHERE key clauses: `col = NULL` is
     /// never true, so a NULL identity value matches nothing and the
     /// row-count guard aborts the batch — the safe outcome, since a NULL
     /// key cannot address a row anyway.
-    fn value_sql(&mut self, value: &Value) -> String {
+    fn value_sql(&mut self, value: &Value, cast: Option<&str>) -> String {
         if value.is_null() {
             return "NULL".to_string();
         }
         self.values.push(value.clone());
-        match self.dialect {
-            Dialect::Sqlite => "?".to_string(),
-            Dialect::Postgres => format!("${}", self.values.len()),
+        match (self.dialect, cast) {
+            (Dialect::Sqlite, _) => "?".to_string(),
+            (Dialect::Postgres, Some(cast)) => format!("${}::{cast}", self.values.len()),
+            (Dialect::Postgres, None) => format!("${}", self.values.len()),
         }
     }
+}
+
+/// The Postgres cast target for one column's bound parameters, derived from
+/// the introspected column type.
+///
+/// Why: sqlx binds [`Value::Text`] as a *text-typed* parameter, and
+/// Postgres refuses `SET int_col = $1` for it (documented on
+/// `postgres::bind_params`). The editor (FRE-24) stages every rich
+/// Postgres value — timestamps, numerics, json, booleans — as text, so
+/// without a cast none of them could be saved. `information_schema`
+/// `data_type` strings ("integer", "timestamp without time zone", "jsonb",
+/// "numeric", …) are themselves valid cast targets, so the introspected
+/// type is used verbatim. Casts also apply to WHERE key values, where e.g.
+/// a uuid or timestamp key arrives from the grid as text.
+///
+/// Skipped (`None`) — the placeholder then binds as before:
+/// - on SQLite (its type affinity coerces on its own);
+/// - when the column is unknown or its type name is empty;
+/// - for `data_type` strings that are not usable/plain type names:
+///   `ARRAY` and `USER-DEFINED` (enums — `data_type` doesn't carry the
+///   actual type name), or anything outside `[a-z0-9 _]` after
+///   lowercasing. The charset gate also guarantees the interpolated cast
+///   text is inert.
+fn cast_target(table: &TableMeta, dialect: Dialect, column: &str) -> Option<String> {
+    if dialect != Dialect::Postgres {
+        return None;
+    }
+    let type_name = &table.columns.iter().find(|c| c.name == column)?.type_name;
+    let lowered = type_name.trim().to_ascii_lowercase();
+    let plain = !lowered.is_empty()
+        && lowered != "array"
+        && lowered
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == ' ' || c == '_');
+    plain.then_some(lowered)
 }
 
 /// `UPDATE t SET a = ?, b = NULL WHERE k1 = ? AND k2 = ?`, guarded to one
@@ -411,13 +456,20 @@ fn update_statement(
     let mut params = ParamSql::new(dialect);
     let assignments: Vec<String> = sets
         .iter()
-        .map(|(column, value)| format!("{} = {}", quote_ident(column), params.value_sql(value)))
+        .map(|(column, value)| {
+            let cast = cast_target(table, dialect, column);
+            format!(
+                "{} = {}",
+                quote_ident(column),
+                params.value_sql(value, cast.as_deref())
+            )
+        })
         .collect();
     let sql = format!(
         "UPDATE {} SET {} WHERE {}",
         qualified_table(table),
         assignments.join(", "),
-        key_clause(identity, locator, &mut params),
+        key_clause(table, identity, dialect, locator, &mut params),
     );
     CheckedStatement {
         sql,
@@ -439,7 +491,14 @@ fn insert_statement(
         format!("INSERT INTO {} DEFAULT VALUES", qualified_table(table))
     } else {
         let names: Vec<String> = columns.iter().map(|c| quote_ident(c)).collect();
-        let rendered: Vec<String> = values.iter().map(|v| params.value_sql(v)).collect();
+        let rendered: Vec<String> = columns
+            .iter()
+            .zip(values)
+            .map(|(column, value)| {
+                let cast = cast_target(table, dialect, column);
+                params.value_sql(value, cast.as_deref())
+            })
+            .collect();
         format!(
             "INSERT INTO {} ({}) VALUES ({})",
             qualified_table(table),
@@ -465,7 +524,7 @@ fn delete_statement(
     let sql = format!(
         "DELETE FROM {} WHERE {}",
         qualified_table(table),
-        key_clause(identity, locator, &mut params),
+        key_clause(table, identity, dialect, locator, &mut params),
     );
     CheckedStatement {
         sql,
@@ -476,12 +535,28 @@ fn delete_statement(
 
 /// `"k1" = ? AND "k2" = NULL` over the full key, pairing the identity's key
 /// columns with the locator's values (arity is validated by the caller).
-fn key_clause(identity: &RowIdentity, locator: &RowLocator, params: &mut ParamSql) -> String {
+/// Key placeholders carry column casts too ([`cast_target`]) — identity
+/// values of rich Postgres types (uuid, timestamp, numeric keys) arrive
+/// from the grid as text and must coerce in the WHERE clause as well.
+fn key_clause(
+    table: &TableMeta,
+    identity: &RowIdentity,
+    dialect: Dialect,
+    locator: &RowLocator,
+    params: &mut ParamSql,
+) -> String {
     identity
         .key_columns()
         .iter()
         .zip(&locator.identity_values)
-        .map(|(column, value)| format!("{} = {}", quote_ident(column), params.value_sql(value)))
+        .map(|(column, value)| {
+            let cast = cast_target(table, dialect, column);
+            format!(
+                "{} = {}",
+                quote_ident(column),
+                params.value_sql(value, cast.as_deref())
+            )
+        })
         .collect::<Vec<_>>()
         .join(" AND ")
 }
@@ -678,8 +753,9 @@ mod tests {
     #[test]
     fn null_values_render_as_literal_null_never_as_parameters() {
         // UPDATE: SET NULL inline; only the non-NULL set value and the key
-        // are bound. This is what makes `SET int_col = NULL` work on
-        // Postgres, where a bound Value::Null is typed as text.
+        // are bound (with their column casts — the fixture columns are
+        // TEXT). This is what makes `SET int_col = NULL` work on Postgres,
+        // where a bound Value::Null is typed as text.
         let plan = build_statements(
             &pg_table(),
             &identity(),
@@ -692,7 +768,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             plan[0].statement.sql,
-            "UPDATE \"app\".\"t\" SET \"a\" = NULL, \"b\" = $1 WHERE \"id\" = $2"
+            "UPDATE \"app\".\"t\" SET \"a\" = NULL, \"b\" = $1::text WHERE \"id\" = $2::text"
         );
         assert_eq!(
             plan[0].statement.params,
@@ -712,7 +788,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             plan[0].statement.sql,
-            "INSERT INTO \"app\".\"t\" (\"id\", \"a\", \"b\") VALUES ($1, NULL, $2)"
+            "INSERT INTO \"app\".\"t\" (\"id\", \"a\", \"b\") VALUES ($1::text, NULL, $2::text)"
         );
         assert_eq!(
             plan[0].statement.params,
@@ -738,6 +814,122 @@ mod tests {
             "DELETE FROM \"app\".\"t\" WHERE \"id\" = NULL"
         );
         assert!(plan[0].statement.params.is_empty());
+    }
+
+    fn typed_pg_table() -> TableMeta {
+        let typed = |name: &str, type_name: &str, pk: Option<u32>| ColumnMeta {
+            name: name.into(),
+            type_name: type_name.into(),
+            nullable: pk.is_none(),
+            primary_key_position: pk,
+            default: None,
+        };
+        TableMeta {
+            schema: Some("app".into()),
+            name: "typed".into(),
+            kind: TableKind::Table,
+            columns: vec![
+                typed("id", "integer", Some(1)),
+                typed("flag", "boolean", None),
+                typed("at", "timestamp without time zone", None),
+                typed("doc", "jsonb", None),
+                typed("amount", "numeric", None),
+                typed("tags", "ARRAY", None),
+                typed("mood", "USER-DEFINED", None),
+                typed("legacy", "", None),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![],
+        }
+    }
+
+    #[test]
+    fn postgres_params_carry_column_casts_from_introspected_types() {
+        let plan = build_statements(
+            &typed_pg_table(),
+            &identity(),
+            Dialect::Postgres,
+            &[
+                update(1, "flag", Value::Text("true".into())),
+                update(1, "at", Value::Text("2024-06-01 12:30:00".into())),
+                update(1, "doc", Value::Text("{\"a\":1}".into())),
+                update(1, "amount", Value::Text("12345678901234567890.5".into())),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            plan[0].statement.sql,
+            "UPDATE \"app\".\"typed\" SET \
+             \"flag\" = $1::boolean, \
+             \"at\" = $2::timestamp without time zone, \
+             \"doc\" = $3::jsonb, \
+             \"amount\" = $4::numeric \
+             WHERE \"id\" = $5::integer"
+        );
+
+        // Casts apply to INSERT values and DELETE keys too.
+        let plan = build_statements(
+            &typed_pg_table(),
+            &identity(),
+            Dialect::Postgres,
+            &[
+                StagedChange::Insert {
+                    columns: vec!["id".into(), "flag".into()],
+                    values: vec![Value::Integer(2), Value::Text("false".into())],
+                },
+                StagedChange::Delete {
+                    locator: locator(9),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            plan[0].statement.sql,
+            "INSERT INTO \"app\".\"typed\" (\"id\", \"flag\") VALUES ($1::integer, $2::boolean)"
+        );
+        assert_eq!(
+            plan[1].statement.sql,
+            "DELETE FROM \"app\".\"typed\" WHERE \"id\" = $1::integer"
+        );
+    }
+
+    #[test]
+    fn casts_are_skipped_for_unusable_or_unknown_types_and_on_sqlite() {
+        // ARRAY / USER-DEFINED are not cast targets; an empty type name and
+        // a column missing from the metadata have nothing to cast to.
+        let plan = build_statements(
+            &typed_pg_table(),
+            &identity(),
+            Dialect::Postgres,
+            &[
+                update(1, "tags", Value::Text("{a,b}".into())),
+                update(1, "mood", Value::Text("happy".into())),
+                update(1, "legacy", Value::Text("x".into())),
+                update(1, "ghost", Value::Text("y".into())),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            plan[0].statement.sql,
+            "UPDATE \"app\".\"typed\" SET \
+             \"tags\" = $1, \"mood\" = $2, \"legacy\" = $3, \"ghost\" = $4 \
+             WHERE \"id\" = $5::integer"
+        );
+
+        // SQLite never casts — its type affinity coerces on its own.
+        let mut sqlite_table = typed_pg_table();
+        sqlite_table.schema = None;
+        let plan = build_statements(
+            &sqlite_table,
+            &identity(),
+            Dialect::Sqlite,
+            &[update(1, "flag", Value::Integer(1))],
+        )
+        .unwrap();
+        assert_eq!(
+            plan[0].statement.sql,
+            "UPDATE \"typed\" SET \"flag\" = ? WHERE \"id\" = ?"
+        );
     }
 
     #[test]
