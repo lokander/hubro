@@ -1,10 +1,12 @@
 use dioxus::prelude::*;
 use serde::Deserialize;
+use sqlx::types::chrono::{DateTime, Local};
 
 use crate::db::{
     needs_confirmation, ConnectionId, Dialect, QueryResult, StatementOutcome, StatementResult,
     Value,
 };
+use crate::history::HistoryEntry;
 
 use super::state::{AppState, RunStatus};
 
@@ -83,23 +85,41 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
 
     let run = state.sql_runs.read().get(&id).cloned();
     let running = matches!(run.as_ref().map(|r| &r.status), Some(RunStatus::Running));
-    let pending_writes = state
-        .pending_sql
-        .read()
-        .get(&id)
-        .map(|statements| statements.iter().filter(|s| needs_confirmation(s)).count());
+    let pending_writes = state.pending_sql.read().get(&id).map(|pending| {
+        pending
+            .statements
+            .iter()
+            .filter(|s| needs_confirmation(s))
+            .count()
+    });
+    let mut show_history = use_signal(|| false);
 
     rsx! {
-        div { class: "flex h-full min-h-0 flex-col",
+        div { class: "flex h-full min-h-0",
+        div { class: "flex min-w-0 flex-1 flex-col",
             div { class: "flex items-center justify-between border-b border-slate-800 px-3 py-1.5",
                 span { class: "text-xs text-slate-500",
                     "Ctrl+Enter runs the buffer — or just the selection."
                 }
-                if running {
+                div { class: "flex items-center gap-2",
+                    if running {
+                        button {
+                            class: "rounded border border-rose-800 px-2 py-0.5 text-xs text-rose-300 hover:bg-rose-950/50",
+                            onclick: move |_| state.cancel_sql(id),
+                            "Cancel"
+                        }
+                    }
                     button {
-                        class: "rounded border border-rose-800 px-2 py-0.5 text-xs text-rose-300 hover:bg-rose-950/50",
-                        onclick: move |_| state.cancel_sql(id),
-                        "Cancel"
+                        class: if show_history() {
+                            "rounded bg-slate-700 px-2 py-0.5 text-xs text-slate-100"
+                        } else {
+                            "rounded border border-slate-700 px-2 py-0.5 text-xs text-slate-400 hover:bg-slate-800 hover:text-slate-100"
+                        },
+                        onclick: move |_| {
+                            let showing = *show_history.read();
+                            show_history.set(!showing);
+                        },
+                        "History"
                     }
                 }
             }
@@ -146,6 +166,225 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
                 }
             }
         }
+        if show_history() {
+            HistoryPanel { id, editor_element: editor_element.clone() }
+        }
+        }
+    }
+}
+
+/// Cap on entries the history panel fetches per query.
+const HISTORY_PANEL_LIMIT: i64 = 200;
+
+/// Right-side panel listing the current connection's persisted query
+/// history: search, per-entry Load / Run / Copy, clear-history, and the
+/// recording opt-out.
+#[component]
+fn HistoryPanel(id: ConnectionId, editor_element: String) -> Element {
+    let state = use_context::<AppState>();
+    // The controlled input; `search` only follows it on Enter (or when the
+    // input is cleared) so each keystroke doesn't hit the database.
+    let mut search_input = use_signal(String::new);
+    let mut search = use_signal(String::new);
+    let mut confirm_clear = use_signal(|| false);
+    let store_ready = state.history.read().is_some();
+    let history_error = state.history_error.read().clone();
+    let recording = *state.history_recording.read();
+
+    let entries = use_resource(move || {
+        // Reactive dependencies, all cloned out before the await.
+        let store = state.history.read().clone();
+        let _refresh = *state.history_nonce.read();
+        let needle = search.read().clone();
+        let locator = state
+            .open_locators
+            .read()
+            .iter()
+            .find(|(open_id, _)| *open_id == id)
+            .map(|(_, locator)| locator.clone());
+        async move {
+            let (Some(store), Some(locator)) = (store, locator) else {
+                return Ok(Vec::new());
+            };
+            store
+                .list(&locator, Some(&needle), HISTORY_PANEL_LIMIT)
+                .await
+        }
+    });
+    let entries = entries.read().clone();
+
+    rsx! {
+        aside { class: "flex w-80 shrink-0 flex-col border-l border-slate-700 bg-slate-950/50",
+            div { class: "border-b border-slate-800 p-2",
+                input {
+                    class: "w-full rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-200 placeholder:text-slate-600",
+                    placeholder: "Search history (Enter)",
+                    value: "{search_input}",
+                    oninput: move |evt| {
+                        let value = evt.value();
+                        // Clearing the box resets the filter immediately.
+                        if value.trim().is_empty() {
+                            search.set(String::new());
+                        }
+                        search_input.set(value);
+                    },
+                    onkeydown: move |evt: KeyboardEvent| {
+                        if evt.key() == Key::Enter {
+                            search.set(search_input.peek().clone());
+                        }
+                    },
+                }
+            }
+            div { class: "min-h-0 flex-1 overflow-y-auto",
+                if let Some(err) = history_error {
+                    p { class: "px-3 py-2 text-xs text-amber-300",
+                        "History is unavailable: {err}"
+                    }
+                } else if !store_ready {
+                    p { class: "px-3 py-2 text-xs text-slate-500", "Opening history…" }
+                } else {
+                    match entries {
+                        None => rsx! {
+                            p { class: "px-3 py-2 text-xs text-slate-500", "Loading…" }
+                        },
+                        Some(Err(err)) => rsx! {
+                            p { class: "px-3 py-2 text-xs text-amber-300", "History query failed: {err}" }
+                        },
+                        Some(Ok(entries)) if entries.is_empty() => rsx! {
+                            p { class: "px-3 py-2 text-xs text-slate-500",
+                                if search.read().trim().is_empty() {
+                                    "No queries recorded yet."
+                                } else {
+                                    "No matches."
+                                }
+                            }
+                        },
+                        Some(Ok(entries)) => rsx! {
+                            ul { class: "divide-y divide-slate-800/60",
+                                for entry in entries {
+                                    HistoryRow {
+                                        key: "{entry.id}",
+                                        id,
+                                        editor_element: editor_element.clone(),
+                                        entry,
+                                    }
+                                }
+                            }
+                        },
+                    }
+                }
+            }
+            div { class: "flex flex-col gap-2 border-t border-slate-800 p-2",
+                label { class: "flex items-center gap-2 text-xs text-slate-400",
+                    input {
+                        r#type: "checkbox",
+                        checked: recording,
+                        disabled: !store_ready,
+                        onchange: move |evt| state.set_history_recording(evt.checked()),
+                    }
+                    "Record executed queries"
+                }
+                if confirm_clear() {
+                    div { class: "flex items-center gap-2",
+                        span { class: "text-xs text-amber-300", "Clear this connection's history?" }
+                        button {
+                            class: "rounded bg-amber-600 px-2 py-0.5 text-xs font-semibold text-slate-950 hover:bg-amber-500",
+                            onclick: move |_| {
+                                state.clear_history(id);
+                                confirm_clear.set(false);
+                            },
+                            "Clear"
+                        }
+                        button {
+                            class: "rounded border border-slate-600 px-2 py-0.5 text-xs text-slate-300 hover:bg-slate-800",
+                            onclick: move |_| confirm_clear.set(false),
+                            "Keep"
+                        }
+                    }
+                } else {
+                    button {
+                        class: "self-start rounded border border-slate-700 px-2 py-0.5 text-xs text-slate-400 hover:bg-slate-800 hover:text-slate-100",
+                        disabled: !store_ready,
+                        onclick: move |_| confirm_clear.set(true),
+                        "Clear history"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One history entry: status dot, local-time stamp, one-line SQL preview
+/// (full text in the tooltip), and Load / Run / Copy actions.
+#[component]
+fn HistoryRow(id: ConnectionId, editor_element: String, entry: HistoryEntry) -> Element {
+    let state = use_context::<AppState>();
+    let time = format_history_time(entry.executed_at);
+    let preview: String = entry.sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    let sql_json = serde_json::to_string(&entry.sql).unwrap_or_else(|_| "\"\"".into());
+    let sql_for_load = entry.sql.clone();
+    let json_for_load = sql_json.clone();
+    let sql_for_run = entry.sql.clone();
+    let title = match &entry.error {
+        Some(error) => format!("{}\n\n{error}", entry.sql),
+        None => entry.sql.clone(),
+    };
+    rsx! {
+        li { class: "px-3 py-2", title: "{title}",
+            div { class: "flex items-center gap-2",
+                span {
+                    class: if entry.success {
+                        "h-2 w-2 shrink-0 rounded-full bg-emerald-400"
+                    } else {
+                        "h-2 w-2 shrink-0 rounded-full bg-red-400"
+                    },
+                }
+                span { class: "shrink-0 text-xs text-slate-500", "{time}" }
+                span { class: "min-w-0 flex-1 truncate font-mono text-xs text-slate-300",
+                    "{preview}"
+                }
+            }
+            div { class: "mt-1 flex gap-1 pl-4",
+                button {
+                    class: "rounded border border-slate-700 px-1.5 py-0.5 text-xs text-slate-400 hover:bg-slate-800 hover:text-slate-100",
+                    onclick: move |_| {
+                        document::eval(&format!(
+                            r#"DVEditor.setDoc("{editor_element}", {json_for_load});"#
+                        ));
+                        state.set_sql_text(id, sql_for_load.clone());
+                    },
+                    "Load"
+                }
+                button {
+                    class: "rounded border border-slate-700 px-1.5 py-0.5 text-xs text-cyan-300 hover:bg-slate-800",
+                    onclick: move |_| state.run_sql(id, sql_for_run.clone()),
+                    "Run"
+                }
+                button {
+                    class: "rounded border border-slate-700 px-1.5 py-0.5 text-xs text-slate-400 hover:bg-slate-800 hover:text-slate-100",
+                    onclick: move |_| {
+                        document::eval(&format!(
+                            "navigator.clipboard.writeText({sql_json});"
+                        ));
+                    },
+                    "Copy"
+                }
+            }
+        }
+    }
+}
+
+/// Formats a unix timestamp in local time: bare `HH:MM:SS` for today,
+/// date-prefixed for older entries.
+fn format_history_time(unix_secs: i64) -> String {
+    let Some(utc) = DateTime::from_timestamp(unix_secs, 0) else {
+        return String::new();
+    };
+    let local = utc.with_timezone(&Local);
+    if local.date_naive() == Local::now().date_naive() {
+        local.format("%H:%M:%S").to_string()
+    } else {
+        local.format("%Y-%m-%d %H:%M").to_string()
     }
 }
 

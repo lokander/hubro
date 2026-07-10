@@ -10,6 +10,7 @@ use crate::db::{
     url_with_password, ConnectionId, ConnectionRegistry, DbError, DbPool, StatementResult,
     TableMeta,
 };
+use crate::history::HistoryStore;
 use crate::tunnel::{Tunnel, TunnelAuth, TunnelConfig, TunnelError};
 
 /// Which screen the main panel shows: the connections screen or one open
@@ -107,6 +108,14 @@ pub struct SqlRun {
     pub status: RunStatus,
 }
 
+/// A script held back by the write-confirmation banner: the original text
+/// (recorded into history when the run happens) plus its split statements.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingSql {
+    pub script: String,
+    pub statements: Vec<String>,
+}
+
 impl TabUi {
     /// Flips one table's expansion state.
     pub fn toggle_expanded(&mut self, table: &str) {
@@ -178,7 +187,7 @@ pub struct AppState {
     pub sql_runs: Signal<HashMap<ConnectionId, SqlRun>>,
     /// Scripts containing writes, held here until the user confirms (or
     /// dismisses) the write-confirmation banner.
-    pub pending_sql: Signal<HashMap<ConnectionId, Vec<String>>>,
+    pub pending_sql: Signal<HashMap<ConnectionId, PendingSql>>,
     /// Handle of the in-flight run per connection, kept so the Cancel
     /// button can abort it. Entries are removed when a run completes.
     pub sql_tasks: Signal<HashMap<ConnectionId, Task>>,
@@ -186,6 +195,18 @@ pub struct AppState {
     /// and a completing task only writes its result while its generation is
     /// still current.
     pub sql_generations: Signal<HashMap<ConnectionId, u64>>,
+    /// Persisted query-history store, opened in the background at startup.
+    /// `None` while opening or when opening failed (see
+    /// [`Self::history_error`]) — history is best-effort and the app works
+    /// without it.
+    pub history: Signal<Option<HistoryStore>>,
+    /// Why the history store is unavailable, shown in the history panel.
+    pub history_error: Signal<Option<String>>,
+    /// Bumped whenever a run lands in (or is cleared from) the history
+    /// store, so open history panels re-query.
+    pub history_nonce: Signal<u64>,
+    /// UI mirror of the store's persisted recording flag.
+    pub history_recording: Signal<bool>,
 }
 
 impl AppState {
@@ -204,7 +225,7 @@ impl AppState {
                 Some("no config directory found".to_string()),
             ),
         };
-        Self {
+        let state = Self {
             registry: Signal::new(ConnectionRegistry::default()),
             active: Signal::new(ActiveView::Connections),
             saved: Signal::new(saved),
@@ -220,7 +241,29 @@ impl AppState {
             pending_sql: Signal::new(HashMap::new()),
             sql_tasks: Signal::new(HashMap::new()),
             sql_generations: Signal::new(HashMap::new()),
-        }
+            // Root-scoped: these are written from `spawn_forever` tasks
+            // (which run in the root scope), so the component scope that
+            // built the state must not own them.
+            history: Signal::new_in_scope(None, ScopeId::ROOT),
+            history_error: Signal::new_in_scope(None, ScopeId::ROOT),
+            history_nonce: Signal::new_in_scope(0, ScopeId::ROOT),
+            history_recording: Signal::new_in_scope(true, ScopeId::ROOT),
+        };
+        // Open the history store in the background; a failure only disables
+        // the history panel, never the app. spawn_forever: the opening must
+        // not be tied to whichever component happened to create the state.
+        let mut state_for_open = state;
+        spawn_forever(async move {
+            match HistoryStore::open().await {
+                Ok(store) => {
+                    let enabled = store.recording_enabled().await.unwrap_or(true);
+                    state_for_open.history_recording.set(enabled);
+                    state_for_open.history.set(Some(store));
+                }
+                Err(err) => state_for_open.history_error.set(Some(err)),
+            }
+        });
+        state
     }
 
     /// Adds a database file to the saved list (deduped by path) and
@@ -646,17 +689,23 @@ impl AppState {
             return;
         }
         if statements.iter().any(|s| needs_confirmation(s)) {
-            self.pending_sql.write().insert(id, statements);
+            self.pending_sql.write().insert(
+                id,
+                PendingSql {
+                    script: sql,
+                    statements,
+                },
+            );
             return;
         }
-        self.execute_script(id, statements);
+        self.execute_script(id, sql, statements);
     }
 
     /// Confirms the write banner: runs the stashed script.
     pub fn confirm_pending_sql(mut self, id: ConnectionId) {
         let pending = self.pending_sql.write().remove(&id);
-        if let Some(statements) = pending {
-            self.execute_script(id, statements);
+        if let Some(pending) = pending {
+            self.execute_script(id, pending.script, pending.statements);
         }
     }
 
@@ -694,7 +743,7 @@ impl AppState {
     /// Executes a split script in the background: reads fetch rows, writes
     /// report affected counts, execution stops at the first error. Each
     /// statement's outcome lands in [`Self::sql_runs`] as it finishes.
-    fn execute_script(mut self, id: ConnectionId, statements: Vec<String>) {
+    fn execute_script(mut self, id: ConnectionId, script: String, statements: Vec<String>) {
         let Some(pool) = self.registry.read().get(id).map(|c| c.pool.clone()) else {
             return;
         };
@@ -730,6 +779,12 @@ impl AppState {
             })
             .await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
+            // History is recorded even when a newer run made this one stale —
+            // the script did execute. Cancelled runs never reach this point
+            // (the future is dropped), so they are not recorded.
+            let error_text = result.as_ref().err().map(|e| e.error.to_string());
+            self.record_history(id, script, result.is_ok(), error_text)
+                .await;
             // Stale-run guard: a newer run (or a close) owns the slot now.
             if self.sql_generation(id) != generation {
                 return;
@@ -752,6 +807,65 @@ impl AppState {
 
     fn sql_generation(self, id: ConnectionId) -> u64 {
         self.sql_generations.read().get(&id).copied().unwrap_or(0)
+    }
+
+    /// Best-effort history write for a completed run: never blocks or fails
+    /// the run itself. All signal reads are scoped before the await; the
+    /// nonce bump afterwards tells open history panels to re-query.
+    async fn record_history(
+        mut self,
+        id: ConnectionId,
+        script: String,
+        success: bool,
+        error: Option<String>,
+    ) {
+        let locator = self
+            .open_locators
+            .read()
+            .iter()
+            .find(|(open_id, _)| *open_id == id)
+            .map(|(_, locator)| locator.clone());
+        let Some(locator) = locator else { return };
+        let store = self.history.read().clone();
+        let Some(store) = store else { return };
+        let recorded = store
+            .record(&locator, &script, success, error.as_deref())
+            .await;
+        if recorded.unwrap_or(false) {
+            let mut nonce = self.history_nonce.write();
+            *nonce += 1;
+        }
+    }
+
+    /// Persists the history opt-out flag (best-effort) and mirrors it into
+    /// the UI signal immediately.
+    pub fn set_history_recording(mut self, enabled: bool) {
+        self.history_recording.set(enabled);
+        let store = self.history.read().clone();
+        let Some(store) = store else { return };
+        spawn_forever(async move {
+            let _ = store.set_recording(enabled).await;
+        });
+    }
+
+    /// Deletes one connection's history and refreshes open panels.
+    pub fn clear_history(self, id: ConnectionId) {
+        let locator = self
+            .open_locators
+            .read()
+            .iter()
+            .find(|(open_id, _)| *open_id == id)
+            .map(|(_, locator)| locator.clone());
+        let Some(locator) = locator else { return };
+        let store = self.history.read().clone();
+        let Some(store) = store else { return };
+        let mut nonce_signal = self.history_nonce;
+        spawn_forever(async move {
+            if store.clear(&locator).await.is_ok() {
+                let mut nonce = nonce_signal.write();
+                *nonce += 1;
+            }
+        });
     }
 
     /// Marks a table as selected in one tab's sidebar.

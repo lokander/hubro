@@ -60,6 +60,16 @@ export function create(id, parentId, dialectName, initialDoc) {
   return true;
 }
 
+export function setDoc(id, text) {
+  const view = views.get(id);
+  if (!view) return false;
+  view.dispatch({
+    changes: { from: 0, to: view.state.doc.length, insert: text || "" },
+  });
+  view.focus();
+  return true;
+}
+
 export function destroy(id) {
   const view = views.get(id);
   if (view) {
