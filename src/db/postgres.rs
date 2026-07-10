@@ -478,6 +478,11 @@ fn infinity_marker(raw: &PgValueRef) -> Option<&'static str> {
                 Some("infinity")
             } else if bytes == i64::MIN.to_be_bytes() || bytes == i32::MIN.to_be_bytes() {
                 Some("-infinity")
+            } else if binary_datetime_exceeds_chrono(bytes) {
+                // Postgres stores finite dates far beyond chrono's
+                // ~year-262143 cap; sqlx's chrono decode would panic on the
+                // overflow, so degrade those to a marker instead.
+                Some("<out of chrono range>")
             } else {
                 None
             }
@@ -490,6 +495,38 @@ fn infinity_marker(raw: &PgValueRef) -> Option<&'static str> {
             b"-infinity" => Some("-infinity"),
             _ => None,
         },
+    }
+}
+
+/// True when a binary timestamp (8-byte µs) or date (4-byte days) since the
+/// 2000-01-01 Postgres epoch cannot be represented by chrono.
+fn binary_datetime_exceeds_chrono(bytes: &[u8]) -> bool {
+    let epoch_date = NaiveDate::from_ymd_opt(2000, 1, 1).expect("static date");
+    match bytes.len() {
+        8 => {
+            let micros = i64::from_be_bytes(bytes.try_into().expect("length checked"));
+            let epoch = epoch_date.and_hms_opt(0, 0, 0).expect("static time");
+            // num_microseconds is None only if the span itself overflows
+            // i64; treat that as "no bound" on the affected side.
+            let max = NaiveDateTime::MAX
+                .signed_duration_since(epoch)
+                .num_microseconds()
+                .unwrap_or(i64::MAX);
+            let min = NaiveDateTime::MIN
+                .signed_duration_since(epoch)
+                .num_microseconds()
+                .unwrap_or(i64::MIN);
+            micros > max || micros < min
+        }
+        4 => {
+            let days = i64::from(i32::from_be_bytes(
+                bytes.try_into().expect("length checked"),
+            ));
+            let max = NaiveDate::MAX.signed_duration_since(epoch_date).num_days();
+            let min = NaiveDate::MIN.signed_duration_since(epoch_date).num_days();
+            days > max || days < min
+        }
+        _ => false,
     }
 }
 
