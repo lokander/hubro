@@ -264,21 +264,24 @@ fn ConnectionsScreen() -> Element {
     }
 }
 
-/// Inline password prompt for a saved Postgres connection (session-only
-/// storage; keyring persistence is FRE-27).
+/// Inline password prompt for a saved Postgres connection. "Remember"
+/// stores the password in the OS keyring; without it (or when no keyring is
+/// available) the password lives in session memory only.
 #[component]
 fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
     let state = use_context::<AppState>();
     let mut password = use_signal(String::new);
+    let mut remember = use_signal(|| true);
     let url = prompt.url.clone();
     let name = prompt.name.clone();
     let submit = move || {
         let url = url.clone();
         let name = name.clone();
         let entered = password.peek().clone();
+        let remember_choice = *remember.peek();
         spawn(async move {
             state
-                .connect_postgres_with_password(url, name, entered)
+                .connect_postgres_with_password(url, name, entered, remember_choice)
                 .await;
         });
     };
@@ -315,8 +318,13 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
                     "Cancel"
                 }
             }
-            p { class: "mt-2 text-xs text-slate-500",
-                "Remembered for this session only — keyring storage arrives later."
+            label { class: "mt-2 flex items-center gap-2 text-xs text-slate-400",
+                input {
+                    r#type: "checkbox",
+                    checked: remember(),
+                    onchange: move |evt| remember.set(evt.checked()),
+                }
+                "Remember in the system keyring (falls back to this session only)"
             }
         }
     }
@@ -333,6 +341,7 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
     let mut database = use_signal(String::new);
     let mut user = use_signal(String::new);
     let mut password = use_signal(String::new);
+    let mut remember = use_signal(|| true);
     let mut sslmode = use_signal(|| "prefer".to_string());
     let mut pasted_url = use_signal(String::new);
     let mut form_error = use_signal(|| Option::<String>::None);
@@ -386,6 +395,7 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                 entered_password = embedded;
             }
         }
+        let remember_choice = *remember.peek();
         form_error.set(None);
         spawn(async move {
             if entered_password.is_empty() {
@@ -398,6 +408,7 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                         url.clone(),
                         display_name.clone(),
                         entered_password,
+                        remember_choice,
                     )
                     .await;
             }
@@ -479,9 +490,17 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                 input {
                     r#type: "password",
                     class: field_class,
-                    placeholder: "password (kept for this session only)",
+                    placeholder: "password",
                     value: "{password}",
                     oninput: move |evt| password.set(evt.value()),
+                }
+                label { class: "flex items-center gap-2 text-xs text-slate-400",
+                    input {
+                        r#type: "checkbox",
+                        checked: remember(),
+                        onchange: move |evt| remember.set(evt.checked()),
+                    }
+                    "Remember in the system keyring (falls back to this session only)"
                 }
                 div { class: "flex justify-end gap-2",
                     button {
