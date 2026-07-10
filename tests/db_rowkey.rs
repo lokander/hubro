@@ -76,7 +76,12 @@ async fn sqlite_fallbacks_on_real_introspection_output() {
          CREATE TABLE nullable_unique (email TEXT, note TEXT);
          CREATE UNIQUE INDEX uniq_nullable_email ON nullable_unique(email);
          CREATE TABLE expr_unique (email TEXT NOT NULL);
-         CREATE UNIQUE INDEX uniq_lower_email ON expr_unique(lower(email));",
+         CREATE UNIQUE INDEX uniq_lower_email ON expr_unique(lower(email));
+         CREATE TABLE partial_unique (email TEXT NOT NULL, active INTEGER);
+         CREATE UNIQUE INDEX uniq_active_email ON partial_unique(email)
+             WHERE active = 1;
+         INSERT INTO partial_unique (email, active) VALUES
+             ('dup@x', 0), ('dup@x', 0);",
     )
     .await;
     let pool = fixture.open().await;
@@ -97,8 +102,10 @@ async fn sqlite_fallbacks_on_real_introspection_output() {
             column: "rowid".into()
         })
     );
-    // Nullable / expression unique indexes are rejected — rowid it is.
-    for name in ["nullable_unique", "expr_unique"] {
+    // Nullable / expression / partial unique indexes are rejected — rowid
+    // it is. The partial-index fixture even holds duplicate emails outside
+    // the predicate's partition, which "email = ?" could never tell apart.
+    for name in ["nullable_unique", "expr_unique", "partial_unique"] {
         assert_eq!(
             detect_row_identity(find(&tables, None, name), Dialect::Sqlite),
             Some(RowIdentity::Rowid {
@@ -107,6 +114,15 @@ async fn sqlite_fallbacks_on_real_introspection_output() {
             "table {name}"
         );
     }
+    // Introspection carries the partial flag itself (the rejection above
+    // depends on it).
+    let partial = find(&tables, None, "partial_unique");
+    let idx = partial
+        .indexes
+        .iter()
+        .find(|i| i.name == "uniq_active_email")
+        .unwrap();
+    assert!(idx.unique && idx.partial);
 
     pool.close().await;
 }
@@ -245,6 +261,9 @@ async fn postgres_detection_on_real_introspection_output() {
         "CREATE UNIQUE INDEX rowkey_uniq_nullable ON rowkey.nullable_unique (email)",
         "CREATE TABLE rowkey.expr_unique (email text NOT NULL)",
         "CREATE UNIQUE INDEX rowkey_uniq_expr ON rowkey.expr_unique (lower(email))",
+        "CREATE TABLE rowkey.partial_unique (email text NOT NULL, active boolean NOT NULL)",
+        "CREATE UNIQUE INDEX rowkey_uniq_partial ON rowkey.partial_unique (email) WHERE active",
+        "INSERT INTO rowkey.partial_unique VALUES ('dup@x', false), ('dup@x', false)",
         "CREATE TABLE rowkey.keyless (data text)",
         "CREATE VIEW rowkey.pk_view AS SELECT id FROM rowkey.with_pk",
     ] {
@@ -272,18 +291,85 @@ async fn postgres_detection_on_real_introspection_output() {
             columns: vec!["email".into()]
         })
     );
-    // Nullable unique, expression-only unique, and keyless tables are all
-    // read-only on Postgres — no rowid to fall back to.
-    for name in ["nullable_unique", "expr_unique", "keyless"] {
+    // Nullable unique, expression-only unique, partial unique, and keyless
+    // tables are all read-only on Postgres — no rowid to fall back to.
+    // `detect_row_identity == None` on a `TableKind::Table` is exactly the
+    // condition the grid's read-only notice keys on.
+    for name in [
+        "nullable_unique",
+        "expr_unique",
+        "partial_unique",
+        "keyless",
+    ] {
+        let table = find(&tables, schema, name);
+        assert_eq!(table.kind, TableKind::Table);
         assert_eq!(
-            detect_row_identity(find(&tables, schema, name), Dialect::Postgres),
+            detect_row_identity(table, Dialect::Postgres),
             None,
             "table {name}"
         );
     }
+    // Introspection carries the partial flag itself (the rejection above
+    // depends on it); the fixture even holds duplicate emails outside the
+    // predicate's partition.
+    let partial = find(&tables, schema, "partial_unique");
+    let idx = partial
+        .indexes
+        .iter()
+        .find(|i| i.name == "rowkey_uniq_partial")
+        .unwrap();
+    assert!(idx.unique && idx.partial);
     let view = find(&tables, schema, "pk_view");
     assert_eq!(view.kind, TableKind::View);
     assert_eq!(detect_row_identity(view, Dialect::Postgres), None);
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_invalid_index_is_not_introspected() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    for sql in [
+        "DROP SCHEMA IF EXISTS rowkey_invalid CASCADE",
+        "CREATE SCHEMA rowkey_invalid",
+        "CREATE TABLE rowkey_invalid.dups (email text NOT NULL)",
+        "INSERT INTO rowkey_invalid.dups VALUES ('dup@x'), ('dup@x')",
+    ] {
+        pool.query(sql).await.unwrap();
+    }
+    // CREATE UNIQUE INDEX CONCURRENTLY over duplicate data fails partway
+    // and deterministically leaves an INVALID index entry behind (Postgres
+    // documents that the failed index remains and must be dropped
+    // manually). An invalid index guarantees nothing — introspection must
+    // not surface it, or row identity could trust a broken index.
+    pool.query(
+        "CREATE UNIQUE INDEX CONCURRENTLY rowkey_invalid_uniq ON rowkey_invalid.dups (email)",
+    )
+    .await
+    .expect_err("unique index over duplicates must fail");
+    let exists = pool
+        .query(
+            "SELECT ix.indisvalid::text FROM pg_index ix \
+             JOIN pg_class i ON i.oid = ix.indexrelid \
+             WHERE i.relname = 'rowkey_invalid_uniq'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        exists.rows.first().map(|r| r[0].clone()),
+        Some(Value::Text("false".into())),
+        "precondition: the failed CONCURRENTLY build left an invalid index"
+    );
+
+    let tables = pool.introspect().await.unwrap();
+    let dups = find(&tables, Some("rowkey_invalid"), "dups");
+    assert!(
+        dups.indexes.iter().all(|i| i.name != "rowkey_invalid_uniq"),
+        "invalid index must be dropped from metadata: {:?}",
+        dups.indexes
+    );
+    assert_eq!(detect_row_identity(dups, Dialect::Postgres), None);
 
     pool.close().await;
 }

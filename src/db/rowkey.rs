@@ -22,6 +22,12 @@ pub enum RowIdentity {
     /// SQLite's implicit rowid, reached through `column` — normally
     /// `rowid`, or `_rowid_`/`oid` when user columns shadow the earlier
     /// names.
+    ///
+    /// Caveat: a rowid is not a stable handle. VACUUM can renumber rowids,
+    /// and a concurrent writer can delete a row and have its rowid reused
+    /// by a new INSERT. Editing (FRE-24) must fresh-read the row (rowid
+    /// included) right before building the guarded write, not reuse a
+    /// rowid captured earlier.
     Rowid { column: String },
 }
 
@@ -47,12 +53,15 @@ impl RowIdentity {
 ///   the PK is exactly equivalent. (SQLite rowid tables historically allow
 ///   NULLs in non-INTEGER PKs; a NULL key value simply matches nothing with
 ///   `=`, so a guarded write aborts instead of hitting a wrong row.)
-/// - Without a PK, the first unique index whose columns all exist as real
-///   NOT NULL columns is used. Expression entries (surfaced as `"<expr>"`
-///   by introspection) have no bindable column and disqualify the index.
-///   Nullable columns disqualify it too: SQL NULLs compare unequal, so a
-///   unique index still admits multiple rows that differ only in NULLs —
-///   such rows cannot be uniquely addressed by `col = ?`.
+/// - Without a PK, the first non-partial unique index whose columns all
+///   exist as real NOT NULL columns is used. Partial indexes
+///   (`CREATE UNIQUE INDEX … WHERE …`) are disqualified outright: they only
+///   guarantee uniqueness among rows matching their predicate, so duplicates
+///   can exist across the rest of the table. Expression entries (surfaced
+///   as `"<expr>"` by introspection) have no bindable column and disqualify
+///   the index. Nullable columns disqualify it too: SQL NULLs compare
+///   unequal, so a unique index still admits multiple rows that differ only
+///   in NULLs — such rows cannot be uniquely addressed by `col = ?`.
 /// - SQLite tables with neither are necessarily rowid tables, so the
 ///   implicit rowid addresses their rows — unless user columns shadow every
 ///   accessor name (`rowid`, `_rowid_`, `oid`), a pathological case that
@@ -66,7 +75,7 @@ pub fn detect_row_identity(table: &TableMeta, dialect: Dialect) -> Option<RowIde
     if !pk.is_empty() {
         return Some(RowIdentity::PrimaryKey { columns: pk });
     }
-    for index in table.indexes.iter().filter(|i| i.unique) {
+    for index in table.indexes.iter().filter(|i| i.unique && !i.partial) {
         let usable = !index.columns.is_empty()
             && index
                 .columns
@@ -204,7 +213,15 @@ mod tests {
         IndexMeta {
             name: name.into(),
             unique,
+            partial: false,
             columns: columns.iter().map(|c| c.to_string()).collect(),
+        }
+    }
+
+    fn partial_index(name: &str, unique: bool, columns: &[&str]) -> IndexMeta {
+        IndexMeta {
+            partial: true,
+            ..index(name, unique, columns)
         }
     }
 
@@ -316,6 +333,46 @@ mod tests {
                 column: "rowid".into()
             }),
             "sqlite: falls through to the rowid instead"
+        );
+    }
+
+    #[test]
+    fn partial_unique_index_is_rejected() {
+        // `CREATE UNIQUE INDEX … WHERE …` only enforces uniqueness inside
+        // its predicate; duplicates can exist across the rest of the table,
+        // so it must never serve as row identity.
+        let t = table(
+            TableKind::Table,
+            vec![col("email", false, None)],
+            vec![partial_index("uniq_active_email", true, &["email"])],
+        );
+        assert_eq!(
+            detect_row_identity(&t, Dialect::Postgres),
+            None,
+            "postgres: a partial unique index leaves the table read-only"
+        );
+        assert_eq!(
+            detect_row_identity(&t, Dialect::Sqlite),
+            Some(RowIdentity::Rowid {
+                column: "rowid".into()
+            }),
+            "sqlite: falls through to the rowid instead"
+        );
+        // A later full unique index is still picked up.
+        let recovered = table(
+            TableKind::Table,
+            vec![col("email", false, None)],
+            vec![
+                partial_index("uniq_active_email", true, &["email"]),
+                index("uniq_email", true, &["email"]),
+            ],
+        );
+        assert_eq!(
+            detect_row_identity(&recovered, Dialect::Postgres),
+            Some(RowIdentity::UniqueIndex {
+                name: "uniq_email".into(),
+                columns: vec!["email".into()]
+            })
         );
     }
 

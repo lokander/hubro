@@ -186,6 +186,7 @@ async fn table_indexes(pool: &SqlitePool, table: &str) -> Result<Vec<IndexMeta>,
     for row in rows {
         let name: String = get(&row, "name")?;
         let unique: i64 = get(&row, "unique")?;
+        let partial: i64 = get(&row, "partial")?;
         let column_rows = pragma(pool, "index_info", &name).await?;
         let mut columns: Vec<(i64, Option<String>)> = Vec::with_capacity(column_rows.len());
         for col in column_rows {
@@ -195,6 +196,7 @@ async fn table_indexes(pool: &SqlitePool, table: &str) -> Result<Vec<IndexMeta>,
         indexes.push(IndexMeta {
             name,
             unique: unique != 0,
+            partial: partial != 0,
             // A NULL column name means the index is on an expression or rowid.
             columns: columns
                 .into_iter()
