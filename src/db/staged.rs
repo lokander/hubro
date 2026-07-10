@@ -427,8 +427,19 @@ impl ParamSql {
 /// - for `data_type` strings that are not usable/plain type names:
 ///   `ARRAY` and `USER-DEFINED` (enums — `data_type` doesn't carry the
 ///   actual type name), or anything outside `[a-z0-9 _]` after
-///   lowercasing. The charset gate also guarantees the interpolated cast
-///   text is inert.
+///   lowercasing (the charset gate also guarantees the interpolated cast
+///   text is inert);
+/// - for type names whose **bare form implies a restrictive default
+///   modifier**: `data_type` drops length modifiers, so a `character(3)`
+///   column reports just "character" — and `::character` means `char(1)`,
+///   which would silently TRUNCATE the value to one character on SET (and
+///   make a `char(n)` key column never match its row, aborting every
+///   save); `::bit` likewise means `bit(1)` and errors loudly. These are
+///   exactly the bare names with restrictive defaults — `character
+///   varying` and `numeric` stay castable because their bare forms are
+///   unbounded/unconstrained. For the skipped types the uncast text
+///   parameter is correct: Postgres's assignment/comparison coercion
+///   handles text → char(n)/bit(n) with the column's true modifier.
 fn cast_target(table: &TableMeta, dialect: Dialect, column: &str) -> Option<String> {
     if dialect != Dialect::Postgres {
         return None;
@@ -437,6 +448,8 @@ fn cast_target(table: &TableMeta, dialect: Dialect, column: &str) -> Option<Stri
     let lowered = type_name.trim().to_ascii_lowercase();
     let plain = !lowered.is_empty()
         && lowered != "array"
+        && lowered != "character"
+        && lowered != "bit"
         && lowered
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == ' ' || c == '_');
@@ -837,6 +850,9 @@ mod tests {
                 typed("tags", "ARRAY", None),
                 typed("mood", "USER-DEFINED", None),
                 typed("legacy", "", None),
+                typed("code", "character", None),
+                typed("mask", "bit", None),
+                typed("nick", "character varying", None),
             ],
             indexes: vec![],
             foreign_keys: vec![],
@@ -914,6 +930,28 @@ mod tests {
             "UPDATE \"app\".\"typed\" SET \
              \"tags\" = $1, \"mood\" = $2, \"legacy\" = $3, \"ghost\" = $4 \
              WHERE \"id\" = $5::integer"
+        );
+
+        // Bare "character" and "bit" imply restrictive default modifiers
+        // (`::character` = char(1) would TRUNCATE a character(3) value) —
+        // no cast; assignment coercion handles the uncast text correctly.
+        // "character varying" is unbounded when bare and keeps its cast.
+        let plan = build_statements(
+            &typed_pg_table(),
+            &identity(),
+            Dialect::Postgres,
+            &[
+                update(1, "code", Value::Text("xyz".into())),
+                update(1, "mask", Value::Text("1010".into())),
+                update(1, "nick", Value::Text("zed".into())),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            plan[0].statement.sql,
+            "UPDATE \"app\".\"typed\" SET \
+             \"code\" = $1, \"mask\" = $2, \"nick\" = $3::character varying \
+             WHERE \"id\" = $4::integer"
         );
 
         // SQLite never casts — its type affinity coerces on its own.

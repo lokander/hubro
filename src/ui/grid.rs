@@ -38,10 +38,8 @@ struct ActiveEdit {
 pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let state = use_context::<AppState>();
     let mut page = use_signal(|| 0u64);
-    // Which cell's editor is open. Survives refetches by row key: if the
-    // page shifts under the editor the addressed row simply isn't rendered
-    // and the editor disappears (no stale locator can be committed).
-    let editing = use_signal(|| Option::<ActiveEdit>::None);
+    // Which cell's editor is open (by row key + column).
+    let mut editing = use_signal(|| Option::<ActiveEdit>::None);
     let mut sort = use_signal(|| Option::<(String, SortDir)>::None);
     // The filter inputs are staged locally and only hit the query when
     // applied, so typing doesn't fire a query per keystroke.
@@ -49,6 +47,22 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let mut filter_op = use_signal(|| FilterOp::Contains);
     let mut filter_text = use_signal(String::new);
     let mut applied_filter = use_signal(|| Option::<Filter>::None);
+
+    // Close any open editor when the rows change under it: a page flip,
+    // sort/filter change, or refetch replaces the grid's contents, and a
+    // stale ActiveEdit would otherwise linger and spontaneously re-open the
+    // editor if its row key ever scrolls back into view.
+    let table_key_for_reset = table.key();
+    use_effect(move || {
+        let _ = page();
+        let _ = sort.read();
+        let _ = applied_filter.read();
+        let _ = state
+            .grid_refresh
+            .read()
+            .get(&(id, table_key_for_reset.clone()));
+        editing.set(None);
+    });
 
     let table_for_resource = table.clone();
     let rows_resource = use_resource(move || {
@@ -876,7 +890,12 @@ mod tests {
         let kinds: HashMap<String, (EditorKind, bool)> = [
             (
                 "id".to_string(),
-                (EditorKind::Numeric { decimal: false }, false),
+                (
+                    EditorKind::Numeric {
+                        kind: super::super::editing::NumericKind::Integer,
+                    },
+                    false,
+                ),
             ),
             ("title".to_string(), (EditorKind::Text, true)),
             ("cover".to_string(), (EditorKind::Blob, true)),
