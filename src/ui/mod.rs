@@ -1,6 +1,7 @@
 //! UI components. `App` is the root; `main.rs` only configures the window
 //! and launches it.
 
+mod editor;
 mod grid;
 mod shell;
 mod sidebar;
@@ -13,6 +14,7 @@ use dioxus::prelude::*;
 use shell::Shell;
 
 const FAVICON: Asset = asset!("/assets/favicon.ico");
+const CODEMIRROR_JS: Asset = asset!("/assets/codemirror.js");
 const MAIN_CSS: Asset = asset!("/assets/main.css");
 const TAILWIND_CSS: Asset = asset!("/assets/tailwind.css");
 
@@ -21,6 +23,7 @@ pub fn App() -> Element {
     use_context_provider(AppState::new);
     rsx! {
         document::Link { rel: "icon", href: FAVICON }
+        document::Script { src: CODEMIRROR_JS }
         document::Link { rel: "stylesheet", href: MAIN_CSS }
         document::Link { rel: "stylesheet", href: TAILWIND_CSS }
         Shell {}
