@@ -149,6 +149,145 @@ async fn same_named_pk_and_fk_constraints_do_not_confuse_pk_detection() {
 }
 
 #[tokio::test]
+async fn postgres_rich_types_render_correctly() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    for sql in [
+        "DROP TABLE IF EXISTS rich_types",
+        "DROP TYPE IF EXISTS mood_rich_types",
+        "CREATE TYPE mood_rich_types AS ENUM ('sad', 'ok', 'happy')",
+        "CREATE TABLE rich_types (
+            id serial PRIMARY KEY,
+            flag boolean,
+            ts timestamp,
+            ts_frac timestamp,
+            tstz timestamptz,
+            d date,
+            t time,
+            t_frac time,
+            ttz timetz,
+            iv interval,
+            iv_neg interval,
+            num numeric(30, 10),
+            uid uuid,
+            j json,
+            jb jsonb,
+            mood mood_rich_types,
+            tags text[],
+            nums int4[],
+            bigs int8[],
+            smalls int2[],
+            floats float8[],
+            flags bool[],
+            uids uuid[],
+            decs numeric[],
+            r int4range
+        )",
+        "INSERT INTO rich_types (
+            flag, ts, ts_frac, tstz, d, t, t_frac, ttz, iv, iv_neg, num, uid,
+            j, jb, mood, tags, nums, bigs, smalls, floats, flags, uids, decs, r
+        ) VALUES (
+            true,
+            '2024-03-05 07:08:09',
+            '2024-03-05 07:08:09.123456',
+            '2024-03-05 07:08:09+02',
+            '2024-03-05',
+            '07:08:09',
+            '07:08:09.5',
+            '07:08:09+02',
+            '1 mon 2 days 03:04:05',
+            '-3 days',
+            '123456789012345678.0987654321',
+            'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11',
+            '{\"a\": 1, \"b\": [true, null]}',
+            '{\"z\": \"txt\", \"y\": 2.5}',
+            'happy',
+            ARRAY['x', 'y', NULL],
+            ARRAY[1, 2, 3],
+            ARRAY[9223372036854775807],
+            ARRAY[7::int2],
+            ARRAY[1.5, 2.25],
+            ARRAY[true, false],
+            ARRAY['A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid],
+            ARRAY[1.50, 2.5]::numeric[],
+            int4range(1, 5)
+        )",
+    ] {
+        pool.query(sql).await.unwrap();
+    }
+
+    let result = pool
+        .query("SELECT * FROM rich_types ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    let row = &result.rows[0];
+    let col = |name: &str| {
+        let idx = result
+            .columns
+            .iter()
+            .position(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no column {name}"));
+        &row[idx]
+    };
+
+    // Booleans render as text — clearer in a viewer than 0/1.
+    assert_eq!(*col("flag"), Value::Text("true".into()));
+    // Date/time: fractional seconds only when present, no trailing zeros.
+    assert_eq!(*col("ts"), Value::Text("2024-03-05 07:08:09".into()));
+    assert_eq!(
+        *col("ts_frac"),
+        Value::Text("2024-03-05 07:08:09.123456".into())
+    );
+    // timestamptz normalizes to UTC with an explicit offset ('+02' input).
+    assert_eq!(
+        *col("tstz"),
+        Value::Text("2024-03-05 05:08:09+00:00".into())
+    );
+    assert_eq!(*col("d"), Value::Text("2024-03-05".into()));
+    assert_eq!(*col("t"), Value::Text("07:08:09".into()));
+    assert_eq!(*col("t_frac"), Value::Text("07:08:09.5".into()));
+    // timetz keeps its stored offset.
+    assert_eq!(*col("ttz"), Value::Text("07:08:09+02:00".into()));
+    assert_eq!(*col("iv"), Value::Text("1 mon 2 days 03:04:05".into()));
+    assert_eq!(*col("iv_neg"), Value::Text("-3 days".into()));
+    // numeric with 28 significant digits survives exactly — proof the
+    // value never went through f64 (which holds ~15-17). rust_decimal
+    // caps at 28-29 significant digits; beyond that sqlx rounds.
+    assert_eq!(
+        *col("num"),
+        Value::Text("123456789012345678.0987654321".into())
+    );
+    // uuid is hyphenated lowercase regardless of input case.
+    assert_eq!(
+        *col("uid"),
+        Value::Text("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11".into())
+    );
+    // json/jsonb re-serialize compactly (whitespace from the input is not
+    // preserved); jsonb additionally re-orders keys.
+    assert_eq!(*col("j"), Value::Text("{\"a\":1,\"b\":[true,null]}".into()));
+    assert_eq!(*col("jb"), Value::Text("{\"y\":2.5,\"z\":\"txt\"}".into()));
+    // Enum columns render their label, not a fallback marker.
+    assert_eq!(*col("mood"), Value::Text("happy".into()));
+    // Arrays render as Postgres-style literals; NULL elements spelled out.
+    assert_eq!(*col("tags"), Value::Text("{x,y,NULL}".into()));
+    assert_eq!(*col("nums"), Value::Text("{1,2,3}".into()));
+    assert_eq!(*col("bigs"), Value::Text("{9223372036854775807}".into()));
+    assert_eq!(*col("smalls"), Value::Text("{7}".into()));
+    assert_eq!(*col("floats"), Value::Text("{1.5,2.25}".into()));
+    assert_eq!(*col("flags"), Value::Text("{true,false}".into()));
+    assert_eq!(
+        *col("uids"),
+        Value::Text("{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}".into())
+    );
+    assert_eq!(*col("decs"), Value::Text("{1.50,2.5}".into()));
+    // Exotic types keep the graceful marker fallback instead of erroring.
+    assert_eq!(*col("r"), Value::Text("<int4range>".into()));
+
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn postgres_bad_password_is_an_authentication_error() {
     let Some(url) = test_url() else { return };
     let wrong = url_with_password(&url, "definitely-wrong-password").unwrap();
