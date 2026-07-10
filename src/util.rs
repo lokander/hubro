@@ -15,6 +15,12 @@ pub fn human_bytes(bytes: u64) -> String {
         value /= 1024.0;
         unit += 1;
     }
+    // {:.1} rounds, which can carry the value to 1024.0 — bump the unit so
+    // 1048575 renders as "1.0 MB", not "1024.0 KB"
+    if (value * 10.0).round() >= 10240.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
     format!("{value:.1} {}", UNITS[unit])
 }
 
@@ -34,6 +40,7 @@ mod tests {
         assert_eq!(human_bytes(1024), "1.0 KB");
         assert_eq!(human_bytes(1536), "1.5 KB");
         assert_eq!(human_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(human_bytes(1024 * 1024 - 1), "1.0 MB");
         assert_eq!(human_bytes(5 * 1024 * 1024 * 1024), "5.0 GB");
     }
 
