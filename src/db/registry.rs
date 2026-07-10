@@ -48,6 +48,15 @@ impl DbPool {
         }
     }
 
+    /// Executes a statement without fetching rows (INSERT/UPDATE/DDL/…),
+    /// returning the driver's affected-row count.
+    pub async fn execute(&self, sql: &str) -> Result<u64, DbError> {
+        match self {
+            DbPool::Sqlite(pool) => sqlite::execute(pool, sql).await,
+            DbPool::Postgres(pool) => postgres::execute(pool, sql).await,
+        }
+    }
+
     async fn query_with(&self, sql: &str, params: &[Value]) -> Result<QueryResult, DbError> {
         match self {
             DbPool::Sqlite(pool) => sqlite::query_with(pool, sql, params).await,
