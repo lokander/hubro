@@ -6,7 +6,7 @@ use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
 
 use super::error::DbError;
-use super::schema::{ColumnMeta, TableKind, TableMeta};
+use super::schema::{ColumnMeta, ForeignKeyMeta, IndexMeta, TableKind, TableMeta};
 use super::value::{ColumnInfo, QueryResult, Value};
 
 /// Splices a password into a Postgres URL (percent-encoding handled by the
@@ -155,61 +155,170 @@ pub async fn query_with(
     })
 }
 
-/// Minimal introspection until FRE-11: `public` tables/views + columns from
-/// information_schema (no PKs/indexes/FKs yet).
+/// Full multi-schema introspection: every user schema's tables and views
+/// with columns, primary keys, indexes (incl. unique), and foreign keys —
+/// parity with the SQLite metadata model. Four batched queries regardless
+/// of table count.
 pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
-    let rows = sqlx::query(
-        "SELECT table_name, table_type FROM information_schema.tables \
-         WHERE table_schema = 'public' ORDER BY table_name",
+    let map_err = |e: sqlx::Error| DbError::Introspect(e.to_string());
+
+    // Tables and views across all non-system schemas.
+    let table_rows = sqlx::query(
+        "SELECT table_schema, table_name, table_type \
+         FROM information_schema.tables \
+         WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
+         ORDER BY table_schema, table_name",
     )
     .fetch_all(pool)
     .await
-    .map_err(|e| DbError::Introspect(e.to_string()))?;
+    .map_err(map_err)?;
 
-    let mut tables = Vec::with_capacity(rows.len());
-    for row in rows {
-        let name: String = get(&row, "table_name")?;
-        let table_type: String = get(&row, "table_type")?;
-        let kind = if table_type == "VIEW" {
-            TableKind::View
-        } else {
-            TableKind::Table
-        };
+    // Columns with PK positions resolved in SQL (LEFT JOIN on the pkey
+    // constraint), one row per column.
+    let column_rows = sqlx::query(
+        "SELECT c.table_schema, c.table_name, c.column_name, c.data_type, \
+                c.is_nullable, c.column_default, pk.ordinal_position AS pk_position \
+         FROM information_schema.columns c \
+         LEFT JOIN ( \
+             SELECT kcu.table_schema, kcu.table_name, kcu.column_name, kcu.ordinal_position \
+             FROM information_schema.table_constraints tc \
+             JOIN information_schema.key_column_usage kcu \
+               ON kcu.constraint_name = tc.constraint_name \
+              AND kcu.constraint_schema = tc.constraint_schema \
+             WHERE tc.constraint_type = 'PRIMARY KEY' \
+         ) pk ON pk.table_schema = c.table_schema \
+             AND pk.table_name = c.table_name \
+             AND pk.column_name = c.column_name \
+         WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema') \
+         ORDER BY c.table_schema, c.table_name, c.ordinal_position",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(map_err)?;
+
+    // Indexes from pg_catalog (information_schema has no index view).
+    // Expression-index entries have a 0 attnum and no attribute row; those
+    // key positions surface as NULL column names.
+    let index_rows = sqlx::query(
+        "SELECT n.nspname AS table_schema, t.relname AS table_name, \
+                i.relname AS index_name, ix.indisunique AS is_unique, \
+                k.ord AS key_position, a.attname AS column_name \
+         FROM pg_index ix \
+         JOIN pg_class t ON t.oid = ix.indrelid \
+         JOIN pg_class i ON i.oid = ix.indexrelid \
+         JOIN pg_namespace n ON n.oid = t.relnamespace \
+         CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) \
+         LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
+         WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
+         ORDER BY n.nspname, t.relname, i.relname, k.ord",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(map_err)?;
+
+    // Foreign keys from pg_constraint; conkey/confkey arrays preserve the
+    // multi-column ordering that information_schema loses.
+    let fk_rows = sqlx::query(
+        "SELECT n.nspname AS table_schema, t.relname AS table_name, \
+                rn.nspname AS ref_schema, rt.relname AS ref_table, \
+                (SELECT array_agg(a.attname ORDER BY x.ord) \
+                 FROM unnest(c.conkey) WITH ORDINALITY AS x(attnum, ord) \
+                 JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = x.attnum \
+                ) AS columns, \
+                (SELECT array_agg(a.attname ORDER BY x.ord) \
+                 FROM unnest(c.confkey) WITH ORDINALITY AS x(attnum, ord) \
+                 JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = x.attnum \
+                ) AS ref_columns \
+         FROM pg_constraint c \
+         JOIN pg_class t ON t.oid = c.conrelid \
+         JOIN pg_namespace n ON n.oid = t.relnamespace \
+         JOIN pg_class rt ON rt.oid = c.confrelid \
+         JOIN pg_namespace rn ON rn.oid = rt.relnamespace \
+         WHERE c.contype = 'f' \
+           AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+         ORDER BY n.nspname, t.relname, c.conname",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(map_err)?;
+
+    // Group the batched rows per (schema, table).
+    let mut tables: Vec<TableMeta> = Vec::with_capacity(table_rows.len());
+    for row in &table_rows {
+        let table_type: String = get(row, "table_type")?;
         tables.push(TableMeta {
-            columns: table_columns(pool, &name).await?,
+            schema: Some(get(row, "table_schema")?),
+            name: get(row, "table_name")?,
+            kind: if table_type == "VIEW" {
+                TableKind::View
+            } else {
+                TableKind::Table
+            },
+            columns: Vec::new(),
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
-            name,
-            kind,
         });
     }
-    Ok(tables)
-}
+    let index_of = |schema: &str, name: &str, tables: &[TableMeta]| {
+        tables
+            .iter()
+            .position(|t| t.schema.as_deref() == Some(schema) && t.name == name)
+    };
 
-async fn table_columns(pool: &PgPool, table: &str) -> Result<Vec<ColumnMeta>, DbError> {
-    let rows = sqlx::query(
-        "SELECT column_name, data_type, is_nullable, column_default \
-         FROM information_schema.columns \
-         WHERE table_schema = 'public' AND table_name = $1 \
-         ORDER BY ordinal_position",
-    )
-    .bind(table)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| DbError::Introspect(e.to_string()))?;
-
-    let mut columns = Vec::with_capacity(rows.len());
-    for row in rows {
-        let nullable: String = get(&row, "is_nullable")?;
-        columns.push(ColumnMeta {
-            name: get(&row, "column_name")?,
-            type_name: get(&row, "data_type")?,
+    for row in &column_rows {
+        let schema: String = get(row, "table_schema")?;
+        let table: String = get(row, "table_name")?;
+        let Some(idx) = index_of(&schema, &table, &tables) else {
+            continue;
+        };
+        let nullable: String = get(row, "is_nullable")?;
+        let pk_position: Option<i32> = get(row, "pk_position")?;
+        tables[idx].columns.push(ColumnMeta {
+            name: get(row, "column_name")?,
+            type_name: get(row, "data_type")?,
             nullable: nullable == "YES",
-            primary_key_position: None,
-            default: get::<Option<String>>(&row, "column_default")?,
+            primary_key_position: pk_position.map(|p| p as u32),
+            default: get::<Option<String>>(row, "column_default")?,
         });
     }
-    Ok(columns)
+
+    for row in &index_rows {
+        let schema: String = get(row, "table_schema")?;
+        let table: String = get(row, "table_name")?;
+        let Some(idx) = index_of(&schema, &table, &tables) else {
+            continue;
+        };
+        let index_name: String = get(row, "index_name")?;
+        let column: Option<String> = get(row, "column_name")?;
+        let column = column.unwrap_or_else(|| "<expr>".to_string());
+        let unique: bool = get(row, "is_unique")?;
+        let indexes = &mut tables[idx].indexes;
+        match indexes.last_mut() {
+            Some(last) if last.name == index_name => last.columns.push(column),
+            _ => indexes.push(IndexMeta {
+                name: index_name,
+                unique,
+                columns: vec![column],
+            }),
+        }
+    }
+
+    for row in &fk_rows {
+        let schema: String = get(row, "table_schema")?;
+        let table: String = get(row, "table_name")?;
+        let Some(idx) = index_of(&schema, &table, &tables) else {
+            continue;
+        };
+        let ref_columns: Vec<String> = get(row, "ref_columns")?;
+        tables[idx].foreign_keys.push(ForeignKeyMeta {
+            columns: get(row, "columns")?,
+            referenced_schema: Some(get(row, "ref_schema")?),
+            referenced_table: get(row, "ref_table")?,
+            referenced_columns: ref_columns.into_iter().map(Some).collect(),
+        });
+    }
+
+    Ok(tables)
 }
 
 fn get<'r, T: sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>>(

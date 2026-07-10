@@ -102,7 +102,7 @@ fn ConnectionView(id: ConnectionId) -> Element {
                     // Keyed by table so grid state (page, sort, filter)
                     // resets when another table is selected.
                     Some(table) => rsx! {
-                        DataGrid { key: "{table}", id, table: table.clone() }
+                        DataGrid { key: "{table.key()}", id, table: table.clone() }
                     },
                     None => rsx! {
                         div { class: "flex flex-1 items-center justify-center",

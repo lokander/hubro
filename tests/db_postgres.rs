@@ -73,6 +73,7 @@ async fn postgres_paging_sorting_filtering_and_values_work() {
     fresh_fixture(&pool, "fruits_page").await;
 
     let mut request = PageRequest {
+        schema: None,
         table: "fruits_page".into(),
         limit: 2,
         offset: 0,
@@ -128,4 +129,98 @@ async fn postgres_bad_password_is_an_authentication_error() {
         ),
         other => panic!("expected Connect error, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn postgres_multi_schema_introspection_has_parity_metadata() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    for sql in [
+        "DROP SCHEMA IF EXISTS warehouse CASCADE",
+        "CREATE SCHEMA warehouse",
+        "CREATE TABLE warehouse.locations (
+            region text NOT NULL,
+            slot integer NOT NULL,
+            label text,
+            PRIMARY KEY (region, slot)
+        )",
+        "CREATE TABLE warehouse.stock (
+            id serial PRIMARY KEY,
+            region text NOT NULL,
+            slot integer NOT NULL,
+            note text,
+            FOREIGN KEY (region, slot) REFERENCES warehouse.locations (region, slot)
+        )",
+        "CREATE UNIQUE INDEX stock_note_unique ON warehouse.stock (note)",
+        "CREATE INDEX stock_expr_idx ON warehouse.stock (lower(note))",
+        "CREATE VIEW warehouse.stock_notes AS SELECT note FROM warehouse.stock",
+        "INSERT INTO warehouse.locations VALUES ('eu', 1, 'shelf A')",
+        "INSERT INTO warehouse.stock (region, slot, note) VALUES ('eu', 1, 'first')",
+    ] {
+        pool.query(sql).await.unwrap();
+    }
+
+    let tables = pool.introspect().await.unwrap();
+
+    // Multi-schema: entries from both public (earlier fixtures) and
+    // warehouse appear, each tagged with its schema.
+    assert!(tables.iter().any(|t| t.schema.as_deref() == Some("public")));
+    let locations = tables
+        .iter()
+        .find(|t| t.schema.as_deref() == Some("warehouse") && t.name == "locations")
+        .unwrap();
+    // Composite PK in declaration order.
+    let pk: Vec<&str> = locations
+        .primary_key()
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(pk, ["region", "slot"]);
+
+    let stock = tables
+        .iter()
+        .find(|t| t.schema.as_deref() == Some("warehouse") && t.name == "stock")
+        .unwrap();
+    // Unique and expression indexes.
+    assert!(stock
+        .indexes
+        .iter()
+        .any(|i| i.name == "stock_note_unique" && i.unique && i.columns == ["note"]));
+    assert!(stock
+        .indexes
+        .iter()
+        .any(|i| i.name == "stock_expr_idx" && !i.unique && i.columns == ["<expr>"]));
+    // Multi-column FK with ordering and referenced schema.
+    let fk = stock
+        .foreign_keys
+        .iter()
+        .find(|fk| fk.referenced_table == "locations")
+        .unwrap();
+    assert_eq!(fk.columns, ["region", "slot"]);
+    assert_eq!(fk.referenced_schema.as_deref(), Some("warehouse"));
+    assert_eq!(
+        fk.referenced_columns,
+        [Some("region".to_string()), Some("slot".to_string())]
+    );
+
+    let view = tables
+        .iter()
+        .find(|t| t.schema.as_deref() == Some("warehouse") && t.name == "stock_notes")
+        .unwrap();
+    assert_eq!(view.kind, TableKind::View);
+
+    // Schema-qualified paging works end to end.
+    let request = PageRequest {
+        schema: Some("warehouse".into()),
+        table: "stock".into(),
+        limit: 10,
+        offset: 0,
+        sort: None,
+        filter: None,
+    };
+    assert_eq!(pool.count_rows(&request).await.unwrap(), 1);
+    let page = pool.fetch_page(&request).await.unwrap();
+    assert_eq!(page.rows[0][3], Value::Text("first".into()));
+
+    pool.close().await;
 }

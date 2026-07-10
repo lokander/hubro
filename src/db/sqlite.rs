@@ -100,6 +100,7 @@ pub async fn introspect(pool: &SqlitePool) -> Result<Vec<TableMeta>, DbError> {
             TableKind::Table
         };
         tables.push(TableMeta {
+            schema: None,
             columns: table_columns(pool, &name).await?,
             indexes: table_indexes(pool, &name).await?,
             foreign_keys: table_foreign_keys(pool, &name).await?,
@@ -181,6 +182,7 @@ async fn table_foreign_keys(
                 id,
                 ForeignKeyMeta {
                     columns: vec![from],
+                    referenced_schema: None,
                     referenced_table,
                     referenced_columns: vec![to],
                 },

@@ -35,6 +35,8 @@ pub struct Filter {
 /// One page of one table, with optional sort and filter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageRequest {
+    /// Schema qualifier (`None` for SQLite / default resolution).
+    pub schema: Option<String>,
     pub table: String,
     pub limit: u32,
     pub offset: u64,
@@ -71,7 +73,7 @@ impl PageRequest {
         };
         let sql = format!(
             "SELECT * FROM {}{where_clause}{order} LIMIT {} OFFSET {}",
-            quote_ident(&self.table),
+            self.qualified_table(),
             self.limit,
             self.offset,
         );
@@ -83,9 +85,16 @@ impl PageRequest {
         let (where_clause, params) = self.where_clause(dialect);
         let sql = format!(
             "SELECT COUNT(*) FROM {}{where_clause}",
-            quote_ident(&self.table)
+            self.qualified_table()
         );
         (sql, params)
+    }
+
+    fn qualified_table(&self) -> String {
+        match &self.schema {
+            Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(&self.table)),
+            None => quote_ident(&self.table),
+        }
     }
 
     fn where_clause(&self, dialect: Dialect) -> (String, Vec<Value>) {
@@ -131,6 +140,7 @@ mod tests {
 
     fn base() -> PageRequest {
         PageRequest {
+            schema: None,
             table: "tracks".into(),
             limit: 100,
             offset: 200,
@@ -187,6 +197,17 @@ mod tests {
             "SELECT * FROM \"tracks\" WHERE \"name\" LIKE ? ESCAPE '\\' LIMIT 100 OFFSET 200"
         );
         assert_eq!(params, vec![Value::Text("%50\\%\\_\\\\%".into())]);
+    }
+
+    #[test]
+    fn schema_qualifier_is_quoted_when_present() {
+        let mut req = base();
+        req.schema = Some("app data".into());
+        let (sql, _) = req.select_sql(Dialect::Postgres);
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"app data\".\"tracks\" LIMIT 100 OFFSET 200"
+        );
     }
 
     #[test]

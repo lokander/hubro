@@ -8,6 +8,7 @@ use dataview::db::{Filter, FilterOp, PageRequest, SortDir, Value};
 
 fn request(table: &str) -> PageRequest {
     PageRequest {
+        schema: None,
         table: table.into(),
         limit: 10,
         offset: 0,
@@ -18,6 +19,7 @@ fn request(table: &str) -> PageRequest {
 
 fn sorted(table: &str, column: &str, dir: SortDir) -> PageRequest {
     PageRequest {
+        schema: None,
         sort: Some((column.into(), dir)),
         ..request(table)
     }
@@ -55,6 +57,7 @@ async fn offset_beyond_the_end_yields_an_empty_page() {
     let pool = fixture.open().await;
 
     let req = PageRequest {
+        schema: None,
         offset: 100,
         ..request("numbers")
     };
@@ -70,6 +73,7 @@ async fn count_rows_ignores_limit_and_offset() {
     let pool = fixture.open().await;
 
     let req = PageRequest {
+        schema: None,
         limit: 3,
         offset: 100,
         ..request("numbers")
@@ -106,6 +110,7 @@ async fn sort_places_nulls_first_ascending_and_last_descending() {
     assert_eq!(asc.rows[5][2], Value::Real(0.5));
 
     let desc_req = PageRequest {
+        schema: None,
         limit: 25,
         ..sorted("numbers", "score", SortDir::Desc)
     };
@@ -166,6 +171,7 @@ async fn equals_filter_with_text_value_matches_numeric_column_via_affinity() {
     // Filter values are always strings from the UI; the INTEGER affinity of
     // `n` must coerce '7' so the comparison matches numerically.
     let req = PageRequest {
+        schema: None,
         filter: Some(Filter {
             column: "n".into(),
             op: FilterOp::Equals,
@@ -188,6 +194,7 @@ async fn filter_sort_and_paging_combine() {
     // 'row 1' matches labels 'row 10'..'row 19' (labels are zero-padded, so
     // n = 1 is 'row 01' and stays out): 10 rows total.
     let mut req = PageRequest {
+        schema: None,
         limit: 3,
         offset: 8,
         sort: Some(("label".into(), SortDir::Desc)),
@@ -219,6 +226,7 @@ async fn paging_works_on_tables_and_columns_with_weird_names() {
     // Table name with an embedded double quote and a space; sort on a column
     // with a space, filter on it too, and read a unicode-named column.
     let req = PageRequest {
+        schema: None,
         table: "we\"ird table".into(),
         limit: 10,
         offset: 0,
@@ -238,6 +246,7 @@ async fn paging_works_on_tables_and_columns_with_weird_names() {
 
     // An SQL keyword as table name with a keyword column.
     let req = PageRequest {
+        schema: None,
         filter: Some(Filter {
             column: "group".into(),
             op: FilterOp::Equals,
