@@ -12,6 +12,8 @@
     --color-amber-900: oklch(41.4% 0.112 45.904);
     --color-emerald-300: oklch(84.5% 0.143 164.978);
     --color-emerald-900: oklch(37.8% 0.077 168.94);
+    --color-teal-300: oklch(85.5% 0.138 181.071);
+    --color-teal-900: oklch(38.6% 0.063 188.416);
     --color-cyan-300: oklch(86.5% 0.127 207.078);
     --color-cyan-600: oklch(60.9% 0.126 221.723);
     --color-cyan-700: oklch(52% 0.105 223.128);
@@ -249,6 +251,9 @@
   .ml-4 {
     margin-left: calc(var(--spacing) * 4);
   }
+  .block {
+    display: block;
+  }
   .flex {
     display: flex;
   }
@@ -329,6 +334,9 @@
   }
   .gap-3 {
     gap: calc(var(--spacing) * 3);
+  }
+  .gap-4 {
+    gap: calc(var(--spacing) * 4);
   }
   .gap-6 {
     gap: calc(var(--spacing) * 6);
@@ -445,6 +453,12 @@
   .bg-slate-900 {
     background-color: var(--color-slate-900);
   }
+  .bg-slate-900\/60 {
+    background-color: color-mix(in srgb, oklch(20.8% 0.042 265.755) 60%, transparent);
+    @supports (color: color-mix(in lab, red, red)) {
+      background-color: color-mix(in oklab, var(--color-slate-900) 60%, transparent);
+    }
+  }
   .bg-slate-950 {
     background-color: var(--color-slate-950);
   }
@@ -466,11 +480,20 @@
       background-color: color-mix(in oklab, var(--color-slate-950) 80%, transparent);
     }
   }
+  .bg-teal-900\/50 {
+    background-color: color-mix(in srgb, oklch(38.6% 0.063 188.416) 50%, transparent);
+    @supports (color: color-mix(in lab, red, red)) {
+      background-color: color-mix(in oklab, var(--color-teal-900) 50%, transparent);
+    }
+  }
   .bg-violet-900\/50 {
     background-color: color-mix(in srgb, oklch(38% 0.189 293.745) 50%, transparent);
     @supports (color: color-mix(in lab, red, red)) {
       background-color: color-mix(in oklab, var(--color-violet-900) 50%, transparent);
     }
+  }
+  .p-3 {
+    padding: calc(var(--spacing) * 3);
   }
   .p-4 {
     padding: calc(var(--spacing) * 4);
@@ -597,6 +620,9 @@
   }
   .text-slate-600 {
     color: var(--color-slate-600);
+  }
+  .text-teal-300 {
+    color: var(--color-teal-300);
   }
   .text-violet-300 {
     color: var(--color-violet-300);

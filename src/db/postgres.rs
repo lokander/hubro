@@ -44,6 +44,35 @@ pub fn sanitized_url(url: &str) -> Result<String, DbError> {
     Ok(parsed.into())
 }
 
+/// The host and port a Postgres URL points at (default port 5432) — with an
+/// SSH tunnel this is the address the SSH server must reach.
+pub fn url_target(url: &str) -> Result<(String, u16), DbError> {
+    let parsed = url::Url::parse(url).map_err(|e| DbError::Connect(format!("invalid URL: {e}")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| DbError::Connect("URL has no host".into()))?
+        // IPv6 hosts come back bracketed; the forward target wants the bare
+        // address.
+        .trim_matches(['[', ']'])
+        .to_string();
+    Ok((host, parsed.port().unwrap_or(5432)))
+}
+
+/// Rewrites a URL to connect through a forwarded local port; everything else
+/// (user, database, query params) is kept. The saved URL stays the logical
+/// one — this form is only ever used for the actual connect.
+pub fn url_via_local_port(url: &str, port: u16) -> Result<String, DbError> {
+    let mut parsed =
+        url::Url::parse(url).map_err(|e| DbError::Connect(format!("invalid URL: {e}")))?;
+    parsed
+        .set_host(Some("127.0.0.1"))
+        .map_err(|e| DbError::Connect(format!("rewriting URL host: {e}")))?;
+    parsed
+        .set_port(Some(port))
+        .map_err(|_| DbError::Connect("rewriting URL port failed".into()))?;
+    Ok(parsed.into())
+}
+
 /// Builds a password-free URL from the individual connection-form fields.
 pub fn build_url(
     host: &str,
@@ -667,6 +696,31 @@ mod tests {
         assert_eq!(
             format_interval(&iv(-1, -2, -5_000_000)),
             "-1 mon -2 days -00:00:05"
+        );
+    }
+
+    #[test]
+    fn url_target_extracts_host_and_defaults_port() {
+        assert_eq!(
+            url_target("postgres://u@db.internal/app").unwrap(),
+            ("db.internal".to_string(), 5432)
+        );
+        assert_eq!(
+            url_target("postgres://u@db.internal:6543/app").unwrap(),
+            ("db.internal".to_string(), 6543)
+        );
+        assert_eq!(
+            url_target("postgres://u@[::1]:6543/app").unwrap(),
+            ("::1".to_string(), 6543)
+        );
+        assert!(url_target("not a url").is_err());
+    }
+
+    #[test]
+    fn url_via_local_port_rewrites_only_host_and_port() {
+        assert_eq!(
+            url_via_local_port("postgres://u@db.internal:5432/app?sslmode=disable", 40123).unwrap(),
+            "postgres://u@127.0.0.1:40123/app?sslmode=disable"
         );
     }
 

@@ -5,7 +5,11 @@ use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
 
 use crate::config::{default_config_path, SavedConnection, SavedList};
-use crate::db::{url_with_password, ConnectionId, ConnectionRegistry, DbError, DbPool, TableMeta};
+use crate::db::{
+    url_target, url_via_local_port, url_with_password, ConnectionId, ConnectionRegistry, DbError,
+    DbPool, TableMeta,
+};
+use crate::tunnel::{Tunnel, TunnelAuth, TunnelConfig, TunnelError};
 
 /// Which screen the main panel shows: the connections screen or one open
 /// connection tab.
@@ -66,11 +70,32 @@ impl TabUi {
     }
 }
 
-/// A pending password request for a saved Postgres connection.
+/// What a pending [`PasswordPrompt`] is asking for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    /// The database password.
+    DbPassword,
+    /// The passphrase decrypting the SSH tunnel's key file.
+    SshPassphrase,
+}
+
+/// A pending secret request for a saved Postgres connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PasswordPrompt {
     pub url: String,
     pub name: String,
+    pub kind: PromptKind,
+    /// Tunnel settings of the connect attempt, carried through the prompt so
+    /// the retry resumes the same flow.
+    pub tunnel: Option<TunnelConfig>,
+}
+
+/// Keyring/session key for a connection's SSH key passphrase. The `#ssh`
+/// suffix keeps it disjoint from the database password stored under the
+/// bare URL (`#` cannot appear in a valid connection URL's serialized form
+/// unescaped, so this never collides).
+pub(crate) fn ssh_secret_key(url: &str) -> String {
+    format!("{url}#ssh")
 }
 
 /// App-wide state provided via context. `Copy` because it only holds signals.
@@ -89,11 +114,16 @@ pub struct AppState {
     /// Error from the most recent connect/config operation, shown on the
     /// connections screen.
     pub connect_error: Signal<Option<String>>,
-    /// Postgres passwords entered this session, keyed by stored URL. Never
-    /// persisted; the OS keyring arrives with FRE-27.
+    /// Secrets entered this session: Postgres passwords keyed by stored URL,
+    /// SSH key passphrases keyed by [`ssh_secret_key`]. Never persisted here
+    /// — the OS keyring handles "remember".
     pub session_passwords: Signal<HashMap<String, String>>,
-    /// When set, the connections screen asks for this connection's password.
+    /// When set, the connections screen asks for this connection's password
+    /// or SSH key passphrase.
     pub password_prompt: Signal<Option<PasswordPrompt>>,
+    /// Live SSH tunnels, one per tunneled open connection. Removing an entry
+    /// drops the [`Tunnel`], which shuts the forward down.
+    pub tunnels: Signal<HashMap<ConnectionId, Tunnel>>,
     /// Introspected schema per open connection.
     pub schemas: Signal<HashMap<ConnectionId, SchemaLoad>>,
     /// Sidebar/grid UI state per open connection.
@@ -125,6 +155,7 @@ impl AppState {
             connect_error: Signal::new(load_error),
             session_passwords: Signal::new(HashMap::new()),
             password_prompt: Signal::new(None),
+            tunnels: Signal::new(HashMap::new()),
             schemas: Signal::new(HashMap::new()),
             tab_ui: Signal::new(HashMap::new()),
         }
@@ -144,19 +175,21 @@ impl AppState {
     }
 
     /// Adds a Postgres connection to the saved list (URL stored without a
-    /// password) and persists.
-    pub fn add_saved_postgres(mut self, name: String, url: String) {
+    /// password; tunnel settings, sans passphrase, stored alongside) and
+    /// persists.
+    pub fn add_saved_postgres(mut self, name: String, url: String, tunnel: Option<TunnelConfig>) {
         let added = self
             .saved
             .write()
-            .add(SavedConnection::Postgres { name, url });
+            .add(SavedConnection::Postgres { name, url, tunnel });
         if added {
             self.persist_saved();
         }
     }
 
     /// Removes a saved connection (open tabs are unaffected) and persists.
-    /// Postgres entries also drop their keyring credential.
+    /// Postgres entries also drop their keyring credentials (database
+    /// password and SSH key passphrase).
     pub fn remove_saved(mut self, locator: &str) {
         let removed = self.saved.write().remove(locator);
         if let Some(entry) = removed {
@@ -164,7 +197,8 @@ impl AppState {
                 // Best-effort, off-thread: a missing keyring just means
                 // nothing was stored.
                 spawn_forever(async move {
-                    let _ = crate::secrets::delete_password_async(url).await;
+                    let _ = crate::secrets::delete_password_async(url.clone()).await;
+                    let _ = crate::secrets::delete_password_async(ssh_secret_key(&url)).await;
                 });
             }
             self.persist_saved();
@@ -193,17 +227,28 @@ impl AppState {
             return;
         }
         let result = DbPool::open_sqlite(&path).await;
-        self.finish_connect(locator, tab_title(&path), result);
+        self.finish_connect(locator, tab_title(&path), result, None);
     }
 
-    /// Opens a saved Postgres connection. Uses the session password when one
-    /// is known; otherwise tries without and falls back to a password prompt
-    /// on authentication failure (so trust-auth servers connect silently).
-    pub async fn connect_postgres(mut self, url: String, name: String) {
+    /// Opens a saved Postgres connection. With a tunnel configured, the
+    /// tunnel opens first (its failures surface as "SSH tunnel: …", distinct
+    /// from database errors) and Postgres connects through the forwarded
+    /// port. Uses the session password when one is known; otherwise tries
+    /// without and falls back to a password prompt on authentication failure
+    /// (so trust-auth servers connect silently).
+    pub async fn connect_postgres(
+        mut self,
+        url: String,
+        name: String,
+        tunnel: Option<TunnelConfig>,
+    ) {
         self.connect_error.set(None);
         if self.focus_or_reserve(&url) {
             return;
         }
+        let Some((connect_url, live_tunnel)) = self.open_tunnel(&url, &name, &tunnel).await else {
+            return; // failure already surfaced (error or passphrase prompt)
+        };
         // Session memory first, then the OS keyring. The keyring call runs
         // off-thread (a locked wallet can block on a user dialog) and only
         // after the session read guard is dropped; errors mean "no keyring"
@@ -217,11 +262,11 @@ impl AppState {
         }
         let had_password = session_password.is_some();
         let result = match &session_password {
-            Some(password) => match url_with_password(&url, password) {
+            Some(password) => match url_with_password(&connect_url, password) {
                 Ok(full) => DbPool::open_postgres(&full).await,
                 Err(err) => Err(err),
             },
-            None => DbPool::open_postgres(&url).await,
+            None => DbPool::open_postgres(&connect_url).await,
         };
         match result {
             Err(DbError::Connect(msg)) if msg.contains("authentication failed") => {
@@ -233,25 +278,33 @@ impl AppState {
                     self.connect_error
                         .set(Some(format!("connection failed: {msg}")));
                 }
-                self.password_prompt.set(Some(PasswordPrompt { url, name }));
+                // live_tunnel drops here; the retry re-opens it.
+                self.password_prompt.set(Some(PasswordPrompt {
+                    url,
+                    name,
+                    kind: PromptKind::DbPassword,
+                    tunnel,
+                }));
             }
             result => {
-                self.finish_connect(url.clone(), name.clone(), result);
-                self.save_postgres_if_open(&url, &name);
+                self.finish_connect(url.clone(), name.clone(), result, live_tunnel);
+                self.save_postgres_if_open(&url, &name, tunnel);
             }
         }
     }
 
-    /// Completes the password prompt: connects with the entered password.
-    /// On success the password always lives in session memory; with
-    /// `remember` it is also stored in the OS keyring (silently staying
-    /// session-only when no keyring is available).
+    /// Completes the password prompt: connects with the entered password
+    /// (through the tunnel when one is configured). On success the password
+    /// always lives in session memory; with `remember` it is also stored in
+    /// the OS keyring (silently staying session-only when no keyring is
+    /// available).
     pub async fn connect_postgres_with_password(
         mut self,
         url: String,
         name: String,
         password: String,
         remember: bool,
+        tunnel: Option<TunnelConfig>,
     ) {
         self.connect_error.set(None);
         // The prompt replaces the reservation made by connect_postgres, so
@@ -259,7 +312,10 @@ impl AppState {
         if self.focus_or_reserve(&url) {
             return;
         }
-        let result = match url_with_password(&url, &password) {
+        let Some((connect_url, live_tunnel)) = self.open_tunnel(&url, &name, &tunnel).await else {
+            return;
+        };
+        let result = match url_with_password(&connect_url, &password) {
             Ok(full) => DbPool::open_postgres(&full).await,
             Err(err) => Err(err),
         };
@@ -280,18 +336,144 @@ impl AppState {
             self.session_passwords.write().insert(url.clone(), password);
             self.password_prompt.set(None);
         }
-        self.finish_connect(url.clone(), name.clone(), result);
-        self.save_postgres_if_open(&url, &name);
+        self.finish_connect(url.clone(), name.clone(), result, live_tunnel);
+        self.save_postgres_if_open(&url, &name, tunnel);
+    }
+
+    /// Completes the SSH-passphrase prompt: remembers the passphrase for the
+    /// session and re-runs the connect flow (which now finds it). Keyring
+    /// persistence happens only after the connect succeeded, so a mistyped
+    /// passphrase is never stored.
+    pub async fn connect_postgres_with_ssh_passphrase(
+        mut self,
+        url: String,
+        name: String,
+        tunnel: TunnelConfig,
+        passphrase: String,
+        remember: bool,
+    ) {
+        self.stash_ssh_passphrase(&url, passphrase);
+        self.password_prompt.set(None);
+        self.connect_postgres(url.clone(), name, Some(tunnel)).await;
+        let connected = self.open_locators.read().iter().any(|(_, l)| *l == url);
+        if remember && connected {
+            self.persist_ssh_passphrase(&url).await;
+        }
+    }
+
+    /// Puts an SSH key passphrase into session memory so the next tunnel
+    /// open for `url` finds it.
+    pub fn stash_ssh_passphrase(mut self, url: &str, passphrase: String) {
+        self.session_passwords
+            .write()
+            .insert(ssh_secret_key(url), passphrase);
+    }
+
+    /// Stores the session passphrase for `url` in the OS keyring under the
+    /// `#ssh` key, surfacing a non-fatal notice when the keyring is
+    /// unavailable. Call after a successful tunneled connect.
+    pub async fn persist_ssh_passphrase(mut self, url: &str) {
+        let key = ssh_secret_key(url);
+        let passphrase = self.session_passwords.read().get(&key).cloned();
+        let Some(passphrase) = passphrase else {
+            return;
+        };
+        if crate::secrets::store_password_async(key, passphrase)
+            .await
+            .is_err()
+        {
+            self.connect_error.set(Some(
+                "connected, but the SSH key passphrase could not be stored in the system \
+                 keyring — it is remembered for this session only"
+                    .to_string(),
+            ));
+        }
+    }
+
+    /// Opens the SSH tunnel when one is configured, returning the URL the
+    /// database should actually connect to (host/port rewritten to the
+    /// forwarded local port — the saved URL stays the logical one) plus the
+    /// live tunnel. `None` means the attempt already ended: the reservation
+    /// was released and either an error was surfaced or the passphrase
+    /// prompt was raised.
+    async fn open_tunnel(
+        mut self,
+        url: &str,
+        name: &str,
+        tunnel: &Option<TunnelConfig>,
+    ) -> Option<(String, Option<Tunnel>)> {
+        let Some(config) = tunnel else {
+            return Some((url.to_string(), None));
+        };
+        // The passphrase flows like the database password: session memory,
+        // then keyring (off-thread, guard dropped before the await), then a
+        // prompt. Only key-file auth can need one.
+        let secret_key = ssh_secret_key(url);
+        let mut passphrase = None;
+        if matches!(config.auth, TunnelAuth::KeyFile { .. }) {
+            passphrase = self.session_passwords.read().get(&secret_key).cloned();
+            if passphrase.is_none() {
+                passphrase = crate::secrets::get_password_async(secret_key.clone())
+                    .await
+                    .ok()
+                    .flatten();
+            }
+        }
+        let had_passphrase = passphrase.is_some();
+        let target = match url_target(url) {
+            Ok(target) => target,
+            Err(err) => {
+                self.fail_connect(url, err.to_string());
+                return None;
+            }
+        };
+        match Tunnel::open(config.clone(), passphrase, target.0, target.1).await {
+            Ok(live) => match url_via_local_port(url, live.local_port()) {
+                Ok(rewritten) => Some((rewritten, Some(live))),
+                Err(err) => {
+                    self.fail_connect(url, err.to_string());
+                    None
+                }
+            },
+            Err(err @ TunnelError::NeedsPassphrase(_)) => {
+                self.connecting.write().retain(|l| l != url);
+                if had_passphrase {
+                    // Stored passphrase is stale; drop it everywhere and
+                    // re-ask.
+                    self.session_passwords.write().remove(&secret_key);
+                    let _ = crate::secrets::delete_password_async(secret_key).await;
+                    self.connect_error.set(Some(err.to_string()));
+                }
+                self.password_prompt.set(Some(PasswordPrompt {
+                    url: url.to_string(),
+                    name: name.to_string(),
+                    kind: PromptKind::SshPassphrase,
+                    tunnel: Some(config.clone()),
+                }));
+                None
+            }
+            Err(err) => {
+                self.fail_connect(url, err.to_string());
+                None
+            }
+        }
+    }
+
+    /// Releases a connect reservation and surfaces its error.
+    fn fail_connect(mut self, locator: &str, message: String) {
+        self.connecting.write().retain(|l| l != locator);
+        self.connect_error.set(Some(message));
     }
 
     /// A successful Postgres connect always joins the saved list (add is a
-    /// no-op when the URL is already saved). This keeps the "connect first,
-    /// save on success" contract even when the connect went through the
-    /// password prompt instead of the form's direct path.
-    fn save_postgres_if_open(self, url: &str, name: &str) {
+    /// no-op when URL and tunnel are already saved, and updates the tunnel
+    /// of an existing entry otherwise). This keeps the "connect first, save
+    /// on success" contract even when the connect went through a prompt
+    /// instead of the form's direct path.
+    fn save_postgres_if_open(self, url: &str, name: &str, tunnel: Option<TunnelConfig>) {
         let is_open = self.open_locators.read().iter().any(|(_, l)| l == url);
         if is_open {
-            self.add_saved_postgres(name.to_string(), url.to_string());
+            self.add_saved_postgres(name.to_string(), url.to_string(), tunnel);
         }
     }
 
@@ -318,18 +500,31 @@ impl AppState {
         false
     }
 
-    /// Releases the reservation and either opens the tab or surfaces the
-    /// error.
-    fn finish_connect(mut self, locator: String, name: String, result: Result<DbPool, DbError>) {
+    /// Releases the reservation and either opens the tab (keeping the
+    /// tunnel, when there is one, alive for the connection's lifetime) or
+    /// surfaces the error (dropping the tunnel).
+    fn finish_connect(
+        mut self,
+        locator: String,
+        name: String,
+        result: Result<DbPool, DbError>,
+        tunnel: Option<Tunnel>,
+    ) {
         self.connecting.write().retain(|l| l != &locator);
         match result {
             Ok(pool) => {
                 let id = self.registry.write().insert(name, pool);
+                if let Some(tunnel) = tunnel {
+                    self.tunnels.write().insert(id, tunnel);
+                }
                 self.open_locators.write().push((id, locator));
                 self.active.set(ActiveView::Connection(id));
                 self.load_schema(id);
             }
-            Err(err) => self.connect_error.set(Some(err.to_string())),
+            Err(err) => {
+                drop(tunnel); // a tunnel without its database is useless
+                self.connect_error.set(Some(err.to_string()));
+            }
         }
     }
 
@@ -372,7 +567,8 @@ impl AppState {
     }
 
     /// Closes a tab: drops it from the registry, closes the pool in the
-    /// background, and leaves the view somewhere sensible.
+    /// background, shuts down its SSH tunnel (if any), and leaves the view
+    /// somewhere sensible.
     pub fn close_connection(mut self, id: ConnectionId) {
         let removed = self.registry.write().remove(id);
         if let Some(connection) = removed {
@@ -380,6 +576,8 @@ impl AppState {
             // component unmounts first.
             spawn_forever(async move { connection.pool.close().await });
         }
+        // Dropping the Tunnel signals its forward task to shut down.
+        self.tunnels.write().remove(&id);
         self.open_locators
             .write()
             .retain(|(open_id, _)| *open_id != id);

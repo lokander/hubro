@@ -5,5 +5,6 @@
 pub mod config;
 pub mod db;
 pub mod secrets;
+pub mod tunnel;
 pub mod ui;
 pub mod util;
