@@ -2,11 +2,11 @@ use dioxus::prelude::*;
 use serde::Deserialize;
 
 use crate::db::{
-    classify_statement, ConnectionId, Dialect, QueryResult, StatementKind, StatementOutcome,
-    StatementResult, Value,
+    needs_confirmation, ConnectionId, Dialect, QueryResult, StatementOutcome, StatementResult,
+    Value,
 };
 
-use super::state::{AppState, RunStatus, CANCELLED};
+use super::state::{AppState, RunStatus};
 
 /// Cap on rendered result rows (per statement). The full result still sits
 /// in memory until FRE-33 introduces streaming/limits at the query layer,
@@ -83,12 +83,11 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
 
     let run = state.sql_runs.read().get(&id).cloned();
     let running = matches!(run.as_ref().map(|r| &r.status), Some(RunStatus::Running));
-    let pending_writes = state.pending_sql.read().get(&id).map(|statements| {
-        statements
-            .iter()
-            .filter(|s| classify_statement(s) == StatementKind::Write)
-            .count()
-    });
+    let pending_writes = state
+        .pending_sql
+        .read()
+        .get(&id)
+        .map(|statements| statements.iter().filter(|s| needs_confirmation(s)).count());
 
     rsx! {
         div { class: "flex h-full min-h-0 flex-col",
@@ -172,27 +171,22 @@ fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
             statement_index,
             preview,
             elapsed_ms,
-        } => {
-            if error == CANCELLED {
-                rsx! {
-                    p { class: "border-t border-amber-900/50 px-4 py-3 text-sm text-amber-300",
-                        "Run cancelled."
-                    }
+        } => rsx! {
+            div { class: "border-t border-red-900/50 bg-red-950/20 px-4 py-3",
+                p { class: "mb-1 font-mono text-xs text-red-300/80",
+                    "{statement_index + 1} · {preview}"
                 }
-            } else {
-                rsx! {
-                    div { class: "border-t border-red-900/50 bg-red-950/20 px-4 py-3",
-                        p { class: "mb-1 font-mono text-xs text-red-300/80",
-                            "{statement_index + 1} · {preview}"
-                        }
-                        p { class: "font-mono text-sm text-red-400", "{error}" }
-                        p { class: "mt-1 text-xs text-slate-500",
-                            "Script stopped after {elapsed_ms} ms; earlier statements were not rolled back."
-                        }
-                    }
+                p { class: "font-mono text-sm text-red-400", "{error}" }
+                p { class: "mt-1 text-xs text-slate-500",
+                    "Script stopped after {elapsed_ms} ms; earlier statements were not rolled back."
                 }
             }
-        }
+        },
+        RunStatus::Cancelled => rsx! {
+            p { class: "border-t border-amber-900/50 px-4 py-3 text-sm text-amber-300",
+                "Run cancelled — an in-flight statement may still complete on the server."
+            }
+        },
     }
 }
 
