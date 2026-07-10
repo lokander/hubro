@@ -13,7 +13,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `cargo check` / `cargo clippy` — type-check and lint without the Dioxus CLI.
 - Tailwind is compiled automatically by `dx serve` (Dioxus 0.7+): it picks up `tailwind.css` next to Cargo.toml and outputs to `assets/tailwind.css`. No npm/Tailwind CLI setup is needed.
 
-There are no tests yet; if added, run with `cargo test`.
+- `cargo test` — run all tests: unit tests live in `#[cfg(test)]` modules next to the code, integration tests in `tests/`. Test fixture files go in `tests/fixtures/`. Run a single test with `cargo test <name>`.
+
+The crate is split into a library (`src/lib.rs`, holds app modules) and a thin binary (`src/main.rs`) so integration tests can import app code as `dataview::...`.
 
 When a live database server (e.g. Postgres) is needed for testing or development, run it in Docker — never install or run database servers directly on the host.
 
