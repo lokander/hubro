@@ -156,9 +156,14 @@ impl AppState {
     }
 
     /// Removes a saved connection (open tabs are unaffected) and persists.
+    /// Postgres entries also drop their keyring credential.
     pub fn remove_saved(mut self, locator: &str) {
         let removed = self.saved.write().remove(locator);
         if removed {
+            if locator.starts_with("postgres") {
+                // Best-effort: a missing keyring just means nothing stored.
+                let _ = crate::secrets::delete_password(locator);
+            }
             self.persist_saved();
         }
     }
@@ -196,7 +201,14 @@ impl AppState {
         if self.focus_or_reserve(&url) {
             return;
         }
-        let session_password = self.session_passwords.read().get(&url).cloned();
+        // Session memory first, then the OS keyring (sync D-Bus call, fast;
+        // errors mean "no keyring" and fall through to the prompt flow).
+        let session_password = self
+            .session_passwords
+            .read()
+            .get(&url)
+            .cloned()
+            .or_else(|| crate::secrets::get_password(&url).ok().flatten());
         let had_password = session_password.is_some();
         let result = match &session_password {
             Some(password) => match url_with_password(&url, password) {
@@ -209,8 +221,9 @@ impl AppState {
             Err(DbError::Connect(msg)) if msg.contains("authentication failed") => {
                 self.connecting.write().retain(|l| l != &url);
                 if had_password {
-                    // Stored session password is stale; drop it and re-ask.
+                    // Stored password is stale; drop it everywhere and re-ask.
                     self.session_passwords.write().remove(&url);
+                    let _ = crate::secrets::delete_password(&url);
                     self.connect_error
                         .set(Some(format!("connection failed: {msg}")));
                 }
@@ -223,13 +236,16 @@ impl AppState {
         }
     }
 
-    /// Completes the password prompt: connects with the entered password and
-    /// remembers it for the rest of the session on success.
+    /// Completes the password prompt: connects with the entered password.
+    /// On success the password always lives in session memory; with
+    /// `remember` it is also stored in the OS keyring (silently staying
+    /// session-only when no keyring is available).
     pub async fn connect_postgres_with_password(
         mut self,
         url: String,
         name: String,
         password: String,
+        remember: bool,
     ) {
         self.connect_error.set(None);
         // The prompt replaces the reservation made by connect_postgres, so
@@ -242,6 +258,9 @@ impl AppState {
             Err(err) => Err(err),
         };
         if result.is_ok() {
+            if remember {
+                let _ = crate::secrets::store_password(&url, &password);
+            }
             self.session_passwords.write().insert(url.clone(), password);
             self.password_prompt.set(None);
         }
