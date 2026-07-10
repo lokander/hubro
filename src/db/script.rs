@@ -115,8 +115,10 @@ fn dollar_tag_end(bytes: &[u8], at: usize) -> Option<usize> {
     (bytes.get(j) == Some(&b'$')).then_some(j + 1)
 }
 
-/// Whether a statement reads rows or mutates state (decides fetch vs
-/// execute, and whether a script needs write confirmation).
+/// Whether a statement returns rows (executed via fetch) or not (executed
+/// via execute, reporting an affected-row count). This is an execution-mode
+/// choice only — see [`needs_confirmation`] for the "can this mutate?"
+/// question, which is deliberately stricter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatementKind {
     Read,
@@ -124,10 +126,11 @@ pub enum StatementKind {
 }
 
 /// Classifies by the first significant keyword. The read set is
-/// deliberately small; anything unrecognized counts as a write so the
-/// confirmation errs on the safe side. `WITH` is treated as a read even
-/// though Postgres allows data-modifying CTEs — the rows such a statement
-/// returns are still worth showing, and `fetch` executes it all the same.
+/// deliberately small; anything unrecognized counts as a write. `WITH` is
+/// classified as a read even though Postgres allows data-modifying CTEs —
+/// the rows such a statement returns are still worth showing, and `fetch`
+/// executes it all the same (the confirmation banner is handled separately
+/// by [`needs_confirmation`]).
 pub fn classify_statement(sql: &str) -> StatementKind {
     match first_keyword(sql).to_ascii_lowercase().as_str() {
         "select" | "with" | "values" | "show" | "explain" | "pragma" | "table" => {
@@ -135,6 +138,114 @@ pub fn classify_statement(sql: &str) -> StatementKind {
         }
         _ => StatementKind::Write,
     }
+}
+
+/// Keywords that mark a fetch-classified statement as potentially mutating
+/// when they appear anywhere outside strings and comments.
+const EMBEDDED_WRITE_KEYWORDS: [&str; 9] = [
+    "insert", "update", "delete", "merge", "create", "drop", "alter", "truncate", "replace",
+];
+
+/// Whether running this statement can mutate the database, i.e. whether the
+/// editor must ask before running it. Everything [`classify_statement`]
+/// calls a write needs confirmation; on top of that, fetch-classified
+/// statements are token-scanned (outside strings/comments, so quoted
+/// literals never trigger) for embedded write forms:
+///
+/// - `WITH` / `EXPLAIN`: any [`EMBEDDED_WRITE_KEYWORDS`] token anywhere —
+///   catches data-modifying CTEs (`WITH x AS (DELETE …) SELECT …`) and
+///   `EXPLAIN ANALYZE UPDATE …`, which Postgres actually executes. Plain
+///   `EXPLAIN SELECT` / `EXPLAIN ANALYZE SELECT` do not prompt.
+/// - `SELECT`: an `INTO` token — `SELECT … INTO new_table` creates a table.
+/// - `PRAGMA`: a `=` or `(` — the value-setting forms. This deliberately
+///   over-prompts call-form read pragmas like `PRAGMA table_info(t)`: some
+///   pragmas accept both spellings for setting, and prompting is the
+///   fail-safe side.
+pub fn needs_confirmation(sql: &str) -> bool {
+    if classify_statement(sql) == StatementKind::Write {
+        return true;
+    }
+    match first_keyword(sql).to_ascii_lowercase().as_str() {
+        "with" | "explain" => has_top_level_word(sql, |word| {
+            EMBEDDED_WRITE_KEYWORDS.contains(&word.to_ascii_lowercase().as_str())
+        }),
+        "select" => has_top_level_word(sql, |word| word.eq_ignore_ascii_case("into")),
+        "pragma" => {
+            let code = strip_strings_and_comments(sql);
+            code.contains('=') || code.contains('(')
+        }
+        _ => false,
+    }
+}
+
+/// Whether any word-ish token (identifier characters) of the statement —
+/// with strings and comments removed — matches the predicate.
+fn has_top_level_word(sql: &str, matches: impl Fn(&str) -> bool) -> bool {
+    strip_strings_and_comments(sql)
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|word| !word.is_empty() && matches(word))
+}
+
+/// The statement text with quoted strings (single, double, dollar) and
+/// comments blanked out to spaces, so token scans can't be fooled by
+/// literals like `'please do not DELETE me'`. Same lexer states as
+/// [`split_statements`].
+fn strip_strings_and_comments(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = vec![b' '; bytes.len()];
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'\'' | b'"') => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let mut depth = 1usize;
+                i += 2;
+                while i < bytes.len() && depth > 0 {
+                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'$' => {
+                if let Some(open_end) = dollar_tag_end(bytes, i) {
+                    let delimiter = &sql[i..open_end];
+                    match sql[open_end..].find(delimiter) {
+                        Some(close) => i = open_end + close + delimiter.len(),
+                        None => i = bytes.len(),
+                    }
+                } else {
+                    out[i] = b'$';
+                    i += 1;
+                }
+            }
+            c => {
+                out[i] = c;
+                i += 1;
+            }
+        }
+    }
+    // Multibyte chars survive intact: the fallthrough arm copies them byte
+    // by byte across iterations, and blanked regions always start and end
+    // at ASCII delimiters (a UTF-8 continuation byte can never equal an
+    // ASCII quote/comment marker), so sequences are never split.
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The first keyword of a statement, skipping leading whitespace, comments,
@@ -398,6 +509,77 @@ mod tests {
         ] {
             assert_eq!(classify_statement(sql), StatementKind::Write, "{sql:?}");
         }
+    }
+
+    #[test]
+    fn embedded_writes_in_fetch_statements_need_confirmation() {
+        for sql in [
+            // Data-modifying CTEs execute their writes.
+            "WITH moved AS (DELETE FROM t RETURNING *) SELECT * FROM moved",
+            "with x as (insert into t values (1) returning id) select * from x",
+            "WITH x AS (UPDATE t SET a = 1 RETURNING a) SELECT * FROM x",
+            // Postgres actually executes the statement under EXPLAIN ANALYZE.
+            "EXPLAIN ANALYZE UPDATE t SET a = 1",
+            "EXPLAIN (ANALYZE, BUFFERS) DELETE FROM t",
+            // SELECT INTO creates a table.
+            "SELECT * INTO new_table FROM t",
+            "select a, b into backup from t where a > 1",
+            // Value-setting pragmas mutate the database file.
+            "PRAGMA journal_mode = WAL",
+            "PRAGMA busy_timeout(5000)",
+        ] {
+            assert!(needs_confirmation(sql), "{sql:?} must need confirmation");
+        }
+    }
+
+    #[test]
+    fn plain_reads_do_not_need_confirmation() {
+        for sql in [
+            "SELECT * FROM t",
+            "SELECT a AS into_marker FROM t", // 'into' only as part of a word
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            "EXPLAIN SELECT * FROM t",
+            "EXPLAIN ANALYZE SELECT * FROM t",
+            "PRAGMA journal_mode", // bare query form reads the setting
+            "VALUES (1)",
+            "SHOW server_version",
+            "TABLE t",
+            // Write keywords inside literals and comments must not trigger.
+            "SELECT 'please DELETE me later; INTO the bin' FROM t",
+            "WITH x AS (SELECT 'drop table users') SELECT * FROM x",
+            "EXPLAIN SELECT 1 -- update later\n",
+            "WITH x AS (SELECT 1) SELECT * FROM x /* create index? */",
+            "SELECT \"into\" FROM t", // quoted identifier
+        ] {
+            assert!(!needs_confirmation(sql), "{sql:?} must not prompt");
+        }
+    }
+
+    #[test]
+    fn classified_writes_always_need_confirmation() {
+        for sql in ["INSERT INTO t VALUES (1)", "DROP TABLE t", "BEGIN", ""] {
+            assert!(needs_confirmation(sql), "{sql:?} must need confirmation");
+        }
+    }
+
+    #[test]
+    fn strip_strings_and_comments_blanks_only_literals_and_comments() {
+        let stripped = strip_strings_and_comments("SELECT 'a;b', \"q\" -- c\nFROM t /* x */");
+        assert!(stripped.contains("SELECT"));
+        assert!(stripped.contains("FROM t"));
+        for gone in ["a;b", "q", "c", "x", "'", "\"", "--", "/*"] {
+            assert!(!stripped.contains(gone), "{gone:?} should be blanked");
+        }
+        let stripped = strip_strings_and_comments("SELECT $$drop$$, $t$delete$t$, $1");
+        assert!(!stripped.contains("drop"));
+        assert!(!stripped.contains("delete"));
+        assert!(stripped.contains("$1")); // parameter placeholder survives
+                                          // Length in bytes is preserved and multibyte text stays valid UTF-8.
+        let input = "SELECT übercol, 'смузи' FROM t";
+        let stripped = strip_strings_and_comments(input);
+        assert_eq!(stripped.len(), input.len());
+        assert!(stripped.contains("übercol"));
+        assert!(!stripped.contains("смузи"));
     }
 
     #[test]

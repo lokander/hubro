@@ -6,9 +6,9 @@ use dioxus::prelude::*;
 
 use crate::config::{default_config_path, SavedConnection, SavedList};
 use crate::db::{
-    classify_statement, run_script, split_statements, url_target, url_via_local_port,
-    url_with_password, ConnectionId, ConnectionRegistry, DbError, DbPool, StatementKind,
-    StatementResult, TableMeta,
+    needs_confirmation, run_script, split_statements, url_target, url_via_local_port,
+    url_with_password, ConnectionId, ConnectionRegistry, DbError, DbPool, StatementResult,
+    TableMeta,
 };
 use crate::tunnel::{Tunnel, TunnelAuth, TunnelConfig, TunnelError};
 
@@ -75,10 +75,6 @@ pub struct TabUi {
     pub sql_text: String,
 }
 
-/// Marker error message for a run the user cancelled; the editor renders
-/// this state specially instead of as a database error.
-pub const CANCELLED: &str = "cancelled";
-
 /// Where a script run currently stands. Per-statement outcomes accumulate
 /// in [`SqlRun::statements`] as they finish; the status carries the
 /// script-level timing and failure info.
@@ -88,15 +84,19 @@ pub enum RunStatus {
     Done {
         elapsed_ms: u64,
     },
-    /// The statement at `statement_index` (0-based, into the script) failed
-    /// — or the run was cancelled (`error == CANCELLED`). Outcomes of the
-    /// statements before it stay visible in [`SqlRun::statements`].
+    /// The statement at `statement_index` (0-based, into the script)
+    /// failed. Outcomes of the statements before it stay visible in
+    /// [`SqlRun::statements`].
     Failed {
         error: String,
         statement_index: usize,
         preview: String,
         elapsed_ms: u64,
     },
+    /// The user aborted the run. Outcomes of the statements that finished
+    /// before the abort stay visible; the in-flight statement may still
+    /// complete server-side (see [`AppState::cancel_sql`]).
+    Cancelled,
 }
 
 /// State of the most recent SQL script run per connection.
@@ -619,24 +619,33 @@ impl AppState {
         self.tab_ui.write().entry(id).or_default().pane = pane;
     }
 
-    /// Stores the editor buffer (synced from the webview on change).
+    /// Stores the editor buffer (synced from the webview on change). An
+    /// actual text change invalidates any pending write confirmation — the
+    /// banner must never run SQL that no longer matches the buffer.
     pub fn set_sql_text(mut self, id: ConnectionId, text: String) {
-        self.tab_ui.write().entry(id).or_default().sql_text = text;
+        let changed = {
+            let mut tab_ui = self.tab_ui.write();
+            let ui = tab_ui.entry(id).or_default();
+            let changed = ui.sql_text != text;
+            ui.sql_text = text;
+            changed
+        };
+        if changed {
+            self.pending_sql.write().remove(&id);
+        }
     }
 
-    /// Runs a free-form SQL script against one connection. Scripts that
-    /// contain any write statement are not executed yet: they are stashed
-    /// in [`Self::pending_sql`] and the editor shows a confirmation banner.
+    /// Runs a free-form SQL script against one connection. Scripts where
+    /// any statement can mutate the database (see [`needs_confirmation`])
+    /// are not executed yet: they are stashed in [`Self::pending_sql`] and
+    /// the editor shows a confirmation banner.
     pub fn run_sql(mut self, id: ConnectionId, sql: String) {
         self.pending_sql.write().remove(&id);
         let statements = split_statements(&sql);
         if statements.is_empty() {
             return;
         }
-        let has_write = statements
-            .iter()
-            .any(|s| classify_statement(s) == StatementKind::Write);
-        if has_write {
+        if statements.iter().any(|s| needs_confirmation(s)) {
             self.pending_sql.write().insert(id, statements);
             return;
         }
@@ -659,26 +668,25 @@ impl AppState {
     /// Aborts the in-flight run, keeping the outcomes of the statements
     /// that already finished visible and marking the run cancelled.
     ///
-    /// Cancelling drops the sqlx future mid-query; what happens to the
-    /// query itself is backend-specific:
-    /// - SQLite: the statement keeps running to completion on sqlx's worker
-    ///   thread — only the future stops being polled, so a long write still
-    ///   lands. The pool connection stays usable.
-    /// - Postgres: the checked-out connection is dirty (a response is still
-    ///   in flight) and gets closed/recycled by the pool instead of being
-    ///   reused; the server notices the closed socket and aborts the query.
+    /// Cancelling only drops the sqlx future — on BOTH backends the
+    /// in-flight statement itself is NOT interrupted and still completes
+    /// (a cancelled UPDATE still commits):
+    /// - SQLite: the statement runs to completion on sqlx's worker thread;
+    ///   only the future stops being polled.
+    /// - Postgres: returning the pooled connection makes sqlx drain the
+    ///   socket until the in-flight query has finished server-side, after
+    ///   which the connection goes back to the pool healthy — the server
+    ///   never sees a disconnect, so the query is not aborted.
+    ///
+    /// Either way each cancelled long-running query pins one pool
+    /// connection until the statement finishes.
     pub fn cancel_sql(mut self, id: ConnectionId) {
         let task = self.sql_tasks.write().remove(&id);
         let Some(task) = task else { return };
         task.cancel();
         if let Some(run) = self.sql_runs.write().get_mut(&id) {
             if run.status == RunStatus::Running {
-                run.status = RunStatus::Failed {
-                    error: CANCELLED.to_string(),
-                    statement_index: run.statements.len(),
-                    preview: String::new(),
-                    elapsed_ms: 0,
-                };
+                run.status = RunStatus::Cancelled;
             }
         }
     }
