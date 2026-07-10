@@ -15,6 +15,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 There are no tests yet; if added, run with `cargo test`.
 
+## Interactive testing (screenshots + clicking)
+
+The dev machine runs KDE Plasma on Wayland. To drive the app (click, type, screenshot) without touching the user's real cursor, run it inside a nested Xephyr X server:
+
+```bash
+Xephyr :2 -screen 900x700 &
+DISPLAY=:2 GDK_BACKEND=x11 ./target/dx/dataview/debug/linux/app/dataview &   # binary path from `dx build`
+DISPLAY=:2 xdotool search --name "Dioxus App" windowmove 50 50               # app may spawn outside the nested root
+DISPLAY=:2 xdotool mousemove X Y click 1                                     # full pointer control
+import -display :2 -window root shot.png                                     # screenshot the nested display
+```
+
+Driving the app directly on the desktop half-works and isn't worth it: `spectacle -b -n -a -o shot.png` captures windows and `xdotool key` reaches XWayland windows (after a one-time KDE "Remote Control" approval), but KWin ignores XTEST pointer events, so mouse control is impossible outside Xephyr.
+
 ## Commits
 
 Use [Conventional Commits](https://www.conventionalcommits.org/) with **subject line only** — no body, no footers (including no Co-Authored-By trailers). Example: `feat: add csv import`.
