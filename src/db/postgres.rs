@@ -4,7 +4,8 @@
 
 use sqlx::postgres::types::{PgInterval, PgTimeTz};
 use sqlx::postgres::{
-    PgHasArrayType, PgPool, PgPoolOptions, PgRow, PgTypeKind, PgValueFormat, PgValueRef,
+    PgDatabaseError, PgErrorPosition, PgHasArrayType, PgPool, PgPoolOptions, PgRow, PgTypeKind,
+    PgValueFormat, PgValueRef,
 };
 use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{Decimal, JsonValue, Uuid};
@@ -164,7 +165,7 @@ pub async fn query_with(
     let rows = prepared
         .fetch_all(pool)
         .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
+        .map_err(|e| query_error(e, sql))?;
     let columns = match rows.first() {
         Some(row) => row
             .columns()
@@ -187,6 +188,60 @@ pub async fn query_with(
         columns,
         rows: out_rows,
     })
+}
+
+/// Executes a statement without decoding rows, returning the driver's
+/// affected-row count.
+pub async fn execute(pool: &PgPool, sql: &str) -> Result<u64, DbError> {
+    sqlx::query(sql)
+        .execute(pool)
+        .await
+        .map(|done| done.rows_affected())
+        .map_err(|e| query_error(e, sql))
+}
+
+/// Builds a query error, appending "line L, column C" when the server
+/// reported an error cursor. Postgres sends the position as a 1-based
+/// *character* index into the query text; positions into internally
+/// generated queries ([`PgErrorPosition::Internal`]) don't map to the user's
+/// text and are ignored.
+fn query_error(err: sqlx::Error, sql: &str) -> DbError {
+    let mut message = err.to_string();
+    if let sqlx::Error::Database(db_err) = &err {
+        if let Some(pg) = db_err.try_downcast_ref::<PgDatabaseError>() {
+            if let Some(PgErrorPosition::Original(position)) = pg.position() {
+                if let Some((line, column)) = line_col(sql, position) {
+                    message.push_str(&format!(" (line {line}, column {column})"));
+                }
+            }
+        }
+    }
+    DbError::Query(message)
+}
+
+/// Maps a 1-based character position into 1-based line and column numbers.
+/// Returns `None` for positions outside the text (except one-past-the-end,
+/// which the server reports e.g. for input that stops too early).
+fn line_col(sql: &str, position: usize) -> Option<(usize, usize)> {
+    if position == 0 {
+        return None;
+    }
+    let mut line = 1usize;
+    let mut column = 1usize;
+    let mut seen = 0usize;
+    for c in sql.chars() {
+        seen += 1;
+        if seen == position {
+            return Some((line, column));
+        }
+        if c == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    (position == seen + 1).then_some((line, column))
 }
 
 /// Full multi-schema introspection: every user schema's tables and views
@@ -722,6 +777,28 @@ mod tests {
             url_via_local_port("postgres://u@db.internal:5432/app?sslmode=disable", 40123).unwrap(),
             "postgres://u@127.0.0.1:40123/app?sslmode=disable"
         );
+    }
+
+    #[test]
+    fn line_col_maps_character_positions() {
+        let sql = "SELECT 1 +\n  bad_col\nFROM t";
+        assert_eq!(line_col(sql, 1), Some((1, 1)));
+        assert_eq!(line_col(sql, 8), Some((1, 8)));
+        // First char of line 2 ("SELECT 1 +\n" is 11 chars).
+        assert_eq!(line_col(sql, 12), Some((2, 1)));
+        assert_eq!(line_col(sql, 14), Some((2, 3)));
+        // One past the end is valid (server points at missing input).
+        let len = sql.chars().count();
+        assert_eq!(line_col(sql, len + 1), Some((3, 7)));
+        // Zero and far-out-of-range positions are dropped.
+        assert_eq!(line_col(sql, 0), None);
+        assert_eq!(line_col(sql, len + 2), None);
+    }
+
+    #[test]
+    fn line_col_counts_characters_not_bytes() {
+        // "ыыы" is 6 bytes but 3 chars; position 5 is the 'X'.
+        assert_eq!(line_col("ыыыаX", 5), Some((1, 5)));
     }
 
     #[test]

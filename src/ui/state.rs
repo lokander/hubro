@@ -1,13 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use dioxus::core::spawn_forever;
+use dioxus::core::{spawn_forever, Task};
 use dioxus::prelude::*;
 
 use crate::config::{default_config_path, SavedConnection, SavedList};
 use crate::db::{
-    url_target, url_via_local_port, url_with_password, ConnectionId, ConnectionRegistry, DbError,
-    DbPool, TableMeta,
+    classify_statement, run_script, split_statements, url_target, url_via_local_port,
+    url_with_password, ConnectionId, ConnectionRegistry, DbError, DbPool, StatementKind,
+    StatementResult, TableMeta,
 };
 use crate::tunnel::{Tunnel, TunnelAuth, TunnelConfig, TunnelError};
 
@@ -74,13 +75,36 @@ pub struct TabUi {
     pub sql_text: String,
 }
 
-/// State of the most recent SQL run per connection. Minimal for FRE-13;
-/// FRE-21 adds counts, timing, confirmation, and cancellation.
+/// Marker error message for a run the user cancelled; the editor renders
+/// this state specially instead of as a database error.
+pub const CANCELLED: &str = "cancelled";
+
+/// Where a script run currently stands. Per-statement outcomes accumulate
+/// in [`SqlRun::statements`] as they finish; the status carries the
+/// script-level timing and failure info.
 #[derive(Debug, Clone, PartialEq)]
-pub enum SqlRun {
+pub enum RunStatus {
     Running,
-    Done(crate::db::QueryResult),
-    Failed(String),
+    Done {
+        elapsed_ms: u64,
+    },
+    /// The statement at `statement_index` (0-based, into the script) failed
+    /// — or the run was cancelled (`error == CANCELLED`). Outcomes of the
+    /// statements before it stay visible in [`SqlRun::statements`].
+    Failed {
+        error: String,
+        statement_index: usize,
+        preview: String,
+        elapsed_ms: u64,
+    },
+}
+
+/// State of the most recent SQL script run per connection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SqlRun {
+    /// Outcomes of the statements that finished, in script order.
+    pub statements: Vec<StatementResult>,
+    pub status: RunStatus,
 }
 
 impl TabUi {
@@ -152,6 +176,16 @@ pub struct AppState {
     pub tab_ui: Signal<HashMap<ConnectionId, TabUi>>,
     /// Latest free-form SQL result per connection.
     pub sql_runs: Signal<HashMap<ConnectionId, SqlRun>>,
+    /// Scripts containing writes, held here until the user confirms (or
+    /// dismisses) the write-confirmation banner.
+    pub pending_sql: Signal<HashMap<ConnectionId, Vec<String>>>,
+    /// Handle of the in-flight run per connection, kept so the Cancel
+    /// button can abort it. Entries are removed when a run completes.
+    pub sql_tasks: Signal<HashMap<ConnectionId, Task>>,
+    /// Stale-run guard: each started run gets the next generation number,
+    /// and a completing task only writes its result while its generation is
+    /// still current.
+    pub sql_generations: Signal<HashMap<ConnectionId, u64>>,
 }
 
 impl AppState {
@@ -183,6 +217,9 @@ impl AppState {
             schemas: Signal::new(HashMap::new()),
             tab_ui: Signal::new(HashMap::new()),
             sql_runs: Signal::new(HashMap::new()),
+            pending_sql: Signal::new(HashMap::new()),
+            sql_tasks: Signal::new(HashMap::new()),
+            sql_generations: Signal::new(HashMap::new()),
         }
     }
 
@@ -587,21 +624,126 @@ impl AppState {
         self.tab_ui.write().entry(id).or_default().sql_text = text;
     }
 
-    /// Runs free-form SQL against one connection in the background.
+    /// Runs a free-form SQL script against one connection. Scripts that
+    /// contain any write statement are not executed yet: they are stashed
+    /// in [`Self::pending_sql`] and the editor shows a confirmation banner.
     pub fn run_sql(mut self, id: ConnectionId, sql: String) {
+        self.pending_sql.write().remove(&id);
+        let statements = split_statements(&sql);
+        if statements.is_empty() {
+            return;
+        }
+        let has_write = statements
+            .iter()
+            .any(|s| classify_statement(s) == StatementKind::Write);
+        if has_write {
+            self.pending_sql.write().insert(id, statements);
+            return;
+        }
+        self.execute_script(id, statements);
+    }
+
+    /// Confirms the write banner: runs the stashed script.
+    pub fn confirm_pending_sql(mut self, id: ConnectionId) {
+        let pending = self.pending_sql.write().remove(&id);
+        if let Some(statements) = pending {
+            self.execute_script(id, statements);
+        }
+    }
+
+    /// Dismisses the write banner without running anything.
+    pub fn dismiss_pending_sql(mut self, id: ConnectionId) {
+        self.pending_sql.write().remove(&id);
+    }
+
+    /// Aborts the in-flight run, keeping the outcomes of the statements
+    /// that already finished visible and marking the run cancelled.
+    ///
+    /// Cancelling drops the sqlx future mid-query; what happens to the
+    /// query itself is backend-specific:
+    /// - SQLite: the statement keeps running to completion on sqlx's worker
+    ///   thread — only the future stops being polled, so a long write still
+    ///   lands. The pool connection stays usable.
+    /// - Postgres: the checked-out connection is dirty (a response is still
+    ///   in flight) and gets closed/recycled by the pool instead of being
+    ///   reused; the server notices the closed socket and aborts the query.
+    pub fn cancel_sql(mut self, id: ConnectionId) {
+        let task = self.sql_tasks.write().remove(&id);
+        let Some(task) = task else { return };
+        task.cancel();
+        if let Some(run) = self.sql_runs.write().get_mut(&id) {
+            if run.status == RunStatus::Running {
+                run.status = RunStatus::Failed {
+                    error: CANCELLED.to_string(),
+                    statement_index: run.statements.len(),
+                    preview: String::new(),
+                    elapsed_ms: 0,
+                };
+            }
+        }
+    }
+
+    /// Executes a split script in the background: reads fetch rows, writes
+    /// report affected counts, execution stops at the first error. Each
+    /// statement's outcome lands in [`Self::sql_runs`] as it finishes.
+    fn execute_script(mut self, id: ConnectionId, statements: Vec<String>) {
         let Some(pool) = self.registry.read().get(id).map(|c| c.pool.clone()) else {
             return;
         };
-        self.sql_runs.write().insert(id, SqlRun::Running);
-        spawn_forever(async move {
-            let outcome = match pool.query(&sql).await {
-                Ok(result) => SqlRun::Done(result),
-                Err(err) => SqlRun::Failed(err.to_string()),
-            };
-            if self.registry.read().get(id).is_some() {
-                self.sql_runs.write().insert(id, outcome);
+        // A re-run replaces any still-running task for this connection.
+        let previous = self.sql_tasks.write().remove(&id);
+        if let Some(previous) = previous {
+            previous.cancel();
+        }
+        let generation = {
+            let mut generations = self.sql_generations.write();
+            let entry = generations.entry(id).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        self.sql_runs.write().insert(
+            id,
+            SqlRun {
+                statements: Vec::new(),
+                status: RunStatus::Running,
+            },
+        );
+        // spawn_forever: the run must survive pane/tab switches unmounting
+        // the editor component. No signal borrow is held across an await —
+        // the pool is cloned out above and every write below is scoped.
+        let task = spawn_forever(async move {
+            let started = std::time::Instant::now();
+            let result = run_script(&pool, &statements, |statement| {
+                if self.sql_generation(id) == generation {
+                    if let Some(run) = self.sql_runs.write().get_mut(&id) {
+                        run.statements.push(statement);
+                    }
+                }
+            })
+            .await;
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            // Stale-run guard: a newer run (or a close) owns the slot now.
+            if self.sql_generation(id) != generation {
+                return;
+            }
+            self.sql_tasks.write().remove(&id);
+            if let Some(run) = self.sql_runs.write().get_mut(&id) {
+                run.status = match result {
+                    Ok(()) => RunStatus::Done { elapsed_ms },
+                    Err(err) => RunStatus::Failed {
+                        error: err.error.to_string(),
+                        statement_index: err.statement_index,
+                        preview: err.preview,
+                        elapsed_ms,
+                    },
+                };
             }
         });
+        self.sql_tasks.write().insert(id, task);
+    }
+
+    fn sql_generation(self, id: ConnectionId) -> u64 {
+        self.sql_generations.read().get(&id).copied().unwrap_or(0)
     }
 
     /// Marks a table as selected in one tab's sidebar.
@@ -636,6 +778,15 @@ impl AppState {
         self.schemas.write().remove(&id);
         self.tab_ui.write().remove(&id);
         self.sql_runs.write().remove(&id);
+        self.pending_sql.write().remove(&id);
+        // Abort any in-flight run and drop its bookkeeping; bumping nothing
+        // is fine — removing the generation entry makes any still-alive
+        // task's generation stale.
+        let task = self.sql_tasks.write().remove(&id);
+        if let Some(task) = task {
+            task.cancel();
+        }
+        self.sql_generations.write().remove(&id);
         if *self.active.read() == ActiveView::Connection(id) {
             self.active.set(ActiveView::Connections);
         }

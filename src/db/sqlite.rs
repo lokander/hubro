@@ -34,6 +34,18 @@ pub async fn query(pool: &SqlitePool, sql: &str) -> Result<QueryResult, DbError>
     query_with(pool, sql, &[]).await
 }
 
+/// Executes a statement without decoding rows, returning the driver's
+/// affected-row count. sqlx 0.8 does not expose `sqlite3_error_offset` (its
+/// `SqliteError` carries only code + message), so failures have no position
+/// info beyond the `near "…"` context SQLite puts in the message itself.
+pub async fn execute(pool: &SqlitePool, sql: &str) -> Result<u64, DbError> {
+    sqlx::query(sql)
+        .execute(pool)
+        .await
+        .map(|done| done.rows_affected())
+        .map_err(|e| DbError::Query(e.to_string()))
+}
+
 /// Like [`query`], with bound parameters (used by the paged table reader so
 /// filter values never touch the SQL text).
 pub async fn query_with(

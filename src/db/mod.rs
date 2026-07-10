@@ -11,6 +11,7 @@ mod page;
 mod postgres;
 mod registry;
 mod schema;
+mod script;
 mod sqlite;
 mod value;
 
@@ -19,5 +20,9 @@ pub use page::{Dialect, Filter, FilterOp, PageRequest, SortDir};
 pub use postgres::{build_url, sanitized_url, url_target, url_via_local_port, url_with_password};
 pub use registry::{Connection, ConnectionId, ConnectionRegistry, DbPool};
 pub use schema::{ColumnMeta, ForeignKeyMeta, IndexMeta, TableKind, TableMeta};
+pub use script::{
+    classify_statement, run_script, split_statements, statement_preview, ScriptError,
+    StatementKind, StatementOutcome, StatementResult,
+};
 pub use sqlite::open_sqlite;
 pub use value::{ColumnInfo, QueryResult, Value};

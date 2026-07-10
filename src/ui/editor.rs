@@ -1,13 +1,16 @@
 use dioxus::prelude::*;
 use serde::Deserialize;
 
-use crate::db::{ConnectionId, Dialect, Value};
+use crate::db::{
+    classify_statement, ConnectionId, Dialect, QueryResult, StatementKind, StatementOutcome,
+    StatementResult, Value,
+};
 
-use super::state::{AppState, SqlRun};
+use super::state::{AppState, RunStatus, CANCELLED};
 
-/// Cap on rendered result rows. The full result still sits in memory until
-/// FRE-33 introduces streaming/limits at the query layer, but the DOM must
-/// not receive a million rows.
+/// Cap on rendered result rows (per statement). The full result still sits
+/// in memory until FRE-33 introduces streaming/limits at the query layer,
+/// but the DOM must not receive a million rows.
 const MAX_RENDERED_ROWS: usize = 500;
 
 /// Messages the CodeMirror bundle sends over the eval channel.
@@ -79,6 +82,13 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
     });
 
     let run = state.sql_runs.read().get(&id).cloned();
+    let running = matches!(run.as_ref().map(|r| &r.status), Some(RunStatus::Running));
+    let pending_writes = state.pending_sql.read().get(&id).map(|statements| {
+        statements
+            .iter()
+            .filter(|s| classify_statement(s) == StatementKind::Write)
+            .count()
+    });
 
     rsx! {
         div { class: "flex h-full min-h-0 flex-col",
@@ -86,55 +96,162 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
                 span { class: "text-xs text-slate-500",
                     "Ctrl+Enter runs the buffer — or just the selection."
                 }
+                if running {
+                    button {
+                        class: "rounded border border-rose-800 px-2 py-0.5 text-xs text-rose-300 hover:bg-rose-950/50",
+                        onclick: move |_| state.cancel_sql(id),
+                        "Cancel"
+                    }
+                }
             }
             div {
                 id: "{editor_element}",
                 class: "h-1/2 min-h-0 shrink-0 overflow-hidden border-b border-slate-700 text-sm",
             }
             div { class: "min-h-0 flex-1 overflow-auto",
+                if let Some(write_count) = pending_writes {
+                    div { class: "flex items-center gap-3 border-b border-amber-900/50 bg-amber-950/30 px-4 py-2",
+                        span { class: "text-sm text-amber-300",
+                            if write_count == 1 {
+                                "This script contains 1 write statement. Run anyway?"
+                            } else {
+                                "This script contains {write_count} write statements. Run anyway?"
+                            }
+                        }
+                        button {
+                            class: "rounded bg-amber-600 px-2.5 py-0.5 text-xs font-semibold text-slate-950 hover:bg-amber-500",
+                            onclick: move |_| state.confirm_pending_sql(id),
+                            "Run"
+                        }
+                        button {
+                            class: "rounded border border-slate-600 px-2.5 py-0.5 text-xs text-slate-300 hover:bg-slate-800",
+                            onclick: move |_| state.dismiss_pending_sql(id),
+                            "Cancel"
+                        }
+                    }
+                }
                 match run {
                     None => rsx! {
                         p { class: "px-4 py-3 text-sm text-slate-500", "Results appear here." }
                     },
-                    Some(SqlRun::Running) => rsx! {
-                        p { class: "px-4 py-3 text-sm text-slate-500", "Running…" }
-                    },
-                    Some(SqlRun::Failed(err)) => rsx! {
-                        p { class: "px-4 py-3 font-mono text-sm text-red-400", "{err}" }
-                    },
-                    Some(SqlRun::Done(result)) => rsx! {
-                        if result.rows.is_empty() {
-                            p { class: "px-4 py-3 text-sm text-slate-500",
-                                "The statement returned no rows."
-                            }
-                        } else {
-                            if result.rows.len() > MAX_RENDERED_ROWS {
-                                p { class: "border-b border-amber-900/50 bg-amber-950/30 px-4 py-1.5 text-xs text-amber-300",
-                                    "Showing the first {MAX_RENDERED_ROWS} of {result.rows.len()} rows."
-                                }
-                            }
-                            table { class: "w-full border-collapse text-left",
-                                thead { class: "sticky top-0 bg-slate-900",
-                                    tr {
-                                        for column in result.columns.iter() {
-                                            th { class: "border-b border-slate-700 px-3 py-1.5 font-mono text-xs font-semibold text-slate-300",
-                                                "{column.name}"
-                                            }
-                                        }
-                                    }
-                                }
-                                tbody {
-                                    for row in result.rows.iter().take(MAX_RENDERED_ROWS) {
-                                        tr { class: "border-t border-slate-800/60 hover:bg-slate-800/30",
-                                            for value in row.iter() {
-                                                ResultCell { value: value.clone() }
-                                            }
-                                        }
-                                    }
-                                }
+                    Some(run) => rsx! {
+                        for (index, statement) in run.statements.iter().enumerate() {
+                            StatementSection {
+                                key: "{index}",
+                                index: index + 1,
+                                result: statement.clone(),
                             }
                         }
+                        RunStatusLine { status: run.status.clone(), statement_count: run.statements.len() }
                     },
+                }
+            }
+        }
+    }
+}
+
+/// The script-level footer: running indicator, total elapsed time (shown
+/// once per run), or the failure block.
+#[component]
+fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
+    match status {
+        RunStatus::Running => rsx! {
+            p { class: "px-4 py-3 text-sm text-slate-500", "Running…" }
+        },
+        RunStatus::Done { elapsed_ms } => rsx! {
+            p { class: "px-4 py-2 text-xs text-slate-500",
+                if statement_count == 1 {
+                    "1 statement in {elapsed_ms} ms"
+                } else {
+                    "{statement_count} statements in {elapsed_ms} ms"
+                }
+            }
+        },
+        RunStatus::Failed {
+            error,
+            statement_index,
+            preview,
+            elapsed_ms,
+        } => {
+            if error == CANCELLED {
+                rsx! {
+                    p { class: "border-t border-amber-900/50 px-4 py-3 text-sm text-amber-300",
+                        "Run cancelled."
+                    }
+                }
+            } else {
+                rsx! {
+                    div { class: "border-t border-red-900/50 bg-red-950/20 px-4 py-3",
+                        p { class: "mb-1 font-mono text-xs text-red-300/80",
+                            "{statement_index + 1} · {preview}"
+                        }
+                        p { class: "font-mono text-sm text-red-400", "{error}" }
+                        p { class: "mt-1 text-xs text-slate-500",
+                            "Script stopped after {elapsed_ms} ms; earlier statements were not rolled back."
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One executed statement's section: a header naming the statement plus its
+/// row count or affected count, and the result table for reads.
+#[component]
+fn StatementSection(index: usize, result: StatementResult) -> Element {
+    let summary = match &result.outcome {
+        StatementOutcome::Affected(1) => "1 row affected".to_string(),
+        StatementOutcome::Affected(n) => format!("{n} rows affected"),
+        StatementOutcome::Rows(r) if r.rows.len() == 1 => "1 row".to_string(),
+        StatementOutcome::Rows(r) => format!("{} rows", r.rows.len()),
+    };
+    rsx! {
+        div { class: "border-b border-slate-800",
+            p { class: "flex items-baseline gap-2 bg-slate-900/60 px-4 py-1.5 text-xs",
+                span { class: "font-mono text-slate-500", "{index}" }
+                span { class: "min-w-0 truncate font-mono text-slate-300", "{result.preview}" }
+                span { class: "shrink-0 text-cyan-400", "— {summary}" }
+            }
+            match &result.outcome {
+                StatementOutcome::Affected(_) => rsx! {},
+                StatementOutcome::Rows(rows) if rows.rows.is_empty() => rsx! {
+                    p { class: "px-4 py-2 text-sm text-slate-500", "The statement returned no rows." }
+                },
+                StatementOutcome::Rows(rows) => rsx! {
+                    ResultTable { result: rows.clone() }
+                },
+            }
+        }
+    }
+}
+
+/// A result grid, capped at [`MAX_RENDERED_ROWS`] rendered rows.
+#[component]
+fn ResultTable(result: QueryResult) -> Element {
+    rsx! {
+        if result.rows.len() > MAX_RENDERED_ROWS {
+            p { class: "border-b border-amber-900/50 bg-amber-950/30 px-4 py-1.5 text-xs text-amber-300",
+                "Showing the first {MAX_RENDERED_ROWS} of {result.rows.len()} rows."
+            }
+        }
+        table { class: "w-full border-collapse text-left",
+            thead { class: "sticky top-0 bg-slate-900",
+                tr {
+                    for column in result.columns.iter() {
+                        th { class: "border-b border-slate-700 px-3 py-1.5 font-mono text-xs font-semibold text-slate-300",
+                            "{column.name}"
+                        }
+                    }
+                }
+            }
+            tbody {
+                for row in result.rows.iter().take(MAX_RENDERED_ROWS) {
+                    tr { class: "border-t border-slate-800/60 hover:bg-slate-800/30",
+                        for value in row.iter() {
+                            ResultCell { value: value.clone() }
+                        }
+                    }
                 }
             }
         }
