@@ -4,6 +4,7 @@ use dioxus::prelude::*;
 
 use crate::db::ConnectionId;
 
+use super::editor::SqlEditor;
 use super::grid::DataGrid;
 use super::sidebar::SchemaSidebar;
 use super::state::{ActiveView, AppState};
@@ -84,11 +85,14 @@ fn ConnectionView(id: ConnectionId) -> Element {
             div { class: "p-8 text-slate-400", "This connection is closed." }
         };
     };
-    let selected = state
-        .tab_ui
-        .read()
-        .get(&id)
-        .and_then(|ui| ui.selected_table.clone());
+    let (selected, pane) = {
+        let tab_ui = state.tab_ui.read();
+        let ui = tab_ui.get(&id);
+        (
+            ui.and_then(|ui| ui.selected_table.clone()),
+            ui.map(|ui| ui.pane).unwrap_or_default(),
+        )
+    };
     rsx! {
         div { class: "flex h-full",
             aside { class: "flex w-72 shrink-0 flex-col border-r border-slate-700 bg-slate-950/50",
@@ -98,19 +102,50 @@ fn ConnectionView(id: ConnectionId) -> Element {
                 SchemaSidebar { id }
             }
             section { class: "flex min-w-0 flex-1 flex-col",
-                match selected {
-                    // Keyed by table so grid state (page, sort, filter)
-                    // resets when another table is selected.
-                    Some(table) => rsx! {
-                        DataGrid { key: "{table.key()}", id, table: table.clone() }
+                div { class: "flex gap-1 border-b border-slate-800 px-3 py-1.5",
+                    PaneButton { id, pane, target: super::state::Pane::Browser, label: "Data" }
+                    PaneButton { id, pane, target: super::state::Pane::Sql, label: "SQL" }
+                }
+                match pane {
+                    super::state::Pane::Sql => rsx! {
+                        SqlEditor { key: "sql-{id:?}", id }
                     },
-                    None => rsx! {
-                        div { class: "flex flex-1 items-center justify-center",
-                            p { class: "text-slate-500", "Select a table to view its data." }
-                        }
+                    super::state::Pane::Browser => match selected {
+                        // Keyed by table so grid state (page, sort, filter)
+                        // resets when another table is selected.
+                        Some(table) => rsx! {
+                            DataGrid { key: "{table.key()}", id, table: table.clone() }
+                        },
+                        None => rsx! {
+                            div { class: "flex flex-1 items-center justify-center",
+                                p { class: "text-slate-500", "Select a table to view its data." }
+                            }
+                        },
                     },
                 }
             }
+        }
+    }
+}
+
+/// One segment of the Data / SQL pane switch.
+#[component]
+fn PaneButton(
+    id: ConnectionId,
+    pane: super::state::Pane,
+    target: super::state::Pane,
+    label: String,
+) -> Element {
+    let state = use_context::<AppState>();
+    rsx! {
+        button {
+            class: if pane == target {
+                "rounded px-3 py-0.5 text-xs bg-slate-700 text-slate-100"
+            } else {
+                "rounded px-3 py-0.5 text-xs text-slate-400 hover:bg-slate-800 hover:text-slate-100"
+            },
+            onclick: move |_| state.set_pane(id, target),
+            "{label}"
         }
     }
 }

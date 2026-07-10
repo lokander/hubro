@@ -52,6 +52,14 @@ impl TableRef {
     }
 }
 
+/// Which pane a connection tab shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Pane {
+    #[default]
+    Browser,
+    Sql,
+}
+
 /// Per-tab UI state that must survive tab switches.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TabUi {
@@ -59,6 +67,20 @@ pub struct TabUi {
     pub selected_table: Option<TableRef>,
     /// Tables expanded in the sidebar tree, by [`TableRef::key`].
     pub expanded: HashSet<String>,
+    /// Data browser vs SQL editor.
+    pub pane: Pane,
+    /// SQL editor buffer, synced from the webview so it survives pane and
+    /// tab switches.
+    pub sql_text: String,
+}
+
+/// State of the most recent SQL run per connection. Minimal for FRE-13;
+/// FRE-21 adds counts, timing, confirmation, and cancellation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqlRun {
+    Running,
+    Done(crate::db::QueryResult),
+    Failed(String),
 }
 
 impl TabUi {
@@ -128,6 +150,8 @@ pub struct AppState {
     pub schemas: Signal<HashMap<ConnectionId, SchemaLoad>>,
     /// Sidebar/grid UI state per open connection.
     pub tab_ui: Signal<HashMap<ConnectionId, TabUi>>,
+    /// Latest free-form SQL result per connection.
+    pub sql_runs: Signal<HashMap<ConnectionId, SqlRun>>,
 }
 
 impl AppState {
@@ -158,6 +182,7 @@ impl AppState {
             tunnels: Signal::new(HashMap::new()),
             schemas: Signal::new(HashMap::new()),
             tab_ui: Signal::new(HashMap::new()),
+            sql_runs: Signal::new(HashMap::new()),
         }
     }
 
@@ -552,6 +577,33 @@ impl AppState {
         });
     }
 
+    /// Switches a tab between the data browser and the SQL editor.
+    pub fn set_pane(mut self, id: ConnectionId, pane: Pane) {
+        self.tab_ui.write().entry(id).or_default().pane = pane;
+    }
+
+    /// Stores the editor buffer (synced from the webview on change).
+    pub fn set_sql_text(mut self, id: ConnectionId, text: String) {
+        self.tab_ui.write().entry(id).or_default().sql_text = text;
+    }
+
+    /// Runs free-form SQL against one connection in the background.
+    pub fn run_sql(mut self, id: ConnectionId, sql: String) {
+        let Some(pool) = self.registry.read().get(id).map(|c| c.pool.clone()) else {
+            return;
+        };
+        self.sql_runs.write().insert(id, SqlRun::Running);
+        spawn_forever(async move {
+            let outcome = match pool.query(&sql).await {
+                Ok(result) => SqlRun::Done(result),
+                Err(err) => SqlRun::Failed(err.to_string()),
+            };
+            if self.registry.read().get(id).is_some() {
+                self.sql_runs.write().insert(id, outcome);
+            }
+        });
+    }
+
     /// Marks a table as selected in one tab's sidebar.
     pub fn select_table(mut self, id: ConnectionId, table: &TableRef) {
         self.tab_ui.write().entry(id).or_default().selected_table = Some(table.clone());
@@ -583,6 +635,7 @@ impl AppState {
             .retain(|(open_id, _)| *open_id != id);
         self.schemas.write().remove(&id);
         self.tab_ui.write().remove(&id);
+        self.sql_runs.write().remove(&id);
         if *self.active.read() == ActiveView::Connection(id) {
             self.active.set(ActiveView::Connections);
         }
