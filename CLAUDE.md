@@ -19,6 +19,8 @@ The crate is split into a library (`src/lib.rs`, holds app modules) and a thin b
 
 When a live database server (e.g. Postgres) is needed for testing or development, run it in Docker — never install or run database servers directly on the host.
 
+Git pushes use SSH; the key is passphrase-protected. If pushes fail with "Permission denied (publickey)", ask the user to run `ssh-add`, or temporarily switch the remote to HTTPS with the authenticated `gh` CLI (`gh auth setup-git`).
+
 ## Interactive testing (screenshots + clicking)
 
 The dev machine runs KDE Plasma on Wayland. To drive the app (click, type, screenshot) without touching the user's real cursor, run it inside a nested Xephyr X server:
@@ -40,7 +42,7 @@ Work is tracked in Linear (team FRE). Docs-only changes (CLAUDE.md, README, etc.
 1. Move the Linear issue to In Progress. Create a **git worktree** on the issue's branch (use Linear's suggested branch name, e.g. `lokander/fre-5-set-up-async-database-layer`), and do all work there.
 2. Commit (conventional, subject-only), push the branch, and open a **GitHub PR** with `gh pr create`. Reference the issue ID (e.g. FRE-5) in the PR so Linear links it.
 3. Spawn a **subagent to review the PR** (correctness, the Dioxus 0.7 rules above, scope vs the issue). Post its findings on the PR. Blocking findings must be fixed and re-reviewed; only proceed once the review approves.
-4. **Rebase-merge** the PR (`gh pr merge --rebase`), delete the branch, remove the worktree, and move the issue to Done.
+4. **Remove the worktree first**, then rebase-merge (`gh pr merge --rebase --delete-branch`) from the main checkout — merging from inside the worktree fails trying to check out `main`. Move the issue to Done with the PR linked.
 
 ## Commits
 
