@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod db;
+pub mod history;
 pub mod secrets;
 pub mod tunnel;
 pub mod ui;
