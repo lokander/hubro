@@ -5,20 +5,38 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ConnectionKind {
-    Sqlite,
+/// One entry in the saved-connections list. Internally tagged on `kind`, so
+/// existing `kind = "sqlite"` + `path` TOML entries keep deserializing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum SavedConnection {
+    Sqlite {
+        name: String,
+        path: PathBuf,
+    },
+    Postgres {
+        name: String,
+        /// Connection URL **without** a password — credentials never live in
+        /// the config file (keyring persistence arrives with FRE-27).
+        url: String,
+    },
 }
 
-/// One entry in the saved-connections list.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SavedConnection {
-    pub name: String,
-    pub kind: ConnectionKind,
-    /// Database file path (SQLite). Later kinds store their locator here or
-    /// in kind-specific fields.
-    pub path: PathBuf,
+impl SavedConnection {
+    pub fn name(&self) -> &str {
+        match self {
+            SavedConnection::Sqlite { name, .. } | SavedConnection::Postgres { name, .. } => name,
+        }
+    }
+
+    /// Stable identity used for dedupe and display: the file path or the
+    /// stored URL.
+    pub fn locator(&self) -> String {
+        match self {
+            SavedConnection::Sqlite { path, .. } => path.display().to_string(),
+            SavedConnection::Postgres { url, .. } => url.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,20 +129,24 @@ impl SavedList {
         &self.entries
     }
 
-    /// Adds unless an entry with the same path exists. Returns whether the
-    /// list changed.
+    /// Adds unless an entry with the same locator exists. Returns whether
+    /// the list changed.
     pub fn add(&mut self, connection: SavedConnection) -> bool {
-        if self.entries.iter().any(|s| s.path == connection.path) {
+        if self
+            .entries
+            .iter()
+            .any(|s| s.locator() == connection.locator())
+        {
             return false;
         }
         self.entries.push(connection);
         true
     }
 
-    /// Removes the entry with this path. Returns whether the list changed.
-    pub fn remove(&mut self, path: &Path) -> bool {
+    /// Removes the entry with this locator. Returns whether the list changed.
+    pub fn remove(&mut self, locator: &str) -> bool {
         let before = self.entries.len();
-        self.entries.retain(|s| s.path != path);
+        self.entries.retain(|s| s.locator() != locator);
         self.entries.len() != before
     }
 
@@ -146,10 +168,16 @@ mod tests {
     use super::*;
 
     fn saved(name: &str, path: &str) -> SavedConnection {
-        SavedConnection {
+        SavedConnection::Sqlite {
             name: name.into(),
-            kind: ConnectionKind::Sqlite,
             path: PathBuf::from(path),
+        }
+    }
+
+    fn saved_pg(name: &str, url: &str) -> SavedConnection {
+        SavedConnection::Postgres {
+            name: name.into(),
+            url: url.into(),
         }
     }
 
@@ -167,9 +195,39 @@ mod tests {
         let connections = vec![
             saved("music.db", "/data/music.db"),
             saved("with späce.db", "/tmp/with späce.db"),
+            saved_pg(
+                "prod",
+                "postgres://user@db.example.com:5432/app?sslmode=require",
+            ),
         ];
         save_connections(&path, &connections).unwrap();
         assert_eq!(load_connections(&path).unwrap(), connections);
+    }
+
+    #[test]
+    fn legacy_sqlite_entries_still_deserialize() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.toml");
+        // Format written before the Postgres variant existed.
+        std::fs::write(
+            &path,
+            "[[connections]]\nname = \"music.db\"\nkind = \"sqlite\"\npath = \"/data/music.db\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_connections(&path).unwrap(),
+            vec![saved("music.db", "/data/music.db")]
+        );
+    }
+
+    #[test]
+    fn add_dedupes_postgres_by_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut list, _) = SavedList::load(&dir.path().join("connections.toml"));
+        assert!(list.add(saved_pg("prod", "postgres://u@h:5432/db")));
+        assert!(!list.add(saved_pg("other name", "postgres://u@h:5432/db")));
+        assert!(list.remove("postgres://u@h:5432/db"));
+        assert!(list.entries().is_empty());
     }
 
     #[test]
@@ -220,8 +278,8 @@ mod tests {
         let (reloaded, _) = SavedList::load(&path);
         assert_eq!(reloaded.entries(), list.entries());
 
-        assert!(!list.remove(Path::new("/tmp/missing.db")));
-        assert!(list.remove(Path::new("/tmp/a.db")));
+        assert!(!list.remove("/tmp/missing.db"));
+        assert!(list.remove("/tmp/a.db"));
         assert!(list.entries().is_empty());
     }
 }

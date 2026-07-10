@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
 
-use crate::config::{default_config_path, ConnectionKind, SavedConnection, SavedList};
-use crate::db::{ConnectionId, ConnectionRegistry, DbPool, TableMeta};
+use crate::config::{default_config_path, SavedConnection, SavedList};
+use crate::db::{url_with_password, ConnectionId, ConnectionRegistry, DbError, DbPool, TableMeta};
 
 /// Which screen the main panel shows: the connections screen or one open
 /// connection tab.
@@ -41,6 +41,13 @@ impl TabUi {
     }
 }
 
+/// A pending password request for a saved Postgres connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasswordPrompt {
+    pub url: String,
+    pub name: String,
+}
+
 /// App-wide state provided via context. `Copy` because it only holds signals.
 #[derive(Clone, Copy)]
 pub struct AppState {
@@ -48,14 +55,20 @@ pub struct AppState {
     pub active: Signal<ActiveView>,
     /// Saved connections shown on the launch screen.
     pub saved: Signal<SavedList>,
-    /// Which file each open tab came from, for "already open" detection.
-    /// Keys are canonicalized where possible.
-    pub open_paths: Signal<Vec<(ConnectionId, PathBuf)>>,
-    /// Paths with a connect in flight, reserved before the pool open await.
-    pub connecting: Signal<Vec<PathBuf>>,
+    /// Locator (canonical file path / URL) each open tab came from, for
+    /// "already open" detection.
+    pub open_locators: Signal<Vec<(ConnectionId, String)>>,
+    /// Locators with a connect in flight, reserved before the pool open
+    /// await.
+    pub connecting: Signal<Vec<String>>,
     /// Error from the most recent connect/config operation, shown on the
     /// connections screen.
     pub connect_error: Signal<Option<String>>,
+    /// Postgres passwords entered this session, keyed by stored URL. Never
+    /// persisted; the OS keyring arrives with FRE-27.
+    pub session_passwords: Signal<HashMap<String, String>>,
+    /// When set, the connections screen asks for this connection's password.
+    pub password_prompt: Signal<Option<PasswordPrompt>>,
     /// Introspected schema per open connection.
     pub schemas: Signal<HashMap<ConnectionId, SchemaLoad>>,
     /// Sidebar/grid UI state per open connection.
@@ -82,9 +95,11 @@ impl AppState {
             registry: Signal::new(ConnectionRegistry::default()),
             active: Signal::new(ActiveView::Connections),
             saved: Signal::new(saved),
-            open_paths: Signal::new(Vec::new()),
+            open_locators: Signal::new(Vec::new()),
             connecting: Signal::new(Vec::new()),
             connect_error: Signal::new(load_error),
+            session_passwords: Signal::new(HashMap::new()),
+            password_prompt: Signal::new(None),
             schemas: Signal::new(HashMap::new()),
             tab_ui: Signal::new(HashMap::new()),
         }
@@ -94,9 +109,8 @@ impl AppState {
     /// persists the list.
     pub fn add_saved(mut self, path: PathBuf) {
         let path = canonical(&path);
-        let added = self.saved.write().add(SavedConnection {
+        let added = self.saved.write().add(SavedConnection::Sqlite {
             name: tab_title(&path),
-            kind: ConnectionKind::Sqlite,
             path,
         });
         if added {
@@ -104,9 +118,21 @@ impl AppState {
         }
     }
 
+    /// Adds a Postgres connection to the saved list (URL stored without a
+    /// password) and persists.
+    pub fn add_saved_postgres(mut self, name: String, url: String) {
+        let added = self
+            .saved
+            .write()
+            .add(SavedConnection::Postgres { name, url });
+        if added {
+            self.persist_saved();
+        }
+    }
+
     /// Removes a saved connection (open tabs are unaffected) and persists.
-    pub fn remove_saved(mut self, path: &Path) {
-        let removed = self.saved.write().remove(path);
+    pub fn remove_saved(mut self, locator: &str) {
+        let removed = self.saved.write().remove(locator);
         if removed {
             self.persist_saved();
         }
@@ -124,37 +150,107 @@ impl AppState {
         }
     }
 
-    /// Opens a saved connection in a new tab, or focuses the existing tab
-    /// when the same file is already open. Pool creation happens before any
-    /// signal is written, so no borrow spans the await; the `connecting`
-    /// list reserves the path synchronously so a double-click can't open
-    /// two tabs for the same file.
+    /// Opens a saved SQLite connection in a new tab, or focuses the existing
+    /// tab when the same file is already open.
     pub async fn connect(mut self, path: PathBuf) {
         self.connect_error.set(None);
         let path = canonical(&path);
+        let locator = path.display().to_string();
+        if self.focus_or_reserve(&locator) {
+            return;
+        }
+        let result = DbPool::open_sqlite(&path).await;
+        self.finish_connect(locator, tab_title(&path), result);
+    }
+
+    /// Opens a saved Postgres connection. Uses the session password when one
+    /// is known; otherwise tries without and falls back to a password prompt
+    /// on authentication failure (so trust-auth servers connect silently).
+    pub async fn connect_postgres(mut self, url: String, name: String) {
+        self.connect_error.set(None);
+        if self.focus_or_reserve(&url) {
+            return;
+        }
+        let session_password = self.session_passwords.read().get(&url).cloned();
+        let had_password = session_password.is_some();
+        let result = match &session_password {
+            Some(password) => match url_with_password(&url, password) {
+                Ok(full) => DbPool::open_postgres(&full).await,
+                Err(err) => Err(err),
+            },
+            None => DbPool::open_postgres(&url).await,
+        };
+        match result {
+            Err(DbError::Connect(msg)) if msg.contains("authentication failed") => {
+                self.connecting.write().retain(|l| l != &url);
+                if had_password {
+                    // Stored session password is stale; drop it and re-ask.
+                    self.session_passwords.write().remove(&url);
+                    self.connect_error
+                        .set(Some(format!("connection failed: {msg}")));
+                }
+                self.password_prompt.set(Some(PasswordPrompt { url, name }));
+            }
+            result => self.finish_connect(url, name, result),
+        }
+    }
+
+    /// Completes the password prompt: connects with the entered password and
+    /// remembers it for the rest of the session on success.
+    pub async fn connect_postgres_with_password(
+        mut self,
+        url: String,
+        name: String,
+        password: String,
+    ) {
+        self.connect_error.set(None);
+        // The prompt replaces the reservation made by connect_postgres, so
+        // re-reserve here.
+        if self.focus_or_reserve(&url) {
+            return;
+        }
+        let result = match url_with_password(&url, &password) {
+            Ok(full) => DbPool::open_postgres(&full).await,
+            Err(err) => Err(err),
+        };
+        if result.is_ok() {
+            self.session_passwords.write().insert(url.clone(), password);
+            self.password_prompt.set(None);
+        }
+        self.finish_connect(url, name, result);
+    }
+
+    /// Focuses the tab if the locator is already open, or reserves it for a
+    /// new connect. Returns true when the caller should stop (already open
+    /// or connect already in flight). The write borrow is scoped — nothing
+    /// spans a later await.
+    fn focus_or_reserve(mut self, locator: &str) -> bool {
         let already_open = self
-            .open_paths
+            .open_locators
             .read()
             .iter()
-            .find(|(_, p)| *p == path)
+            .find(|(_, l)| l == locator)
             .map(|(id, _)| *id);
         if let Some(id) = already_open {
             self.active.set(ActiveView::Connection(id));
-            return;
+            return true;
         }
-        {
-            let mut connecting = self.connecting.write();
-            if connecting.contains(&path) {
-                return;
-            }
-            connecting.push(path.clone());
+        let mut connecting = self.connecting.write();
+        if connecting.iter().any(|l| l == locator) {
+            return true;
         }
-        let result = DbPool::open_sqlite(&path).await;
-        self.connecting.write().retain(|p| p != &path);
+        connecting.push(locator.to_string());
+        false
+    }
+
+    /// Releases the reservation and either opens the tab or surfaces the
+    /// error.
+    fn finish_connect(mut self, locator: String, name: String, result: Result<DbPool, DbError>) {
+        self.connecting.write().retain(|l| l != &locator);
         match result {
             Ok(pool) => {
-                let id = self.registry.write().insert(tab_title(&path), pool);
-                self.open_paths.write().push((id, path));
+                let id = self.registry.write().insert(name, pool);
+                self.open_locators.write().push((id, locator));
                 self.active.set(ActiveView::Connection(id));
                 self.load_schema(id);
             }
@@ -209,7 +305,7 @@ impl AppState {
             // component unmounts first.
             spawn_forever(async move { connection.pool.close().await });
         }
-        self.open_paths
+        self.open_locators
             .write()
             .retain(|(open_id, _)| *open_id != id);
         self.schemas.write().remove(&id);

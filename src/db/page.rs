@@ -42,10 +42,27 @@ pub struct PageRequest {
     pub filter: Option<Filter>,
 }
 
+/// SQL flavor differences the page builder must care about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    Sqlite,
+    Postgres,
+}
+
+impl Dialect {
+    /// First bound-parameter placeholder (at most one is ever used here).
+    fn placeholder(self) -> &'static str {
+        match self {
+            Dialect::Sqlite => "?",
+            Dialect::Postgres => "$1",
+        }
+    }
+}
+
 impl PageRequest {
     /// SELECT for this page: SQL plus bound parameters.
-    pub fn select_sql(&self) -> (String, Vec<Value>) {
-        let (where_clause, params) = self.where_clause();
+    pub fn select_sql(&self, dialect: Dialect) -> (String, Vec<Value>) {
+        let (where_clause, params) = self.where_clause(dialect);
         let order = match &self.sort {
             Some((column, dir)) => {
                 format!(" ORDER BY {} {}", quote_ident(column), dir.sql())
@@ -62,8 +79,8 @@ impl PageRequest {
     }
 
     /// COUNT(*) with the same filter, for the row-count indicator.
-    pub fn count_sql(&self) -> (String, Vec<Value>) {
-        let (where_clause, params) = self.where_clause();
+    pub fn count_sql(&self, dialect: Dialect) -> (String, Vec<Value>) {
+        let (where_clause, params) = self.where_clause(dialect);
         let sql = format!(
             "SELECT COUNT(*) FROM {}{where_clause}",
             quote_ident(&self.table)
@@ -71,19 +88,27 @@ impl PageRequest {
         (sql, params)
     }
 
-    fn where_clause(&self) -> (String, Vec<Value>) {
-        match &self.filter {
-            None => (String::new(), Vec::new()),
-            Some(filter) => match filter.op {
-                FilterOp::Equals => (
-                    format!(" WHERE {} = ?", quote_ident(&filter.column)),
-                    vec![Value::Text(filter.value.clone())],
-                ),
-                FilterOp::Contains => (
-                    format!(" WHERE {} LIKE ? ESCAPE '\\'", quote_ident(&filter.column)),
-                    vec![Value::Text(format!("%{}%", escape_like(&filter.value)))],
-                ),
-            },
+    fn where_clause(&self, dialect: Dialect) -> (String, Vec<Value>) {
+        let Some(filter) = &self.filter else {
+            return (String::new(), Vec::new());
+        };
+        // Postgres compares strictly by type, so the column is cast to text
+        // to match the text filter value (SQLite's affinity handles this
+        // implicitly). Fine for a viewer; indexes aren't a concern yet.
+        let column = match dialect {
+            Dialect::Sqlite => quote_ident(&filter.column),
+            Dialect::Postgres => format!("{}::text", quote_ident(&filter.column)),
+        };
+        let placeholder = dialect.placeholder();
+        match filter.op {
+            FilterOp::Equals => (
+                format!(" WHERE {column} = {placeholder}"),
+                vec![Value::Text(filter.value.clone())],
+            ),
+            FilterOp::Contains => (
+                format!(" WHERE {column} LIKE {placeholder} ESCAPE '\\'"),
+                vec![Value::Text(format!("%{}%", escape_like(&filter.value)))],
+            ),
         }
     }
 }
@@ -116,7 +141,7 @@ mod tests {
 
     #[test]
     fn plain_page_selects_with_limit_offset() {
-        let (sql, params) = base().select_sql();
+        let (sql, params) = base().select_sql(Dialect::Sqlite);
         assert_eq!(sql, "SELECT * FROM \"tracks\" LIMIT 100 OFFSET 200");
         assert!(params.is_empty());
     }
@@ -125,7 +150,7 @@ mod tests {
     fn sort_adds_order_by_with_quoted_column() {
         let mut req = base();
         req.sort = Some(("na\"me".into(), SortDir::Desc));
-        let (sql, _) = req.select_sql();
+        let (sql, _) = req.select_sql(Dialect::Sqlite);
         assert_eq!(
             sql,
             "SELECT * FROM \"tracks\" ORDER BY \"na\"\"me\" DESC LIMIT 100 OFFSET 200"
@@ -140,7 +165,7 @@ mod tests {
             op: FilterOp::Equals,
             value: "Track 7".into(),
         });
-        let (sql, params) = req.select_sql();
+        let (sql, params) = req.select_sql(Dialect::Sqlite);
         assert_eq!(
             sql,
             "SELECT * FROM \"tracks\" WHERE \"name\" = ? LIMIT 100 OFFSET 200"
@@ -156,12 +181,33 @@ mod tests {
             op: FilterOp::Contains,
             value: "50%_\\".into(),
         });
-        let (sql, params) = req.select_sql();
+        let (sql, params) = req.select_sql(Dialect::Sqlite);
         assert_eq!(
             sql,
             "SELECT * FROM \"tracks\" WHERE \"name\" LIKE ? ESCAPE '\\' LIMIT 100 OFFSET 200"
         );
         assert_eq!(params, vec![Value::Text("%50\\%\\_\\\\%".into())]);
+    }
+
+    #[test]
+    fn postgres_dialect_uses_dollar_placeholder_and_text_cast() {
+        let mut req = base();
+        req.filter = Some(Filter {
+            column: "name".into(),
+            op: FilterOp::Equals,
+            value: "7".into(),
+        });
+        let (sql, params) = req.select_sql(Dialect::Postgres);
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"tracks\" WHERE \"name\"::text = $1 LIMIT 100 OFFSET 200"
+        );
+        assert_eq!(params, vec![Value::Text("7".into())]);
+        let (count_sql, _) = req.count_sql(Dialect::Postgres);
+        assert_eq!(
+            count_sql,
+            "SELECT COUNT(*) FROM \"tracks\" WHERE \"name\"::text = $1"
+        );
     }
 
     #[test]
@@ -172,7 +218,7 @@ mod tests {
             op: FilterOp::Contains,
             value: "abc".into(),
         });
-        let (sql, params) = req.count_sql();
+        let (sql, params) = req.count_sql(Dialect::Sqlite);
         assert_eq!(
             sql,
             "SELECT COUNT(*) FROM \"tracks\" WHERE \"name\" LIKE ? ESCAPE '\\'"
