@@ -16,7 +16,7 @@ mod value;
 
 pub use error::DbError;
 pub use page::{Dialect, Filter, FilterOp, PageRequest, SortDir};
-pub use postgres::{build_url, sanitized_url, url_with_password};
+pub use postgres::{build_url, sanitized_url, url_target, url_via_local_port, url_with_password};
 pub use registry::{Connection, ConnectionId, ConnectionRegistry, DbPool};
 pub use schema::{ColumnMeta, ForeignKeyMeta, IndexMeta, TableKind, TableMeta};
 pub use sqlite::open_sqlite;

@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::tunnel::TunnelConfig;
+
 /// One entry in the saved-connections list. Internally tagged on `kind`, so
 /// existing `kind = "sqlite"` + `path` TOML entries keep deserializing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +21,11 @@ pub enum SavedConnection {
         /// Connection URL **without** a password — credentials never live in
         /// the config file (keyring persistence arrives with FRE-27).
         url: String,
+        /// Optional SSH tunnel to reach the server through. `default` +
+        /// `skip_serializing_if` keep pre-tunnel config files (and files
+        /// written for tunnel-less connections) unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tunnel: Option<TunnelConfig>,
     },
 }
 
@@ -131,16 +138,32 @@ impl SavedList {
 
     /// Adds unless an entry with the same locator exists. Returns whether
     /// the list changed.
+    ///
+    /// Re-adding an existing Postgres URL keeps the entry (and its name) but
+    /// adopts a changed tunnel config, so reconnecting with different tunnel
+    /// settings persists them.
     pub fn add(&mut self, connection: SavedConnection) -> bool {
-        if self
+        let existing = self
             .entries
-            .iter()
-            .any(|s| s.locator() == connection.locator())
+            .iter_mut()
+            .find(|s| s.locator() == connection.locator());
+        let Some(existing) = existing else {
+            self.entries.push(connection);
+            return true;
+        };
+        if let (
+            SavedConnection::Postgres { tunnel, .. },
+            SavedConnection::Postgres {
+                tunnel: new_tunnel, ..
+            },
+        ) = (existing, &connection)
         {
-            return false;
+            if *tunnel != *new_tunnel {
+                *tunnel = new_tunnel.clone();
+                return true;
+            }
         }
-        self.entries.push(connection);
-        true
+        false
     }
 
     /// Removes and returns the entry with this locator (`None` when absent).
@@ -177,6 +200,16 @@ mod tests {
         SavedConnection::Postgres {
             name: name.into(),
             url: url.into(),
+            tunnel: None,
+        }
+    }
+
+    fn tunnel(auth: crate::tunnel::TunnelAuth) -> TunnelConfig {
+        TunnelConfig {
+            host: "bastion.example.com".into(),
+            port: 2222,
+            user: "deploy".into(),
+            auth,
         }
     }
 
@@ -201,6 +234,81 @@ mod tests {
         ];
         save_connections(&path, &connections).unwrap();
         assert_eq!(load_connections(&path).unwrap(), connections);
+    }
+
+    #[test]
+    fn tunnel_config_round_trips_and_serializes_tagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.toml");
+        let connections = vec![
+            SavedConnection::Postgres {
+                name: "via agent".into(),
+                url: "postgres://u@db.internal:5432/app".into(),
+                tunnel: Some(tunnel(crate::tunnel::TunnelAuth::Agent)),
+            },
+            SavedConnection::Postgres {
+                name: "via key".into(),
+                url: "postgres://u@db2.internal:5432/app".into(),
+                tunnel: Some(tunnel(crate::tunnel::TunnelAuth::KeyFile {
+                    path: PathBuf::from("/home/u/.ssh/id_ed25519"),
+                })),
+            },
+        ];
+        save_connections(&path, &connections).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        // TOML-friendly tagged forms, no secrets.
+        assert!(text.contains("method = \"agent\""));
+        assert!(text.contains("method = \"keyfile\""));
+        assert!(!text.to_lowercase().contains("passphrase"));
+        assert_eq!(load_connections(&path).unwrap(), connections);
+    }
+
+    #[test]
+    fn tunnel_less_postgres_entries_serialize_without_a_tunnel_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.toml");
+        save_connections(&path, &[saved_pg("prod", "postgres://u@h:5432/db")]).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("tunnel"));
+    }
+
+    #[test]
+    fn legacy_postgres_entries_without_tunnel_still_deserialize() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.toml");
+        // Format written before the tunnel field existed.
+        std::fs::write(
+            &path,
+            "[[connections]]\nname = \"prod\"\nkind = \"postgres\"\nurl = \"postgres://u@h:5432/db\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_connections(&path).unwrap(),
+            vec![saved_pg("prod", "postgres://u@h:5432/db")]
+        );
+    }
+
+    #[test]
+    fn add_updates_the_tunnel_of_an_existing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut list, _) = SavedList::load(&dir.path().join("connections.toml"));
+        assert!(list.add(saved_pg("prod", "postgres://u@h:5432/db")));
+        // Same URL, tunnel added: entry is updated (and keeps its name).
+        let with_tunnel = SavedConnection::Postgres {
+            name: "ignored".into(),
+            url: "postgres://u@h:5432/db".into(),
+            tunnel: Some(tunnel(crate::tunnel::TunnelAuth::Agent)),
+        };
+        assert!(list.add(with_tunnel.clone()));
+        assert_eq!(list.entries().len(), 1);
+        match &list.entries()[0] {
+            SavedConnection::Postgres { name, tunnel, .. } => {
+                assert_eq!(name, "prod");
+                assert_eq!(tunnel.as_ref().unwrap().host, "bastion.example.com");
+            }
+            other => panic!("unexpected entry {other:?}"),
+        }
+        // Identical tunnel again: no change.
+        assert!(!list.add(with_tunnel));
     }
 
     #[test]

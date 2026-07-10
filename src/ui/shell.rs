@@ -122,6 +122,7 @@ struct SavedRow {
     locator: String,
     is_postgres: bool,
     is_open: bool,
+    tunnel: Option<crate::tunnel::TunnelConfig>,
 }
 
 /// Launch screen: the persisted saved-connections list plus add flows for
@@ -146,11 +147,16 @@ fn ConnectionsScreen() -> Element {
                     }
                     crate::config::SavedConnection::Postgres { url, .. } => url.clone(),
                 };
+                let tunnel = match s {
+                    crate::config::SavedConnection::Postgres { tunnel, .. } => tunnel.clone(),
+                    _ => None,
+                };
                 SavedRow {
                     name: s.name().to_string(),
                     locator: s.locator(),
                     is_postgres: matches!(s, crate::config::SavedConnection::Postgres { .. }),
                     is_open: open.iter().any(|(_, l)| *l == canonical_locator),
+                    tunnel,
                 }
             })
             .collect()
@@ -194,7 +200,9 @@ fn ConnectionsScreen() -> Element {
                                         let row = row.clone();
                                         spawn(async move {
                                             if row.is_postgres {
-                                                state.connect_postgres(row.locator, row.name).await;
+                                                state
+                                                    .connect_postgres(row.locator, row.name, row.tunnel)
+                                                    .await;
                                             } else {
                                                 state.connect(PathBuf::from(row.locator)).await;
                                             }
@@ -212,6 +220,11 @@ fn ConnectionsScreen() -> Element {
                                             "rounded bg-slate-800 px-1.5 py-0.5 text-xs text-slate-400"
                                         },
                                         if row.is_postgres { "postgres" } else { "sqlite" }
+                                    }
+                                    if row.tunnel.is_some() {
+                                        span { class: "rounded bg-teal-900/50 px-1.5 py-0.5 text-xs text-teal-300",
+                                            "ssh"
+                                        }
                                     }
                                     if row.is_open {
                                         span { class: "rounded bg-sky-900/60 px-1.5 py-0.5 text-xs text-sky-300",
@@ -237,7 +250,9 @@ fn ConnectionsScreen() -> Element {
                 }
             }
             if let Some(prompt) = prompt {
-                PasswordPromptCard { key: "{prompt.url}", prompt }
+                // Keyed on kind too: moving from the SSH-passphrase prompt to
+                // the db-password prompt for the same URL resets the input.
+                PasswordPromptCard { key: "{prompt.url}:{prompt.kind:?}", prompt }
             }
             div { class: "flex gap-3",
                 button {
@@ -264,31 +279,60 @@ fn ConnectionsScreen() -> Element {
     }
 }
 
-/// Inline password prompt for a saved Postgres connection. "Remember"
-/// stores the password in the OS keyring; without it (or when no keyring is
-/// available) the password lives in session memory only.
+/// Inline secret prompt for a saved Postgres connection: the database
+/// password, or the SSH key passphrase when the tunnel's key is encrypted.
+/// "Remember" stores the secret in the OS keyring; without it (or when no
+/// keyring is available) it lives in session memory only.
 #[component]
 fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
+    use super::state::PromptKind;
     let state = use_context::<AppState>();
     let mut password = use_signal(String::new);
     let mut remember = use_signal(|| true);
-    let url = prompt.url.clone();
-    let name = prompt.name.clone();
+    let prompt_for_submit = prompt.clone();
     let submit = move || {
-        let url = url.clone();
-        let name = name.clone();
+        let prompt = prompt_for_submit.clone();
         let entered = password.peek().clone();
         let remember_choice = *remember.peek();
-        spawn(async move {
-            state
-                .connect_postgres_with_password(url, name, entered, remember_choice)
-                .await;
+        // spawn_forever: the connect flow clears `password_prompt`, which
+        // unmounts this card — a scope-tied `spawn` would be cancelled at
+        // its next await, silently abandoning the connect.
+        dioxus::core::spawn_forever(async move {
+            match prompt.kind {
+                PromptKind::DbPassword => {
+                    state
+                        .connect_postgres_with_password(
+                            prompt.url,
+                            prompt.name,
+                            entered,
+                            remember_choice,
+                            prompt.tunnel,
+                        )
+                        .await;
+                }
+                PromptKind::SshPassphrase => {
+                    // An SSH prompt always carries its tunnel config.
+                    let Some(tunnel) = prompt.tunnel else { return };
+                    state
+                        .connect_postgres_with_ssh_passphrase(
+                            prompt.url,
+                            prompt.name,
+                            tunnel,
+                            entered,
+                            remember_choice,
+                        )
+                        .await;
+                }
+            }
         });
     };
     rsx! {
         div { class: "w-full max-w-xl rounded border border-cyan-800 bg-slate-950/80 p-4",
             p { class: "mb-2 text-sm text-slate-300",
-                "Password for "
+                match prompt.kind {
+                    PromptKind::DbPassword => "Password for ",
+                    PromptKind::SshPassphrase => "SSH key passphrase for ",
+                }
                 span { class: "font-mono text-cyan-300", "{prompt.name}" }
             }
             div { class: "flex gap-2",
@@ -330,9 +374,11 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
     }
 }
 
-/// Add-Postgres panel: individual fields or a pasted URL.
+/// Add-Postgres panel: individual fields or a pasted URL, plus an optional
+/// SSH tunnel.
 #[component]
 fn PostgresForm(on_done: EventHandler<()>) -> Element {
+    use crate::tunnel::{TunnelAuth, TunnelConfig};
     let state = use_context::<AppState>();
     let mut use_url = use_signal(|| false);
     let mut name = use_signal(String::new);
@@ -344,9 +390,80 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
     let mut remember = use_signal(|| true);
     let mut sslmode = use_signal(|| "prefer".to_string());
     let mut pasted_url = use_signal(String::new);
+    let mut use_tunnel = use_signal(|| false);
+    let mut ssh_host = use_signal(String::new);
+    let mut ssh_port = use_signal(String::new);
+    let mut ssh_user = use_signal(String::new);
+    // false = ssh-agent (the default), true = key file.
+    let mut ssh_use_key = use_signal(|| false);
+    let mut ssh_key_path = use_signal(String::new);
+    let mut ssh_passphrase = use_signal(String::new);
     let mut form_error = use_signal(|| Option::<String>::None);
 
     let mut submit = move || {
+        // Tunnel settings are validated first so a bad SSH field fails
+        // before any connect attempt.
+        let tunnel: Option<TunnelConfig> = if *use_tunnel.peek() {
+            let host = ssh_host.peek().trim().to_string();
+            if host.is_empty() {
+                form_error.set(Some("SSH host must not be empty".to_string()));
+                return;
+            }
+            let port_text = ssh_port.peek().trim().to_string();
+            let port = if port_text.is_empty() {
+                22
+            } else {
+                match port_text.parse() {
+                    Ok(port) => port,
+                    Err(_) => {
+                        form_error.set(Some(format!("invalid SSH port: {port_text}")));
+                        return;
+                    }
+                }
+            };
+            let user = ssh_user.peek().trim().to_string();
+            if user.is_empty() {
+                form_error.set(Some("SSH user must not be empty".to_string()));
+                return;
+            }
+            let auth = if *ssh_use_key.peek() {
+                let path = ssh_key_path.peek().trim().to_string();
+                if path.is_empty() {
+                    form_error.set(Some("SSH key file path must not be empty".to_string()));
+                    return;
+                }
+                // The placeholder suggests ~/.ssh/…, so honor a leading ~/.
+                let path = match path.strip_prefix("~/") {
+                    Some(rest) => match dirs::home_dir() {
+                        Some(home) => home.join(rest),
+                        None => PathBuf::from(path),
+                    },
+                    None => PathBuf::from(path),
+                };
+                TunnelAuth::KeyFile { path }
+            } else {
+                TunnelAuth::Agent
+            };
+            Some(TunnelConfig {
+                host,
+                port,
+                user,
+                auth,
+            })
+        } else {
+            None
+        };
+        let entered_passphrase = if matches!(
+            tunnel,
+            Some(TunnelConfig {
+                auth: TunnelAuth::KeyFile { .. },
+                ..
+            })
+        ) {
+            Some(ssh_passphrase.peek().clone()).filter(|p| !p.is_empty())
+        } else {
+            None
+        };
         // A password pasted inside the URL is used for this connect (and
         // remembered for the session on success) but never persisted.
         let embedded_password = if *use_url.peek() {
@@ -398,9 +515,14 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
         let remember_choice = *remember.peek();
         form_error.set(None);
         spawn(async move {
+            // An entered passphrase seeds session memory so the tunnel open
+            // finds it, exactly as if it came from the prompt.
+            if let Some(passphrase) = &entered_passphrase {
+                state.stash_ssh_passphrase(&url, passphrase.clone());
+            }
             if entered_password.is_empty() {
                 state
-                    .connect_postgres(url.clone(), display_name.clone())
+                    .connect_postgres(url.clone(), display_name.clone(), tunnel.clone())
                     .await;
             } else {
                 state
@@ -409,12 +531,16 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                         display_name.clone(),
                         entered_password,
                         remember_choice,
+                        tunnel.clone(),
                     )
                     .await;
             }
             // Only save and close the form when the connection worked.
             if state.open_locators.peek().iter().any(|(_, l)| *l == url) {
-                state.add_saved_postgres(display_name, url);
+                if remember_choice && entered_passphrase.is_some() {
+                    state.persist_ssh_passphrase(&url).await;
+                }
+                state.add_saved_postgres(display_name, url, tunnel);
                 on_done.call(());
             }
         });
@@ -493,6 +619,73 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                     placeholder: "password",
                     value: "{password}",
                     oninput: move |evt| password.set(evt.value()),
+                }
+                label { class: "flex items-center gap-2 text-xs text-slate-400",
+                    input {
+                        r#type: "checkbox",
+                        checked: use_tunnel(),
+                        onchange: move |evt| use_tunnel.set(evt.checked()),
+                    }
+                    "Connect through an SSH tunnel"
+                }
+                if use_tunnel() {
+                    div { class: "flex flex-col gap-2 rounded border border-slate-800 bg-slate-900/60 p-3",
+                        div { class: "flex gap-2",
+                            input {
+                                class: "{field_class} flex-[3]",
+                                placeholder: "ssh host",
+                                value: "{ssh_host}",
+                                oninput: move |evt| ssh_host.set(evt.value()),
+                            }
+                            input {
+                                class: "{field_class} flex-1",
+                                placeholder: "22",
+                                value: "{ssh_port}",
+                                oninput: move |evt| ssh_port.set(evt.value()),
+                            }
+                        }
+                        input {
+                            class: field_class,
+                            placeholder: "ssh user",
+                            value: "{ssh_user}",
+                            oninput: move |evt| ssh_user.set(evt.value()),
+                        }
+                        div { class: "flex gap-4 text-xs text-slate-400",
+                            label { class: "flex items-center gap-2",
+                                input {
+                                    r#type: "radio",
+                                    name: "ssh-auth",
+                                    checked: !ssh_use_key(),
+                                    onchange: move |_| ssh_use_key.set(false),
+                                }
+                                "ssh-agent"
+                            }
+                            label { class: "flex items-center gap-2",
+                                input {
+                                    r#type: "radio",
+                                    name: "ssh-auth",
+                                    checked: ssh_use_key(),
+                                    onchange: move |_| ssh_use_key.set(true),
+                                }
+                                "key file"
+                            }
+                        }
+                        if ssh_use_key() {
+                            input {
+                                class: field_class,
+                                placeholder: "key file path, e.g. ~/.ssh/id_ed25519",
+                                value: "{ssh_key_path}",
+                                oninput: move |evt| ssh_key_path.set(evt.value()),
+                            }
+                            input {
+                                r#type: "password",
+                                class: field_class,
+                                placeholder: "key passphrase (if the key is encrypted)",
+                                value: "{ssh_passphrase}",
+                                oninput: move |evt| ssh_passphrase.set(evt.value()),
+                            }
+                        }
+                    }
                 }
                 label { class: "flex items-center gap-2 text-xs text-slate-400",
                     input {
