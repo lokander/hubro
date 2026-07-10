@@ -27,7 +27,6 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let table_for_resource = table.clone();
     let rows_resource = use_resource(move || {
         let table = table_for_resource.clone();
-        let _ = &table;
         // Read reactive deps before any await so the resource re-runs when
         // they change and no borrow spans the await.
         let request = PageRequest {

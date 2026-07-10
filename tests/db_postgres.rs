@@ -115,6 +115,40 @@ async fn postgres_paging_sorting_filtering_and_values_work() {
 }
 
 #[tokio::test]
+async fn same_named_pk_and_fk_constraints_do_not_confuse_pk_detection() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    for sql in [
+        "DROP SCHEMA IF EXISTS pkbug CASCADE",
+        "CREATE SCHEMA pkbug",
+        "CREATE TABLE pkbug.t1 (id integer, CONSTRAINT samename PRIMARY KEY (id))",
+        "CREATE TABLE pkbug.t2 (
+            own_id integer,
+            ref integer,
+            CONSTRAINT t2_pkey PRIMARY KEY (own_id),
+            CONSTRAINT samename FOREIGN KEY (ref) REFERENCES pkbug.t1 (id)
+        )",
+    ] {
+        pool.query(sql).await.unwrap();
+    }
+
+    let tables = pool.introspect().await.unwrap();
+    let t2 = tables
+        .iter()
+        .find(|t| t.schema.as_deref() == Some("pkbug") && t.name == "t2")
+        .unwrap();
+    // The FK named like t1's PK must not mark t2.ref as a PK column…
+    let ref_col = t2.columns.iter().find(|c| c.name == "ref").unwrap();
+    assert_eq!(ref_col.primary_key_position, None);
+    // …nor duplicate any column rows.
+    assert_eq!(t2.columns.len(), 2);
+    let pk: Vec<&str> = t2.primary_key().iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(pk, ["own_id"]);
+
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn postgres_bad_password_is_an_authentication_error() {
     let Some(url) = test_url() else { return };
     let wrong = url_with_password(&url, "definitely-wrong-password").unwrap();
@@ -138,6 +172,10 @@ async fn postgres_multi_schema_introspection_has_parity_metadata() {
     for sql in [
         "DROP SCHEMA IF EXISTS warehouse CASCADE",
         "CREATE SCHEMA warehouse",
+        // Same-named table in two schemas: attribution must not bleed.
+        "DROP TABLE IF EXISTS wh_probe",
+        "CREATE TABLE wh_probe (public_only integer)",
+        "CREATE TABLE warehouse.wh_probe (warehouse_only text)",
         "CREATE TABLE warehouse.locations (
             region text NOT NULL,
             slot integer NOT NULL,
@@ -162,9 +200,19 @@ async fn postgres_multi_schema_introspection_has_parity_metadata() {
 
     let tables = pool.introspect().await.unwrap();
 
-    // Multi-schema: entries from both public (earlier fixtures) and
-    // warehouse appear, each tagged with its schema.
-    assert!(tables.iter().any(|t| t.schema.as_deref() == Some("public")));
+    // Multi-schema: same-named tables in different schemas stay separate,
+    // each with its own columns.
+    let public_probe = tables
+        .iter()
+        .find(|t| t.schema.as_deref() == Some("public") && t.name == "wh_probe")
+        .unwrap();
+    assert_eq!(public_probe.columns.len(), 1);
+    assert_eq!(public_probe.columns[0].name, "public_only");
+    let warehouse_probe = tables
+        .iter()
+        .find(|t| t.schema.as_deref() == Some("warehouse") && t.name == "wh_probe")
+        .unwrap();
+    assert_eq!(warehouse_probe.columns[0].name, "warehouse_only");
     let locations = tables
         .iter()
         .find(|t| t.schema.as_deref() == Some("warehouse") && t.name == "locations")

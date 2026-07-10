@@ -185,6 +185,8 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
              JOIN information_schema.key_column_usage kcu \
                ON kcu.constraint_name = tc.constraint_name \
               AND kcu.constraint_schema = tc.constraint_schema \
+              AND kcu.table_schema = tc.table_schema \
+              AND kcu.table_name = tc.table_name \
              WHERE tc.constraint_type = 'PRIMARY KEY' \
          ) pk ON pk.table_schema = c.table_schema \
              AND pk.table_name = c.table_name \
@@ -210,6 +212,8 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
          CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) \
          LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
          WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
+           AND n.nspname NOT LIKE 'pg\\_%' \
+           AND k.ord <= ix.indnkeyatts \
          ORDER BY n.nspname, t.relname, i.relname, k.ord",
     )
     .fetch_all(pool)
@@ -236,6 +240,7 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
          JOIN pg_namespace rn ON rn.oid = rt.relnamespace \
          WHERE c.contype = 'f' \
            AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+           AND n.nspname NOT LIKE 'pg\\_%' \
          ORDER BY n.nspname, t.relname, c.conname",
     )
     .fetch_all(pool)
