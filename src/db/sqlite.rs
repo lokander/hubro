@@ -6,6 +6,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRo
 use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
 
 use super::error::DbError;
+use super::page::quote_ident;
 use super::schema::{ColumnMeta, ForeignKeyMeta, IndexMeta, TableKind, TableMeta};
 use super::value::{ColumnInfo, QueryResult, Value};
 
@@ -30,7 +31,27 @@ pub async fn open_sqlite(path: &Path) -> Result<SqlitePool, DbError> {
 /// Runs an arbitrary query, decoding every cell into the backend-neutral
 /// [`Value`] model.
 pub async fn query(pool: &SqlitePool, sql: &str) -> Result<QueryResult, DbError> {
-    let rows = sqlx::query(sql)
+    query_with(pool, sql, &[]).await
+}
+
+/// Like [`query`], with bound parameters (used by the paged table reader so
+/// filter values never touch the SQL text).
+pub async fn query_with(
+    pool: &SqlitePool,
+    sql: &str,
+    params: &[Value],
+) -> Result<QueryResult, DbError> {
+    let mut prepared = sqlx::query(sql);
+    for param in params {
+        prepared = match param {
+            Value::Null => prepared.bind(None::<i64>),
+            Value::Integer(i) => prepared.bind(*i),
+            Value::Real(r) => prepared.bind(*r),
+            Value::Text(t) => prepared.bind(t.clone()),
+            Value::Blob(b) => prepared.bind(b.clone()),
+        };
+    }
+    let rows = prepared
         .fetch_all(pool)
         .await
         .map_err(|e| DbError::Query(e.to_string()))?;
@@ -175,12 +196,6 @@ async fn pragma(pool: &SqlitePool, pragma: &str, arg: &str) -> Result<Vec<Sqlite
         .fetch_all(pool)
         .await
         .map_err(|e| DbError::Introspect(e.to_string()))
-}
-
-/// Quotes an identifier for safe interpolation (names come from the schema
-/// itself, but may still contain quotes, spaces, or unicode).
-fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 fn get<'r, T: sqlx::Decode<'r, sqlx::Sqlite> + sqlx::Type<sqlx::Sqlite>>(
