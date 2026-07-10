@@ -11,6 +11,36 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use keyring::Entry;
 
+/// Runs a keyring operation off the UI thread. Secret Service calls can
+/// block indefinitely (e.g. waiting for the user to unlock the wallet), and
+/// Dioxus polls its tasks on the main thread — so blocking here would freeze
+/// the whole window. Falls back to calling inline when no tokio runtime is
+/// available (plain unit tests).
+async fn run_blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => match handle.spawn_blocking(f).await {
+            Ok(result) => result,
+            Err(join_err) => Err(format!("keyring task failed: {join_err}")),
+        },
+        Err(_) => f(),
+    }
+}
+
+/// Async wrappers for use from UI tasks — see [`run_blocking`].
+pub async fn store_password_async(url: String, password: String) -> Result<(), String> {
+    run_blocking(move || store_password(&url, &password)).await
+}
+
+pub async fn get_password_async(url: String) -> Result<Option<String>, String> {
+    run_blocking(move || get_password(&url)).await
+}
+
+pub async fn delete_password_async(url: String) -> Result<(), String> {
+    run_blocking(move || delete_password(&url)).await
+}
+
 const SERVICE: &str = "dataview";
 
 /// Set `DATAVIEW_DISABLE_KEYRING=1` to force the session-only fallback
@@ -31,7 +61,8 @@ fn entry(url: &str) -> Result<Arc<Entry>, String> {
     let mut cache = ENTRIES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .expect("entry cache poisoned");
+        // The map itself can't be left inconsistent; recover from poisoning.
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(cached) = cache.get(url) {
         return Ok(cached.clone());
     }
@@ -41,6 +72,10 @@ fn entry(url: &str) -> Result<Arc<Entry>, String> {
 }
 
 /// Stores (or replaces) the password for a connection URL.
+///
+/// Note: entries are keyed by the exact URL, so re-adding the same server
+/// with a different port/user/sslmode creates a distinct entry; the old one
+/// lingers until its saved connection is removed.
 pub fn store_password(url: &str, password: &str) -> Result<(), String> {
     entry(url)?
         .set_password(password)
@@ -88,6 +123,9 @@ mod tests {
     fn store_get_delete_round_trip() {
         let _guard = TEST_LOCK.lock().unwrap();
         use_mock();
+        // Hermetic even when the developer's shell exports the disable flag
+        // (the headless test recipe suggests it).
+        std::env::remove_var("DATAVIEW_DISABLE_KEYRING");
         let url = "postgres://u@h:5432/roundtrip";
         assert_eq!(get_password(url).unwrap(), None);
         store_password(url, "s3cret").unwrap();

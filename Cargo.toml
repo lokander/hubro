@@ -15,6 +15,7 @@ dirs = "6"
 rfd = "0.15"
 url = "2"
 percent-encoding = "2"
+tokio = { version = "1", features = ["rt"] }
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
