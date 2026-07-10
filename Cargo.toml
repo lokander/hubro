@@ -8,7 +8,7 @@ edition = "2021"
 
 [dependencies]
 dioxus = { version = "0.7.1", features = [] }
-sqlx = { version = "0.8", default-features = false, features = ["sqlite", "postgres", "runtime-tokio", "tls-rustls-ring", "macros"] }
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "postgres", "runtime-tokio", "tls-rustls-ring", "macros", "chrono", "uuid", "json", "rust_decimal"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "6"

@@ -2,7 +2,10 @@
 //! (multi-schema, indexes, FKs) lands with FRE-11; until then only tables
 //! and columns of the `public` schema are listed.
 
-use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
+use sqlx::postgres::types::{PgInterval, PgTimeTz};
+use sqlx::postgres::{PgHasArrayType, PgPool, PgPoolOptions, PgRow, PgTypeKind};
+use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use sqlx::types::{Decimal, JsonValue, Uuid};
 use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
 
 use super::error::DbError;
@@ -334,8 +337,11 @@ fn get<'r, T: sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>>(
         .map_err(|e| DbError::Introspect(format!("column {column}: {e}")))
 }
 
-/// Decodes the common scalar types; everything else falls back to a text
-/// cast where possible. Full Postgres type rendering is FRE-12.
+/// Decodes scalar and rich Postgres types into the backend-neutral [`Value`]
+/// model. Rich types (dates, numeric, uuid, json, intervals, arrays, enums)
+/// render as `Value::Text` in a form close to what `psql` would print;
+/// anything unhandled falls back to a text cast where possible, then to a
+/// `<typename>` marker — never an error for the whole page.
 fn decode_value(row: &PgRow, idx: usize) -> Result<Value, DbError> {
     let raw = row
         .try_get_raw(idx)
@@ -346,7 +352,9 @@ fn decode_value(row: &PgRow, idx: usize) -> Result<Value, DbError> {
     let type_name = raw.type_info().name().to_string();
     let map_err = |e: sqlx::Error| DbError::Query(e.to_string());
     let decoded = match type_name.as_str() {
-        "BOOL" => Value::Integer(row.try_get::<bool, _>(idx).map_err(map_err)? as i64),
+        // Booleans render as text: "true"/"false" reads better in a viewer
+        // than 0/1.
+        "BOOL" => Value::Text(row.try_get::<bool, _>(idx).map_err(map_err)?.to_string()),
         "INT2" => Value::Integer(row.try_get::<i16, _>(idx).map_err(map_err)? as i64),
         "INT4" => Value::Integer(row.try_get::<i32, _>(idx).map_err(map_err)? as i64),
         "INT8" => Value::Integer(row.try_get::<i64, _>(idx).map_err(map_err)?),
@@ -356,14 +364,142 @@ fn decode_value(row: &PgRow, idx: usize) -> Result<Value, DbError> {
             Value::Text(row.try_get::<String, _>(idx).map_err(map_err)?)
         }
         "BYTEA" => Value::Blob(row.try_get::<Vec<u8>, _>(idx).map_err(map_err)?),
-        _ => match row.try_get::<String, _>(idx) {
-            Ok(text) => Value::Text(text),
-            // Unknown type that won't decode as text; show a marker rather
-            // than erroring the whole page (proper rendering is FRE-12).
-            Err(_) => Value::Text(format!("<{}>", type_name.to_lowercase())),
-        },
+        // Date/time family. `%.f` prints fractional seconds only when
+        // non-zero, with no trailing zeros — matching Postgres output.
+        "TIMESTAMP" => {
+            let ts = row.try_get::<NaiveDateTime, _>(idx).map_err(map_err)?;
+            Value::Text(trim_fraction(ts.format("%Y-%m-%d %H:%M:%S%.f").to_string()))
+        }
+        "TIMESTAMPTZ" => {
+            // Postgres sends timestamptz as an instant; render in UTC with
+            // an explicit offset so the timezone-awareness is visible.
+            let ts = row.try_get::<DateTime<Utc>, _>(idx).map_err(map_err)?;
+            let local = trim_fraction(ts.format("%Y-%m-%d %H:%M:%S%.f").to_string());
+            Value::Text(format!("{local}+00:00"))
+        }
+        "DATE" => {
+            let d = row.try_get::<NaiveDate, _>(idx).map_err(map_err)?;
+            Value::Text(d.format("%Y-%m-%d").to_string())
+        }
+        "TIME" => {
+            let t = row.try_get::<NaiveTime, _>(idx).map_err(map_err)?;
+            Value::Text(trim_fraction(t.format("%H:%M:%S%.f").to_string()))
+        }
+        "TIMETZ" => {
+            let t = row.try_get::<PgTimeTz, _>(idx).map_err(map_err)?;
+            let time = trim_fraction(t.time.format("%H:%M:%S%.f").to_string());
+            Value::Text(format!("{time}{}", t.offset))
+        }
+        "INTERVAL" => {
+            let iv = row.try_get::<PgInterval, _>(idx).map_err(map_err)?;
+            Value::Text(format_interval(&iv))
+        }
+        // Exact decimal string via rust_decimal — must not round-trip
+        // through f64.
+        "NUMERIC" => Value::Text(row.try_get::<Decimal, _>(idx).map_err(map_err)?.to_string()),
+        "UUID" => Value::Text(row.try_get::<Uuid, _>(idx).map_err(map_err)?.to_string()),
+        // Compact JSON text (serde_json Display is compact).
+        "JSON" | "JSONB" => Value::Text(
+            row.try_get::<JsonValue, _>(idx)
+                .map_err(map_err)?
+                .to_string(),
+        ),
+        // Arrays of the common element types render as a Postgres-style
+        // literal. NULL elements render as NULL; text elements are not
+        // quoted/escaped (this is a display form, not parseable syntax).
+        "TEXT[]" | "VARCHAR[]" | "BPCHAR[]" | "NAME[]" => {
+            decode_array::<String>(row, idx, |v| v).map_err(map_err)?
+        }
+        "INT2[]" => decode_array::<i16>(row, idx, |v| v.to_string()).map_err(map_err)?,
+        "INT4[]" => decode_array::<i32>(row, idx, |v| v.to_string()).map_err(map_err)?,
+        "INT8[]" => decode_array::<i64>(row, idx, |v| v.to_string()).map_err(map_err)?,
+        "FLOAT4[]" => decode_array::<f32>(row, idx, |v| v.to_string()).map_err(map_err)?,
+        "FLOAT8[]" => decode_array::<f64>(row, idx, |v| v.to_string()).map_err(map_err)?,
+        "BOOL[]" => decode_array::<bool>(row, idx, |v| v.to_string()).map_err(map_err)?,
+        "UUID[]" => decode_array::<Uuid>(row, idx, |v| v.to_string()).map_err(map_err)?,
+        "NUMERIC[]" => decode_array::<Decimal>(row, idx, |v| v.to_string()).map_err(map_err)?,
+        _ => {
+            // User-defined enums: the wire value (text or binary format) is
+            // the label itself, but `try_get::<String>` refuses the unknown
+            // OID, so read the raw bytes directly.
+            if matches!(raw.type_info().kind(), PgTypeKind::Enum(_)) {
+                match raw.as_str() {
+                    Ok(label) => Value::Text(label.to_string()),
+                    Err(_) => Value::Text(format!("<{}>", type_name.to_lowercase())),
+                }
+            } else {
+                match row.try_get::<String, _>(idx) {
+                    Ok(text) => Value::Text(text),
+                    // Unknown type that won't decode as text (e.g. ranges,
+                    // inet, money); show a marker rather than erroring the
+                    // whole page.
+                    Err(_) => Value::Text(format!("<{}>", type_name.to_lowercase())),
+                }
+            }
+        }
     };
     Ok(decoded)
+}
+
+/// Decodes a one-dimensional array column and renders it as a
+/// Postgres-style literal, e.g. `{a,b,NULL}`.
+fn decode_array<T>(row: &PgRow, idx: usize, fmt: impl Fn(T) -> String) -> Result<Value, sqlx::Error>
+where
+    T: for<'a> sqlx::Decode<'a, sqlx::Postgres> + sqlx::Type<sqlx::Postgres> + PgHasArrayType,
+{
+    let items: Vec<Option<T>> = row.try_get(idx)?;
+    let mut parts = Vec::with_capacity(items.len());
+    for item in items {
+        parts.push(match item {
+            Some(v) => fmt(v),
+            None => "NULL".to_string(),
+        });
+    }
+    Ok(Value::Text(format!("{{{}}}", parts.join(","))))
+}
+
+/// Trims trailing zeros from a chrono-formatted fractional second: `%.f`
+/// pads to 3/6/9 digits ("09.500"), Postgres prints minimal ("09.5"). The
+/// input must end with the seconds field; the fraction dot is the only dot.
+fn trim_fraction(mut s: String) -> String {
+    if s.contains('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+    }
+    s
+}
+
+/// Compact human form for an interval, e.g. "1 mon 2 days 03:04:05.5".
+/// Zero parts are omitted; a zero interval renders as "00:00:00". Each
+/// part carries its own sign, matching how Postgres prints mixed-sign
+/// intervals.
+fn format_interval(iv: &PgInterval) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if iv.months != 0 {
+        let unit = if iv.months.abs() == 1 { "mon" } else { "mons" };
+        parts.push(format!("{} {unit}", iv.months));
+    }
+    if iv.days != 0 {
+        let unit = if iv.days.abs() == 1 { "day" } else { "days" };
+        parts.push(format!("{} {unit}", iv.days));
+    }
+    if iv.microseconds != 0 || parts.is_empty() {
+        let sign = if iv.microseconds < 0 { "-" } else { "" };
+        let abs = iv.microseconds.unsigned_abs();
+        let secs = abs / 1_000_000;
+        let micros = abs % 1_000_000;
+        let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+        let mut time = format!("{sign}{h:02}:{m:02}:{s:02}");
+        if micros != 0 {
+            time.push_str(format!(".{micros:06}").trim_end_matches('0'));
+        }
+        parts.push(time);
+    }
+    parts.join(" ")
 }
 
 #[cfg(test)]
@@ -417,6 +553,32 @@ mod tests {
         let friendly = friendly_connect_error(&role);
         assert!(friendly.starts_with("unknown role"));
         assert!(!friendly.contains("authentication failed"));
+    }
+
+    #[test]
+    fn interval_formats_compactly() {
+        let iv = |months, days, microseconds| PgInterval {
+            months,
+            days,
+            microseconds,
+        };
+        // All parts present, plural units, fractional seconds trimmed.
+        assert_eq!(
+            format_interval(&iv(14, 2, (3 * 3600 + 4 * 60 + 5) * 1_000_000)),
+            "14 mons 2 days 03:04:05"
+        );
+        assert_eq!(
+            format_interval(&iv(1, 1, 5_000_000 + 500_000)),
+            "1 mon 1 day 00:00:05.5"
+        );
+        // Zero parts are omitted; all-zero renders a zero time.
+        assert_eq!(format_interval(&iv(0, 3, 0)), "3 days");
+        assert_eq!(format_interval(&iv(0, 0, 0)), "00:00:00");
+        // Negative components each carry their sign.
+        assert_eq!(
+            format_interval(&iv(-1, -2, -5_000_000)),
+            "-1 mon -2 days -00:00:05"
+        );
     }
 
     #[test]
