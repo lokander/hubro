@@ -159,10 +159,13 @@ impl AppState {
     /// Postgres entries also drop their keyring credential.
     pub fn remove_saved(mut self, locator: &str) {
         let removed = self.saved.write().remove(locator);
-        if removed {
-            if locator.starts_with("postgres") {
-                // Best-effort: a missing keyring just means nothing stored.
-                let _ = crate::secrets::delete_password(locator);
+        if let Some(entry) = removed {
+            if let SavedConnection::Postgres { url, .. } = entry {
+                // Best-effort, off-thread: a missing keyring just means
+                // nothing was stored.
+                spawn_forever(async move {
+                    let _ = crate::secrets::delete_password_async(url).await;
+                });
             }
             self.persist_saved();
         }
@@ -201,14 +204,17 @@ impl AppState {
         if self.focus_or_reserve(&url) {
             return;
         }
-        // Session memory first, then the OS keyring (sync D-Bus call, fast;
-        // errors mean "no keyring" and fall through to the prompt flow).
-        let session_password = self
-            .session_passwords
-            .read()
-            .get(&url)
-            .cloned()
-            .or_else(|| crate::secrets::get_password(&url).ok().flatten());
+        // Session memory first, then the OS keyring. The keyring call runs
+        // off-thread (a locked wallet can block on a user dialog) and only
+        // after the session read guard is dropped; errors mean "no keyring"
+        // and fall through to the prompt flow.
+        let mut session_password = self.session_passwords.read().get(&url).cloned();
+        if session_password.is_none() {
+            session_password = crate::secrets::get_password_async(url.clone())
+                .await
+                .ok()
+                .flatten();
+        }
         let had_password = session_password.is_some();
         let result = match &session_password {
             Some(password) => match url_with_password(&url, password) {
@@ -223,7 +229,7 @@ impl AppState {
                 if had_password {
                     // Stored password is stale; drop it everywhere and re-ask.
                     self.session_passwords.write().remove(&url);
-                    let _ = crate::secrets::delete_password(&url);
+                    let _ = crate::secrets::delete_password_async(url.clone()).await;
                     self.connect_error
                         .set(Some(format!("connection failed: {msg}")));
                 }
@@ -259,7 +265,17 @@ impl AppState {
         };
         if result.is_ok() {
             if remember {
-                let _ = crate::secrets::store_password(&url, &password);
+                // Off-thread; surface a non-fatal notice when the user asked
+                // to remember but the keyring store failed.
+                let store =
+                    crate::secrets::store_password_async(url.clone(), password.clone()).await;
+                if store.is_err() {
+                    self.connect_error.set(Some(
+                        "connected, but the password could not be stored in the system \
+                         keyring — it is remembered for this session only"
+                            .to_string(),
+                    ));
+                }
             }
             self.session_passwords.write().insert(url.clone(), password);
             self.password_prompt.set(None);

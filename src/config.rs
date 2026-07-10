@@ -143,11 +143,10 @@ impl SavedList {
         true
     }
 
-    /// Removes the entry with this locator. Returns whether the list changed.
-    pub fn remove(&mut self, locator: &str) -> bool {
-        let before = self.entries.len();
-        self.entries.retain(|s| s.locator() != locator);
-        self.entries.len() != before
+    /// Removes and returns the entry with this locator (`None` when absent).
+    pub fn remove(&mut self, locator: &str) -> Option<SavedConnection> {
+        let index = self.entries.iter().position(|s| s.locator() == locator)?;
+        Some(self.entries.remove(index))
     }
 
     /// Persists the list — unless it came from an unreadable file, in which
@@ -226,7 +225,7 @@ mod tests {
         let (mut list, _) = SavedList::load(&dir.path().join("connections.toml"));
         assert!(list.add(saved_pg("prod", "postgres://u@h:5432/db")));
         assert!(!list.add(saved_pg("other name", "postgres://u@h:5432/db")));
-        assert!(list.remove("postgres://u@h:5432/db"));
+        assert!(list.remove("postgres://u@h:5432/db").is_some());
         assert!(list.entries().is_empty());
     }
 
@@ -278,8 +277,8 @@ mod tests {
         let (reloaded, _) = SavedList::load(&path);
         assert_eq!(reloaded.entries(), list.entries());
 
-        assert!(!list.remove("/tmp/missing.db"));
-        assert!(list.remove("/tmp/a.db"));
+        assert!(list.remove("/tmp/missing.db").is_none());
+        assert!(list.remove("/tmp/a.db").is_some());
         assert!(list.entries().is_empty());
     }
 }
