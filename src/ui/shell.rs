@@ -97,43 +97,92 @@ fn ConnectionView(id: ConnectionId) -> Element {
     }
 }
 
-/// Launch screen. The saved-connections list and native file picker arrive
-/// with FRE-7; until then databases open via a path typed in directly.
+/// Launch screen: the persisted saved-connections list. Add via the native
+/// file picker; connect opens a tab (or focuses the existing one).
 #[component]
 fn ConnectionsScreen() -> Element {
     let state = use_context::<AppState>();
-    let mut path_input = use_signal(String::new);
     let error = state.connect_error.read().clone();
+    let saved: Vec<(String, PathBuf, bool)> = {
+        let open_paths = state.open_paths.read();
+        state
+            .saved
+            .read()
+            .iter()
+            .map(|s| {
+                let is_open = open_paths.iter().any(|(_, p)| *p == s.path);
+                (s.name.clone(), s.path.clone(), is_open)
+            })
+            .collect()
+    };
 
-    let open = move || {
-        let path = PathBuf::from(path_input.read().trim());
-        if path.as_os_str().is_empty() {
-            return;
-        }
-        spawn(async move { state.open_sqlite(path).await });
+    let pick_file = move |_| {
+        spawn(async move {
+            let picked = rfd::AsyncFileDialog::new()
+                .set_title("Add a SQLite database")
+                .add_filter("SQLite databases", &["db", "sqlite", "sqlite3"])
+                .add_filter("All files", &["*"])
+                .pick_file()
+                .await;
+            if let Some(file) = picked {
+                state.add_saved(file.path().to_path_buf());
+            }
+        });
     };
 
     rsx! {
-        div { class: "flex h-full flex-col items-center justify-center gap-4",
-            h1 { class: "text-2xl font-semibold text-slate-200", "dataview" }
-            p { class: "text-sm text-slate-400", "Open a SQLite database file to get started." }
-            div { class: "flex w-full max-w-xl gap-2 px-8",
-                input {
-                    class: "min-w-0 flex-1 rounded border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-200 placeholder:text-slate-600",
-                    placeholder: "/path/to/database.db",
-                    value: "{path_input}",
-                    oninput: move |evt| path_input.set(evt.value()),
-                    onkeydown: move |evt| {
-                        if evt.key() == Key::Enter {
-                            open();
+        div { class: "flex h-full flex-col items-center justify-center gap-6",
+            div { class: "text-center",
+                h1 { class: "text-2xl font-semibold text-slate-200", "dataview" }
+                p { class: "mt-1 text-sm text-slate-400",
+                    if saved.is_empty() {
+                        "Add a SQLite database file to get started."
+                    } else {
+                        "Pick a saved connection, or add another database."
+                    }
+                }
+            }
+            if !saved.is_empty() {
+                ul { class: "w-full max-w-xl divide-y divide-slate-800 rounded border border-slate-700 bg-slate-950/60",
+                    for (name, path, is_open) in saved {
+                        li { class: "flex items-center gap-3 px-4 py-3",
+                            button {
+                                class: "min-w-0 flex-1 text-left",
+                                onclick: {
+                                    let path = path.clone();
+                                    move |_| {
+                                        let path = path.clone();
+                                        spawn(async move { state.connect(path).await });
+                                    }
+                                },
+                                div { class: "flex items-center gap-2",
+                                    span { class: "truncate text-sm font-medium text-slate-200",
+                                        "{name}"
+                                    }
+                                    if is_open {
+                                        span { class: "rounded bg-sky-900/60 px-1.5 py-0.5 text-xs text-sky-300",
+                                            "open"
+                                        }
+                                    }
+                                }
+                                div { class: "truncate font-mono text-xs text-slate-500",
+                                    "{path.display()}"
+                                }
+                            }
+                            button {
+                                class: "rounded px-2 py-1 text-xs text-slate-500 hover:bg-slate-800 hover:text-slate-200",
+                                aria_label: "Remove saved connection",
+                                onclick: move |_| state.remove_saved(&path),
+                                "Remove"
+                            }
                         }
-                    },
+                    }
                 }
-                button {
-                    class: "rounded bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500",
-                    onclick: move |_| open(),
-                    "Open"
-                }
+            }
+            button {
+                class: "rounded bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500",
+                onclick: pick_file,
+                "Add database…"
             }
             if let Some(err) = error {
                 p { class: "max-w-xl px-8 text-sm text-red-400", "{err}" }

@@ -9,6 +9,10 @@ edition = "2021"
 [dependencies]
 dioxus = { version = "0.7.1", features = [] }
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "macros"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "6"
+rfd = "0.15"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
