@@ -4,11 +4,11 @@ use sqlx::types::chrono::{DateTime, Local};
 
 use crate::db::{
     needs_confirmation, ConnectionId, Dialect, QueryResult, StatementOutcome, StatementResult,
-    Value,
+    TableMeta, Value,
 };
 use crate::history::HistoryEntry;
 
-use super::state::{AppState, RunStatus};
+use super::state::{AppState, RunStatus, SchemaLoad};
 
 /// Cap on rendered result rows (per statement). The full result still sits
 /// in memory until FRE-33 introduces streaming/limits at the query layer,
@@ -36,6 +36,10 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
         .map(|c| c.pool.dialect())
         .unwrap_or(Dialect::Sqlite);
     let editor_element = format!("sql-editor-{id:?}").replace(['(', ')'], "-");
+    let dialect_name = match dialect {
+        Dialect::Postgres => "postgres",
+        Dialect::Sqlite => "sqlite",
+    };
 
     // Mount CodeMirror once and pump its messages. The eval channel stays
     // open for the component's lifetime; unmounting destroys the JS view.
@@ -48,9 +52,11 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
             .get(&id)
             .map(|ui| ui.sql_text.clone())
             .unwrap_or_default();
-        let dialect_name = match dialect {
-            Dialect::Postgres => "postgres",
-            Dialect::Sqlite => "sqlite",
+        // Whatever the introspection has produced so far; the refresh
+        // effect below pushes updates once (re)loads finish.
+        let schema_json = match state.schemas.peek().get(&id) {
+            Some(SchemaLoad::Ready(tables)) => completion_schema(tables, dialect).to_string(),
+            _ => "{}".to_string(),
         };
         let initial_json = serde_json::to_string(&initial).unwrap_or_else(|_| "\"\"".into());
         spawn(async move {
@@ -58,7 +64,7 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
                 r#"
                 window.__dvRun = (p) => dioxus.send(JSON.stringify({{ kind: "run", sql: p.sql }}));
                 window.__dvDoc = (p) => dioxus.send(JSON.stringify({{ kind: "doc", doc: p.doc }}));
-                DVEditor.create("{element}", "{element}", "{dialect_name}", {initial_json});
+                DVEditor.create("{element}", "{element}", "{dialect_name}", {initial_json}, {schema_json});
                 "#
             );
             let mut channel = document::eval(&js);
@@ -76,6 +82,21 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
                 }
             }
         });
+    });
+
+    // Keep completion data in sync with schema reloads: reading the signal
+    // (not peeking) subscribes this effect, so it re-runs whenever
+    // `load_schema` rewrites the entry. While a reload is in flight
+    // (Loading) or failed, the editor keeps its previous completions.
+    let element_for_schema = editor_element.clone();
+    use_effect(move || {
+        let schema_json = match state.schemas.read().get(&id) {
+            Some(SchemaLoad::Ready(tables)) => completion_schema(tables, dialect).to_string(),
+            _ => return,
+        };
+        document::eval(&format!(
+            r#"DVEditor.updateSchema("{element_for_schema}", "{dialect_name}", {schema_json});"#
+        ));
     });
 
     let element_for_drop = editor_element.clone();
@@ -374,6 +395,36 @@ fn HistoryRow(id: ConnectionId, editor_element: String, entry: HistoryEntry) -> 
     }
 }
 
+/// Builds the completion namespace handed to lang-sql (its `SQLNamespace`
+/// shape): an object mapping table names — `"table"` on SQLite,
+/// `"schema.table"` on Postgres — to arrays of column names. lang-sql splits
+/// keys on unescaped dots, so literal dots inside identifiers are escaped as
+/// `\.`; it also quote-applies any completion whose label needs quoting, so
+/// weird identifiers can be passed through as plain strings.
+fn completion_schema(tables: &[TableMeta], dialect: Dialect) -> serde_json::Value {
+    let mut namespace = serde_json::Map::new();
+    for table in tables {
+        let key = match (&dialect, &table.schema) {
+            (Dialect::Postgres, Some(schema)) => {
+                format!("{}.{}", escape_dots(schema), escape_dots(&table.name))
+            }
+            _ => escape_dots(&table.name),
+        };
+        let columns: Vec<serde_json::Value> = table
+            .columns
+            .iter()
+            .map(|c| serde_json::Value::String(c.name.clone()))
+            .collect();
+        namespace.insert(key, serde_json::Value::Array(columns));
+    }
+    serde_json::Value::Object(namespace)
+}
+
+/// Escapes literal dots in an identifier for use in an `SQLNamespace` key.
+fn escape_dots(name: &str) -> String {
+    name.replace('.', "\\.")
+}
+
 /// Formats a unix timestamp in local time: bare `HH:MM:SS` for today,
 /// date-prefixed for older entries.
 fn format_history_time(unix_secs: i64) -> String {
@@ -503,5 +554,91 @@ fn ResultCell(value: Value) -> Element {
         td { class,
             div { class: "max-w-md truncate", title: "{display}", "{display}" }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{ColumnMeta, TableKind};
+    use serde_json::json;
+
+    fn table(schema: Option<&str>, name: &str, columns: &[&str]) -> TableMeta {
+        TableMeta {
+            schema: schema.map(Into::into),
+            name: name.into(),
+            kind: TableKind::Table,
+            columns: columns
+                .iter()
+                .map(|c| ColumnMeta {
+                    name: (*c).into(),
+                    type_name: "TEXT".into(),
+                    nullable: true,
+                    primary_key_position: None,
+                    default: None,
+                })
+                .collect(),
+            indexes: vec![],
+            foreign_keys: vec![],
+        }
+    }
+
+    #[test]
+    fn sqlite_schema_uses_flat_table_names() {
+        let tables = [
+            table(None, "artists", &["id", "name"]),
+            table(None, "albums", &["id", "artist_id", "title"]),
+        ];
+        assert_eq!(
+            completion_schema(&tables, Dialect::Sqlite),
+            json!({
+                "artists": ["id", "name"],
+                "albums": ["id", "artist_id", "title"],
+            })
+        );
+    }
+
+    #[test]
+    fn postgres_schema_qualifies_table_names() {
+        let tables = [
+            table(Some("public"), "users", &["id", "email"]),
+            table(Some("audit"), "events", &["id", "at"]),
+        ];
+        assert_eq!(
+            completion_schema(&tables, Dialect::Postgres),
+            json!({
+                "public.users": ["id", "email"],
+                "audit.events": ["id", "at"],
+            })
+        );
+    }
+
+    #[test]
+    fn postgres_table_without_schema_stays_flat() {
+        let tables = [table(None, "loners", &["id"])];
+        assert_eq!(
+            completion_schema(&tables, Dialect::Postgres),
+            json!({ "loners": ["id"] })
+        );
+    }
+
+    #[test]
+    fn dots_in_identifiers_are_escaped_for_the_namespace() {
+        // lang-sql splits namespace keys on unescaped dots, so a literal dot
+        // in a schema or table name must arrive as `\.`.
+        let tables = [table(
+            Some("odd.schema"),
+            "weird.table",
+            &["a b", "sel.ect"],
+        )];
+        assert_eq!(
+            completion_schema(&tables, Dialect::Postgres),
+            json!({ r"odd\.schema.weird\.table": ["a b", "sel.ect"] })
+        );
+    }
+
+    #[test]
+    fn empty_schema_serializes_to_an_empty_object() {
+        assert_eq!(completion_schema(&[], Dialect::Sqlite), json!({}));
     }
 }
