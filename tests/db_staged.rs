@@ -527,6 +527,117 @@ async fn postgres_staged_text_values_coerce_to_column_types() {
     pool.close().await;
 }
 
+/// Regression for the char(n) truncation bug: `information_schema` reports
+/// a `character(3)` column as just "character", and `$1::character` means
+/// char(1) — the cast would silently truncate "xyz" to 'x' on SET, and a
+/// char(n) key column cast in the WHERE clause would never match its row
+/// (aborting every save). The builder must leave these params uncast;
+/// Postgres's assignment/comparison coercion then applies the column's
+/// true modifier.
+#[tokio::test]
+async fn postgres_char_n_columns_round_trip_uncast() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    for sql in [
+        "DROP SCHEMA IF EXISTS staged_charn CASCADE",
+        "CREATE SCHEMA staged_charn",
+        // char(3) both as a plain column AND as the identity key.
+        "CREATE TABLE staged_charn.items (
+            code character(3) PRIMARY KEY,
+            label text NOT NULL,
+            tag character(3)
+        )",
+        "INSERT INTO staged_charn.items VALUES ('abc', 'one', 'aaa')",
+    ] {
+        pool.query(sql).await.unwrap();
+    }
+    let tables = pool.introspect().await.unwrap();
+    let items = find(&tables, Some("staged_charn"), "items").clone();
+    // The truncation trap must be armed for this test to mean anything:
+    // introspection reports the bare, modifier-less name.
+    assert_eq!(
+        items
+            .columns
+            .iter()
+            .find(|c| c.name == "tag")
+            .unwrap()
+            .type_name,
+        "character"
+    );
+    let identity = detect_row_identity(&items, Dialect::Postgres).unwrap();
+
+    // SET on a character(3) column keeps the full value, and the
+    // character(3) PRIMARY KEY addresses its row (guard passes).
+    let key = vec![Value::Text("abc".into())];
+    let changes = vec![
+        update(key.clone(), "tag", Value::Text("xyz".into())),
+        update(key, "label", Value::Text("two".into())),
+    ];
+    let counts = apply_staged(&pool, &items, &identity, &changes)
+        .await
+        .unwrap();
+    assert_eq!(counts.updated_rows, 1);
+
+    let check = pool
+        .query("SELECT label, tag FROM staged_charn.items WHERE code = 'abc'")
+        .await
+        .unwrap();
+    assert_eq!(check.rows[0][0], Value::Text("two".into()));
+    assert_eq!(
+        check.rows[0][1],
+        Value::Text("xyz".into()),
+        "character(3) SET must not truncate to char(1)"
+    );
+
+    pool.close().await;
+}
+
+/// bit(n) columns cannot take a text parameter at all (text → bit has no
+/// assignment cast, and `$1::bit` would mean bit(1)); with the cast
+/// skipped the save fails LOUDLY and rolls back — never a silent wrong
+/// value. Documented limitation until a dedicated bit editor exists.
+#[tokio::test]
+async fn postgres_bit_n_edit_fails_loudly_and_rolls_back() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    for sql in [
+        "DROP SCHEMA IF EXISTS staged_bitn CASCADE",
+        "CREATE SCHEMA staged_bitn",
+        "CREATE TABLE staged_bitn.items (
+            id integer PRIMARY KEY,
+            mask bit(3)
+        )",
+        "INSERT INTO staged_bitn.items VALUES (1, B'101')",
+    ] {
+        pool.query(sql).await.unwrap();
+    }
+    let tables = pool.introspect().await.unwrap();
+    let items = find(&tables, Some("staged_bitn"), "items").clone();
+    let identity = detect_row_identity(&items, Dialect::Postgres).unwrap();
+
+    let changes = vec![update(
+        vec![Value::Integer(1)],
+        "mask",
+        Value::Text("110".into()),
+    )];
+    let err = apply_staged(&pool, &items, &identity, &changes)
+        .await
+        .unwrap_err();
+    assert_eq!(err.change_index, Some(0), "the edit itself is named");
+
+    let check = pool
+        .query("SELECT mask::text FROM staged_bitn.items WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(
+        check.rows[0][0],
+        Value::Text("101".into()),
+        "failed bit edit must roll back, never store a wrong value"
+    );
+
+    pool.close().await;
+}
+
 /// INSERT values coerce through the same casts (FRE-25 will stage inserts
 /// with text values from the same editors).
 #[tokio::test]

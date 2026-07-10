@@ -20,8 +20,11 @@
 //! - `numeric` / `decimal` → validated number, staged as [`Value::Integer`]
 //!   when it parses as i64 and as [`Value::Text`] otherwise — an exact
 //!   decimal must not round-trip through f64
-//! - `int` / `serial` / `real` / `float` / `double` → validated number,
-//!   staged as [`Value::Integer`] or [`Value::Real`]
+//! - `int` / `serial` → validated **whole** number staged as
+//!   [`Value::Integer`]; fractional input is rejected inline (staging it
+//!   would silently round through the save-time `::integer` cast)
+//! - `real` / `float` / `double` → validated number, staged as
+//!   [`Value::Integer`] or [`Value::Real`]
 //! - everything else (including an empty/unknown declared type, and
 //!   Postgres `point`, whose `int` substring is explicitly ignored) → text
 //!
@@ -38,10 +41,8 @@ use crate::db::{Dialect, Value};
 pub enum EditorKind {
     /// Free-form text (also the fallback for unknown declared types).
     Text,
-    /// Validated number. `decimal` marks exact-precision columns
-    /// (numeric/decimal): non-integer input stays text so precision
-    /// survives (the backend casts it).
-    Numeric { decimal: bool },
+    /// Validated number; the flavor decides what may be staged.
+    Numeric { kind: NumericKind },
     /// Checkbox; the staged value is dialect-specific (see [`bool_value`]).
     Bool,
     /// Multiline text validated as JSON before staging.
@@ -50,6 +51,19 @@ pub enum EditorKind {
     DateTime,
     /// Blob/bytea columns are read-only for now.
     Blob,
+}
+
+/// Numeric column flavors, deciding how validated input is staged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumericKind {
+    /// int/serial family: only whole numbers may be staged — a fractional
+    /// value would silently round through the save-time `::integer` cast.
+    Integer,
+    /// real/float/double: stages [`Value::Integer`] or [`Value::Real`].
+    Float,
+    /// numeric/decimal: non-integer input is staged as the typed text so
+    /// exact precision never rounds through f64 (the backend casts it).
+    Exact,
 }
 
 /// Derives the editor kind from a declared column type (see the module docs
@@ -76,13 +90,19 @@ pub fn editor_kind(type_name: &str) -> EditorKind {
         return EditorKind::Text;
     }
     if t.contains("numeric") || t.contains("decimal") {
-        return EditorKind::Numeric { decimal: true };
+        return EditorKind::Numeric {
+            kind: NumericKind::Exact,
+        };
     }
-    if ["int", "serial", "real", "float", "double"]
-        .iter()
-        .any(|n| t.contains(n))
-    {
-        return EditorKind::Numeric { decimal: false };
+    if t.contains("int") || t.contains("serial") {
+        return EditorKind::Numeric {
+            kind: NumericKind::Integer,
+        };
+    }
+    if ["real", "float", "double"].iter().any(|n| t.contains(n)) {
+        return EditorKind::Numeric {
+            kind: NumericKind::Float,
+        };
     }
     EditorKind::Text
 }
@@ -127,7 +147,7 @@ pub fn parse_input(kind: EditorKind, dialect: Dialect, text: &str) -> Result<Val
             Ok(_) => Ok(Value::Text(text.to_string())),
             Err(err) => Err(format!("invalid JSON: {err}")),
         },
-        EditorKind::Numeric { decimal } => parse_numeric(text, decimal),
+        EditorKind::Numeric { kind } => parse_numeric(text, kind),
         EditorKind::Bool => Ok(bool_value(
             dialect,
             bool_checked(&Value::Text(text.trim().to_string())),
@@ -136,12 +156,17 @@ pub fn parse_input(kind: EditorKind, dialect: Dialect, text: &str) -> Result<Val
     }
 }
 
-/// Numeric validation: integers stage as [`Value::Integer`]; other numbers
-/// stage as [`Value::Real`] — except on exact-precision columns
-/// (`decimal`), where the original text is staged so e.g. a 30-digit
-/// numeric never rounds through f64. Non-numbers (and inf/NaN) are
-/// rejected.
-fn parse_numeric(text: &str, decimal: bool) -> Result<Value, String> {
+/// Numeric validation: whole numbers stage as [`Value::Integer`] on every
+/// flavor. Beyond that, per [`NumericKind`]:
+///
+/// - `Integer` rejects anything that is not an i64 — staging "1.5" for an
+///   integer column would silently round to 2 through the save-time
+///   `::integer` cast;
+/// - `Float` stages other finite numbers as [`Value::Real`];
+/// - `Exact` stages them as the typed text (no f64 round-trip).
+///
+/// Non-numbers (and inf/NaN) are rejected on every flavor.
+fn parse_numeric(text: &str, kind: NumericKind) -> Result<Value, String> {
     let t = text.trim();
     if t.is_empty() {
         return Err("enter a number (or use the ∅ NULL button)".to_string());
@@ -149,12 +174,10 @@ fn parse_numeric(text: &str, decimal: bool) -> Result<Value, String> {
     if let Ok(i) = t.parse::<i64>() {
         return Ok(Value::Integer(i));
     }
-    match t.parse::<f64>() {
-        Ok(f) if f.is_finite() => Ok(if decimal {
-            Value::Text(t.to_string())
-        } else {
-            Value::Real(f)
-        }),
+    match (kind, t.parse::<f64>()) {
+        (NumericKind::Integer, Ok(f)) if f.is_finite() => Err(format!("not a whole number: {t}")),
+        (NumericKind::Float, Ok(f)) if f.is_finite() => Ok(Value::Real(f)),
+        (NumericKind::Exact, Ok(f)) if f.is_finite() => Ok(Value::Text(t.to_string())),
         _ => Err(format!("not a number: {t}")),
     }
 }
@@ -248,6 +271,12 @@ pub fn CellEditor(
     // blur instead of running the Shift+Tab commit.
     let on_key = move |evt: KeyboardEvent| match evt.code() {
         Code::Enter | Code::NumpadEnter => {
+            // An IME composition is confirmed with Enter — that keystroke
+            // belongs to the composition, not to us, and must not commit
+            // and close the editor mid-input.
+            if evt.is_composing() {
+                return;
+            }
             if multiline && evt.modifiers().shift() {
                 return; // newline inside the JSON editor
             }
@@ -370,46 +399,35 @@ pub fn CellEditor(
 mod tests {
     use super::*;
 
+    const INTEGER: EditorKind = EditorKind::Numeric {
+        kind: NumericKind::Integer,
+    };
+    const FLOAT: EditorKind = EditorKind::Numeric {
+        kind: NumericKind::Float,
+    };
+    const EXACT: EditorKind = EditorKind::Numeric {
+        kind: NumericKind::Exact,
+    };
+
     #[test]
     fn editor_kinds_derive_from_type_substrings() {
         // SQLite declared types (arbitrary case, may carry parens).
-        assert_eq!(
-            editor_kind("INTEGER"),
-            EditorKind::Numeric { decimal: false }
-        );
+        assert_eq!(editor_kind("INTEGER"), INTEGER);
         assert_eq!(editor_kind("VARCHAR(40)"), EditorKind::Text);
         assert_eq!(editor_kind("BOOLEAN"), EditorKind::Bool);
         assert_eq!(editor_kind("BLOB"), EditorKind::Blob);
         assert_eq!(editor_kind("DATETIME"), EditorKind::DateTime);
-        assert_eq!(
-            editor_kind("DECIMAL(10,5)"),
-            EditorKind::Numeric { decimal: true }
-        );
+        assert_eq!(editor_kind("DECIMAL(10,5)"), EXACT);
         // SQLite columns may have no declared type at all.
         assert_eq!(editor_kind(""), EditorKind::Text);
 
         // Postgres information_schema data_type strings.
-        assert_eq!(
-            editor_kind("integer"),
-            EditorKind::Numeric { decimal: false }
-        );
-        assert_eq!(
-            editor_kind("smallint"),
-            EditorKind::Numeric { decimal: false }
-        );
-        assert_eq!(
-            editor_kind("bigserial"),
-            EditorKind::Numeric { decimal: false }
-        );
-        assert_eq!(
-            editor_kind("double precision"),
-            EditorKind::Numeric { decimal: false }
-        );
-        assert_eq!(editor_kind("real"), EditorKind::Numeric { decimal: false });
-        assert_eq!(
-            editor_kind("numeric"),
-            EditorKind::Numeric { decimal: true }
-        );
+        assert_eq!(editor_kind("integer"), INTEGER);
+        assert_eq!(editor_kind("smallint"), INTEGER);
+        assert_eq!(editor_kind("bigserial"), INTEGER);
+        assert_eq!(editor_kind("double precision"), FLOAT);
+        assert_eq!(editor_kind("real"), FLOAT);
+        assert_eq!(editor_kind("numeric"), EXACT);
         assert_eq!(editor_kind("boolean"), EditorKind::Bool);
         assert_eq!(editor_kind("json"), EditorKind::Json);
         assert_eq!(editor_kind("jsonb"), EditorKind::Json);
@@ -431,8 +449,8 @@ mod tests {
 
     #[test]
     fn numeric_input_stages_integer_real_or_exact_text() {
-        let float = |s| parse_numeric(s, false);
-        let exact = |s| parse_numeric(s, true);
+        let float = |s| parse_numeric(s, NumericKind::Float);
+        let exact = |s| parse_numeric(s, NumericKind::Exact);
         assert_eq!(float("42"), Ok(Value::Integer(42)));
         assert_eq!(float(" -7 "), Ok(Value::Integer(-7)));
         assert_eq!(float("1.5"), Ok(Value::Real(1.5)));
@@ -451,6 +469,26 @@ mod tests {
         assert!(float("inf").is_err());
         assert!(float("NaN").is_err());
         assert!(exact("12,5").is_err());
+    }
+
+    #[test]
+    fn integer_columns_reject_fractional_input() {
+        let integer = |s| parse_numeric(s, NumericKind::Integer);
+        assert_eq!(integer("42"), Ok(Value::Integer(42)));
+        assert_eq!(integer(" -7 "), Ok(Value::Integer(-7)));
+        // Fractional (or any non-i64) input must not stage: the save-time
+        // ::integer cast would silently round "1.5" to 2.
+        let err = integer("1.5").unwrap_err();
+        assert!(err.contains("whole number"), "got: {err}");
+        assert!(integer("1e3").is_err(), "scientific notation is not i64");
+        assert!(integer("abc").is_err());
+        assert!(integer("").is_err());
+        // Same rule through the public parse_input path.
+        assert!(parse_input(INTEGER, Dialect::Postgres, "2.75").is_err());
+        assert_eq!(
+            parse_input(INTEGER, Dialect::Sqlite, "12"),
+            Ok(Value::Integer(12))
+        );
     }
 
     #[test]
