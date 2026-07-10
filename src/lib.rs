@@ -3,4 +3,5 @@
 //! binary entry point.
 
 pub mod db;
+pub mod ui;
 pub mod util;
