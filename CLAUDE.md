@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`dataview` is a Dioxus 0.7 **desktop-only** app (Rust). Do not add web or mobile platform support.
+`dataview` is a **desktop-only database viewer** (SQLite and Postgres, via sqlx) built with Dioxus 0.7 (Rust). Do not add web or mobile platform support. Work is tracked in the Linear project "dataview" (team FRE).
 
 ## Commands
 
@@ -14,6 +14,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Tailwind is compiled automatically by `dx serve` (Dioxus 0.7+): it picks up `tailwind.css` next to Cargo.toml and outputs to `assets/tailwind.css`. No npm/Tailwind CLI setup is needed.
 
 There are no tests yet; if added, run with `cargo test`.
+
+When a live database server (e.g. Postgres) is needed for testing or development, run it in Docker — never install or run database servers directly on the host.
 
 ## Interactive testing (screenshots + clicking)
 
@@ -28,6 +30,15 @@ import -display :2 -window root shot.png                                     # s
 ```
 
 Driving the app directly on the desktop half-works and isn't worth it: `spectacle -b -n -a -o shot.png` captures windows and `xdotool key` reaches XWayland windows (after a one-time KDE "Remote Control" approval), but KWin ignores XTEST pointer events, so mouse control is impossible outside Xephyr.
+
+## Issue workflow
+
+Work is tracked in Linear (team FRE). Docs-only changes (CLAUDE.md, README, etc.) may be committed directly to `main`; all other work follows this flow:
+
+1. Move the Linear issue to In Progress. Create a **git worktree** on the issue's branch (use Linear's suggested branch name, e.g. `lokander/fre-5-set-up-async-database-layer`), and do all work there.
+2. Commit (conventional, subject-only), push the branch, and open a **GitHub PR** with `gh pr create`. Reference the issue ID (e.g. FRE-5) in the PR so Linear links it.
+3. Spawn a **subagent to review the PR** (correctness, the Dioxus 0.7 rules above, scope vs the issue). Post its findings on the PR. Blocking findings must be fixed and re-reviewed; only proceed once the review approves.
+4. **Rebase-merge** the PR (`gh pr merge --rebase`), delete the branch, remove the worktree, and move the issue to Done.
 
 ## Commits
 
