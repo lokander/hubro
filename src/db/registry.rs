@@ -8,6 +8,7 @@ use super::page::{Dialect, PageRequest};
 use super::postgres;
 use super::schema::TableMeta;
 use super::sqlite;
+use super::staged::CheckedStatement;
 use super::value::{QueryResult, Value};
 
 /// Stable handle for one open connection (one tab in the UI).
@@ -61,18 +62,38 @@ impl DbPool {
     /// when the affected-row count is exactly `expected_rows`; otherwise
     /// rolls back and returns [`DbError::RowCountMismatch`]. Row edits go
     /// through this so a statement that would touch more rows than the one
-    /// being edited can never commit.
+    /// being edited can never commit. (One-statement convenience over
+    /// [`Self::execute_all_checked`].)
     pub async fn execute_checked(
         &self,
         sql: &str,
         params: &[Value],
         expected_rows: u64,
     ) -> Result<u64, DbError> {
+        let statement = CheckedStatement {
+            sql: sql.to_string(),
+            params: params.to_vec(),
+            expected_rows,
+        };
+        self.execute_all_checked(std::slice::from_ref(&statement))
+            .await
+            .map(|()| expected_rows)
+            .map_err(|(_, error)| error)
+    }
+
+    /// Executes every statement inside ONE transaction, committing only when
+    /// each affected exactly its expected row count. Any failure rolls the
+    /// whole batch back; the error names the failing statement by index
+    /// (`None` when opening or committing the transaction itself failed).
+    /// Staged edits (FRE-14) apply through this so a batch either lands
+    /// completely or not at all.
+    pub async fn execute_all_checked(
+        &self,
+        statements: &[CheckedStatement],
+    ) -> Result<(), (Option<usize>, DbError)> {
         match self {
-            DbPool::Sqlite(pool) => sqlite::execute_checked(pool, sql, params, expected_rows).await,
-            DbPool::Postgres(pool) => {
-                postgres::execute_checked(pool, sql, params, expected_rows).await
-            }
+            DbPool::Sqlite(pool) => sqlite::execute_all_checked(pool, statements).await,
+            DbPool::Postgres(pool) => postgres::execute_all_checked(pool, statements).await,
         }
     }
 

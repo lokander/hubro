@@ -14,6 +14,7 @@ fn request(table: &str) -> PageRequest {
         offset: 0,
         sort: None,
         filter: None,
+        extra_key_column: None,
     }
 }
 
@@ -236,6 +237,7 @@ async fn paging_works_on_tables_and_columns_with_weird_names() {
             op: FilterOp::Contains,
             value: "row".into(),
         }),
+        extra_key_column: None,
     };
     assert_eq!(pool.count_rows(&req).await.unwrap(), 3);
     let page = pool.fetch_page(&req).await.unwrap();

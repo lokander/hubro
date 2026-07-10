@@ -6,12 +6,13 @@ use dioxus::prelude::*;
 
 use crate::config::{default_config_path, SavedConnection, SavedList};
 use crate::db::{
-    needs_confirmation, run_script, split_statements, url_target, url_via_local_port,
-    url_with_password, ConnectionId, ConnectionRegistry, DbError, DbPool, StatementResult,
-    TableMeta,
+    apply_staged, detect_row_identity, needs_confirmation, run_script, split_statements,
+    url_target, url_via_local_port, url_with_password, ConnectionId, ConnectionRegistry, DbError,
+    DbPool, RowLocator, StatementResult, TableMeta, Value,
 };
 use crate::history::HistoryStore;
 use crate::tunnel::{Tunnel, TunnelAuth, TunnelConfig, TunnelError};
+use crate::ui::stage::TableStage;
 
 /// Which screen the main panel shows: the connections screen or one open
 /// connection tab.
@@ -60,6 +61,22 @@ pub enum Pane {
     #[default]
     Browser,
     Sql,
+}
+
+/// A navigation the unsaved-changes guard intercepted (see
+/// [`AppState::nav_guard`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingNav {
+    pub id: ConnectionId,
+    pub action: NavAction,
+}
+
+/// The navigations guarded against unsaved staged edits.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NavAction {
+    SelectTable(TableRef),
+    SetPane(Pane),
+    CloseConnection,
 }
 
 /// Per-tab UI state that must survive tab switches.
@@ -183,6 +200,26 @@ pub struct AppState {
     pub schemas: Signal<HashMap<ConnectionId, SchemaLoad>>,
     /// Sidebar/grid UI state per open connection.
     pub tab_ui: Signal<HashMap<ConnectionId, TabUi>>,
+    /// Staged (unsaved) edits per connection, keyed by [`TableRef::key`].
+    /// FRE-24/25 push changes in via [`Self::stage_cell_edit`] /
+    /// [`Self::stage_insert`] / [`Self::stage_delete`]; [`Self::save_staged`]
+    /// applies a table's stage in one transaction.
+    pub staged: Signal<HashMap<ConnectionId, HashMap<String, TableStage>>>,
+    /// Per-table grid refresh nonce, keyed by (connection,
+    /// [`TableRef::key`]). Lifted out of the grid component so a successful
+    /// save can force a refetch; the grid's Refresh button bumps it too.
+    /// (The grid's resource reads the whole map, so a bump for one table
+    /// re-runs any mounted grid's fetch — harmless, since only the selected
+    /// table's grid is mounted.)
+    pub grid_refresh: Signal<HashMap<(ConnectionId, String), u64>>,
+    /// Two-step unsaved-changes guard. Navigating away from staged edits
+    /// (selecting another table, switching panes, closing the tab) does not
+    /// happen immediately: the first attempt parks the intent here and the
+    /// grid's Save bar shows a blocking notice; repeating the *same* action
+    /// discards the affected stage(s) and proceeds. Any other action —
+    /// saving, discarding, staging more edits, or a different navigation —
+    /// replaces or clears the parked intent.
+    pub nav_guard: Signal<Option<PendingNav>>,
     /// Latest free-form SQL result per connection.
     pub sql_runs: Signal<HashMap<ConnectionId, SqlRun>>,
     /// Scripts containing writes, held here until the user confirms (or
@@ -237,6 +274,10 @@ impl AppState {
             tunnels: Signal::new(HashMap::new()),
             schemas: Signal::new(HashMap::new()),
             tab_ui: Signal::new(HashMap::new()),
+            // Root-scoped: written from the spawn_forever save task.
+            staged: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            grid_refresh: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            nav_guard: Signal::new(None),
             sql_runs: Signal::new(HashMap::new()),
             pending_sql: Signal::new(HashMap::new()),
             sql_tasks: Signal::new(HashMap::new()),
@@ -657,8 +698,37 @@ impl AppState {
         });
     }
 
-    /// Switches a tab between the data browser and the SQL editor.
+    /// Switches a tab between the data browser and the SQL editor. Guarded:
+    /// leaving the browser while the selected table has staged edits takes
+    /// two attempts (see [`Self::nav_guard`]); the second discards them.
     pub fn set_pane(mut self, id: ConnectionId, pane: Pane) {
+        let (current_pane, selected) = {
+            let tab_ui = self.tab_ui.read();
+            let ui = tab_ui.get(&id);
+            (
+                ui.map(|ui| ui.pane).unwrap_or_default(),
+                ui.and_then(|ui| ui.selected_table.clone()),
+            )
+        };
+        if current_pane == pane {
+            return;
+        }
+        if current_pane == Pane::Browser {
+            if let Some(table) = &selected {
+                if self.stage_dirty(id, table) {
+                    let intent = PendingNav {
+                        id,
+                        action: NavAction::SetPane(pane),
+                    };
+                    if self.nav_guard.read().as_ref() != Some(&intent) {
+                        self.nav_guard.set(Some(intent));
+                        return;
+                    }
+                    self.discard_staged(id, table);
+                }
+            }
+        }
+        self.nav_guard.set(None);
         self.tab_ui.write().entry(id).or_default().pane = pane;
     }
 
@@ -868,8 +938,32 @@ impl AppState {
         });
     }
 
-    /// Marks a table as selected in one tab's sidebar.
+    /// Marks a table as selected in one tab's sidebar. Guarded: switching
+    /// away from a table with staged edits takes two attempts (see
+    /// [`Self::nav_guard`]); the second discards them and switches.
     pub fn select_table(mut self, id: ConnectionId, table: &TableRef) {
+        let current = self
+            .tab_ui
+            .read()
+            .get(&id)
+            .and_then(|ui| ui.selected_table.clone());
+        if current.as_ref() == Some(table) {
+            return;
+        }
+        if let Some(current_table) = &current {
+            if self.stage_dirty(id, current_table) {
+                let intent = PendingNav {
+                    id,
+                    action: NavAction::SelectTable(table.clone()),
+                };
+                if self.nav_guard.read().as_ref() != Some(&intent) {
+                    self.nav_guard.set(Some(intent));
+                    return;
+                }
+                self.discard_staged(id, current_table);
+            }
+        }
+        self.nav_guard.set(None);
         self.tab_ui.write().entry(id).or_default().selected_table = Some(table.clone());
     }
 
@@ -882,10 +976,216 @@ impl AppState {
             .toggle_expanded(table);
     }
 
+    /// Stages a cell edit (FRE-24 pushes edits in through this). Edits
+    /// coalesce per `(row, column)` — the last staged value wins.
+    pub fn stage_cell_edit(
+        mut self,
+        id: ConnectionId,
+        table: &TableRef,
+        locator: RowLocator,
+        column: &str,
+        value: Value,
+    ) {
+        self.nav_guard.set(None);
+        self.staged
+            .write()
+            .entry(id)
+            .or_default()
+            .entry(table.key())
+            .or_default()
+            .set_cell_edit(locator, column, value);
+    }
+
+    /// Stages a row insert (FRE-25 pushes inserts in through this).
+    pub fn stage_insert(
+        mut self,
+        id: ConnectionId,
+        table: &TableRef,
+        columns: Vec<String>,
+        values: Vec<Value>,
+    ) {
+        self.nav_guard.set(None);
+        self.staged
+            .write()
+            .entry(id)
+            .or_default()
+            .entry(table.key())
+            .or_default()
+            .add_insert(columns, values);
+    }
+
+    /// Stages a row delete (FRE-25 pushes deletes in through this).
+    pub fn stage_delete(mut self, id: ConnectionId, table: &TableRef, locator: RowLocator) {
+        self.nav_guard.set(None);
+        self.staged
+            .write()
+            .entry(id)
+            .or_default()
+            .entry(table.key())
+            .or_default()
+            .mark_delete(locator);
+    }
+
+    /// The current stage of one table view, if any (cloned for rendering).
+    pub fn table_stage(&self, id: ConnectionId, table: &TableRef) -> Option<TableStage> {
+        self.staged
+            .read()
+            .get(&id)
+            .and_then(|tables| tables.get(&table.key()))
+            .cloned()
+    }
+
+    /// Discards all staged changes of one table view.
+    pub fn discard_staged(mut self, id: ConnectionId, table: &TableRef) {
+        self.nav_guard.set(None);
+        let mut staged = self.staged.write();
+        if let Some(tables) = staged.get_mut(&id) {
+            tables.remove(&table.key());
+            if tables.is_empty() {
+                staged.remove(&id);
+            }
+        }
+    }
+
+    /// Whether one table view has pending staged changes.
+    fn stage_dirty(&self, id: ConnectionId, table: &TableRef) -> bool {
+        self.staged
+            .read()
+            .get(&id)
+            .and_then(|tables| tables.get(&table.key()))
+            .is_some_and(|stage| !stage.is_empty())
+    }
+
+    /// Whether any table of the connection has pending staged changes.
+    fn any_stage_dirty(&self, id: ConnectionId) -> bool {
+        self.staged
+            .read()
+            .get(&id)
+            .is_some_and(|tables| tables.values().any(|stage| !stage.is_empty()))
+    }
+
+    /// Forces the grid of one table to refetch (used by the grid's Refresh
+    /// button and by [`Self::save_staged`] after a successful apply).
+    pub fn bump_grid_refresh(mut self, id: ConnectionId, table_key: &str) {
+        let mut refresh = self.grid_refresh.write();
+        *refresh.entry((id, table_key.to_string())).or_insert(0) += 1;
+    }
+
+    /// Applies one table's staged changes in ONE transaction, in the
+    /// background. On success the stage is cleared and the grid refetches;
+    /// on failure the stage stays intact (so the user can fix or discard)
+    /// and the Save bar shows which change failed.
+    pub fn save_staged(mut self, id: ConnectionId, table: &TableRef) {
+        let table_key = table.key();
+        // Snapshot the normalized change list and flip the in-flight flag —
+        // one scoped write, nothing spans the await below.
+        let changes = {
+            let mut staged = self.staged.write();
+            let Some(stage) = staged.get_mut(&id).and_then(|t| t.get_mut(&table_key)) else {
+                return;
+            };
+            if stage.saving || stage.is_empty() {
+                return;
+            }
+            stage.saving = true;
+            stage.last_error = None;
+            stage.changes()
+        };
+        self.nav_guard.set(None);
+        let pool = self.registry.read().get(id).map(|c| c.pool.clone());
+        let meta = self.schemas.read().get(&id).and_then(|load| match load {
+            SchemaLoad::Ready(tables) => tables
+                .iter()
+                .find(|t| t.name == table.name && t.schema == table.schema)
+                .cloned(),
+            _ => None,
+        });
+        let (Some(pool), Some(meta)) = (pool, meta) else {
+            self.fail_save(
+                id,
+                &table_key,
+                "connection or schema no longer available".into(),
+            );
+            return;
+        };
+        let Some(identity) = detect_row_identity(&meta, pool.dialect()) else {
+            self.fail_save(
+                id,
+                &table_key,
+                "this table has no usable row identity — it is read-only".into(),
+            );
+            return;
+        };
+        // spawn_forever: the save must survive the grid unmounting (e.g. a
+        // guarded navigation completing while the apply runs).
+        spawn_forever(async move {
+            let result = apply_staged(&pool, &meta, &identity, &changes).await;
+            match result {
+                Ok(_counts) => {
+                    {
+                        let mut staged = self.staged.write();
+                        if let Some(tables) = staged.get_mut(&id) {
+                            tables.remove(&table_key);
+                            if tables.is_empty() {
+                                staged.remove(&id);
+                            }
+                        }
+                    }
+                    self.bump_grid_refresh(id, &table_key);
+                }
+                Err(err) => {
+                    // Name the failing change so the user can find it: the
+                    // index points into the same normalized list the stage
+                    // still holds.
+                    let message = match err.change_index.and_then(|i| changes.get(i)) {
+                        Some(change) => format!(
+                            "change {} of {} ({}) failed: {} — nothing was applied",
+                            err.change_index.unwrap_or(0) + 1,
+                            changes.len(),
+                            change.describe(),
+                            err.message
+                        ),
+                        None => format!("{} — nothing was applied", err.message),
+                    };
+                    self.fail_save(id, &table_key, message);
+                }
+            }
+        });
+    }
+
+    /// Records a failed save on the stage (kept intact) and re-enables Save.
+    fn fail_save(mut self, id: ConnectionId, table_key: &str, message: String) {
+        let mut staged = self.staged.write();
+        if let Some(stage) = staged.get_mut(&id).and_then(|t| t.get_mut(table_key)) {
+            stage.saving = false;
+            stage.last_error = Some(message);
+        }
+    }
+
     /// Closes a tab: drops it from the registry, closes the pool in the
     /// background, shuts down its SSH tunnel (if any), and leaves the view
     /// somewhere sensible.
+    ///
+    /// Guarded: closing while ANY table of the connection has staged edits
+    /// takes two attempts (see [`Self::nav_guard`]) — closing is the one
+    /// navigation that actually destroys them. The notice renders in the
+    /// dirty table's Save bar, so when another pane or tab is in front the
+    /// first click can look inert; the second click still closes. A
+    /// deliberate simplification, kept until a global toast/dialog exists.
     pub fn close_connection(mut self, id: ConnectionId) {
+        if self.any_stage_dirty(id) {
+            let intent = PendingNav {
+                id,
+                action: NavAction::CloseConnection,
+            };
+            if self.nav_guard.read().as_ref() != Some(&intent) {
+                self.nav_guard.set(Some(intent));
+                return;
+            }
+        }
+        self.nav_guard.set(None);
+        self.staged.write().remove(&id);
+        self.grid_refresh.write().retain(|(conn, _), _| *conn != id);
         let removed = self.registry.write().remove(id);
         if let Some(connection) = removed {
             // spawn_forever so the close isn't cancelled if the calling

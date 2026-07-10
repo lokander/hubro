@@ -13,6 +13,7 @@ use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
 
 use super::error::DbError;
 use super::schema::{ColumnMeta, ForeignKeyMeta, IndexMeta, TableKind, TableMeta};
+use super::staged::CheckedStatement;
 use super::value::{ColumnInfo, QueryResult, Value};
 
 /// Splices a password into a Postgres URL (percent-encoding handled by the
@@ -151,11 +152,13 @@ type PgQuery<'q> = sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArgu
 
 /// Binds backend-neutral [`Value`] parameters onto a prepared query.
 ///
-/// FRE-24 caveat: `Value::Null` binds as `None::<String>`, i.e. a NULL of
+/// NULL caveat: `Value::Null` binds as `None::<String>`, i.e. a NULL of
 /// type text. That is fine for the current uses (filter values are text),
 /// but Postgres rejects a text NULL for non-text columns in e.g.
-/// `SET col = $n` — cell editing will need typed NULLs (or an explicit
-/// `$n::type` cast in the generated SQL).
+/// `SET col = $n`. Cell editing solves this at the SQL level: the staged
+/// SQL builders (`staged::ParamSql::value_sql`) render NULL values inline
+/// as the literal `NULL` instead of binding them, so a NULL never reaches
+/// this function from an edit.
 fn bind_params<'q>(mut query: PgQuery<'q>, params: &[Value]) -> PgQuery<'q> {
     for param in params {
         query = match param {
@@ -212,38 +215,51 @@ pub async fn execute(pool: &PgPool, sql: &str) -> Result<u64, DbError> {
         .map_err(|e| query_error(e, sql))
 }
 
-/// Executes a parameterized write inside a transaction and commits only when
-/// it affected exactly `expected_rows` rows; any other count rolls back and
-/// surfaces [`DbError::RowCountMismatch`]. This is the safety net for row
-/// edits: a WHERE clause that unexpectedly matches more (or fewer) rows than
-/// the one being edited must never commit.
-pub async fn execute_checked(
+/// Executes parameterized writes inside ONE transaction, committing only
+/// when every statement affected exactly its `expected_rows` rows. Any SQL
+/// error or count mismatch rolls the whole batch back; the error carries the
+/// index of the failing statement (`None` for begin/commit failures, which
+/// belong to no statement). This is the safety net for row edits: a WHERE
+/// clause that unexpectedly matches more (or fewer) rows than the one being
+/// edited must never commit — and with staged edits (FRE-14), neither may
+/// any sibling change in the same batch.
+pub async fn execute_all_checked(
     pool: &PgPool,
-    sql: &str,
-    params: &[Value],
-    expected_rows: u64,
-) -> Result<u64, DbError> {
+    statements: &[CheckedStatement],
+) -> Result<(), (Option<usize>, DbError)> {
     let mut tx = pool
         .begin()
         .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-    let done = bind_params(sqlx::query(sql), params)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| query_error(e, sql))?;
-    let affected = done.rows_affected();
-    if affected != expected_rows {
+        .map_err(|e| (None, DbError::Query(e.to_string())))?;
+    for (index, statement) in statements.iter().enumerate() {
+        let result = bind_params(sqlx::query(&statement.sql), &statement.params)
+            .execute(&mut *tx)
+            .await;
         // Dropping the transaction would roll back too; do it explicitly and
-        // ignore secondary errors — the mismatch is what the caller needs.
-        let _ = tx.rollback().await;
-        return Err(DbError::RowCountMismatch(format!(
-            "statement affected {affected} rows, expected {expected_rows} — rolled back"
-        )));
+        // ignore secondary errors — the original failure is what the caller
+        // needs.
+        let done = match result {
+            Ok(done) => done,
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err((Some(index), query_error(e, &statement.sql)));
+            }
+        };
+        let affected = done.rows_affected();
+        if affected != statement.expected_rows {
+            let _ = tx.rollback().await;
+            return Err((
+                Some(index),
+                DbError::RowCountMismatch(format!(
+                    "statement affected {affected} rows, expected {} — rolled back",
+                    statement.expected_rows
+                )),
+            ));
+        }
     }
     tx.commit()
         .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-    Ok(affected)
+        .map_err(|e| (None, DbError::Query(e.to_string())))
 }
 
 /// Builds a query error, appending "line L, column C" when the server

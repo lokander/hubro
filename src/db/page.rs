@@ -42,6 +42,12 @@ pub struct PageRequest {
     pub offset: u64,
     pub sort: Option<(String, SortDir)>,
     pub filter: Option<Filter>,
+    /// Extra column selected ahead of `*`, e.g. `SELECT "rowid", * FROM …`.
+    /// Used for SQLite tables whose row identity is the implicit rowid
+    /// ([`RowIdentity::Rowid`](super::rowkey::RowIdentity::Rowid)): the
+    /// rowid is not part of `*`, but staged edits need it in every fetched
+    /// row to build row locators. The grid hides the column from display.
+    pub extra_key_column: Option<String>,
 }
 
 /// SQL flavor differences the page builder must care about.
@@ -71,8 +77,12 @@ impl PageRequest {
             }
             None => String::new(),
         };
+        let extra = match &self.extra_key_column {
+            Some(column) => format!("{}, ", quote_ident(column)),
+            None => String::new(),
+        };
         let sql = format!(
-            "SELECT * FROM {}{where_clause}{order} LIMIT {} OFFSET {}",
+            "SELECT {extra}* FROM {}{where_clause}{order} LIMIT {} OFFSET {}",
             self.qualified_table(),
             self.limit,
             self.offset,
@@ -146,6 +156,7 @@ mod tests {
             offset: 200,
             sort: None,
             filter: None,
+            extra_key_column: None,
         }
     }
 
@@ -197,6 +208,21 @@ mod tests {
             "SELECT * FROM \"tracks\" WHERE \"name\" LIKE ? ESCAPE '\\' LIMIT 100 OFFSET 200"
         );
         assert_eq!(params, vec![Value::Text("%50\\%\\_\\\\%".into())]);
+    }
+
+    #[test]
+    fn extra_key_column_is_selected_ahead_of_star() {
+        let mut req = base();
+        req.extra_key_column = Some("rowid".into());
+        let (sql, params) = req.select_sql(Dialect::Sqlite);
+        assert_eq!(
+            sql,
+            "SELECT \"rowid\", * FROM \"tracks\" LIMIT 100 OFFSET 200"
+        );
+        assert!(params.is_empty());
+        // COUNT(*) is unaffected.
+        let (count_sql, _) = req.count_sql(Dialect::Sqlite);
+        assert_eq!(count_sql, "SELECT COUNT(*) FROM \"tracks\"");
     }
 
     #[test]

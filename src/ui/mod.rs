@@ -5,9 +5,11 @@ mod editor;
 mod grid;
 mod shell;
 mod sidebar;
+pub mod stage;
 mod state;
 
-pub use state::{tab_title, ActiveView, AppState};
+pub use stage::TableStage;
+pub use state::{tab_title, ActiveView, AppState, TableRef};
 
 use dioxus::prelude::*;
 
