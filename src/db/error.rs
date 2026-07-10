@@ -10,12 +10,18 @@ pub enum DbError {
     Query(String),
     /// Reading schema metadata failed.
     Introspect(String),
+    /// A guarded write affected an unexpected number of rows and was rolled
+    /// back (see [`DbPool::execute_checked`](super::DbPool::execute_checked)).
+    RowCountMismatch(String),
 }
 
 impl DbError {
     pub fn message(&self) -> &str {
         match self {
-            DbError::Connect(m) | DbError::Query(m) | DbError::Introspect(m) => m,
+            DbError::Connect(m)
+            | DbError::Query(m)
+            | DbError::Introspect(m)
+            | DbError::RowCountMismatch(m) => m,
         }
     }
 }
@@ -26,6 +32,7 @@ impl fmt::Display for DbError {
             DbError::Connect(m) => write!(f, "connection failed: {m}"),
             DbError::Query(m) => write!(f, "query failed: {m}"),
             DbError::Introspect(m) => write!(f, "schema introspection failed: {m}"),
+            DbError::RowCountMismatch(m) => write!(f, "write aborted: {m}"),
         }
     }
 }

@@ -1,8 +1,11 @@
 use dioxus::prelude::*;
 
-use crate::db::{ConnectionId, Filter, FilterOp, PageRequest, QueryResult, SortDir, Value};
+use crate::db::{
+    detect_row_identity, ConnectionId, Filter, FilterOp, PageRequest, QueryResult, SortDir,
+    TableKind, TableMeta, Value,
+};
 
-use super::state::{AppState, TableRef};
+use super::state::{AppState, SchemaLoad, TableRef};
 
 const PAGE_SIZE: u32 = 100;
 
@@ -49,20 +52,37 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         }
     });
 
-    // Column names for the filter dropdown and header fallback: prefer the
-    // introspected schema so headers exist even for zero-row results.
-    let schema_columns: Vec<String> = state
-        .schemas
-        .read()
-        .get(&id)
-        .and_then(|load| match load {
-            super::state::SchemaLoad::Ready(tables) => tables
-                .iter()
-                .find(|t| t.name == table.name && t.schema == table.schema)
-                .map(|t| t.columns.iter().map(|c| c.name.clone()).collect()),
-            _ => None,
-        })
+    // Introspected metadata for this table: column names feed the filter
+    // dropdown and header fallback (so headers exist even for zero-row
+    // results), and row-identity detection decides the read-only notice.
+    let table_meta: Option<TableMeta> = state.schemas.read().get(&id).and_then(|load| match load {
+        SchemaLoad::Ready(tables) => tables
+            .iter()
+            .find(|t| t.name == table.name && t.schema == table.schema)
+            .cloned(),
+        _ => None,
+    });
+    let schema_columns: Vec<String> = table_meta
+        .as_ref()
+        .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
         .unwrap_or_default();
+
+    // Editing (FRE-24+) will consult the same detection; until then the
+    // notice explains up front why these rows will stay read-only.
+    let dialect = state.registry.read().get(id).map(|c| c.pool.dialect());
+    let read_only_notice: Option<&'static str> = match (&table_meta, dialect) {
+        (Some(meta), Some(dialect)) if detect_row_identity(meta, dialect).is_none() => {
+            if meta.kind == TableKind::View {
+                Some("Views are read-only.")
+            } else {
+                Some(
+                    "This table has no primary key or usable unique index — \
+                     editing will be disabled.",
+                )
+            }
+        }
+        _ => None,
+    };
 
     let current = rows_resource.read();
     let sort_value = sort();
@@ -124,6 +144,12 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     title: "Re-run the current query",
                     onclick: move |_| { refresh_nonce += 1; },
                     "↻ Refresh"
+                }
+            }
+            // Read-only notice (views / no usable row key)
+            if let Some(notice) = read_only_notice {
+                div { class: "border-b border-slate-800 bg-slate-800/60 px-3 py-1.5 text-xs text-slate-300",
+                    "{notice}"
                 }
             }
             // Grid

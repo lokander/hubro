@@ -57,6 +57,25 @@ impl DbPool {
         }
     }
 
+    /// Executes a parameterized write inside a transaction and commits only
+    /// when the affected-row count is exactly `expected_rows`; otherwise
+    /// rolls back and returns [`DbError::RowCountMismatch`]. Row edits go
+    /// through this so a statement that would touch more rows than the one
+    /// being edited can never commit.
+    pub async fn execute_checked(
+        &self,
+        sql: &str,
+        params: &[Value],
+        expected_rows: u64,
+    ) -> Result<u64, DbError> {
+        match self {
+            DbPool::Sqlite(pool) => sqlite::execute_checked(pool, sql, params, expected_rows).await,
+            DbPool::Postgres(pool) => {
+                postgres::execute_checked(pool, sql, params, expected_rows).await
+            }
+        }
+    }
+
     async fn query_with(&self, sql: &str, params: &[Value]) -> Result<QueryResult, DbError> {
         match self {
             DbPool::Sqlite(pool) => sqlite::query_with(pool, sql, params).await,
