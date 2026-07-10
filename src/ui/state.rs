@@ -32,8 +32,15 @@ pub struct TableRef {
 }
 
 impl TableRef {
-    /// Stable string form, used as component keys and expansion-set entries.
+    /// Stable string form, used as component keys and expansion-set
+    /// entries. Debug-formats both parts so schema/name splits can't
+    /// collide (schema "a" + table "b.c" vs schema "a.b" + table "c").
     pub fn key(&self) -> String {
+        format!("{:?}:{:?}", self.schema, self.name)
+    }
+
+    /// Human-readable qualified name.
+    pub fn label(&self) -> String {
         match &self.schema {
             Some(schema) => format!("{schema}.{}", self.name),
             None => self.name.clone(),
