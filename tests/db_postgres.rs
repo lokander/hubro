@@ -253,7 +253,9 @@ async fn postgres_rich_types_render_correctly() {
     assert_eq!(*col("iv_neg"), Value::Text("-3 days".into()));
     // numeric with 28 significant digits survives exactly — proof the
     // value never went through f64 (which holds ~15-17). rust_decimal
-    // caps at 28-29 significant digits; beyond that sqlx rounds.
+    // caps at 28-29 significant digits; beyond that the decode fails and
+    // the cell degrades to the <numeric> marker (covered in
+    // postgres_undecodable_cells_degrade_without_erroring_the_page).
     assert_eq!(
         *col("num"),
         Value::Text("123456789012345678.0987654321".into())
@@ -283,6 +285,82 @@ async fn postgres_rich_types_render_correctly() {
     assert_eq!(*col("decs"), Value::Text("{1.50,2.5}".into()));
     // Exotic types keep the graceful marker fallback instead of erroring.
     assert_eq!(*col("r"), Value::Text("<int4range>".into()));
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_undecodable_cells_degrade_without_erroring_the_page() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    for sql in [
+        "DROP TABLE IF EXISTS degrade_cells",
+        "CREATE TABLE degrade_cells (
+            id serial PRIMARY KEY,
+            nan_num numeric,
+            big_num numeric,
+            matrix int4[],
+            ts_inf timestamp,
+            ts_neg_inf timestamp,
+            tstz_inf timestamptz,
+            tstz_neg_inf timestamptz,
+            d_inf date,
+            d_neg_inf date,
+            ok_text text
+        )",
+        "INSERT INTO degrade_cells (
+            nan_num, big_num, matrix, ts_inf, ts_neg_inf, tstz_inf,
+            tstz_neg_inf, d_inf, d_neg_inf, ok_text
+        ) VALUES (
+            'NaN',
+            123456789012345678901234567890123456789,
+            '{{1,2},{3,4}}',
+            'infinity',
+            '-infinity',
+            'infinity',
+            '-infinity',
+            'infinity',
+            '-infinity',
+            'still here'
+        )",
+    ] {
+        pool.query(sql).await.unwrap();
+    }
+
+    // The whole row (page) must render despite the hostile cells — no Err,
+    // and certainly no panic.
+    let result = pool
+        .query("SELECT * FROM degrade_cells ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    let row = &result.rows[0];
+    let col = |name: &str| {
+        let idx = result
+            .columns
+            .iter()
+            .position(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no column {name}"));
+        &row[idx]
+    };
+
+    // rust_decimal can represent neither NaN nor 39 significant digits;
+    // both cells degrade to the marker instead of erroring the page.
+    assert_eq!(*col("nan_num"), Value::Text("<numeric>".into()));
+    assert_eq!(*col("big_num"), Value::Text("<numeric>".into()));
+    // sqlx only decodes one-dimensional arrays; a 2-D array degrades.
+    assert_eq!(*col("matrix"), Value::Text("<int4[]>".into()));
+    // Infinite timestamps/dates would panic inside chrono if they reached
+    // it; the wire-format special case renders them like psql does.
+    assert_eq!(*col("ts_inf"), Value::Text("infinity".into()));
+    assert_eq!(*col("ts_neg_inf"), Value::Text("-infinity".into()));
+    assert_eq!(*col("tstz_inf"), Value::Text("infinity".into()));
+    assert_eq!(*col("tstz_neg_inf"), Value::Text("-infinity".into()));
+    assert_eq!(*col("d_inf"), Value::Text("infinity".into()));
+    assert_eq!(*col("d_neg_inf"), Value::Text("-infinity".into()));
+    // Healthy cells in the same row are unaffected.
+    assert_eq!(*col("id"), Value::Integer(1));
+    assert_eq!(*col("ok_text"), Value::Text("still here".into()));
 
     pool.close().await;
 }
