@@ -108,9 +108,13 @@ fn ConnectionsScreen() -> Element {
         state
             .saved
             .read()
+            .entries()
             .iter()
             .map(|s| {
-                let is_open = open_paths.iter().any(|(_, p)| *p == s.path);
+                // open_paths holds canonicalized paths; compare like with like.
+                let is_open = open_paths
+                    .iter()
+                    .any(|(_, p)| *p == super::state::canonical(&s.path));
                 (s.name.clone(), s.path.clone(), is_open)
             })
             .collect()

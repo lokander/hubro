@@ -2,9 +2,7 @@ use std::path::{Path, PathBuf};
 
 use dioxus::prelude::*;
 
-use crate::config::{
-    default_config_path, load_connections, save_connections, ConnectionKind, SavedConnection,
-};
+use crate::config::{default_config_path, ConnectionKind, SavedConnection, SavedList};
 use crate::db::{ConnectionId, ConnectionRegistry, DbPool};
 
 /// Which screen the main panel shows: the connections screen or one open
@@ -21,10 +19,12 @@ pub struct AppState {
     pub registry: Signal<ConnectionRegistry>,
     pub active: Signal<ActiveView>,
     /// Saved connections shown on the launch screen.
-    pub saved: Signal<Vec<SavedConnection>>,
+    pub saved: Signal<SavedList>,
     /// Which file each open tab came from, for "already open" detection.
     /// Keys are canonicalized where possible.
     pub open_paths: Signal<Vec<(ConnectionId, PathBuf)>>,
+    /// Paths with a connect in flight, reserved before the pool open await.
+    pub connecting: Signal<Vec<PathBuf>>,
     /// Error from the most recent connect/config operation, shown on the
     /// connections screen.
     pub connect_error: Signal<Option<String>>,
@@ -33,20 +33,25 @@ pub struct AppState {
 impl AppState {
     /// Must be called from a component (signals need the runtime).
     pub fn new() -> Self {
-        // A failed config load surfaces on the launch screen but still
-        // starts the app with an empty list.
+        // A failed config load surfaces on the launch screen and the app
+        // starts with an empty list; SavedList remembers the failure and
+        // refuses to persist over the unreadable file.
         let (saved, load_error) = match default_config_path() {
-            Some(path) => match load_connections(&path) {
-                Ok(saved) => (saved, None),
-                Err(err) => (Vec::new(), Some(err.to_string())),
-            },
-            None => (Vec::new(), Some("no config directory found".to_string())),
+            Some(path) => {
+                let (list, error) = SavedList::load(&path);
+                (list, error.map(|e| e.to_string()))
+            }
+            None => (
+                SavedList::load(Path::new("/nonexistent")).0,
+                Some("no config directory found".to_string()),
+            ),
         };
         Self {
             registry: Signal::new(ConnectionRegistry::default()),
             active: Signal::new(ActiveView::Connections),
             saved: Signal::new(saved),
             open_paths: Signal::new(Vec::new()),
+            connecting: Signal::new(Vec::new()),
             connect_error: Signal::new(load_error),
         }
     }
@@ -55,21 +60,22 @@ impl AppState {
     /// persists the list.
     pub fn add_saved(mut self, path: PathBuf) {
         let path = canonical(&path);
-        if self.saved.read().iter().any(|s| s.path == path) {
-            return;
-        }
-        self.saved.write().push(SavedConnection {
+        let added = self.saved.write().add(SavedConnection {
             name: tab_title(&path),
             kind: ConnectionKind::Sqlite,
             path,
         });
-        self.persist_saved();
+        if added {
+            self.persist_saved();
+        }
     }
 
     /// Removes a saved connection (open tabs are unaffected) and persists.
     pub fn remove_saved(mut self, path: &Path) {
-        self.saved.write().retain(|s| s.path != path);
-        self.persist_saved();
+        let removed = self.saved.write().remove(path);
+        if removed {
+            self.persist_saved();
+        }
     }
 
     fn persist_saved(mut self) {
@@ -78,7 +84,7 @@ impl AppState {
                 .set(Some("no config directory found".to_string()));
             return;
         };
-        let result = save_connections(&config, &self.saved.read());
+        let result = self.saved.read().persist(&config);
         if let Err(err) = result {
             self.connect_error.set(Some(err.to_string()));
         }
@@ -86,7 +92,9 @@ impl AppState {
 
     /// Opens a saved connection in a new tab, or focuses the existing tab
     /// when the same file is already open. Pool creation happens before any
-    /// signal is written, so no borrow spans the await.
+    /// signal is written, so no borrow spans the await; the `connecting`
+    /// list reserves the path synchronously so a double-click can't open
+    /// two tabs for the same file.
     pub async fn connect(mut self, path: PathBuf) {
         self.connect_error.set(None);
         let path = canonical(&path);
@@ -100,7 +108,16 @@ impl AppState {
             self.active.set(ActiveView::Connection(id));
             return;
         }
-        match DbPool::open_sqlite(&path).await {
+        {
+            let mut connecting = self.connecting.write();
+            if connecting.contains(&path) {
+                return;
+            }
+            connecting.push(path.clone());
+        }
+        let result = DbPool::open_sqlite(&path).await;
+        self.connecting.write().retain(|p| p != &path);
+        match result {
             Ok(pool) => {
                 let id = self.registry.write().insert(tab_title(&path), pool);
                 self.open_paths.write().push((id, path));
@@ -134,7 +151,7 @@ impl Default for AppState {
 
 /// Canonicalizes for dedupe purposes; falls back to the given path when the
 /// file is missing (the connect attempt will surface that error).
-fn canonical(path: &Path) -> PathBuf {
+pub(crate) fn canonical(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
