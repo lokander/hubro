@@ -3,9 +3,10 @@ use std::path::Path;
 use sqlx::sqlite::SqlitePool;
 
 use super::error::DbError;
+use super::page::PageRequest;
 use super::schema::TableMeta;
 use super::sqlite;
-use super::value::QueryResult;
+use super::value::{QueryResult, Value};
 
 /// Stable handle for one open connection (one tab in the UI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -28,6 +29,28 @@ impl DbPool {
     pub async fn query(&self, sql: &str) -> Result<QueryResult, DbError> {
         match self {
             DbPool::Sqlite(pool) => sqlite::query(pool, sql).await,
+        }
+    }
+
+    /// One page of a table, honoring the request's sort and filter.
+    pub async fn fetch_page(&self, request: &PageRequest) -> Result<QueryResult, DbError> {
+        let (sql, params) = request.select_sql();
+        match self {
+            DbPool::Sqlite(pool) => sqlite::query_with(pool, &sql, &params).await,
+        }
+    }
+
+    /// Total row count for the request's table and filter (paging ignored).
+    pub async fn count_rows(&self, request: &PageRequest) -> Result<u64, DbError> {
+        let (sql, params) = request.count_sql();
+        let result = match self {
+            DbPool::Sqlite(pool) => sqlite::query_with(pool, &sql, &params).await?,
+        };
+        match result.rows.first().and_then(|r| r.first()) {
+            Some(Value::Integer(n)) => Ok(*n as u64),
+            other => Err(DbError::Query(format!(
+                "unexpected COUNT(*) result: {other:?}"
+            ))),
         }
     }
 

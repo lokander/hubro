@@ -4,6 +4,7 @@ use dioxus::prelude::*;
 
 use crate::db::ConnectionId;
 
+use super::grid::DataGrid;
 use super::sidebar::SchemaSidebar;
 use super::state::{ActiveView, AppState};
 
@@ -72,8 +73,7 @@ fn TabBar() -> Element {
     }
 }
 
-/// Layout for one open connection: schema sidebar left, content panel right.
-/// The grid arrives with FRE-9; selecting a table shows its name meanwhile.
+/// Layout for one open connection: schema sidebar left, data grid right.
 #[component]
 fn ConnectionView(id: ConnectionId) -> Element {
     let state = use_context::<AppState>();
@@ -97,15 +97,17 @@ fn ConnectionView(id: ConnectionId) -> Element {
                 }
                 SchemaSidebar { id }
             }
-            section { class: "flex min-w-0 flex-1 items-center justify-center",
+            section { class: "flex min-w-0 flex-1 flex-col",
                 match selected {
+                    // Keyed by table so grid state (page, sort, filter)
+                    // resets when another table is selected.
                     Some(table) => rsx! {
-                        p { class: "font-mono text-slate-400",
-                            "{table} — data grid coming with FRE-9."
-                        }
+                        DataGrid { key: "{table}", id, table: table.clone() }
                     },
                     None => rsx! {
-                        p { class: "text-slate-500", "Select a table to view its data." }
+                        div { class: "flex flex-1 items-center justify-center",
+                            p { class: "text-slate-500", "Select a table to view its data." }
+                        }
                     },
                 }
             }
