@@ -343,7 +343,14 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
         let embedded_password = if *use_url.peek() {
             url::Url::parse(pasted_url.peek().trim())
                 .ok()
-                .and_then(|u| u.password().map(|p| p.to_string()))
+                .and_then(|u| {
+                    // Url::password() returns the still-encoded form.
+                    u.password().map(|p| {
+                        percent_encoding::percent_decode_str(p)
+                            .decode_utf8_lossy()
+                            .into_owned()
+                    })
+                })
         } else {
             None
         };
