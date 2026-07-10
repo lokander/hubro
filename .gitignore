@@ -9,5 +9,4 @@
 # Local npm install used only to rebuild assets/codemirror.js
 # (see assets/codemirror-README.md); the bundle itself is committed.
 /assets/node_modules
-/assets/package.json
 /assets/package-lock.json
