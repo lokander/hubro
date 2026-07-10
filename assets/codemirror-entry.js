@@ -1,17 +1,32 @@
 import { EditorView, keymap, lineNumbers, highlightActiveLine } from "@codemirror/view";
-import { EditorState, Prec } from "@codemirror/state";
+import { EditorState, Compartment, Prec } from "@codemirror/state";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
+import { autocompletion } from "@codemirror/autocomplete";
 import { sql, SQLite, PostgreSQL } from "@codemirror/lang-sql";
 import { oneDark } from "@codemirror/theme-one-dark";
 
 const views = new Map();
 const debounces = new Map();
+const sqlCompartments = new Map();
 
-export function create(id, parentId, dialectName, initialDoc) {
+// Builds the sql() language support for a dialect plus a schema namespace
+// object (lang-sql SQLNamespace: "table" or "schema.table" keys mapping to
+// column-name arrays). Postgres gets defaultSchema so `public` tables
+// complete unqualified.
+function sqlSupport(dialectName, schema) {
+  const postgres = dialectName === "postgres";
+  return sql({
+    dialect: postgres ? PostgreSQL : SQLite,
+    schema: schema || {},
+    defaultSchema: postgres ? "public" : undefined,
+    upperCaseKeywords: true,
+  });
+}
+
+export function create(id, parentId, dialectName, initialDoc, schema) {
   destroy(id);
   const parent = document.getElementById(parentId);
   if (!parent) return false;
-  const dialect = dialectName === "postgres" ? PostgreSQL : SQLite;
   const runKeys = Prec.highest(
     keymap.of([
       {
@@ -38,6 +53,9 @@ export function create(id, parentId, dialectName, initialDoc) {
       }, 250)
     );
   });
+  // The sql() extension lives in a compartment so updateSchema can swap in
+  // fresh completion data after a schema reload without recreating the view.
+  const sqlCompartment = new Compartment();
   const view = new EditorView({
     state: EditorState.create({
       doc: initialDoc || "",
@@ -45,10 +63,11 @@ export function create(id, parentId, dialectName, initialDoc) {
         lineNumbers(),
         history(),
         highlightActiveLine(),
+        autocompletion(),
         keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
         runKeys,
         syncDoc,
-        sql({ dialect }),
+        sqlCompartment.of(sqlSupport(dialectName, schema)),
         oneDark,
         EditorView.theme({ "&": { height: "100%" }, ".cm-scroller": { overflow: "auto" } }),
       ],
@@ -56,7 +75,16 @@ export function create(id, parentId, dialectName, initialDoc) {
     parent,
   });
   views.set(id, view);
+  sqlCompartments.set(id, sqlCompartment);
   view.focus();
+  return true;
+}
+
+export function updateSchema(id, dialectName, schema) {
+  const view = views.get(id);
+  const sqlCompartment = sqlCompartments.get(id);
+  if (!view || !sqlCompartment) return false;
+  view.dispatch({ effects: sqlCompartment.reconfigure(sqlSupport(dialectName, schema)) });
   return true;
 }
 
@@ -76,6 +104,7 @@ export function destroy(id) {
     view.destroy();
     views.delete(id);
   }
+  sqlCompartments.delete(id);
   clearTimeout(debounces.get(id));
   debounces.delete(id);
 }
