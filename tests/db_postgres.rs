@@ -79,6 +79,7 @@ async fn postgres_paging_sorting_filtering_and_values_work() {
         offset: 0,
         sort: Some(("name".into(), SortDir::Asc)),
         filter: None,
+        extra_key_column: None,
     };
     assert_eq!(pool.count_rows(&request).await.unwrap(), 4);
     let page = pool.fetch_page(&request).await.unwrap();
@@ -482,6 +483,7 @@ async fn postgres_multi_schema_introspection_has_parity_metadata() {
         offset: 0,
         sort: None,
         filter: None,
+        extra_key_column: None,
     };
     assert_eq!(pool.count_rows(&request).await.unwrap(), 1);
     let page = pool.fetch_page(&request).await.unwrap();

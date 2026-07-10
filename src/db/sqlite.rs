@@ -8,6 +8,7 @@ use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
 use super::error::DbError;
 use super::page::quote_ident;
 use super::schema::{ColumnMeta, ForeignKeyMeta, IndexMeta, TableKind, TableMeta};
+use super::staged::CheckedStatement;
 use super::value::{ColumnInfo, QueryResult, Value};
 
 /// Opens an existing SQLite database file and validates it is actually a
@@ -46,38 +47,51 @@ pub async fn execute(pool: &SqlitePool, sql: &str) -> Result<u64, DbError> {
         .map_err(|e| DbError::Query(e.to_string()))
 }
 
-/// Executes a parameterized write inside a transaction and commits only when
-/// it affected exactly `expected_rows` rows; any other count rolls back and
-/// surfaces [`DbError::RowCountMismatch`]. This is the safety net for row
-/// edits: a WHERE clause that unexpectedly matches more (or fewer) rows than
-/// the one being edited must never commit.
-pub async fn execute_checked(
+/// Executes parameterized writes inside ONE transaction, committing only
+/// when every statement affected exactly its `expected_rows` rows. Any SQL
+/// error or count mismatch rolls the whole batch back; the error carries the
+/// index of the failing statement (`None` for begin/commit failures, which
+/// belong to no statement). This is the safety net for row edits: a WHERE
+/// clause that unexpectedly matches more (or fewer) rows than the one being
+/// edited must never commit — and with staged edits (FRE-14), neither may
+/// any sibling change in the same batch.
+pub async fn execute_all_checked(
     pool: &SqlitePool,
-    sql: &str,
-    params: &[Value],
-    expected_rows: u64,
-) -> Result<u64, DbError> {
+    statements: &[CheckedStatement],
+) -> Result<(), (Option<usize>, DbError)> {
     let mut tx = pool
         .begin()
         .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-    let done = bind_params(sqlx::query(sql), params)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-    let affected = done.rows_affected();
-    if affected != expected_rows {
+        .map_err(|e| (None, DbError::Query(e.to_string())))?;
+    for (index, statement) in statements.iter().enumerate() {
+        let result = bind_params(sqlx::query(&statement.sql), &statement.params)
+            .execute(&mut *tx)
+            .await;
         // Dropping the transaction would roll back too; do it explicitly and
-        // ignore secondary errors — the mismatch is what the caller needs.
-        let _ = tx.rollback().await;
-        return Err(DbError::RowCountMismatch(format!(
-            "statement affected {affected} rows, expected {expected_rows} — rolled back"
-        )));
+        // ignore secondary errors — the original failure is what the caller
+        // needs.
+        let done = match result {
+            Ok(done) => done,
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err((Some(index), DbError::Query(e.to_string())));
+            }
+        };
+        let affected = done.rows_affected();
+        if affected != statement.expected_rows {
+            let _ = tx.rollback().await;
+            return Err((
+                Some(index),
+                DbError::RowCountMismatch(format!(
+                    "statement affected {affected} rows, expected {} — rolled back",
+                    statement.expected_rows
+                )),
+            ));
+        }
     }
     tx.commit()
         .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-    Ok(affected)
+        .map_err(|e| (None, DbError::Query(e.to_string())))
 }
 
 type SqliteQuery<'q> = sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>;

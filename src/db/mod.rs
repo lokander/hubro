@@ -14,6 +14,7 @@ mod rowkey;
 mod schema;
 mod script;
 mod sqlite;
+mod staged;
 mod value;
 
 pub use error::DbError;
@@ -27,4 +28,7 @@ pub use script::{
     ScriptError, StatementKind, StatementOutcome, StatementResult,
 };
 pub use sqlite::open_sqlite;
+pub use staged::{
+    apply_staged, AppliedCounts, CheckedStatement, RowLocator, StagedChange, StagedError,
+};
 pub use value::{ColumnInfo, QueryResult, Value};
