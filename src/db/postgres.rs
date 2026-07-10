@@ -3,7 +3,9 @@
 //! and columns of the `public` schema are listed.
 
 use sqlx::postgres::types::{PgInterval, PgTimeTz};
-use sqlx::postgres::{PgHasArrayType, PgPool, PgPoolOptions, PgRow, PgTypeKind};
+use sqlx::postgres::{
+    PgHasArrayType, PgPool, PgPoolOptions, PgRow, PgTypeKind, PgValueFormat, PgValueRef,
+};
 use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{Decimal, JsonValue, Uuid};
 use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
@@ -339,9 +341,13 @@ fn get<'r, T: sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>>(
 
 /// Decodes scalar and rich Postgres types into the backend-neutral [`Value`]
 /// model. Rich types (dates, numeric, uuid, json, intervals, arrays, enums)
-/// render as `Value::Text` in a form close to what `psql` would print;
-/// anything unhandled falls back to a text cast where possible, then to a
-/// `<typename>` marker — never an error for the whole page.
+/// render as `Value::Text` in a form close to what `psql` would print.
+///
+/// Cell data never errors the page: a type without a dedicated arm — or one
+/// whose dedicated decode fails (NaN or >28-digit numeric, multidimensional
+/// array, …) — degrades through [`decode_fallback`] to a text cast where
+/// possible, then to a `<typename>` marker. The only `Err` left is an
+/// out-of-range column index, which is a programming error.
 fn decode_value(row: &PgRow, idx: usize) -> Result<Value, DbError> {
     let raw = row
         .try_get_raw(idx)
@@ -349,105 +355,151 @@ fn decode_value(row: &PgRow, idx: usize) -> Result<Value, DbError> {
     if raw.is_null() {
         return Ok(Value::Null);
     }
-    let type_name = raw.type_info().name().to_string();
-    let map_err = |e: sqlx::Error| DbError::Query(e.to_string());
-    let decoded = match type_name.as_str() {
+    Ok(decode_typed(row, idx, &raw).unwrap_or_else(|| decode_fallback(row, idx, &raw)))
+}
+
+/// Type-specific decoding. Returns `None` both for types without a
+/// dedicated arm and for values a dedicated arm cannot represent; the
+/// caller degrades those via [`decode_fallback`].
+fn decode_typed(row: &PgRow, idx: usize, raw: &PgValueRef) -> Option<Value> {
+    match raw.type_info().name() {
         // Booleans render as text: "true"/"false" reads better in a viewer
         // than 0/1.
-        "BOOL" => Value::Text(row.try_get::<bool, _>(idx).map_err(map_err)?.to_string()),
-        "INT2" => Value::Integer(row.try_get::<i16, _>(idx).map_err(map_err)? as i64),
-        "INT4" => Value::Integer(row.try_get::<i32, _>(idx).map_err(map_err)? as i64),
-        "INT8" => Value::Integer(row.try_get::<i64, _>(idx).map_err(map_err)?),
-        "FLOAT4" => Value::Real(row.try_get::<f32, _>(idx).map_err(map_err)? as f64),
-        "FLOAT8" => Value::Real(row.try_get::<f64, _>(idx).map_err(map_err)?),
+        "BOOL" => Some(Value::Text(row.try_get::<bool, _>(idx).ok()?.to_string())),
+        "INT2" => Some(Value::Integer(row.try_get::<i16, _>(idx).ok()? as i64)),
+        "INT4" => Some(Value::Integer(row.try_get::<i32, _>(idx).ok()? as i64)),
+        "INT8" => Some(Value::Integer(row.try_get::<i64, _>(idx).ok()?)),
+        "FLOAT4" => Some(Value::Real(row.try_get::<f32, _>(idx).ok()? as f64)),
+        "FLOAT8" => Some(Value::Real(row.try_get::<f64, _>(idx).ok()?)),
         "TEXT" | "VARCHAR" | "BPCHAR" | "NAME" | "CHAR" => {
-            Value::Text(row.try_get::<String, _>(idx).map_err(map_err)?)
+            Some(Value::Text(row.try_get::<String, _>(idx).ok()?))
         }
-        "BYTEA" => Value::Blob(row.try_get::<Vec<u8>, _>(idx).map_err(map_err)?),
+        "BYTEA" => Some(Value::Blob(row.try_get::<Vec<u8>, _>(idx).ok()?)),
         // Date/time family. `%.f` prints fractional seconds only when
-        // non-zero, with no trailing zeros — matching Postgres output.
+        // non-zero; trailing zeros are trimmed to match Postgres output.
+        // 'infinity'/'-infinity' must be caught from the wire bytes before
+        // chrono: sqlx 0.8 panics (not errors) decoding them.
         "TIMESTAMP" => {
-            let ts = row.try_get::<NaiveDateTime, _>(idx).map_err(map_err)?;
-            Value::Text(trim_fraction(ts.format("%Y-%m-%d %H:%M:%S%.f").to_string()))
+            if let Some(inf) = infinity_marker(raw) {
+                return Some(Value::Text(inf.to_string()));
+            }
+            let ts = row.try_get::<NaiveDateTime, _>(idx).ok()?;
+            Some(Value::Text(trim_fraction(
+                ts.format("%Y-%m-%d %H:%M:%S%.f").to_string(),
+            )))
         }
         "TIMESTAMPTZ" => {
+            if let Some(inf) = infinity_marker(raw) {
+                return Some(Value::Text(inf.to_string()));
+            }
             // Postgres sends timestamptz as an instant; render in UTC with
             // an explicit offset so the timezone-awareness is visible.
-            let ts = row.try_get::<DateTime<Utc>, _>(idx).map_err(map_err)?;
+            let ts = row.try_get::<DateTime<Utc>, _>(idx).ok()?;
             let local = trim_fraction(ts.format("%Y-%m-%d %H:%M:%S%.f").to_string());
-            Value::Text(format!("{local}+00:00"))
+            Some(Value::Text(format!("{local}+00:00")))
         }
         "DATE" => {
-            let d = row.try_get::<NaiveDate, _>(idx).map_err(map_err)?;
-            Value::Text(d.format("%Y-%m-%d").to_string())
+            if let Some(inf) = infinity_marker(raw) {
+                return Some(Value::Text(inf.to_string()));
+            }
+            let d = row.try_get::<NaiveDate, _>(idx).ok()?;
+            Some(Value::Text(d.format("%Y-%m-%d").to_string()))
         }
         "TIME" => {
-            let t = row.try_get::<NaiveTime, _>(idx).map_err(map_err)?;
-            Value::Text(trim_fraction(t.format("%H:%M:%S%.f").to_string()))
+            let t = row.try_get::<NaiveTime, _>(idx).ok()?;
+            Some(Value::Text(trim_fraction(
+                t.format("%H:%M:%S%.f").to_string(),
+            )))
         }
         "TIMETZ" => {
-            let t = row.try_get::<PgTimeTz, _>(idx).map_err(map_err)?;
+            let t = row.try_get::<PgTimeTz, _>(idx).ok()?;
             let time = trim_fraction(t.time.format("%H:%M:%S%.f").to_string());
-            Value::Text(format!("{time}{}", t.offset))
+            Some(Value::Text(format!("{time}{}", t.offset)))
         }
         "INTERVAL" => {
-            let iv = row.try_get::<PgInterval, _>(idx).map_err(map_err)?;
-            Value::Text(format_interval(&iv))
+            let iv = row.try_get::<PgInterval, _>(idx).ok()?;
+            Some(Value::Text(format_interval(&iv)))
         }
         // Exact decimal string via rust_decimal — must not round-trip
-        // through f64.
-        "NUMERIC" => Value::Text(row.try_get::<Decimal, _>(idx).map_err(map_err)?.to_string()),
-        "UUID" => Value::Text(row.try_get::<Uuid, _>(idx).map_err(map_err)?.to_string()),
+        // through f64. NaN and >28 significant digits are not representable
+        // and degrade to the marker.
+        "NUMERIC" => Some(Value::Text(
+            row.try_get::<Decimal, _>(idx).ok()?.to_string(),
+        )),
+        "UUID" => Some(Value::Text(row.try_get::<Uuid, _>(idx).ok()?.to_string())),
         // Compact JSON text (serde_json Display is compact).
-        "JSON" | "JSONB" => Value::Text(
-            row.try_get::<JsonValue, _>(idx)
-                .map_err(map_err)?
-                .to_string(),
-        ),
+        "JSON" | "JSONB" => Some(Value::Text(
+            row.try_get::<JsonValue, _>(idx).ok()?.to_string(),
+        )),
         // Arrays of the common element types render as a Postgres-style
         // literal. NULL elements render as NULL; text elements are not
         // quoted/escaped (this is a display form, not parseable syntax).
-        "TEXT[]" | "VARCHAR[]" | "BPCHAR[]" | "NAME[]" => {
-            decode_array::<String>(row, idx, |v| v).map_err(map_err)?
+        // sqlx only decodes one-dimensional arrays; others degrade.
+        "TEXT[]" | "VARCHAR[]" | "BPCHAR[]" | "NAME[]" => decode_array::<String>(row, idx, |v| v),
+        "INT2[]" => decode_array::<i16>(row, idx, |v| v.to_string()),
+        "INT4[]" => decode_array::<i32>(row, idx, |v| v.to_string()),
+        "INT8[]" => decode_array::<i64>(row, idx, |v| v.to_string()),
+        "FLOAT4[]" => decode_array::<f32>(row, idx, |v| v.to_string()),
+        "FLOAT8[]" => decode_array::<f64>(row, idx, |v| v.to_string()),
+        "BOOL[]" => decode_array::<bool>(row, idx, |v| v.to_string()),
+        "UUID[]" => decode_array::<Uuid>(row, idx, |v| v.to_string()),
+        "NUMERIC[]" => decode_array::<Decimal>(row, idx, |v| v.to_string()),
+        _ => None,
+    }
+}
+
+/// Graceful degradation for values [`decode_typed`] can't produce: enum
+/// labels from the raw bytes, then a text cast, then a `<typename>` marker.
+/// Infallible by design — one odd cell must not take down the page.
+fn decode_fallback(row: &PgRow, idx: usize, raw: &PgValueRef) -> Value {
+    // User-defined enums: the wire value (text or binary format) is the
+    // label itself, but `try_get::<String>` refuses the unknown OID, so
+    // read the raw bytes directly.
+    if matches!(raw.type_info().kind(), PgTypeKind::Enum(_)) {
+        if let Ok(label) = raw.as_str() {
+            return Value::Text(label.to_string());
         }
-        "INT2[]" => decode_array::<i16>(row, idx, |v| v.to_string()).map_err(map_err)?,
-        "INT4[]" => decode_array::<i32>(row, idx, |v| v.to_string()).map_err(map_err)?,
-        "INT8[]" => decode_array::<i64>(row, idx, |v| v.to_string()).map_err(map_err)?,
-        "FLOAT4[]" => decode_array::<f32>(row, idx, |v| v.to_string()).map_err(map_err)?,
-        "FLOAT8[]" => decode_array::<f64>(row, idx, |v| v.to_string()).map_err(map_err)?,
-        "BOOL[]" => decode_array::<bool>(row, idx, |v| v.to_string()).map_err(map_err)?,
-        "UUID[]" => decode_array::<Uuid>(row, idx, |v| v.to_string()).map_err(map_err)?,
-        "NUMERIC[]" => decode_array::<Decimal>(row, idx, |v| v.to_string()).map_err(map_err)?,
-        _ => {
-            // User-defined enums: the wire value (text or binary format) is
-            // the label itself, but `try_get::<String>` refuses the unknown
-            // OID, so read the raw bytes directly.
-            if matches!(raw.type_info().kind(), PgTypeKind::Enum(_)) {
-                match raw.as_str() {
-                    Ok(label) => Value::Text(label.to_string()),
-                    Err(_) => Value::Text(format!("<{}>", type_name.to_lowercase())),
-                }
+    } else if let Ok(text) = row.try_get::<String, _>(idx) {
+        return Value::Text(text);
+    }
+    Value::Text(format!("<{}>", raw.type_info().name().to_lowercase()))
+}
+
+/// Detects Postgres `infinity`/`-infinity` timestamp, timestamptz, and date
+/// values from the wire bytes. Binary format encodes them as i64::MAX/MIN
+/// (timestamp/timestamptz) or i32::MAX/MIN (date) big-endian; text format
+/// spells them out. They must not reach chrono — sqlx 0.8 decodes via
+/// `epoch + Duration`, whose overflow panics rather than erroring.
+fn infinity_marker(raw: &PgValueRef) -> Option<&'static str> {
+    let bytes = raw.as_bytes().ok()?;
+    match raw.format() {
+        PgValueFormat::Binary => {
+            if bytes == i64::MAX.to_be_bytes() || bytes == i32::MAX.to_be_bytes() {
+                Some("infinity")
+            } else if bytes == i64::MIN.to_be_bytes() || bytes == i32::MIN.to_be_bytes() {
+                Some("-infinity")
             } else {
-                match row.try_get::<String, _>(idx) {
-                    Ok(text) => Value::Text(text),
-                    // Unknown type that won't decode as text (e.g. ranges,
-                    // inet, money); show a marker rather than erroring the
-                    // whole page.
-                    Err(_) => Value::Text(format!("<{}>", type_name.to_lowercase())),
-                }
+                None
             }
         }
-    };
-    Ok(decoded)
+        // b"infinity" is coincidentally 8 bytes like a binary timestamp,
+        // but the formats are branched on above so exact ASCII match here
+        // is unambiguous.
+        PgValueFormat::Text => match bytes {
+            b"infinity" => Some("infinity"),
+            b"-infinity" => Some("-infinity"),
+            _ => None,
+        },
+    }
 }
 
 /// Decodes a one-dimensional array column and renders it as a
 /// Postgres-style literal, e.g. `{a,b,NULL}`.
-fn decode_array<T>(row: &PgRow, idx: usize, fmt: impl Fn(T) -> String) -> Result<Value, sqlx::Error>
+fn decode_array<T>(row: &PgRow, idx: usize, fmt: impl Fn(T) -> String) -> Option<Value>
 where
     T: for<'a> sqlx::Decode<'a, sqlx::Postgres> + sqlx::Type<sqlx::Postgres> + PgHasArrayType,
 {
-    let items: Vec<Option<T>> = row.try_get(idx)?;
+    let items: Vec<Option<T>> = row.try_get(idx).ok()?;
     let mut parts = Vec::with_capacity(items.len());
     for item in items {
         parts.push(match item {
@@ -455,7 +507,7 @@ where
             None => "NULL".to_string(),
         });
     }
-    Ok(Value::Text(format!("{{{}}}", parts.join(","))))
+    Some(Value::Text(format!("{{{}}}", parts.join(","))))
 }
 
 /// Trims trailing zeros from a chrono-formatted fractional second: `%.f`
