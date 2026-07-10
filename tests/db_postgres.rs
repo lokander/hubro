@@ -489,3 +489,29 @@ async fn postgres_multi_schema_introspection_has_parity_metadata() {
 
     pool.close().await;
 }
+
+#[tokio::test]
+async fn finite_datetimes_beyond_chrono_range_degrade_to_markers() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    // Postgres accepts these; chrono caps at ~year 262143, and sqlx's
+    // decode would panic on the overflow without the guard.
+    let result = pool
+        .query(
+            "SELECT '5874000-01-01'::date AS far_date, \
+                    '294000-01-01 00:00:00+00'::timestamptz AS far_ts, \
+                    'ok' AS healthy",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.rows[0][0],
+        Value::Text("<out of chrono range>".into())
+    );
+    assert_eq!(
+        result.rows[0][1],
+        Value::Text("<out of chrono range>".into())
+    );
+    assert_eq!(result.rows[0][2], Value::Text("ok".into()));
+    pool.close().await;
+}
