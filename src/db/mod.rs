@@ -8,13 +8,15 @@
 
 mod error;
 mod page;
+mod postgres;
 mod registry;
 mod schema;
 mod sqlite;
 mod value;
 
 pub use error::DbError;
-pub use page::{Filter, FilterOp, PageRequest, SortDir};
+pub use page::{Dialect, Filter, FilterOp, PageRequest, SortDir};
+pub use postgres::{build_url, sanitized_url, url_with_password};
 pub use registry::{Connection, ConnectionId, ConnectionRegistry, DbPool};
 pub use schema::{ColumnMeta, ForeignKeyMeta, IndexMeta, TableKind, TableMeta};
 pub use sqlite::open_sqlite;

@@ -1,9 +1,11 @@
 use std::path::Path;
 
+use sqlx::postgres::PgPool;
 use sqlx::sqlite::SqlitePool;
 
 use super::error::DbError;
-use super::page::PageRequest;
+use super::page::{Dialect, PageRequest};
+use super::postgres;
 use super::schema::TableMeta;
 use super::sqlite;
 use super::value::{QueryResult, Value};
@@ -18,6 +20,7 @@ pub struct ConnectionId(u64);
 #[derive(Clone)]
 pub enum DbPool {
     Sqlite(SqlitePool),
+    Postgres(PgPool),
 }
 
 impl DbPool {
@@ -26,26 +29,42 @@ impl DbPool {
         Ok(DbPool::Sqlite(sqlite::open_sqlite(path).await?))
     }
 
+    /// Connects to a Postgres URL (password already spliced in if any).
+    pub async fn open_postgres(url: &str) -> Result<DbPool, DbError> {
+        Ok(DbPool::Postgres(postgres::open_postgres(url).await?))
+    }
+
+    pub fn dialect(&self) -> Dialect {
+        match self {
+            DbPool::Sqlite(_) => Dialect::Sqlite,
+            DbPool::Postgres(_) => Dialect::Postgres,
+        }
+    }
+
     pub async fn query(&self, sql: &str) -> Result<QueryResult, DbError> {
         match self {
             DbPool::Sqlite(pool) => sqlite::query(pool, sql).await,
+            DbPool::Postgres(pool) => postgres::query_with(pool, sql, &[]).await,
+        }
+    }
+
+    async fn query_with(&self, sql: &str, params: &[Value]) -> Result<QueryResult, DbError> {
+        match self {
+            DbPool::Sqlite(pool) => sqlite::query_with(pool, sql, params).await,
+            DbPool::Postgres(pool) => postgres::query_with(pool, sql, params).await,
         }
     }
 
     /// One page of a table, honoring the request's sort and filter.
     pub async fn fetch_page(&self, request: &PageRequest) -> Result<QueryResult, DbError> {
-        let (sql, params) = request.select_sql();
-        match self {
-            DbPool::Sqlite(pool) => sqlite::query_with(pool, &sql, &params).await,
-        }
+        let (sql, params) = request.select_sql(self.dialect());
+        self.query_with(&sql, &params).await
     }
 
     /// Total row count for the request's table and filter (paging ignored).
     pub async fn count_rows(&self, request: &PageRequest) -> Result<u64, DbError> {
-        let (sql, params) = request.count_sql();
-        let result = match self {
-            DbPool::Sqlite(pool) => sqlite::query_with(pool, &sql, &params).await?,
-        };
+        let (sql, params) = request.count_sql(self.dialect());
+        let result = self.query_with(&sql, &params).await?;
         match result.rows.first().and_then(|r| r.first()) {
             Some(Value::Integer(n)) => Ok(*n as u64),
             other => Err(DbError::Query(format!(
@@ -57,12 +76,14 @@ impl DbPool {
     pub async fn introspect(&self) -> Result<Vec<TableMeta>, DbError> {
         match self {
             DbPool::Sqlite(pool) => sqlite::introspect(pool).await,
+            DbPool::Postgres(pool) => postgres::introspect(pool).await,
         }
     }
 
     pub async fn close(&self) {
         match self {
             DbPool::Sqlite(pool) => pool.close().await,
+            DbPool::Postgres(pool) => pool.close().await,
         }
     }
 }
