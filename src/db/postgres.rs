@@ -52,6 +52,9 @@ pub fn build_url(
     } else {
         port.trim().to_string()
     };
+    if host.trim().is_empty() {
+        return Err(DbError::Connect("host must not be empty".into()));
+    }
     let mut parsed = url::Url::parse("postgres://localhost").expect("static base URL parses");
     parsed
         .set_host(Some(host.trim()))
@@ -93,8 +96,10 @@ pub async fn open_postgres(url: &str) -> Result<PgPool, DbError> {
 fn friendly_connect_error(err: &sqlx::Error) -> String {
     let msg = err.to_string();
     let lower = msg.to_lowercase();
-    if lower.contains("password authentication failed") || lower.contains("role") {
+    if lower.contains("password authentication failed") {
         format!("authentication failed — {msg}")
+    } else if lower.contains("role") && lower.contains("does not exist") {
+        format!("unknown role — {msg}")
     } else if lower.contains("tls") || lower.contains("ssl") {
         format!("TLS error — {msg}")
     } else if lower.contains("connection refused")
@@ -215,6 +220,38 @@ fn get<'r, T: sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>>(
         .map_err(|e| DbError::Introspect(format!("column {column}: {e}")))
 }
 
+/// Decodes the common scalar types; everything else falls back to a text
+/// cast where possible. Full Postgres type rendering is FRE-12.
+fn decode_value(row: &PgRow, idx: usize) -> Result<Value, DbError> {
+    let raw = row
+        .try_get_raw(idx)
+        .map_err(|e| DbError::Query(e.to_string()))?;
+    if raw.is_null() {
+        return Ok(Value::Null);
+    }
+    let type_name = raw.type_info().name().to_string();
+    let map_err = |e: sqlx::Error| DbError::Query(e.to_string());
+    let decoded = match type_name.as_str() {
+        "BOOL" => Value::Integer(row.try_get::<bool, _>(idx).map_err(map_err)? as i64),
+        "INT2" => Value::Integer(row.try_get::<i16, _>(idx).map_err(map_err)? as i64),
+        "INT4" => Value::Integer(row.try_get::<i32, _>(idx).map_err(map_err)? as i64),
+        "INT8" => Value::Integer(row.try_get::<i64, _>(idx).map_err(map_err)?),
+        "FLOAT4" => Value::Real(row.try_get::<f32, _>(idx).map_err(map_err)? as f64),
+        "FLOAT8" => Value::Real(row.try_get::<f64, _>(idx).map_err(map_err)?),
+        "TEXT" | "VARCHAR" | "BPCHAR" | "NAME" | "CHAR" => {
+            Value::Text(row.try_get::<String, _>(idx).map_err(map_err)?)
+        }
+        "BYTEA" => Value::Blob(row.try_get::<Vec<u8>, _>(idx).map_err(map_err)?),
+        _ => match row.try_get::<String, _>(idx) {
+            Ok(text) => Value::Text(text),
+            // Unknown type that won't decode as text; show a marker rather
+            // than erroring the whole page (proper rendering is FRE-12).
+            Err(_) => Value::Text(format!("<{}>", type_name.to_lowercase())),
+        },
+    };
+    Ok(decoded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,37 +297,17 @@ mod tests {
         assert!(friendly_connect_error(&net).starts_with("network error"));
         let tls = sqlx::Error::Protocol("TLS handshake failed".into());
         assert!(friendly_connect_error(&tls).starts_with("TLS error"));
+        // A typo'd username is not a password problem — it must not trigger
+        // the password prompt (which keys on "authentication failed").
+        let role = sqlx::Error::Protocol("role \"nope\" does not exist".into());
+        let friendly = friendly_connect_error(&role);
+        assert!(friendly.starts_with("unknown role"));
+        assert!(!friendly.contains("authentication failed"));
     }
-}
 
-/// Decodes the common scalar types; everything else falls back to a text
-/// cast where possible. Full Postgres type rendering is FRE-12.
-fn decode_value(row: &PgRow, idx: usize) -> Result<Value, DbError> {
-    let raw = row
-        .try_get_raw(idx)
-        .map_err(|e| DbError::Query(e.to_string()))?;
-    if raw.is_null() {
-        return Ok(Value::Null);
+    #[test]
+    fn build_url_rejects_an_empty_host() {
+        let err = build_url("  ", "5432", "db", "u", "prefer").unwrap_err();
+        assert!(err.to_string().contains("host"));
     }
-    let type_name = raw.type_info().name().to_string();
-    let map_err = |e: sqlx::Error| DbError::Query(e.to_string());
-    let decoded = match type_name.as_str() {
-        "BOOL" => Value::Integer(row.try_get::<bool, _>(idx).map_err(map_err)? as i64),
-        "INT2" => Value::Integer(row.try_get::<i16, _>(idx).map_err(map_err)? as i64),
-        "INT4" => Value::Integer(row.try_get::<i32, _>(idx).map_err(map_err)? as i64),
-        "INT8" => Value::Integer(row.try_get::<i64, _>(idx).map_err(map_err)?),
-        "FLOAT4" => Value::Real(row.try_get::<f32, _>(idx).map_err(map_err)? as f64),
-        "FLOAT8" => Value::Real(row.try_get::<f64, _>(idx).map_err(map_err)?),
-        "TEXT" | "VARCHAR" | "BPCHAR" | "NAME" | "CHAR" => {
-            Value::Text(row.try_get::<String, _>(idx).map_err(map_err)?)
-        }
-        "BYTEA" => Value::Blob(row.try_get::<Vec<u8>, _>(idx).map_err(map_err)?),
-        _ => match row.try_get::<String, _>(idx) {
-            Ok(text) => Value::Text(text),
-            // Unknown type that won't decode as text; show a marker rather
-            // than erroring the whole page (proper rendering is FRE-12).
-            Err(_) => Value::Text(format!("<{}>", type_name.to_lowercase())),
-        },
-    };
-    Ok(decoded)
 }
