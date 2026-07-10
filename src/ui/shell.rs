@@ -4,6 +4,7 @@ use dioxus::prelude::*;
 
 use crate::db::ConnectionId;
 
+use super::sidebar::SchemaSidebar;
 use super::state::{ActiveView, AppState};
 
 /// Top-level layout: tab bar over the active view.
@@ -17,7 +18,8 @@ pub fn Shell() -> Element {
             main { class: "min-h-0 flex-1",
                 match active {
                     ActiveView::Connections => rsx! { ConnectionsScreen {} },
-                    ActiveView::Connection(id) => rsx! { ConnectionView { id } },
+                    // Keyed so per-tab hook state never leaks across tabs.
+                    ActiveView::Connection(id) => rsx! { ConnectionView { key: "{id:?}", id } },
                 }
             }
         }
@@ -71,7 +73,7 @@ fn TabBar() -> Element {
 }
 
 /// Layout for one open connection: schema sidebar left, content panel right.
-/// The sidebar and grid are placeholders until FRE-8/FRE-9 land.
+/// The grid arrives with FRE-9; selecting a table shows its name meanwhile.
 #[component]
 fn ConnectionView(id: ConnectionId) -> Element {
     let state = use_context::<AppState>();
@@ -82,16 +84,30 @@ fn ConnectionView(id: ConnectionId) -> Element {
             div { class: "p-8 text-slate-400", "This connection is closed." }
         };
     };
+    let selected = state
+        .tab_ui
+        .read()
+        .get(&id)
+        .and_then(|ui| ui.selected_table.clone());
     rsx! {
         div { class: "flex h-full",
-            aside { class: "flex w-64 shrink-0 flex-col border-r border-slate-700 bg-slate-950/50",
+            aside { class: "flex w-72 shrink-0 flex-col border-r border-slate-700 bg-slate-950/50",
                 h2 { class: "border-b border-slate-800 px-4 py-3 font-mono text-sm text-slate-300",
                     "{name}"
                 }
-                p { class: "px-4 py-3 text-sm text-slate-500", "Schema browser coming soon." }
+                SchemaSidebar { id }
             }
             section { class: "flex min-w-0 flex-1 items-center justify-center",
-                p { class: "text-slate-500", "Select a table to view its data." }
+                match selected {
+                    Some(table) => rsx! {
+                        p { class: "font-mono text-slate-400",
+                            "{table} — data grid coming with FRE-9."
+                        }
+                    },
+                    None => rsx! {
+                        p { class: "text-slate-500", "Select a table to view its data." }
+                    },
+                }
             }
         }
     }
