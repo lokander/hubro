@@ -313,10 +313,18 @@ async fn accept_loop(
 ) {
     let mut copies = tokio::task::JoinSet::new();
     loop {
+        // Reap finished forwards so their results don't accumulate for the
+        // tunnel's lifetime.
+        while copies.try_join_next().is_some() {}
         tokio::select! {
             _ = &mut shutdown => break,
             accepted = listener.accept() => {
-                let Ok((mut stream, peer)) = accepted else { break };
+                let (mut stream, peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    // Transient accept errors (ECONNABORTED, fd pressure)
+                    // must not kill the tunnel; only shutdown ends the loop.
+                    Err(_) => continue,
+                };
                 let channel = handle
                     .channel_open_direct_tcpip(
                         target_host.clone(),
