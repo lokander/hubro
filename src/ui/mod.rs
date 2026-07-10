@@ -2,6 +2,7 @@
 //! and launches it.
 
 mod shell;
+mod sidebar;
 mod state;
 
 pub use state::{tab_title, ActiveView, AppState};
