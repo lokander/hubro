@@ -122,23 +122,36 @@ pub struct AppliedCounts {
     pub deleted_rows: usize,
 }
 
-/// A failed [`apply_staged`]: everything was rolled back.
+/// A failed [`apply_staged`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedError {
     /// Index into the caller's change list identifying the change that
     /// failed. For an UPDATE statement covering several column edits of one
     /// row, this is the index of the *first* of those edits. `None` when
     /// the failure was not attributable to a single change (opening or
-    /// committing the transaction failed).
+    /// committing the transaction failed — in which case there is no
+    /// rollback guarantee either).
     pub change_index: Option<usize>,
+    /// Human-readable summary of the failing change; for a grouped UPDATE
+    /// it names the row and every column it set (e.g. `update of row (1, 2)
+    /// [columns title, year]`). `None` exactly when `change_index` is.
+    pub change_summary: Option<String>,
     pub message: String,
 }
 
 impl fmt::Display for StagedError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.change_index {
-            Some(index) => write!(f, "change {} failed: {}", index + 1, self.message),
-            None => write!(f, "{}", self.message),
+        match (self.change_index, &self.change_summary) {
+            (Some(index), Some(summary)) => {
+                write!(
+                    f,
+                    "change {} ({summary}) failed: {}",
+                    index + 1,
+                    self.message
+                )
+            }
+            (Some(index), None) => write!(f, "change {} failed: {}", index + 1, self.message),
+            _ => write!(f, "{}", self.message),
         }
     }
 }
@@ -160,12 +173,14 @@ pub struct CheckedStatement {
 /// `changes`.
 ///
 /// Statement building:
-/// - Updates are grouped per row: all `Update`s sharing a locator become a
-///   single `UPDATE … SET a = …, b = … WHERE <full key>` at the position of
-///   the row's first update. Callers are expected to pass the normalized
-///   order (updates grouped by row, then inserts, then deletes — see
-///   `ui::stage::TableStage::changes`), but any order works; grouping is by
-///   locator equality, not adjacency.
+/// - Updates are grouped per row: all `Update`s sharing a row — matched by
+///   [`RowLocator::key`], the same bit-exact identity the UI stage keys rows
+///   on, NOT by `PartialEq` (so `0.0`/`-0.0` locators stay two rows and NaN
+///   groups with itself) — become a single `UPDATE … SET a = …, b = …
+///   WHERE <full key>` at the position of the row's first update. Callers
+///   are expected to pass the normalized order (updates grouped by row,
+///   then inserts, then deletes — see `ui::stage::TableStage::changes`),
+///   but any order works; grouping is by row key, not adjacency.
 /// - Every UPDATE and DELETE is guarded: affecting anything other than
 ///   exactly one row aborts and rolls back the whole batch (the FRE-26
 ///   safety net, batch-wide).
@@ -186,6 +201,7 @@ pub async fn apply_staged(
         .await
         .map_err(|(statement_index, error)| StagedError {
             change_index: statement_index.map(|i| plan[i].change_index),
+            change_summary: statement_index.map(|i| plan[i].summary.clone()),
             message: error.to_string(),
         })?;
     let mut counts = AppliedCounts::default();
@@ -207,17 +223,23 @@ enum StatementKind {
 }
 
 /// One statement of the plan, remembering which change it came from (for
-/// grouped updates: the first of the row's changes).
+/// grouped updates: the first of the row's changes) and how to describe it
+/// in a failure message (for grouped updates: the row and ALL its columns,
+/// not just the first).
 #[derive(Debug)]
 struct BuiltStatement {
     statement: CheckedStatement,
     change_index: usize,
     kind: StatementKind,
+    summary: String,
 }
 
 /// Pre-grouping slot: updates accumulate SET entries until rendered.
 enum Slot {
     UpdateGroup {
+        /// [`RowLocator::key`] of `locator` — grouping matches rows by the
+        /// stage's bit-exact row identity, never by value `PartialEq`.
+        key: String,
         locator: RowLocator,
         first_index: usize,
         sets: Vec<(String, Value)>,
@@ -236,12 +258,13 @@ fn build_statements(
     changes: &[StagedChange],
 ) -> Result<Vec<BuiltStatement>, StagedError> {
     let key_len = identity.key_columns().len();
-    let check_locator = |locator: &RowLocator, index: usize| {
+    let check_locator = |locator: &RowLocator, index: usize, change: &StagedChange| {
         if locator.identity_values.len() == key_len {
             Ok(())
         } else {
             Err(StagedError {
                 change_index: Some(index),
+                change_summary: Some(change.describe()),
                 message: format!(
                     "row locator carries {} values but the row identity needs {key_len}",
                     locator.identity_values.len()
@@ -257,16 +280,20 @@ fn build_statements(
                 column,
                 value,
             } => {
-                check_locator(locator, index)?;
+                check_locator(locator, index, change)?;
+                // Group by the row KEY (bit-exact, the identity the UI
+                // stage coalesced under) — PartialEq would merge 0.0/-0.0
+                // locators (a duplicate-SET error at best, the wrong row at
+                // worst) and never group NaN with itself.
+                let row_key = locator.key();
                 let existing = slots.iter_mut().find_map(|slot| match slot {
-                    Slot::UpdateGroup {
-                        locator: l, sets, ..
-                    } if l == locator => Some(sets),
+                    Slot::UpdateGroup { key, sets, .. } if *key == row_key => Some(sets),
                     _ => None,
                 });
                 match existing {
                     Some(sets) => sets.push((column.clone(), value.clone())),
                     None => slots.push(Slot::UpdateGroup {
+                        key: row_key,
                         locator: locator.clone(),
                         first_index: index,
                         sets: vec![(column.clone(), value.clone())],
@@ -277,6 +304,7 @@ fn build_statements(
                 if columns.len() != values.len() {
                     return Err(StagedError {
                         change_index: Some(index),
+                        change_summary: Some(change.describe()),
                         message: format!(
                             "insert names {} columns but carries {} values",
                             columns.len(),
@@ -288,14 +316,16 @@ fn build_statements(
                     statement: insert_statement(table, dialect, columns, values),
                     change_index: index,
                     kind: StatementKind::Insert,
+                    summary: change.describe(),
                 }));
             }
             StagedChange::Delete { locator } => {
-                check_locator(locator, index)?;
+                check_locator(locator, index, change)?;
                 slots.push(Slot::Ready(BuiltStatement {
                     statement: delete_statement(table, identity, dialect, locator),
                     change_index: index,
                     kind: StatementKind::Delete,
+                    summary: change.describe(),
                 }));
             }
         }
@@ -307,14 +337,27 @@ fn build_statements(
                 locator,
                 first_index,
                 sets,
+                ..
             } => BuiltStatement {
                 statement: update_statement(table, identity, dialect, &locator, &sets),
                 change_index: first_index,
                 kind: StatementKind::Update,
+                summary: update_summary(&locator, &sets),
             },
             Slot::Ready(built) => built,
         })
         .collect())
+}
+
+/// Failure summary for a (possibly multi-column) row update: names the row
+/// and every column the statement sets.
+fn update_summary(locator: &RowLocator, sets: &[(String, Value)]) -> String {
+    let columns: Vec<&str> = sets.iter().map(|(column, _)| column.as_str()).collect();
+    format!(
+        "update of row {} [columns {}]",
+        locator.summary(),
+        columns.join(", ")
+    )
 }
 
 /// Accumulates bound parameters while rendering value positions into SQL.
@@ -572,6 +615,8 @@ mod tests {
         );
         assert_eq!(plan[0].statement.expected_rows, 1);
         assert_eq!(plan[0].change_index, 0);
+        // The failure summary names the row and BOTH columns.
+        assert_eq!(plan[0].summary, "update of row (1) [columns a, b]");
     }
 
     #[test]
@@ -593,6 +638,41 @@ mod tests {
         assert_eq!(plan[0].change_index, 0);
         assert!(plan[0].statement.sql.contains("\"a\" = ?, \"b\" = ?"));
         assert_eq!(plan[1].change_index, 1);
+        assert_eq!(plan[1].summary, "update of row (2) [columns a]");
+    }
+
+    #[test]
+    fn grouping_matches_row_keys_not_float_equality() {
+        let real_update = |bits: f64, column: &str| StagedChange::Update {
+            locator: RowLocator {
+                identity_values: vec![Value::Real(bits)],
+            },
+            column: column.into(),
+            value: Value::Integer(1),
+        };
+        // 0.0 == -0.0 by PartialEq, but they are two different stage rows
+        // (bit-distinct keys) — merging them would build one UPDATE with a
+        // duplicate SET column (a Postgres error) against the wrong row.
+        let plan = build_statements(
+            &table(),
+            &identity(),
+            Dialect::Sqlite,
+            &[real_update(0.0, "a"), real_update(-0.0, "a")],
+        )
+        .unwrap();
+        assert_eq!(plan.len(), 2, "0.0 and -0.0 must stay separate rows");
+
+        // NaN != NaN by PartialEq, but it is one stage row — its column
+        // edits must group into one statement, not repeat the UPDATE.
+        let plan = build_statements(
+            &table(),
+            &identity(),
+            Dialect::Sqlite,
+            &[real_update(f64::NAN, "a"), real_update(f64::NAN, "b")],
+        )
+        .unwrap();
+        assert_eq!(plan.len(), 1, "NaN groups with itself");
+        assert!(plan[0].statement.sql.contains("\"a\" = ?, \"b\" = ?"));
     }
 
     #[test]
@@ -744,6 +824,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.change_index, Some(1));
+        assert_eq!(err.change_summary, Some("delete of row ()".into()));
         assert!(err.message.contains("locator"), "message: {}", err.message);
 
         let bad_insert = StagedChange::Insert {
@@ -786,14 +867,25 @@ mod tests {
     }
 
     #[test]
-    fn staged_error_display_is_one_based() {
+    fn staged_error_display_is_one_based_and_carries_the_summary() {
         let err = StagedError {
             change_index: Some(2),
+            change_summary: Some("update of row (1) [columns a]".into()),
+            message: "boom".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "change 3 (update of row (1) [columns a]) failed: boom"
+        );
+        let err = StagedError {
+            change_index: Some(2),
+            change_summary: None,
             message: "boom".into(),
         };
         assert_eq!(err.to_string(), "change 3 failed: boom");
         let err = StagedError {
             change_index: None,
+            change_summary: None,
             message: "boom".into(),
         };
         assert_eq!(err.to_string(), "boom");

@@ -109,6 +109,54 @@ impl TableStage {
         self.edits.is_empty() && self.inserts.is_empty() && self.deletes.is_empty()
     }
 
+    /// Removes exactly the given (previously snapshotted, now successfully
+    /// applied) changes from the stage, and clears the save bookkeeping
+    /// (`saving`, `last_error`). Changes staged AFTER the snapshot survive —
+    /// this is what makes staging during an in-flight save safe (see
+    /// `AppState::save_staged` for the contract):
+    ///
+    /// - a cell edit is removed only while its staged value still equals
+    ///   the applied value — a re-edit of the same cell after the snapshot
+    ///   stays staged;
+    /// - an insert is removed by whole-row equality (first match);
+    /// - a delete is removed by row — the row is gone, so a delete
+    ///   re-staged after the snapshot would be meaningless anyway.
+    pub fn remove_applied(&mut self, applied: &[StagedChange]) {
+        for change in applied {
+            match change {
+                StagedChange::Update {
+                    locator,
+                    column,
+                    value,
+                } => {
+                    let key = locator.key();
+                    if let Some(row) = self.edits.get_mut(&key) {
+                        if row.values.get(column) == Some(value) {
+                            row.values.remove(column);
+                        }
+                        if row.values.is_empty() {
+                            self.edits.remove(&key);
+                        }
+                    }
+                }
+                StagedChange::Insert { columns, values } => {
+                    let position = self
+                        .inserts
+                        .iter()
+                        .position(|i| i.columns == *columns && i.values == *values);
+                    if let Some(position) = position {
+                        self.inserts.remove(position);
+                    }
+                }
+                StagedChange::Delete { locator } => {
+                    self.deletes.remove(&locator.key());
+                }
+            }
+        }
+        self.saving = false;
+        self.last_error = None;
+    }
+
     /// The normalized change list handed to
     /// [`apply_staged`](crate::db::apply_staged):
     ///
@@ -258,6 +306,58 @@ mod tests {
         let mut edited = TableStage::default();
         edited.set_cell_edit(locator(1), "a", Value::Null);
         assert!(!edited.is_empty());
+    }
+
+    #[test]
+    fn changes_staged_during_a_save_survive_the_success_clear() {
+        // Simulates the slow-save race: snapshot the changes (as
+        // save_staged does), stage more while the save is "in flight", then
+        // apply the success-clear.
+        let mut stage = TableStage::default();
+        stage.set_cell_edit(locator(1), "a", Value::Integer(1));
+        stage.add_insert(vec!["a".into()], vec![Value::Integer(9)]);
+        stage.mark_delete(locator(3));
+        let snapshot = stage.changes();
+        stage.saving = true;
+
+        // Staged after the snapshot: a new cell, a re-edit of the saved
+        // cell, and another insert.
+        stage.set_cell_edit(locator(2), "b", Value::Integer(2));
+        stage.set_cell_edit(locator(1), "a", Value::Integer(100));
+        stage.add_insert(vec!["a".into()], vec![Value::Integer(10)]);
+
+        stage.remove_applied(&snapshot);
+        assert!(!stage.saving);
+        assert!(stage.last_error.is_none());
+        // The snapshotted insert and delete are gone; everything staged
+        // after the snapshot survives, including the re-edit.
+        assert!(!stage.is_deleted(&locator(3).key()));
+        assert_eq!(stage.inserts().len(), 1);
+        assert_eq!(stage.inserts()[0].values, vec![Value::Integer(10)]);
+        assert_eq!(
+            stage.edited_value(&locator(1).key(), "a"),
+            Some(&Value::Integer(100)),
+            "re-edit after the snapshot must not be destroyed"
+        );
+        assert_eq!(
+            stage.edited_value(&locator(2).key(), "b"),
+            Some(&Value::Integer(2))
+        );
+        assert_eq!(stage.pending_count(), 3);
+    }
+
+    #[test]
+    fn remove_applied_clears_an_untouched_stage_completely() {
+        let mut stage = TableStage::default();
+        stage.set_cell_edit(locator(1), "a", Value::Integer(1));
+        stage.set_cell_edit(locator(1), "b", Value::Null);
+        stage.add_insert(vec![], vec![]);
+        stage.mark_delete(locator(2));
+        let snapshot = stage.changes();
+        stage.saving = true;
+        stage.remove_applied(&snapshot);
+        assert!(stage.is_empty());
+        assert!(!stage.saving);
     }
 
     #[test]

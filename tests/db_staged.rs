@@ -170,6 +170,10 @@ async fn sqlite_failure_mid_batch_rolls_everything_back_and_names_the_change() {
         .await
         .unwrap_err();
     assert_eq!(err.change_index, Some(1), "the second change failed");
+    assert_eq!(
+        err.change_summary,
+        Some("update of row (99, 99) [columns title]".into())
+    );
     assert!(
         err.message.contains("affected 0 rows"),
         "got: {}",
@@ -385,6 +389,7 @@ async fn postgres_failure_mid_batch_rolls_everything_back_and_names_the_change()
         .await
         .unwrap_err();
     assert_eq!(err.change_index, Some(1));
+    assert_eq!(err.change_summary, Some("delete of row (99)".into()));
     assert!(
         err.message.contains("affected 0 rows"),
         "got: {}",
