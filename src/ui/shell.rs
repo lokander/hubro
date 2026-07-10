@@ -237,7 +237,7 @@ fn ConnectionsScreen() -> Element {
                 }
             }
             if let Some(prompt) = prompt {
-                PasswordPromptCard { prompt }
+                PasswordPromptCard { key: "{prompt.url}", prompt }
             }
             div { class: "flex gap-3",
                 button {
@@ -338,6 +338,15 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
     let mut form_error = use_signal(|| Option::<String>::None);
 
     let mut submit = move || {
+        // A password pasted inside the URL is used for this connect (and
+        // remembered for the session on success) but never persisted.
+        let embedded_password = if *use_url.peek() {
+            url::Url::parse(pasted_url.peek().trim())
+                .ok()
+                .and_then(|u| u.password().map(|p| p.to_string()))
+        } else {
+            None
+        };
         let built = if *use_url.peek() {
             crate::db::sanitized_url(&pasted_url.peek())
         } else {
@@ -364,7 +373,12 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                 entered
             }
         };
-        let entered_password = password.peek().clone();
+        let mut entered_password = password.peek().clone();
+        if entered_password.is_empty() {
+            if let Some(embedded) = embedded_password {
+                entered_password = embedded;
+            }
+        }
         form_error.set(None);
         spawn(async move {
             if entered_password.is_empty() {

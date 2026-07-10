@@ -191,7 +191,10 @@ impl AppState {
                 }
                 self.password_prompt.set(Some(PasswordPrompt { url, name }));
             }
-            result => self.finish_connect(url, name, result),
+            result => {
+                self.finish_connect(url.clone(), name.clone(), result);
+                self.save_postgres_if_open(&url, &name);
+            }
         }
     }
 
@@ -217,7 +220,19 @@ impl AppState {
             self.session_passwords.write().insert(url.clone(), password);
             self.password_prompt.set(None);
         }
-        self.finish_connect(url, name, result);
+        self.finish_connect(url.clone(), name.clone(), result);
+        self.save_postgres_if_open(&url, &name);
+    }
+
+    /// A successful Postgres connect always joins the saved list (add is a
+    /// no-op when the URL is already saved). This keeps the "connect first,
+    /// save on success" contract even when the connect went through the
+    /// password prompt instead of the form's direct path.
+    fn save_postgres_if_open(self, url: &str, name: &str) {
+        let is_open = self.open_locators.read().iter().any(|(_, l)| l == url);
+        if is_open {
+            self.add_saved_postgres(name.to_string(), url.to_string());
+        }
     }
 
     /// Focuses the tab if the locator is already open, or reserves it for a
