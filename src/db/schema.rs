@@ -23,6 +23,10 @@ pub struct ColumnMeta {
 pub struct IndexMeta {
     pub name: String,
     pub unique: bool,
+    /// Partial index (`CREATE INDEX … WHERE predicate`). A partial unique
+    /// index only guarantees uniqueness among the rows matching its
+    /// predicate, so row identity (rowkey.rs) must never rely on one.
+    pub partial: bool,
     pub columns: Vec<String>,
 }
 

@@ -150,6 +150,12 @@ fn friendly_connect_error(err: &sqlx::Error) -> String {
 type PgQuery<'q> = sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>;
 
 /// Binds backend-neutral [`Value`] parameters onto a prepared query.
+///
+/// FRE-24 caveat: `Value::Null` binds as `None::<String>`, i.e. a NULL of
+/// type text. That is fine for the current uses (filter values are text),
+/// but Postgres rejects a text NULL for non-text columns in e.g.
+/// `SET col = $n` — cell editing will need typed NULLs (or an explicit
+/// `$n::type` cast in the generated SQL).
 fn bind_params<'q>(mut query: PgQuery<'q>, params: &[Value]) -> PgQuery<'q> {
     for param in params {
         query = match param {
@@ -329,10 +335,14 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
 
     // Indexes from pg_catalog (information_schema has no index view).
     // Expression-index entries have a 0 attnum and no attribute row; those
-    // key positions surface as NULL column names.
+    // key positions surface as NULL column names. Partial indexes
+    // (indpred) are flagged so row-identity detection can reject them;
+    // invalid indexes (e.g. from a failed CREATE INDEX CONCURRENTLY) make
+    // no guarantees at all and are dropped entirely.
     let index_rows = sqlx::query(
         "SELECT n.nspname AS table_schema, t.relname AS table_name, \
                 i.relname AS index_name, ix.indisunique AS is_unique, \
+                ix.indpred IS NOT NULL AS is_partial, \
                 k.ord AS key_position, a.attname AS column_name \
          FROM pg_index ix \
          JOIN pg_class t ON t.oid = ix.indrelid \
@@ -343,6 +353,7 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
          WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
            AND n.nspname NOT LIKE 'pg\\_%' \
            AND k.ord <= ix.indnkeyatts \
+           AND ix.indisvalid \
          ORDER BY n.nspname, t.relname, i.relname, k.ord",
     )
     .fetch_all(pool)
@@ -426,12 +437,14 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
         let column: Option<String> = get(row, "column_name")?;
         let column = column.unwrap_or_else(|| "<expr>".to_string());
         let unique: bool = get(row, "is_unique")?;
+        let partial: bool = get(row, "is_partial")?;
         let indexes = &mut tables[idx].indexes;
         match indexes.last_mut() {
             Some(last) if last.name == index_name => last.columns.push(column),
             _ => indexes.push(IndexMeta {
                 name: index_name,
                 unique,
+                partial,
                 columns: vec![column],
             }),
         }

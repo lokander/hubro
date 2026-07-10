@@ -165,6 +165,9 @@ fn TableDetails(table: ReadSignal<TableMeta>) -> Element {
                                 "unique"
                             }
                         }
+                        if index.partial {
+                            span { class: "rounded bg-slate-800 px-1 text-slate-400", "partial" }
+                        }
                     }
                 }
             }
