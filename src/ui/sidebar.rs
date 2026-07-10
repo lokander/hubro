@@ -2,7 +2,7 @@ use dioxus::prelude::*;
 
 use crate::db::{ConnectionId, TableKind, TableMeta};
 
-use super::state::{AppState, SchemaLoad};
+use super::state::{AppState, SchemaLoad, TableRef};
 
 /// Sidebar for one connection: the introspected schema as an expandable
 /// tree. Tables and views expand to columns (with PK/NOT NULL markers) and
@@ -41,13 +41,35 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
                     SchemaLoad::Ready(tables) if tables.is_empty() => rsx! {
                         p { class: "px-4 py-2 text-sm text-slate-500", "This database has no tables." }
                     },
-                    SchemaLoad::Ready(tables) => rsx! {
-                        ul {
-                            for table in tables {
-                                TableNode { id, table }
+                    SchemaLoad::Ready(tables) => {
+                        // Group by schema (Postgres); SQLite tables have no
+                        // schema and render as a flat list.
+                        let mut groups: Vec<(Option<String>, Vec<TableMeta>)> = Vec::new();
+                        for table in tables {
+                            match groups.last_mut() {
+                                Some((schema, group)) if *schema == table.schema => {
+                                    group.push(table)
+                                }
+                                _ => groups.push((table.schema.clone(), vec![table])),
                             }
                         }
-                    },
+                        let show_headers = groups.len() > 1
+                            || groups.first().is_some_and(|(s, _)| s.is_some());
+                        rsx! {
+                            for (schema, group) in groups {
+                                if show_headers {
+                                    p { class: "px-2 pt-2 pb-0.5 text-xs font-semibold uppercase tracking-wide text-slate-600",
+                                        {schema.clone().unwrap_or_else(|| "(no schema)".to_string())}
+                                    }
+                                }
+                                ul {
+                                    for table in group {
+                                        TableNode { key: "{table.schema:?}.{table.name}", id, table }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -61,19 +83,24 @@ fn TableNode(id: ConnectionId, table: ReadSignal<TableMeta>) -> Element {
     let state = use_context::<AppState>();
     let name = table.read().name.clone();
     let kind = table.read().kind;
+    let table_ref = TableRef {
+        schema: table.read().schema.clone(),
+        name: name.clone(),
+    };
+    let key = table_ref.key();
     let (expanded, selected) = {
         let tab_ui = state.tab_ui.read();
         match tab_ui.get(&id) {
             Some(ui) => (
-                ui.expanded.contains(&name),
-                ui.selected_table.as_deref() == Some(name.as_str()),
+                ui.expanded.contains(&key),
+                ui.selected_table.as_ref() == Some(&table_ref),
             ),
             None => (false, false),
         }
     };
 
-    let toggle_name = name.clone();
-    let select_name = name.clone();
+    let toggle_key = key.clone();
+    let select_ref = table_ref.clone();
     rsx! {
         li {
             div {
@@ -85,12 +112,12 @@ fn TableNode(id: ConnectionId, table: ReadSignal<TableMeta>) -> Element {
                 button {
                     class: "w-4 shrink-0 text-xs text-slate-500 hover:text-slate-200",
                     aria_label: if expanded { "Collapse" } else { "Expand" },
-                    onclick: move |_| state.toggle_expanded(id, &toggle_name),
+                    onclick: move |_| state.toggle_expanded(id, &toggle_key),
                     if expanded { "▾" } else { "▸" }
                 }
                 button {
                     class: "flex min-w-0 flex-1 items-center gap-2 text-left",
-                    onclick: move |_| state.select_table(id, &select_name),
+                    onclick: move |_| state.select_table(id, &select_ref),
                     span { class: "truncate font-mono", "{name}" }
                     if kind == TableKind::View {
                         span { class: "rounded bg-violet-900/50 px-1 text-xs text-violet-300",

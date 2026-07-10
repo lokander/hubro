@@ -30,6 +30,8 @@ pub struct IndexMeta {
 pub struct ForeignKeyMeta {
     /// Referencing columns in this table, in key order.
     pub columns: Vec<String>,
+    /// Schema of the referenced table (`None` on backends without schemas).
+    pub referenced_schema: Option<String>,
     pub referenced_table: String,
     /// Referenced columns, parallel to `columns`. An entry is `None` when the
     /// FK references the target table's implicit primary key.
@@ -38,6 +40,9 @@ pub struct ForeignKeyMeta {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableMeta {
+    /// Schema the table lives in (`None` on backends without schemas, i.e.
+    /// SQLite).
+    pub schema: Option<String>,
     pub name: String,
     pub kind: TableKind,
     pub columns: Vec<ColumnMeta>,
@@ -75,6 +80,7 @@ mod tests {
     #[test]
     fn primary_key_is_ordered_by_key_position() {
         let table = TableMeta {
+            schema: None,
             name: "t".into(),
             kind: TableKind::Table,
             columns: vec![col("a", Some(2)), col("b", None), col("c", Some(1))],

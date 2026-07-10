@@ -2,7 +2,7 @@ use dioxus::prelude::*;
 
 use crate::db::{ConnectionId, Filter, FilterOp, PageRequest, QueryResult, SortDir, Value};
 
-use super::state::AppState;
+use super::state::{AppState, TableRef};
 
 const PAGE_SIZE: u32 = 100;
 
@@ -12,7 +12,7 @@ const PAGE_SIZE: u32 = 100;
 /// Callers key this component by table name, so all hook state here is
 /// per-table and resets when another table is selected.
 #[component]
-pub fn DataGrid(id: ConnectionId, table: String) -> Element {
+pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let state = use_context::<AppState>();
     let mut page = use_signal(|| 0u64);
     let mut sort = use_signal(|| Option::<(String, SortDir)>::None);
@@ -27,10 +27,12 @@ pub fn DataGrid(id: ConnectionId, table: String) -> Element {
     let table_for_resource = table.clone();
     let rows_resource = use_resource(move || {
         let table = table_for_resource.clone();
+        let _ = &table;
         // Read reactive deps before any await so the resource re-runs when
         // they change and no borrow spans the await.
         let request = PageRequest {
-            table,
+            schema: table.schema.clone(),
+            table: table.name.clone(),
             limit: PAGE_SIZE,
             offset: page() * PAGE_SIZE as u64,
             sort: sort(),
@@ -57,7 +59,7 @@ pub fn DataGrid(id: ConnectionId, table: String) -> Element {
         .and_then(|load| match load {
             super::state::SchemaLoad::Ready(tables) => tables
                 .iter()
-                .find(|t| t.name == table)
+                .find(|t| t.name == table.name && t.schema == table.schema)
                 .map(|t| t.columns.iter().map(|c| c.name.clone()).collect()),
             _ => None,
         })

@@ -23,12 +23,30 @@ pub enum SchemaLoad {
     Failed(String),
 }
 
+/// A table identified by optional schema + name (schema is `None` on
+/// SQLite).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TableRef {
+    pub schema: Option<String>,
+    pub name: String,
+}
+
+impl TableRef {
+    /// Stable string form, used as component keys and expansion-set entries.
+    pub fn key(&self) -> String {
+        match &self.schema {
+            Some(schema) => format!("{schema}.{}", self.name),
+            None => self.name.clone(),
+        }
+    }
+}
+
 /// Per-tab UI state that must survive tab switches.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TabUi {
     /// Table selected in the sidebar (shown in the data grid).
-    pub selected_table: Option<String>,
-    /// Tables expanded in the sidebar tree.
+    pub selected_table: Option<TableRef>,
+    /// Tables expanded in the sidebar tree, by [`TableRef::key`].
     pub expanded: HashSet<String>,
 }
 
@@ -298,8 +316,8 @@ impl AppState {
     }
 
     /// Marks a table as selected in one tab's sidebar.
-    pub fn select_table(mut self, id: ConnectionId, table: &str) {
-        self.tab_ui.write().entry(id).or_default().selected_table = Some(table.to_string());
+    pub fn select_table(mut self, id: ConnectionId, table: &TableRef) {
+        self.tab_ui.write().entry(id).or_default().selected_table = Some(table.clone());
     }
 
     /// Flips a table's expansion state in one tab's sidebar tree.
