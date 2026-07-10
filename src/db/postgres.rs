@@ -147,22 +147,28 @@ fn friendly_connect_error(err: &sqlx::Error) -> String {
     }
 }
 
+type PgQuery<'q> = sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>;
+
+/// Binds backend-neutral [`Value`] parameters onto a prepared query.
+fn bind_params<'q>(mut query: PgQuery<'q>, params: &[Value]) -> PgQuery<'q> {
+    for param in params {
+        query = match param {
+            Value::Null => query.bind(None::<String>),
+            Value::Integer(i) => query.bind(*i),
+            Value::Real(r) => query.bind(*r),
+            Value::Text(t) => query.bind(t.clone()),
+            Value::Blob(b) => query.bind(b.clone()),
+        };
+    }
+    query
+}
+
 pub async fn query_with(
     pool: &PgPool,
     sql: &str,
     params: &[Value],
 ) -> Result<QueryResult, DbError> {
-    let mut prepared = sqlx::query(sql);
-    for param in params {
-        prepared = match param {
-            Value::Null => prepared.bind(None::<String>),
-            Value::Integer(i) => prepared.bind(*i),
-            Value::Real(r) => prepared.bind(*r),
-            Value::Text(t) => prepared.bind(t.clone()),
-            Value::Blob(b) => prepared.bind(b.clone()),
-        };
-    }
-    let rows = prepared
+    let rows = bind_params(sqlx::query(sql), params)
         .fetch_all(pool)
         .await
         .map_err(|e| query_error(e, sql))?;
@@ -198,6 +204,40 @@ pub async fn execute(pool: &PgPool, sql: &str) -> Result<u64, DbError> {
         .await
         .map(|done| done.rows_affected())
         .map_err(|e| query_error(e, sql))
+}
+
+/// Executes a parameterized write inside a transaction and commits only when
+/// it affected exactly `expected_rows` rows; any other count rolls back and
+/// surfaces [`DbError::RowCountMismatch`]. This is the safety net for row
+/// edits: a WHERE clause that unexpectedly matches more (or fewer) rows than
+/// the one being edited must never commit.
+pub async fn execute_checked(
+    pool: &PgPool,
+    sql: &str,
+    params: &[Value],
+    expected_rows: u64,
+) -> Result<u64, DbError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+    let done = bind_params(sqlx::query(sql), params)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| query_error(e, sql))?;
+    let affected = done.rows_affected();
+    if affected != expected_rows {
+        // Dropping the transaction would roll back too; do it explicitly and
+        // ignore secondary errors — the mismatch is what the caller needs.
+        let _ = tx.rollback().await;
+        return Err(DbError::RowCountMismatch(format!(
+            "statement affected {affected} rows, expected {expected_rows} — rolled back"
+        )));
+    }
+    tx.commit()
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+    Ok(affected)
 }
 
 /// Builds a query error, appending "line L, column C" when the server

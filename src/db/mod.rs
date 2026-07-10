@@ -10,6 +10,7 @@ mod error;
 mod page;
 mod postgres;
 mod registry;
+mod rowkey;
 mod schema;
 mod script;
 mod sqlite;
@@ -19,6 +20,7 @@ pub use error::DbError;
 pub use page::{Dialect, Filter, FilterOp, PageRequest, SortDir};
 pub use postgres::{build_url, sanitized_url, url_target, url_via_local_port, url_with_password};
 pub use registry::{Connection, ConnectionId, ConnectionRegistry, DbPool};
+pub use rowkey::{delete_sql, detect_row_identity, update_sql, RowIdentity};
 pub use schema::{ColumnMeta, ForeignKeyMeta, IndexMeta, TableKind, TableMeta};
 pub use script::{
     classify_statement, needs_confirmation, run_script, split_statements, statement_preview,
