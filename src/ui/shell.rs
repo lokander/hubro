@@ -1,8 +1,12 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
+use dioxus::desktop::tao::dpi::PhysicalPosition;
+use dioxus::desktop::tao::event::{Event, WindowEvent};
+use dioxus::desktop::{use_window, use_wry_event_handler, DesktopService};
 use dioxus::prelude::*;
 
-use crate::config::Theme;
+use crate::config::{default_settings_path, save_window_geometry, Theme, WindowGeometry};
 use crate::db::ConnectionId;
 
 use super::editor::SqlEditor;
@@ -91,6 +95,21 @@ pub fn Shell() -> Element {
         });
     });
 
+    // Session persistence (FRE-30): re-snapshot whenever the open tabs, their
+    // selected table/pane, or the active view change, and write session.toml
+    // only when the snapshot actually differs. `current_session` reads
+    // `open_locators`, `tab_ui`, and `active`, so this effect re-runs on any
+    // of them — including per-keystroke `tab_ui` changes from the SQL editor,
+    // which diff to an identical snapshot and skip the write.
+    let mut last_session = use_signal(|| state.current_session());
+    use_effect(move || {
+        let current = state.current_session();
+        if current != *last_session.peek() {
+            last_session.set(current);
+            state.persist_session();
+        }
+    });
+
     rsx! {
         // The `.dark` class gates every `dark:` utility below it (see the
         // @custom-variant in tailwind.css); toggling it swaps the theme.
@@ -100,6 +119,7 @@ pub fn Shell() -> Element {
             } else {
                 "flex h-screen flex-col bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100"
             },
+            WindowPersistence {}
             TabBar {}
             main { class: "min-h-0 flex-1",
                 match active {
@@ -115,6 +135,89 @@ pub fn Shell() -> Element {
             }
         }
     }
+}
+
+/// Reads the window's current geometry in logical pixels. Logical (not
+/// physical) so a saved geometry restores sanely across monitors of different
+/// DPI. An unavailable outer position (some platforms) just drops the
+/// coordinates.
+fn read_geometry(window: &DesktopService) -> WindowGeometry {
+    let scale = window.scale_factor();
+    let size = window.inner_size().to_logical::<f64>(scale);
+    let position = window
+        .outer_position()
+        .ok()
+        .map(|p: PhysicalPosition<i32>| p.to_logical::<f64>(scale));
+    WindowGeometry {
+        width: size.width,
+        height: size.height,
+        x: position.map(|p| p.x),
+        y: position.map(|p| p.y),
+        maximized: window.is_maximized(),
+    }
+}
+
+/// Updates the in-memory geometry from a resize/move. While maximized the
+/// size/position are the maximized bounds, so we keep the last restored ones
+/// (un-maximizing returns to them) and only remember the maximized flag.
+fn update_geometry(latest: &mut Signal<WindowGeometry>, window: &DesktopService) {
+    if window.is_maximized() {
+        latest.with_mut(|g| g.maximized = true);
+    } else {
+        latest.set(read_geometry(window));
+    }
+}
+
+/// Captures window size/position and persists it to settings.toml (FRE-30) so
+/// the next launch restores it. Renders nothing.
+///
+/// Mechanism: a `use_wry_event_handler` updates an in-memory geometry on every
+/// `Resized`/`Moved` (cheap, no file I/O) and writes the final value on
+/// `CloseRequested`; a 1 s poll writes it when it settles, so dragging the
+/// window produces one write, not one per pixel. Writes are best-effort — a
+/// failure only means the geometry won't survive this restart, never a crash.
+#[component]
+fn WindowPersistence() -> Element {
+    let window = use_window();
+    let mut latest = use_signal(|| read_geometry(&window));
+
+    {
+        let window = window.clone();
+        use_wry_event_handler(move |event, _| match event {
+            Event::WindowEvent {
+                event: WindowEvent::Resized(_) | WindowEvent::Moved(_),
+                ..
+            } => update_geometry(&mut latest, &window),
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => {
+                update_geometry(&mut latest, &window);
+                if let Some(path) = default_settings_path() {
+                    let _ = save_window_geometry(&path, latest.peek().sanitized());
+                }
+            }
+            _ => {}
+        });
+    }
+
+    // Debounced writer: at most one write per second, and only on a real
+    // change. `peek` avoids subscribing, so this future runs exactly once.
+    use_future(move || async move {
+        let mut persisted = *latest.peek();
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let current = *latest.peek();
+            if current != persisted {
+                persisted = current;
+                if let Some(path) = default_settings_path() {
+                    let _ = save_window_geometry(&path, current.sanitized());
+                }
+            }
+        }
+    });
+
+    rsx! {}
 }
 
 /// One shortcut row: a description and its key(s).
