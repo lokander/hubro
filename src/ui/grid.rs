@@ -16,6 +16,41 @@ use super::state::{AppState, ExportStatus, SchemaLoad, TableRef};
 
 const PAGE_SIZE: u32 = 100;
 
+/// Fixed data-row height in CSS pixels (FRE-32). Rows render one truncated
+/// line at `text-xs` + `py-1`, so their height is uniform; pinning it lets the
+/// windowed renderer compute exact scroll offsets and spacer heights. Measured
+/// in the WebKitGTK webview (rows sit on a 33px pitch). The GridRow `<tr>` is
+/// held to this height so an open inline editor can't shift the offsets.
+const ROW_HEIGHT: f64 = 33.0;
+
+/// Rows rendered above and below the viewport (FRE-32). A margin so a fast
+/// flick rarely reveals a blank spacer before the range updates, and so small
+/// errors from the sticky header offset never uncover an unrendered row.
+const ROW_OVERSCAN: usize = 12;
+
+/// Scroll/resize listener installed on `#dv-grid` (FRE-32). rAF-coalesces
+/// bursts and reports `[scrollTop, clientHeight]` back over the eval channel so
+/// the component can derive the visible row range. Installed once per mount.
+const GRID_SCROLL_JS: &str = r#"
+(() => {
+  const el = document.getElementById('dv-grid');
+  if (!el) return;
+  let scheduled = false, settle = null;
+  const report = () => { scheduled = false; dioxus.send([el.scrollTop, el.clientHeight]); };
+  const onScroll = () => {
+    if (!scheduled) { scheduled = true; requestAnimationFrame(report); }
+    // Trailing settle: guarantee a final report at the resting position even
+    // if momentum scrolling ends without a last 'scroll' event, so the window
+    // can never stay stale (blank) after a fast fling.
+    clearTimeout(settle);
+    settle = setTimeout(report, 120);
+  };
+  el.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', onScroll, { passive: true });
+  requestAnimationFrame(report);
+})();
+"#;
+
 /// The cell whose in-place editor is open, addressed by row key
 /// ([`RowLocator::key`]) + column name. At most one editor is open per
 /// grid.
@@ -74,6 +109,13 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // demand (FRE-33).
     let mut expanded = use_signal(|| Option::<ExpandView>::None);
     let mut sort = use_signal(|| Option::<(String, SortDir)>::None);
+    // Windowed rendering (FRE-32): the grid's live scroll offset and viewport
+    // height, fed by a scroll/resize listener installed on `#dv-grid`. The
+    // visible row range is derived from these; only rows in that range (plus
+    // overscan) are put in the DOM. `viewport_h` seeds non-zero so the first
+    // render before the listener reports still windows to a sane range.
+    let mut scroll_top = use_signal(|| 0.0f64);
+    let mut viewport_h = use_signal(|| 600.0f64);
     // Rows ticked for deletion (row key → locator). UI-only state: nothing
     // is staged until "Delete N selected".
     let mut selected = use_signal(HashMap::<String, RowLocator>::new);
@@ -157,6 +199,15 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         // the clamp effect below trims it to None for an empty page.
         focused_cell.set(Some((0, 0)));
         expanded.set(None);
+        // Reset the windowed scroll position too (FRE-32) so a new page/sort/
+        // filter starts at the top, both the tracked offset and the container.
+        scroll_top.set(0.0);
+        document::eval(
+            "requestAnimationFrame(() => { \
+                const el = document.getElementById('dv-grid'); \
+                if (el) el.scrollTop = 0; \
+            });",
+        );
     });
 
     let table_for_resource = table.clone();
@@ -288,16 +339,64 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         }
     });
 
-    // Scroll the focused cell into view as it moves (it carries the
-    // `dv-focused-cell` id). Next frame, so the ring's node exists.
+    // Scroll the focused cell into view as it moves (FRE-15 + FRE-32). With
+    // windowed rows an offscreen focused row may not be in the DOM yet, so we
+    // can't rely on its node: instead scroll the container to the focused
+    // row's computed offset (rows are `ROW_HEIGHT` tall), which also updates
+    // the visible range so the row renders. A second frame then nudges the
+    // now-rendered cell into view horizontally (column offsets aren't fixed).
     use_effect(move || {
-        let _ = focused_cell.read();
-        document::eval(
-            "requestAnimationFrame(() => { \
-                const el = document.getElementById('dv-focused-cell'); \
-                if (el) el.scrollIntoView({ block: 'nearest', inline: 'nearest' }); \
-            });",
-        );
+        let Some((r, _c)) = *focused_cell.read() else {
+            return;
+        };
+        let top = r as f64 * ROW_HEIGHT;
+        document::eval(&format!(
+            "requestAnimationFrame(() => {{ \
+                const el = document.getElementById('dv-grid'); \
+                if (!el) return; \
+                const h = {ROW_HEIGHT}; const top = {top}; const pad = 2 * h; \
+                if (top < el.scrollTop + pad) {{ \
+                    el.scrollTop = Math.max(0, top - pad); \
+                }} else if (top + h > el.scrollTop + el.clientHeight - pad) {{ \
+                    el.scrollTop = top + h - el.clientHeight + pad; \
+                }} \
+                requestAnimationFrame(() => {{ \
+                    const c = document.getElementById('dv-focused-cell'); \
+                    if (c) c.scrollIntoView({{ block: 'nearest', inline: 'nearest' }}); \
+                }}); \
+            }});",
+        ));
+    });
+
+    // Install a scroll/resize listener on the grid container once per mount and
+    // pump the offset/height it reports into `scroll_top`/`viewport_h`, which
+    // drive the visible-row range (FRE-32). rAF-coalesced so a scroll burst
+    // yields at most one update per frame. The channel stays open for the
+    // component's life; it reads no signals, so it installs exactly once.
+    use_effect(move || {
+        spawn(async move {
+            let mut channel = document::eval(GRID_SCROLL_JS);
+            while let Ok(msg) = channel.recv::<(f64, f64)>().await {
+                let (top, height) = msg;
+                if *scroll_top.peek() != top {
+                    scroll_top.set(top);
+                }
+                if height > 0.0 && *viewport_h.peek() != height {
+                    viewport_h.set(height);
+                }
+            }
+        });
+    });
+
+    // The rows to actually put in the DOM (FRE-32): a contiguous window around
+    // the viewport. Arrow-keying to an offscreen row is handled by the
+    // focus-scroll effect below, which scrolls that row into view (updating
+    // `scroll_top`, so this window then includes it) rather than widening the
+    // window to the focus — the latter would drag the window back to a
+    // now-offscreen focus and defeat windowing after a mouse scroll.
+    let visible_range = use_memo(move || {
+        let total = grid_nav.read().rows.len();
+        compute_visible_range(scroll_top(), viewport_h(), ROW_HEIGHT, total, ROW_OVERSCAN)
     });
 
     // Return keyboard focus to the grid container whenever no cell editor is
@@ -740,6 +839,22 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                             rows.is_empty() && pending_inserts.is_empty(),
                             applied_filter.read().is_some(),
                         );
+                        // Windowed rendering (FRE-32): only rows in the visible
+                        // range go in the DOM; a top and bottom spacer row of
+                        // the elided rows' total height keeps the scrollbar and
+                        // offsets correct. `total_cols` sizes the spacers'
+                        // single colspan cell across every column.
+                        let total_rows = rows.len();
+                        let total_cols = headers.len() + usize::from(select_enabled);
+                        let (win_start, win_end) = *visible_range.read();
+                        let (win_start, win_end) = (win_start.min(total_rows), win_end.min(total_rows));
+                        let top_spacer = win_start as f64 * ROW_HEIGHT;
+                        let bottom_spacer = (total_rows - win_end) as f64 * ROW_HEIGHT;
+                        let windowed_rows: Vec<(usize, RowView)> = rows
+                            .into_iter()
+                            .enumerate()
+                            .filter(|(index, _)| *index >= win_start && *index < win_end)
+                            .collect();
                         rsx! {
                             match empty {
                                 // No-filter-match: distinct from an empty
@@ -808,7 +923,17 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                         }
                                     }
                                     tbody {
-                                        for (index, row) in rows.into_iter().enumerate() {
+                                        // Top spacer: the height of the rows
+                                        // elided above the window (FRE-32).
+                                        if top_spacer > 0.0 {
+                                            tr {
+                                                td {
+                                                    colspan: "{total_cols}",
+                                                    style: "height:{top_spacer}px;padding:0;border:0;",
+                                                }
+                                            }
+                                        }
+                                        for (index, row) in windowed_rows {
                                             GridRow {
                                                 key: "{row_render_key(&row, index)}",
                                                 id,
@@ -833,6 +958,16 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                                         state.navigate_fk(id, &fk, &row_values, &origin, applied_filter.peek().clone());
                                                     }
                                                 },
+                                            }
+                                        }
+                                        // Bottom spacer: the height of the rows
+                                        // elided below the window (FRE-32).
+                                        if bottom_spacer > 0.0 {
+                                            tr {
+                                                td {
+                                                    colspan: "{total_cols}",
+                                                    style: "height:{bottom_spacer}px;padding:0;border:0;",
+                                                }
                                             }
                                         }
                                         // Pending inserts: phantom rows with
@@ -1258,6 +1393,38 @@ fn apply_grid_move(pos: (usize, usize), mv: GridMove, rows: usize, cols: usize) 
     }
 }
 
+/// The half-open range of row indices to render for a scroll position
+/// (FRE-32): windowed rendering keeps only these rows in the DOM. `first` is
+/// the row at the top of the viewport (`scroll_top / row_height`); the window
+/// spans the viewport's worth of rows plus `overscan` on each side, clamped to
+/// `[0, total]`. A zero `total` or non-positive `row_height` yields an empty
+/// `(0, 0)` range. `end >= start` always holds.
+fn compute_visible_range(
+    scroll_top: f64,
+    viewport: f64,
+    row_height: f64,
+    total: usize,
+    overscan: usize,
+) -> (usize, usize) {
+    if total == 0 || row_height <= 0.0 {
+        return (0, 0);
+    }
+    let first = (scroll_top.max(0.0) / row_height).floor() as usize;
+    let visible = (viewport.max(0.0) / row_height).ceil() as usize + 1;
+    let end = first
+        .saturating_add(visible)
+        .saturating_add(overscan)
+        .min(total);
+    // Derive `start` backward from the clamped `end` (window = viewport rows +
+    // overscan on both sides). In the middle of the page this is identical to
+    // `first - overscan`, but when `end` clamps to `total` it keeps a full
+    // window at the bottom — so a momentum fling that overshoots `scroll_top`
+    // past the content can never leave an empty range (a blank viewport).
+    let window = visible.saturating_add(2 * overscan);
+    let start = end.saturating_sub(window);
+    (start, end)
+}
+
 /// Keyboard-navigation snapshot of the visible page (FRE-15): enough per-cell
 /// data (row key, column, editability, display text) for the focusable grid
 /// container's key handler to move the focus ring and open the editor without
@@ -1485,6 +1652,10 @@ fn GridRow(
             } else {
                 "border-t border-slate-200 dark:border-slate-800/60 hover:bg-slate-100 dark:hover:bg-slate-800/30"
             },
+            // Uniform row height (FRE-32): the windowed renderer positions rows
+            // by `ROW_HEIGHT`, so pin it here — this also stops an open inline
+            // editor from making its row taller and drifting the offsets.
+            style: "height:{ROW_HEIGHT}px;",
             if select_enabled {
                 td { class: "w-8 px-2 py-1",
                     if let Some((key, locator)) = checkbox {
@@ -2408,6 +2579,38 @@ mod tests {
         let nav = GridNav::build(vec!["id".into(), "title".into()], &rows, &kinds);
         assert!(nav.rows[0].key.is_none());
         assert!(nav.rows.iter().all(|r| r.cells.iter().all(|c| !c.editable)));
+    }
+
+    #[test]
+    fn visible_range_windows_around_the_scroll_position() {
+        // 33px rows, a 330px viewport (~10 rows), overscan 8, 100 rows.
+        // At the top: start clamps to 0, end covers ~10 visible + 1 + overscan.
+        assert_eq!(compute_visible_range(0.0, 330.0, 33.0, 100, 8), (0, 19));
+        // Scrolled to row 50 (50 * 33 = 1650): first = 50, window
+        // 50-8 .. 50+11+8 = 42 .. 69.
+        assert_eq!(compute_visible_range(1650.0, 330.0, 33.0, 100, 8), (42, 69));
+        // Near the bottom the end clamps to `total` and start is derived
+        // backward to keep a full window (first = floor(3200/33) = 96,
+        // end = 100, window = 11 + 16 = 27, start = 100 - 27 = 73).
+        assert_eq!(
+            compute_visible_range(3200.0, 330.0, 33.0, 100, 8),
+            (73, 100)
+        );
+    }
+
+    #[test]
+    fn visible_range_clamps_and_handles_empty() {
+        // Empty page: nothing to render.
+        assert_eq!(compute_visible_range(0.0, 600.0, 33.0, 0, 8), (0, 0));
+        // Non-positive row height can't be divided by: empty range, no panic.
+        assert_eq!(compute_visible_range(100.0, 600.0, 0.0, 50, 8), (0, 0));
+        // A page shorter than the viewport renders in full.
+        assert_eq!(compute_visible_range(0.0, 600.0, 33.0, 5, 8), (0, 5));
+        // A scroll offset past the content still yields a valid clamped range
+        // (end at total, start no greater than end).
+        let (start, end) = compute_visible_range(99_999.0, 600.0, 33.0, 40, 8);
+        assert_eq!(end, 40);
+        assert!(start <= end);
     }
 
     #[test]
