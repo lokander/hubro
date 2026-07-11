@@ -87,3 +87,87 @@ Notes:
   paths (`schema_load` building metadata) are noticeably faster in release.
 - `page_nav_deep` at ~a third of a second for a single 100-row page confirms the
   O(offset) cost of OFFSET paging: this is the headline motivation for FRE-32.
+
+## Virtual scrolling (FRE-32)
+
+The budgets above are db-layer numbers. FRE-32 addresses the *other* half of a
+"table opened" — how long WebKitGTK spends laying out and painting a page's
+worth of rows, and how smoothly it scrolls — which the db harness can't see.
+
+### The problem, measured in the webview
+
+A LIMIT-`PAGE_SIZE` page is only 100 rows, so the row *count* is not the
+bottleneck. The cost is **wide** tables: with 120 columns a 100-row page is
+`100 × 121 = 12,100` `<td>` nodes, and an auto-layout `<table>` must lay every
+one of them out (column widths depend on all cells).
+
+Profiled in the app (debug build, WebKitGTK, `WEBKIT_DISABLE_COMPOSITING_MODE=1`,
+a 120-column × 5,000-row SQLite fixture, one 100-row page) by counting rendered
+nodes and timing a forced full relayout of `#dv-grid`:
+
+| Grid | DOM `<tr>` | DOM `<td>` | Forced relayout (debug) |
+| --- | --- | --- | --- |
+| Before (whole page rendered) | 100 | 12,100 | ~5.7 ms |
+| After (windowed) | ~28 + 1 spacer | ~3,400 | ~1.5 ms |
+
+The windowed grid keeps only the rows in (and near) the viewport in the DOM, so
+node count and layout cost scale with the **viewport**, not the page — ~3.6×
+fewer nodes and ~3.8× faster relayout on the 120-column fixture, with more
+headroom as columns or (a future larger) page size grow.
+
+An earlier attempt used `content-visibility: auto` on each `<tr>` (a smaller,
+less invasive change). Measured in the same webview it made **no difference**
+(`rendered=100/100`, relayout ~5.8 ms unchanged): an auto-layout table row can't
+skip layout because the table needs every row to size its columns. So we
+implemented true windowing instead.
+
+### How it works
+
+- Data rows have a fixed height (`ROW_HEIGHT`, 33 px), so a row's scroll offset
+  is `index × ROW_HEIGHT`.
+- A scroll/resize listener on `#dv-grid` reports `scrollTop` + `clientHeight`
+  (rAF-coalesced, plus a trailing "settle" report so a momentum fling always
+  ends with a final update). `compute_visible_range` turns those into the row
+  window `[start, end)` — viewport rows plus `ROW_OVERSCAN` (12) on each side,
+  with `start` derived backward from a clamped `end` so an overscrolling fling
+  can never leave the window empty (a blank viewport).
+- The `<tbody>` renders a top spacer `<tr>` of `start × ROW_HEIGHT`, then
+  `rows[start..end]`, then a bottom spacer — so the scrollbar and offsets match
+  the full page while only the window is in the DOM.
+- Every per-row behavior is untouched because rows are still keyed by their
+  stable row key and rendered by the same `GridRow`: selection, dirty/edited
+  (amber) and pending-delete (red) tints, inline editing, truncated-preview
+  expand, and FK ↗ jumps all survive a row scrolling out and back. The keyboard
+  focus ring (FRE-15) still works: arrowing to an offscreen row scrolls it into
+  view (by its computed offset, since row height is fixed), which brings it into
+  the window and keeps the ring.
+
+### Paging model
+
+Unchanged, deliberately: the grid still pages at LIMIT `PAGE_SIZE` = 100 with
+Prev/Next, and windowing applies **within** the current page. Scrolling across a
+page boundary still uses the pager. This is the low-risk choice — it keeps
+per-page memory bounded (FRE-33) and leaves the fetch/count path alone. A larger
+page or infinite-scroll-within-a-window would be a separate, bigger change.
+
+### In-budget counts
+
+- **Columns:** smooth (relayout ~1.5 ms, no scroll jank) at **120 columns × a
+  100-row page** — comfortably within a 60 Hz (16.7 ms) frame budget in a debug
+  build. Column virtualization is therefore **not** implemented: per the issue,
+  it's only warranted "if profiling says it's needed," and at 120 columns the
+  windowed grid is well inside budget. If a future table pushes column counts
+  far higher, revisit with the same measurement.
+- **Rows per page:** the whole page (100) is safe; the DOM footprint is bounded
+  by the viewport (~24–44 rows) regardless of page height, so raising
+  `PAGE_SIZE` later stays render-safe (re-check the FRE-34 memory budget first).
+
+### Reproducing the measurement
+
+The webview render numbers are gathered manually (there is no automated webview
+timing harness — the FRE-34 budgets cover the db layer). Build a wide fixture
+(e.g. `common::FixtureDb::wide(5000, 120)` dumped to a file, or any 100+‑column
+table), open it in the app, and in a `document::eval` probe count
+`#dv-grid tbody tr` / `td` and time a forced relayout
+(`grid.style.width` toggle + `void grid.scrollHeight`), comparing the windowed
+grid against a build that renders the whole page.
