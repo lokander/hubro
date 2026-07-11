@@ -4,6 +4,7 @@
 pub mod editing;
 mod editor;
 mod grid;
+mod notice;
 mod shell;
 mod sidebar;
 pub mod stage;

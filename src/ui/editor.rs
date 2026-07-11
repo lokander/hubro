@@ -8,6 +8,7 @@ use crate::db::{
 };
 use crate::history::HistoryEntry;
 
+use super::notice::{Banner, BannerKind, EmptyState, LoadingLine};
 use super::state::{AppState, ExportStatus, RunStatus, SchemaLoad};
 
 /// Cap on rendered result rows (per statement). The full result still sits
@@ -172,7 +173,11 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
                 }
                 match run {
                     None => rsx! {
-                        p { class: "px-4 py-3 text-sm text-slate-500", "Results appear here." }
+                        EmptyState {
+                            icon: "\u{25B6}", // ▶ play
+                            title: "Results appear here",
+                            hint: "Write SQL above and press Ctrl+Enter to run it.",
+                        }
                     },
                     Some(run) => rsx! {
                         for (index, statement) in run.statements.iter().enumerate() {
@@ -259,18 +264,20 @@ fn HistoryPanel(id: ConnectionId, editor_element: String) -> Element {
             }
             div { class: "min-h-0 flex-1 overflow-y-auto",
                 if let Some(err) = history_error {
-                    p { class: "px-3 py-2 text-xs text-amber-700 dark:text-amber-300",
-                        "History is unavailable: {err}"
+                    div { class: "p-2",
+                        Banner { kind: BannerKind::Warning, message: format!("History is unavailable: {err}") }
                     }
                 } else if !store_ready {
-                    p { class: "px-3 py-2 text-xs text-slate-500", "Opening history…" }
+                    LoadingLine { label: "Opening history…" }
                 } else {
                     match entries {
                         None => rsx! {
-                            p { class: "px-3 py-2 text-xs text-slate-500", "Loading…" }
+                            LoadingLine { label: "Loading…" }
                         },
                         Some(Err(err)) => rsx! {
-                            p { class: "px-3 py-2 text-xs text-amber-700 dark:text-amber-300", "History query failed: {err}" }
+                            div { class: "p-2",
+                                Banner { kind: BannerKind::Warning, message: format!("History query failed: {err}") }
+                            }
                         },
                         Some(Ok(entries)) if entries.is_empty() => rsx! {
                             p { class: "px-3 py-2 text-xs text-slate-500",
@@ -446,7 +453,7 @@ fn format_history_time(unix_secs: i64) -> String {
 fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
     match status {
         RunStatus::Running => rsx! {
-            p { class: "px-4 py-3 text-sm text-slate-500", "Running…" }
+            LoadingLine { label: "Running…" }
         },
         RunStatus::Done { elapsed_ms } => rsx! {
             p { class: "px-4 py-2 text-xs text-slate-500",
@@ -463,13 +470,18 @@ fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
             preview,
             elapsed_ms,
         } => rsx! {
-            div { class: "border-t border-red-300 dark:border-red-900/50 bg-red-100 dark:bg-red-950/20 px-4 py-3",
-                p { class: "mb-1 font-mono text-xs text-red-600 dark:text-red-300/80",
-                    "{statement_index + 1} · {preview}"
-                }
-                p { class: "font-mono text-sm text-red-600 dark:text-red-400", "{error}" }
-                p { class: "mt-1 text-xs text-slate-500",
-                    "Script stopped after {elapsed_ms} ms; earlier statements were not rolled back."
+            // Shares the Banner error palette; keeps the structured
+            // statement/error/note layout a single message can't hold.
+            div { class: "m-3 flex items-start gap-2 rounded border px-3 py-2 {BannerKind::Error.container_classes()}",
+                span { class: "shrink-0 select-none leading-5", "{BannerKind::Error.icon()}" }
+                div { class: "min-w-0 flex-1",
+                    p { class: "mb-1 truncate font-mono text-xs opacity-80",
+                        "{statement_index + 1} · {preview}"
+                    }
+                    p { class: "font-mono text-sm break-words", "{error}" }
+                    p { class: "mt-1 text-xs text-slate-500 dark:text-slate-400",
+                        "Script stopped after {elapsed_ms} ms; earlier statements were not rolled back."
+                    }
                 }
             }
         },

@@ -7,6 +7,7 @@ use crate::db::ConnectionId;
 
 use super::editor::SqlEditor;
 use super::grid::DataGrid;
+use super::notice::{Banner, BannerKind, EmptyState};
 use super::sidebar::SchemaSidebar;
 use super::state::{ActiveView, AppState};
 
@@ -246,12 +247,18 @@ fn ConnectionsScreen() -> Element {
         div { class: "flex h-full flex-col items-center justify-center gap-6 overflow-y-auto py-8",
             div { class: "text-center",
                 h1 { class: "text-2xl font-semibold text-slate-900 dark:text-slate-200", "dataview" }
-                p { class: "mt-1 text-sm text-slate-500 dark:text-slate-400",
-                    if saved.is_empty() {
-                        "Add a SQLite file or a Postgres server to get started."
-                    } else {
+                if !saved.is_empty() {
+                    p { class: "mt-1 text-sm text-slate-500 dark:text-slate-400",
                         "Pick a saved connection, or add another database."
                     }
+                }
+            }
+            if saved.is_empty() {
+                // Designed empty state; the Add buttons below are its action.
+                EmptyState {
+                    icon: "\u{1F50C}", // 🔌 plug
+                    title: "No connections yet",
+                    hint: "Add a SQLite file or Postgres server to get started.",
                 }
             }
             if !saved.is_empty() {
@@ -339,7 +346,13 @@ fn ConnectionsScreen() -> Element {
                 PostgresForm { on_done: move |_| show_pg_form.set(false) }
             }
             if let Some(err) = error {
-                p { class: "max-w-xl px-8 text-sm text-red-600 dark:text-red-400", "{err}" }
+                div { class: "w-full max-w-xl px-8",
+                    Banner {
+                        kind: BannerKind::Error,
+                        message: err,
+                        on_dismiss: move |_| state.connect_error.clone().set(None),
+                    }
+                }
             }
         }
     }

@@ -2,6 +2,7 @@ use dioxus::prelude::*;
 
 use crate::db::{ConnectionId, TableKind, TableMeta};
 
+use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState};
 use super::state::{AppState, SchemaLoad, TableRef};
 
 /// Sidebar for one connection: the introspected schema as an expandable
@@ -33,13 +34,19 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
             div { class: "min-h-0 flex-1 overflow-y-auto py-1",
                 match schema {
                     SchemaLoad::Loading => rsx! {
-                        p { class: "px-4 py-2 text-sm text-slate-500", "Loading schema…" }
+                        DelayedLoading { label: "Loading schema…" }
                     },
                     SchemaLoad::Failed(err) => rsx! {
-                        p { class: "px-4 py-2 text-sm text-red-600 dark:text-red-400", "{err}" }
+                        div { class: "p-2",
+                            Banner { kind: BannerKind::Error, message: err }
+                        }
                     },
                     SchemaLoad::Ready(tables) if tables.is_empty() => rsx! {
-                        p { class: "px-4 py-2 text-sm text-slate-500", "This database has no tables." }
+                        EmptyState {
+                            icon: "\u{1F5C4}", // 🗄 file cabinet
+                            title: "No tables",
+                            hint: "This database has no tables yet.",
+                        }
                     },
                     SchemaLoad::Ready(tables) => {
                         // Group by schema (Postgres); SQLite tables have no
