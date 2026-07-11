@@ -3,9 +3,9 @@ use std::collections::{HashMap, HashSet};
 use dioxus::prelude::*;
 
 use crate::db::{
-    detect_row_identity, ConnectionId, Dialect, ExportFormat, Filter, FilterOp, Generated,
-    PageRequest, QueryResult, RowIdentity, RowLocator, SortDir, StagedChange, TableKind, TableMeta,
-    Value,
+    detect_row_identity, ConnectionId, Dialect, ExportFormat, Filter, FilterOp, ForeignKeyMeta,
+    Generated, PageRequest, QueryResult, RowIdentity, RowLocator, SortDir, StagedChange, TableKind,
+    TableMeta, Value,
 };
 
 use super::editing::{editor_kind, CellEditor, EditNav, EditorKind};
@@ -86,7 +86,36 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let mut filter_column = use_signal(String::new);
     let mut filter_op = use_signal(|| FilterOp::Contains);
     let mut filter_text = use_signal(String::new);
-    let mut applied_filter = use_signal(|| Option::<Filter>::None);
+    // Seed the filter from a pending foreign-key focus targeting this table
+    // (FRE-29), so a jump paints the referenced row with no unfiltered flash.
+    // The consuming effect below clears the focus (and handles a same-table
+    // jump, where the grid stays mounted and only the filter changes).
+    let seed_table = table.clone();
+    let mut applied_filter = use_signal(move || {
+        state
+            .pending_focus
+            .peek()
+            .get(&id)
+            .filter(|focus| focus.table == seed_table)
+            .and_then(|focus| focus.filter.clone())
+    });
+    let focus_table = table.clone();
+    use_effect(move || {
+        let mut state = state;
+        let matched = state
+            .pending_focus
+            .read()
+            .get(&id)
+            .filter(|focus| focus.table == focus_table)
+            .cloned();
+        if let Some(focus) = matched {
+            applied_filter.set(focus.filter);
+            page.set(0);
+            // Reading pending_focus above subscribes this effect; removing the
+            // consumed entry re-runs it once (now no match) — no loop.
+            state.pending_focus.write().remove(&id);
+        }
+    });
 
     // Close any open editor and drop the row selection when the rows change
     // under them: a page flip, sort/filter change, or refetch replaces the
@@ -164,6 +193,24 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         .as_ref()
         .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
         .unwrap_or_default();
+    // Foreign keys of this table drive the clickable FK cells (FRE-29).
+    // `col_to_fk` maps a referencing column to the index of the FK it belongs
+    // to; a column in several FKs takes the first (documented v1 limit).
+    let foreign_keys: Vec<ForeignKeyMeta> = table_meta
+        .as_ref()
+        .map(|t| t.foreign_keys.clone())
+        .unwrap_or_default();
+    let col_to_fk: HashMap<String, usize> = {
+        let mut map = HashMap::new();
+        for (index, fk) in foreign_keys.iter().enumerate() {
+            for column in &fk.columns {
+                map.entry(column.clone()).or_insert(index);
+            }
+        }
+        map
+    };
+    // Whether the FK Back stack has anywhere to return to (reactive).
+    let can_back = state.can_go_back(id);
 
     let dialect: Option<Dialect> = state.registry.read().get(id).map(|c| c.pool.dialect());
     let identity: Option<RowIdentity> = match (&table_meta, dialect) {
@@ -255,6 +302,15 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         div { class: "flex h-full min-h-0 flex-col",
             // Filter bar
             div { class: "flex items-center gap-2 border-b border-slate-200 dark:border-slate-800 px-3 py-2 text-sm",
+                // Back: return to the view a foreign-key jump came from (FRE-29).
+                if can_back {
+                    button {
+                        class: "rounded px-2 py-1 text-xs text-cyan-700 dark:text-cyan-300 hover:bg-cyan-100 dark:hover:bg-cyan-950/40",
+                        title: "Back to the previous view",
+                        onclick: move |_| state.navigate_back(id),
+                        "← Back"
+                    }
+                }
                 select {
                     class: "rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 text-xs text-slate-900 dark:text-slate-300",
                     onchange: move |evt| filter_column.set(evt.value()),
@@ -290,6 +346,15 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     class: "rounded bg-slate-300 dark:bg-slate-700 px-3 py-1 text-xs text-slate-900 dark:text-slate-100 hover:bg-slate-400 dark:hover:bg-slate-600",
                     onclick: move |_| apply_filter(filter_column, filter_op, filter_text, applied_filter, page),
                     "Apply"
+                }
+                // An FK jump installs an equality filter the single-column
+                // inputs can't show; a chip spells out what's pinned (FRE-29).
+                if let Some(description) = equality_filter_label(applied_filter.read().as_ref()) {
+                    span {
+                        class: "rounded bg-cyan-100 dark:bg-cyan-950/50 px-2 py-1 font-mono text-xs text-cyan-700 dark:text-cyan-300",
+                        title: "Filtered to a referenced row",
+                        "{description}"
+                    }
                 }
                 if applied_filter.read().is_some() {
                     button {
@@ -524,10 +589,18 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                                 table: row_table.clone(),
                                                 row,
                                                 column_kinds: column_kinds.clone(),
+                                                foreign_keys: foreign_keys.clone(),
+                                                col_to_fk: col_to_fk.clone(),
                                                 dialect: dialect.unwrap_or(Dialect::Sqlite),
                                                 editing,
                                                 select_enabled,
                                                 selected,
+                                                on_fk_jump: {
+                                                    let origin = row_table.clone();
+                                                    move |(fk, row_values): (ForeignKeyMeta, HashMap<String, Value>)| {
+                                                        state.navigate_fk(id, &fk, &row_values, &origin, applied_filter.peek().clone());
+                                                    }
+                                                },
                                             }
                                         }
                                         // Pending inserts: phantom rows with
@@ -815,6 +888,22 @@ fn spawn_grid_export(
     });
 }
 
+/// A short chip describing an equality (foreign-key) filter, e.g.
+/// `artist_id = 1, seq = 2`. `None` for no filter or the single-column filter
+/// bar filter (which the inputs already show).
+fn equality_filter_label(filter: Option<&Filter>) -> Option<String> {
+    match filter? {
+        Filter::Equalities(pairs) => Some(
+            pairs
+                .iter()
+                .map(|(column, value)| format!("{column} = {}", value.display()))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        Filter::Column { .. } => None,
+    }
+}
+
 /// Applies the staged filter inputs and resets to the first page.
 fn apply_filter(
     filter_column: Signal<String>,
@@ -828,7 +917,7 @@ fn apply_filter(
     if column.is_empty() || value.is_empty() {
         applied_filter.set(None);
     } else {
-        applied_filter.set(Some(Filter {
+        applied_filter.set(Some(Filter::Column {
             column,
             op: *filter_op.peek(),
             value,
@@ -879,10 +968,17 @@ fn GridRow(
     table: TableRef,
     row: RowView,
     column_kinds: HashMap<String, (EditorKind, bool)>,
+    /// Foreign keys of this table, indexed by `col_to_fk` (FRE-29).
+    foreign_keys: Vec<ForeignKeyMeta>,
+    /// Referencing column → index into `foreign_keys` (first FK wins).
+    col_to_fk: HashMap<String, usize>,
     dialect: Dialect,
     editing: Signal<Option<ActiveEdit>>,
     select_enabled: bool,
     mut selected: Signal<HashMap<String, RowLocator>>,
+    /// Follows the FK a clicked cell belongs to, carrying that FK plus this
+    /// row's column → value map (the source of the jump's equality filter).
+    on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>)>,
 ) -> Element {
     // This row's Tab order: its editable columns, left to right.
     let editable_columns: Vec<String> = row
@@ -890,6 +986,12 @@ fn GridRow(
         .iter()
         .filter(|cell| cell_editable(cell, &column_kinds))
         .map(|cell| cell.column.clone())
+        .collect();
+    // The row's values by column, the source for any FK jump from this row.
+    let row_values: HashMap<String, Value> = row
+        .cells
+        .iter()
+        .map(|cell| (cell.column.clone(), cell.value.clone()))
         .collect();
     // Rows pending delete (or unaddressable) can't be (re)selected; their
     // leading cell stays empty.
@@ -937,6 +1039,14 @@ fn GridRow(
                     dialect,
                     editable_columns: editable_columns.clone(),
                     editing,
+                    // FK cells (non-NULL value belonging to an FK) carry the
+                    // jump payload: the FK plus this row's values. A NULL FK
+                    // references nothing, so it renders as a plain cell.
+                    fk_jump: col_to_fk
+                        .get(&cell.column)
+                        .filter(|_| !cell.value.is_null())
+                        .map(|&index| (foreign_keys[index].clone(), row_values.clone())),
+                    on_fk_jump,
                 }
             }
         }
@@ -960,6 +1070,12 @@ fn GridCellSlot(
     dialect: Dialect,
     editable_columns: Vec<String>,
     mut editing: Signal<Option<ActiveEdit>>,
+    /// `Some((fk, row_values))` when this cell belongs to a foreign key and
+    /// has a non-NULL value — renders a ↗ jump link (FRE-29). Editing the
+    /// cell value stays on double-click/Enter, so navigation and editing never
+    /// contend for the same gesture.
+    fk_jump: Option<(ForeignKeyMeta, HashMap<String, Value>)>,
+    on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>)>,
 ) -> Element {
     let state = use_context::<AppState>();
     let is_active = editable
@@ -1045,7 +1161,23 @@ fn GridCellSlot(
                         open_on_enter();
                     }
                 },
-                div { class: "max-w-md truncate", title: "{tooltip}", "{display}" }
+                div { class: "flex items-center gap-1",
+                    div { class: "max-w-md truncate", title: "{tooltip}", "{display}" }
+                    // FK jump affordance: a single click follows the key to the
+                    // referenced row. Kept distinct from the cell body so the
+                    // double-click / Enter edit gesture is untouched.
+                    if let Some((fk, row_values)) = fk_jump.clone() {
+                        a {
+                            class: "shrink-0 cursor-pointer select-none text-cyan-600 dark:text-cyan-400 hover:underline",
+                            title: "Go to {fk.referenced_table}",
+                            onclick: move |evt| {
+                                evt.stop_propagation();
+                                on_fk_jump.call((fk.clone(), row_values.clone()));
+                            },
+                            "↗"
+                        }
+                    }
+                }
             }
         }
     }

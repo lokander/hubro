@@ -8,6 +8,7 @@
 
 mod error;
 mod export;
+mod fk;
 mod page;
 mod postgres;
 mod registry;
@@ -20,6 +21,7 @@ mod value;
 
 pub use error::DbError;
 pub use export::{write_result, ExportFormat};
+pub use fk::{build_fk_filter, resolve_referenced_column};
 pub use page::{Dialect, Filter, FilterOp, PageRequest, SortDir};
 pub use postgres::{build_url, sanitized_url, url_target, url_via_local_port, url_with_password};
 pub use registry::{Connection, ConnectionId, ConnectionRegistry, DbPool};

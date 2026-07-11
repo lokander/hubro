@@ -6,7 +6,7 @@
 mod common;
 
 use common::FixtureDb;
-use dataview::db::{DbPool, ExportFormat, Filter, FilterOp, PageRequest, SortDir, Value};
+use dataview::db::{DbPool, ExportFormat, Filter, PageRequest, SortDir, Value};
 
 /// Streams an export into an in-memory buffer, returning (bytes, row_count).
 async fn export_to_string(
@@ -98,11 +98,7 @@ async fn sqlite_export_respects_filter_and_sort_via_page_request() {
         limit: 0,
         offset: 0,
         sort: Some(("id".into(), SortDir::Desc)),
-        filter: Some(Filter {
-            column: "name".into(),
-            op: FilterOp::Contains,
-            value: "a".into(),
-        }),
+        filter: Some(Filter::contains("name", "a")),
         extra_key_column: None,
     };
     let (sql, params) = request.export_sql(pool.dialect());
@@ -239,11 +235,7 @@ async fn postgres_export_respects_filter_and_sort() {
         limit: 0,
         offset: 0,
         sort: Some(("id".into(), SortDir::Desc)),
-        filter: Some(Filter {
-            column: "name".into(),
-            op: FilterOp::Equals,
-            value: "banana".into(),
-        }),
+        filter: Some(Filter::equals("name", "banana")),
         extra_key_column: None,
     };
     let (sql, params) = request.export_sql(pool.dialect());
