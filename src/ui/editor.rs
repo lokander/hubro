@@ -3,12 +3,12 @@ use serde::Deserialize;
 use sqlx::types::chrono::{DateTime, Local};
 
 use crate::db::{
-    needs_confirmation, ConnectionId, Dialect, QueryResult, StatementOutcome, StatementResult,
-    TableMeta, Value,
+    needs_confirmation, ConnectionId, Dialect, ExportFormat, QueryResult, StatementOutcome,
+    StatementResult, TableMeta, Value,
 };
 use crate::history::HistoryEntry;
 
-use super::state::{AppState, RunStatus, SchemaLoad};
+use super::state::{AppState, ExportStatus, RunStatus, SchemaLoad};
 
 /// Cap on rendered result rows (per statement). The full result still sits
 /// in memory until FRE-33 introduces streaming/limits at the query layer,
@@ -178,6 +178,7 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
                         for (index, statement) in run.statements.iter().enumerate() {
                             StatementSection {
                                 key: "{index}",
+                                id,
                                 index: index + 1,
                                 result: statement.clone(),
                             }
@@ -481,21 +482,58 @@ fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
 }
 
 /// One executed statement's section: a header naming the statement plus its
-/// row count or affected count, and the result table for reads.
+/// row count or affected count, and the result table for reads. Read results
+/// carry an Export CSV/JSON control that serializes the full held
+/// [`QueryResult`] (not just the rendered rows) through a native save dialog.
 #[component]
-fn StatementSection(index: usize, result: StatementResult) -> Element {
+fn StatementSection(id: ConnectionId, index: usize, result: StatementResult) -> Element {
+    let state = use_context::<AppState>();
     let summary = match &result.outcome {
         StatementOutcome::Affected(1) => "1 row affected".to_string(),
         StatementOutcome::Affected(n) => format!("{n} rows affected"),
         StatementOutcome::Rows(r) if r.rows.len() == 1 => "1 row".to_string(),
         StatementOutcome::Rows(r) => format!("{} rows", r.rows.len()),
     };
+    // The held result to export (reads only). Cloned once here so the export
+    // buttons can hand a snapshot to the background task.
+    let exportable: Option<QueryResult> = match &result.outcome {
+        StatementOutcome::Rows(rows) if !rows.rows.is_empty() => Some(rows.clone()),
+        _ => None,
+    };
+    let export_status: Option<ExportStatus> = state.export_status.read().get(&id).cloned();
     rsx! {
         div { class: "border-b border-slate-200 dark:border-slate-800",
             p { class: "flex items-baseline gap-2 bg-slate-100 dark:bg-slate-900/60 px-4 py-1.5 text-xs",
                 span { class: "font-mono text-slate-500", "{index}" }
                 span { class: "min-w-0 truncate font-mono text-slate-900 dark:text-slate-300", "{result.preview}" }
                 span { class: "shrink-0 text-cyan-700 dark:text-cyan-400", "— {summary}" }
+                if let Some(result) = exportable {
+                    div { class: "flex-1" }
+                    if let Some(status) = export_status.as_ref() {
+                        {
+                            let (text, class) = status.line();
+                            rsx! { span { class: "shrink-0 {class}", title: "{text}", "{text}" } }
+                        }
+                    }
+                    button {
+                        class: "shrink-0 rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                        title: "Export this result to CSV",
+                        onclick: {
+                            let result = result.clone();
+                            move |_| spawn_result_export(state, id, result.clone(), ExportFormat::Csv)
+                        },
+                        "Export CSV"
+                    }
+                    button {
+                        class: "shrink-0 rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                        title: "Export this result to JSON",
+                        onclick: {
+                            let result = result.clone();
+                            move |_| spawn_result_export(state, id, result.clone(), ExportFormat::Json)
+                        },
+                        "Export JSON"
+                    }
+                }
             }
             match &result.outcome {
                 StatementOutcome::Affected(_) => rsx! {},
@@ -508,6 +546,33 @@ fn StatementSection(index: usize, result: StatementResult) -> Element {
             }
         }
     }
+}
+
+/// Opens a native save dialog and, on a chosen path, writes the held
+/// [`QueryResult`] to it in `format` via [`AppState::export_result`] (a
+/// background task; the UI never blocks).
+fn spawn_result_export(
+    state: AppState,
+    id: ConnectionId,
+    result: QueryResult,
+    format: ExportFormat,
+) {
+    let (filter_name, ext) = match format {
+        ExportFormat::Csv => ("CSV", "csv"),
+        ExportFormat::Json => ("JSON", "json"),
+    };
+    let suggested = format!("query-result.{ext}");
+    spawn(async move {
+        let picked = rfd::AsyncFileDialog::new()
+            .set_title("Export query result")
+            .set_file_name(suggested)
+            .add_filter(filter_name, &[ext])
+            .save_file()
+            .await;
+        if let Some(file) = picked {
+            state.export_result(id, result, format, file.path().to_path_buf());
+        }
+    });
 }
 
 /// A result grid, capped at [`MAX_RENDERED_ROWS`] rendered rows.

@@ -11,8 +11,9 @@ use crate::config::{
 };
 use crate::db::{
     apply_staged, detect_row_identity, needs_confirmation, run_script, split_statements,
-    url_target, url_via_local_port, url_with_password, ConnectionId, ConnectionRegistry, DbError,
-    DbPool, RowLocator, StatementResult, TableMeta, Value,
+    url_target, url_via_local_port, url_with_password, write_result, ConnectionId,
+    ConnectionRegistry, DbError, DbPool, ExportFormat, QueryResult, RowLocator, StatementResult,
+    TableMeta, Value,
 };
 use crate::history::HistoryStore;
 use crate::tunnel::{Tunnel, TunnelAuth, TunnelConfig, TunnelError};
@@ -158,6 +159,37 @@ pub struct SqlRun {
     pub status: RunStatus,
 }
 
+/// Progress of the most recent export (grid or SQL result) per connection.
+/// Shown as a small transient line in the pane's toolbar; it stays until the
+/// next export replaces it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExportStatus {
+    Running,
+    Done { rows: u64 },
+    Failed(String),
+}
+
+impl ExportStatus {
+    /// The toolbar line for this status: display text plus a Tailwind color
+    /// class. Shared by the grid and SQL-editor export controls.
+    pub fn line(&self) -> (String, &'static str) {
+        match self {
+            ExportStatus::Running => (
+                "Exporting…".to_string(),
+                "text-slate-500 dark:text-slate-400",
+            ),
+            ExportStatus::Done { rows } => (
+                format!("Exported {rows} row{}", if *rows == 1 { "" } else { "s" }),
+                "text-emerald-700 dark:text-emerald-400",
+            ),
+            ExportStatus::Failed(err) => (
+                format!("Export failed: {err}"),
+                "text-red-600 dark:text-red-400",
+            ),
+        }
+    }
+}
+
 /// A script held back by the write-confirmation banner: the original text
 /// (recorded into history when the run happens) plus its split statements.
 #[derive(Debug, Clone, PartialEq)]
@@ -290,6 +322,9 @@ pub struct AppState {
     /// `theme` and — for `System` — a one-time startup read of the OS
     /// preference. Root-scoped: written from the startup detection task.
     pub dark: Signal<bool>,
+    /// Latest export progress per connection (grid or SQL result). Root-
+    /// scoped: written from the `spawn_forever` export task.
+    pub export_status: Signal<HashMap<ConnectionId, ExportStatus>>,
 }
 
 impl AppState {
@@ -345,6 +380,8 @@ impl AppState {
             // the startup detection task (below) corrects `System`. Root-
             // scoped: written from that spawn_forever task.
             dark: Signal::new_in_scope(theme.resolve_dark(false), ScopeId::ROOT),
+            // Root-scoped: written from the spawn_forever export task.
+            export_status: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
         };
         // Resolve the OS dark-mode preference once at startup. Reacting to
         // live OS theme changes is out of scope (a startup read suffices);
@@ -1371,6 +1408,80 @@ impl AppState {
         });
     }
 
+    /// Streams a live query (the current grid view: filter + sort, no paging)
+    /// to `path` in `format`, in a background task. The query re-runs against
+    /// the connection so it always reflects committed data; rows are pulled
+    /// one at a time and written incrementally (see
+    /// [`DbPool::export`](crate::db::DbPool::export)). Progress lands in
+    /// [`Self::export_status`]; the UI never blocks.
+    pub fn export_query(
+        mut self,
+        id: ConnectionId,
+        sql: String,
+        params: Vec<Value>,
+        format: ExportFormat,
+        path: PathBuf,
+    ) {
+        let pool = self.registry.read().get(id).map(|c| c.pool.clone());
+        let Some(pool) = pool else {
+            self.export_status
+                .write()
+                .insert(id, ExportStatus::Failed("connection closed".into()));
+            return;
+        };
+        self.export_status.write().insert(id, ExportStatus::Running);
+        // spawn_forever: the export must survive the grid unmounting (a pane
+        // or tab switch) — a plain spawn would cancel it mid-write.
+        spawn_forever(async move {
+            use std::io::Write as _;
+            let outcome = async {
+                let file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+                let mut writer = std::io::BufWriter::new(file);
+                let rows = pool
+                    .export(&sql, &params, format, &mut writer)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                writer.flush().map_err(|e| e.to_string())?;
+                Ok::<u64, String>(rows)
+            }
+            .await;
+            self.finish_export(id, outcome);
+        });
+    }
+
+    /// Writes an already-materialized [`QueryResult`] (the SQL editor's held
+    /// result) to `path` in `format`, in a background task. Shares the row
+    /// formatters with [`Self::export_query`]; no database round-trip.
+    pub fn export_result(
+        mut self,
+        id: ConnectionId,
+        result: QueryResult,
+        format: ExportFormat,
+        path: PathBuf,
+    ) {
+        self.export_status.write().insert(id, ExportStatus::Running);
+        spawn_forever(async move {
+            use std::io::Write as _;
+            let outcome = (|| {
+                let file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+                let mut writer = std::io::BufWriter::new(file);
+                let rows = write_result(&result, format, &mut writer).map_err(|e| e.to_string())?;
+                writer.flush().map_err(|e| e.to_string())?;
+                Ok::<u64, String>(rows)
+            })();
+            self.finish_export(id, outcome);
+        });
+    }
+
+    /// Records an export's terminal status.
+    fn finish_export(mut self, id: ConnectionId, outcome: Result<u64, String>) {
+        let status = match outcome {
+            Ok(rows) => ExportStatus::Done { rows },
+            Err(err) => ExportStatus::Failed(err),
+        };
+        self.export_status.write().insert(id, status);
+    }
+
     /// Records a failed save on the stage (kept intact) and re-enables Save.
     fn fail_save(mut self, id: ConnectionId, table_key: &str, message: String) {
         let mut staged = self.staged.write();
@@ -1419,6 +1530,7 @@ impl AppState {
         self.tab_ui.write().remove(&id);
         self.sql_runs.write().remove(&id);
         self.pending_sql.write().remove(&id);
+        self.export_status.write().remove(&id);
         // Abort any in-flight run and drop its bookkeeping; bumping nothing
         // is fine — removing the generation entry makes any still-alive
         // task's generation stale.

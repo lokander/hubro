@@ -1,9 +1,11 @@
+use std::io::Write;
 use std::path::Path;
 
 use sqlx::postgres::PgPool;
 use sqlx::sqlite::SqlitePool;
 
 use super::error::DbError;
+use super::export::ExportFormat;
 use super::page::{Dialect, PageRequest};
 use super::postgres;
 use super::schema::TableMeta;
@@ -119,6 +121,22 @@ impl DbPool {
             other => Err(DbError::Query(format!(
                 "unexpected COUNT(*) result: {other:?}"
             ))),
+        }
+    }
+
+    /// Streams the rows of `sql` (with bound `params`) to `out` in `format`,
+    /// pulling one row at a time so the export never buffers the full result.
+    /// Returns the number of data rows written. See [`export`](super::export).
+    pub async fn export(
+        &self,
+        sql: &str,
+        params: &[Value],
+        format: ExportFormat,
+        out: &mut impl Write,
+    ) -> Result<u64, DbError> {
+        match self {
+            DbPool::Sqlite(pool) => sqlite::export(pool, sql, params, format, out).await,
+            DbPool::Postgres(pool) => postgres::export(pool, sql, params, format, out).await,
         }
     }
 

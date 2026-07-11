@@ -3,13 +3,14 @@ use std::collections::{HashMap, HashSet};
 use dioxus::prelude::*;
 
 use crate::db::{
-    detect_row_identity, ConnectionId, Dialect, Filter, FilterOp, Generated, PageRequest,
-    QueryResult, RowIdentity, RowLocator, SortDir, StagedChange, TableKind, TableMeta, Value,
+    detect_row_identity, ConnectionId, Dialect, ExportFormat, Filter, FilterOp, Generated,
+    PageRequest, QueryResult, RowIdentity, RowLocator, SortDir, StagedChange, TableKind, TableMeta,
+    Value,
 };
 
 use super::editing::{editor_kind, CellEditor, EditNav, EditorKind};
 use super::stage::{required_insert_columns, PendingInsert, TableStage};
-use super::state::{AppState, SchemaLoad, TableRef};
+use super::state::{AppState, ExportStatus, SchemaLoad, TableRef};
 
 const PAGE_SIZE: u32 = 100;
 
@@ -242,6 +243,8 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
 
     let current = rows_resource.read();
     let sort_value = sort();
+    let export_status: Option<ExportStatus> = state.export_status.read().get(&id).cloned();
+    let export_table = table.clone();
     let refresh_table = table.clone();
     let save_table = table.clone();
     let discard_table = table.clone();
@@ -300,6 +303,32 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     }
                 }
                 div { class: "flex-1" }
+                if let Some(status) = export_status.as_ref() {
+                    {
+                        let (text, class) = status.line();
+                        rsx! { span { class: "truncate text-xs {class}", title: "{text}", "{text}" } }
+                    }
+                }
+                if let Some(export_dialect) = dialect {
+                    button {
+                        class: "rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                        title: "Export the current view (filter + sort, all rows) to CSV",
+                        onclick: {
+                            let export_table = export_table.clone();
+                            move |_| spawn_grid_export(state, id, export_table.clone(), export_dialect, sort.peek().clone(), applied_filter.peek().clone(), ExportFormat::Csv)
+                        },
+                        "Export CSV"
+                    }
+                    button {
+                        class: "rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                        title: "Export the current view (filter + sort, all rows) to JSON",
+                        onclick: {
+                            let export_table = export_table.clone();
+                            move |_| spawn_grid_export(state, id, export_table.clone(), export_dialect, sort.peek().clone(), applied_filter.peek().clone(), ExportFormat::Json)
+                        },
+                        "Export JSON"
+                    }
+                }
                 button {
                     class: "rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
                     title: "Re-run the current query",
@@ -743,6 +772,47 @@ fn step_column(columns: &[String], current: &str, delta: i32) -> Option<String> 
         return None;
     }
     columns.get(next as usize).cloned()
+}
+
+/// Opens a native save dialog and, on a chosen path, streams the current
+/// grid view (active filter + sort, all matching rows — no paging) to it in
+/// `format`. The export runs in the background via
+/// [`AppState::export_query`]; the UI never blocks.
+fn spawn_grid_export(
+    state: AppState,
+    id: ConnectionId,
+    table: TableRef,
+    dialect: Dialect,
+    sort: Option<(String, SortDir)>,
+    filter: Option<Filter>,
+    format: ExportFormat,
+) {
+    let request = PageRequest {
+        schema: table.schema.clone(),
+        table: table.name.clone(),
+        limit: 0,
+        offset: 0,
+        sort,
+        filter,
+        extra_key_column: None,
+    };
+    let (sql, params) = request.export_sql(dialect);
+    let suggested = format!("{}.{}", table.name, format.extension());
+    let (filter_name, ext) = match format {
+        ExportFormat::Csv => ("CSV", "csv"),
+        ExportFormat::Json => ("JSON", "json"),
+    };
+    spawn(async move {
+        let picked = rfd::AsyncFileDialog::new()
+            .set_title("Export table")
+            .set_file_name(suggested)
+            .add_filter(filter_name, &[ext])
+            .save_file()
+            .await;
+        if let Some(file) = picked {
+            state.export_query(id, sql, params, format, file.path().to_path_buf());
+        }
+    });
 }
 
 /// Applies the staged filter inputs and resets to the first page.

@@ -2,6 +2,8 @@
 //! (multi-schema, indexes, FKs) lands with FRE-11; until then only tables
 //! and columns of the `public` schema are listed.
 
+use std::io::Write;
+
 use sqlx::postgres::types::{PgInterval, PgTimeTz};
 use sqlx::postgres::{
     PgDatabaseError, PgErrorPosition, PgHasArrayType, PgPool, PgPoolOptions, PgRow, PgTypeKind,
@@ -12,6 +14,7 @@ use sqlx::types::{Decimal, JsonValue, Uuid};
 use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
 
 use super::error::DbError;
+use super::export::{export_io_err, ExportFormat, ExportSink};
 use super::schema::{ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta};
 use super::staged::CheckedStatement;
 use super::value::{ColumnInfo, QueryResult, Value};
@@ -203,6 +206,63 @@ pub async fn query_with(
         columns,
         rows: out_rows,
     })
+}
+
+/// Streams a query to `out` in the given format, pulling rows one at a time
+/// (`fetch`, not `fetch_all`) and writing each incrementally — peak memory is
+/// one decoded row plus the writer's buffer. Returns the number of data rows
+/// written. When the result is empty the column names come from a statement
+/// describe so the header (CSV) / empty array (JSON) still reflect the query.
+pub async fn export(
+    pool: &PgPool,
+    sql: &str,
+    params: &[Value],
+    format: ExportFormat,
+    out: &mut impl Write,
+) -> Result<u64, DbError> {
+    use futures_util::TryStreamExt as _;
+
+    let mut stream = bind_params(sqlx::query(sql), params).fetch(pool);
+    let mut sink: Option<ExportSink> = None;
+    let mut rows = 0u64;
+    while let Some(row) = stream.try_next().await.map_err(|e| query_error(e, sql))? {
+        let sink = match sink.as_mut() {
+            Some(sink) => sink,
+            None => {
+                let columns = row.columns().iter().map(|c| c.name().to_string()).collect();
+                let mut new_sink = ExportSink::new(format, columns);
+                new_sink.begin(out).map_err(export_io_err)?;
+                sink.insert(new_sink)
+            }
+        };
+        let mut values = Vec::with_capacity(row.columns().len());
+        for idx in 0..row.columns().len() {
+            values.push(decode_value(&row, idx)?);
+        }
+        sink.write_row(&values, out).map_err(export_io_err)?;
+        rows += 1;
+    }
+    match sink.as_mut() {
+        Some(sink) => sink.end(out).map_err(export_io_err)?,
+        None => {
+            let columns = describe_columns(pool, sql).await?;
+            let mut sink = ExportSink::new(format, columns);
+            sink.begin(out).map_err(export_io_err)?;
+            sink.end(out).map_err(export_io_err)?;
+        }
+    }
+    Ok(rows)
+}
+
+/// Column names of a prepared statement, for the header of a zero-row export.
+async fn describe_columns(pool: &PgPool, sql: &str) -> Result<Vec<String>, DbError> {
+    use sqlx::Executor as _;
+    let described = pool.describe(sql).await.map_err(|e| query_error(e, sql))?;
+    Ok(described
+        .columns()
+        .iter()
+        .map(|c| c.name().to_string())
+        .collect())
 }
 
 /// Executes a statement without decoding rows, returning the driver's

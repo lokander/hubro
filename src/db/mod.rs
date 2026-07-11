@@ -7,6 +7,7 @@
 //! resulting values in signals — never hold a signal borrow across an await.
 
 mod error;
+mod export;
 mod page;
 mod postgres;
 mod registry;
@@ -18,6 +19,7 @@ mod staged;
 mod value;
 
 pub use error::DbError;
+pub use export::{write_result, ExportFormat};
 pub use page::{Dialect, Filter, FilterOp, PageRequest, SortDir};
 pub use postgres::{build_url, sanitized_url, url_target, url_via_local_port, url_with_password};
 pub use registry::{Connection, ConnectionId, ConnectionRegistry, DbPool};
