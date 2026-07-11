@@ -288,6 +288,10 @@ pub fn CellEditor(
     // blur instead of running the Shift+Tab commit.
     let on_key = move |evt: KeyboardEvent| match evt.code() {
         Code::Enter | Code::NumpadEnter => {
+            // Stop these keys from bubbling to the grid's key handler, which
+            // would otherwise re-open an editor on the focused cell the
+            // instant this commit sets `editing = None`.
+            evt.stop_propagation();
             // An IME composition is confirmed with Enter — that keystroke
             // belongs to the composition, not to us, and must not commit
             // and close the editor mid-input.
@@ -301,10 +305,12 @@ pub fn CellEditor(
             commit(EditNav::Stay);
         }
         Code::Escape => {
+            evt.stop_propagation();
             finished.set(true);
             on_cancel.call(());
         }
         Code::Tab => {
+            evt.stop_propagation();
             evt.prevent_default();
             commit(if evt.modifiers().shift() {
                 EditNav::Prev
