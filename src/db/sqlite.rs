@@ -11,7 +11,7 @@ use super::export::{export_io_err, ExportFormat, ExportSink};
 use super::page::quote_ident;
 use super::schema::{ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta};
 use super::staged::CheckedStatement;
-use super::value::{ColumnInfo, QueryResult, Value};
+use super::value::{cap_value, ColumnInfo, QueryResult, Value};
 
 /// Opens an existing SQLite database file and validates it is actually a
 /// SQLite database (the file header is only checked on first real access).
@@ -135,16 +135,77 @@ pub async fn query_with(
     };
     let mut out_rows = Vec::with_capacity(rows.len());
     for row in &rows {
-        let mut values = Vec::with_capacity(row.columns().len());
-        for idx in 0..row.columns().len() {
-            values.push(decode_value(row, idx)?);
-        }
-        out_rows.push(values);
+        out_rows.push(decode_row(row)?);
     }
     Ok(QueryResult {
         columns,
         rows: out_rows,
     })
+}
+
+/// Streams `sql` one row at a time (`fetch`, not `fetch_all`), decoding and
+/// retaining at most `max_rows` rows and capping each cell to `cell_cap`
+/// bytes, so neither the row count nor a pathologically large cell can make
+/// the free-form query path scale with table or value size (FRE-33). Returns
+/// the (bounded) result and whether more rows existed beyond the cap. Shares
+/// the same streaming primitive as [`export`].
+pub async fn query_capped(
+    pool: &SqlitePool,
+    sql: &str,
+    params: &[Value],
+    max_rows: u64,
+    cell_cap: usize,
+) -> Result<(QueryResult, bool), DbError> {
+    use futures_util::TryStreamExt as _;
+
+    let mut stream = bind_params(sqlx::query(sql), params).fetch(pool);
+    let mut columns: Vec<ColumnInfo> = Vec::new();
+    let mut out_rows: Vec<Vec<Value>> = Vec::new();
+    let mut truncated = false;
+    while let Some(row) = stream
+        .try_next()
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?
+    {
+        // The cap+1'th row that reaches us proves there is more; stop before
+        // decoding it so exactly `max_rows` rows are retained.
+        if out_rows.len() as u64 >= max_rows {
+            truncated = true;
+            break;
+        }
+        if columns.is_empty() {
+            columns = row
+                .columns()
+                .iter()
+                .map(|c| ColumnInfo {
+                    name: c.name().to_string(),
+                })
+                .collect();
+        }
+        let values = decode_row(&row)?
+            .into_iter()
+            .map(|v| cap_value(v, cell_cap))
+            .collect();
+        out_rows.push(values);
+    }
+    Ok((
+        QueryResult {
+            columns,
+            rows: out_rows,
+        },
+        truncated,
+    ))
+}
+
+/// Decodes every cell of one fetched row into the backend-neutral [`Value`]
+/// model. Shared by the buffered ([`query_with`]) and streaming
+/// ([`query_capped`], [`export`]) paths.
+fn decode_row(row: &SqliteRow) -> Result<Vec<Value>, DbError> {
+    let mut values = Vec::with_capacity(row.columns().len());
+    for idx in 0..row.columns().len() {
+        values.push(decode_value(row, idx)?);
+    }
+    Ok(values)
 }
 
 /// Streams a query to `out` in the given format, pulling rows one at a time
@@ -178,10 +239,7 @@ pub async fn export(
                 sink.insert(new_sink)
             }
         };
-        let mut values = Vec::with_capacity(row.columns().len());
-        for idx in 0..row.columns().len() {
-            values.push(decode_value(&row, idx)?);
-        }
+        let values = decode_row(&row)?;
         sink.write_row(&values, out).map_err(export_io_err)?;
         rows += 1;
     }
@@ -246,9 +304,20 @@ pub async fn introspect(pool: &SqlitePool) -> Result<Vec<TableMeta>, DbError> {
 }
 
 async fn table_columns(pool: &SqlitePool, table: &str) -> Result<Vec<ColumnMeta>, DbError> {
-    let rows = pragma(pool, "table_info", table).await?;
+    // `table_xinfo` (not `table_info`) so generated (`AS (…)`) columns are
+    // reported: they appear in `SELECT *`, so the grid's bounded page fetch —
+    // which builds an explicit projection from this metadata (FRE-33) — must
+    // know about them, and they must be read-only. `table_xinfo` adds a
+    // `hidden` column: 0 = ordinary, 2 = VIRTUAL generated, 3 = STORED
+    // generated, 1 = a hidden column (virtual-table machinery) that `SELECT *`
+    // does NOT return — skip those so the projection still matches `SELECT *`.
+    let rows = pragma(pool, "table_xinfo", table).await?;
     let mut columns = Vec::with_capacity(rows.len());
     for row in rows {
+        let hidden: i64 = get(&row, "hidden")?;
+        if hidden == 1 {
+            continue;
+        }
         let pk: i64 = get(&row, "pk")?;
         let notnull: i64 = get(&row, "notnull")?;
         columns.push(ColumnMeta {
@@ -257,9 +326,13 @@ async fn table_columns(pool: &SqlitePool, table: &str) -> Result<Vec<ColumnMeta>
             nullable: notnull == 0,
             primary_key_position: (pk > 0).then_some(pk as u32),
             default: get::<Option<String>>(&row, "dflt_value")?,
-            // SQLite's `PRAGMA table_info` omits generated (`AS (…)`)
-            // columns entirely, so any column it reports is user-writable.
-            generated: Generated::Never,
+            // 2/3 are VIRTUAL/STORED generated columns: database-assigned and
+            // not writable through ordinary INSERT/UPDATE.
+            generated: if hidden == 2 || hidden == 3 {
+                Generated::Always
+            } else {
+                Generated::Never
+            },
         });
     }
     Ok(columns)

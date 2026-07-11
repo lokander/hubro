@@ -28,7 +28,7 @@
 mod common;
 
 use common::{budgets, perf_scale, FixtureDb, Timings};
-use dataview::db::{DbPool, PageRequest};
+use dataview::db::{DbPool, PageRequest, Value, PREVIEW_BYTES};
 
 fn request(table: &str) -> PageRequest {
     PageRequest {
@@ -200,6 +200,66 @@ async fn budget_big_value_page() {
         async move {
             let page = pool.fetch_page(&req).await.unwrap();
             assert_eq!(page.rows.len() as u64, perf_scale::BIG_VALUE_ROWS);
+        }
+    })
+    .await
+    .report_and_assert(budgets::BIG_VALUE_PAGE);
+
+    pool.close().await;
+}
+
+/// The bounded page path (FRE-33) must keep peak memory independent of value
+/// size. This asserts a **memory bound** — the whole decoded page is far
+/// smaller than even one full 4 MB value — as the observable proxy for bounded
+/// memory, then times it against the same `big_value_page` budget.
+#[tokio::test]
+#[ignore = "builds a multi-MB-value fixture; run with --ignored"]
+async fn budget_big_value_page_bounded() {
+    let fixture =
+        FixtureDb::big_values_cached(perf_scale::BIG_VALUE_ROWS, perf_scale::BIG_VALUE_BYTES).await;
+    let pool = fixture.open().await;
+    let tables = pool.introspect().await.unwrap();
+    let cols = tables
+        .iter()
+        .find(|t| t.name == "big_values")
+        .unwrap()
+        .columns
+        .clone();
+    let req = request("big_values");
+
+    // Memory bound: every large cell is capped at PREVIEW_BYTES, so the whole
+    // decoded page is a few KB — not rows × 4 MB.
+    let page = pool.fetch_page_bounded(&req, &cols, &["id"]).await.unwrap();
+    let decoded: usize = page
+        .result
+        .rows
+        .iter()
+        .flat_map(|r| r.iter())
+        .map(|v| match v {
+            Value::Text(t) => t.len(),
+            Value::Blob(b) => b.len(),
+            _ => 8,
+        })
+        .sum();
+    let bound = page.result.rows.len() * page.result.columns.len() * (PREVIEW_BYTES + 64);
+    assert!(
+        decoded <= bound,
+        "decoded page {decoded} exceeds the bound {bound}"
+    );
+    assert!(
+        decoded < perf_scale::BIG_VALUE_BYTES,
+        "the entire page ({decoded} B) must be smaller than one full value \
+         ({} B)",
+        perf_scale::BIG_VALUE_BYTES
+    );
+
+    Timings::measure("big_value_page_bounded", ITERS, || {
+        let pool = &pool;
+        let req = req.clone();
+        let cols = cols.clone();
+        async move {
+            let page = pool.fetch_page_bounded(&req, &cols, &["id"]).await.unwrap();
+            assert_eq!(page.result.rows.len() as u64, perf_scale::BIG_VALUE_ROWS);
         }
     })
     .await

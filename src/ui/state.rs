@@ -12,7 +12,7 @@ use crate::config::{
 };
 use crate::db::{
     apply_staged, build_fk_filter, detect_row_identity, needs_confirmation, run_script,
-    split_statements, url_target, url_via_local_port, url_with_password, write_result,
+    split_statements, url_target, url_via_local_port, url_with_password, write_result, CellFetch,
     ConnectionId, ConnectionRegistry, DbError, DbPool, ExportFormat, Filter, ForeignKeyMeta,
     QueryResult, RowLocator, StatementResult, TableMeta, Value,
 };
@@ -1306,6 +1306,38 @@ impl AppState {
                 stack.pop();
             }
         }
+    }
+
+    /// Loads one cell's full value on demand — the grid's expand and
+    /// truncated-cell editing path (FRE-33). Clones the pool and this table's
+    /// metadata out of the signals before the await (no borrow spans it), then
+    /// targets the row through its [`RowLocator`]. Returns a user-facing error
+    /// string on any failure. Never `spawn`ed itself — callers drive it from a
+    /// `use_resource` so the fetch is tied to the open editor/overlay.
+    pub async fn load_cell(
+        self,
+        id: ConnectionId,
+        table: TableRef,
+        locator: RowLocator,
+        column: String,
+    ) -> Result<CellFetch, String> {
+        let pool = self.registry.read().get(id).map(|c| c.pool.clone());
+        let meta = self.schemas.read().get(&id).and_then(|load| match load {
+            SchemaLoad::Ready(tables) => tables
+                .iter()
+                .find(|t| t.name == table.name && t.schema == table.schema)
+                .cloned(),
+            _ => None,
+        });
+        let (Some(pool), Some(meta)) = (pool, meta) else {
+            return Err("connection or schema no longer available".into());
+        };
+        let Some(identity) = detect_row_identity(&meta, pool.dialect()) else {
+            return Err("this table has no usable row identity".into());
+        };
+        pool.fetch_cell(&meta, &identity, &locator, &column)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// The primary-key column names of `table` in key order, from the loaded

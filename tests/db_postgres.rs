@@ -8,7 +8,8 @@
 //! ```
 
 use dataview::db::{
-    url_with_password, DbError, DbPool, Filter, PageRequest, SortDir, TableKind, Value,
+    detect_row_identity, url_with_password, DbError, DbPool, Filter, PageRequest, RowLocator,
+    SortDir, TableKind, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 fn test_url() -> Option<String> {
@@ -507,5 +508,132 @@ async fn finite_datetimes_beyond_chrono_range_degrade_to_markers() {
         Value::Text("<out of chrono range>".into())
     );
     assert_eq!(result.rows[0][2], Value::Text("ok".into()));
+    pool.close().await;
+}
+
+// ---- Bounded-memory reads (FRE-33) ---------------------------------------
+
+#[tokio::test]
+async fn postgres_bounded_page_previews_large_text_and_bytea() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.query("DROP TABLE IF EXISTS bounded_docs")
+        .await
+        .unwrap();
+    pool.query(
+        "CREATE TABLE bounded_docs (
+            id integer PRIMARY KEY,
+            small_note text,
+            big_text text,
+            payload bytea
+        )",
+    )
+    .await
+    .unwrap();
+    // A 50 000-char text and a 40 000-byte bytea.
+    pool.query(
+        "INSERT INTO bounded_docs (id, small_note, big_text, payload) VALUES
+            (1, 'hi', repeat('A', 50000), decode(repeat('00', 40000), 'hex')),
+            (2, 'yo', 'short enough', decode('0102', 'hex'))",
+    )
+    .await
+    .unwrap();
+
+    let tables = pool.introspect().await.unwrap();
+    let docs = tables
+        .iter()
+        .find(|t| t.name == "bounded_docs")
+        .unwrap()
+        .clone();
+    let request = PageRequest {
+        schema: docs.schema.clone(),
+        table: "bounded_docs".into(),
+        limit: 100,
+        offset: 0,
+        sort: Some(("id".into(), SortDir::Asc)),
+        filter: None,
+        extra_key_column: None,
+    };
+
+    let page = pool
+        .fetch_page_bounded(&request, &docs.columns, &["id"])
+        .await
+        .unwrap();
+    assert_eq!(page.result.columns.len(), 4, "length columns stripped");
+    // big_text previewed with the real length; bytea previewed as size.
+    let text_preview = page.previews[0][2].expect("big_text truncated");
+    assert_eq!(text_preview.full_len, 50_000);
+    assert!(!text_preview.binary);
+    if let Value::Text(t) = &page.result.rows[0][2] {
+        assert!(t.chars().count() <= PREVIEW_BYTES);
+    } else {
+        panic!("expected text preview");
+    }
+    let blob_preview = page.previews[0][3].expect("bytea truncated");
+    assert_eq!(blob_preview.full_len, 40_000);
+    assert!(blob_preview.binary);
+    // Short values are complete.
+    assert!(page.previews[1][2].is_none());
+    assert!(page.previews[0][1].is_none());
+
+    // fetch_cell returns the full text.
+    let identity = detect_row_identity(&docs, pool.dialect()).unwrap();
+    let locator = RowLocator {
+        identity_values: vec![Value::Integer(1)],
+    };
+    let cell = pool
+        .fetch_cell(&docs, &identity, &locator, "big_text")
+        .await
+        .unwrap();
+    assert_eq!(cell.full_len, 50_000);
+    assert!(!cell.capped);
+    if let Value::Text(t) = &cell.value {
+        assert_eq!(t.chars().count(), 50_000);
+    } else {
+        panic!("expected full text");
+    }
+
+    pool.query("DROP TABLE IF EXISTS bounded_docs")
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_query_capped_stops_and_bounds_cells() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+
+    // Row cap: 25 rows exist, ask for 10.
+    let (result, truncated) = pool
+        .query_capped(
+            "SELECT g FROM generate_series(1, 25) AS g ORDER BY g",
+            &[],
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows.len(), 10);
+    assert!(truncated);
+
+    // Under the cap: no truncation.
+    let (result, truncated) = pool
+        .query_capped("SELECT g FROM generate_series(1, 5) AS g", &[], 100)
+        .await
+        .unwrap();
+    assert_eq!(result.rows.len(), 5);
+    assert!(!truncated);
+
+    // Huge cell capped.
+    let (result, _t) = pool
+        .query_capped("SELECT repeat('Z', 200000) AS v", &[], 10)
+        .await
+        .unwrap();
+    if let Value::Text(t) = &result.rows[0][0] {
+        assert!(t.len() <= QUERY_CELL_CAP, "cell capped, got {}", t.len());
+    } else {
+        panic!("expected text");
+    }
+
     pool.close().await;
 }

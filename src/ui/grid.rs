@@ -4,9 +4,10 @@ use dioxus::prelude::*;
 
 use crate::db::{
     detect_row_identity, ConnectionId, Dialect, ExportFormat, Filter, FilterOp, ForeignKeyMeta,
-    Generated, PageRequest, QueryResult, RowIdentity, RowLocator, SortDir, StagedChange, TableKind,
-    TableMeta, Value,
+    Generated, Page, PageRequest, PreviewInfo, QueryResult, RowIdentity, RowLocator, SortDir,
+    StagedChange, TableKind, TableMeta, Value, FETCH_CELL_MAX_BYTES,
 };
+use crate::util::human_bytes;
 
 use super::editing::{editor_kind, CellEditor, EditNav, EditorKind};
 use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState};
@@ -22,6 +23,17 @@ const PAGE_SIZE: u32 = 100;
 struct ActiveEdit {
     row_key: String,
     column: String,
+}
+
+/// What the value-expand popup shows: a short value already in hand, or a
+/// truncated cell whose full value is loaded lazily via
+/// [`AppState::load_cell`] (FRE-33).
+#[derive(Debug, Clone, PartialEq)]
+enum ExpandView {
+    /// A value already fully in the page — rendered directly.
+    Text(String),
+    /// A truncated cell: fetch and show its full value.
+    Fetch { locator: RowLocator, column: String },
 }
 
 /// Paged grid for one table: sortable headers, per-column contains/equals
@@ -57,7 +69,10 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // Keyboard focus ring in the grid (row, col into the visible page's
     // rows × columns), and the value-expand popup (FRE-15).
     let mut focused_cell = use_signal(|| Option::<(usize, usize)>::None);
-    let mut expanded_cell = use_signal(|| Option::<String>::None);
+    // The value-expand popup (FRE-15): either an already-known short value
+    // rendered inline, or a truncated cell whose full value is fetched on
+    // demand (FRE-33).
+    let mut expanded = use_signal(|| Option::<ExpandView>::None);
     let mut sort = use_signal(|| Option::<(String, SortDir)>::None);
     // Rows ticked for deletion (row key → locator). UI-only state: nothing
     // is staged until "Delete N selected".
@@ -141,7 +156,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         // Re-seed the focus ring at the first cell and drop any expand popup;
         // the clamp effect below trims it to None for an empty page.
         focused_cell.set(Some((0, 0)));
-        expanded_cell.set(None);
+        expanded.set(None);
     });
 
     let table_for_resource = table.clone();
@@ -156,16 +171,32 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         // column is returned alongside the result so rendering hides
         // exactly what this fetch prepended (never a stale render-time
         // guess).
-        let extra_key_column = {
+        //
+        // The bounded fetch also needs the table's columns (to preview large
+        // ones) and the columns that must NOT be previewed: identity keys and
+        // foreign-key columns, whose truncation would misaddress rows or
+        // misdirect a jump (FRE-33).
+        let (columns, no_preview, extra_key_column) = {
             let dialect = state.registry.read().get(id).map(|c| c.pool.dialect());
             let schemas = state.schemas.read();
             let meta = find_table(schemas.get(&id), &table);
             match (meta, dialect) {
-                (Some(meta), Some(dialect)) => match detect_row_identity(meta, dialect) {
-                    Some(RowIdentity::Rowid { column }) => Some(column),
-                    _ => None,
-                },
-                _ => None,
+                (Some(meta), Some(dialect)) => {
+                    let identity = detect_row_identity(meta, dialect);
+                    let extra = match &identity {
+                        Some(RowIdentity::Rowid { column }) => Some(column.clone()),
+                        _ => None,
+                    };
+                    let mut no_preview: Vec<String> = identity
+                        .as_ref()
+                        .map(|i| i.key_columns().iter().map(|s| s.to_string()).collect())
+                        .unwrap_or_default();
+                    for fk in &meta.foreign_keys {
+                        no_preview.extend(fk.columns.iter().cloned());
+                    }
+                    (meta.columns.clone(), no_preview, extra)
+                }
+                _ => (Vec::new(), Vec::new(), None),
             }
         };
         let request = PageRequest {
@@ -184,9 +215,12 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                 return Err(crate::db::DbError::Query("connection closed".into()));
             };
             let total = pool.count_rows(&request).await?;
-            let result = pool.fetch_page(&request).await?;
-            Ok::<(QueryResult, u64, Option<String>), crate::db::DbError>((
-                result,
+            let no_preview_refs: Vec<&str> = no_preview.iter().map(String::as_str).collect();
+            let page = pool
+                .fetch_page_bounded(&request, &columns, &no_preview_refs)
+                .await?;
+            Ok::<(Page, u64, Option<String>), crate::db::DbError>((
+                page,
                 total,
                 request.extra_key_column,
             ))
@@ -200,9 +234,10 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let nav_table = table.clone();
     let grid_nav = use_memo(move || {
         let current = rows_resource.read();
-        let Some(Ok((result, _total, extra_key))) = current.as_ref() else {
+        let Some(Ok((page, _total, extra_key))) = current.as_ref() else {
             return GridNav::default();
         };
+        let result = &page.result;
         let dialect = state.registry.read().get(id).map(|c| c.pool.dialect());
         let table_meta = find_table(state.schemas.read().get(&id), &nav_table).cloned();
         let identity = match (&table_meta, dialect) {
@@ -225,7 +260,13 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                 .map(|c| c.name.clone())
                 .collect()
         };
-        let rows = view_rows(result, hidden, identity.as_ref(), stage.as_ref());
+        let rows = view_rows(
+            result,
+            &page.previews,
+            hidden,
+            identity.as_ref(),
+            stage.as_ref(),
+        );
         GridNav::build(headers, &rows, &column_kinds)
     });
 
@@ -382,9 +423,9 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         let code = evt.code();
         // Escape closes the value-expand popup, if one is open.
         if code == Code::Escape {
-            if expanded_cell.peek().is_some() {
+            if expanded.peek().is_some() {
                 evt.prevent_default();
-                expanded_cell.set(None);
+                expanded.set(None);
             }
             return;
         }
@@ -398,14 +439,24 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             let nav = grid_nav.peek();
             let (r, c) = (pos.0.min(rows - 1), pos.1.min(cols - 1));
             if let Some(cell) = nav.rows.get(r).and_then(|row| row.cells.get(c)) {
-                // Editable cell → open the in-place editor; otherwise show the
-                // full (untruncated) value in the expand popup.
+                // Editable cell → open the in-place editor; otherwise expand
+                // the value. A truncated cell fetches its full value on demand
+                // (FRE-33); a complete one shows the in-hand text.
                 match (cell.editable, nav.rows[r].key.clone()) {
                     (true, Some(key)) => editing.set(Some(ActiveEdit {
                         row_key: key,
                         column: cell.column.clone(),
                     })),
-                    _ => expanded_cell.set(Some(cell.display.clone())),
+                    _ => {
+                        let view = match (cell.truncated, nav.rows[r].locator.clone()) {
+                            (true, Some(locator)) => ExpandView::Fetch {
+                                locator,
+                                column: cell.column.clone(),
+                            },
+                            _ => ExpandView::Text(cell.display.clone()),
+                        };
+                        expanded.set(Some(view));
+                    }
                 }
             }
             return;
@@ -425,7 +476,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             FocusOutcome::NextPage => {
                 // Don't page past the end (mirrors the Next button's guard).
                 let total = match rows_resource.peek().as_ref() {
-                    Some(Ok((_, total, _))) => *total,
+                    Some(Ok((_page, total, _))) => *total,
                     _ => 0,
                 };
                 let p = *page.peek();
@@ -655,7 +706,8 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                             Banner { kind: BannerKind::Error, message: err.to_string() }
                         }
                     },
-                    Some(Ok((result, _total, extra_key))) => {
+                    Some(Ok((page_data, _total, extra_key))) => {
+                        let result = &page_data.result;
                         // The fetch prepended the row-identity key column
                         // (rowid) when one was requested; keep it for
                         // locators, hide it from display.
@@ -665,7 +717,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                         } else {
                             result.columns.iter().skip(hidden).map(|c| c.name.clone()).collect()
                         };
-                        let rows = view_rows(result, hidden, identity.as_ref(), stage.as_ref());
+                        let rows = view_rows(result, &page_data.previews, hidden, identity.as_ref(), stage.as_ref());
                         let pending_inserts: Vec<PendingInsert> = stage
                             .as_ref()
                             .map(|s| s.inserts().to_vec())
@@ -820,7 +872,8 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             // Footer: paging + counts
             div { class: "flex items-center gap-3 border-t border-slate-200 dark:border-slate-800 px-3 py-1.5 text-xs text-slate-500 dark:text-slate-400",
                 match current.as_ref() {
-                    Some(Ok((result, total, _))) => {
+                    Some(Ok((page_data, total, _))) => {
+                        let result = &page_data.result;
                         let first = if *total == 0 { 0 } else { page() * PAGE_SIZE as u64 + 1 };
                         let last = page() * PAGE_SIZE as u64 + result.rows.len() as u64;
                         rsx! {
@@ -847,12 +900,13 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                 }
             }
             // Value-expand popup (FRE-15): Enter on a read-only / non-editable
-            // focused cell shows its full, untruncated value. Dismissed by a
-            // backdrop click, the ✕, or Escape (handled by the grid container).
-            if let Some(value) = expanded_cell.read().clone() {
+            // focused cell shows its full value — fetched on demand for a
+            // truncated cell (FRE-33). Dismissed by a backdrop click, the ✕,
+            // or Escape (handled by the grid container).
+            if let Some(view) = expanded.read().clone() {
                 div {
                     class: "fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-4",
-                    onclick: move |_| expanded_cell.set(None),
+                    onclick: move |_| expanded.set(None),
                     div {
                         class: "max-h-[70vh] w-full max-w-2xl overflow-auto rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 p-4 shadow-xl",
                         onclick: move |evt| evt.stop_propagation(),
@@ -863,12 +917,19 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                             button {
                                 class: "rounded px-2 py-0.5 text-sm text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
                                 aria_label: "Close",
-                                onclick: move |_| expanded_cell.set(None),
+                                onclick: move |_| expanded.set(None),
                                 "✕"
                             }
                         }
-                        pre { class: "whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
-                            "{value}"
+                        match view {
+                            ExpandView::Text(value) => rsx! {
+                                pre { class: "whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
+                                    "{value}"
+                                }
+                            },
+                            ExpandView::Fetch { locator, column } => rsx! {
+                                ExpandedValue { id, table: table.clone(), locator, column }
+                            },
                         }
                     }
                 }
@@ -915,8 +976,15 @@ fn find_table<'a>(load: Option<&'a SchemaLoad>, table: &TableRef) -> Option<&'a 
 #[derive(Debug, Clone, PartialEq)]
 struct CellView {
     column: String,
+    /// The fetched value. For a truncated large cell (`preview` is `Some`)
+    /// this is only a bounded PREVIEW — never stage it as an edit; the full
+    /// value is loaded on demand (FRE-33).
     value: Value,
     dirty: bool,
+    /// Full-value metadata when this cell is a truncated preview; `None` for a
+    /// complete value (and always `None` for a dirty/staged cell, whose value
+    /// is the user's full staged input).
+    preview: Option<PreviewInfo>,
     /// Row-level editability: the row has a locator, is not pending
     /// deletion, and this cell's fetched value is not a blob. Column-type
     /// restrictions (blob-typed columns) apply on top at render time.
@@ -942,6 +1010,7 @@ struct RowView {
 /// mismatch) render clean and read-only — they can't be addressed.
 fn view_rows(
     result: &QueryResult,
+    previews: &[Vec<Option<PreviewInfo>>],
     hidden: usize,
     identity: Option<&RowIdentity>,
     stage: Option<&TableStage>,
@@ -956,7 +1025,7 @@ fn view_rows(
             .collect()
     });
     let mut rows = Vec::with_capacity(result.rows.len());
-    for row in &result.rows {
+    for (row_index, row) in result.rows.iter().enumerate() {
         let locator: Option<RowLocator> = key_indices.as_ref().map(|indices| RowLocator {
             identity_values: indices.iter().map(|&i| row[i].clone()).collect(),
         });
@@ -973,10 +1042,22 @@ fn view_rows(
                     (Some(key), Some(stage)) => stage.edited_value(key, &column),
                     _ => None,
                 };
+                // A staged cell holds the user's full value, so it is never a
+                // preview; otherwise carry the fetched cell's preview metadata.
+                let preview = if staged.is_some() {
+                    None
+                } else {
+                    previews
+                        .get(row_index)
+                        .and_then(|cells| cells.get(index))
+                        .copied()
+                        .flatten()
+                };
                 CellView {
                     dirty: staged.is_some(),
                     editable: locator.is_some() && !deleted && !matches!(value, Value::Blob(_)),
                     value: staged.unwrap_or(value).clone(),
+                    preview,
                     column,
                 }
             })
@@ -989,6 +1070,18 @@ fn view_rows(
         });
     }
     rows
+}
+
+/// The display string for a cell, accounting for truncated previews: a
+/// truncated text/json cell shows its preview with an ellipsis; a truncated
+/// blob shows its real size (the preview only holds a prefix); everything
+/// else displays normally.
+fn cell_display(cell: &CellView) -> String {
+    match (&cell.value, cell.preview) {
+        (Value::Text(preview), Some(_)) => format!("{preview}…"),
+        (_, Some(info)) if info.binary => format!("<blob {}>", human_bytes(info.full_len)),
+        _ => cell.value.display(),
+    }
 }
 
 /// Stable list key for one row: the row key when the row is addressable,
@@ -1181,6 +1274,9 @@ struct GridNavRow {
     /// Row key ([`RowLocator::key`]) when addressable — needed to open the
     /// editor; `None` rows can only have their value expanded.
     key: Option<String>,
+    /// The row's locator, used to fetch a truncated cell's full value on
+    /// expand (FRE-33).
+    locator: Option<RowLocator>,
     cells: Vec<GridNavCell>,
 }
 
@@ -1189,6 +1285,9 @@ struct GridNavCell {
     column: String,
     editable: bool,
     display: String,
+    /// Whether this cell is a truncated preview — Enter expands it by fetching
+    /// the full value rather than showing the in-hand preview (FRE-33).
+    truncated: bool,
 }
 
 impl GridNav {
@@ -1201,13 +1300,15 @@ impl GridNav {
             .iter()
             .map(|row| GridNavRow {
                 key: row.key.clone(),
+                locator: row.locator.clone(),
                 cells: row
                     .cells
                     .iter()
                     .map(|cell| GridNavCell {
                         column: cell.column.clone(),
                         editable: cell_editable(cell, column_kinds),
-                        display: cell.value.display(),
+                        display: cell_display(cell),
+                        truncated: cell.preview.is_some(),
                     })
                     .collect(),
             })
@@ -1468,6 +1569,25 @@ fn GridCellSlot(
         let locator = locator.clone().expect("editable cell has a locator");
         let row_key = row_key.clone().expect("editable cell has a row key");
         let column = cell.column.clone();
+        // A truncated cell holds only a preview — the editor must load the
+        // full current value first, so a preview can never be staged as the
+        // new value and silently truncate the stored data (FRE-33).
+        if cell.preview.is_some() {
+            return rsx! {
+                TruncatedCellEditor {
+                    id,
+                    table: table.clone(),
+                    locator,
+                    row_key,
+                    column,
+                    kind,
+                    dialect,
+                    nullable,
+                    editable_columns,
+                    editing,
+                }
+            };
+        }
         let commit_table = table.clone();
         rsx! {
             CellEditor {
@@ -1506,8 +1626,10 @@ fn GridCellSlot(
         // Blob and generated cells explain why they're locked; other
         // read-only cells (views, keyless tables) are covered by the
         // grid-level notice.
-        let display = cell.value.display();
-        let tooltip = if kind == EditorKind::Generated {
+        let display = cell_display(&cell);
+        let tooltip = if cell.preview.is_some() {
+            "Truncated preview — press Enter to view (or edit) the full value".to_string()
+        } else if kind == EditorKind::Generated {
             "generated by the database — read-only".to_string()
         } else if kind == EditorKind::Blob || matches!(cell.value, Value::Blob(_)) {
             "blobs are read-only".to_string()
@@ -1767,6 +1889,160 @@ fn InsertCellSlot(
     }
 }
 
+/// The in-place editor for a TRUNCATED cell (FRE-33): loads the full current
+/// value via [`AppState::load_cell`] first, then hands it to the shared
+/// [`CellEditor`] so the edit starts from the complete value — a preview is
+/// NEVER staged as the new value (which would silently truncate the stored
+/// data). A value larger than the fetch cap can't be edited inline at all
+/// (the prefix would still corrupt it); it shows a read-only note instead.
+#[component]
+fn TruncatedCellEditor(
+    id: ConnectionId,
+    table: TableRef,
+    locator: RowLocator,
+    row_key: String,
+    column: String,
+    kind: EditorKind,
+    dialect: Dialect,
+    nullable: bool,
+    editable_columns: Vec<String>,
+    mut editing: Signal<Option<ActiveEdit>>,
+) -> Element {
+    let state = use_context::<AppState>();
+    let fetch_table = table.clone();
+    let fetch_locator = locator.clone();
+    let fetch_column = column.clone();
+    let cell = use_resource(move || {
+        let table = fetch_table.clone();
+        let locator = fetch_locator.clone();
+        let column = fetch_column.clone();
+        async move { state.load_cell(id, table, locator, column).await }
+    });
+    let loaded = cell.read();
+    match loaded.as_ref() {
+        None => rsx! {
+            td { class: "px-2 py-1", DelayedLoading { label: "Loading full value…" } }
+        },
+        Some(Err(err)) => {
+            let err = err.clone();
+            rsx! {
+                td { class: "px-2 py-1",
+                    div { class: "flex items-center gap-2",
+                        Banner { kind: BannerKind::Error, message: err }
+                        button {
+                            class: "shrink-0 rounded border border-slate-400 dark:border-slate-600 px-2 py-0.5 text-xs",
+                            onclick: move |_| editing.set(None),
+                            "Close"
+                        }
+                    }
+                }
+            }
+        }
+        Some(Ok(fetch)) if fetch.capped => {
+            let note = format!(
+                "This value is too large to edit inline (over {}). Open it with Expand to view it.",
+                human_bytes(FETCH_CELL_MAX_BYTES as u64),
+            );
+            rsx! {
+                td { class: "px-2 py-1",
+                    div { class: "flex items-center gap-2",
+                        Banner { kind: BannerKind::Warning, message: note }
+                        button {
+                            class: "shrink-0 rounded border border-slate-400 dark:border-slate-600 px-2 py-0.5 text-xs",
+                            onclick: move |_| editing.set(None),
+                            "Close"
+                        }
+                    }
+                }
+            }
+        }
+        Some(Ok(fetch)) => {
+            let initial = fetch.value.clone();
+            let commit_table = table.clone();
+            let commit_column = column.clone();
+            let commit_row_key = row_key.clone();
+            let commit_columns = editable_columns.clone();
+            let commit_locator = locator.clone();
+            rsx! {
+                CellEditor {
+                    kind,
+                    dialect,
+                    nullable,
+                    initial,
+                    on_commit: move |(value, nav): (Option<Value>, EditNav)| {
+                        if let Some(value) = value {
+                            state.stage_cell_edit(id, &commit_table, commit_locator.clone(), &commit_column, value);
+                        }
+                        let next = match nav {
+                            EditNav::Stay => None,
+                            EditNav::Next => step_column(&commit_columns, &commit_column, 1),
+                            EditNav::Prev => step_column(&commit_columns, &commit_column, -1),
+                        };
+                        editing.set(next.map(|column| ActiveEdit {
+                            row_key: commit_row_key.clone(),
+                            column,
+                        }));
+                    },
+                    on_cancel: move |_| editing.set(None),
+                }
+            }
+        }
+    }
+}
+
+/// The full-value body of the expand popup for a truncated cell (FRE-33):
+/// loads the value via [`AppState::load_cell`] and renders it. Text/json show
+/// in full (a value over the fetch cap shows its first chunk with a note);
+/// binary values show their size only.
+#[component]
+fn ExpandedValue(
+    id: ConnectionId,
+    table: TableRef,
+    locator: RowLocator,
+    column: String,
+) -> Element {
+    let state = use_context::<AppState>();
+    let fetch_table = table.clone();
+    let fetch_locator = locator.clone();
+    let fetch_column = column.clone();
+    let cell = use_resource(move || {
+        let table = fetch_table.clone();
+        let locator = fetch_locator.clone();
+        let column = fetch_column.clone();
+        async move { state.load_cell(id, table, locator, column).await }
+    });
+    let loaded = cell.read();
+    match loaded.as_ref() {
+        None => rsx! {
+            DelayedLoading { label: "Loading full value…" }
+        },
+        Some(Err(err)) => rsx! {
+            Banner { kind: BannerKind::Error, message: err.clone() }
+        },
+        Some(Ok(fetch)) => {
+            if let Value::Blob(_) = &fetch.value {
+                return rsx! {
+                    p { class: "font-mono text-xs text-slate-500 dark:text-slate-400",
+                        "Binary value — {human_bytes(fetch.full_len)} (content not shown)."
+                    }
+                };
+            }
+            let text = fetch.value.display();
+            let capped = fetch.capped;
+            rsx! {
+                if capped {
+                    p { class: "mb-2 rounded border border-amber-300 dark:border-amber-800/70 bg-amber-50 dark:bg-amber-950/40 px-2 py-1 text-xs text-amber-700 dark:text-amber-300",
+                        "Value is very large; showing the first {human_bytes(FETCH_CELL_MAX_BYTES as u64)}."
+                    }
+                }
+                pre { class: "whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
+                    "{text}"
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1836,7 +2112,7 @@ mod tests {
             identity_values: vec![Value::Integer(2)],
         });
         let result = two_column_result();
-        let rows = view_rows(&result, 0, Some(&pk_identity()), Some(&stage));
+        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), Some(&stage));
         assert_eq!(rows.len(), 2);
         // Row 1: title cell dirty, showing the staged value; id cell clean.
         assert!(!rows[0].deleted);
@@ -1874,7 +2150,7 @@ mod tests {
             "body",
             Value::Text("edited".into()),
         );
-        let rows = view_rows(&result, 1, Some(&identity), Some(&stage));
+        let rows = view_rows(&result, &[], 1, Some(&identity), Some(&stage));
         // The rowid column is hidden; the one visible cell is the dirty body.
         assert_eq!(rows[0].cells.len(), 1);
         assert!(rows[0].cells[0].dirty);
@@ -1892,7 +2168,7 @@ mod tests {
             Value::Text("edited".into()),
         );
         let result = two_column_result();
-        let rows = view_rows(&result, 0, None, Some(&stage));
+        let rows = view_rows(&result, &[], 0, None, Some(&stage));
         assert!(rows.iter().all(|r| !r.deleted));
         assert!(rows.iter().flat_map(|r| r.cells.iter()).all(|c| !c.dirty));
     }
@@ -1917,7 +2193,7 @@ mod tests {
 
         // With an identity, plain cells are editable…
         let result = two_column_result();
-        let rows = view_rows(&result, 0, Some(&pk_identity()), None);
+        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), None);
         assert!(rows[0].locator.is_some());
         assert!(cell_editable(&rows[0].cells[1], &kinds));
         // …a column missing from the metadata falls back to editable text…
@@ -1925,7 +2201,7 @@ mod tests {
         assert_eq!(kind, EditorKind::Text);
         assert!(nullable);
         // …but without an identity nothing is.
-        let rows = view_rows(&result, 0, None, None);
+        let rows = view_rows(&result, &[], 0, None, None);
         assert!(rows[0].locator.is_none());
         assert!(!rows[0].cells[1].editable);
 
@@ -1934,7 +2210,7 @@ mod tests {
         stage.mark_delete(RowLocator {
             identity_values: vec![Value::Integer(1)],
         });
-        let rows = view_rows(&result, 0, Some(&pk_identity()), Some(&stage));
+        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), Some(&stage));
         assert!(rows[0].deleted);
         assert!(rows[0].cells.iter().all(|c| !c.editable));
         assert!(rows[1].cells.iter().all(|c| c.editable));
@@ -1949,13 +2225,13 @@ mod tests {
             ],
             rows: vec![vec![Value::Integer(1), Value::Blob(vec![1, 2])]],
         };
-        let rows = view_rows(&blob_result, 0, Some(&pk_identity()), None);
+        let rows = view_rows(&blob_result, &[], 0, Some(&pk_identity()), None);
         assert!(!rows[0].cells[1].editable, "blob value cell");
         let null_blob = QueryResult {
             rows: vec![vec![Value::Integer(1), Value::Null]],
             ..blob_result
         };
-        let rows = view_rows(&null_blob, 0, Some(&pk_identity()), None);
+        let rows = view_rows(&null_blob, &[], 0, Some(&pk_identity()), None);
         assert!(
             rows[0].cells[1].editable,
             "row-level check passes for a NULL in a blob column…"
@@ -2120,7 +2396,7 @@ mod tests {
         .into_iter()
         .collect();
         let result = two_column_result();
-        let rows = view_rows(&result, 0, Some(&pk_identity()), None);
+        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), None);
         let nav = GridNav::build(vec!["id".into(), "title".into()], &rows, &kinds);
         assert_eq!(nav.dims(), (2, 2));
         // Both cells of an identified table are editable text here.
@@ -2128,7 +2404,7 @@ mod tests {
         assert_eq!(nav.rows[0].cells[1].column, "title");
         assert_eq!(nav.rows[0].cells[0].display, "1");
         // Without an identity, nothing is editable and rows have no key.
-        let rows = view_rows(&result, 0, None, None);
+        let rows = view_rows(&result, &[], 0, None, None);
         let nav = GridNav::build(vec!["id".into(), "title".into()], &rows, &kinds);
         assert!(nav.rows[0].key.is_none());
         assert!(nav.rows.iter().all(|r| r.cells.iter().all(|c| !c.editable)));
