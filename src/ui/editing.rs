@@ -212,6 +212,9 @@ pub enum EditNav {
 ///   delete it (the ∅ button covers the reverse).
 /// - The ∅ NULL button stages an explicit NULL — distinct from committing
 ///   an empty string. Hidden on NOT NULL columns.
+/// - The ↺ default button (only rendered when `on_default` is wired — i.e.
+///   in pending-insert phantom rows, FRE-25) reverts the cell to "database
+///   default": the column is then omitted from the INSERT entirely.
 /// - Validation failures (numeric, JSON) show inline and keep the editor
 ///   open; nothing is staged.
 /// - Checkbox (boolean) editors stage-and-close immediately on toggle.
@@ -223,6 +226,9 @@ pub fn CellEditor(
     initial: Value,
     on_commit: EventHandler<(Option<Value>, EditNav)>,
     on_cancel: EventHandler<()>,
+    /// Revert-to-database-default action. Existing rows have no default to
+    /// revert to, so the grid only wires this for pending-insert cells.
+    on_default: Option<EventHandler<()>>,
 ) -> Element {
     let initial_for_text = initial.clone();
     let mut text = use_signal(move || match &initial_for_text {
@@ -385,6 +391,24 @@ pub fn CellEditor(
                             }
                         },
                         "∅ NULL"
+                    }
+                }
+                if let Some(on_default) = on_default {
+                    button {
+                        class: "shrink-0 rounded border border-slate-600 px-1.5 py-0.5 text-xs \
+                                text-slate-400 hover:border-emerald-500 hover:text-emerald-300",
+                        title: "Revert to database default (omit this column from the insert)",
+                        tabindex: "-1",
+                        // Same focus dance as the ∅ button: keep focus in
+                        // the input so blur-commit cannot race this click.
+                        onmousedown: move |evt| evt.prevent_default(),
+                        onclick: move |_| {
+                            if !finished() {
+                                finished.set(true);
+                                on_default.call(());
+                            }
+                        },
+                        "↺ default"
                     }
                 }
             }

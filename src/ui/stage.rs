@@ -4,17 +4,18 @@
 //!
 //! FRE-24/25 (cell editors, insert/delete affordances) only push changes in
 //! through [`AppState::stage_cell_edit`](super::state::AppState::stage_cell_edit)
-//! / `stage_insert` / `stage_delete`; everything downstream — dirty
-//! rendering, the Save/Discard bar, the transactional apply — already works.
+//! / the `stage_insert_*` / `stage_delete` family; everything downstream —
+//! dirty rendering, the Save/Discard bar, the transactional apply — already
+//! works.
 //!
 //! Rows are keyed by [`RowLocator::key`], the serialized identity values
 //! (`Value` holds `f64` and cannot be a `HashMap` key itself; the key string
 //! trades hashability for a lookup through the serialization — see
 //! `RowLocator::key` for the exact tradeoffs).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::db::{RowLocator, StagedChange, Value};
+use crate::db::{Dialect, RowLocator, StagedChange, TableMeta, Value};
 
 /// Pending, unapplied changes for one table view.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -27,6 +28,9 @@ pub struct TableStage {
     deletes: HashMap<String, RowLocator>,
     /// New rows, in the order they were staged.
     inserts: Vec<PendingInsert>,
+    /// Id handed to the next [`Self::add_insert`]; never reused within one
+    /// stage, so phantom-row keys stay unambiguous across removals.
+    next_insert_id: u64,
     /// A save is in flight; the Save button disables and further saves
     /// no-op until it settles.
     pub saving: bool,
@@ -43,11 +47,52 @@ struct RowEdits {
     values: HashMap<String, Value>,
 }
 
-/// One pending row insert. `columns` empty means "all defaults".
+/// One pending row insert — a "phantom row" in the grid. Every column
+/// starts as "database default"; only columns the user overrides carry a
+/// value here. An all-default row saves as `INSERT … DEFAULT VALUES`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingInsert {
-    pub columns: Vec<String>,
-    pub values: Vec<Value>,
+    /// Stage-local id, stable for the life of the stage (ids are never
+    /// reused), so the grid can address this phantom row across re-renders —
+    /// see [`Self::row_key`].
+    id: u64,
+    /// column name → staged override. A column absent here is left to the
+    /// database (its default, serial/identity assignment, or NULL).
+    values: HashMap<String, Value>,
+}
+
+impl PendingInsert {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Grid row key for this phantom row. The `insert:` prefix cannot
+    /// collide with [`RowLocator::key`] output (locator keys are sequences
+    /// of `<tag><payload>;` where an `i` tag is always followed by digits).
+    pub fn row_key(&self) -> String {
+        format!("insert:{}", self.id)
+    }
+
+    /// The staged override for one column (`None` = database default).
+    pub fn value(&self, column: &str) -> Option<&Value> {
+        self.values.get(column)
+    }
+
+    /// Whether the column still lacks a concrete value: no override, or an
+    /// explicit NULL override (which cannot satisfy a required column).
+    pub fn lacks_value(&self, column: &str) -> bool {
+        self.values.get(column).is_none_or(Value::is_null)
+    }
+
+    /// The [`StagedChange`] this insert generates: only overridden columns,
+    /// sorted by name (deterministic); no overrides at all → empty columns,
+    /// which `apply_staged` renders as `INSERT … DEFAULT VALUES`.
+    pub fn change(&self) -> StagedChange {
+        let mut columns: Vec<String> = self.values.keys().cloned().collect();
+        columns.sort();
+        let values = columns.iter().map(|c| self.values[c].clone()).collect();
+        StagedChange::Insert { columns, values }
+    }
 }
 
 impl TableStage {
@@ -69,9 +114,37 @@ impl TableStage {
             .insert(column.into(), value);
     }
 
-    /// Stages one new row.
-    pub fn add_insert(&mut self, columns: Vec<String>, values: Vec<Value>) {
-        self.inserts.push(PendingInsert { columns, values });
+    /// Stages one new all-default row, returning its stage-local id.
+    pub fn add_insert(&mut self) -> u64 {
+        let id = self.next_insert_id;
+        self.next_insert_id += 1;
+        self.inserts.push(PendingInsert {
+            id,
+            values: HashMap::new(),
+        });
+        id
+    }
+
+    /// Stages a concrete value for one column of a pending insert,
+    /// replacing any earlier override (last one wins). Unknown ids no-op
+    /// (the phantom row may have been removed or applied meanwhile).
+    pub fn set_insert_value(&mut self, insert_id: u64, column: impl Into<String>, value: Value) {
+        if let Some(insert) = self.inserts.iter_mut().find(|i| i.id == insert_id) {
+            insert.values.insert(column.into(), value);
+        }
+    }
+
+    /// Reverts one column of a pending insert to "database default".
+    pub fn clear_insert_value(&mut self, insert_id: u64, column: &str) {
+        if let Some(insert) = self.inserts.iter_mut().find(|i| i.id == insert_id) {
+            insert.values.remove(column);
+        }
+    }
+
+    /// Drops a pending insert entirely — deleting a phantom row stages
+    /// nothing, the row simply disappears.
+    pub fn remove_insert(&mut self, insert_id: u64) {
+        self.inserts.retain(|i| i.id != insert_id);
     }
 
     /// Marks the row at `locator` for deletion. Any pending cell edits of
@@ -98,6 +171,26 @@ impl TableStage {
         &self.inserts
     }
 
+    /// Number of rows staged for deletion (drives the save-time
+    /// exact-count confirmation).
+    pub fn delete_count(&self) -> usize {
+        self.deletes.len()
+    }
+
+    /// How many required cells (per [`required_insert_columns`]) are still
+    /// unfilled across all pending inserts. Non-zero blocks the Save button.
+    pub fn missing_required(&self, required: &HashSet<String>) -> usize {
+        self.inserts
+            .iter()
+            .map(|insert| {
+                required
+                    .iter()
+                    .filter(|column| insert.lacks_value(column))
+                    .count()
+            })
+            .sum()
+    }
+
     /// Number of pending changes as the user counts them: edited cells +
     /// inserts + deletes.
     pub fn pending_count(&self) -> usize {
@@ -118,7 +211,11 @@ impl TableStage {
     /// - a cell edit is removed only while its staged value still equals
     ///   the applied value — a re-edit of the same cell after the snapshot
     ///   stays staged;
-    /// - an insert is removed by whole-row equality (first match);
+    /// - an insert is removed by whole-row equality of its *generated
+    ///   change* ([`PendingInsert::change`], first match) — an insert whose
+    ///   overrides were edited after the snapshot no longer matches and
+    ///   stays staged (it will insert a second row, which is what "staging
+    ///   more during a save" means for inserts);
     /// - a delete is removed by row — the row is gone, so a delete
     ///   re-staged after the snapshot would be meaningless anyway.
     pub fn remove_applied(&mut self, applied: &[StagedChange]) {
@@ -139,11 +236,8 @@ impl TableStage {
                         }
                     }
                 }
-                StagedChange::Insert { columns, values } => {
-                    let position = self
-                        .inserts
-                        .iter()
-                        .position(|i| i.columns == *columns && i.values == *values);
+                StagedChange::Insert { .. } => {
+                    let position = self.inserts.iter().position(|i| i.change() == *change);
                     if let Some(position) = position {
                         self.inserts.remove(position);
                     }
@@ -186,10 +280,7 @@ impl TableStage {
             }
         }
         for insert in &self.inserts {
-            out.push(StagedChange::Insert {
-                columns: insert.columns.clone(),
-                values: insert.values.clone(),
-            });
+            out.push(insert.change());
         }
         let mut delete_keys: Vec<&String> = self.deletes.keys().collect();
         delete_keys.sort();
@@ -200,6 +291,45 @@ impl TableStage {
         }
         out
     }
+}
+
+/// Columns that must be given a concrete value before a pending insert may
+/// save: NOT NULL, no default, and not auto-assigned by the database.
+///
+/// REQUIRED = `!nullable && default.is_none()`, minus the auto-assigned
+/// cases, which differ per backend:
+///
+/// - **SQLite**: a *single-column* `INTEGER PRIMARY KEY` is an alias for
+///   the rowid — auto-assigned on insert even though PRAGMA metadata shows
+///   no default. Only the exact (case-insensitive) declared type "INTEGER"
+///   aliases the rowid (`INT` or `INTEGER(4)` do not), and only when the
+///   PK has exactly one column — an INTEGER member of a composite PK is
+///   never auto-assigned. Caveat: in a `WITHOUT ROWID` table an INTEGER PK
+///   is not auto-assigned either, but introspection does not expose
+///   without-rowid-ness; such a column is (wrongly) treated as
+///   auto-assigned here, and leaving it default fails loudly at save time
+///   (NOT NULL violation, whole batch rolled back).
+/// - **Postgres**: `serial`/`bigserial` columns carry a `nextval(…)`
+///   `column_default`, and identity columns (`GENERATED … AS IDENTITY`,
+///   which have a NULL `column_default`) are introspected with a
+///   `GENERATED … AS IDENTITY` default marker (see `postgres.rs`), so both
+///   fall out via `default.is_some()`.
+pub fn required_insert_columns(meta: &TableMeta, dialect: Dialect) -> HashSet<String> {
+    let single_pk = meta.primary_key().len() == 1;
+    meta.columns
+        .iter()
+        .filter(|column| {
+            if column.nullable || column.default.is_some() {
+                return false;
+            }
+            let rowid_alias = dialect == Dialect::Sqlite
+                && single_pk
+                && column.primary_key_position.is_some()
+                && column.type_name.eq_ignore_ascii_case("integer");
+            !rowid_alias
+        })
+        .map(|column| column.name.clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -239,7 +369,8 @@ mod tests {
         let mut stage = TableStage::default();
         // Staged deliberately out of order.
         stage.mark_delete(locator(9));
-        stage.add_insert(vec!["a".into()], vec![Value::Integer(1)]);
+        let insert = stage.add_insert();
+        stage.set_insert_value(insert, "a", Value::Integer(1));
         stage.set_cell_edit(locator(2), "b", Value::Integer(20));
         stage.set_cell_edit(locator(2), "a", Value::Integer(10));
         stage.set_cell_edit(locator(1), "a", Value::Integer(5));
@@ -315,7 +446,8 @@ mod tests {
         // apply the success-clear.
         let mut stage = TableStage::default();
         stage.set_cell_edit(locator(1), "a", Value::Integer(1));
-        stage.add_insert(vec!["a".into()], vec![Value::Integer(9)]);
+        let first_insert = stage.add_insert();
+        stage.set_insert_value(first_insert, "a", Value::Integer(9));
         stage.mark_delete(locator(3));
         let snapshot = stage.changes();
         stage.saving = true;
@@ -324,7 +456,8 @@ mod tests {
         // cell, and another insert.
         stage.set_cell_edit(locator(2), "b", Value::Integer(2));
         stage.set_cell_edit(locator(1), "a", Value::Integer(100));
-        stage.add_insert(vec!["a".into()], vec![Value::Integer(10)]);
+        let second_insert = stage.add_insert();
+        stage.set_insert_value(second_insert, "a", Value::Integer(10));
 
         stage.remove_applied(&snapshot);
         assert!(!stage.saving);
@@ -333,7 +466,7 @@ mod tests {
         // after the snapshot survives, including the re-edit.
         assert!(!stage.is_deleted(&locator(3).key()));
         assert_eq!(stage.inserts().len(), 1);
-        assert_eq!(stage.inserts()[0].values, vec![Value::Integer(10)]);
+        assert_eq!(stage.inserts()[0].value("a"), Some(&Value::Integer(10)));
         assert_eq!(
             stage.edited_value(&locator(1).key(), "a"),
             Some(&Value::Integer(100)),
@@ -351,13 +484,208 @@ mod tests {
         let mut stage = TableStage::default();
         stage.set_cell_edit(locator(1), "a", Value::Integer(1));
         stage.set_cell_edit(locator(1), "b", Value::Null);
-        stage.add_insert(vec![], vec![]);
+        stage.add_insert(); // all-default row → DEFAULT VALUES
         stage.mark_delete(locator(2));
         let snapshot = stage.changes();
         stage.saving = true;
         stage.remove_applied(&snapshot);
         assert!(stage.is_empty());
         assert!(!stage.saving);
+    }
+
+    #[test]
+    fn insert_change_carries_only_overridden_columns() {
+        let mut stage = TableStage::default();
+        let insert = stage.add_insert();
+        // All-default: empty columns → DEFAULT VALUES downstream.
+        assert_eq!(
+            stage.inserts()[0].change(),
+            StagedChange::Insert {
+                columns: vec![],
+                values: vec![],
+            }
+        );
+        // Overrides (staged out of name order, last one wins per column;
+        // an explicit NULL override is still an override).
+        stage.set_insert_value(insert, "title", Value::Text("draft".into()));
+        stage.set_insert_value(insert, "title", Value::Text("final".into()));
+        stage.set_insert_value(insert, "amount", Value::Integer(5));
+        stage.set_insert_value(insert, "note", Value::Null);
+        assert_eq!(
+            stage.inserts()[0].change(),
+            StagedChange::Insert {
+                columns: vec!["amount".into(), "note".into(), "title".into()],
+                values: vec![Value::Integer(5), Value::Null, Value::Text("final".into())],
+            }
+        );
+        // Revert-to-default drops the override again.
+        stage.clear_insert_value(insert, "amount");
+        assert_eq!(stage.inserts()[0].value("amount"), None);
+        assert_eq!(
+            stage.inserts()[0].change(),
+            StagedChange::Insert {
+                columns: vec!["note".into(), "title".into()],
+                values: vec![Value::Null, Value::Text("final".into())],
+            }
+        );
+    }
+
+    #[test]
+    fn removing_a_phantom_insert_stages_nothing() {
+        let mut stage = TableStage::default();
+        let first = stage.add_insert();
+        let second = stage.add_insert();
+        stage.set_insert_value(second, "a", Value::Integer(1));
+        assert_eq!(stage.pending_count(), 2);
+
+        stage.remove_insert(first);
+        // Only the other phantom row remains; no delete was staged.
+        assert_eq!(stage.inserts().len(), 1);
+        assert_eq!(stage.inserts()[0].id(), second);
+        assert_eq!(stage.delete_count(), 0);
+        assert_eq!(stage.pending_count(), 1);
+
+        stage.remove_insert(second);
+        assert!(
+            stage.is_empty(),
+            "removing the last insert empties the stage"
+        );
+
+        // Ids are never reused, so a stale phantom-row key cannot address
+        // a newer insert.
+        let third = stage.add_insert();
+        assert!(third > second);
+        // Mutations against removed ids are ignored.
+        stage.set_insert_value(second, "a", Value::Integer(9));
+        assert_eq!(stage.inserts().len(), 1);
+        assert_eq!(stage.inserts()[0].value("a"), None);
+    }
+
+    #[test]
+    fn phantom_row_keys_are_stable_and_distinct_from_locator_keys() {
+        let mut stage = TableStage::default();
+        let insert = stage.add_insert();
+        let key = stage.inserts()[0].row_key();
+        assert_eq!(key, format!("insert:{insert}"));
+        stage.set_insert_value(insert, "a", Value::Integer(1));
+        assert_eq!(stage.inserts()[0].row_key(), key, "key survives edits");
+        // No RowLocator can produce an "insert:…" key (tags are followed by
+        // their payload, e.g. `i<digits>;`).
+        assert_ne!(locator(0).key(), key);
+    }
+
+    fn column(
+        name: &str,
+        type_name: &str,
+        nullable: bool,
+        pk: Option<u32>,
+        default: Option<&str>,
+    ) -> crate::db::ColumnMeta {
+        crate::db::ColumnMeta {
+            name: name.into(),
+            type_name: type_name.into(),
+            nullable,
+            primary_key_position: pk,
+            default: default.map(String::from),
+        }
+    }
+
+    fn meta(columns: Vec<crate::db::ColumnMeta>) -> TableMeta {
+        TableMeta {
+            schema: None,
+            name: "t".into(),
+            kind: crate::db::TableKind::Table,
+            columns,
+            indexes: vec![],
+            foreign_keys: vec![],
+        }
+    }
+
+    #[test]
+    fn required_columns_are_not_null_without_default_or_auto_assignment() {
+        let table = meta(vec![
+            // SQLite rowid alias: INTEGER single-column PK, auto-assigned.
+            column("id", "INTEGER", false, Some(1), None),
+            column("title", "TEXT", false, None, None),
+            column("note", "TEXT", true, None, None),
+            column("state", "TEXT", false, None, Some("'draft'")),
+        ]);
+        let required = required_insert_columns(&table, Dialect::Sqlite);
+        assert_eq!(required, HashSet::from(["title".to_string()]));
+
+        // The declared type must be exactly INTEGER for the rowid alias —
+        // "INT" is not auto-assigned; case is ignored.
+        let int_pk = meta(vec![column("id", "INT", false, Some(1), None)]);
+        assert!(required_insert_columns(&int_pk, Dialect::Sqlite).contains("id"));
+        let lower = meta(vec![column("id", "integer", false, Some(1), None)]);
+        assert!(required_insert_columns(&lower, Dialect::Sqlite).is_empty());
+
+        // An INTEGER member of a composite PK is never auto-assigned.
+        let composite = meta(vec![
+            column("a", "INTEGER", false, Some(1), None),
+            column("b", "INTEGER", false, Some(2), None),
+        ]);
+        assert_eq!(
+            required_insert_columns(&composite, Dialect::Sqlite),
+            HashSet::from(["a".to_string(), "b".to_string()])
+        );
+
+        // On Postgres the INTEGER-PK exemption never applies; serial and
+        // identity columns are exempt through their default marker instead.
+        let pg = meta(vec![
+            column("plain_pk", "integer", false, Some(1), None),
+            column(
+                "serial_id",
+                "integer",
+                false,
+                None,
+                Some("nextval('t_id_seq'::regclass)"),
+            ),
+            column(
+                "identity_id",
+                "integer",
+                false,
+                None,
+                Some("GENERATED ALWAYS AS IDENTITY"),
+            ),
+            column("label", "text", false, None, None),
+        ]);
+        assert_eq!(
+            required_insert_columns(&pg, Dialect::Postgres),
+            HashSet::from(["plain_pk".to_string(), "label".to_string()])
+        );
+    }
+
+    #[test]
+    fn missing_required_counts_unfilled_cells_across_inserts() {
+        let required = HashSet::from(["a".to_string(), "b".to_string()]);
+        let mut stage = TableStage::default();
+        assert_eq!(
+            stage.missing_required(&required),
+            0,
+            "no inserts, nothing missing"
+        );
+
+        let first = stage.add_insert();
+        let second = stage.add_insert();
+        assert_eq!(stage.missing_required(&required), 4);
+
+        stage.set_insert_value(first, "a", Value::Integer(1));
+        // An explicit NULL cannot satisfy a required (NOT NULL) column.
+        stage.set_insert_value(first, "b", Value::Null);
+        // Overriding a non-required column changes nothing.
+        stage.set_insert_value(second, "c", Value::Integer(3));
+        assert_eq!(stage.missing_required(&required), 3);
+
+        stage.set_insert_value(first, "b", Value::Integer(2));
+        stage.set_insert_value(second, "a", Value::Integer(1));
+        stage.set_insert_value(second, "b", Value::Integer(2));
+        assert_eq!(stage.missing_required(&required), 0);
+
+        // Edits and deletes never count as missing — only pending inserts.
+        stage.set_cell_edit(locator(1), "a", Value::Null);
+        stage.mark_delete(locator(2));
+        assert_eq!(stage.missing_required(&required), 0);
     }
 
     #[test]

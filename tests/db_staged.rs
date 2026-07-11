@@ -1,7 +1,9 @@
 //! End-to-end tests for staged edits (FRE-14): `apply_staged` runs a whole
 //! change list — updates, inserts, deletes — in ONE transaction on both
 //! backends, rolling everything back when any change fails and naming the
-//! failing change by index.
+//! failing change by index. The FRE-25 cases drive the same path through
+//! `TableStage` (per-column insert overrides, multi-delete with an edit
+//! alongside) the way the grid stages them.
 //!
 //! Postgres cases need a running server (Docker only, per CLAUDE.md) and are
 //! skipped unless `DATAVIEW_PG_TEST_URL` is set — see tests/db_postgres.rs
@@ -9,12 +11,16 @@
 
 mod common;
 
+use std::collections::HashSet;
+
 use common::FixtureDb;
 use dataview::db::{
     apply_staged, detect_row_identity, DbPool, Dialect, PageRequest, RowIdentity, RowLocator,
     StagedChange, TableMeta, Value,
 };
 use dataview::ui::editing::bool_value;
+use dataview::ui::stage::required_insert_columns;
+use dataview::ui::TableStage;
 
 fn test_url() -> Option<String> {
     match std::env::var("DATAVIEW_PG_TEST_URL") {
@@ -715,6 +721,209 @@ async fn postgres_set_null_on_integer_column_works_via_literal_null() {
         .unwrap();
     assert_eq!(check.rows[0][0], Value::Text("emptied".into()));
     assert_eq!(check.rows[0][1], Value::Null);
+
+    pool.close().await;
+}
+
+/// FRE-25 sqlite insert flow, staged the way the grid does it (per-column
+/// overrides on a `TableStage`): only overridden columns reach the INSERT,
+/// the INTEGER PRIMARY KEY (rowid alias — exempt from the required set) and
+/// the defaulted column get their values from the database, and a fully
+/// default phantom row inserts via DEFAULT VALUES.
+#[tokio::test]
+async fn sqlite_staged_insert_leaves_defaults_to_the_database() {
+    let fixture = FixtureDb::with_sql(
+        "CREATE TABLE items (
+            id INTEGER PRIMARY KEY,
+            label TEXT NOT NULL,
+            qty INTEGER NOT NULL DEFAULT 5,
+            note TEXT
+        );",
+    )
+    .await;
+    let pool = fixture.open().await;
+    let tables = pool.introspect().await.unwrap();
+    let items = find(&tables, None, "items").clone();
+    let identity = detect_row_identity(&items, Dialect::Sqlite).unwrap();
+
+    // Required-column boundary: only `label` is NOT NULL without a default
+    // that the database won't auto-assign (id is the rowid alias).
+    let required = required_insert_columns(&items, Dialect::Sqlite);
+    assert_eq!(required, HashSet::from(["label".to_string()]));
+
+    let mut stage = TableStage::default();
+    let insert = stage.add_insert();
+    assert_eq!(stage.missing_required(&required), 1, "label unfilled");
+    stage.set_insert_value(insert, "label", Value::Text("widget".into()));
+    assert_eq!(
+        stage.missing_required(&required),
+        0,
+        "label filled → saveable"
+    );
+
+    let counts = apply_staged(&pool, &items, &identity, &stage.changes())
+        .await
+        .unwrap();
+    assert_eq!(counts.inserted_rows, 1);
+
+    // The database assigned id (rowid alias) and the qty default.
+    let check = pool
+        .query("SELECT id, label, qty, note FROM items")
+        .await
+        .unwrap();
+    assert_eq!(check.rows.len(), 1);
+    assert_eq!(check.rows[0][0], Value::Integer(1), "db-assigned id");
+    assert_eq!(check.rows[0][1], Value::Text("widget".into()));
+    assert_eq!(check.rows[0][2], Value::Integer(5), "column default");
+    assert_eq!(check.rows[0][3], Value::Null, "nullable column left NULL");
+
+    // A second, fully defaultable table: an all-default phantom row goes
+    // through INSERT … DEFAULT VALUES.
+    pool.query("CREATE TABLE logs (id INTEGER PRIMARY KEY, note TEXT DEFAULT 'x')")
+        .await
+        .unwrap();
+    let tables = pool.introspect().await.unwrap();
+    let logs = find(&tables, None, "logs").clone();
+    let logs_identity = detect_row_identity(&logs, Dialect::Sqlite).unwrap();
+    assert!(required_insert_columns(&logs, Dialect::Sqlite).is_empty());
+    let mut stage = TableStage::default();
+    stage.add_insert();
+    assert_eq!(
+        stage.changes(),
+        vec![StagedChange::Insert {
+            columns: vec![],
+            values: vec![],
+        }]
+    );
+    apply_staged(&pool, &logs, &logs_identity, &stage.changes())
+        .await
+        .unwrap();
+    let check = pool.query("SELECT id, note FROM logs").await.unwrap();
+    assert_eq!(check.rows[0][0], Value::Integer(1));
+    assert_eq!(check.rows[0][1], Value::Text("x".into()));
+
+    pool.close().await;
+}
+
+/// FRE-25 postgres insert flow: serial and identity columns are exempt from
+/// the required set (nextval default / synthetic identity marker), stay out
+/// of the INSERT when not overridden, and get database-assigned values —
+/// verified by re-query.
+#[tokio::test]
+async fn postgres_staged_insert_gets_serial_and_identity_values() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    for sql in [
+        "DROP SCHEMA IF EXISTS staged_insert_defaults CASCADE",
+        "CREATE SCHEMA staged_insert_defaults",
+        "CREATE TABLE staged_insert_defaults.items (
+            id serial PRIMARY KEY,
+            seq integer GENERATED ALWAYS AS IDENTITY,
+            label text NOT NULL,
+            qty integer NOT NULL DEFAULT 7,
+            note text
+        )",
+    ] {
+        pool.query(sql).await.unwrap();
+    }
+    let tables = pool.introspect().await.unwrap();
+    let items = find(&tables, Some("staged_insert_defaults"), "items").clone();
+    let identity = detect_row_identity(&items, Dialect::Postgres).unwrap();
+
+    // Introspection surfaces the auto-assignments: serial via its real
+    // nextval default, identity via the synthetic marker.
+    let by_name = |name: &str| items.columns.iter().find(|c| c.name == name).unwrap();
+    assert!(by_name("id")
+        .default
+        .as_deref()
+        .unwrap()
+        .contains("nextval"));
+    assert_eq!(
+        by_name("seq").default.as_deref(),
+        Some("GENERATED ALWAYS AS IDENTITY")
+    );
+
+    // Required-column boundary: only `label` must be filled.
+    let required = required_insert_columns(&items, Dialect::Postgres);
+    assert_eq!(required, HashSet::from(["label".to_string()]));
+
+    let mut stage = TableStage::default();
+    let insert = stage.add_insert();
+    assert_eq!(stage.missing_required(&required), 1);
+    stage.set_insert_value(insert, "label", Value::Text("gadget".into()));
+    assert_eq!(stage.missing_required(&required), 0);
+    // The generated change carries ONLY the overridden column.
+    assert_eq!(
+        stage.changes(),
+        vec![StagedChange::Insert {
+            columns: vec!["label".into()],
+            values: vec![Value::Text("gadget".into())],
+        }]
+    );
+
+    let counts = apply_staged(&pool, &items, &identity, &stage.changes())
+        .await
+        .unwrap();
+    assert_eq!(counts.inserted_rows, 1);
+
+    let check = pool
+        .query("SELECT id, seq, label, qty, note FROM staged_insert_defaults.items")
+        .await
+        .unwrap();
+    assert_eq!(check.rows.len(), 1);
+    assert_eq!(check.rows[0][0], Value::Integer(1), "serial assigned");
+    assert_eq!(check.rows[0][1], Value::Integer(1), "identity assigned");
+    assert_eq!(check.rows[0][2], Value::Text("gadget".into()));
+    assert_eq!(check.rows[0][3], Value::Integer(7), "column default");
+    assert_eq!(check.rows[0][4], Value::Null);
+
+    pool.close().await;
+}
+
+/// FRE-25 multi-delete: two selected rows staged for deletion plus an edit,
+/// all in ONE transaction; the exact delete count the confirmation showed is
+/// what lands.
+#[tokio::test]
+async fn sqlite_staged_multi_delete_with_edit_applies_exact_counts() {
+    let fixture = FixtureDb::with_sql(
+        "CREATE TABLE contacts (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+         INSERT INTO contacts VALUES (1, 'ana'), (2, 'bo'), (3, 'cy'), (4, 'dee');",
+    )
+    .await;
+    let pool = fixture.open().await;
+    let tables = pool.introspect().await.unwrap();
+    let contacts = find(&tables, None, "contacts").clone();
+    let identity = detect_row_identity(&contacts, Dialect::Sqlite).unwrap();
+
+    // Stage exactly as the grid does: selection → mark_delete per row, plus
+    // an edit of a surviving row.
+    let mut stage = TableStage::default();
+    stage.mark_delete(locator(vec![Value::Integer(2)]));
+    stage.mark_delete(locator(vec![Value::Integer(3)]));
+    stage.set_cell_edit(
+        locator(vec![Value::Integer(1)]),
+        "name",
+        Value::Text("Sole Survivor".into()),
+    );
+    // This is the count the save-time confirmation shows.
+    assert_eq!(stage.delete_count(), 2);
+    assert_eq!(stage.pending_count(), 3);
+
+    let counts = apply_staged(&pool, &contacts, &identity, &stage.changes())
+        .await
+        .unwrap();
+    assert_eq!(counts.deleted_rows, 2, "exactly the confirmed count");
+    assert_eq!(counts.updated_rows, 1);
+    assert_eq!(counts.inserted_rows, 0);
+
+    let check = pool
+        .query("SELECT id, name FROM contacts ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(check.rows.len(), 2);
+    assert_eq!(check.rows[0][0], Value::Integer(1));
+    assert_eq!(check.rows[0][1], Value::Text("Sole Survivor".into()));
+    assert_eq!(check.rows[1][0], Value::Integer(4), "row 4 untouched");
 
     pool.close().await;
 }

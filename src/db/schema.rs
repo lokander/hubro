@@ -15,7 +15,10 @@ pub struct ColumnMeta {
     pub nullable: bool,
     /// 1-based position within the primary key; `None` when not part of it.
     pub primary_key_position: Option<u32>,
-    /// Default value expression as written in the schema, if any.
+    /// Default value expression as written in the schema, if any. Postgres
+    /// identity columns (whose `column_default` is NULL even though the
+    /// database auto-assigns them) carry a synthetic `GENERATED … AS
+    /// IDENTITY` marker here — see `postgres::introspect`.
     pub default: Option<String>,
 }
 
