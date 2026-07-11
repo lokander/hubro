@@ -348,6 +348,10 @@ pub struct AppState {
     /// foreign-key jumps, most recent last. [`Self::navigate_back`] pops one;
     /// a manual table selection clears the stack.
     pub nav_history: Signal<HashMap<ConnectionId, Vec<FocusTarget>>>,
+    /// Whether the keyboard-shortcut cheatsheet overlay is showing (FRE-15).
+    /// App-global (one overlay for the whole window), toggled by `?` and
+    /// dismissed by Escape / a backdrop click / `?` again.
+    pub show_cheatsheet: Signal<bool>,
 }
 
 impl AppState {
@@ -409,6 +413,7 @@ impl AppState {
             // so component scope is fine (like tab_ui / nav_guard).
             pending_focus: Signal::new(HashMap::new()),
             nav_history: Signal::new(HashMap::new()),
+            show_cheatsheet: Signal::new(false),
         };
         // Resolve the OS dark-mode preference once at startup. Reacting to
         // live OS theme changes is out of scope (a startup read suffices);
@@ -863,6 +868,41 @@ impl AppState {
         }
         self.nav_guard.set(None);
         self.tab_ui.write().entry(id).or_default().pane = pane;
+    }
+
+    /// Toggles the Data/SQL pane of the currently active connection tab
+    /// (FRE-15, the `Ctrl+E` shortcut). A no-op on the connections screen.
+    /// Routed through [`Self::set_pane`], so the unsaved-changes guard still
+    /// applies when leaving the browser with staged edits.
+    pub fn toggle_active_pane(self) {
+        let ActiveView::Connection(id) = *self.active.read() else {
+            return;
+        };
+        let current = self
+            .tab_ui
+            .read()
+            .get(&id)
+            .map(|ui| ui.pane)
+            .unwrap_or_default();
+        let target = match current {
+            Pane::Browser => Pane::Sql,
+            Pane::Sql => Pane::Browser,
+        };
+        self.set_pane(id, target);
+    }
+
+    /// Flips the shortcut cheatsheet overlay (FRE-15, the `?` shortcut).
+    pub fn toggle_cheatsheet(mut self) {
+        let showing = *self.show_cheatsheet.read();
+        self.show_cheatsheet.set(!showing);
+    }
+
+    /// Closes the shortcut cheatsheet if it is open (FRE-15, Escape). Kept
+    /// idempotent so a stray Escape never churns the signal.
+    pub fn close_cheatsheet(mut self) {
+        if *self.show_cheatsheet.read() {
+            self.show_cheatsheet.set(false);
+        }
     }
 
     /// Stores the editor buffer (synced from the webview on change). An
