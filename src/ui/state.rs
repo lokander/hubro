@@ -461,13 +461,13 @@ impl AppState {
                 Err(err) => state_for_open.history_error.set(Some(err)),
             }
         });
-        // Restore the previous session (open tabs + active view) in the
-        // background. spawn_forever: like the tasks above, it must outlive the
-        // component that created the state. Reads the saved list loaded above.
-        let state_for_restore = state;
-        spawn_forever(async move {
-            state_for_restore.restore_session().await;
-        });
+        // Session restore is triggered once from the Shell component (see
+        // `Shell`), not here: it drives the normal `connect`/`connect_postgres`
+        // flow, which writes the core connection signals (registry,
+        // open_locators, active, tab_ui, …). Those are owned by the root App
+        // scope, so running restore from a component-scoped task keeps the
+        // writes in a live scope — a root `spawn_forever` here would write
+        // them from a foreign scope (the `__copy_value_hoisted` case).
         state
     }
 
@@ -1836,7 +1836,7 @@ impl AppState {
     /// connection whose password isn't stored is simply left for the user to
     /// click. A locator whose file/server is gone just fails to reopen through
     /// the normal connect-error path; it never blocks the rest of the restore.
-    async fn restore_session(mut self) {
+    pub async fn restore_session(mut self) {
         let Some(path) = default_session_path() else {
             return;
         };

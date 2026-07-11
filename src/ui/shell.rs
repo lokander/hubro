@@ -95,6 +95,16 @@ pub fn Shell() -> Element {
         });
     });
 
+    // Restore the previous session exactly once, from this component's scope
+    // (not a root `spawn_forever` in AppState::new): restore drives the normal
+    // connect flow, which writes the core connection signals — running it here
+    // keeps those writes in a live scope, matching the manual connect path.
+    use_hook(|| {
+        spawn(async move {
+            state.restore_session().await;
+        });
+    });
+
     // Session persistence (FRE-30): re-snapshot whenever the open tabs, their
     // selected table/pane, or the active view change, and write session.toml
     // only when the snapshot actually differs. `current_session` reads
