@@ -7,7 +7,7 @@ use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
 
 use super::error::DbError;
 use super::page::quote_ident;
-use super::schema::{ColumnMeta, ForeignKeyMeta, IndexMeta, TableKind, TableMeta};
+use super::schema::{ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta};
 use super::staged::CheckedStatement;
 use super::value::{ColumnInfo, QueryResult, Value};
 
@@ -189,6 +189,9 @@ async fn table_columns(pool: &SqlitePool, table: &str) -> Result<Vec<ColumnMeta>
             nullable: notnull == 0,
             primary_key_position: (pk > 0).then_some(pk as u32),
             default: get::<Option<String>>(&row, "dflt_value")?,
+            // SQLite's `PRAGMA table_info` omits generated (`AS (…)`)
+            // columns entirely, so any column it reports is user-writable.
+            generated: Generated::Never,
         });
     }
     Ok(columns)

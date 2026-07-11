@@ -310,16 +310,16 @@ impl TableStage {
 ///   auto-assigned here, and leaving it default fails loudly at save time
 ///   (NOT NULL violation, whole batch rolled back).
 /// - **Postgres**: `serial`/`bigserial` columns carry a `nextval(…)`
-///   `column_default`, and identity columns (`GENERATED … AS IDENTITY`,
-///   which have a NULL `column_default`) are introspected with a
-///   `GENERATED … AS IDENTITY` default marker (see `postgres.rs`), so both
-///   fall out via `default.is_some()`.
+///   `column_default`; identity columns (`GENERATED … AS IDENTITY`) and
+///   stored generated columns (`GENERATED ALWAYS AS (expr) STORED`) have a
+///   NULL `column_default` but are flagged via [`ColumnMeta::generated`].
+///   All fall out via [`ColumnMeta::is_auto_assigned`].
 pub fn required_insert_columns(meta: &TableMeta, dialect: Dialect) -> HashSet<String> {
     let single_pk = meta.primary_key().len() == 1;
     meta.columns
         .iter()
         .filter(|column| {
-            if column.nullable || column.default.is_some() {
+            if column.nullable || column.is_auto_assigned() {
                 return false;
             }
             let rowid_alias = dialect == Dialect::Sqlite
@@ -587,6 +587,22 @@ mod tests {
             nullable,
             primary_key_position: pk,
             default: default.map(String::from),
+            generated: crate::db::Generated::Never,
+        }
+    }
+
+    fn generated_column(
+        name: &str,
+        type_name: &str,
+        generated: crate::db::Generated,
+    ) -> crate::db::ColumnMeta {
+        crate::db::ColumnMeta {
+            name: name.into(),
+            type_name: type_name.into(),
+            nullable: false,
+            primary_key_position: None,
+            default: None,
+            generated,
         }
     }
 
@@ -630,8 +646,9 @@ mod tests {
             HashSet::from(["a".to_string(), "b".to_string()])
         );
 
-        // On Postgres the INTEGER-PK exemption never applies; serial and
-        // identity columns are exempt through their default marker instead.
+        // On Postgres the INTEGER-PK exemption never applies; serial columns
+        // are exempt via their real default, and identity/stored-generated
+        // columns via `ColumnMeta::generated`.
         let pg = meta(vec![
             column("plain_pk", "integer", false, Some(1), None),
             column(
@@ -641,13 +658,13 @@ mod tests {
                 None,
                 Some("nextval('t_id_seq'::regclass)"),
             ),
-            column(
-                "identity_id",
+            generated_column("identity_always", "integer", crate::db::Generated::Always),
+            generated_column(
+                "identity_default",
                 "integer",
-                false,
-                None,
-                Some("GENERATED ALWAYS AS IDENTITY"),
+                crate::db::Generated::ByDefault,
             ),
+            generated_column("computed", "integer", crate::db::Generated::Always),
             column("label", "text", false, None, None),
         ]);
         assert_eq!(

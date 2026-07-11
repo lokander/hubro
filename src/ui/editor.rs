@@ -576,6 +576,7 @@ mod tests {
                     nullable: true,
                     primary_key_position: None,
                     default: None,
+                    generated: crate::db::Generated::Never,
                 })
                 .collect(),
             indexes: vec![],

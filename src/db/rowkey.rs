@@ -197,7 +197,7 @@ fn qualified_table(table: &TableMeta) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::schema::{ColumnMeta, IndexMeta};
+    use crate::db::schema::{ColumnMeta, Generated, IndexMeta};
 
     fn col(name: &str, nullable: bool, pk: Option<u32>) -> ColumnMeta {
         ColumnMeta {
@@ -206,6 +206,7 @@ mod tests {
             nullable,
             primary_key_position: pk,
             default: None,
+            generated: Generated::Never,
         }
     }
 
