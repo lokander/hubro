@@ -103,6 +103,85 @@ pub fn save_connections(path: &Path, connections: &[SavedConnection]) -> Result<
         .map_err(|err| ConfigError(format!("replacing {}: {err}", path.display())))
 }
 
+/// Which theme the app uses. `System` follows the OS preference; `Light`
+/// and `Dark` are manual overrides. Serialized lowercase in settings.toml.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl Theme {
+    /// Resolves to a concrete dark/light choice: `System` defers to the OS
+    /// preference, explicit choices ignore it.
+    pub fn resolve_dark(self, system_prefers_dark: bool) -> bool {
+        match self {
+            Theme::System => system_prefers_dark,
+            Theme::Light => false,
+            Theme::Dark => true,
+        }
+    }
+
+    /// Cycles System → Light → Dark → System for the toggle control.
+    pub fn next(self) -> Theme {
+        match self {
+            Theme::System => Theme::Light,
+            Theme::Light => Theme::Dark,
+            Theme::Dark => Theme::System,
+        }
+    }
+
+    /// Short label for the toggle control.
+    pub fn label(self) -> &'static str {
+        match self {
+            Theme::System => "System",
+            Theme::Light => "Light",
+            Theme::Dark => "Dark",
+        }
+    }
+}
+
+/// User preferences, persisted separately from the connections list so a
+/// corrupt settings file never blocks connecting to databases.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Settings {
+    #[serde(default)]
+    pub theme: Theme,
+}
+
+/// Default location: `$XDG_CONFIG_HOME/dataview/settings.toml`.
+pub fn default_settings_path() -> Option<PathBuf> {
+    Some(dirs::config_dir()?.join("dataview").join("settings.toml"))
+}
+
+/// Loads settings. A missing *or* malformed file yields defaults — these are
+/// non-critical UI preferences, so (unlike the connections list) a bad file
+/// never surfaces an error or blocks the app; the user just gets defaults.
+pub fn load_settings(path: &Path) -> Settings {
+    match std::fs::read_to_string(path) {
+        Ok(text) => toml::from_str(&text).unwrap_or_default(),
+        Err(_) => Settings::default(),
+    }
+}
+
+/// Persists settings, creating parent dirs and writing via a temp file +
+/// rename so a crash mid-write can't corrupt the file.
+pub fn save_settings(path: &Path, settings: &Settings) -> Result<(), ConfigError> {
+    let text = toml::to_string_pretty(settings).map_err(|err| ConfigError(err.to_string()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| ConfigError(format!("creating {}: {err}", parent.display())))?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, text)
+        .map_err(|err| ConfigError(format!("writing {}: {err}", tmp.display())))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|err| ConfigError(format!("replacing {}: {err}", path.display())))
+}
+
 /// The saved-connections list plus the load outcome. Mutations go through
 /// this type so a list that failed to load is never persisted back over the
 /// user's file.
@@ -368,6 +447,60 @@ mod tests {
         assert!(list.persist(&path).is_err());
         // The unreadable file is untouched, not replaced by the empty list.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
+    }
+
+    #[test]
+    fn theme_serde_round_trips_lowercase() {
+        for (theme, token) in [
+            (Theme::System, "\"system\""),
+            (Theme::Light, "\"light\""),
+            (Theme::Dark, "\"dark\""),
+        ] {
+            assert_eq!(toml::Value::try_from(theme).unwrap().to_string(), token);
+            let settings = Settings { theme };
+            let text = toml::to_string(&settings).unwrap();
+            assert_eq!(toml::from_str::<Settings>(&text).unwrap(), settings);
+        }
+    }
+
+    #[test]
+    fn theme_resolves_dark_from_system_preference() {
+        assert!(Theme::System.resolve_dark(true));
+        assert!(!Theme::System.resolve_dark(false));
+        // Explicit choices ignore the system preference.
+        assert!(!Theme::Light.resolve_dark(true));
+        assert!(Theme::Dark.resolve_dark(false));
+    }
+
+    #[test]
+    fn theme_next_cycles_system_light_dark() {
+        assert_eq!(Theme::System.next(), Theme::Light);
+        assert_eq!(Theme::Light.next(), Theme::Dark);
+        assert_eq!(Theme::Dark.next(), Theme::System);
+    }
+
+    #[test]
+    fn missing_settings_file_loads_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope").join("settings.toml");
+        assert_eq!(load_settings(&path).theme, Theme::System);
+    }
+
+    #[test]
+    fn malformed_settings_file_falls_back_to_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "theme = 42").unwrap();
+        assert_eq!(load_settings(&path).theme, Theme::System);
+    }
+
+    #[test]
+    fn settings_save_and_load_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deep").join("settings.toml");
+        let settings = Settings { theme: Theme::Dark };
+        save_settings(&path, &settings).unwrap();
+        assert_eq!(load_settings(&path), settings);
     }
 
     #[test]
