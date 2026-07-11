@@ -1434,17 +1434,25 @@ impl AppState {
         // or tab switch) — a plain spawn would cancel it mid-write.
         spawn_forever(async move {
             use std::io::Write as _;
+            // Stream into a temp file and rename on success, so a mid-stream
+            // failure can't clobber an existing file at `path`.
+            let tmp = export_temp_path(&path);
             let outcome = async {
-                let file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+                let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
                 let mut writer = std::io::BufWriter::new(file);
                 let rows = pool
                     .export(&sql, &params, format, &mut writer)
                     .await
                     .map_err(|e| e.to_string())?;
                 writer.flush().map_err(|e| e.to_string())?;
+                drop(writer);
+                std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
                 Ok::<u64, String>(rows)
             }
             .await;
+            if outcome.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
             self.finish_export(id, outcome);
         });
     }
@@ -1462,13 +1470,19 @@ impl AppState {
         self.export_status.write().insert(id, ExportStatus::Running);
         spawn_forever(async move {
             use std::io::Write as _;
+            let tmp = export_temp_path(&path);
             let outcome = (|| {
-                let file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+                let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
                 let mut writer = std::io::BufWriter::new(file);
                 let rows = write_result(&result, format, &mut writer).map_err(|e| e.to_string())?;
                 writer.flush().map_err(|e| e.to_string())?;
+                drop(writer);
+                std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
                 Ok::<u64, String>(rows)
             })();
+            if outcome.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
             self.finish_export(id, outcome);
         });
     }
@@ -1564,6 +1578,15 @@ async fn system_prefers_dark() -> bool {
 /// file is missing (the connect attempt will surface that error).
 pub(crate) fn canonical(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Sibling temp path for an atomic export write (`foo.csv` → `foo.csv.part`).
+/// Streaming into this and renaming on success keeps a mid-stream failure
+/// from clobbering an existing file at the destination.
+fn export_temp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".part");
+    path.with_file_name(name)
 }
 
 /// Tab label for a database file: the file name, or the whole path when
