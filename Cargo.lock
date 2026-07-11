@@ -1312,6 +1312,7 @@ version = "0.1.0"
 dependencies = [
  "dioxus",
  "dirs",
+ "futures-util",
  "keyring",
  "percent-encoding",
  "rfd 0.15.4",

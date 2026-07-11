@@ -90,6 +90,26 @@ impl PageRequest {
         (sql, params)
     }
 
+    /// SELECT for exporting the current view: the same table, filter, and
+    /// sort as [`Self::select_sql`], but WITHOUT `LIMIT`/`OFFSET` (every
+    /// matching row) and without the hidden `extra_key_column` (exports show
+    /// the visible `*` columns only). Row order still follows the active
+    /// sort so a sorted export matches what the grid shows.
+    pub fn export_sql(&self, dialect: Dialect) -> (String, Vec<Value>) {
+        let (where_clause, params) = self.where_clause(dialect);
+        let order = match &self.sort {
+            Some((column, dir)) => {
+                format!(" ORDER BY {} {}", quote_ident(column), dir.sql())
+            }
+            None => String::new(),
+        };
+        let sql = format!(
+            "SELECT * FROM {}{where_clause}{order}",
+            self.qualified_table(),
+        );
+        (sql, params)
+    }
+
     /// COUNT(*) with the same filter, for the row-count indicator.
     pub fn count_sql(&self, dialect: Dialect) -> (String, Vec<Value>) {
         let (where_clause, params) = self.where_clause(dialect);
@@ -223,6 +243,31 @@ mod tests {
         // COUNT(*) is unaffected.
         let (count_sql, _) = req.count_sql(Dialect::Sqlite);
         assert_eq!(count_sql, "SELECT COUNT(*) FROM \"tracks\"");
+    }
+
+    #[test]
+    fn export_sql_drops_limit_offset_and_extra_key_but_keeps_filter_and_sort() {
+        let mut req = base();
+        req.extra_key_column = Some("rowid".into());
+        req.sort = Some(("name".into(), SortDir::Desc));
+        req.filter = Some(Filter {
+            column: "name".into(),
+            op: FilterOp::Contains,
+            value: "abc".into(),
+        });
+        let (sql, params) = req.export_sql(Dialect::Sqlite);
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"tracks\" WHERE \"name\" LIKE ? ESCAPE '\\' ORDER BY \"name\" DESC"
+        );
+        assert_eq!(params, vec![Value::Text("%abc%".into())]);
+    }
+
+    #[test]
+    fn export_sql_plain_is_select_star() {
+        let (sql, params) = base().export_sql(Dialect::Postgres);
+        assert_eq!(sql, "SELECT * FROM \"tracks\"");
+        assert!(params.is_empty());
     }
 
     #[test]

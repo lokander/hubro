@@ -940,10 +940,10 @@
       }
     }
   }
-  .hover\:text-white {
+  .hover\:text-slate-950 {
     &:hover {
       @media (hover: hover) {
-        color: var(--color-white);
+        color: var(--color-slate-950);
       }
     }
   }
@@ -1255,6 +1255,11 @@
       }
     }
   }
+  .dark\:text-emerald-400 {
+    &:where(.dark, .dark *) {
+      color: var(--color-emerald-400);
+    }
+  }
   .dark\:text-emerald-500\/70 {
     &:where(.dark, .dark *) {
       color: color-mix(in srgb, oklch(69.6% 0.17 162.48) 70%, transparent);
@@ -1476,6 +1481,15 @@
       &:hover {
         @media (hover: hover) {
           color: var(--color-slate-200);
+        }
+      }
+    }
+  }
+  .dark\:hover\:text-white {
+    &:where(.dark, .dark *) {
+      &:hover {
+        @media (hover: hover) {
+          color: var(--color-white);
         }
       }
     }
