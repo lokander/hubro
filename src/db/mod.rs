@@ -22,9 +22,15 @@ mod value;
 pub use error::DbError;
 pub use export::{write_result, ExportFormat};
 pub use fk::{build_fk_filter, resolve_referenced_column};
-pub use page::{Dialect, Filter, FilterOp, PageRequest, SortDir};
+pub use page::{
+    classify_column, ColumnClass, Dialect, Filter, FilterOp, Page, PageRequest, PreviewInfo,
+    SortDir, PREVIEW_BYTES,
+};
 pub use postgres::{build_url, sanitized_url, url_target, url_via_local_port, url_with_password};
-pub use registry::{Connection, ConnectionId, ConnectionRegistry, DbPool};
+pub use registry::{
+    CellFetch, Connection, ConnectionId, ConnectionRegistry, DbPool, FETCH_CELL_MAX_BYTES,
+    MAX_QUERY_ROWS, QUERY_CELL_CAP,
+};
 pub use rowkey::{delete_sql, detect_row_identity, update_sql, RowIdentity};
 pub use schema::{ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta};
 pub use script::{

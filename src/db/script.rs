@@ -9,7 +9,7 @@
 //! BEGIN/COMMIT in the script works as usual).
 
 use super::error::DbError;
-use super::registry::DbPool;
+use super::registry::{DbPool, MAX_QUERY_ROWS};
 use super::value::QueryResult;
 
 /// Splits a script into individual statements on `;`, respecting:
@@ -331,6 +331,10 @@ pub enum StatementOutcome {
 pub struct StatementResult {
     pub preview: String,
     pub outcome: StatementOutcome,
+    /// True when a read hit the [`MAX_QUERY_ROWS`] fetch cap and its result
+    /// holds only the first N rows (FRE-33) — the editor shows a "showing
+    /// first N" indicator. Always false for writes.
+    pub truncated: bool,
 }
 
 /// Where and how a script failed. Statements before `statement_index`
@@ -353,17 +357,23 @@ pub async fn run_script(
     mut on_result: impl FnMut(StatementResult),
 ) -> Result<(), ScriptError> {
     for (statement_index, statement) in statements.iter().enumerate() {
+        // Reads stream through the row cap so a huge result never buffers in
+        // full; writes report an affected-row count as before.
         let outcome = match classify_statement(statement) {
-            StatementKind::Read => pool.query(statement).await.map(StatementOutcome::Rows),
+            StatementKind::Read => pool
+                .query_capped(statement, &[], MAX_QUERY_ROWS)
+                .await
+                .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated)),
             StatementKind::Write => pool
                 .execute(statement)
                 .await
-                .map(StatementOutcome::Affected),
+                .map(|affected| (StatementOutcome::Affected(affected), false)),
         };
         match outcome {
-            Ok(outcome) => on_result(StatementResult {
+            Ok((outcome, truncated)) => on_result(StatementResult {
                 preview: statement_preview(statement),
                 outcome,
+                truncated,
             }),
             Err(error) => {
                 return Err(ScriptError {

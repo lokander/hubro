@@ -6,12 +6,48 @@ use sqlx::sqlite::SqlitePool;
 
 use super::error::DbError;
 use super::export::ExportFormat;
-use super::page::{Dialect, PageRequest};
+use super::page::{
+    classify_column, equalities_where, quote_ident, ColumnClass, Dialect, Page, PageRequest,
+    PREVIEW_BYTES,
+};
 use super::postgres;
-use super::schema::TableMeta;
+use super::rowkey::RowIdentity;
+use super::schema::{ColumnMeta, TableMeta};
 use super::sqlite;
-use super::staged::CheckedStatement;
+use super::staged::{CheckedStatement, RowLocator};
 use super::value::{QueryResult, Value};
+
+/// Hard cap on rows the free-form query path fetches into memory, independent
+/// of the editor's 500-row *render* cap. A `SELECT` returning more is
+/// truncated to this many rows with a "showing first N" indicator, so a query
+/// against a multi-GB table can never buffer the whole result (FRE-33).
+pub const MAX_QUERY_ROWS: u64 = 10_000;
+
+/// Per-cell byte cap applied while streaming the free-form query path, so a
+/// `SELECT *` returning huge individual cells can't blow memory even within
+/// the row cap. Generous enough to show any reasonable value; the result is
+/// read-only (never staged/exported through this), so the trim is display-only.
+pub const QUERY_CELL_CAP: usize = 64 * 1024;
+
+/// Cap on the full value [`DbPool::fetch_cell`] loads for a cell expand/edit.
+/// A value larger than this comes back as an 8 MiB prefix flagged
+/// [`CellFetch::capped`]; the editor then refuses to stage it (staging a
+/// prefix would silently truncate the stored value — data loss), and the
+/// expand overlay notes the value is too large to show in full.
+pub const FETCH_CELL_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// One cell's value loaded on demand ([`DbPool::fetch_cell`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CellFetch {
+    /// The value — the complete cell unless [`Self::capped`] is set, in which
+    /// case it is only the first [`FETCH_CELL_MAX_BYTES`].
+    pub value: Value,
+    /// The underlying value's full length (chars for text, bytes for blob).
+    pub full_len: u64,
+    /// True when the value exceeded the fetch cap and was truncated — it must
+    /// NOT be staged as an edit.
+    pub capped: bool,
+}
 
 /// Stable handle for one open connection (one tab in the UI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -112,6 +148,117 @@ impl DbPool {
         self.query_with(&sql, &params).await
     }
 
+    /// One page of a table with **bounded previews** of large columns (long
+    /// text / json / blobs): the grid's read path (FRE-33). `columns` are the
+    /// table's visible columns (introspection order); `no_preview` names
+    /// columns that must be fetched whole — the row-identity key columns and
+    /// foreign-key columns, whose truncation would misaddress rows or
+    /// misdirect a foreign-key jump. The returned [`Page`] carries per-cell
+    /// truncation metadata; the full value of a truncated cell is loaded on
+    /// demand via [`Self::fetch_cell`].
+    pub async fn fetch_page_bounded(
+        &self,
+        request: &PageRequest,
+        columns: &[ColumnMeta],
+        no_preview: &[&str],
+    ) -> Result<Page, DbError> {
+        let (sql, params, plan) =
+            request.select_bounded_sql(self.dialect(), columns, no_preview, PREVIEW_BYTES);
+        let raw = self.query_with(&sql, &params).await?;
+        Ok(plan.assemble(raw, PREVIEW_BYTES))
+    }
+
+    /// Streams an arbitrary read query, retaining at most `max_rows` rows and
+    /// capping each cell to [`QUERY_CELL_CAP`] bytes (FRE-33). Returns the
+    /// bounded result plus whether rows were dropped past the cap, so the SQL
+    /// editor can show a "showing first N" indicator. Pulls rows one at a time
+    /// (`fetch` + `try_next`) — the same streaming primitive as [`Self::export`].
+    pub async fn query_capped(
+        &self,
+        sql: &str,
+        params: &[Value],
+        max_rows: u64,
+    ) -> Result<(QueryResult, bool), DbError> {
+        match self {
+            DbPool::Sqlite(pool) => {
+                sqlite::query_capped(pool, sql, params, max_rows, QUERY_CELL_CAP).await
+            }
+            DbPool::Postgres(pool) => {
+                postgres::query_capped(pool, sql, params, max_rows, QUERY_CELL_CAP).await
+            }
+        }
+    }
+
+    /// Loads one cell's full value on demand — the lazy counterpart to the
+    /// grid's bounded page fetch (FRE-33). Builds a targeted
+    /// `SELECT <col> FROM <table> WHERE <full key> = …` from the row's
+    /// [`RowLocator`], previewing at [`FETCH_CELL_MAX_BYTES`] so even a
+    /// multi-GB cell returns a bounded prefix (flagged [`CellFetch::capped`])
+    /// rather than the whole thing. Used by cell expand and by the editor when
+    /// opening a truncated cell (so a preview is never staged as an edit).
+    pub async fn fetch_cell(
+        &self,
+        table: &TableMeta,
+        identity: &RowIdentity,
+        locator: &RowLocator,
+        column: &str,
+    ) -> Result<CellFetch, DbError> {
+        let dialect = self.dialect();
+        let class = table
+            .columns
+            .iter()
+            .find(|c| c.name == column)
+            .map(|c| classify_column(&c.type_name))
+            .unwrap_or(ColumnClass::Text);
+        let cap = FETCH_CELL_MAX_BYTES as i64;
+        let q = quote_ident(column);
+        let (value_expr, length_expr): (String, String) = match (dialect, class) {
+            (_, ColumnClass::Scalar) => (q.clone(), "NULL".to_string()),
+            (Dialect::Sqlite, _) => (format!("substr({q}, 1, {cap})"), format!("length({q})")),
+            (Dialect::Postgres, ColumnClass::Text) => (
+                format!("left({q}::text, {cap})"),
+                format!("length({q}::text)"),
+            ),
+            (Dialect::Postgres, ColumnClass::Binary) => (
+                format!("substring({q} from 1 for {cap})"),
+                format!("octet_length({q})"),
+            ),
+        };
+        // Bind the row's key values as text, mirroring how the equalities page
+        // filter / foreign-key jumps pin a row (exotic key types compare too).
+        let pairs: Vec<(String, Value)> = identity
+            .key_columns()
+            .iter()
+            .zip(locator.identity_values.iter())
+            .map(|(col, value)| ((*col).to_string(), value.clone()))
+            .collect();
+        let (where_clause, params) = equalities_where(&pairs, dialect);
+        let sql = format!(
+            "SELECT {value_expr}, {length_expr} FROM {}{where_clause} LIMIT 1",
+            qualified_table(table),
+        );
+        let result = self.query_with(&sql, &params).await?;
+        let Some(row) = result.rows.into_iter().next() else {
+            // The row is gone (concurrent delete): report an empty value
+            // rather than an error.
+            return Ok(CellFetch {
+                value: Value::Null,
+                full_len: 0,
+                capped: false,
+            });
+        };
+        let value = row.first().cloned().unwrap_or(Value::Null);
+        let full_len = match row.get(1) {
+            Some(Value::Integer(n)) => *n as u64,
+            _ => value_len(&value),
+        };
+        Ok(CellFetch {
+            capped: full_len > FETCH_CELL_MAX_BYTES as u64,
+            value,
+            full_len,
+        })
+    }
+
     /// Total row count for the request's table and filter (paging ignored).
     pub async fn count_rows(&self, request: &PageRequest) -> Result<u64, DbError> {
         let (sql, params) = request.count_sql(self.dialect());
@@ -152,6 +299,24 @@ impl DbPool {
             DbPool::Sqlite(pool) => pool.close().await,
             DbPool::Postgres(pool) => pool.close().await,
         }
+    }
+}
+
+/// Schema-qualified, quoted table name for a targeted single-row read.
+fn qualified_table(table: &TableMeta) -> String {
+    match &table.schema {
+        Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(&table.name)),
+        None => quote_ident(&table.name),
+    }
+}
+
+/// Fallback full-length for a value when the `length` column came back NULL
+/// or non-integer (chars for text, bytes for blob, else 0).
+fn value_len(value: &Value) -> u64 {
+    match value {
+        Value::Text(t) => t.chars().count() as u64,
+        Value::Blob(b) => b.len() as u64,
+        _ => 0,
     }
 }
 

@@ -17,7 +17,7 @@ use super::error::DbError;
 use super::export::{export_io_err, ExportFormat, ExportSink};
 use super::schema::{ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta};
 use super::staged::CheckedStatement;
-use super::value::{ColumnInfo, QueryResult, Value};
+use super::value::{cap_value, ColumnInfo, QueryResult, Value};
 
 /// Splices a password into a Postgres URL (percent-encoding handled by the
 /// url crate). Saved config stores URLs without passwords; this rebuilds the
@@ -196,16 +196,72 @@ pub async fn query_with(
     };
     let mut out_rows = Vec::with_capacity(rows.len());
     for row in &rows {
-        let mut values = Vec::with_capacity(row.columns().len());
-        for idx in 0..row.columns().len() {
-            values.push(decode_value(row, idx)?);
-        }
-        out_rows.push(values);
+        out_rows.push(decode_row(row)?);
     }
     Ok(QueryResult {
         columns,
         rows: out_rows,
     })
+}
+
+/// Streams `sql` one row at a time (`fetch`, not `fetch_all`), decoding and
+/// retaining at most `max_rows` rows and capping each cell to `cell_cap`
+/// bytes, so the free-form query path never scales with table or value size
+/// (FRE-33). Returns the (bounded) result and whether more rows existed
+/// beyond the cap. Shares the streaming primitive with [`export`].
+pub async fn query_capped(
+    pool: &PgPool,
+    sql: &str,
+    params: &[Value],
+    max_rows: u64,
+    cell_cap: usize,
+) -> Result<(QueryResult, bool), DbError> {
+    use futures_util::TryStreamExt as _;
+
+    let mut stream = bind_params(sqlx::query(sql), params).fetch(pool);
+    let mut columns: Vec<ColumnInfo> = Vec::new();
+    let mut out_rows: Vec<Vec<Value>> = Vec::new();
+    let mut truncated = false;
+    while let Some(row) = stream.try_next().await.map_err(|e| query_error(e, sql))? {
+        // The cap+1'th row that reaches us proves there is more; stop before
+        // decoding it so exactly `max_rows` rows are retained.
+        if out_rows.len() as u64 >= max_rows {
+            truncated = true;
+            break;
+        }
+        if columns.is_empty() {
+            columns = row
+                .columns()
+                .iter()
+                .map(|c| ColumnInfo {
+                    name: c.name().to_string(),
+                })
+                .collect();
+        }
+        let values = decode_row(&row)?
+            .into_iter()
+            .map(|v| cap_value(v, cell_cap))
+            .collect();
+        out_rows.push(values);
+    }
+    Ok((
+        QueryResult {
+            columns,
+            rows: out_rows,
+        },
+        truncated,
+    ))
+}
+
+/// Decodes every cell of one fetched row into the backend-neutral [`Value`]
+/// model. Shared by the buffered ([`query_with`]) and streaming
+/// ([`query_capped`], [`export`]) paths.
+fn decode_row(row: &PgRow) -> Result<Vec<Value>, DbError> {
+    let mut values = Vec::with_capacity(row.columns().len());
+    for idx in 0..row.columns().len() {
+        values.push(decode_value(row, idx)?);
+    }
+    Ok(values)
 }
 
 /// Streams a query to `out` in the given format, pulling rows one at a time
@@ -235,10 +291,7 @@ pub async fn export(
                 sink.insert(new_sink)
             }
         };
-        let mut values = Vec::with_capacity(row.columns().len());
-        for idx in 0..row.columns().len() {
-            values.push(decode_value(&row, idx)?);
-        }
+        let values = decode_row(&row)?;
         sink.write_row(&values, out).map_err(export_io_err)?;
         rows += 1;
     }

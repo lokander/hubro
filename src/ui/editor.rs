@@ -4,7 +4,7 @@ use sqlx::types::chrono::{DateTime, Local};
 
 use crate::db::{
     needs_confirmation, ConnectionId, Dialect, ExportFormat, QueryResult, StatementOutcome,
-    StatementResult, TableMeta, Value,
+    StatementResult, TableMeta, Value, MAX_QUERY_ROWS,
 };
 use crate::history::HistoryEntry;
 
@@ -544,6 +544,19 @@ fn StatementSection(id: ConnectionId, index: usize, result: StatementResult) -> 
                             move |_| spawn_result_export(state, id, result.clone(), ExportFormat::Json)
                         },
                         "Export JSON"
+                    }
+                }
+            }
+            // The result was capped at the fetch limit to bound memory
+            // (distinct from the 500-row render cap inside ResultTable).
+            if result.truncated {
+                div { class: "px-4 pt-2",
+                    Banner {
+                        kind: BannerKind::Warning,
+                        message: format!(
+                            "Result truncated — showing the first {MAX_QUERY_ROWS} rows to keep memory bounded. \
+                             Add a LIMIT or a WHERE clause to narrow it.",
+                        ),
                     }
                 }
             }
