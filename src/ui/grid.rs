@@ -9,6 +9,7 @@ use crate::db::{
 };
 
 use super::editing::{editor_kind, CellEditor, EditNav, EditorKind};
+use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState};
 use super::stage::{required_insert_columns, PendingInsert, TableStage};
 use super::state::{AppState, ExportStatus, SchemaLoad, TableRef};
 
@@ -492,18 +493,20 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             }
             // Read-only notice (views / no usable row key)
             if let Some(notice) = read_only_notice {
-                div { class: "border-b border-slate-200 dark:border-slate-800 bg-slate-200 dark:bg-slate-800/60 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-300",
-                    "{notice}"
+                div { class: "px-3 pt-2",
+                    Banner { kind: BannerKind::Info, message: notice.to_string() }
                 }
             }
             // Grid
             div { class: "min-h-0 flex-1 overflow-auto",
                 match current.as_ref() {
                     None => rsx! {
-                        p { class: "px-4 py-3 text-sm text-slate-500", "Loading…" }
+                        DelayedLoading { label: "Loading…" }
                     },
                     Some(Err(err)) => rsx! {
-                        p { class: "px-4 py-3 text-sm text-red-600 dark:text-red-400", "{err}" }
+                        div { class: "p-3",
+                            Banner { kind: BannerKind::Error, message: err.to_string() }
+                        }
                     },
                     Some(Ok((result, _total, extra_key))) => {
                         // The fetch prepended the row-identity key column
@@ -534,16 +537,40 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                         let insert_headers = headers.clone();
                         let insert_parent_table = row_table.clone();
                         let new_row_table = row_table.clone();
+                        let empty = empty_state(
+                            rows.is_empty() && pending_inserts.is_empty(),
+                            applied_filter.read().is_some(),
+                        );
                         rsx! {
-                            if rows.is_empty() && pending_inserts.is_empty() {
-                                p { class: "px-4 py-3 text-sm text-slate-500",
-                                    if applied_filter.read().is_some() {
-                                        "No rows match the filter."
-                                    } else {
-                                        "This table is empty."
+                            match empty {
+                                // No-filter-match: distinct from an empty
+                                // table, with a Clear-filter action.
+                                Some(GridEmpty::NoMatch) => rsx! {
+                                    EmptyState {
+                                        icon: "\u{1F50D}", // 🔍 magnifying glass
+                                        title: "No rows match the filter",
+                                        hint: "No rows in this table match the current filter.",
+                                        button {
+                                            class: "rounded border border-slate-300 dark:border-slate-700 px-3 py-1 text-xs text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
+                                            onclick: move |_| {
+                                                applied_filter.set(None);
+                                                filter_text.set(String::new());
+                                                page.set(0);
+                                            },
+                                            "Clear filter"
+                                        }
                                     }
-                                }
-                            } else {
+                                },
+                                // Empty table: the "+ New row" affordance below
+                                // stays available for editable tables.
+                                Some(GridEmpty::Table) => rsx! {
+                                    EmptyState {
+                                        icon: "\u{1F4C4}", // 📄 page
+                                        title: "This table has no rows",
+                                        hint: "There is no data here yet.",
+                                    }
+                                },
+                                None => rsx! {
                                 table { class: "w-full border-collapse text-left",
                                     thead { class: "sticky top-0 bg-slate-100 dark:bg-slate-900",
                                         tr {
@@ -621,6 +648,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                         }
                                     }
                                 }
+                                },
                             }
                             // Insert affordance (editable tables only):
                             // appends a phantom row, all columns defaulted.
@@ -667,6 +695,30 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             }
         }
     }
+}
+
+/// Which designed empty state a zero-row grid page shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GridEmpty {
+    /// The table (matching the active filter, if any) has no rows.
+    Table,
+    /// A filter is active and nothing matches it — offers "Clear filter".
+    NoMatch,
+}
+
+/// Selects the grid's empty state: `None` when the page has rows or pending
+/// inserts to render, otherwise the no-filter-match state when a filter is
+/// applied ([`GridEmpty::NoMatch`]) or the empty-table state
+/// ([`GridEmpty::Table`]) when the whole table is empty.
+fn empty_state(no_visible_rows: bool, has_filter: bool) -> Option<GridEmpty> {
+    if !no_visible_rows {
+        return None;
+    }
+    Some(if has_filter {
+        GridEmpty::NoMatch
+    } else {
+        GridEmpty::Table
+    })
 }
 
 /// Finds one table's metadata in a loaded schema.
@@ -1387,6 +1439,17 @@ fn InsertCellSlot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_state_selector_distinguishes_the_four_cases() {
+        // Rows present (or pending inserts): no empty state at all.
+        assert_eq!(empty_state(false, false), None);
+        assert_eq!(empty_state(false, true), None);
+        // Zero rows, no filter: the empty-table state.
+        assert_eq!(empty_state(true, false), Some(GridEmpty::Table));
+        // Zero rows with an active filter: the no-match state (distinct).
+        assert_eq!(empty_state(true, true), Some(GridEmpty::NoMatch));
+    }
 
     #[test]
     fn sort_cycles_per_column() {
