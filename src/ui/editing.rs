@@ -51,6 +51,16 @@ pub enum EditorKind {
     DateTime,
     /// Blob/bytea columns are read-only for now.
     Blob,
+    /// Database-assigned `GENERATED ALWAYS` identity/stored columns: not
+    /// writable through ordinary SQL, so read-only in the editor.
+    Generated,
+}
+
+impl EditorKind {
+    /// Whether cells of this kind are read-only (never open an editor).
+    pub fn is_read_only(self) -> bool {
+        matches!(self, EditorKind::Blob | EditorKind::Generated)
+    }
 }
 
 /// Numeric column flavors, deciding how validated input is staged.
@@ -153,6 +163,7 @@ pub fn parse_input(kind: EditorKind, dialect: Dialect, text: &str) -> Result<Val
             bool_checked(&Value::Text(text.trim().to_string())),
         )),
         EditorKind::Blob => Err("blobs are read-only".to_string()),
+        EditorKind::Generated => Err("generated columns are read-only".to_string()),
     }
 }
 
@@ -432,6 +443,18 @@ mod tests {
     const EXACT: EditorKind = EditorKind::Numeric {
         kind: NumericKind::Exact,
     };
+
+    #[test]
+    fn read_only_kinds_are_blobs_and_generated_columns() {
+        assert!(EditorKind::Blob.is_read_only());
+        assert!(EditorKind::Generated.is_read_only());
+        assert!(!EditorKind::Text.is_read_only());
+        assert!(!EditorKind::Bool.is_read_only());
+        assert!(!INTEGER.is_read_only());
+        // A generated column never opens an editor, but parse_input must
+        // still refuse rather than silently stage.
+        assert!(parse_input(EditorKind::Generated, Dialect::Postgres, "1").is_err());
+    }
 
     #[test]
     fn editor_kinds_derive_from_type_substrings() {
