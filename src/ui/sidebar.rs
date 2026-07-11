@@ -123,7 +123,13 @@ fn TableNode(id: ConnectionId, table: ReadSignal<TableMeta>) -> Element {
                     if expanded { "▾" } else { "▸" }
                 }
                 button {
-                    class: "flex min-w-0 flex-1 items-center gap-2 text-left",
+                    // `dv-table-btn` + `data-selected` drive the keyboard
+                    // sidebar navigation (FRE-15): the global key listener
+                    // focuses these buttons (Ctrl+B) and moves focus between
+                    // them with ↑/↓; a focused button opens its table on
+                    // Enter/Space natively via this onclick.
+                    class: "dv-table-btn flex min-w-0 flex-1 items-center gap-2 text-left",
+                    "data-selected": selected,
                     onclick: move |_| state.select_table(id, &select_ref),
                     span { class: "truncate font-mono", "{name}" }
                     if kind == TableKind::View {

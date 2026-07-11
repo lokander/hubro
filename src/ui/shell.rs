@@ -11,12 +11,86 @@ use super::notice::{Banner, BannerKind, EmptyState};
 use super::sidebar::SchemaSidebar;
 use super::state::{ActiveView, AppState};
 
+/// The window-level keyboard listener (FRE-15). Installed once as a plain
+/// `keydown` handler on `window` — a webview-robust way to capture app-global
+/// shortcuts regardless of which element holds focus (a focusable Dioxus
+/// wrapper would only see keys while it, and not the sidebar/grid/buttons,
+/// had focus). It self-guards against text-entry contexts (inputs, the cell
+/// editor, CodeMirror) so typing never triggers a shortcut, handles the
+/// focus-only shortcuts entirely in JS (focus the filter, focus + arrow
+/// through the sidebar table list), and forwards the state-changing ones to
+/// Rust via `dioxus.send`. The `__dvKeys` guard makes a re-install (e.g. dev
+/// hot-reload) a no-op.
+const GLOBAL_KEYS_JS: &str = r#"
+(() => {
+  if (window.__dvKeys) return;
+  window.__dvKeys = true;
+  const typing = (el) => {
+    if (!el) return false;
+    const tag = el.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+    if (el.isContentEditable) return true;
+    return !!(el.closest && el.closest('.cm-editor'));
+  };
+  const tableButtons = () => Array.from(document.querySelectorAll('.dv-table-btn'));
+  window.addEventListener('keydown', (e) => {
+    const el = document.activeElement;
+    // Sidebar table-list navigation: a focused table button (not a text
+    // field) arrows between siblings; Enter/Space open it natively.
+    if (el && el.classList && el.classList.contains('dv-table-btn')) {
+      const btns = tableButtons();
+      const i = btns.indexOf(el);
+      if (e.key === 'ArrowDown') { e.preventDefault(); if (i >= 0 && i + 1 < btns.length) btns[i + 1].focus(); return; }
+      if (e.key === 'ArrowUp')   { e.preventDefault(); if (i > 0) btns[i - 1].focus(); return; }
+      if (e.key === 'Home')      { e.preventDefault(); if (btns.length) btns[0].focus(); return; }
+      if (e.key === 'End')       { e.preventDefault(); if (btns.length) btns[btns.length - 1].focus(); return; }
+    }
+    if (typing(el)) return;
+    if (e.key === '?') { e.preventDefault(); dioxus.send('cheatsheet'); return; }
+    if (e.key === 'Escape') { dioxus.send('escape'); return; }
+    if (e.key === '/') {
+      const f = document.getElementById('dv-filter');
+      if (f) { e.preventDefault(); f.focus(); }
+      return;
+    }
+    if (e.ctrlKey && (e.key === 'e' || e.key === 'E')) { e.preventDefault(); dioxus.send('pane'); return; }
+    if (e.ctrlKey && (e.key === 'b' || e.key === 'B')) {
+      e.preventDefault();
+      const btns = tableButtons();
+      const cur = btns.find((b) => b.getAttribute('data-selected') === 'true') || btns[0];
+      if (cur) cur.focus();
+      return;
+    }
+  });
+})();
+"#;
+
 /// Top-level layout: tab bar over the active view.
 #[component]
 pub fn Shell() -> Element {
     let state = use_context::<AppState>();
     let active = *state.active.read();
     let dark = state.dark;
+    let show_cheatsheet = state.show_cheatsheet;
+
+    // Install the window-level shortcut listener once and pump the keys it
+    // forwards. The eval channel stays open for the app's lifetime; reading
+    // no signals here keeps the effect from re-running (and the JS guard
+    // would ignore a re-install anyway).
+    use_effect(move || {
+        spawn(async move {
+            let mut channel = document::eval(GLOBAL_KEYS_JS);
+            while let Ok(msg) = channel.recv::<String>().await {
+                match msg.as_str() {
+                    "cheatsheet" => state.toggle_cheatsheet(),
+                    "escape" => state.close_cheatsheet(),
+                    "pane" => state.toggle_active_pane(),
+                    _ => {}
+                }
+            }
+        });
+    });
+
     rsx! {
         // The `.dark` class gates every `dark:` utility below it (see the
         // @custom-variant in tailwind.css); toggling it swaps the theme.
@@ -32,6 +106,96 @@ pub fn Shell() -> Element {
                     ActiveView::Connections => rsx! { ConnectionsScreen {} },
                     // Keyed so per-tab hook state never leaks across tabs.
                     ActiveView::Connection(id) => rsx! { ConnectionView { key: "{id:?}", id } },
+                }
+            }
+            // Rendered inside the `.dark`-scoped root so the overlay themes
+            // with the app.
+            if show_cheatsheet() {
+                Cheatsheet {}
+            }
+        }
+    }
+}
+
+/// One shortcut row: a description and its key(s).
+#[component]
+fn ShortcutRow(keys: &'static str, desc: &'static str) -> Element {
+    rsx! {
+        div { class: "flex items-center justify-between gap-6 py-1",
+            span { class: "text-sm text-slate-700 dark:text-slate-300", "{desc}" }
+            kbd { class: "shrink-0 rounded border border-slate-300 dark:border-slate-600 bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 font-mono text-xs text-slate-700 dark:text-slate-200",
+                "{keys}"
+            }
+        }
+    }
+}
+
+/// A group heading in the cheatsheet.
+#[component]
+fn ShortcutGroup(title: &'static str, children: Element) -> Element {
+    rsx! {
+        div {
+            h3 { class: "mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400",
+                "{title}"
+            }
+            {children}
+        }
+    }
+}
+
+/// The `?` shortcut cheatsheet (FRE-15): a modal overlay grouping every
+/// keybinding, dismissed by Escape (handled by the global listener), a click
+/// on the backdrop, or `?` again. Kept in sync by hand with the actual
+/// bindings in [`GLOBAL_KEYS_JS`] and the grid's key handler.
+#[component]
+fn Cheatsheet() -> Element {
+    let state = use_context::<AppState>();
+    rsx! {
+        // Backdrop: a click anywhere outside the panel closes.
+        div {
+            class: "fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4",
+            onclick: move |_| state.close_cheatsheet(),
+            div {
+                // Stop clicks inside the panel from reaching the backdrop.
+                onclick: move |evt| evt.stop_propagation(),
+                class: "max-h-[85vh] w-full max-w-lg overflow-y-auto rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 p-5 shadow-xl",
+                div { class: "mb-4 flex items-center justify-between",
+                    h2 { class: "text-lg font-semibold text-slate-900 dark:text-slate-100",
+                        "Keyboard shortcuts"
+                    }
+                    button {
+                        class: "rounded px-2 py-1 text-sm text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                        aria_label: "Close",
+                        onclick: move |_| state.close_cheatsheet(),
+                        "✕"
+                    }
+                }
+                div { class: "grid grid-cols-1 gap-5 sm:grid-cols-2",
+                    ShortcutGroup { title: "Data grid",
+                        ShortcutRow { keys: "↑ ↓ ← →", desc: "Move the focused cell" }
+                        ShortcutRow { keys: "Home / End", desc: "First / last cell in the row" }
+                        ShortcutRow { keys: "Ctrl+Home / End", desc: "First / last cell on the page" }
+                        ShortcutRow { keys: "PageUp / PageDown", desc: "Previous / next page" }
+                        ShortcutRow { keys: "Enter", desc: "Edit the cell, or show its full value" }
+                        ShortcutRow { keys: "Esc", desc: "Close the value popup" }
+                    }
+                    ShortcutGroup { title: "Navigation",
+                        ShortcutRow { keys: "/", desc: "Focus the filter box" }
+                        ShortcutRow { keys: "Ctrl+B", desc: "Focus the table list" }
+                        ShortcutRow { keys: "↑ ↓ / Enter", desc: "Move / open a table (in the list)" }
+                        ShortcutRow { keys: "Ctrl+E", desc: "Switch Data / SQL pane" }
+                        ShortcutRow { keys: "?", desc: "Toggle this help" }
+                        ShortcutRow { keys: "Esc", desc: "Close this help" }
+                    }
+                    ShortcutGroup { title: "Cell editor",
+                        ShortcutRow { keys: "Enter", desc: "Commit the edit" }
+                        ShortcutRow { keys: "Esc", desc: "Cancel the edit" }
+                        ShortcutRow { keys: "Tab / Shift+Tab", desc: "Next / previous field" }
+                        ShortcutRow { keys: "Double-click", desc: "Edit a cell with the mouse" }
+                    }
+                    ShortcutGroup { title: "SQL editor",
+                        ShortcutRow { keys: "Ctrl+Enter", desc: "Run the buffer or selection" }
+                    }
                 }
             }
         }

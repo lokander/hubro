@@ -54,6 +54,10 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let mut page = use_signal(|| 0u64);
     // Which cell's editor is open (by row key + column).
     let mut editing = use_signal(|| Option::<ActiveEdit>::None);
+    // Keyboard focus ring in the grid (row, col into the visible page's
+    // rows × columns), and the value-expand popup (FRE-15).
+    let mut focused_cell = use_signal(|| Option::<(usize, usize)>::None);
+    let mut expanded_cell = use_signal(|| Option::<String>::None);
     let mut sort = use_signal(|| Option::<(String, SortDir)>::None);
     // Rows ticked for deletion (row key → locator). UI-only state: nothing
     // is staged until "Delete N selected".
@@ -134,6 +138,10 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             .get(&(id, table_key_for_reset.clone()));
         editing.set(None);
         selected.set(HashMap::new());
+        // Re-seed the focus ring at the first cell and drop any expand popup;
+        // the clamp effect below trims it to None for an empty page.
+        focused_cell.set(Some((0, 0)));
+        expanded_cell.set(None);
     });
 
     let table_for_resource = table.clone();
@@ -185,6 +193,88 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         }
     });
 
+    // Keyboard-navigation model of the visible page (FRE-15): recomputed with
+    // the fetched page and the stage, read by the grid container's key handler
+    // for focus movement and Enter. Mirrors the render's row prep (view_rows)
+    // but owns its data so the `'static` key closure can read it off-render.
+    let nav_table = table.clone();
+    let grid_nav = use_memo(move || {
+        let current = rows_resource.read();
+        let Some(Ok((result, _total, extra_key))) = current.as_ref() else {
+            return GridNav::default();
+        };
+        let dialect = state.registry.read().get(id).map(|c| c.pool.dialect());
+        let table_meta = find_table(state.schemas.read().get(&id), &nav_table).cloned();
+        let identity = match (&table_meta, dialect) {
+            (Some(meta), Some(dialect)) => detect_row_identity(meta, dialect),
+            _ => None,
+        };
+        let column_kinds = column_kinds_of(table_meta.as_ref());
+        let stage = state.table_stage(id, &nav_table);
+        let hidden = usize::from(extra_key.is_some());
+        let headers: Vec<String> = if result.columns.is_empty() {
+            table_meta
+                .as_ref()
+                .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
+                .unwrap_or_default()
+        } else {
+            result
+                .columns
+                .iter()
+                .skip(hidden)
+                .map(|c| c.name.clone())
+                .collect()
+        };
+        let rows = view_rows(result, hidden, identity.as_ref(), stage.as_ref());
+        GridNav::build(headers, &rows, &column_kinds)
+    });
+
+    // Keep the focus ring inside the current page and seed it once data
+    // arrives, so it is visible and never indexes out of range after a page or
+    // filter change shrinks the grid.
+    use_effect(move || {
+        let (rows, cols) = grid_nav.read().dims();
+        if rows == 0 || cols == 0 {
+            if focused_cell.peek().is_some() {
+                focused_cell.set(None);
+            }
+        } else {
+            let (r, c) = focused_cell.peek().unwrap_or((0, 0));
+            let clamped = (r.min(rows - 1), c.min(cols - 1));
+            if *focused_cell.peek() != Some(clamped) {
+                focused_cell.set(Some(clamped));
+            }
+        }
+    });
+
+    // Scroll the focused cell into view as it moves (it carries the
+    // `dv-focused-cell` id). Next frame, so the ring's node exists.
+    use_effect(move || {
+        let _ = focused_cell.read();
+        document::eval(
+            "requestAnimationFrame(() => { \
+                const el = document.getElementById('dv-focused-cell'); \
+                if (el) el.scrollIntoView({ block: 'nearest', inline: 'nearest' }); \
+            });",
+        );
+    });
+
+    // Return keyboard focus to the grid container whenever no cell editor is
+    // open — on mount, and after an editor closes (the editor input, not the
+    // container, held focus) — so arrow navigation keeps working without a
+    // mouse click. Only fires on an editing → None transition, so it never
+    // steals focus from the filter box or sidebar while the grid is idle.
+    use_effect(move || {
+        if editing.read().is_none() {
+            document::eval(
+                "requestAnimationFrame(() => { \
+                    const el = document.getElementById('dv-grid'); \
+                    if (el) el.focus(); \
+                });",
+            );
+        }
+    });
+
     // Introspected metadata for this table: column names feed the filter
     // dropdown and header fallback (so headers exist even for zero-row
     // results), and row-identity detection decides the read-only notice and
@@ -221,25 +311,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // Per-column editor kind + nullability, from introspection. Cells whose
     // column is missing here (transient schema/result mismatch) fall back
     // to a plain text editor on a nullable column.
-    let column_kinds: HashMap<String, (EditorKind, bool)> = table_meta
-        .as_ref()
-        .map(|meta| {
-            meta.columns
-                .iter()
-                .map(|c| {
-                    // Database-assigned GENERATED ALWAYS columns can't be
-                    // written through INSERT/UPDATE — surface them as a
-                    // read-only kind rather than inviting doomed input.
-                    let kind = if c.generated == Generated::Always {
-                        EditorKind::Generated
-                    } else {
-                        editor_kind(&c.type_name)
-                    };
-                    (c.name.clone(), (kind, c.nullable))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let column_kinds: HashMap<String, (EditorKind, bool)> = column_kinds_of(table_meta.as_ref());
     // Editing consults the same identity detection: no identity → no
     // editors; the notice explains up front why the rows are read-only.
     let read_only_notice: Option<&'static str> = match (&table_meta, identity.is_none()) {
@@ -299,6 +371,72 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let delete_table = table.clone();
     let row_table = table.clone();
 
+    // Grid keyboard navigation (FRE-15). Attached to the focusable scroll
+    // container, so it also receives keydowns bubbling from focused children;
+    // it no-ops while an editor is open (whose own keys bubble here). Movement
+    // and Enter act on `grid_nav`/`focused_cell`; PageUp/PageDown flip pages.
+    let on_grid_key = move |evt: KeyboardEvent| {
+        if editing.peek().is_some() {
+            return;
+        }
+        let code = evt.code();
+        // Escape closes the value-expand popup, if one is open.
+        if code == Code::Escape {
+            if expanded_cell.peek().is_some() {
+                evt.prevent_default();
+                expanded_cell.set(None);
+            }
+            return;
+        }
+        let (rows, cols) = grid_nav.peek().dims();
+        if rows == 0 || cols == 0 {
+            return;
+        }
+        let pos = focused_cell.peek().unwrap_or((0, 0));
+        if code == Code::Enter || code == Code::NumpadEnter {
+            evt.prevent_default();
+            let nav = grid_nav.peek();
+            let (r, c) = (pos.0.min(rows - 1), pos.1.min(cols - 1));
+            if let Some(cell) = nav.rows.get(r).and_then(|row| row.cells.get(c)) {
+                // Editable cell → open the in-place editor; otherwise show the
+                // full (untruncated) value in the expand popup.
+                match (cell.editable, nav.rows[r].key.clone()) {
+                    (true, Some(key)) => editing.set(Some(ActiveEdit {
+                        row_key: key,
+                        column: cell.column.clone(),
+                    })),
+                    _ => expanded_cell.set(Some(cell.display.clone())),
+                }
+            }
+            return;
+        }
+        let Some(mv) = grid_move_for(code, evt.modifiers().ctrl()) else {
+            return;
+        };
+        evt.prevent_default();
+        match apply_grid_move(pos, mv, rows, cols) {
+            FocusOutcome::Cell(next) => focused_cell.set(Some(next)),
+            FocusOutcome::PrevPage => {
+                let p = *page.peek();
+                if p > 0 {
+                    page.set(p - 1);
+                }
+            }
+            FocusOutcome::NextPage => {
+                // Don't page past the end (mirrors the Next button's guard).
+                let total = match rows_resource.peek().as_ref() {
+                    Some(Ok((_, total, _))) => *total,
+                    _ => 0,
+                };
+                let p = *page.peek();
+                let last = p * PAGE_SIZE as u64 + rows as u64;
+                if last < total {
+                    page.set(p + 1);
+                }
+            }
+        }
+    };
+
     rsx! {
         div { class: "flex h-full min-h-0 flex-col",
             // Filter bar
@@ -333,6 +471,8 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     option { value: "equals", "equals" }
                 }
                 input {
+                    // `dv-filter` is the target of the `/` focus shortcut (FRE-15).
+                    id: "dv-filter",
                     class: "w-48 rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 font-mono text-xs text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600",
                     placeholder: "filter value",
                     value: "{filter_text}",
@@ -497,8 +637,15 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     Banner { kind: BannerKind::Info, message: notice.to_string() }
                 }
             }
-            // Grid
-            div { class: "min-h-0 flex-1 overflow-auto",
+            // Grid — a single focusable region (tabindex 0) so arrow-key cell
+            // navigation works without per-cell tab stops (FRE-15). Focused on
+            // mount so the ring responds immediately; `outline-none` since the
+            // ring itself signals focus.
+            div {
+                id: "dv-grid",
+                class: "min-h-0 flex-1 overflow-auto outline-none",
+                tabindex: "0",
+                onkeydown: on_grid_key,
                 match current.as_ref() {
                     None => rsx! {
                         DelayedLoading { label: "Loading…" }
@@ -620,6 +767,12 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                                 col_to_fk: col_to_fk.clone(),
                                                 dialect: dialect.unwrap_or(Dialect::Sqlite),
                                                 editing,
+                                                // The focused column in this row (FRE-15), else None; only the
+                                                // two rows whose focus changed re-render on a move.
+                                                focused_col: match focused_cell() {
+                                                    Some((r, c)) if r == index => Some(c),
+                                                    _ => None,
+                                                },
                                                 select_enabled,
                                                 selected,
                                                 on_fk_jump: {
@@ -691,6 +844,33 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     _ => rsx! {
                         span { "…" }
                     },
+                }
+            }
+            // Value-expand popup (FRE-15): Enter on a read-only / non-editable
+            // focused cell shows its full, untruncated value. Dismissed by a
+            // backdrop click, the ✕, or Escape (handled by the grid container).
+            if let Some(value) = expanded_cell.read().clone() {
+                div {
+                    class: "fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-4",
+                    onclick: move |_| expanded_cell.set(None),
+                    div {
+                        class: "max-h-[70vh] w-full max-w-2xl overflow-auto rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 p-4 shadow-xl",
+                        onclick: move |evt| evt.stop_propagation(),
+                        div { class: "mb-2 flex items-center justify-between",
+                            span { class: "text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400",
+                                "Cell value"
+                            }
+                            button {
+                                class: "rounded px-2 py-0.5 text-sm text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                                aria_label: "Close",
+                                onclick: move |_| expanded_cell.set(None),
+                                "✕"
+                            }
+                        }
+                        pre { class: "whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
+                            "{value}"
+                        }
+                    }
                 }
             }
         }
@@ -869,6 +1049,26 @@ fn confirm_notice(deletes: usize, others: usize) -> String {
     }
 }
 
+/// Per-column editor kind + nullability from introspected metadata.
+/// Database-assigned `GENERATED ALWAYS` columns become a read-only kind
+/// rather than inviting doomed input. Empty when the schema isn't ready.
+fn column_kinds_of(meta: Option<&TableMeta>) -> HashMap<String, (EditorKind, bool)> {
+    meta.map(|meta| {
+        meta.columns
+            .iter()
+            .map(|c| {
+                let kind = if c.generated == Generated::Always {
+                    EditorKind::Generated
+                } else {
+                    editor_kind(&c.type_name)
+                };
+                (c.name.clone(), (kind, c.nullable))
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 /// Whether a cell may open an editor: the row allows it (locator present,
 /// not deleted, value not a blob) and the column's type is editable
 /// (blob and database-generated columns are read-only).
@@ -897,6 +1097,128 @@ fn step_column(columns: &[String], current: &str, delta: i32) -> Option<String> 
         return None;
     }
     columns.get(next as usize).cloned()
+}
+
+/// A move requested by a grid-navigation key (FRE-15), resolved by
+/// [`apply_grid_move`] into a new focused cell or a page change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GridMove {
+    Up,
+    Down,
+    Left,
+    Right,
+    RowStart,
+    RowEnd,
+    PageFirst,
+    PageLast,
+    PrevPage,
+    NextPage,
+}
+
+/// Maps a physical key (plus whether Ctrl is held) to a grid move, or `None`
+/// for keys the grid doesn't navigate on. Matches on `Code` (physical key),
+/// layout- and IME-independent, consistent with the cell editor.
+fn grid_move_for(code: Code, ctrl: bool) -> Option<GridMove> {
+    Some(match code {
+        Code::ArrowUp => GridMove::Up,
+        Code::ArrowDown => GridMove::Down,
+        Code::ArrowLeft => GridMove::Left,
+        Code::ArrowRight => GridMove::Right,
+        Code::Home if ctrl => GridMove::PageFirst,
+        Code::Home => GridMove::RowStart,
+        Code::End if ctrl => GridMove::PageLast,
+        Code::End => GridMove::RowEnd,
+        Code::PageUp => GridMove::PrevPage,
+        Code::PageDown => GridMove::NextPage,
+        _ => return None,
+    })
+}
+
+/// The outcome of a grid move against a `rows`×`cols` page from `pos`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusOutcome {
+    /// A new focused cell on the same page.
+    Cell((usize, usize)),
+    PrevPage,
+    NextPage,
+}
+
+/// Resolves a [`GridMove`] from `pos` (row, col) within a `rows`×`cols` page.
+/// Arrow/Home/End moves clamp at the page edges — they never cross pages;
+/// PageUp/PageDown do that deliberately, so cell motion stays predictable.
+/// `pos` is clamped into range first, so a stale focus (the page just shrank)
+/// can't index out of bounds. Assumes `rows > 0` and `cols > 0`.
+fn apply_grid_move(pos: (usize, usize), mv: GridMove, rows: usize, cols: usize) -> FocusOutcome {
+    let r = pos.0.min(rows - 1);
+    let c = pos.1.min(cols - 1);
+    match mv {
+        GridMove::Up => FocusOutcome::Cell((r.saturating_sub(1), c)),
+        GridMove::Down => FocusOutcome::Cell(((r + 1).min(rows - 1), c)),
+        GridMove::Left => FocusOutcome::Cell((r, c.saturating_sub(1))),
+        GridMove::Right => FocusOutcome::Cell((r, (c + 1).min(cols - 1))),
+        GridMove::RowStart => FocusOutcome::Cell((r, 0)),
+        GridMove::RowEnd => FocusOutcome::Cell((r, cols - 1)),
+        GridMove::PageFirst => FocusOutcome::Cell((0, 0)),
+        GridMove::PageLast => FocusOutcome::Cell((rows - 1, cols - 1)),
+        GridMove::PrevPage => FocusOutcome::PrevPage,
+        GridMove::NextPage => FocusOutcome::NextPage,
+    }
+}
+
+/// Keyboard-navigation snapshot of the visible page (FRE-15): enough per-cell
+/// data (row key, column, editability, display text) for the focusable grid
+/// container's key handler to move the focus ring and open the editor without
+/// threading render-time borrows into the `'static` closure. Built by a memo
+/// from the same fetched page + stage the grid renders.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct GridNav {
+    headers: Vec<String>,
+    rows: Vec<GridNavRow>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct GridNavRow {
+    /// Row key ([`RowLocator::key`]) when addressable — needed to open the
+    /// editor; `None` rows can only have their value expanded.
+    key: Option<String>,
+    cells: Vec<GridNavCell>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct GridNavCell {
+    column: String,
+    editable: bool,
+    display: String,
+}
+
+impl GridNav {
+    fn build(
+        headers: Vec<String>,
+        rows: &[RowView],
+        column_kinds: &HashMap<String, (EditorKind, bool)>,
+    ) -> Self {
+        let rows = rows
+            .iter()
+            .map(|row| GridNavRow {
+                key: row.key.clone(),
+                cells: row
+                    .cells
+                    .iter()
+                    .map(|cell| GridNavCell {
+                        column: cell.column.clone(),
+                        editable: cell_editable(cell, column_kinds),
+                        display: cell.value.display(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        GridNav { headers, rows }
+    }
+
+    /// (rows on the page, columns); a zero in either means nothing to focus.
+    fn dims(&self) -> (usize, usize) {
+        (self.rows.len(), self.headers.len())
+    }
 }
 
 /// Opens a native save dialog and, on a chosen path, streams the current
@@ -1026,6 +1348,9 @@ fn GridRow(
     col_to_fk: HashMap<String, usize>,
     dialect: Dialect,
     editing: Signal<Option<ActiveEdit>>,
+    /// The keyboard-focused column in this row (FRE-15), or `None` when the
+    /// focus ring is on another row.
+    focused_col: Option<usize>,
     select_enabled: bool,
     mut selected: Signal<HashMap<String, RowLocator>>,
     /// Follows the FK a clicked cell belongs to, carrying that FK plus this
@@ -1077,7 +1402,7 @@ fn GridRow(
                     }
                 }
             }
-            for cell in row.cells.clone() {
+            for (col_index , cell) in row.cells.clone().into_iter().enumerate() {
                 GridCellSlot {
                     key: "{cell.column}",
                     id,
@@ -1087,6 +1412,7 @@ fn GridRow(
                     kind: cell_kind(&cell, &column_kinds).0,
                     nullable: cell_kind(&cell, &column_kinds).1,
                     editable: cell_editable(&cell, &column_kinds),
+                    focused: focused_col == Some(col_index),
                     cell: cell.clone(),
                     dialect,
                     editable_columns: editable_columns.clone(),
@@ -1119,6 +1445,8 @@ fn GridCellSlot(
     kind: EditorKind,
     nullable: bool,
     editable: bool,
+    /// Whether this cell holds the grid's keyboard focus ring (FRE-15).
+    focused: bool,
     dialect: Dialect,
     editable_columns: Vec<String>,
     mut editing: Signal<Option<ActiveEdit>>,
@@ -1175,7 +1503,6 @@ fn GridCellSlot(
                 }));
             }
         };
-        let mut open_on_enter = activate.clone();
         // Blob and generated cells explain why they're locked; other
         // read-only cells (views, keyless tables) are covered by the
         // grid-level notice.
@@ -1192,25 +1519,29 @@ fn GridCellSlot(
             Value::Blob(_) => "font-mono text-xs text-violet-700 dark:text-violet-400",
             _ => "font-mono text-xs text-slate-900 dark:text-slate-200",
         };
-        let class = if cell.dirty {
-            format!("px-3 py-1 {text} bg-amber-100 dark:bg-amber-900/40")
+        // The keyboard focus ring (FRE-15). Theme-aware; inset so it reads
+        // over the cell borders. The focused cell carries `dv-focused-cell`
+        // so the grid can scroll it into view.
+        let ring = if focused {
+            " ring-2 ring-inset ring-sky-500 dark:ring-sky-400"
         } else {
-            format!("px-3 py-1 {text}")
+            ""
+        };
+        let class = if cell.dirty {
+            format!("px-3 py-1 {text} bg-amber-100 dark:bg-amber-900/40{ring}")
+        } else {
+            format!("px-3 py-1 {text}{ring}")
         };
         rsx! {
             td {
                 class,
-                // Editable cells are focusable so Enter can open the editor
-                // without a mouse.
-                tabindex: if editable { "0" },
+                id: if focused { "dv-focused-cell" },
+                // Double-click opens the editor with the mouse; keyboard
+                // activation (Enter) is handled centrally by the grid
+                // container via the focus ring (FRE-15).
                 ondoubleclick: move |_| {
                     if editable {
                         activate();
-                    }
-                },
-                onkeydown: move |evt| {
-                    if editable && evt.key() == Key::Enter {
-                        open_on_enter();
                     }
                 },
                 div { class: "flex items-center gap-1",
@@ -1681,6 +2012,126 @@ mod tests {
             required_missing_message(2),
             Some("2 required column(s) missing in pending insert(s)".into())
         );
+    }
+
+    #[test]
+    fn grid_keys_map_to_moves() {
+        // Arrows and edges.
+        assert_eq!(grid_move_for(Code::ArrowUp, false), Some(GridMove::Up));
+        assert_eq!(grid_move_for(Code::ArrowDown, false), Some(GridMove::Down));
+        assert_eq!(grid_move_for(Code::ArrowLeft, false), Some(GridMove::Left));
+        assert_eq!(
+            grid_move_for(Code::ArrowRight, false),
+            Some(GridMove::Right)
+        );
+        // Home/End switch to page-wide moves with Ctrl.
+        assert_eq!(grid_move_for(Code::Home, false), Some(GridMove::RowStart));
+        assert_eq!(grid_move_for(Code::Home, true), Some(GridMove::PageFirst));
+        assert_eq!(grid_move_for(Code::End, false), Some(GridMove::RowEnd));
+        assert_eq!(grid_move_for(Code::End, true), Some(GridMove::PageLast));
+        // Paging keys.
+        assert_eq!(grid_move_for(Code::PageUp, false), Some(GridMove::PrevPage));
+        assert_eq!(
+            grid_move_for(Code::PageDown, false),
+            Some(GridMove::NextPage)
+        );
+        // Enter/Escape are handled separately, not as moves.
+        assert_eq!(grid_move_for(Code::Enter, false), None);
+        assert_eq!(grid_move_for(Code::KeyA, false), None);
+    }
+
+    #[test]
+    fn arrow_moves_clamp_at_the_page_edges() {
+        // 3 rows × 2 cols; arrows never leave the page.
+        let up = |pos| apply_grid_move(pos, GridMove::Up, 3, 2);
+        let down = |pos| apply_grid_move(pos, GridMove::Down, 3, 2);
+        let left = |pos| apply_grid_move(pos, GridMove::Left, 3, 2);
+        let right = |pos| apply_grid_move(pos, GridMove::Right, 3, 2);
+        assert_eq!(down((0, 0)), FocusOutcome::Cell((1, 0)));
+        assert_eq!(
+            down((2, 0)),
+            FocusOutcome::Cell((2, 0)),
+            "clamp at last row"
+        );
+        assert_eq!(up((0, 1)), FocusOutcome::Cell((0, 1)), "clamp at first row");
+        assert_eq!(up((2, 1)), FocusOutcome::Cell((1, 1)));
+        assert_eq!(right((0, 0)), FocusOutcome::Cell((0, 1)));
+        assert_eq!(
+            right((0, 1)),
+            FocusOutcome::Cell((0, 1)),
+            "clamp at last col"
+        );
+        assert_eq!(
+            left((0, 0)),
+            FocusOutcome::Cell((0, 0)),
+            "clamp at first col"
+        );
+        assert_eq!(left((1, 1)), FocusOutcome::Cell((1, 0)));
+    }
+
+    #[test]
+    fn home_end_and_paging_moves() {
+        assert_eq!(
+            apply_grid_move((1, 1), GridMove::RowStart, 3, 4),
+            FocusOutcome::Cell((1, 0))
+        );
+        assert_eq!(
+            apply_grid_move((1, 1), GridMove::RowEnd, 3, 4),
+            FocusOutcome::Cell((1, 3))
+        );
+        assert_eq!(
+            apply_grid_move((2, 2), GridMove::PageFirst, 3, 4),
+            FocusOutcome::Cell((0, 0))
+        );
+        assert_eq!(
+            apply_grid_move((0, 0), GridMove::PageLast, 3, 4),
+            FocusOutcome::Cell((2, 3))
+        );
+        assert_eq!(
+            apply_grid_move((0, 0), GridMove::PrevPage, 3, 4),
+            FocusOutcome::PrevPage
+        );
+        assert_eq!(
+            apply_grid_move((0, 0), GridMove::NextPage, 3, 4),
+            FocusOutcome::NextPage
+        );
+    }
+
+    #[test]
+    fn stale_focus_is_clamped_before_moving() {
+        // Focus at (5, 5) but the page is only 2×2 (it just shrank): the move
+        // resolves from the clamped (1, 1), never indexing out of bounds.
+        assert_eq!(
+            apply_grid_move((5, 5), GridMove::Up, 2, 2),
+            FocusOutcome::Cell((0, 1))
+        );
+        assert_eq!(
+            apply_grid_move((5, 5), GridMove::Left, 2, 2),
+            FocusOutcome::Cell((1, 0))
+        );
+    }
+
+    #[test]
+    fn grid_nav_reports_dims_and_cell_editability() {
+        let kinds: HashMap<String, (EditorKind, bool)> = [
+            ("id".to_string(), (EditorKind::Text, false)),
+            ("title".to_string(), (EditorKind::Text, true)),
+        ]
+        .into_iter()
+        .collect();
+        let result = two_column_result();
+        let rows = view_rows(&result, 0, Some(&pk_identity()), None);
+        let nav = GridNav::build(vec!["id".into(), "title".into()], &rows, &kinds);
+        assert_eq!(nav.dims(), (2, 2));
+        // Both cells of an identified table are editable text here.
+        assert!(nav.rows[0].cells[1].editable);
+        assert_eq!(nav.rows[0].cells[1].column, "title");
+        assert_eq!(nav.rows[0].cells[0].display, "1");
+        // Without an identity, nothing is editable and rows have no key.
+        let rows = view_rows(&result, 0, None, None);
+        let nav = GridNav::build(vec!["id".into(), "title".into()], &rows, &kinds);
+        assert!(nav.rows[0].key.is_none());
+        assert!(nav.rows.iter().all(|r| r.cells.iter().all(|c| !c.editable)));
     }
 
     #[test]
