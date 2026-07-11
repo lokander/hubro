@@ -334,10 +334,11 @@ pub fn CellEditor(
         );
     });
 
-    let input_class = "w-full min-w-28 rounded border border-amber-500 bg-slate-950 px-1.5 \
-                       py-0.5 font-mono text-xs text-slate-100 outline-none";
+    let input_class =
+        "w-full min-w-28 rounded border border-amber-500 bg-slate-100 dark:bg-slate-950 px-1.5 \
+                       py-0.5 font-mono text-xs text-slate-900 dark:text-slate-100 outline-none";
     rsx! {
-        td { class: "bg-amber-900/30 px-1 py-0.5 align-top",
+        td { class: "bg-amber-100 dark:bg-amber-900/30 px-1 py-0.5 align-top",
             div { class: "flex items-start gap-1",
                 if kind == EditorKind::Bool {
                     input {
@@ -388,8 +389,8 @@ pub fn CellEditor(
                 }
                 if nullable {
                     button {
-                        class: "shrink-0 rounded border border-slate-600 px-1.5 py-0.5 text-xs \
-                                text-slate-400 hover:border-amber-500 hover:text-amber-300",
+                        class: "shrink-0 rounded border border-slate-400 dark:border-slate-600 px-1.5 py-0.5 text-xs \
+                                text-slate-500 dark:text-slate-400 hover:border-amber-500 hover:text-amber-700 dark:hover:text-amber-300",
                         title: "Stage NULL (distinct from an empty string)",
                         tabindex: "-1",
                         // prevent_default on mousedown keeps focus in the
@@ -406,8 +407,8 @@ pub fn CellEditor(
                 }
                 if let Some(on_default) = on_default {
                     button {
-                        class: "shrink-0 rounded border border-slate-600 px-1.5 py-0.5 text-xs \
-                                text-slate-400 hover:border-emerald-500 hover:text-emerald-300",
+                        class: "shrink-0 rounded border border-slate-400 dark:border-slate-600 px-1.5 py-0.5 text-xs \
+                                text-slate-500 dark:text-slate-400 hover:border-emerald-500 hover:text-emerald-700 dark:hover:text-emerald-300",
                         title: "Revert to database default (omit this column from the insert)",
                         tabindex: "-1",
                         // Same focus dance as the ∅ button: keep focus in
@@ -424,7 +425,7 @@ pub fn CellEditor(
                 }
             }
             if let Some(message) = error() {
-                div { class: "mt-0.5 max-w-md text-xs text-red-400", "{message}" }
+                div { class: "mt-0.5 max-w-md text-xs text-red-600 dark:text-red-400", "{message}" }
             }
         }
     }

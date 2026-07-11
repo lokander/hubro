@@ -118,23 +118,23 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
     rsx! {
         div { class: "flex h-full min-h-0",
         div { class: "flex min-w-0 flex-1 flex-col",
-            div { class: "flex items-center justify-between border-b border-slate-800 px-3 py-1.5",
+            div { class: "flex items-center justify-between border-b border-slate-200 dark:border-slate-800 px-3 py-1.5",
                 span { class: "text-xs text-slate-500",
                     "Ctrl+Enter runs the buffer — or just the selection."
                 }
                 div { class: "flex items-center gap-2",
                     if running {
                         button {
-                            class: "rounded border border-rose-800 px-2 py-0.5 text-xs text-rose-300 hover:bg-rose-950/50",
+                            class: "rounded border border-rose-300 dark:border-rose-800 px-2 py-0.5 text-xs text-rose-700 dark:text-rose-300 hover:bg-rose-100 dark:hover:bg-rose-950/50",
                             onclick: move |_| state.cancel_sql(id),
                             "Cancel"
                         }
                     }
                     button {
                         class: if show_history() {
-                            "rounded bg-slate-700 px-2 py-0.5 text-xs text-slate-100"
+                            "rounded bg-slate-300 dark:bg-slate-700 px-2 py-0.5 text-xs text-slate-900 dark:text-slate-100"
                         } else {
-                            "rounded border border-slate-700 px-2 py-0.5 text-xs text-slate-400 hover:bg-slate-800 hover:text-slate-100"
+                            "rounded border border-slate-300 dark:border-slate-700 px-2 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100"
                         },
                         onclick: move |_| {
                             let showing = *show_history.read();
@@ -146,12 +146,12 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
             }
             div {
                 id: "{editor_element}",
-                class: "h-1/2 min-h-0 shrink-0 overflow-hidden border-b border-slate-700 text-sm",
+                class: "h-1/2 min-h-0 shrink-0 overflow-hidden border-b border-slate-300 dark:border-slate-700 text-sm",
             }
             div { class: "min-h-0 flex-1 overflow-auto",
                 if let Some(write_count) = pending_writes {
-                    div { class: "flex items-center gap-3 border-b border-amber-900/50 bg-amber-950/30 px-4 py-2",
-                        span { class: "text-sm text-amber-300",
+                    div { class: "flex items-center gap-3 border-b border-amber-300 dark:border-amber-900/50 bg-amber-100 dark:bg-amber-950/30 px-4 py-2",
+                        span { class: "text-sm text-amber-700 dark:text-amber-300",
                             if write_count == 1 {
                                 "This script contains 1 write statement. Run anyway?"
                             } else {
@@ -164,7 +164,7 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
                             "Run"
                         }
                         button {
-                            class: "rounded border border-slate-600 px-2.5 py-0.5 text-xs text-slate-300 hover:bg-slate-800",
+                            class: "rounded border border-slate-400 dark:border-slate-600 px-2.5 py-0.5 text-xs text-slate-900 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
                             onclick: move |_| state.dismiss_pending_sql(id),
                             "Cancel"
                         }
@@ -235,10 +235,10 @@ fn HistoryPanel(id: ConnectionId, editor_element: String) -> Element {
     let entries = entries.read().clone();
 
     rsx! {
-        aside { class: "flex w-80 shrink-0 flex-col border-l border-slate-700 bg-slate-950/50",
-            div { class: "border-b border-slate-800 p-2",
+        aside { class: "flex w-80 shrink-0 flex-col border-l border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/50",
+            div { class: "border-b border-slate-200 dark:border-slate-800 p-2",
                 input {
-                    class: "w-full rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-200 placeholder:text-slate-600",
+                    class: "w-full rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 text-xs text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600",
                     placeholder: "Search history (Enter)",
                     value: "{search_input}",
                     oninput: move |evt| {
@@ -258,7 +258,7 @@ fn HistoryPanel(id: ConnectionId, editor_element: String) -> Element {
             }
             div { class: "min-h-0 flex-1 overflow-y-auto",
                 if let Some(err) = history_error {
-                    p { class: "px-3 py-2 text-xs text-amber-300",
+                    p { class: "px-3 py-2 text-xs text-amber-700 dark:text-amber-300",
                         "History is unavailable: {err}"
                     }
                 } else if !store_ready {
@@ -269,7 +269,7 @@ fn HistoryPanel(id: ConnectionId, editor_element: String) -> Element {
                             p { class: "px-3 py-2 text-xs text-slate-500", "Loading…" }
                         },
                         Some(Err(err)) => rsx! {
-                            p { class: "px-3 py-2 text-xs text-amber-300", "History query failed: {err}" }
+                            p { class: "px-3 py-2 text-xs text-amber-700 dark:text-amber-300", "History query failed: {err}" }
                         },
                         Some(Ok(entries)) if entries.is_empty() => rsx! {
                             p { class: "px-3 py-2 text-xs text-slate-500",
@@ -281,7 +281,7 @@ fn HistoryPanel(id: ConnectionId, editor_element: String) -> Element {
                             }
                         },
                         Some(Ok(entries)) => rsx! {
-                            ul { class: "divide-y divide-slate-800/60",
+                            ul { class: "divide-y divide-slate-200 dark:divide-slate-800/60",
                                 for entry in entries {
                                     HistoryRow {
                                         key: "{entry.id}",
@@ -295,8 +295,8 @@ fn HistoryPanel(id: ConnectionId, editor_element: String) -> Element {
                     }
                 }
             }
-            div { class: "flex flex-col gap-2 border-t border-slate-800 p-2",
-                label { class: "flex items-center gap-2 text-xs text-slate-400",
+            div { class: "flex flex-col gap-2 border-t border-slate-200 dark:border-slate-800 p-2",
+                label { class: "flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
                     input {
                         r#type: "checkbox",
                         checked: recording,
@@ -307,7 +307,7 @@ fn HistoryPanel(id: ConnectionId, editor_element: String) -> Element {
                 }
                 if confirm_clear() {
                     div { class: "flex items-center gap-2",
-                        span { class: "text-xs text-amber-300", "Clear this connection's history?" }
+                        span { class: "text-xs text-amber-700 dark:text-amber-300", "Clear this connection's history?" }
                         button {
                             class: "rounded bg-amber-600 px-2 py-0.5 text-xs font-semibold text-slate-950 hover:bg-amber-500",
                             onclick: move |_| {
@@ -317,14 +317,14 @@ fn HistoryPanel(id: ConnectionId, editor_element: String) -> Element {
                             "Clear"
                         }
                         button {
-                            class: "rounded border border-slate-600 px-2 py-0.5 text-xs text-slate-300 hover:bg-slate-800",
+                            class: "rounded border border-slate-400 dark:border-slate-600 px-2 py-0.5 text-xs text-slate-900 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
                             onclick: move |_| confirm_clear.set(false),
                             "Keep"
                         }
                     }
                 } else {
                     button {
-                        class: "self-start rounded border border-slate-700 px-2 py-0.5 text-xs text-slate-400 hover:bg-slate-800 hover:text-slate-100",
+                        class: "self-start rounded border border-slate-300 dark:border-slate-700 px-2 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
                         disabled: !store_ready,
                         onclick: move |_| confirm_clear.set(true),
                         "Clear history"
@@ -361,13 +361,13 @@ fn HistoryRow(id: ConnectionId, editor_element: String, entry: HistoryEntry) -> 
                     },
                 }
                 span { class: "shrink-0 text-xs text-slate-500", "{time}" }
-                span { class: "min-w-0 flex-1 truncate font-mono text-xs text-slate-300",
+                span { class: "min-w-0 flex-1 truncate font-mono text-xs text-slate-900 dark:text-slate-300",
                     "{preview}"
                 }
             }
             div { class: "mt-1 flex gap-1 pl-4",
                 button {
-                    class: "rounded border border-slate-700 px-1.5 py-0.5 text-xs text-slate-400 hover:bg-slate-800 hover:text-slate-100",
+                    class: "rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
                     onclick: move |_| {
                         document::eval(&format!(
                             r#"DVEditor.setDoc("{editor_element}", {json_for_load});"#
@@ -377,12 +377,12 @@ fn HistoryRow(id: ConnectionId, editor_element: String, entry: HistoryEntry) -> 
                     "Load"
                 }
                 button {
-                    class: "rounded border border-slate-700 px-1.5 py-0.5 text-xs text-cyan-300 hover:bg-slate-800",
+                    class: "rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-cyan-700 dark:text-cyan-300 hover:bg-slate-200 dark:hover:bg-slate-800",
                     onclick: move |_| state.run_sql(id, sql_for_run.clone()),
                     "Run"
                 }
                 button {
-                    class: "rounded border border-slate-700 px-1.5 py-0.5 text-xs text-slate-400 hover:bg-slate-800 hover:text-slate-100",
+                    class: "rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
                     onclick: move |_| {
                         document::eval(&format!(
                             "navigator.clipboard.writeText({sql_json});"
@@ -462,18 +462,18 @@ fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
             preview,
             elapsed_ms,
         } => rsx! {
-            div { class: "border-t border-red-900/50 bg-red-950/20 px-4 py-3",
-                p { class: "mb-1 font-mono text-xs text-red-300/80",
+            div { class: "border-t border-red-300 dark:border-red-900/50 bg-red-100 dark:bg-red-950/20 px-4 py-3",
+                p { class: "mb-1 font-mono text-xs text-red-600 dark:text-red-300/80",
                     "{statement_index + 1} · {preview}"
                 }
-                p { class: "font-mono text-sm text-red-400", "{error}" }
+                p { class: "font-mono text-sm text-red-600 dark:text-red-400", "{error}" }
                 p { class: "mt-1 text-xs text-slate-500",
                     "Script stopped after {elapsed_ms} ms; earlier statements were not rolled back."
                 }
             }
         },
         RunStatus::Cancelled => rsx! {
-            p { class: "border-t border-amber-900/50 px-4 py-3 text-sm text-amber-300",
+            p { class: "border-t border-amber-300 dark:border-amber-900/50 px-4 py-3 text-sm text-amber-700 dark:text-amber-300",
                 "Run cancelled — an in-flight statement may still complete on the server."
             }
         },
@@ -491,11 +491,11 @@ fn StatementSection(index: usize, result: StatementResult) -> Element {
         StatementOutcome::Rows(r) => format!("{} rows", r.rows.len()),
     };
     rsx! {
-        div { class: "border-b border-slate-800",
-            p { class: "flex items-baseline gap-2 bg-slate-900/60 px-4 py-1.5 text-xs",
+        div { class: "border-b border-slate-200 dark:border-slate-800",
+            p { class: "flex items-baseline gap-2 bg-slate-100 dark:bg-slate-900/60 px-4 py-1.5 text-xs",
                 span { class: "font-mono text-slate-500", "{index}" }
-                span { class: "min-w-0 truncate font-mono text-slate-300", "{result.preview}" }
-                span { class: "shrink-0 text-cyan-400", "— {summary}" }
+                span { class: "min-w-0 truncate font-mono text-slate-900 dark:text-slate-300", "{result.preview}" }
+                span { class: "shrink-0 text-cyan-700 dark:text-cyan-400", "— {summary}" }
             }
             match &result.outcome {
                 StatementOutcome::Affected(_) => rsx! {},
@@ -515,15 +515,15 @@ fn StatementSection(index: usize, result: StatementResult) -> Element {
 fn ResultTable(result: QueryResult) -> Element {
     rsx! {
         if result.rows.len() > MAX_RENDERED_ROWS {
-            p { class: "border-b border-amber-900/50 bg-amber-950/30 px-4 py-1.5 text-xs text-amber-300",
+            p { class: "border-b border-amber-300 dark:border-amber-900/50 bg-amber-100 dark:bg-amber-950/30 px-4 py-1.5 text-xs text-amber-700 dark:text-amber-300",
                 "Showing the first {MAX_RENDERED_ROWS} of {result.rows.len()} rows."
             }
         }
         table { class: "w-full border-collapse text-left",
-            thead { class: "sticky top-0 bg-slate-900",
+            thead { class: "sticky top-0 bg-slate-100 dark:bg-slate-900",
                 tr {
                     for column in result.columns.iter() {
-                        th { class: "border-b border-slate-700 px-3 py-1.5 font-mono text-xs font-semibold text-slate-300",
+                        th { class: "border-b border-slate-300 dark:border-slate-700 px-3 py-1.5 font-mono text-xs font-semibold text-slate-900 dark:text-slate-300",
                             "{column.name}"
                         }
                     }
@@ -531,7 +531,7 @@ fn ResultTable(result: QueryResult) -> Element {
             }
             tbody {
                 for row in result.rows.iter().take(MAX_RENDERED_ROWS) {
-                    tr { class: "border-t border-slate-800/60 hover:bg-slate-800/30",
+                    tr { class: "border-t border-slate-200 dark:border-slate-800/60 hover:bg-slate-100 dark:hover:bg-slate-800/30",
                         for value in row.iter() {
                             ResultCell { value: value.clone() }
                         }
@@ -546,9 +546,9 @@ fn ResultTable(result: QueryResult) -> Element {
 fn ResultCell(value: Value) -> Element {
     let display = value.display();
     let class = match &value {
-        Value::Null => "px-3 py-1 font-mono text-xs italic text-slate-600",
-        Value::Blob(_) => "px-3 py-1 font-mono text-xs text-violet-400",
-        _ => "px-3 py-1 font-mono text-xs text-slate-200",
+        Value::Null => "px-3 py-1 font-mono text-xs italic text-slate-400 dark:text-slate-600",
+        Value::Blob(_) => "px-3 py-1 font-mono text-xs text-violet-700 dark:text-violet-400",
+        _ => "px-3 py-1 font-mono text-xs text-slate-900 dark:text-slate-200",
     };
     rsx! {
         td { class,

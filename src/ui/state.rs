@@ -5,7 +5,10 @@ use std::time::{Duration, Instant};
 use dioxus::core::{spawn_forever, Task};
 use dioxus::prelude::*;
 
-use crate::config::{default_config_path, SavedConnection, SavedList};
+use crate::config::{
+    default_config_path, default_settings_path, load_settings, save_settings, SavedConnection,
+    SavedList, Settings, Theme,
+};
 use crate::db::{
     apply_staged, detect_row_identity, needs_confirmation, run_script, split_statements,
     url_target, url_via_local_port, url_with_password, ConnectionId, ConnectionRegistry, DbError,
@@ -280,6 +283,13 @@ pub struct AppState {
     pub history_nonce: Signal<u64>,
     /// UI mirror of the store's persisted recording flag.
     pub history_recording: Signal<bool>,
+    /// The persisted theme choice (System / Light / Dark). The toggle cycles
+    /// it; [`Self::set_theme`] persists it to settings.toml.
+    pub theme: Signal<Theme>,
+    /// Resolved dark/light, driving the root `.dark` class. Derived from
+    /// `theme` and — for `System` — a one-time startup read of the OS
+    /// preference. Root-scoped: written from the startup detection task.
+    pub dark: Signal<bool>,
 }
 
 impl AppState {
@@ -298,6 +308,11 @@ impl AppState {
                 Some("no config directory found".to_string()),
             ),
         };
+        // Theme preference: best-effort load, defaults on any problem
+        // (settings are non-critical and never block the app).
+        let theme = default_settings_path()
+            .map(|path| load_settings(&path).theme)
+            .unwrap_or_default();
         let state = Self {
             registry: Signal::new(ConnectionRegistry::default()),
             active: Signal::new(ActiveView::Connections),
@@ -325,7 +340,26 @@ impl AppState {
             history_error: Signal::new_in_scope(None, ScopeId::ROOT),
             history_nonce: Signal::new_in_scope(0, ScopeId::ROOT),
             history_recording: Signal::new_in_scope(true, ScopeId::ROOT),
+            theme: Signal::new(theme),
+            // Start from the persisted theme assuming a light system default;
+            // the startup detection task (below) corrects `System`. Root-
+            // scoped: written from that spawn_forever task.
+            dark: Signal::new_in_scope(theme.resolve_dark(false), ScopeId::ROOT),
         };
+        // Resolve the OS dark-mode preference once at startup. Reacting to
+        // live OS theme changes is out of scope (a startup read suffices);
+        // an explicit Light/Dark choice overrides it regardless.
+        let mut state_for_theme = state;
+        spawn_forever(async move {
+            if *state_for_theme.theme.peek() != Theme::System {
+                return;
+            }
+            let prefers_dark = system_prefers_dark().await;
+            // Guard against a toggle landing before the read resolved.
+            if *state_for_theme.theme.peek() == Theme::System {
+                state_for_theme.dark.set(prefers_dark);
+            }
+        });
         // Open the history store in the background; a failure only disables
         // the history panel, never the app. spawn_forever: the opening must
         // not be tied to whichever component happened to create the state.
@@ -953,6 +987,35 @@ impl AppState {
         });
     }
 
+    /// Sets the theme: updates the resolved `dark` signal immediately and
+    /// persists the choice to settings.toml (best-effort — a write failure
+    /// only means the choice won't survive a restart, never an error). For
+    /// `System` the resolution re-reads the OS preference in the background.
+    pub fn set_theme(mut self, theme: Theme) {
+        self.theme.set(theme);
+        match theme {
+            Theme::Light => self.dark.set(false),
+            Theme::Dark => self.dark.set(true),
+            Theme::System => {
+                let mut state = self;
+                spawn_forever(async move {
+                    let prefers_dark = system_prefers_dark().await;
+                    if *state.theme.peek() == Theme::System {
+                        state.dark.set(prefers_dark);
+                    }
+                });
+            }
+        }
+        // Persist off the UI path; no signal borrow is held across the write.
+        let Some(path) = default_settings_path() else {
+            return;
+        };
+        let settings = Settings { theme };
+        spawn_forever(async move {
+            let _ = save_settings(&path, &settings);
+        });
+    }
+
     /// Deletes one connection's history and refreshes open panels.
     pub fn clear_history(self, id: ConnectionId) {
         let locator = self
@@ -1374,6 +1437,15 @@ impl Default for AppState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Reads the OS dark-mode preference through the webview's `matchMedia`.
+/// Any failure (eval error, closed channel, non-bool result) is treated as
+/// "light" — a safe, legible default.
+async fn system_prefers_dark() -> bool {
+    let mut eval =
+        document::eval("dioxus.send(window.matchMedia('(prefers-color-scheme: dark)').matches);");
+    eval.recv::<bool>().await.unwrap_or(false)
 }
 
 /// Canonicalizes for dedupe purposes; falls back to the given path when the

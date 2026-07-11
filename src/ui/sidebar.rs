@@ -19,12 +19,12 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
 
     rsx! {
         div { class: "flex min-h-0 flex-1 flex-col",
-            div { class: "flex items-center justify-between border-b border-slate-800 px-4 py-2",
+            div { class: "flex items-center justify-between border-b border-slate-200 dark:border-slate-800 px-4 py-2",
                 span { class: "text-xs font-semibold uppercase tracking-wide text-slate-500",
                     "Schema"
                 }
                 button {
-                    class: "rounded px-2 py-0.5 text-xs text-slate-400 hover:bg-slate-800 hover:text-slate-100",
+                    class: "rounded px-2 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
                     title: "Reload schema",
                     onclick: move |_| state.load_schema(id),
                     "↻ Reload"
@@ -36,7 +36,7 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
                         p { class: "px-4 py-2 text-sm text-slate-500", "Loading schema…" }
                     },
                     SchemaLoad::Failed(err) => rsx! {
-                        p { class: "px-4 py-2 text-sm text-red-400", "{err}" }
+                        p { class: "px-4 py-2 text-sm text-red-600 dark:text-red-400", "{err}" }
                     },
                     SchemaLoad::Ready(tables) if tables.is_empty() => rsx! {
                         p { class: "px-4 py-2 text-sm text-slate-500", "This database has no tables." }
@@ -58,7 +58,7 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
                         rsx! {
                             for (schema, group) in groups {
                                 if show_headers {
-                                    p { class: "px-2 pt-2 pb-0.5 text-xs font-semibold uppercase tracking-wide text-slate-600",
+                                    p { class: "px-2 pt-2 pb-0.5 text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-600",
                                         {schema.clone().unwrap_or_else(|| "(no schema)".to_string())}
                                     }
                                 }
@@ -105,12 +105,12 @@ fn TableNode(id: ConnectionId, table: ReadSignal<TableMeta>) -> Element {
         li {
             div {
                 class: if selected {
-                    "flex items-center gap-1 bg-sky-900/40 px-2 py-1 text-sm text-sky-200"
+                    "flex items-center gap-1 bg-sky-100 dark:bg-sky-900/40 px-2 py-1 text-sm text-sky-700 dark:text-sky-200"
                 } else {
-                    "flex items-center gap-1 px-2 py-1 text-sm text-slate-300 hover:bg-slate-800/60"
+                    "flex items-center gap-1 px-2 py-1 text-sm text-slate-900 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800/60"
                 },
                 button {
-                    class: "w-4 shrink-0 text-xs text-slate-500 hover:text-slate-200",
+                    class: "w-4 shrink-0 text-xs text-slate-500 hover:text-slate-900 dark:hover:text-slate-200",
                     aria_label: if expanded { "Collapse" } else { "Expand" },
                     onclick: move |_| state.toggle_expanded(id, &toggle_key),
                     if expanded { "▾" } else { "▸" }
@@ -120,7 +120,7 @@ fn TableNode(id: ConnectionId, table: ReadSignal<TableMeta>) -> Element {
                     onclick: move |_| state.select_table(id, &select_ref),
                     span { class: "truncate font-mono", "{name}" }
                     if kind == TableKind::View {
-                        span { class: "rounded bg-violet-900/50 px-1 text-xs text-violet-300",
+                        span { class: "rounded bg-violet-100 dark:bg-violet-900/50 px-1 text-xs text-violet-700 dark:text-violet-300",
                             "view"
                         }
                     }
@@ -137,36 +137,36 @@ fn TableNode(id: ConnectionId, table: ReadSignal<TableMeta>) -> Element {
 fn TableDetails(table: ReadSignal<TableMeta>) -> Element {
     let table = table.read();
     rsx! {
-        ul { class: "border-l border-slate-800 pb-1 pl-3 ml-4",
+        ul { class: "border-l border-slate-200 dark:border-slate-800 pb-1 pl-3 ml-4",
             for column in table.columns.clone() {
                 li { class: "flex items-baseline gap-2 px-2 py-0.5 text-xs",
-                    span { class: "font-mono text-slate-300", "{column.name}" }
+                    span { class: "font-mono text-slate-900 dark:text-slate-300", "{column.name}" }
                     span { class: "font-mono text-slate-500",
                         {if column.type_name.is_empty() { "any".to_string() } else { column.type_name.to_lowercase() }}
                     }
                     if column.primary_key_position.is_some() {
-                        span { class: "rounded bg-amber-900/50 px-1 text-amber-300", "PK" }
+                        span { class: "rounded bg-amber-100 dark:bg-amber-900/50 px-1 text-amber-700 dark:text-amber-300", "PK" }
                     }
                     if !column.nullable {
-                        span { class: "text-slate-600", "not null" }
+                        span { class: "text-slate-400 dark:text-slate-600", "not null" }
                     }
                 }
             }
             if !table.indexes.is_empty() {
-                li { class: "mt-1 px-2 text-xs uppercase tracking-wide text-slate-600", "Indexes" }
+                li { class: "mt-1 px-2 text-xs uppercase tracking-wide text-slate-400 dark:text-slate-600", "Indexes" }
                 for index in table.indexes.clone() {
                     li { class: "flex items-baseline gap-2 px-2 py-0.5 text-xs",
-                        span { class: "truncate font-mono text-slate-400", "{index.name}" }
-                        span { class: "font-mono text-slate-600",
+                        span { class: "truncate font-mono text-slate-500 dark:text-slate-400", "{index.name}" }
+                        span { class: "font-mono text-slate-400 dark:text-slate-600",
                             "({index.columns.join(\", \")})"
                         }
                         if index.unique {
-                            span { class: "rounded bg-emerald-900/50 px-1 text-emerald-300",
+                            span { class: "rounded bg-emerald-100 dark:bg-emerald-900/50 px-1 text-emerald-700 dark:text-emerald-300",
                                 "unique"
                             }
                         }
                         if index.partial {
-                            span { class: "rounded bg-slate-800 px-1 text-slate-400", "partial" }
+                            span { class: "rounded bg-slate-200 dark:bg-slate-800 px-1 text-slate-500 dark:text-slate-400", "partial" }
                         }
                     }
                 }

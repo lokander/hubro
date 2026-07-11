@@ -251,9 +251,9 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     rsx! {
         div { class: "flex h-full min-h-0 flex-col",
             // Filter bar
-            div { class: "flex items-center gap-2 border-b border-slate-800 px-3 py-2 text-sm",
+            div { class: "flex items-center gap-2 border-b border-slate-200 dark:border-slate-800 px-3 py-2 text-sm",
                 select {
-                    class: "rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-300",
+                    class: "rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 text-xs text-slate-900 dark:text-slate-300",
                     onchange: move |evt| filter_column.set(evt.value()),
                     option { value: "", selected: filter_column.read().is_empty(), "column…" }
                     for column in schema_columns.clone() {
@@ -265,7 +265,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     }
                 }
                 select {
-                    class: "rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-300",
+                    class: "rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 text-xs text-slate-900 dark:text-slate-300",
                     onchange: move |evt| {
                         filter_op.set(if evt.value() == "equals" { FilterOp::Equals } else { FilterOp::Contains });
                     },
@@ -273,7 +273,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     option { value: "equals", "equals" }
                 }
                 input {
-                    class: "w-48 rounded border border-slate-700 bg-slate-950 px-2 py-1 font-mono text-xs text-slate-200 placeholder:text-slate-600",
+                    class: "w-48 rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 font-mono text-xs text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600",
                     placeholder: "filter value",
                     value: "{filter_text}",
                     oninput: move |evt| filter_text.set(evt.value()),
@@ -284,13 +284,13 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     },
                 }
                 button {
-                    class: "rounded bg-slate-700 px-3 py-1 text-xs text-slate-100 hover:bg-slate-600",
+                    class: "rounded bg-slate-300 dark:bg-slate-700 px-3 py-1 text-xs text-slate-900 dark:text-slate-100 hover:bg-slate-400 dark:hover:bg-slate-600",
                     onclick: move |_| apply_filter(filter_column, filter_op, filter_text, applied_filter, page),
                     "Apply"
                 }
                 if applied_filter.read().is_some() {
                     button {
-                        class: "rounded px-2 py-1 text-xs text-slate-400 hover:text-slate-100",
+                        class: "rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
                         onclick: move |_| {
                             applied_filter.set(None);
                             filter_text.set(String::new());
@@ -301,7 +301,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                 }
                 div { class: "flex-1" }
                 button {
-                    class: "rounded px-2 py-1 text-xs text-slate-400 hover:bg-slate-800 hover:text-slate-100",
+                    class: "rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
                     title: "Re-run the current query",
                     onclick: move |_| state.bump_grid_refresh(id, &refresh_table.key()),
                     "↻ Refresh"
@@ -309,25 +309,25 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             }
             // Save/Discard bar: appears while this table has staged changes.
             if pending_count > 0 {
-                div { class: "flex items-center gap-3 border-b border-amber-700/50 bg-amber-950/40 px-3 py-1.5 text-xs",
-                    span { class: "font-semibold text-amber-300",
+                div { class: "flex items-center gap-3 border-b border-amber-300 dark:border-amber-700/50 bg-amber-100 dark:bg-amber-950/40 px-3 py-1.5 text-xs",
+                    span { class: "font-semibold text-amber-700 dark:text-amber-300",
                         if pending_count == 1 { "1 pending change" } else { "{pending_count} pending changes" }
                     }
                     if nav_blocked {
-                        span { class: "text-amber-200",
+                        span { class: "text-amber-700 dark:text-amber-200",
                             "Unsaved changes — Save or Discard first (repeat the action to discard & leave)."
                         }
                     }
                     if armed {
-                        span { class: "text-red-300",
+                        span { class: "text-red-600 dark:text-red-300",
                             "{confirm_notice(delete_count, pending_count - delete_count)}"
                         }
                     }
                     if let Some(message) = required_missing_message(missing_required) {
-                        span { class: "text-red-300", "{message}" }
+                        span { class: "text-red-600 dark:text-red-300", "{message}" }
                     }
                     if let Some(error) = save_error {
-                        span { class: "min-w-0 flex-1 truncate text-red-400", title: "{error}", "{error}" }
+                        span { class: "min-w-0 flex-1 truncate text-red-600 dark:text-red-400", title: "{error}", "{error}" }
                     } else {
                         div { class: "flex-1" }
                     }
@@ -358,7 +358,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                         "{save_button_label(saving, armed, delete_count, pending_count - delete_count)}"
                     }
                     button {
-                        class: "rounded border border-slate-600 px-3 py-1 text-slate-300 hover:bg-slate-800",
+                        class: "rounded border border-slate-400 dark:border-slate-600 px-3 py-1 text-slate-900 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
                         disabled: saving,
                         onclick: move |_| {
                             confirm.set(None);
@@ -370,8 +370,8 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             }
             // Selection bar: rows ticked for deletion (nothing staged yet).
             if !selected.read().is_empty() {
-                div { class: "flex items-center gap-3 border-b border-red-900/50 bg-red-950/30 px-3 py-1.5 text-xs",
-                    span { class: "text-red-200",
+                div { class: "flex items-center gap-3 border-b border-red-300 dark:border-red-900/50 bg-red-100 dark:bg-red-950/30 px-3 py-1.5 text-xs",
+                    span { class: "text-red-600 dark:text-red-200",
                         if selected.read().len() == 1 { "1 row selected" } else { "{selected.read().len()} rows selected" }
                     }
                     div { class: "flex-1" }
@@ -390,7 +390,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                         "Delete {selected.read().len()} selected"
                     }
                     button {
-                        class: "rounded border border-slate-600 px-3 py-1 text-slate-300 hover:bg-slate-800",
+                        class: "rounded border border-slate-400 dark:border-slate-600 px-3 py-1 text-slate-900 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
                         onclick: move |_| selected.set(HashMap::new()),
                         "Clear selection"
                     }
@@ -398,7 +398,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             }
             // Read-only notice (views / no usable row key)
             if let Some(notice) = read_only_notice {
-                div { class: "border-b border-slate-800 bg-slate-800/60 px-3 py-1.5 text-xs text-slate-300",
+                div { class: "border-b border-slate-200 dark:border-slate-800 bg-slate-200 dark:bg-slate-800/60 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-300",
                     "{notice}"
                 }
             }
@@ -409,7 +409,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                         p { class: "px-4 py-3 text-sm text-slate-500", "Loading…" }
                     },
                     Some(Err(err)) => rsx! {
-                        p { class: "px-4 py-3 text-sm text-red-400", "{err}" }
+                        p { class: "px-4 py-3 text-sm text-red-600 dark:text-red-400", "{err}" }
                     },
                     Some(Ok((result, _total, extra_key))) => {
                         // The fetch prepended the row-identity key column
@@ -451,10 +451,10 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                 }
                             } else {
                                 table { class: "w-full border-collapse text-left",
-                                    thead { class: "sticky top-0 bg-slate-900",
+                                    thead { class: "sticky top-0 bg-slate-100 dark:bg-slate-900",
                                         tr {
                                             if select_enabled {
-                                                th { class: "w-8 border-b border-slate-700 px-2 py-1.5",
+                                                th { class: "w-8 border-b border-slate-300 dark:border-slate-700 px-2 py-1.5",
                                                     input {
                                                         r#type: "checkbox",
                                                         class: "accent-red-500",
@@ -524,8 +524,8 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                             // appends a phantom row, all columns defaulted.
                             if select_enabled {
                                 button {
-                                    class: "m-2 rounded border border-dashed border-emerald-700/70 px-3 py-1 \
-                                            text-xs text-emerald-300 hover:bg-emerald-950/40",
+                                    class: "m-2 rounded border border-dashed border-emerald-300 dark:border-emerald-700/70 px-3 py-1 \
+                                            text-xs text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-950/40",
                                     onclick: move |_| state.stage_insert_row(id, &new_row_table),
                                     "+ New row"
                                 }
@@ -535,7 +535,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                 }
             }
             // Footer: paging + counts
-            div { class: "flex items-center gap-3 border-t border-slate-800 px-3 py-1.5 text-xs text-slate-400",
+            div { class: "flex items-center gap-3 border-t border-slate-200 dark:border-slate-800 px-3 py-1.5 text-xs text-slate-500 dark:text-slate-400",
                 match current.as_ref() {
                     Some(Ok((result, total, _))) => {
                         let first = if *total == 0 { 0 } else { page() * PAGE_SIZE as u64 + 1 };
@@ -544,14 +544,14 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                             span { "rows {first}–{last} of {total}" }
                             div { class: "flex-1" }
                             button {
-                                class: "rounded px-2 py-0.5 hover:bg-slate-800 disabled:opacity-40",
+                                class: "rounded px-2 py-0.5 hover:bg-slate-200 dark:hover:bg-slate-800 disabled:opacity-40",
                                 disabled: page() == 0,
                                 onclick: move |_| { let p = page(); page.set(p.saturating_sub(1)); },
                                 "← Prev"
                             }
                             span { "page {page() + 1}" }
                             button {
-                                class: "rounded px-2 py-0.5 hover:bg-slate-800 disabled:opacity-40",
+                                class: "rounded px-2 py-0.5 hover:bg-slate-200 dark:hover:bg-slate-800 disabled:opacity-40",
                                 disabled: last >= *total,
                                 onclick: move |_| { let p = page(); page.set(p + 1); },
                                 "Next →"
@@ -789,9 +789,9 @@ fn GridHeader(
     };
     let clicked_name = name.clone();
     rsx! {
-        th { class: "border-b border-slate-700 px-3 py-1.5",
+        th { class: "border-b border-slate-300 dark:border-slate-700 px-3 py-1.5",
             button {
-                class: "font-mono text-xs font-semibold text-slate-300 hover:text-white",
+                class: "font-mono text-xs font-semibold text-slate-900 dark:text-slate-300 hover:text-white",
                 onclick: move |_| on_sort.call(clicked_name.clone()),
                 "{name}{marker}"
             }
@@ -831,9 +831,9 @@ fn GridRow(
         tr {
             class: if row.deleted {
                 // Pending delete: red tint + strike-through.
-                "border-t border-slate-800/60 bg-red-950/40 line-through decoration-red-400/60"
+                "border-t border-slate-200 dark:border-slate-800/60 bg-red-100 dark:bg-red-950/40 line-through decoration-red-400/60"
             } else {
-                "border-t border-slate-800/60 hover:bg-slate-800/30"
+                "border-t border-slate-200 dark:border-slate-800/60 hover:bg-slate-100 dark:hover:bg-slate-800/30"
             },
             if select_enabled {
                 td { class: "w-8 px-2 py-1",
@@ -950,12 +950,12 @@ fn GridCellSlot(
             display.clone()
         };
         let text = match &cell.value {
-            Value::Null => "font-mono text-xs italic text-slate-600",
-            Value::Blob(_) => "font-mono text-xs text-violet-400",
-            _ => "font-mono text-xs text-slate-200",
+            Value::Null => "font-mono text-xs italic text-slate-400 dark:text-slate-600",
+            Value::Blob(_) => "font-mono text-xs text-violet-700 dark:text-violet-400",
+            _ => "font-mono text-xs text-slate-900 dark:text-slate-200",
         };
         let class = if cell.dirty {
-            format!("px-3 py-1 {text} bg-amber-900/40")
+            format!("px-3 py-1 {text} bg-amber-100 dark:bg-amber-900/40")
         } else {
             format!("px-3 py-1 {text}")
         };
@@ -1018,11 +1018,11 @@ fn InsertRow(
         .collect();
     let remove_table = table.clone();
     rsx! {
-        tr { class: "border-t border-dashed border-emerald-700/60 bg-emerald-950/40",
+        tr { class: "border-t border-dashed border-emerald-300 dark:border-emerald-700/60 bg-emerald-100 dark:bg-emerald-950/40",
             if lead_cell {
                 td { class: "w-8 px-2 py-1",
                     button {
-                        class: "rounded px-1.5 text-xs text-emerald-300/80 hover:bg-red-900/40 hover:text-red-300",
+                        class: "rounded px-1.5 text-xs text-emerald-700 dark:text-emerald-300/80 hover:bg-red-100 dark:hover:bg-red-900/40 hover:text-red-600 dark:hover:text-red-300",
                         title: "Remove this pending insert (stages nothing)",
                         onclick: move |_| state.remove_pending_insert(id, &remove_table, insert_id),
                         "✕"
@@ -1133,13 +1133,16 @@ fn InsertCellSlot(
             // identity / NULL).
             None => (
                 "default".to_string(),
-                "font-mono text-xs italic text-emerald-500/70",
+                "font-mono text-xs italic text-emerald-600 dark:text-emerald-500/70",
             ),
             Some(Value::Null) => (
                 Value::Null.display(),
-                "font-mono text-xs italic text-slate-600",
+                "font-mono text-xs italic text-slate-400 dark:text-slate-600",
             ),
-            Some(value) => (value.display(), "font-mono text-xs text-slate-200"),
+            Some(value) => (
+                value.display(),
+                "font-mono text-xs text-slate-900 dark:text-slate-200",
+            ),
         };
         let tooltip = if missing {
             "required: NOT NULL without a default — fill in before saving".to_string()
@@ -1149,7 +1152,7 @@ fn InsertCellSlot(
             display.clone()
         };
         let dirty_tint = if override_value.is_some() {
-            " bg-amber-900/40"
+            " bg-amber-100 dark:bg-amber-900/40"
         } else {
             ""
         };

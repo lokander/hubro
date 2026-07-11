@@ -1,1 +1,6 @@
 @import "tailwindcss";
+
+/* Class-based dark mode: `dark:` utilities activate whenever a `.dark`
+   ancestor is present. Overrides Tailwind v4's default prefers-color-scheme
+   dark mode because the theme is a manual, persisted toggle (FRE-16). */
+@custom-variant dark (&:where(.dark, .dark *));

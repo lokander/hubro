@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use dioxus::prelude::*;
 
+use crate::config::Theme;
 use crate::db::ConnectionId;
 
 use super::editor::SqlEditor;
@@ -14,8 +15,16 @@ use super::state::{ActiveView, AppState};
 pub fn Shell() -> Element {
     let state = use_context::<AppState>();
     let active = *state.active.read();
+    let dark = state.dark;
     rsx! {
-        div { class: "flex h-screen flex-col bg-slate-900 text-slate-100",
+        // The `.dark` class gates every `dark:` utility below it (see the
+        // @custom-variant in tailwind.css); toggling it swaps the theme.
+        div {
+            class: if dark() {
+                "dark flex h-screen flex-col bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100"
+            } else {
+                "flex h-screen flex-col bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100"
+            },
             TabBar {}
             main { class: "min-h-0 flex-1",
                 match active {
@@ -41,12 +50,12 @@ fn TabBar() -> Element {
         .map(|c| (c.id, c.name.clone()))
         .collect();
     rsx! {
-        header { class: "flex items-center gap-1 border-b border-slate-700 bg-slate-950 px-2 pt-1",
+        header { class: "flex items-center gap-1 border-b border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 pt-1",
             button {
                 class: if active == ActiveView::Connections {
-                    "rounded-t px-3 py-1.5 text-sm bg-slate-900 text-slate-100"
+                    "rounded-t px-3 py-1.5 text-sm bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100"
                 } else {
-                    "rounded-t px-3 py-1.5 text-sm text-slate-400 hover:text-slate-100"
+                    "rounded-t px-3 py-1.5 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100"
                 },
                 onclick: move |_| state.active.set(ActiveView::Connections),
                 "Connections"
@@ -54,22 +63,44 @@ fn TabBar() -> Element {
             for (id, name) in tabs {
                 div {
                     class: if active == ActiveView::Connection(id) {
-                        "flex items-center gap-1 rounded-t bg-slate-900 px-3 py-1.5 text-sm text-slate-100"
+                        "flex items-center gap-1 rounded-t bg-white dark:bg-slate-900 px-3 py-1.5 text-sm text-slate-900 dark:text-slate-100"
                     } else {
-                        "flex items-center gap-1 rounded-t px-3 py-1.5 text-sm text-slate-400 hover:text-slate-100"
+                        "flex items-center gap-1 rounded-t px-3 py-1.5 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100"
                     },
                     button {
                         onclick: move |_| state.active.set(ActiveView::Connection(id)),
                         "{name}"
                     }
                     button {
-                        class: "rounded px-1 text-slate-500 hover:bg-slate-700 hover:text-slate-200",
+                        class: "rounded px-1 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
                         aria_label: "Close connection",
                         onclick: move |_| state.close_connection(id),
                         "×"
                     }
                 }
             }
+            ThemeToggle {}
+        }
+    }
+}
+
+/// Right-aligned control in the tab bar that cycles System → Light → Dark.
+#[component]
+fn ThemeToggle() -> Element {
+    let state = use_context::<AppState>();
+    let theme = *state.theme.read();
+    let icon = match theme {
+        Theme::System => "◐",
+        Theme::Light => "☀",
+        Theme::Dark => "☾",
+    };
+    rsx! {
+        button {
+            class: "ml-auto rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+            title: "Theme (click to cycle System / Light / Dark)",
+            aria_label: "Toggle theme",
+            onclick: move |_| state.set_theme(theme.next()),
+            "{icon} {theme.label()}"
         }
     }
 }
@@ -82,7 +113,7 @@ fn ConnectionView(id: ConnectionId) -> Element {
     let Some(name) = name else {
         // Tab was closed under us; the view switches away on the next render.
         return rsx! {
-            div { class: "p-8 text-slate-400", "This connection is closed." }
+            div { class: "p-8 text-slate-500 dark:text-slate-400", "This connection is closed." }
         };
     };
     let (selected, pane) = {
@@ -95,14 +126,14 @@ fn ConnectionView(id: ConnectionId) -> Element {
     };
     rsx! {
         div { class: "flex h-full",
-            aside { class: "flex w-72 shrink-0 flex-col border-r border-slate-700 bg-slate-950/50",
-                h2 { class: "border-b border-slate-800 px-4 py-3 font-mono text-sm text-slate-300",
+            aside { class: "flex w-72 shrink-0 flex-col border-r border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/50",
+                h2 { class: "border-b border-slate-200 dark:border-slate-800 px-4 py-3 font-mono text-sm text-slate-900 dark:text-slate-300",
                     "{name}"
                 }
                 SchemaSidebar { id }
             }
             section { class: "flex min-w-0 flex-1 flex-col",
-                div { class: "flex gap-1 border-b border-slate-800 px-3 py-1.5",
+                div { class: "flex gap-1 border-b border-slate-200 dark:border-slate-800 px-3 py-1.5",
                     PaneButton { id, pane, target: super::state::Pane::Browser, label: "Data" }
                     PaneButton { id, pane, target: super::state::Pane::Sql, label: "SQL" }
                 }
@@ -140,9 +171,9 @@ fn PaneButton(
     rsx! {
         button {
             class: if pane == target {
-                "rounded px-3 py-0.5 text-xs bg-slate-700 text-slate-100"
+                "rounded px-3 py-0.5 text-xs bg-slate-300 dark:bg-slate-700 text-slate-900 dark:text-slate-100"
             } else {
-                "rounded px-3 py-0.5 text-xs text-slate-400 hover:bg-slate-800 hover:text-slate-100"
+                "rounded px-3 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100"
             },
             onclick: move |_| state.set_pane(id, target),
             "{label}"
@@ -214,8 +245,8 @@ fn ConnectionsScreen() -> Element {
     rsx! {
         div { class: "flex h-full flex-col items-center justify-center gap-6 overflow-y-auto py-8",
             div { class: "text-center",
-                h1 { class: "text-2xl font-semibold text-slate-200", "dataview" }
-                p { class: "mt-1 text-sm text-slate-400",
+                h1 { class: "text-2xl font-semibold text-slate-900 dark:text-slate-200", "dataview" }
+                p { class: "mt-1 text-sm text-slate-500 dark:text-slate-400",
                     if saved.is_empty() {
                         "Add a SQLite file or a Postgres server to get started."
                     } else {
@@ -224,7 +255,7 @@ fn ConnectionsScreen() -> Element {
                 }
             }
             if !saved.is_empty() {
-                ul { class: "w-full max-w-xl divide-y divide-slate-800 rounded border border-slate-700 bg-slate-950/60",
+                ul { class: "w-full max-w-xl divide-y divide-slate-200 dark:divide-slate-800 rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/60",
                     for row in saved {
                         li { class: "flex items-center gap-3 px-4 py-3",
                             button {
@@ -245,24 +276,24 @@ fn ConnectionsScreen() -> Element {
                                     }
                                 },
                                 div { class: "flex items-center gap-2",
-                                    span { class: "truncate text-sm font-medium text-slate-200",
+                                    span { class: "truncate text-sm font-medium text-slate-900 dark:text-slate-200",
                                         "{row.name}"
                                     }
                                     span {
                                         class: if row.is_postgres {
-                                            "rounded bg-cyan-900/50 px-1.5 py-0.5 text-xs text-cyan-300"
+                                            "rounded bg-cyan-100 dark:bg-cyan-900/50 px-1.5 py-0.5 text-xs text-cyan-700 dark:text-cyan-300"
                                         } else {
-                                            "rounded bg-slate-800 px-1.5 py-0.5 text-xs text-slate-400"
+                                            "rounded bg-slate-200 dark:bg-slate-800 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400"
                                         },
                                         if row.is_postgres { "postgres" } else { "sqlite" }
                                     }
                                     if row.tunnel.is_some() {
-                                        span { class: "rounded bg-teal-900/50 px-1.5 py-0.5 text-xs text-teal-300",
+                                        span { class: "rounded bg-teal-100 dark:bg-teal-900/50 px-1.5 py-0.5 text-xs text-teal-700 dark:text-teal-300",
                                             "ssh"
                                         }
                                     }
                                     if row.is_open {
-                                        span { class: "rounded bg-sky-900/60 px-1.5 py-0.5 text-xs text-sky-300",
+                                        span { class: "rounded bg-sky-100 dark:bg-sky-900/60 px-1.5 py-0.5 text-xs text-sky-700 dark:text-sky-300",
                                             "open"
                                         }
                                     }
@@ -272,7 +303,7 @@ fn ConnectionsScreen() -> Element {
                                 }
                             }
                             button {
-                                class: "rounded px-2 py-1 text-xs text-slate-500 hover:bg-slate-800 hover:text-slate-200",
+                                class: "rounded px-2 py-1 text-xs text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-200",
                                 aria_label: "Remove saved connection",
                                 onclick: {
                                     let locator = row.locator.clone();
@@ -308,7 +339,7 @@ fn ConnectionsScreen() -> Element {
                 PostgresForm { on_done: move |_| show_pg_form.set(false) }
             }
             if let Some(err) = error {
-                p { class: "max-w-xl px-8 text-sm text-red-400", "{err}" }
+                p { class: "max-w-xl px-8 text-sm text-red-600 dark:text-red-400", "{err}" }
             }
         }
     }
@@ -362,18 +393,18 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
         });
     };
     rsx! {
-        div { class: "w-full max-w-xl rounded border border-cyan-800 bg-slate-950/80 p-4",
-            p { class: "mb-2 text-sm text-slate-300",
+        div { class: "w-full max-w-xl rounded border border-cyan-300 dark:border-cyan-800 bg-slate-50 dark:bg-slate-950/80 p-4",
+            p { class: "mb-2 text-sm text-slate-900 dark:text-slate-300",
                 match prompt.kind {
                     PromptKind::DbPassword => "Password for ",
                     PromptKind::SshPassphrase => "SSH key passphrase for ",
                 }
-                span { class: "font-mono text-cyan-300", "{prompt.name}" }
+                span { class: "font-mono text-cyan-700 dark:text-cyan-300", "{prompt.name}" }
             }
             div { class: "flex gap-2",
                 input {
                     r#type: "password",
-                    class: "min-w-0 flex-1 rounded border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-200",
+                    class: "min-w-0 flex-1 rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-3 py-2 font-mono text-sm text-slate-900 dark:text-slate-200",
                     autofocus: true,
                     value: "{password}",
                     oninput: move |evt| password.set(evt.value()),
@@ -392,12 +423,12 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
                     "Connect"
                 }
                 button {
-                    class: "rounded px-3 py-2 text-sm text-slate-400 hover:text-slate-100",
+                    class: "rounded px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
                     onclick: move |_| state.password_prompt.clone().set(None),
                     "Cancel"
                 }
             }
-            label { class: "mt-2 flex items-center gap-2 text-xs text-slate-400",
+            label { class: "mt-2 flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
                 input {
                     r#type: "checkbox",
                     checked: remember(),
@@ -581,13 +612,13 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
         });
     };
 
-    let field_class = "w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-200 placeholder:text-slate-600";
+    let field_class = "w-full rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-3 py-2 font-mono text-sm text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600";
     rsx! {
-        div { class: "w-full max-w-xl rounded border border-slate-700 bg-slate-950/80 p-4",
+        div { class: "w-full max-w-xl rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/80 p-4",
             div { class: "mb-3 flex items-center justify-between",
-                span { class: "text-sm font-medium text-slate-200", "Add a Postgres connection" }
+                span { class: "text-sm font-medium text-slate-900 dark:text-slate-200", "Add a Postgres connection" }
                 button {
-                    class: "text-xs text-slate-400 hover:text-slate-100",
+                    class: "text-xs text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
                     onclick: move |_| {
                         let flip = !*use_url.read();
                         use_url.set(flip);
@@ -640,7 +671,7 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                     }
                     div { class: "flex gap-2",
                         select {
-                            class: "rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm text-slate-300",
+                            class: "rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-2 text-sm text-slate-900 dark:text-slate-300",
                             onchange: move |evt| sslmode.set(evt.value()),
                             option { value: "prefer", selected: *sslmode.read() == "prefer", "sslmode: prefer" }
                             option { value: "require", selected: *sslmode.read() == "require", "sslmode: require" }
@@ -655,7 +686,7 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                     value: "{password}",
                     oninput: move |evt| password.set(evt.value()),
                 }
-                label { class: "flex items-center gap-2 text-xs text-slate-400",
+                label { class: "flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
                     input {
                         r#type: "checkbox",
                         checked: use_tunnel(),
@@ -664,7 +695,7 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                     "Connect through an SSH tunnel"
                 }
                 if use_tunnel() {
-                    div { class: "flex flex-col gap-2 rounded border border-slate-800 bg-slate-900/60 p-3",
+                    div { class: "flex flex-col gap-2 rounded border border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-900/60 p-3",
                         div { class: "flex gap-2",
                             input {
                                 class: "{field_class} flex-[3]",
@@ -685,7 +716,7 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                             value: "{ssh_user}",
                             oninput: move |evt| ssh_user.set(evt.value()),
                         }
-                        div { class: "flex gap-4 text-xs text-slate-400",
+                        div { class: "flex gap-4 text-xs text-slate-500 dark:text-slate-400",
                             label { class: "flex items-center gap-2",
                                 input {
                                     r#type: "radio",
@@ -722,7 +753,7 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                         }
                     }
                 }
-                label { class: "flex items-center gap-2 text-xs text-slate-400",
+                label { class: "flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
                     input {
                         r#type: "checkbox",
                         checked: remember(),
@@ -732,7 +763,7 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                 }
                 div { class: "flex justify-end gap-2",
                     button {
-                        class: "rounded px-3 py-2 text-sm text-slate-400 hover:text-slate-100",
+                        class: "rounded px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
                         onclick: move |_| on_done.call(()),
                         "Cancel"
                     }
@@ -743,7 +774,7 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                     }
                 }
                 if let Some(err) = form_error() {
-                    p { class: "text-sm text-red-400", "{err}" }
+                    p { class: "text-sm text-red-600 dark:text-red-400", "{err}" }
                 }
             }
         }
