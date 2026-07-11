@@ -1,14 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use dioxus::prelude::*;
 
 use crate::db::{
     detect_row_identity, ConnectionId, Dialect, Filter, FilterOp, PageRequest, QueryResult,
-    RowIdentity, RowLocator, SortDir, TableKind, TableMeta, Value,
+    RowIdentity, RowLocator, SortDir, StagedChange, TableKind, TableMeta, Value,
 };
 
 use super::editing::{editor_kind, CellEditor, EditNav, EditorKind};
-use super::stage::TableStage;
+use super::stage::{required_insert_columns, PendingInsert, TableStage};
 use super::state::{AppState, SchemaLoad, TableRef};
 
 const PAGE_SIZE: u32 = 100;
@@ -30,6 +30,18 @@ struct ActiveEdit {
 /// editor (FRE-24, see [`CellEditor`]) on double-click or Enter; commits
 /// only ever stage (never write through).
 ///
+/// Row-level staging (FRE-25), all gated on the table being editable (a
+/// usable row identity exists):
+/// - "+ New row" under the grid appends a phantom [`InsertRow`] whose cells
+///   all start as "database default" and open the same [`CellEditor`];
+///   required columns (see [`required_insert_columns`]) are red-flagged and
+///   block Save until filled. The phantom's ✕ removes it without staging.
+/// - A leading checkbox column selects rows (header = select all on page);
+///   "Delete N selected" stages deletes for the selection. Saving a stage
+///   that contains deletes takes two clicks: the first arms an exact-count
+///   confirmation ("Confirm: delete N + save M"), any staging activity
+///   disarms it.
+///
 /// Callers key this component by table name, so all hook state here is
 /// per-table and resets when another table is selected. (The refresh nonce
 /// is NOT local: it lives in [`AppState::grid_refresh`] so a successful save
@@ -41,6 +53,14 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // Which cell's editor is open (by row key + column).
     let mut editing = use_signal(|| Option::<ActiveEdit>::None);
     let mut sort = use_signal(|| Option::<(String, SortDir)>::None);
+    // Rows ticked for deletion (row key → locator). UI-only state: nothing
+    // is staged until "Delete N selected".
+    let mut selected = use_signal(HashMap::<String, RowLocator>::new);
+    // The armed save confirmation: the exact change list shown to the user
+    // when the Save button turned into "Confirm: delete N…". The second
+    // click only proceeds while the stage still generates this exact list —
+    // ANY staging activity in between disarms and re-arms with fresh counts.
+    let mut confirm = use_signal(|| Option::<Vec<StagedChange>>::None);
     // The filter inputs are staged locally and only hit the query when
     // applied, so typing doesn't fire a query per keystroke.
     let mut filter_column = use_signal(String::new);
@@ -48,10 +68,11 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let mut filter_text = use_signal(String::new);
     let mut applied_filter = use_signal(|| Option::<Filter>::None);
 
-    // Close any open editor when the rows change under it: a page flip,
-    // sort/filter change, or refetch replaces the grid's contents, and a
-    // stale ActiveEdit would otherwise linger and spontaneously re-open the
-    // editor if its row key ever scrolls back into view.
+    // Close any open editor and drop the row selection when the rows change
+    // under them: a page flip, sort/filter change, or refetch replaces the
+    // grid's contents — a stale ActiveEdit would spontaneously re-open the
+    // editor if its row key scrolled back into view, and a stale selection
+    // could stage deletes for rows the user no longer sees.
     let table_key_for_reset = table.key();
     use_effect(move || {
         let _ = page();
@@ -62,6 +83,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             .read()
             .get(&(id, table_key_for_reset.clone()));
         editing.set(None);
+        selected.set(HashMap::new());
     });
 
     let table_for_resource = table.clone();
@@ -161,6 +183,26 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let pending_count = stage.as_ref().map(TableStage::pending_count).unwrap_or(0);
     let saving = stage.as_ref().is_some_and(|s| s.saving);
     let save_error = stage.as_ref().and_then(|s| s.last_error.clone());
+    // Insert/delete affordances only exist where editing works at all.
+    let select_enabled = identity.is_some();
+    // Required-column flagging for pending inserts: NOT NULL + no default +
+    // not auto-assigned (see required_insert_columns for the per-backend
+    // rules). Unfilled required cells red-flag and block Save.
+    let required: HashSet<String> = match (&table_meta, dialect) {
+        (Some(meta), Some(dialect)) => required_insert_columns(meta, dialect),
+        _ => HashSet::new(),
+    };
+    let missing_required = stage
+        .as_ref()
+        .map(|s| s.missing_required(&required))
+        .unwrap_or(0);
+    let delete_count = stage.as_ref().map(TableStage::delete_count).unwrap_or(0);
+    // The confirmation stays armed only while its snapshot still matches
+    // the stage exactly (see `confirm` above).
+    let armed = delete_count > 0
+        && stage
+            .as_ref()
+            .is_some_and(|s| confirm.read().as_deref() == Some(s.changes().as_slice()));
     // The two-step navigation guard parks blocked navigations here; the Save
     // bar explains how to proceed (see AppState::nav_guard for the UX).
     let nav_blocked = state
@@ -174,6 +216,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let refresh_table = table.clone();
     let save_table = table.clone();
     let discard_table = table.clone();
+    let delete_table = table.clone();
     let row_table = table.clone();
 
     rsx! {
@@ -246,22 +289,81 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                             "Unsaved changes — Save or Discard first (repeat the action to discard & leave)."
                         }
                     }
+                    if armed {
+                        span { class: "text-red-300",
+                            "{confirm_notice(delete_count, pending_count - delete_count)}"
+                        }
+                    }
+                    if let Some(message) = required_missing_message(missing_required) {
+                        span { class: "text-red-300", "{message}" }
+                    }
                     if let Some(error) = save_error {
                         span { class: "min-w-0 flex-1 truncate text-red-400", title: "{error}", "{error}" }
                     } else {
                         div { class: "flex-1" }
                     }
                     button {
-                        class: "rounded bg-emerald-700 px-3 py-1 font-semibold text-white hover:bg-emerald-600 disabled:opacity-40",
-                        disabled: saving,
-                        onclick: move |_| state.save_staged(id, &save_table),
-                        if saving { "Saving…" } else { "Save" }
+                        class: if armed {
+                            "rounded bg-red-700 px-3 py-1 font-semibold text-white hover:bg-red-600 disabled:opacity-40"
+                        } else {
+                            "rounded bg-emerald-700 px-3 py-1 font-semibold text-white hover:bg-emerald-600 disabled:opacity-40"
+                        },
+                        disabled: save_disabled(saving, missing_required),
+                        // Two-step save when deletes are staged: the first
+                        // click arms the exact-count confirmation, the second
+                        // (with the stage unchanged) saves. Stages without
+                        // deletes save immediately.
+                        onclick: move |_| {
+                            let Some(stage) = state.table_stage(id, &save_table) else { return };
+                            if stage.saving {
+                                return;
+                            }
+                            let changes = stage.changes();
+                            if stage.delete_count() > 0 && confirm.peek().as_deref() != Some(changes.as_slice()) {
+                                confirm.set(Some(changes));
+                                return;
+                            }
+                            confirm.set(None);
+                            state.save_staged(id, &save_table);
+                        },
+                        "{save_button_label(saving, armed, delete_count, pending_count - delete_count)}"
                     }
                     button {
                         class: "rounded border border-slate-600 px-3 py-1 text-slate-300 hover:bg-slate-800",
                         disabled: saving,
-                        onclick: move |_| state.discard_staged(id, &discard_table),
+                        onclick: move |_| {
+                            confirm.set(None);
+                            state.discard_staged(id, &discard_table);
+                        },
                         "Discard"
+                    }
+                }
+            }
+            // Selection bar: rows ticked for deletion (nothing staged yet).
+            if !selected.read().is_empty() {
+                div { class: "flex items-center gap-3 border-b border-red-900/50 bg-red-950/30 px-3 py-1.5 text-xs",
+                    span { class: "text-red-200",
+                        if selected.read().len() == 1 { "1 row selected" } else { "{selected.read().len()} rows selected" }
+                    }
+                    div { class: "flex-1" }
+                    button {
+                        class: "rounded bg-red-800 px-3 py-1 font-semibold text-white hover:bg-red-700",
+                        onclick: move |_| {
+                            // Stage deletes for the whole selection, then
+                            // clear it — the rows render red (pending
+                            // delete) from the stage now.
+                            let locators = selection_locators(&selected.peek());
+                            for locator in locators {
+                                state.stage_delete(id, &delete_table, locator);
+                            }
+                            selected.set(HashMap::new());
+                        },
+                        "Delete {selected.read().len()} selected"
+                    }
+                    button {
+                        class: "rounded border border-slate-600 px-3 py-1 text-slate-300 hover:bg-slate-800",
+                        onclick: move |_| selected.set(HashMap::new()),
+                        "Clear selection"
                     }
                 }
             }
@@ -291,9 +393,26 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                             result.columns.iter().skip(hidden).map(|c| c.name.clone()).collect()
                         };
                         let rows = view_rows(result, hidden, identity.as_ref(), stage.as_ref());
-                        let inserts = insert_rows(&headers, stage.as_ref());
+                        let pending_inserts: Vec<PendingInsert> = stage
+                            .as_ref()
+                            .map(|s| s.inserts().to_vec())
+                            .unwrap_or_default();
+                        // This page's selectable rows (addressable and not
+                        // already pending delete), for select-all-on-page.
+                        let selectable: Vec<(String, RowLocator)> = rows
+                            .iter()
+                            .filter(|r| !r.deleted)
+                            .filter_map(|r| Some((r.key.clone()?, r.locator.clone()?)))
+                            .collect();
+                        let all_selected = !selectable.is_empty() && {
+                            let sel = selected.read();
+                            selectable.iter().all(|(key, _)| sel.contains_key(key))
+                        };
+                        let insert_headers = headers.clone();
+                        let insert_parent_table = row_table.clone();
+                        let new_row_table = row_table.clone();
                         rsx! {
-                            if rows.is_empty() && inserts.is_empty() {
+                            if rows.is_empty() && pending_inserts.is_empty() {
                                 p { class: "px-4 py-3 text-sm text-slate-500",
                                     if applied_filter.read().is_some() {
                                         "No rows match the filter."
@@ -305,6 +424,31 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                 table { class: "w-full border-collapse text-left",
                                     thead { class: "sticky top-0 bg-slate-900",
                                         tr {
+                                            if select_enabled {
+                                                th { class: "w-8 border-b border-slate-700 px-2 py-1.5",
+                                                    input {
+                                                        r#type: "checkbox",
+                                                        class: "accent-red-500",
+                                                        title: "Select all rows on this page",
+                                                        checked: all_selected,
+                                                        oninput: move |_| {
+                                                            let currently_all = !selectable.is_empty() && {
+                                                                let sel = selected.peek();
+                                                                selectable.iter().all(|(key, _)| sel.contains_key(key))
+                                                            };
+                                                            if currently_all {
+                                                                selected.set(HashMap::new());
+                                                            } else {
+                                                                let mut map = selected.peek().clone();
+                                                                for (key, locator) in &selectable {
+                                                                    map.insert(key.clone(), locator.clone());
+                                                                }
+                                                                selected.set(map);
+                                                            }
+                                                        },
+                                                    }
+                                                }
+                                            }
                                             for header in headers {
                                                 GridHeader { name: header, sort: sort_value.clone(), on_sort: move |name: String| {
                                                     let next = next_sort(&sort.peek(), &name);
@@ -324,18 +468,37 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                                 column_kinds: column_kinds.clone(),
                                                 dialect: dialect.unwrap_or(Dialect::Sqlite),
                                                 editing,
+                                                select_enabled,
+                                                selected,
                                             }
                                         }
-                                        // Pending inserts: phantom rows, green tint
-                                        // (not editable in place — FRE-25 owns insert UX).
-                                        for insert_row in inserts {
-                                            tr { class: "border-t border-slate-800/60 bg-emerald-950/40",
-                                                for cell in insert_row {
-                                                    GridCell { value: cell.value, dirty: cell.dirty }
-                                                }
+                                        // Pending inserts: phantom rows with
+                                        // editable "database default" cells.
+                                        for insert in pending_inserts {
+                                            InsertRow {
+                                                key: "{insert.row_key()}",
+                                                id,
+                                                table: insert_parent_table.clone(),
+                                                insert,
+                                                headers: insert_headers.clone(),
+                                                column_kinds: column_kinds.clone(),
+                                                required: required.clone(),
+                                                dialect: dialect.unwrap_or(Dialect::Sqlite),
+                                                lead_cell: select_enabled,
+                                                editing,
                                             }
                                         }
                                     }
+                                }
+                            }
+                            // Insert affordance (editable tables only):
+                            // appends a phantom row, all columns defaulted.
+                            if select_enabled {
+                                button {
+                                    class: "m-2 rounded border border-dashed border-emerald-700/70 px-3 py-1 \
+                                            text-xs text-emerald-300 hover:bg-emerald-950/40",
+                                    onclick: move |_| state.stage_insert_row(id, &new_row_table),
+                                    "+ New row"
                                 }
                             }
                         }
@@ -474,35 +637,53 @@ fn row_render_key(row: &RowView, index: usize) -> String {
     }
 }
 
-/// Pending inserts as phantom rows aligned to the visible headers; columns
-/// the insert doesn't set render as NULL-styled placeholders.
-fn insert_rows(headers: &[String], stage: Option<&TableStage>) -> Vec<Vec<CellView>> {
-    let Some(stage) = stage else {
-        return Vec::new();
-    };
-    stage
-        .inserts()
-        .iter()
-        .map(|insert| {
-            headers
-                .iter()
-                .map(|header| {
-                    let value = insert
-                        .columns
-                        .iter()
-                        .position(|c| c == header)
-                        .map(|i| insert.values[i].clone())
-                        .unwrap_or(Value::Null);
-                    CellView {
-                        column: header.clone(),
-                        value,
-                        dirty: true,
-                        editable: false,
-                    }
-                })
-                .collect()
-        })
-        .collect()
+/// The staged-delete locators of a selection, in row-key order — a
+/// deterministic order means identical selections always stage identical
+/// change lists (stable failure indexes, stable confirm snapshots).
+fn selection_locators(selected: &HashMap<String, RowLocator>) -> Vec<RowLocator> {
+    let mut keys: Vec<&String> = selected.keys().collect();
+    keys.sort();
+    keys.into_iter().map(|key| selected[key].clone()).collect()
+}
+
+/// Save is blocked while a save is in flight or any pending insert still
+/// lacks a required column.
+fn save_disabled(saving: bool, missing_required: usize) -> bool {
+    saving || missing_required > 0
+}
+
+/// The red inline message shown while required insert cells are unfilled.
+fn required_missing_message(missing: usize) -> Option<String> {
+    (missing > 0).then(|| format!("{missing} required column(s) missing in pending insert(s)"))
+}
+
+/// The Save button's label. Once the exact-count confirmation is armed it
+/// spells out precisely what the second click commits.
+fn save_button_label(saving: bool, armed: bool, deletes: usize, others: usize) -> String {
+    if saving {
+        return "Saving…".to_string();
+    }
+    if !armed {
+        return "Save".to_string();
+    }
+    if others == 0 {
+        format!("Confirm: delete {deletes}")
+    } else {
+        format!("Confirm: delete {deletes} + save {others}")
+    }
+}
+
+/// The armed-confirmation notice, with the exact delete count.
+fn confirm_notice(deletes: usize, others: usize) -> String {
+    let rows = if deletes == 1 { "row" } else { "rows" };
+    if others == 0 {
+        format!("This will delete exactly {deletes} {rows}. Click again to save.")
+    } else {
+        format!(
+            "This will delete exactly {deletes} {rows} and apply {others} other change(s). \
+             Click again to save."
+        )
+    }
 }
 
 /// Whether a cell may open an editor: the row allows it (locator present,
@@ -589,9 +770,10 @@ fn GridHeader(
     }
 }
 
-/// One fetched row: staged tint/strike-through, and one [`GridCellSlot`]
-/// per cell (which renders either the display cell or, for the active
-/// cell, the in-place editor).
+/// One fetched row: staged tint/strike-through, an optional leading
+/// selection checkbox (editable tables), and one [`GridCellSlot`] per cell
+/// (which renders either the display cell or, for the active cell, the
+/// in-place editor).
 #[component]
 fn GridRow(
     id: ConnectionId,
@@ -600,6 +782,8 @@ fn GridRow(
     column_kinds: HashMap<String, (EditorKind, bool)>,
     dialect: Dialect,
     editing: Signal<Option<ActiveEdit>>,
+    select_enabled: bool,
+    mut selected: Signal<HashMap<String, RowLocator>>,
 ) -> Element {
     // This row's Tab order: its editable columns, left to right.
     let editable_columns: Vec<String> = row
@@ -608,6 +792,12 @@ fn GridRow(
         .filter(|cell| cell_editable(cell, &column_kinds))
         .map(|cell| cell.column.clone())
         .collect();
+    // Rows pending delete (or unaddressable) can't be (re)selected; their
+    // leading cell stays empty.
+    let checkbox: Option<(String, RowLocator)> = match (&row.key, &row.locator) {
+        (Some(key), Some(locator)) if !row.deleted => Some((key.clone(), locator.clone())),
+        _ => None,
+    };
     rsx! {
         tr {
             class: if row.deleted {
@@ -616,6 +806,24 @@ fn GridRow(
             } else {
                 "border-t border-slate-800/60 hover:bg-slate-800/30"
             },
+            if select_enabled {
+                td { class: "w-8 px-2 py-1",
+                    if let Some((key, locator)) = checkbox {
+                        input {
+                            r#type: "checkbox",
+                            class: "accent-red-500",
+                            checked: selected.read().contains_key(&key),
+                            oninput: move |_| {
+                                let mut map = selected.peek().clone();
+                                if map.remove(&key).is_none() {
+                                    map.insert(key.clone(), locator.clone());
+                                }
+                                selected.set(map);
+                            },
+                        }
+                    }
+                }
+            }
             for cell in row.cells.clone() {
                 GridCellSlot {
                     key: "{cell.column}",
@@ -743,25 +951,199 @@ fn GridCellSlot(
     }
 }
 
-/// One display-only cell (used for pending-insert phantom rows): monospace,
-/// truncated long text (full value in the tooltip), NULL and blobs rendered
-/// distinctly. A dirty cell shows the *staged* value on an amber tint.
+/// One pending-insert phantom row (green tint, dashed edge): a leading ✕
+/// cell that removes the phantom (staging nothing — see
+/// [`AppState::remove_pending_insert`]), then one [`InsertCellSlot`] per
+/// visible column, sharing the grid's editing state and interaction model.
 #[component]
-fn GridCell(value: Value, dirty: bool) -> Element {
-    let display = value.display();
-    let text = match &value {
-        Value::Null => "font-mono text-xs italic text-slate-600",
-        Value::Blob(_) => "font-mono text-xs text-violet-400",
-        _ => "font-mono text-xs text-slate-200",
-    };
-    let class = if dirty {
-        format!("px-3 py-1 {text} bg-amber-900/40")
-    } else {
-        format!("px-3 py-1 {text}")
-    };
+fn InsertRow(
+    id: ConnectionId,
+    table: TableRef,
+    insert: PendingInsert,
+    headers: Vec<String>,
+    column_kinds: HashMap<String, (EditorKind, bool)>,
+    required: HashSet<String>,
+    dialect: Dialect,
+    /// Whether the grid renders the leading checkbox column (it does
+    /// whenever inserts are possible; this keeps the phantom row aligned).
+    lead_cell: bool,
+    editing: Signal<Option<ActiveEdit>>,
+) -> Element {
+    let state = use_context::<AppState>();
+    let insert_id = insert.id();
+    let row_key = insert.row_key();
+    // Tab order: every non-blob column (blob cells stay "default" — there
+    // is no blob editor yet). Columns missing from the metadata edit as
+    // text, same fallback as existing rows.
+    let editable_columns: Vec<String> = headers
+        .iter()
+        .filter(|header| {
+            column_kinds
+                .get(*header)
+                .map(|(kind, _)| *kind != EditorKind::Blob)
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+    let remove_table = table.clone();
     rsx! {
-        td { class,
-            div { class: "max-w-md truncate", title: "{display}", "{display}" }
+        tr { class: "border-t border-dashed border-emerald-700/60 bg-emerald-950/40",
+            if lead_cell {
+                td { class: "w-8 px-2 py-1",
+                    button {
+                        class: "rounded px-1.5 text-xs text-emerald-300/80 hover:bg-red-900/40 hover:text-red-300",
+                        title: "Remove this pending insert (stages nothing)",
+                        onclick: move |_| state.remove_pending_insert(id, &remove_table, insert_id),
+                        "✕"
+                    }
+                }
+            }
+            for column in headers.clone() {
+                InsertCellSlot {
+                    key: "{column}",
+                    id,
+                    table: table.clone(),
+                    insert_id,
+                    row_key: row_key.clone(),
+                    column: column.clone(),
+                    override_value: insert.value(&column).cloned(),
+                    kind: column_kinds.get(&column).map(|(kind, _)| *kind).unwrap_or(EditorKind::Text),
+                    nullable: column_kinds.get(&column).map(|(_, nullable)| *nullable).unwrap_or(true),
+                    missing: required.contains(&column) && insert.lacks_value(&column),
+                    dialect,
+                    editable_columns: editable_columns.clone(),
+                    editing,
+                }
+            }
+        }
+    }
+}
+
+/// One cell of a phantom insert row. Displays dim italic "default" until
+/// overridden (the column is then omitted from the INSERT — serial/identity
+/// and defaulted columns get their database value); an overridden cell
+/// shows the concrete staged value on the dirty tint. Unfilled REQUIRED
+/// cells carry a red ring. Opens the shared [`CellEditor`] on
+/// double-click/Enter (same model as existing rows) with the extra ↺
+/// revert-to-default action; commits stage per-column overrides via
+/// [`AppState::stage_insert_value`].
+///
+/// Blob-typed columns are not editable (no blob editor yet) and always stay
+/// "default" — a required blob column can therefore never be filled here;
+/// the phantom row must be removed instead.
+#[component]
+fn InsertCellSlot(
+    id: ConnectionId,
+    table: TableRef,
+    insert_id: u64,
+    row_key: String,
+    column: String,
+    override_value: Option<Value>,
+    kind: EditorKind,
+    nullable: bool,
+    missing: bool,
+    dialect: Dialect,
+    editable_columns: Vec<String>,
+    mut editing: Signal<Option<ActiveEdit>>,
+) -> Element {
+    let state = use_context::<AppState>();
+    let editable = kind != EditorKind::Blob;
+    let is_active = editable
+        && editing
+            .read()
+            .as_ref()
+            .is_some_and(|active| active.row_key == row_key && active.column == column);
+
+    if is_active {
+        let commit_table = table.clone();
+        let commit_column = column.clone();
+        let commit_row_key = row_key.clone();
+        let default_table = table.clone();
+        let default_column = column.clone();
+        rsx! {
+            CellEditor {
+                kind,
+                dialect,
+                nullable,
+                initial: override_value.clone().unwrap_or(Value::Null),
+                on_commit: move |(value, nav): (Option<Value>, EditNav)| {
+                    if let Some(value) = value {
+                        state.stage_insert_value(id, &commit_table, insert_id, &commit_column, value);
+                    }
+                    let next = match nav {
+                        EditNav::Stay => None,
+                        EditNav::Next => step_column(&editable_columns, &commit_column, 1),
+                        EditNav::Prev => step_column(&editable_columns, &commit_column, -1),
+                    };
+                    editing.set(next.map(|column| ActiveEdit {
+                        row_key: commit_row_key.clone(),
+                        column,
+                    }));
+                },
+                on_cancel: move |_| editing.set(None),
+                on_default: move |_| {
+                    state.clear_insert_value(id, &default_table, insert_id, &default_column);
+                    editing.set(None);
+                },
+            }
+        }
+    } else {
+        let activate_key = row_key.clone();
+        let activate_column = column.clone();
+        let mut activate = move || {
+            editing.set(Some(ActiveEdit {
+                row_key: activate_key.clone(),
+                column: activate_column.clone(),
+            }));
+        };
+        let mut open_on_enter = activate.clone();
+        let (display, text_class) = match &override_value {
+            // Not overridden: the database decides (default / serial /
+            // identity / NULL).
+            None => (
+                "default".to_string(),
+                "font-mono text-xs italic text-emerald-500/70",
+            ),
+            Some(Value::Null) => (
+                Value::Null.display(),
+                "font-mono text-xs italic text-slate-600",
+            ),
+            Some(value) => (value.display(), "font-mono text-xs text-slate-200"),
+        };
+        let tooltip = if missing {
+            "required: NOT NULL without a default — fill in before saving".to_string()
+        } else if override_value.is_none() {
+            "left to the database default".to_string()
+        } else {
+            display.clone()
+        };
+        let dirty_tint = if override_value.is_some() {
+            " bg-amber-900/40"
+        } else {
+            ""
+        };
+        let missing_ring = if missing {
+            " ring-1 ring-inset ring-red-500"
+        } else {
+            ""
+        };
+        let class = format!("px-3 py-1 {text_class}{dirty_tint}{missing_ring}");
+        rsx! {
+            td {
+                class,
+                tabindex: if editable { "0" },
+                ondoubleclick: move |_| {
+                    if editable {
+                        activate();
+                    }
+                },
+                onkeydown: move |evt| {
+                    if editable && evt.key() == Key::Enter {
+                        open_on_enter();
+                    }
+                },
+                div { class: "max-w-md truncate", title: "{tooltip}", "{display}" }
+            }
         }
     }
 }
@@ -965,15 +1347,59 @@ mod tests {
     }
 
     #[test]
-    fn insert_rows_align_to_headers_and_default_missing_columns_to_null() {
+    fn selection_maps_to_staged_deletes_in_row_key_order() {
+        let locator = |id: i64| RowLocator {
+            identity_values: vec![Value::Integer(id)],
+        };
+        let selected: HashMap<String, RowLocator> = [
+            (locator(2).key(), locator(2)),
+            (locator(1).key(), locator(1)),
+        ]
+        .into_iter()
+        .collect();
+
+        let locators = selection_locators(&selected);
+        assert_eq!(locators, vec![locator(1), locator(2)], "row-key order");
+
+        // Staging the mapped locators marks exactly the selected rows.
         let mut stage = TableStage::default();
-        stage.add_insert(vec!["title".into()], vec![Value::Text("new".into())]);
-        let headers = vec!["id".to_string(), "title".to_string()];
-        let rows = insert_rows(&headers, Some(&stage));
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0][0].value, Value::Null);
-        assert_eq!(rows[0][1].value, Value::Text("new".into()));
-        assert!(rows[0].iter().all(|c| c.dirty));
-        assert!(insert_rows(&headers, None).is_empty());
+        for l in locators {
+            stage.mark_delete(l);
+        }
+        assert!(stage.is_deleted(&locator(1).key()));
+        assert!(stage.is_deleted(&locator(2).key()));
+        assert!(!stage.is_deleted(&locator(3).key()));
+        assert_eq!(stage.delete_count(), 2);
+    }
+
+    #[test]
+    fn save_is_blocked_while_required_cells_are_missing_or_a_save_runs() {
+        assert!(!save_disabled(false, 0));
+        assert!(save_disabled(true, 0), "in-flight save");
+        assert!(save_disabled(false, 2), "missing required cells");
+        assert_eq!(required_missing_message(0), None);
+        assert_eq!(
+            required_missing_message(2),
+            Some("2 required column(s) missing in pending insert(s)".into())
+        );
+    }
+
+    #[test]
+    fn save_button_spells_out_the_armed_delete_count() {
+        assert_eq!(save_button_label(false, false, 3, 1), "Save");
+        assert_eq!(save_button_label(true, true, 3, 1), "Saving…");
+        assert_eq!(save_button_label(false, true, 3, 0), "Confirm: delete 3");
+        assert_eq!(
+            save_button_label(false, true, 2, 4),
+            "Confirm: delete 2 + save 4"
+        );
+        assert_eq!(
+            confirm_notice(1, 0),
+            "This will delete exactly 1 row. Click again to save."
+        );
+        assert_eq!(
+            confirm_notice(2, 3),
+            "This will delete exactly 2 rows and apply 3 other change(s). Click again to save."
+        );
     }
 }

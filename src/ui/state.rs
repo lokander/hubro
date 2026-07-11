@@ -231,9 +231,9 @@ pub struct AppState {
     /// Sidebar/grid UI state per open connection.
     pub tab_ui: Signal<HashMap<ConnectionId, TabUi>>,
     /// Staged (unsaved) edits per connection, keyed by [`TableRef::key`].
-    /// FRE-24/25 push changes in via [`Self::stage_cell_edit`] /
-    /// [`Self::stage_insert`] / [`Self::stage_delete`]; [`Self::save_staged`]
-    /// applies a table's stage in one transaction.
+    /// FRE-24/25 push changes in via [`Self::stage_cell_edit`], the
+    /// `stage_insert_*` family, and [`Self::stage_delete`];
+    /// [`Self::save_staged`] applies a table's stage in one transaction.
     pub staged: Signal<HashMap<ConnectionId, HashMap<String, TableStage>>>,
     /// Per-table grid refresh nonce, keyed by (connection,
     /// [`TableRef::key`]). Lifted out of the grid component so a successful
@@ -1032,14 +1032,9 @@ impl AppState {
             .set_cell_edit(locator, column, value);
     }
 
-    /// Stages a row insert (FRE-25 pushes inserts in through this).
-    pub fn stage_insert(
-        mut self,
-        id: ConnectionId,
-        table: &TableRef,
-        columns: Vec<String>,
-        values: Vec<Value>,
-    ) {
+    /// Stages a new all-default pending insert — the "+ New row" affordance
+    /// (FRE-25). Columns get concrete values via [`Self::stage_insert_value`].
+    pub fn stage_insert_row(mut self, id: ConnectionId, table: &TableRef) {
         self.nav_guard.set(None);
         self.staged
             .write()
@@ -1047,7 +1042,69 @@ impl AppState {
             .or_default()
             .entry(table.key())
             .or_default()
-            .add_insert(columns, values);
+            .add_insert();
+    }
+
+    /// Stages a concrete value for one column of a pending insert (last one
+    /// wins, like cell edits). No-ops when the phantom row no longer exists.
+    pub fn stage_insert_value(
+        mut self,
+        id: ConnectionId,
+        table: &TableRef,
+        insert_id: u64,
+        column: &str,
+        value: Value,
+    ) {
+        self.nav_guard.set(None);
+        if let Some(stage) = self
+            .staged
+            .write()
+            .get_mut(&id)
+            .and_then(|tables| tables.get_mut(&table.key()))
+        {
+            stage.set_insert_value(insert_id, column, value);
+        }
+    }
+
+    /// Reverts one column of a pending insert to "database default".
+    pub fn clear_insert_value(
+        mut self,
+        id: ConnectionId,
+        table: &TableRef,
+        insert_id: u64,
+        column: &str,
+    ) {
+        self.nav_guard.set(None);
+        if let Some(stage) = self
+            .staged
+            .write()
+            .get_mut(&id)
+            .and_then(|tables| tables.get_mut(&table.key()))
+        {
+            stage.clear_insert_value(insert_id, column);
+        }
+    }
+
+    /// Removes a pending insert — "deleting" a phantom row stages nothing,
+    /// the row just disappears. A stage this empties is cleaned up (so the
+    /// Save bar goes away), except while a save is in flight — its
+    /// bookkeeping (`saving`, `last_error`) must survive.
+    pub fn remove_pending_insert(mut self, id: ConnectionId, table: &TableRef, insert_id: u64) {
+        self.nav_guard.set(None);
+        let mut staged = self.staged.write();
+        let Some(tables) = staged.get_mut(&id) else {
+            return;
+        };
+        let Some(stage) = tables.get_mut(&table.key()) else {
+            return;
+        };
+        stage.remove_insert(insert_id);
+        if stage.is_empty() && !stage.saving {
+            tables.remove(&table.key());
+            if tables.is_empty() {
+                staged.remove(&id);
+            }
+        }
     }
 
     /// Stages a row delete (FRE-25 pushes deletes in through this).

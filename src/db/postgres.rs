@@ -325,10 +325,19 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
     .map_err(map_err)?;
 
     // Columns with PK positions resolved in SQL (LEFT JOIN on the pkey
-    // constraint), one row per column.
+    // constraint), one row per column. Identity columns (`GENERATED … AS
+    // IDENTITY`) have a NULL column_default even though the database
+    // auto-assigns them — surface a synthetic default marker so consumers
+    // (e.g. required-column detection for inserts, FRE-25) can treat them
+    // like serial columns, whose nextval(…) default is real.
     let column_rows = sqlx::query(
         "SELECT c.table_schema, c.table_name, c.column_name, c.data_type, \
-                c.is_nullable, c.column_default, pk.ordinal_position AS pk_position \
+                c.is_nullable, \
+                COALESCE(c.column_default, \
+                         CASE WHEN c.is_identity = 'YES' \
+                              THEN 'GENERATED ' || c.identity_generation || ' AS IDENTITY' \
+                         END) AS column_default, \
+                pk.ordinal_position AS pk_position \
          FROM information_schema.columns c \
          LEFT JOIN ( \
              SELECT kcu.table_schema, kcu.table_name, kcu.column_name, kcu.ordinal_position \
