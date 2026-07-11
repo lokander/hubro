@@ -6,8 +6,9 @@ use dioxus::core::{spawn_forever, Task};
 use dioxus::prelude::*;
 
 use crate::config::{
-    default_config_path, default_settings_path, load_settings, save_settings, SavedConnection,
-    SavedList, Settings, Theme,
+    default_config_path, default_session_path, default_settings_path, load_session, load_settings,
+    plan_session_restore, save_session, save_theme, RestoreCandidate, SavedConnection, SavedList,
+    Session, SessionPane, SessionTab, Theme,
 };
 use crate::db::{
     apply_staged, build_fk_filter, detect_row_identity, needs_confirmation, run_script,
@@ -79,6 +80,23 @@ pub enum Pane {
     #[default]
     Browser,
     Sql,
+}
+
+impl Pane {
+    /// The serializable form used in the persisted session (FRE-30).
+    fn to_session(self) -> SessionPane {
+        match self {
+            Pane::Browser => SessionPane::Browser,
+            Pane::Sql => SessionPane::Sql,
+        }
+    }
+
+    fn from_session(pane: SessionPane) -> Self {
+        match pane {
+            SessionPane::Browser => Pane::Browser,
+            SessionPane::Sql => Pane::Sql,
+        }
+    }
 }
 
 /// Minimum age of a parked navigation intent before repeating the action
@@ -442,6 +460,13 @@ impl AppState {
                 }
                 Err(err) => state_for_open.history_error.set(Some(err)),
             }
+        });
+        // Restore the previous session (open tabs + active view) in the
+        // background. spawn_forever: like the tasks above, it must outlive the
+        // component that created the state. Reads the saved list loaded above.
+        let state_for_restore = state;
+        spawn_forever(async move {
+            state_for_restore.restore_session().await;
         });
         state
     }
@@ -1111,12 +1136,13 @@ impl AppState {
             }
         }
         // Persist off the UI path; no signal borrow is held across the write.
+        // `save_theme` merges into the existing file so the window geometry
+        // (FRE-30, same settings.toml) isn't clobbered.
         let Some(path) = default_settings_path() else {
             return;
         };
-        let settings = Settings { theme };
         spawn_forever(async move {
-            let _ = save_settings(&path, &settings);
+            let _ = save_theme(&path, theme);
         });
     }
 
@@ -1753,6 +1779,154 @@ impl AppState {
             self.active.set(ActiveView::Connections);
         }
     }
+
+    /// Snapshots the current session (FRE-30): the open tabs in tab order,
+    /// each with its selected table and pane, plus the active tab's locator.
+    /// Cheap and pure — the SQL editor buffer is deliberately not included, so
+    /// per-keystroke `tab_ui` changes produce an identical snapshot and the
+    /// persistence effect skips the write.
+    pub fn current_session(&self) -> Session {
+        let open = self.open_locators.read();
+        let tab_ui = self.tab_ui.read();
+        let mut tabs = Vec::with_capacity(open.len());
+        for (id, locator) in open.iter() {
+            let (schema, table, pane) = match tab_ui.get(id) {
+                Some(ui) => (
+                    ui.selected_table.as_ref().and_then(|t| t.schema.clone()),
+                    ui.selected_table.as_ref().map(|t| t.name.clone()),
+                    ui.pane.to_session(),
+                ),
+                None => (None, None, SessionPane::default()),
+            };
+            tabs.push(SessionTab {
+                locator: locator.clone(),
+                selected_schema: schema,
+                selected_table: table,
+                pane,
+            });
+        }
+        let active = match *self.active.read() {
+            ActiveView::Connection(id) => open
+                .iter()
+                .find(|(open_id, _)| *open_id == id)
+                .map(|(_, locator)| locator.clone()),
+            ActiveView::Connections => None,
+        };
+        Session { tabs, active }
+    }
+
+    /// Persists the current session (best-effort, off the UI path). Called by
+    /// the persistence effect only when the snapshot actually changed.
+    pub fn persist_session(&self) {
+        let Some(path) = default_session_path() else {
+            return;
+        };
+        let session = self.current_session();
+        spawn_forever(async move {
+            let _ = save_session(&path, &session);
+        });
+    }
+
+    /// Reopens the previous session's tabs (FRE-30). Runs once at startup.
+    ///
+    /// Only connections still in the saved list are reopened (ad-hoc ones are
+    /// not resurrected). SQLite reconnects silently; Postgres reconnects only
+    /// when its password is already available (session memory or keyring), so
+    /// startup never raises a wall of password prompts — a saved Postgres
+    /// connection whose password isn't stored is simply left for the user to
+    /// click. A locator whose file/server is gone just fails to reopen through
+    /// the normal connect-error path; it never blocks the rest of the restore.
+    async fn restore_session(mut self) {
+        let Some(path) = default_session_path() else {
+            return;
+        };
+        let session = load_session(&path);
+        if session.tabs.is_empty() {
+            return;
+        }
+        // Snapshot the saved list in canonical open-locator form up front.
+        let saved: Vec<SavedConnection> = self.saved.read().entries().to_vec();
+        let candidates: Vec<RestoreCandidate> = saved
+            .iter()
+            .map(|s| RestoreCandidate {
+                locator: saved_open_locator(s),
+                is_postgres: matches!(s, SavedConnection::Postgres { .. }),
+            })
+            .collect();
+        // Which Postgres locators have a usable password (session or keyring)?
+        // The keyring read is off-thread and the session-memory borrow is
+        // dropped before it — never held across the await.
+        let mut pg_ready: HashSet<String> = HashSet::new();
+        for candidate in &candidates {
+            if !candidate.is_postgres {
+                continue;
+            }
+            let in_session = self
+                .session_passwords
+                .read()
+                .contains_key(&candidate.locator);
+            let available = if in_session {
+                true
+            } else {
+                crate::secrets::get_password_async(candidate.locator.clone())
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+            };
+            if available {
+                pg_ready.insert(candidate.locator.clone());
+            }
+        }
+        let plan = plan_session_restore(&session.tabs, &candidates, |loc| pg_ready.contains(loc));
+        for tab in &plan {
+            let saved_conn = saved
+                .iter()
+                .find(|s| saved_open_locator(s) == tab.locator)
+                .cloned();
+            let Some(saved_conn) = saved_conn else {
+                continue;
+            };
+            match saved_conn {
+                SavedConnection::Sqlite { path, .. } => self.connect(path).await,
+                SavedConnection::Postgres { url, name, tunnel } => {
+                    self.connect_postgres(url, name, tunnel).await
+                }
+            }
+            // Apply the remembered table + pane to the freshly opened tab.
+            let id = self
+                .open_locators
+                .read()
+                .iter()
+                .find(|(_, locator)| *locator == tab.locator)
+                .map(|(id, _)| *id);
+            if let Some(id) = id {
+                let selected = tab.selected_table.as_ref().map(|name| TableRef {
+                    schema: tab.selected_schema.clone(),
+                    name: name.clone(),
+                });
+                let pane = Pane::from_session(tab.pane);
+                let mut tab_ui = self.tab_ui.write();
+                let ui = tab_ui.entry(id).or_default();
+                ui.selected_table = selected;
+                ui.pane = pane;
+            }
+        }
+        // Restore the active view: the remembered active tab if it reopened,
+        // else the connections screen. (Each connect above set `active` to its
+        // own tab, so this override runs last.)
+        let active_id = session.active.as_ref().and_then(|locator| {
+            self.open_locators
+                .read()
+                .iter()
+                .find(|(_, l)| l == locator)
+                .map(|(id, _)| *id)
+        });
+        match active_id {
+            Some(id) => self.active.set(ActiveView::Connection(id)),
+            None => self.active.set(ActiveView::Connections),
+        }
+    }
 }
 
 impl Default for AppState {
@@ -1774,6 +1948,17 @@ async fn system_prefers_dark() -> bool {
 /// file is missing (the connect attempt will surface that error).
 pub(crate) fn canonical(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The open-locator form of a saved connection: the canonical file path for
+/// SQLite (matching what [`AppState::connect`] stores in `open_locators`) or
+/// the URL for Postgres. Used to match saved connections against remembered
+/// session tabs at restore time.
+fn saved_open_locator(saved: &SavedConnection) -> String {
+    match saved {
+        SavedConnection::Sqlite { path, .. } => canonical(path).display().to_string(),
+        SavedConnection::Postgres { url, .. } => url.clone(),
+    }
 }
 
 /// Sibling temp path for an atomic export write (`foo.csv` → `foo.csv.part`).

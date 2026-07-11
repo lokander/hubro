@@ -144,12 +144,81 @@ impl Theme {
     }
 }
 
+/// Sensible bounds so a corrupt (or hand-edited) geometry can never produce
+/// an unusable window: a sub-minimum or non-finite size falls back to the
+/// launch default, and a wildly out-of-range position is dropped.
+pub const MIN_WINDOW_WIDTH: f64 = 480.0;
+pub const MIN_WINDOW_HEIGHT: f64 = 360.0;
+pub const MAX_WINDOW_DIM: f64 = 16_384.0;
+/// Launch size used when no geometry is saved (the historical hard-coded
+/// WindowBuilder size).
+pub const DEFAULT_WINDOW_WIDTH: f64 = 1200.0;
+pub const DEFAULT_WINDOW_HEIGHT: f64 = 800.0;
+
+/// Persisted window size/position, in logical (scale-factor-independent)
+/// pixels so a display move between monitors of different DPI restores sanely.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WindowGeometry {
+    pub width: f64,
+    pub height: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<f64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub maximized: bool,
+}
+
+impl Default for WindowGeometry {
+    fn default() -> Self {
+        WindowGeometry {
+            width: DEFAULT_WINDOW_WIDTH,
+            height: DEFAULT_WINDOW_HEIGHT,
+            x: None,
+            y: None,
+            maximized: false,
+        }
+    }
+}
+
+impl WindowGeometry {
+    /// Clamps to sane bounds, always yielding a usable geometry: a
+    /// sub-minimum, huge, or non-finite size falls back into
+    /// `[MIN, MAX]` (a corrupt tiny/negative size can't make an unusable
+    /// window), and a non-finite or wildly out-of-range position is dropped
+    /// so the OS/WM places the window instead.
+    pub fn sanitized(self) -> Self {
+        let width = if self.width.is_finite() {
+            self.width.clamp(MIN_WINDOW_WIDTH, MAX_WINDOW_DIM)
+        } else {
+            DEFAULT_WINDOW_WIDTH
+        };
+        let height = if self.height.is_finite() {
+            self.height.clamp(MIN_WINDOW_HEIGHT, MAX_WINDOW_DIM)
+        } else {
+            DEFAULT_WINDOW_HEIGHT
+        };
+        let clean = |v: Option<f64>| v.filter(|p| p.is_finite() && p.abs() <= MAX_WINDOW_DIM);
+        WindowGeometry {
+            width,
+            height,
+            x: clean(self.x),
+            y: clean(self.y),
+            maximized: self.maximized,
+        }
+    }
+}
+
 /// User preferences, persisted separately from the connections list so a
 /// corrupt settings file never blocks connecting to databases.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     pub theme: Theme,
+    /// Last window size/position (FRE-30). `None` until the window is first
+    /// resized/moved; on launch a missing value means "use the default size".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<WindowGeometry>,
 }
 
 /// Default location: `$XDG_CONFIG_HOME/dataview/settings.toml`.
@@ -180,6 +249,124 @@ pub fn save_settings(path: &Path, settings: &Settings) -> Result<(), ConfigError
         .map_err(|err| ConfigError(format!("writing {}: {err}", tmp.display())))?;
     std::fs::rename(&tmp, path)
         .map_err(|err| ConfigError(format!("replacing {}: {err}", path.display())))
+}
+
+/// Persists just the theme, preserving the rest of the settings file (window
+/// geometry). Loads the current file first so a concurrent field isn't lost —
+/// theme and window geometry are written from different code paths.
+pub fn save_theme(path: &Path, theme: Theme) -> Result<(), ConfigError> {
+    let mut settings = load_settings(path);
+    settings.theme = theme;
+    save_settings(path, &settings)
+}
+
+/// Persists just the window geometry, preserving the theme (see
+/// [`save_theme`] for why the file is re-read first).
+pub fn save_window_geometry(path: &Path, geometry: WindowGeometry) -> Result<(), ConfigError> {
+    let mut settings = load_settings(path);
+    settings.window = Some(geometry);
+    save_settings(path, &settings)
+}
+
+/// Which pane a restored tab shows. Mirrors `ui::state::Pane`, but kept here
+/// so the config layer never depends on the UI; serialized lowercase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionPane {
+    #[default]
+    Browser,
+    Sql,
+}
+
+/// One open connection tab, remembered for the next launch.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SessionTab {
+    /// Open-locator (canonical SQLite path or Postgres URL) — matched against
+    /// the saved-connections list at restore time.
+    pub locator: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_schema: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_table: Option<String>,
+    #[serde(default)]
+    pub pane: SessionPane,
+}
+
+/// The last session (FRE-30): open tabs in order, plus which one was active.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Session {
+    #[serde(default)]
+    pub tabs: Vec<SessionTab>,
+    /// Locator of the active tab, or `None` for the connections screen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<String>,
+}
+
+/// Default location: `$XDG_CONFIG_HOME/dataview/session.toml`. Kept separate
+/// from `settings.toml` because it is transient, churns often, and is fine to
+/// lose — whereas a corrupt settings file must not take user preferences with
+/// it.
+pub fn default_session_path() -> Option<PathBuf> {
+    Some(dirs::config_dir()?.join("dataview").join("session.toml"))
+}
+
+/// Loads the last session. A missing *or* malformed file yields an empty
+/// session (never an error): restore is best-effort and must never block or
+/// crash startup.
+pub fn load_session(path: &Path) -> Session {
+    match std::fs::read_to_string(path) {
+        Ok(text) => toml::from_str(&text).unwrap_or_default(),
+        Err(_) => Session::default(),
+    }
+}
+
+/// Persists the session, creating parent dirs and writing via a temp file +
+/// rename so a crash mid-write can't corrupt it.
+pub fn save_session(path: &Path, session: &Session) -> Result<(), ConfigError> {
+    let text = toml::to_string_pretty(session).map_err(|err| ConfigError(err.to_string()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| ConfigError(format!("creating {}: {err}", parent.display())))?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, text)
+        .map_err(|err| ConfigError(format!("writing {}: {err}", tmp.display())))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|err| ConfigError(format!("replacing {}: {err}", path.display())))
+}
+
+/// A saved connection reduced to what session-restore planning needs: its
+/// open-locator (canonical) form and whether it is Postgres.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreCandidate {
+    pub locator: String,
+    pub is_postgres: bool,
+}
+
+/// Decides which remembered tabs to auto-reopen (pure, so it is unit-testable
+/// without a database or keyring).
+///
+/// A tab is reopened only when its locator still matches a saved connection —
+/// ad-hoc connections the user never saved are not resurrected. SQLite
+/// reconnects unconditionally; Postgres reconnects only when a password is
+/// available (`pg_password_available`: session memory or keyring), so startup
+/// never pops a wall of password prompts. Session order (and any duplicates)
+/// is preserved.
+pub fn plan_session_restore(
+    tabs: &[SessionTab],
+    candidates: &[RestoreCandidate],
+    pg_password_available: impl Fn(&str) -> bool,
+) -> Vec<SessionTab> {
+    tabs.iter()
+        .filter(
+            |tab| match candidates.iter().find(|c| c.locator == tab.locator) {
+                None => false,
+                Some(c) if c.is_postgres => pg_password_available(&tab.locator),
+                Some(_) => true,
+            },
+        )
+        .cloned()
+        .collect()
 }
 
 /// The saved-connections list plus the load outcome. Mutations go through
@@ -457,7 +644,10 @@ mod tests {
             (Theme::Dark, "\"dark\""),
         ] {
             assert_eq!(toml::Value::try_from(theme).unwrap().to_string(), token);
-            let settings = Settings { theme };
+            let settings = Settings {
+                theme,
+                ..Default::default()
+            };
             let text = toml::to_string(&settings).unwrap();
             assert_eq!(toml::from_str::<Settings>(&text).unwrap(), settings);
         }
@@ -498,7 +688,10 @@ mod tests {
     fn settings_save_and_load_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("deep").join("settings.toml");
-        let settings = Settings { theme: Theme::Dark };
+        let settings = Settings {
+            theme: Theme::Dark,
+            ..Default::default()
+        };
         save_settings(&path, &settings).unwrap();
         assert_eq!(load_settings(&path), settings);
     }
@@ -521,5 +714,195 @@ mod tests {
         assert!(list.remove("/tmp/missing.db").is_none());
         assert!(list.remove("/tmp/a.db").is_some());
         assert!(list.entries().is_empty());
+    }
+
+    #[test]
+    fn window_geometry_round_trips_in_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let settings = Settings {
+            theme: Theme::Dark,
+            window: Some(WindowGeometry {
+                width: 1024.5,
+                height: 768.0,
+                x: Some(-40.0),
+                y: Some(12.0),
+                maximized: true,
+            }),
+        };
+        save_settings(&path, &settings).unwrap();
+        assert_eq!(load_settings(&path), settings);
+    }
+
+    #[test]
+    fn missing_window_geometry_loads_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        // A theme-only file (as written before FRE-30).
+        std::fs::write(&path, "theme = \"light\"\n").unwrap();
+        let loaded = load_settings(&path);
+        assert_eq!(loaded.theme, Theme::Light);
+        assert_eq!(loaded.window, None);
+    }
+
+    #[test]
+    fn saving_geometry_preserves_theme_and_vice_versa() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        save_theme(&path, Theme::Dark).unwrap();
+        let geo = WindowGeometry {
+            width: 900.0,
+            height: 600.0,
+            x: Some(10.0),
+            y: Some(20.0),
+            maximized: false,
+        };
+        save_window_geometry(&path, geo).unwrap();
+        // The geometry write must not clobber the theme…
+        assert_eq!(load_settings(&path).theme, Theme::Dark);
+        // …and a later theme write must not clobber the geometry.
+        save_theme(&path, Theme::Light).unwrap();
+        let loaded = load_settings(&path);
+        assert_eq!(loaded.theme, Theme::Light);
+        assert_eq!(loaded.window, Some(geo));
+    }
+
+    #[test]
+    fn geometry_sanitized_clamps_tiny_huge_and_negative_sizes() {
+        // Tiny/negative sizes clamp up to the minimums.
+        let tiny = WindowGeometry {
+            width: 1.0,
+            height: -50.0,
+            x: Some(5.0),
+            y: Some(5.0),
+            maximized: false,
+        }
+        .sanitized();
+        assert_eq!(tiny.width, MIN_WINDOW_WIDTH);
+        assert_eq!(tiny.height, MIN_WINDOW_HEIGHT);
+        assert_eq!(tiny.x, Some(5.0));
+
+        // Huge sizes clamp down to the maximum.
+        let huge = WindowGeometry {
+            width: 1.0e9,
+            height: 1.0e9,
+            x: None,
+            y: None,
+            maximized: false,
+        }
+        .sanitized();
+        assert_eq!(huge.width, MAX_WINDOW_DIM);
+        assert_eq!(huge.height, MAX_WINDOW_DIM);
+
+        // Non-finite sizes fall back to the launch defaults; a non-finite or
+        // wildly out-of-range position is dropped.
+        let broken = WindowGeometry {
+            width: f64::NAN,
+            height: f64::INFINITY,
+            x: Some(f64::NAN),
+            y: Some(1.0e9),
+            maximized: true,
+        }
+        .sanitized();
+        assert_eq!(broken.width, DEFAULT_WINDOW_WIDTH);
+        assert_eq!(broken.height, DEFAULT_WINDOW_HEIGHT);
+        assert_eq!(broken.x, None);
+        assert_eq!(broken.y, None);
+        assert!(broken.maximized);
+
+        // A reasonable geometry (including a negative multi-monitor x) is
+        // left untouched.
+        let ok = WindowGeometry {
+            width: 1000.0,
+            height: 700.0,
+            x: Some(-100.0),
+            y: Some(50.0),
+            maximized: false,
+        };
+        assert_eq!(ok.sanitized(), ok);
+    }
+
+    #[test]
+    fn missing_session_file_loads_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope").join("session.toml");
+        assert_eq!(load_session(&path), Session::default());
+        assert!(load_session(&path).tabs.is_empty());
+    }
+
+    #[test]
+    fn malformed_session_file_loads_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.toml");
+        std::fs::write(&path, "tabs = \"not a list\"").unwrap();
+        assert_eq!(load_session(&path), Session::default());
+    }
+
+    #[test]
+    fn session_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deep").join("session.toml");
+        let session = Session {
+            tabs: vec![
+                SessionTab {
+                    locator: "/data/music.db".into(),
+                    selected_schema: None,
+                    selected_table: Some("artists".into()),
+                    pane: SessionPane::Browser,
+                },
+                SessionTab {
+                    locator: "postgres://u@h:5432/app".into(),
+                    selected_schema: Some("public".into()),
+                    selected_table: Some("orders".into()),
+                    pane: SessionPane::Sql,
+                },
+            ],
+            active: Some("postgres://u@h:5432/app".into()),
+        };
+        save_session(&path, &session).unwrap();
+        assert_eq!(load_session(&path), session);
+    }
+
+    #[test]
+    fn plan_restore_keeps_sqlite_and_password_backed_postgres() {
+        let tabs = vec![
+            SessionTab {
+                locator: "/data/a.db".into(),
+                selected_table: Some("t".into()),
+                ..Default::default()
+            },
+            SessionTab {
+                locator: "postgres://u@h:5432/withpw".into(),
+                ..Default::default()
+            },
+            SessionTab {
+                locator: "postgres://u@h:5432/nopw".into(),
+                ..Default::default()
+            },
+            SessionTab {
+                locator: "/data/gone.db".into(),
+                ..Default::default()
+            },
+        ];
+        let candidates = vec![
+            RestoreCandidate {
+                locator: "/data/a.db".into(),
+                is_postgres: false,
+            },
+            RestoreCandidate {
+                locator: "postgres://u@h:5432/withpw".into(),
+                is_postgres: true,
+            },
+            RestoreCandidate {
+                locator: "postgres://u@h:5432/nopw".into(),
+                is_postgres: true,
+            },
+            // "/data/gone.db" is in the session but NOT saved anymore.
+        ];
+        let plan = plan_session_restore(&tabs, &candidates, |loc| loc.ends_with("withpw"));
+        let locators: Vec<&str> = plan.iter().map(|t| t.locator.as_str()).collect();
+        // SQLite kept, pg-with-password kept, pg-without-password skipped, and
+        // the no-longer-saved sqlite dropped. Order preserved.
+        assert_eq!(locators, vec!["/data/a.db", "postgres://u@h:5432/withpw"]);
     }
 }
