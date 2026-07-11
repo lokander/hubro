@@ -791,7 +791,7 @@ fn GridHeader(
     rsx! {
         th { class: "border-b border-slate-300 dark:border-slate-700 px-3 py-1.5",
             button {
-                class: "font-mono text-xs font-semibold text-slate-900 dark:text-slate-300 hover:text-white",
+                class: "font-mono text-xs font-semibold text-slate-900 dark:text-slate-300 hover:text-slate-950 dark:hover:text-white",
                 onclick: move |_| on_sort.call(clicked_name.clone()),
                 "{name}{marker}"
             }
