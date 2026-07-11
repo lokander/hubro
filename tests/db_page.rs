@@ -4,7 +4,7 @@
 mod common;
 
 use common::FixtureDb;
-use dataview::db::{Filter, FilterOp, PageRequest, SortDir, Value};
+use dataview::db::{Filter, PageRequest, SortDir, Value};
 
 fn request(table: &str) -> PageRequest {
     PageRequest {
@@ -141,22 +141,14 @@ async fn contains_filter_treats_percent_and_underscore_literally() {
     let mut req = request("notes");
 
     // '%' in the needle must not act as a wildcard...
-    req.filter = Some(Filter {
-        column: "body".into(),
-        op: FilterOp::Contains,
-        value: "%".into(),
-    });
+    req.filter = Some(Filter::contains("body", "%"));
     let percent = pool.fetch_page(&req).await.unwrap();
     assert_eq!(percent.rows.len(), 1);
     assert_eq!(percent.rows[0][1], Value::Text("100% done".into()));
     assert_eq!(pool.count_rows(&req).await.unwrap(), 1);
 
     // ...and '_' must not match any single character ('axb' stays out).
-    req.filter = Some(Filter {
-        column: "body".into(),
-        op: FilterOp::Contains,
-        value: "a_b".into(),
-    });
+    req.filter = Some(Filter::contains("body", "a_b"));
     let underscore = pool.fetch_page(&req).await.unwrap();
     assert_eq!(underscore.rows.len(), 1);
     assert_eq!(underscore.rows[0][1], Value::Text("a_b".into()));
@@ -173,11 +165,7 @@ async fn equals_filter_with_text_value_matches_numeric_column_via_affinity() {
     // `n` must coerce '7' so the comparison matches numerically.
     let req = PageRequest {
         schema: None,
-        filter: Some(Filter {
-            column: "n".into(),
-            op: FilterOp::Equals,
-            value: "7".into(),
-        }),
+        filter: Some(Filter::equals("n", "7")),
         ..request("numbers")
     };
     let page = pool.fetch_page(&req).await.unwrap();
@@ -199,11 +187,7 @@ async fn filter_sort_and_paging_combine() {
         limit: 3,
         offset: 8,
         sort: Some(("label".into(), SortDir::Desc)),
-        filter: Some(Filter {
-            column: "label".into(),
-            op: FilterOp::Contains,
-            value: "row 1".into(),
-        }),
+        filter: Some(Filter::contains("label", "row 1")),
         ..request("numbers")
     };
     assert_eq!(pool.count_rows(&req).await.unwrap(), 10);
@@ -232,11 +216,7 @@ async fn paging_works_on_tables_and_columns_with_weird_names() {
         limit: 10,
         offset: 0,
         sort: Some(("col name".into(), SortDir::Desc)),
-        filter: Some(Filter {
-            column: "col name".into(),
-            op: FilterOp::Contains,
-            value: "row".into(),
-        }),
+        filter: Some(Filter::contains("col name", "row")),
         extra_key_column: None,
     };
     assert_eq!(pool.count_rows(&req).await.unwrap(), 3);
@@ -249,11 +229,7 @@ async fn paging_works_on_tables_and_columns_with_weird_names() {
     // An SQL keyword as table name with a keyword column.
     let req = PageRequest {
         schema: None,
-        filter: Some(Filter {
-            column: "group".into(),
-            op: FilterOp::Equals,
-            value: "g1".into(),
-        }),
+        filter: Some(Filter::equals("group", "g1")),
         ..request("order")
     };
     let page = pool.fetch_page(&req).await.unwrap();

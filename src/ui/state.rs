@@ -10,10 +10,10 @@ use crate::config::{
     SavedList, Settings, Theme,
 };
 use crate::db::{
-    apply_staged, detect_row_identity, needs_confirmation, run_script, split_statements,
-    url_target, url_via_local_port, url_with_password, write_result, ConnectionId,
-    ConnectionRegistry, DbError, DbPool, ExportFormat, QueryResult, RowLocator, StatementResult,
-    TableMeta, Value,
+    apply_staged, build_fk_filter, detect_row_identity, needs_confirmation, run_script,
+    split_statements, url_target, url_via_local_port, url_with_password, write_result,
+    ConnectionId, ConnectionRegistry, DbError, DbPool, ExportFormat, Filter, ForeignKeyMeta,
+    QueryResult, RowLocator, StatementResult, TableMeta, Value,
 };
 use crate::history::HistoryStore;
 use crate::tunnel::{Tunnel, TunnelAuth, TunnelConfig, TunnelError};
@@ -58,6 +58,19 @@ impl TableRef {
             None => self.name.clone(),
         }
     }
+}
+
+/// A table plus the filter to show it under — the payload of a foreign-key
+/// jump or a Back restore ([`AppState::navigate_fk`] /
+/// [`AppState::navigate_back`]). The grid consumes a pending focus that
+/// targets its table, seeding its filter from it (see
+/// [`AppState::pending_focus`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FocusTarget {
+    pub table: TableRef,
+    /// `None` restores an unfiltered view (a Back to a table the user was
+    /// browsing without a filter).
+    pub filter: Option<Filter>,
 }
 
 /// Which pane a connection tab shows.
@@ -325,6 +338,16 @@ pub struct AppState {
     /// Latest export progress per connection (grid or SQL result). Root-
     /// scoped: written from the `spawn_forever` export task.
     pub export_status: Signal<HashMap<ConnectionId, ExportStatus>>,
+    /// Pending foreign-key focus per connection (FRE-29): a target table plus
+    /// the filter to seed. Set by [`Self::navigate_fk`] / [`Self::navigate_back`]
+    /// right before the target grid is selected; the grid consumes the entry
+    /// matching its table (on mount, or live for a same-table jump) and clears
+    /// it. At most one is pending per connection.
+    pub pending_focus: Signal<HashMap<ConnectionId, FocusTarget>>,
+    /// Back stack per connection (FRE-29): the views left behind by forward
+    /// foreign-key jumps, most recent last. [`Self::navigate_back`] pops one;
+    /// a manual table selection clears the stack.
+    pub nav_history: Signal<HashMap<ConnectionId, Vec<FocusTarget>>>,
 }
 
 impl AppState {
@@ -382,6 +405,10 @@ impl AppState {
             dark: Signal::new_in_scope(theme.resolve_dark(false), ScopeId::ROOT),
             // Root-scoped: written from the spawn_forever export task.
             export_status: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            // FK navigation state is only ever touched from UI event handlers,
+            // so component scope is fine (like tab_ui / nav_guard).
+            pending_focus: Signal::new(HashMap::new()),
+            nav_history: Signal::new(HashMap::new()),
         };
         // Resolve the OS dark-mode preference once at startup. Reacting to
         // live OS theme changes is out of scope (a startup read suffices);
@@ -1077,28 +1104,155 @@ impl AppState {
     /// away from a table with staged edits takes two attempts (see
     /// [`Self::nav_guard`]); the second discards them and switches. While
     /// that table's save is in flight the switch no-ops.
-    pub fn select_table(mut self, id: ConnectionId, table: &TableRef) {
+    ///
+    /// A manual selection clears the foreign-key Back stack and any pending
+    /// focus — the FK trail only makes sense relative to the jumps that built
+    /// it, not to an unrelated sidebar pick.
+    pub fn select_table(self, id: ConnectionId, table: &TableRef) {
+        self.switch_table(id, table, true);
+    }
+
+    /// Switches the selected table, running the unsaved-changes guard. Returns
+    /// whether the selection actually changed: a no-op (already selected) or a
+    /// parked/blocked guard returns `false`. `clear_fk_nav` drops this
+    /// connection's FK Back stack and pending focus on a real switch —
+    /// foreign-key jumps and Back pass `false` so they manage that stack
+    /// themselves.
+    fn switch_table(mut self, id: ConnectionId, table: &TableRef, clear_fk_nav: bool) -> bool {
         let current = self
             .tab_ui
             .read()
             .get(&id)
             .and_then(|ui| ui.selected_table.clone());
         if current.as_ref() == Some(table) {
-            return;
+            return false;
         }
         if let Some(current_table) = &current {
             if self.stage_dirty(id, current_table) {
                 if self.stage_saving(id, current_table) {
-                    return;
+                    return false;
                 }
                 if !self.nav_guard_allows(id, NavAction::SelectTable(table.clone())) {
-                    return;
+                    return false;
                 }
                 self.discard_staged(id, current_table);
             }
         }
         self.nav_guard.set(None);
         self.tab_ui.write().entry(id).or_default().selected_table = Some(table.clone());
+        if clear_fk_nav {
+            self.nav_history.write().remove(&id);
+            self.pending_focus.write().remove(&id);
+        }
+        true
+    }
+
+    /// Whether this connection has anywhere to go Back to (a non-empty FK
+    /// Back stack). Drives the grid's Back button visibility.
+    pub fn can_go_back(&self, id: ConnectionId) -> bool {
+        self.nav_history
+            .read()
+            .get(&id)
+            .is_some_and(|stack| !stack.is_empty())
+    }
+
+    /// Follows a foreign key from `origin` to the row it references (FRE-29):
+    /// resolves the target table, builds the multi-equality filter that pins
+    /// the referenced row from `source_row`, records the origin view on the
+    /// Back stack, and selects the target (seeding its filter through
+    /// [`Self::pending_focus`]).
+    ///
+    /// A no-op when the jump can't be built — any FK column's source value is
+    /// missing or NULL (a NULL foreign key references nothing), or a referenced
+    /// column can't be resolved. Guarded like any table switch: leaving a table
+    /// with unsaved edits takes the usual second confirming click (a
+    /// self-referencing FK only changes the filter, so it is never guarded).
+    pub fn navigate_fk(
+        mut self,
+        id: ConnectionId,
+        fk: &ForeignKeyMeta,
+        source_row: &HashMap<String, Value>,
+        origin: &TableRef,
+        origin_filter: Option<Filter>,
+    ) {
+        let target = TableRef {
+            schema: fk.referenced_schema.clone(),
+            name: fk.referenced_table.clone(),
+        };
+        // The target PK is only consulted for FK columns that reference the
+        // target's implicit primary key (`referenced_columns[i] == None`).
+        let target_pk = self.table_primary_key(id, &target);
+        let Some(filter) = build_fk_filter(fk, source_row, &target_pk) else {
+            return;
+        };
+        let focus = FocusTarget {
+            table: target.clone(),
+            filter: Some(filter),
+        };
+        let origin_focus = FocusTarget {
+            table: origin.clone(),
+            filter: origin_filter,
+        };
+        self.pending_focus.write().insert(id, focus);
+        if &target == origin {
+            // Self-referencing FK: the grid stays mounted and just refocuses
+            // its filter (consumed by its pending-focus effect). Record the
+            // origin so Back can restore the prior filter.
+            self.nav_history
+                .write()
+                .entry(id)
+                .or_default()
+                .push(origin_focus);
+        } else if self.switch_table(id, &target, false) {
+            self.nav_history
+                .write()
+                .entry(id)
+                .or_default()
+                .push(origin_focus);
+        }
+    }
+
+    /// Returns to the most recent view on the FK Back stack (FRE-29),
+    /// restoring its table and filter. A no-op when the stack is empty. The
+    /// entry is only popped once the return actually happens, so a staged-edit
+    /// guard parking the switch keeps it for the confirming click.
+    pub fn navigate_back(mut self, id: ConnectionId) {
+        let target = self
+            .nav_history
+            .read()
+            .get(&id)
+            .and_then(|stack| stack.last().cloned());
+        let Some(target) = target else {
+            return;
+        };
+        let current = self
+            .tab_ui
+            .read()
+            .get(&id)
+            .and_then(|ui| ui.selected_table.clone());
+        let dest = target.table.clone();
+        self.pending_focus.write().insert(id, target);
+        // Same-table restore only refocuses the filter (the grid's effect
+        // consumes it); otherwise switch, honoring the unsaved-edits guard.
+        let restored = current.as_ref() == Some(&dest) || self.switch_table(id, &dest, false);
+        if restored {
+            if let Some(stack) = self.nav_history.write().get_mut(&id) {
+                stack.pop();
+            }
+        }
+    }
+
+    /// The primary-key column names of `table` in key order, from the loaded
+    /// schema (empty when the schema isn't ready or the table has no PK).
+    fn table_primary_key(&self, id: ConnectionId, table: &TableRef) -> Vec<String> {
+        match self.schemas.read().get(&id) {
+            Some(SchemaLoad::Ready(tables)) => tables
+                .iter()
+                .find(|t| t.name == table.name && t.schema == table.schema)
+                .map(|t| t.primary_key().iter().map(|c| c.name.clone()).collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
     }
 
     /// Flips a table's expansion state in one tab's sidebar tree.
@@ -1545,6 +1699,8 @@ impl AppState {
         self.sql_runs.write().remove(&id);
         self.pending_sql.write().remove(&id);
         self.export_status.write().remove(&id);
+        self.pending_focus.write().remove(&id);
+        self.nav_history.write().remove(&id);
         // Abort any in-flight run and drop its bookkeeping; bumping nothing
         // is fine — removing the generation entry makes any still-alive
         // task's generation stale.

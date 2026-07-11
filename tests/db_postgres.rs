@@ -8,7 +8,7 @@
 //! ```
 
 use dataview::db::{
-    url_with_password, DbError, DbPool, Filter, FilterOp, PageRequest, SortDir, TableKind, Value,
+    url_with_password, DbError, DbPool, Filter, PageRequest, SortDir, TableKind, Value,
 };
 
 fn test_url() -> Option<String> {
@@ -88,22 +88,14 @@ async fn postgres_paging_sorting_filtering_and_values_work() {
     assert_eq!(page.rows[1][1], Value::Text("apple".into()));
 
     // Contains filter with an underscore matches literally, not as a wildcard.
-    request.filter = Some(Filter {
-        column: "name".into(),
-        op: FilterOp::Contains,
-        value: "a_".into(),
-    });
+    request.filter = Some(Filter::contains("name", "a_"));
     request.limit = 10;
     let filtered = pool.fetch_page(&request).await.unwrap();
     assert_eq!(filtered.rows.len(), 1);
     assert_eq!(filtered.rows[0][1], Value::Text("a_c".into()));
 
     // Equals filter on a numeric column via the ::text cast.
-    request.filter = Some(Filter {
-        column: "id".into(),
-        op: FilterOp::Equals,
-        value: "1".into(),
-    });
+    request.filter = Some(Filter::equals("id", "1"));
     let by_id = pool.fetch_page(&request).await.unwrap();
     assert_eq!(by_id.rows.len(), 1);
     // serial/int4, real, text, bytea, and NULL all decode.
