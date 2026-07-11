@@ -46,7 +46,15 @@ const GRID_SCROLL_JS: &str = r#"
     settle = setTimeout(report, 120);
   };
   el.addEventListener('scroll', onScroll, { passive: true });
-  window.addEventListener('resize', onScroll, { passive: true });
+  // Observe the grid element's own size instead of a window 'resize'
+  // listener: a ResizeObserver is garbage-collected together with `el` when
+  // the grid unmounts (a table switch remounts DataGrid), so it can't leak a
+  // listener per opened table the way a never-removed window listener would.
+  // It also catches layout-driven resizes (sidebar/pane), not just window
+  // resizes.
+  if (window.ResizeObserver) {
+    new ResizeObserver(onScroll).observe(el);
+  }
   requestAnimationFrame(report);
 })();
 "#;

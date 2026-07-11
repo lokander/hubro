@@ -136,11 +136,17 @@ implemented true windowing instead.
   the full page while only the window is in the DOM.
 - Every per-row behavior is untouched because rows are still keyed by their
   stable row key and rendered by the same `GridRow`: selection, dirty/edited
-  (amber) and pending-delete (red) tints, inline editing, truncated-preview
-  expand, and FK ↗ jumps all survive a row scrolling out and back. The keyboard
+  (amber) and pending-delete (red) tints, truncated-preview expand, and FK ↗
+  jumps all survive a row scrolling out and back (their state lives in signals
+  keyed by row key, re-read when the row re-enters the window). The keyboard
   focus ring (FRE-15) still works: arrowing to an offscreen row scrolls it into
   view (by its computed offset, since row height is fixed), which brings it into
   the window and keeps the ring.
+- One edge with inline editing: if an *open* cell editor is scrolled entirely
+  out of the window by the mouse wheel, its `<tr>` unmounts before an
+  Enter/Tab/blur commit, so uncommitted keystrokes in that cell can be lost
+  (scrolling back re-opens it from the stored value). Committing (Enter/Tab) or
+  clicking away first is unaffected; this only bites mid-edit wheel-scrolling.
 
 ### Paging model
 
