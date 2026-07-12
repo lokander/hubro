@@ -469,6 +469,7 @@ fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
             statement_index,
             preview,
             elapsed_ms,
+            rolled_back,
         } => rsx! {
             // Shares the Banner error palette; keeps the structured
             // statement/error/note layout a single message can't hold.
@@ -480,7 +481,11 @@ fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
                     }
                     p { class: "font-mono text-sm break-words", "{error}" }
                     p { class: "mt-1 text-xs text-slate-500 dark:text-slate-400",
-                        "Script stopped after {elapsed_ms} ms; earlier statements were not rolled back."
+                        if rolled_back {
+                            "Script rolled back after {elapsed_ms} ms — no changes were applied."
+                        } else {
+                            "Script stopped after {elapsed_ms} ms; earlier statements were not rolled back."
+                        }
                     }
                 }
             }

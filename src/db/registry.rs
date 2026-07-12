@@ -62,6 +62,77 @@ pub enum DbPool {
     Postgres(PgPool),
 }
 
+/// A backend-neutral transaction handle for atomically running a script
+/// (FRE-38): every statement runs on the one held connection, so they share a
+/// transaction that [`Self::commit`] or [`Self::rollback`] resolves as a unit.
+pub enum ScriptTx<'p> {
+    Sqlite(sqlx::Transaction<'p, sqlx::Sqlite>),
+    Postgres(sqlx::Transaction<'p, sqlx::Postgres>),
+}
+
+impl ScriptTx<'_> {
+    /// Runs a non-row statement in the transaction, returning affected rows.
+    pub async fn execute(&mut self, sql: &str) -> Result<u64, DbError> {
+        // `&mut Transaction` isn't itself an `Executor`; deref-coerce to the
+        // underlying `&mut Connection`, which is.
+        let affected = match self {
+            ScriptTx::Sqlite(tx) => {
+                let conn: &mut sqlx::sqlite::SqliteConnection = tx;
+                sqlx::query(sql)
+                    .execute(conn)
+                    .await
+                    .map(|d| d.rows_affected())
+            }
+            ScriptTx::Postgres(tx) => {
+                let conn: &mut sqlx::postgres::PgConnection = tx;
+                sqlx::query(sql)
+                    .execute(conn)
+                    .await
+                    .map(|d| d.rows_affected())
+            }
+        };
+        affected.map_err(|e| DbError::Query(e.to_string()))
+    }
+
+    /// Runs a row-returning statement in the transaction, bounded exactly like
+    /// the pool's [`DbPool::query_capped`] (row cap + per-cell byte cap).
+    pub async fn query_capped(
+        &mut self,
+        sql: &str,
+        max_rows: u64,
+    ) -> Result<(QueryResult, bool), DbError> {
+        // `tx` deref-coerces to the `&mut Connection` these helpers take.
+        match self {
+            ScriptTx::Sqlite(tx) => {
+                sqlite::query_capped_conn(tx, sql, max_rows, QUERY_CELL_CAP).await
+            }
+            ScriptTx::Postgres(tx) => {
+                postgres::query_capped_conn(tx, sql, max_rows, QUERY_CELL_CAP).await
+            }
+        }
+    }
+
+    /// Commits the transaction — the script's statements all take effect.
+    pub async fn commit(self) -> Result<(), DbError> {
+        match self {
+            ScriptTx::Sqlite(tx) => tx.commit().await,
+            ScriptTx::Postgres(tx) => tx.commit().await,
+        }
+        .map_err(|e| DbError::Query(e.to_string()))
+    }
+
+    /// Rolls the transaction back — none of the script's statements persist.
+    /// Best-effort: a rollback failure leaves nothing committed anyway (the
+    /// transaction also rolls back on drop), so the original error is what the
+    /// caller reports.
+    pub async fn rollback(self) {
+        let _ = match self {
+            ScriptTx::Sqlite(tx) => tx.rollback().await,
+            ScriptTx::Postgres(tx) => tx.rollback().await,
+        };
+    }
+}
+
 impl DbPool {
     /// Opens an existing SQLite database file.
     pub async fn open_sqlite(path: &Path) -> Result<DbPool, DbError> {
@@ -93,6 +164,24 @@ impl DbPool {
         match self {
             DbPool::Sqlite(pool) => sqlite::execute(pool, sql).await,
             DbPool::Postgres(pool) => postgres::execute(pool, sql).await,
+        }
+    }
+
+    /// Opens a transaction for atomically running a multi-statement script
+    /// (FRE-38). The returned [`ScriptTx`] runs statements on one connection so
+    /// they share a transaction, then commits or rolls back as a unit.
+    pub async fn begin_script_tx(&self) -> Result<ScriptTx<'_>, DbError> {
+        match self {
+            DbPool::Sqlite(pool) => pool
+                .begin()
+                .await
+                .map(ScriptTx::Sqlite)
+                .map_err(|e| DbError::Query(e.to_string())),
+            DbPool::Postgres(pool) => pool
+                .begin()
+                .await
+                .map(ScriptTx::Postgres)
+                .map_err(|e| DbError::Query(e.to_string())),
         }
     }
 
