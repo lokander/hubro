@@ -488,11 +488,19 @@ fn line_col(sql: &str, position: usize) -> Option<(usize, usize)> {
 pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
     let map_err = |e: sqlx::Error| DbError::Introspect(e.to_string());
 
-    // Tables and views across all non-system schemas.
+    // Tables and views across all non-system schemas. Materialized views
+    // (relkind 'm') are not in information_schema, so they come from a
+    // pg_catalog UNION (FRE-41).
     let table_rows = sqlx::query(
         "SELECT table_schema, table_name, table_type \
          FROM information_schema.tables \
          WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
+         UNION ALL \
+         SELECT n.nspname, c.relname, 'MATERIALIZED VIEW' \
+         FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relkind = 'm' \
+           AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
          ORDER BY table_schema, table_name",
     )
     .fetch_all(pool)
@@ -505,11 +513,18 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
     // `is_identity`/`identity_generation`/`is_generated` are surfaced
     // separately and mapped into `ColumnMeta.generated` (FRE-25 required-
     // column detection and read-only gating).
+    // Materialized-view columns aren't in information_schema.columns either, so
+    // they come from pg_catalog (pg_attribute) via a UNION (FRE-41). Matviews
+    // have no PK, identity, or generated columns, so those are constant here;
+    // `format_type` yields the type name (with modifiers, e.g.
+    // `character varying(255)`). `ord` orders columns within a relation across
+    // both halves of the UNION.
     let column_rows = sqlx::query(
         "SELECT c.table_schema, c.table_name, c.column_name, c.data_type, \
                 c.is_nullable, c.column_default, \
                 c.is_identity, c.identity_generation, c.is_generated, \
-                pk.ordinal_position AS pk_position \
+                pk.ordinal_position AS pk_position, \
+                c.ordinal_position AS ord \
          FROM information_schema.columns c \
          LEFT JOIN ( \
              SELECT kcu.table_schema, kcu.table_name, kcu.column_name, kcu.ordinal_position \
@@ -524,7 +539,18 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
              AND pk.table_name = c.table_name \
              AND pk.column_name = c.column_name \
          WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema') \
-         ORDER BY c.table_schema, c.table_name, c.ordinal_position",
+         UNION ALL \
+         SELECT n.nspname, c.relname, a.attname, \
+                format_type(a.atttypid, a.atttypmod), \
+                CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END, \
+                NULL::text, 'NO', NULL::text, 'NEVER', \
+                NULL::int, a.attnum::int \
+         FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relkind = 'm' AND a.attnum > 0 AND NOT a.attisdropped \
+           AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+         ORDER BY table_schema, table_name, ord",
     )
     .fetch_all(pool)
     .await
@@ -591,10 +617,10 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
         tables.push(TableMeta {
             schema: Some(get(row, "table_schema")?),
             name: get(row, "table_name")?,
-            kind: if table_type == "VIEW" {
-                TableKind::View
-            } else {
-                TableKind::Table
+            kind: match table_type.as_str() {
+                "VIEW" => TableKind::View,
+                "MATERIALIZED VIEW" => TableKind::MaterializedView,
+                _ => TableKind::Table,
             },
             columns: Vec::new(),
             indexes: Vec::new(),

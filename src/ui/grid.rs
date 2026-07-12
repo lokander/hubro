@@ -486,7 +486,9 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // editors; the notice explains up front why the rows are read-only.
     let read_only_notice: Option<&'static str> = match (&table_meta, identity.is_none()) {
         (Some(meta), true) => {
-            if meta.kind == TableKind::View {
+            if meta.kind == TableKind::MaterializedView {
+                Some("Materialized views are read-only.")
+            } else if meta.kind == TableKind::View {
                 Some("Views are read-only.")
             } else {
                 Some(

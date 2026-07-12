@@ -68,7 +68,9 @@ impl RowIdentity {
 ///   yields `None` rather than risking a write against the wrong column.
 /// - Postgres tables with neither yield `None`.
 pub fn detect_row_identity(table: &TableMeta, dialect: Dialect) -> Option<RowIdentity> {
-    if table.kind == TableKind::View {
+    // Views and materialized views are read-only; even if a matview carries a
+    // unique index, we must not offer editing that UPDATE/DELETE can't perform.
+    if matches!(table.kind, TableKind::View | TableKind::MaterializedView) {
         return None;
     }
     let pk: Vec<String> = table.primary_key().iter().map(|c| c.name.clone()).collect();
