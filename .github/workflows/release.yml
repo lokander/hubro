@@ -12,7 +12,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Match the dx CLI version to the `dioxus` crate version in Cargo.toml.
+  # Match the dx CLI version to the `dioxus` version Cargo.lock resolves to
+  # (Cargo.toml requests ^0.7.1; the lockfile pins 0.7.9).
   DX_VERSION: "0.7.9"
 
 jobs:
@@ -35,7 +36,7 @@ jobs:
             librsvg2-dev \
             libssl-dev \
             pkg-config \
-            libfuse2 \
+            libfuse2t64 \
             desktop-file-utils
 
       - name: Install Rust toolchain
@@ -47,7 +48,7 @@ jobs:
       # binstall grabs a prebuilt dx binary instead of compiling the CLI from
       # source (which would add many minutes to every release).
       - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@main
+        uses: cargo-bins/cargo-binstall@v1.10.19
 
       - name: Install Dioxus CLI
         run: cargo binstall -y dioxus-cli@${{ env.DX_VERSION }}
