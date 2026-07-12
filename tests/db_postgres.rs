@@ -476,6 +476,15 @@ async fn postgres_multi_schema_introspection_has_parity_metadata() {
     // Materialized view (FRE-41): introspected with its own kind and columns
     // (from pg_catalog, since information_schema omits matviews), and read-only
     // — its unique index must not yield a row identity.
+    // Exactly once: the pg_catalog UNION must not double-list it alongside an
+    // information_schema row.
+    assert_eq!(
+        tables
+            .iter()
+            .filter(|t| t.schema.as_deref() == Some("warehouse") && t.name == "stock_mv")
+            .count(),
+        1
+    );
     let matview = tables
         .iter()
         .find(|t| t.schema.as_deref() == Some("warehouse") && t.name == "stock_mv")
