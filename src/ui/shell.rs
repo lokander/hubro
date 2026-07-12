@@ -143,7 +143,10 @@ pub fn Shell() -> Element {
             if show_cheatsheet() {
                 Cheatsheet {}
             }
-            if state.confirm_quit.read().to_owned() {
+            // Also gated on `any_dirty`: if an in-flight save empties the stage
+            // while the prompt is up, it self-dismisses instead of offering to
+            // discard nothing.
+            if state.confirm_quit.read().to_owned() && state.any_dirty() {
                 QuitConfirmDialog {}
             }
         }
@@ -171,6 +174,9 @@ fn QuitConfirmDialog() -> Element {
                 div { class: "mt-5 flex justify-end gap-2",
                     button {
                         class: "rounded px-3 py-2 text-sm text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800",
+                        // Leaves close-behaviour at WindowHides, which is
+                        // self-correcting: the next CloseRequested re-sets it
+                        // (WindowCloses when clean, WindowHides when still dirty).
                         onclick: move |_| state.confirm_quit.set(false),
                         "Cancel"
                     }
@@ -269,10 +275,12 @@ fn WindowPersistence() -> Element {
             // option the desktop shell offers). Dioxus pauses its render loop
             // while the webview is hidden, so a `use_effect` can't bring it
             // back — but this handler runs for every raw event, so re-show it
-            // here (idempotent) while the confirmation is pending. The hide
-            // itself emits events, so the window bounces straight back.
+            // here while the confirmation is pending. The hide itself emits
+            // events (and the 1 s geometry timer is a backstop), so the window
+            // bounces straight back. Guarded on visibility so we don't re-raise
+            // (and steal focus) on every event once it's already back.
             _ => {
-                if *state.confirm_quit.peek() {
+                if *state.confirm_quit.peek() && !window.is_visible() {
                     window.set_visible(true);
                 }
             }
