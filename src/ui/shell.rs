@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use dioxus::desktop::tao::dpi::PhysicalPosition;
 use dioxus::desktop::tao::event::{Event, WindowEvent};
-use dioxus::desktop::{use_window, use_wry_event_handler, DesktopService};
+use dioxus::desktop::{use_window, use_wry_event_handler, DesktopService, WindowCloseBehaviour};
 use dioxus::prelude::*;
 
 use crate::config::{default_settings_path, save_window_geometry, Theme, WindowGeometry};
@@ -143,6 +143,52 @@ pub fn Shell() -> Element {
             if show_cheatsheet() {
                 Cheatsheet {}
             }
+            if state.confirm_quit.read().to_owned() {
+                QuitConfirmDialog {}
+            }
+        }
+    }
+}
+
+/// Confirmation shown when the user tries to close the window with unsaved
+/// staged edits (FRE-37). The close was vetoed (the window switched to
+/// hide-on-close); here the user either discards and quits for real or cancels
+/// back into the app to save.
+#[component]
+fn QuitConfirmDialog() -> Element {
+    let mut state = use_context::<AppState>();
+    let window = use_window();
+    rsx! {
+        div {
+            class: "fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4",
+            div { class: "w-full max-w-md rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 p-5 shadow-xl",
+                h2 { class: "text-base font-semibold text-slate-900 dark:text-slate-100",
+                    "Discard unsaved changes?"
+                }
+                p { class: "mt-2 text-sm text-slate-600 dark:text-slate-400",
+                    "You have edits that haven't been saved to the database. Quitting now discards them."
+                }
+                div { class: "mt-5 flex justify-end gap-2",
+                    button {
+                        class: "rounded px-3 py-2 text-sm text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800",
+                        onclick: move |_| state.confirm_quit.set(false),
+                        "Cancel"
+                    }
+                    button {
+                        class: "rounded bg-rose-600 px-4 py-2 text-sm font-medium text-white hover:bg-rose-500",
+                        onclick: move |_| {
+                            // Stop the re-show loop, re-arm a real close, then
+                            // request it. `close()` routes through the same
+                            // handler, which now sees WindowCloses and lets the
+                            // window go.
+                            state.confirm_quit.set(false);
+                            window.set_close_behavior(WindowCloseBehaviour::WindowCloses);
+                            window.close();
+                        },
+                        "Discard changes and quit"
+                    }
+                }
+            }
         }
     }
 }
@@ -188,6 +234,7 @@ fn update_geometry(latest: &mut Signal<WindowGeometry>, window: &DesktopService)
 /// failure only means the geometry won't survive this restart, never a crash.
 #[component]
 fn WindowPersistence() -> Element {
+    let state = use_context::<AppState>();
     let window = use_window();
     let mut latest = use_signal(|| read_geometry(&window));
 
@@ -206,8 +253,29 @@ fn WindowPersistence() -> Element {
                 if let Some(path) = default_settings_path() {
                     let _ = save_window_geometry(&path, latest.peek().sanitized());
                 }
+                // This handler runs (via `app.tick`) *before* the built-in
+                // close handler reads the close behaviour, so setting it here
+                // decides what that close does. With unsaved edits, switch to
+                // hide-on-close to veto the destroy and raise the confirmation
+                // (the `_` arm below re-shows the just-hidden window).
+                if state.any_dirty() {
+                    window.set_close_behavior(WindowCloseBehaviour::WindowHides);
+                    state.confirm_quit.clone().set(true);
+                } else {
+                    window.set_close_behavior(WindowCloseBehaviour::WindowCloses);
+                }
             }
-            _ => {}
+            // The vetoed close hides the window (the only non-destructive
+            // option the desktop shell offers). Dioxus pauses its render loop
+            // while the webview is hidden, so a `use_effect` can't bring it
+            // back — but this handler runs for every raw event, so re-show it
+            // here (idempotent) while the confirmation is pending. The hide
+            // itself emits events, so the window bounces straight back.
+            _ => {
+                if *state.confirm_quit.peek() {
+                    window.set_visible(true);
+                }
+            }
         });
     }
 

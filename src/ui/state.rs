@@ -279,6 +279,15 @@ pub(crate) fn ssh_secret_key(url: &str) -> String {
     format!("{url}#ssh")
 }
 
+/// Whether any table stage anywhere in the staged map has pending edits. Pure
+/// so the window-close guard's predicate can be unit-tested without a running
+/// reactive context.
+fn staged_has_dirty(staged: &HashMap<ConnectionId, HashMap<String, TableStage>>) -> bool {
+    staged
+        .values()
+        .any(|tables| tables.values().any(|stage| !stage.is_empty()))
+}
+
 /// App-wide state provided via context. `Copy` because it only holds signals.
 #[derive(Clone, Copy)]
 pub struct AppState {
@@ -305,6 +314,10 @@ pub struct AppState {
     /// When set, the connections screen asks the user to trust an unrecognized
     /// SSH host key before the tunneled connect proceeds (trust-on-first-use).
     pub host_key_prompt: Signal<Option<HostKeyPrompt>>,
+    /// Set when the user tries to close the window with unsaved staged edits:
+    /// the close is vetoed and a discard-and-quit confirmation is shown
+    /// (FRE-37). Cleared on cancel or once the user discards and quits.
+    pub confirm_quit: Signal<bool>,
     /// Live SSH tunnels, one per tunneled open connection. Removing an entry
     /// drops the [`Tunnel`], which shuts the forward down.
     pub tunnels: Signal<HashMap<ConnectionId, Tunnel>>,
@@ -335,8 +348,9 @@ pub struct AppState {
     /// guarded navigations no-op entirely: discarding then would race the
     /// running transaction.
     ///
-    /// Not guarded yet: closing the OS window discards every stage without
-    /// warning — follow-up in FRE-30 (session persistence) / FRE-18.
+    /// Closing the OS window with staged edits is guarded separately by
+    /// [`Self::any_dirty`] + [`Self::confirm_quit`] (FRE-37), which raises a
+    /// discard-and-quit confirmation rather than losing the edits silently.
     pub nav_guard: Signal<Option<PendingNav>>,
     /// Latest free-form SQL result per connection.
     pub sql_runs: Signal<HashMap<ConnectionId, SqlRun>>,
@@ -419,6 +433,7 @@ impl AppState {
             session_passwords: Signal::new(HashMap::new()),
             password_prompt: Signal::new(None),
             host_key_prompt: Signal::new(None),
+            confirm_quit: Signal::new(false),
             tunnels: Signal::new(HashMap::new()),
             schemas: Signal::new(HashMap::new()),
             tab_ui: Signal::new(HashMap::new()),
@@ -1587,6 +1602,13 @@ impl AppState {
             .is_some_and(|tables| tables.values().any(|stage| !stage.is_empty()))
     }
 
+    /// Whether *any* open connection has pending staged edits anywhere. The
+    /// window-close guard (FRE-37) uses this: unlike the per-connection
+    /// navigation guards, closing the OS window isn't scoped to one connection.
+    pub fn any_dirty(&self) -> bool {
+        staged_has_dirty(&self.staged.read())
+    }
+
     /// Whether any table of the connection has a save in flight.
     fn any_stage_saving(&self, id: ConnectionId) -> bool {
         self.staged
@@ -1829,7 +1851,7 @@ impl AppState {
     /// so when another pane or tab is in front the first click can look
     /// inert; the second click still closes. A deliberate simplification,
     /// kept until a global toast/dialog exists. (Closing the OS window is
-    /// NOT guarded — follow-up in FRE-30 / FRE-18.)
+    /// guarded separately by the discard-and-quit confirmation, FRE-37.)
     pub fn close_connection(mut self, id: ConnectionId) {
         if self.any_stage_dirty(id) {
             if self.any_stage_saving(id) {
@@ -2074,6 +2096,37 @@ pub fn tab_title(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn staged_has_dirty_flags_any_pending_edit_anywhere() {
+        use crate::db::RowLocator;
+        let mut registry = ConnectionRegistry::default();
+        let pool =
+            DbPool::Sqlite(sqlx::sqlite::SqlitePool::connect_lazy("sqlite::memory:").unwrap());
+        let id = registry.insert("t.db", pool);
+
+        // Empty map: nothing to lose.
+        let mut staged: HashMap<ConnectionId, HashMap<String, TableStage>> = HashMap::new();
+        assert!(!staged_has_dirty(&staged));
+
+        // A present-but-empty stage still isn't dirty (empties are usually
+        // pruned, but the guard must not trip on a lingering one).
+        let mut tables: HashMap<String, TableStage> = HashMap::new();
+        tables.insert("public.t".to_string(), TableStage::default());
+        staged.insert(id, tables);
+        assert!(!staged_has_dirty(&staged));
+
+        // One pending delete anywhere makes the whole app dirty.
+        staged
+            .get_mut(&id)
+            .unwrap()
+            .get_mut("public.t")
+            .unwrap()
+            .mark_delete(RowLocator {
+                identity_values: vec![crate::db::Value::Integer(1)],
+            });
+        assert!(staged_has_dirty(&staged));
+    }
 
     #[tokio::test]
     async fn nav_guard_confirm_needs_a_matching_intent_and_the_time_floor() {
