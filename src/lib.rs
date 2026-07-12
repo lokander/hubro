@@ -2,6 +2,7 @@
 //! (and eventually other tooling) can import app code; `main.rs` remains the
 //! binary entry point.
 
+pub mod azure;
 pub mod config;
 pub mod db;
 pub mod history;

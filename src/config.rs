@@ -5,7 +5,27 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::azure::EntraAuth;
 use crate::tunnel::TunnelConfig;
+
+/// How a Postgres connection authenticates (FRE-43). `Password` (the default)
+/// resolves a password from session memory / the keyring / a prompt; `Entra`
+/// acquires a Microsoft Entra ID access token and uses it as the password.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum PgAuth {
+    #[default]
+    Password,
+    Entra(EntraAuth),
+}
+
+impl PgAuth {
+    /// Whether this is the default password mode — lets the config skip writing
+    /// an `[…auth]` key for ordinary connections (back-compat).
+    pub fn is_password(&self) -> bool {
+        matches!(self, PgAuth::Password)
+    }
+}
 
 /// One entry in the saved-connections list. Internally tagged on `kind`, so
 /// existing `kind = "sqlite"` + `path` TOML entries keep deserializing.
@@ -27,6 +47,11 @@ pub enum SavedConnection {
         /// written for tunnel-less connections) unchanged.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tunnel: Option<TunnelConfig>,
+        /// Authentication mode (FRE-43). `default` + `skip_serializing_if` keep
+        /// ordinary password connections' TOML unchanged, and pre-Entra config
+        /// files (no `auth` key) deserialize as `Password`.
+        #[serde(default, skip_serializing_if = "PgAuth::is_password")]
+        auth: PgAuth,
     },
 }
 
@@ -427,8 +452,8 @@ impl SavedList {
     /// the list changed.
     ///
     /// Re-adding an existing Postgres URL keeps the entry (and its name) but
-    /// adopts a changed tunnel config, so reconnecting with different tunnel
-    /// settings persists them.
+    /// adopts a changed tunnel config or auth mode, so reconnecting with
+    /// different tunnel/auth settings persists them.
     pub fn add(&mut self, connection: SavedConnection) -> bool {
         let existing = self
             .entries
@@ -439,16 +464,24 @@ impl SavedList {
             return true;
         };
         if let (
-            SavedConnection::Postgres { tunnel, .. },
+            SavedConnection::Postgres { tunnel, auth, .. },
             SavedConnection::Postgres {
-                tunnel: new_tunnel, ..
+                tunnel: new_tunnel,
+                auth: new_auth,
+                ..
             },
         ) = (existing, &connection)
         {
+            let mut changed = false;
             if *tunnel != *new_tunnel {
                 *tunnel = new_tunnel.clone();
-                return true;
+                changed = true;
             }
+            if *auth != *new_auth {
+                *auth = new_auth.clone();
+                changed = true;
+            }
+            return changed;
         }
         false
     }
@@ -488,6 +521,7 @@ mod tests {
             name: name.into(),
             url: url.into(),
             tunnel: None,
+            auth: PgAuth::Password,
         }
     }
 
@@ -558,6 +592,7 @@ mod tests {
                 name: "via agent".into(),
                 url: "postgres://u@db.internal:5432/app".into(),
                 tunnel: Some(tunnel(crate::tunnel::TunnelAuth::Agent)),
+                auth: PgAuth::Password,
             },
             SavedConnection::Postgres {
                 name: "via key".into(),
@@ -565,6 +600,7 @@ mod tests {
                 tunnel: Some(tunnel(crate::tunnel::TunnelAuth::KeyFile {
                     path: PathBuf::from("/home/u/.ssh/id_ed25519"),
                 })),
+                auth: PgAuth::Password,
             },
         ];
         save_connections(&path, &connections).unwrap();
@@ -601,6 +637,83 @@ mod tests {
     }
 
     #[test]
+    fn password_connections_omit_the_auth_key_and_default_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.toml");
+        // A password connection writes no `auth` key (back-compat).
+        save_connections(&path, &[saved_pg("prod", "postgres://u@h:5432/db")]).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("auth"));
+        // And a file with no `auth` key loads as Password.
+        assert_eq!(
+            load_connections(&path).unwrap(),
+            vec![saved_pg("prod", "postgres://u@h:5432/db")]
+        );
+    }
+
+    #[test]
+    fn entra_auth_modes_round_trip_through_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.toml");
+        let entries = vec![
+            SavedConnection::Postgres {
+                name: "azure-interactive".into(),
+                url: "postgres://you@myserver.postgres.database.azure.com:5432/db".into(),
+                tunnel: None,
+                auth: PgAuth::Entra(EntraAuth::Interactive {
+                    tenant: "contoso.onmicrosoft.com".into(),
+                    client_id: None,
+                }),
+            },
+            SavedConnection::Postgres {
+                name: "azure-mi".into(),
+                url: "postgres://mi@other.postgres.database.azure.com:5432/db".into(),
+                tunnel: None,
+                auth: PgAuth::Entra(EntraAuth::ManagedIdentity {
+                    client_id: Some("11111111-2222-3333-4444-555555555555".into()),
+                }),
+            },
+        ];
+        save_connections(&path, &entries).unwrap();
+        // The nested auth table carries kind="entra" + the method tag.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("kind = \"entra\""));
+        assert!(text.contains("method = \"interactive\""));
+        assert!(text.contains("method = \"managedidentity\""));
+        assert_eq!(load_connections(&path).unwrap(), entries);
+    }
+
+    #[test]
+    fn add_adopts_a_changed_auth_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut list, _) = SavedList::load(&dir.path().join("connections.toml"));
+        assert!(list.add(saved_pg("prod", "postgres://u@h:5432/db")));
+        // Same URL, now Entra: the entry is updated (and keeps its name).
+        let entra = SavedConnection::Postgres {
+            name: "ignored".into(),
+            url: "postgres://u@h:5432/db".into(),
+            tunnel: None,
+            auth: PgAuth::Entra(EntraAuth::interactive_default()),
+        };
+        assert!(list.add(entra));
+        assert_eq!(list.entries().len(), 1);
+        match &list.entries()[0] {
+            SavedConnection::Postgres { name, auth, .. } => {
+                assert_eq!(name, "prod");
+                assert!(matches!(auth, PgAuth::Entra(_)));
+            }
+            other => panic!("expected postgres, got {other:?}"),
+        }
+        // Re-adding the identical entry is a no-op.
+        let same = SavedConnection::Postgres {
+            name: "prod".into(),
+            url: "postgres://u@h:5432/db".into(),
+            tunnel: None,
+            auth: PgAuth::Entra(EntraAuth::interactive_default()),
+        };
+        assert!(!list.add(same));
+    }
+
+    #[test]
     fn add_updates_the_tunnel_of_an_existing_entry() {
         let dir = tempfile::tempdir().unwrap();
         let (mut list, _) = SavedList::load(&dir.path().join("connections.toml"));
@@ -610,6 +723,7 @@ mod tests {
             name: "ignored".into(),
             url: "postgres://u@h:5432/db".into(),
             tunnel: Some(tunnel(crate::tunnel::TunnelAuth::Agent)),
+            auth: PgAuth::Password,
         };
         assert!(list.add(with_tunnel.clone()));
         assert_eq!(list.entries().len(), 1);

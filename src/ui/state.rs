@@ -526,10 +526,14 @@ impl AppState {
     /// password; tunnel settings, sans passphrase, stored alongside) and
     /// persists.
     pub fn add_saved_postgres(mut self, name: String, url: String, tunnel: Option<TunnelConfig>) {
-        let added = self
-            .saved
-            .write()
-            .add(SavedConnection::Postgres { name, url, tunnel });
+        // PR1 stores password auth; the Entra auth mode is threaded through in
+        // FRE-44 (the connect-flow/form wiring).
+        let added = self.saved.write().add(SavedConnection::Postgres {
+            name,
+            url,
+            tunnel,
+            auth: crate::config::PgAuth::Password,
+        });
         if added {
             self.persist_saved();
         }
@@ -2011,9 +2015,9 @@ impl AppState {
             };
             match saved_conn {
                 SavedConnection::Sqlite { path, .. } => self.connect(path).await,
-                SavedConnection::Postgres { url, name, tunnel } => {
-                    self.connect_postgres(url, name, tunnel).await
-                }
+                SavedConnection::Postgres {
+                    url, name, tunnel, ..
+                } => self.connect_postgres(url, name, tunnel).await,
             }
             // Apply the remembered table + pane to the freshly opened tab.
             let id = self
