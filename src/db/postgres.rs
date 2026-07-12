@@ -67,10 +67,16 @@ pub fn normalize_pg_url(url: &str) -> Result<String, DbError> {
                 .map_err(|e| DbError::Connect(format!("invalid host: {e}")))?;
         }
     }
-    if parsed.port().is_none() {
+    match parsed.port() {
+        // 0 is not a usable port; reject it here so a pasted URL is held to the
+        // same rule as the connection form (FRE-42).
+        Some(0) => return Err(DbError::Connect("port must be between 1 and 65535".into())),
         // postgres is a non-special scheme, so the url crate always serializes
         // an explicit port — the bare and `:5432` forms now serialize equal.
-        let _ = parsed.set_port(Some(5432));
+        None => {
+            let _ = parsed.set_port(Some(5432));
+        }
+        Some(_) => {}
     }
     Ok(parsed.into())
 }
@@ -1013,6 +1019,13 @@ mod tests {
         // 0 parses as a valid u16 but is not a usable port (FRE-42).
         assert!(build_url("host", "0", "db", "user", "").is_err());
         assert!(build_url("host", "70000", "db", "user", "").is_err());
+    }
+
+    #[test]
+    fn normalize_rejects_a_zero_port() {
+        // The pasted-URL path is held to the same rule as the form fields.
+        assert!(normalize_pg_url("postgres://user@host:0/db").is_err());
+        assert!(normalize_pg_url("postgres://user@host:5432/db").is_ok());
     }
 
     #[test]

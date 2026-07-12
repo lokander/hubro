@@ -313,7 +313,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // pages than the one being viewed. Without this the footer reads
     // "rows 301–300 of 250" and the page sits empty (FRE-42). Only acts on a
     // resolved count; setting the page re-runs this once with a now-valid page,
-    // so it settles without looping.
+    // so it settles without looping. (Reactive; verified live, not by unit test.)
     use_effect(move || {
         if *count_resource.state().read() == UseResourceState::Pending {
             return;
