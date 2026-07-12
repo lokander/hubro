@@ -604,9 +604,14 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             }
             FocusOutcome::NextPage => {
                 // Don't page past the end (mirrors the Next button's guard).
-                let total = match count_resource.peek().as_ref() {
-                    Some(Ok(total)) => *total,
-                    _ => 0,
+                // A re-running count reads as 0 → blocked, like the footer.
+                let total = if *count_resource.state().peek() == UseResourceState::Pending {
+                    0
+                } else {
+                    match count_resource.peek().as_ref() {
+                        Some(Ok(total)) => *total,
+                        _ => 0,
+                    }
                 };
                 let p = *page.peek();
                 let last = p * PAGE_SIZE as u64 + rows as u64;
@@ -1040,12 +1045,19 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     Some(Ok((page_data, _))) => {
                         let result = &page_data.result;
                         // The count comes from its own resource (FRE-40); it
-                        // stays resolved across page flips, and is briefly
-                        // unknown only on first load / a filter change.
-                        let total = count_resource
-                            .read()
-                            .as_ref()
-                            .and_then(|r| r.as_ref().ok().copied());
+                        // stays resolved across page flips, so flipping reuses
+                        // it. While it is *re-running* (a filter change or a
+                        // write bump — `use_resource` keeps the old value but
+                        // flips its state to Pending), treat the total as
+                        // unknown so we never pair new rows with a stale count.
+                        let total = if *count_resource.state().read() == UseResourceState::Pending {
+                            None
+                        } else {
+                            count_resource
+                                .read()
+                                .as_ref()
+                                .and_then(|r| r.as_ref().ok().copied())
+                        };
                         let loaded = result.rows.len() as u64;
                         let first = if loaded == 0 { 0 } else { page() * PAGE_SIZE as u64 + 1 };
                         let last = page() * PAGE_SIZE as u64 + loaded;
