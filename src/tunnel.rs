@@ -8,11 +8,14 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use russh::client;
 use russh::keys::agent::client::AgentClient;
-use russh::keys::{load_secret_key, HashAlg, PrivateKey, PrivateKeyWithHashAlg};
+use russh::keys::known_hosts::learn_known_hosts_path;
+use russh::keys::{
+    check_known_hosts_path, load_secret_key, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey,
+};
 use russh::Disconnect;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -60,6 +63,28 @@ pub enum TunnelError {
     NeedsPassphrase(String),
     /// Local listener or port-forward setup failed.
     Forward(String),
+    /// The server's host key is not recorded in any known_hosts file (first
+    /// contact). Carries the fingerprint/type for display and the serialized
+    /// key so the caller can persist it on user approval (trust-on-first-use).
+    HostKeyUnknown(HostKeyInfo),
+    /// The server presented a key that differs from the one recorded for this
+    /// host — a possible man-in-the-middle. Never auto-trusted.
+    HostKeyChanged(HostKeyInfo),
+}
+
+/// A server host key that the user must make a trust decision about, plus the
+/// data needed to display it and (for [`TunnelError::HostKeyUnknown`]) to
+/// persist it via [`trust_host_key`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostKeyInfo {
+    pub host: String,
+    pub port: u16,
+    /// SHA-256 fingerprint, e.g. `SHA256:abc…`.
+    pub fingerprint: String,
+    /// Key algorithm name, e.g. `ssh-ed25519`.
+    pub key_type: String,
+    /// The public key in OpenSSH one-line form, replayed to [`trust_host_key`].
+    pub key_openssh: String,
 }
 
 impl fmt::Display for TunnelError {
@@ -69,29 +94,133 @@ impl fmt::Display for TunnelError {
             TunnelError::Auth(m) => write!(f, "SSH tunnel: authentication failed: {m}"),
             TunnelError::NeedsPassphrase(m) => write!(f, "SSH tunnel: {m}"),
             TunnelError::Forward(m) => write!(f, "SSH tunnel: port forwarding failed: {m}"),
+            TunnelError::HostKeyUnknown(info) => write!(
+                f,
+                "SSH tunnel: unrecognized host key for {}:{} ({} {})",
+                info.host, info.port, info.key_type, info.fingerprint
+            ),
+            TunnelError::HostKeyChanged(info) => write!(
+                f,
+                "SSH tunnel: HOST KEY CHANGED for {}:{} ({} {}) — possible \
+                 man-in-the-middle; refusing to connect",
+                info.host, info.port, info.key_type, info.fingerprint
+            ),
         }
     }
 }
 
 impl std::error::Error for TunnelError {}
 
-/// russh client handler.
-///
-/// SECURITY WARNING: `check_server_key` accepts ANY server host key, so the
-/// tunnel is not protected against man-in-the-middle attacks on first (or
-/// any) connect. Host-key verification against known_hosts is a follow-up
-/// issue — do not ship a release build without it.
-struct AcceptAnyHostKey;
+/// Trust status of a server host key relative to the known_hosts files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostKeyStatus {
+    /// A matching entry exists — accept silently.
+    Trusted,
+    /// No file mentions this host — first contact (trust-on-first-use).
+    Unknown,
+    /// A file records this host with a *different* key — possible MITM.
+    Changed,
+}
 
-impl client::Handler for AcceptAnyHostKey {
+/// dataview's own known_hosts store (writable): `~/.config/dataview/known_hosts`.
+/// New trust decisions are recorded here; the user's `~/.ssh/known_hosts` is
+/// read but never modified.
+pub fn app_known_hosts_path() -> Option<PathBuf> {
+    Some(dirs::config_dir()?.join("dataview").join("known_hosts"))
+}
+
+/// The app's default set of files consulted to decide whether a server host
+/// key is trusted. Reads honor the user's OpenSSH `~/.ssh/known_hosts` (so
+/// hosts already trusted via `ssh` connect without a prompt) in addition to
+/// dataview's own store. Passed into [`Tunnel::open`] by the UI; tests inject
+/// their own paths instead.
+pub fn default_known_hosts_read() -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Some(app) = app_known_hosts_path() {
+        files.push(app);
+    }
+    if let Some(home) = dirs::home_dir() {
+        files.push(home.join(".ssh").join("known_hosts"));
+    }
+    files
+}
+
+/// Classifies `key` for `host:port` against `files`. A matching entry in any
+/// file means Trusted (that file vouches for this exact key, so it wins over a
+/// mismatch recorded elsewhere). Otherwise, if any file records the host with a
+/// different key it is Changed; if no file mentions the host it is Unknown.
+/// Unreadable or unparsable files contribute no opinion.
+fn verify_host_key(host: &str, port: u16, key: &PublicKey, files: &[PathBuf]) -> HostKeyStatus {
+    let mut changed = false;
+    for path in files {
+        match check_known_hosts_path(host, port, key, path) {
+            Ok(true) => return HostKeyStatus::Trusted,
+            Ok(false) => {}
+            Err(russh::keys::Error::KeyChanged { .. }) => changed = true,
+            Err(_) => {}
+        }
+    }
+    if changed {
+        HostKeyStatus::Changed
+    } else {
+        HostKeyStatus::Unknown
+    }
+}
+
+/// Builds the display/persistence info for the key the server offered.
+fn host_key_info(host: &str, port: u16, key: &PublicKey) -> HostKeyInfo {
+    HostKeyInfo {
+        host: host.to_string(),
+        port,
+        fingerprint: key.fingerprint(HashAlg::Sha256).to_string(),
+        key_type: key.algorithm().as_str().to_string(),
+        key_openssh: key.to_openssh().unwrap_or_default(),
+    }
+}
+
+/// Records a server key into the known_hosts file at `write_path` so a later
+/// connect to `host:port` treats it as trusted. `key_openssh` is the serialized
+/// key carried by [`TunnelError::HostKeyUnknown`] — this is the "yes, trust it"
+/// half of the trust-on-first-use prompt. The UI passes [`app_known_hosts_path`].
+pub fn trust_host_key(
+    host: &str,
+    port: u16,
+    key_openssh: &str,
+    write_path: &Path,
+) -> Result<(), TunnelError> {
+    let key = PublicKey::from_openssh(key_openssh)
+        .map_err(|e| TunnelError::Connect(format!("parsing the host key: {e}")))?;
+    learn_known_hosts_path(host, port, &key, write_path)
+        .map_err(|e| TunnelError::Connect(format!("recording the host key: {e}")))
+}
+
+/// russh client handler that verifies the server's host key against
+/// known_hosts. `check_server_key` records its verdict (and the offered key) so
+/// [`Tunnel::open`] can turn a rejection into a precise [`TunnelError`] after
+/// `client::connect` fails.
+struct HostKeyVerifier {
+    host: String,
+    port: u16,
+    files: Vec<PathBuf>,
+    verdict: Arc<Mutex<Option<HostKeyStatus>>>,
+    offered_key: Arc<Mutex<Option<PublicKey>>>,
+}
+
+impl client::Handler for HostKeyVerifier {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKey,
+        server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        // See the SECURITY WARNING on `AcceptAnyHostKey`.
-        Ok(true)
+        let status = verify_host_key(&self.host, self.port, server_public_key, &self.files);
+        if let Ok(mut offered) = self.offered_key.lock() {
+            *offered = Some(server_public_key.clone());
+        }
+        if let Ok(mut verdict) = self.verdict.lock() {
+            *verdict = Some(status);
+        }
+        Ok(matches!(status, HostKeyStatus::Trusted))
     }
 }
 
@@ -123,11 +252,17 @@ impl Tunnel {
     /// `passphrase` decrypts a [`TunnelAuth::KeyFile`] key when needed; a
     /// missing or wrong passphrase yields [`TunnelError::NeedsPassphrase`]
     /// before any network traffic, so callers can prompt cheaply.
+    ///
+    /// The server's host key is verified against `known_hosts_read` (the UI
+    /// passes [`default_known_hosts_read`]): an unrecognized key yields
+    /// [`TunnelError::HostKeyUnknown`] and a changed one
+    /// [`TunnelError::HostKeyChanged`], both before authentication.
     pub async fn open(
         config: TunnelConfig,
         passphrase: Option<String>,
         target_host: String,
         target_port: u16,
+        known_hosts_read: &[PathBuf],
     ) -> Result<Tunnel, TunnelError> {
         // Load (and decrypt) the key first: fail fast on passphrase
         // problems without a wasted SSH connection.
@@ -138,9 +273,34 @@ impl Tunnel {
 
         let ssh_config = Arc::new(client::Config::default());
         let address = (config.host.as_str(), config.port);
-        let mut handle = client::connect(ssh_config, address, AcceptAnyHostKey)
-            .await
-            .map_err(|e| TunnelError::Connect(format!("{}:{}: {e}", config.host, config.port)))?;
+        let verdict = Arc::new(Mutex::new(None));
+        let offered_key = Arc::new(Mutex::new(None));
+        let verifier = HostKeyVerifier {
+            host: config.host.clone(),
+            port: config.port,
+            files: known_hosts_read.to_vec(),
+            verdict: Arc::clone(&verdict),
+            offered_key: Arc::clone(&offered_key),
+        };
+        let mut handle = match client::connect(ssh_config, address, verifier).await {
+            Ok(handle) => handle,
+            // If the handshake failed because we rejected the host key, turn
+            // the generic connect error into a precise host-key error the UI
+            // can act on (trust prompt for Unknown, hard refusal for Changed).
+            Err(e) => {
+                let status = verdict.lock().ok().and_then(|mut v| v.take());
+                let offered = offered_key.lock().ok().and_then(|mut k| k.take());
+                return Err(match (status, offered) {
+                    (Some(HostKeyStatus::Unknown), Some(key)) => {
+                        TunnelError::HostKeyUnknown(host_key_info(&config.host, config.port, &key))
+                    }
+                    (Some(HostKeyStatus::Changed), Some(key)) => {
+                        TunnelError::HostKeyChanged(host_key_info(&config.host, config.port, &key))
+                    }
+                    _ => TunnelError::Connect(format!("{}:{}: {e}", config.host, config.port)),
+                });
+            }
+        };
 
         authenticate(&mut handle, &config, key).await?;
 
@@ -214,7 +374,7 @@ fn load_key(path: &Path, passphrase: Option<&str>) -> Result<PrivateKey, TunnelE
 /// Public-key authentication: with the loaded key file, or by trying every
 /// identity the ssh-agent offers.
 async fn authenticate(
-    handle: &mut client::Handle<AcceptAnyHostKey>,
+    handle: &mut client::Handle<HostKeyVerifier>,
     config: &TunnelConfig,
     key: Option<PrivateKey>,
 ) -> Result<(), TunnelError> {
@@ -243,7 +403,7 @@ async fn authenticate(
 
 #[cfg(unix)]
 async fn authenticate_with_agent(
-    handle: &mut client::Handle<AcceptAnyHostKey>,
+    handle: &mut client::Handle<HostKeyVerifier>,
     config: &TunnelConfig,
 ) -> Result<(), TunnelError> {
     let mut agent = AgentClient::connect_env()
@@ -277,7 +437,7 @@ async fn authenticate_with_agent(
 
 #[cfg(not(unix))]
 async fn authenticate_with_agent(
-    _handle: &mut client::Handle<AcceptAnyHostKey>,
+    _handle: &mut client::Handle<HostKeyVerifier>,
     _config: &TunnelConfig,
 ) -> Result<(), TunnelError> {
     Err(TunnelError::Auth(
@@ -288,7 +448,7 @@ async fn authenticate_with_agent(
 /// The hash algorithm for RSA signatures, negotiated with the server; `None`
 /// for non-RSA keys (russh ignores it) and for servers that never sent
 /// extension info.
-async fn best_rsa_hash(handle: &client::Handle<AcceptAnyHostKey>, is_rsa: bool) -> Option<HashAlg> {
+async fn best_rsa_hash(handle: &client::Handle<HostKeyVerifier>, is_rsa: bool) -> Option<HashAlg> {
     if !is_rsa {
         return None;
     }
@@ -305,7 +465,7 @@ async fn best_rsa_hash(handle: &client::Handle<AcceptAnyHostKey>, is_rsa: bool) 
 /// `direct-tcpip` channel until the shutdown signal fires, then disconnects
 /// the SSH session. Dropping the `JoinSet` aborts in-flight copies.
 async fn accept_loop(
-    handle: client::Handle<AcceptAnyHostKey>,
+    handle: client::Handle<HostKeyVerifier>,
     listener: TcpListener,
     target_host: String,
     target_port: u16,
@@ -357,6 +517,26 @@ async fn accept_loop(
 mod tests {
     use super::*;
 
+    // Two distinct ed25519 host keys (OpenSSH one-line form).
+    const KEY_A: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
+    const KEY_B: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA6rWI3G1sz07DnfFlrouTcysQlj2P+jpNSOEWD9OJ3X";
+
+    fn pubkey(s: &str) -> PublicKey {
+        PublicKey::from_openssh(s).unwrap()
+    }
+
+    fn write_known_hosts(dir: &Path, name: &str, lines: &[&str]) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        path
+    }
+
+    fn info(host: &str) -> HostKeyInfo {
+        host_key_info(host, 22, &pubkey(KEY_A))
+    }
+
     #[test]
     fn errors_display_with_the_ssh_tunnel_prefix() {
         let cases = [
@@ -364,6 +544,8 @@ mod tests {
             TunnelError::Auth("rejected".into()),
             TunnelError::NeedsPassphrase("key k is encrypted".into()),
             TunnelError::Forward("bind failed".into()),
+            TunnelError::HostKeyUnknown(info("host")),
+            TunnelError::HostKeyChanged(info("host")),
         ];
         for err in cases {
             assert!(
@@ -381,6 +563,98 @@ mod tests {
         assert!(TunnelError::Forward("x".into())
             .to_string()
             .contains("port forwarding failed"));
+        // The MITM case shouts, and both host-key errors show the fingerprint.
+        assert!(TunnelError::HostKeyChanged(info("host"))
+            .to_string()
+            .contains("HOST KEY CHANGED"));
+        assert!(TunnelError::HostKeyUnknown(info("host"))
+            .to_string()
+            .contains("SHA256:"));
+    }
+
+    #[test]
+    fn host_key_info_carries_fingerprint_type_and_serialized_key() {
+        let got = host_key_info("db.internal", 2222, &pubkey(KEY_A));
+        assert_eq!(got.host, "db.internal");
+        assert_eq!(got.port, 2222);
+        assert_eq!(got.key_type, "ssh-ed25519");
+        assert!(got.fingerprint.starts_with("SHA256:"));
+        // The serialized key round-trips back to the same public key.
+        assert_eq!(pubkey(&got.key_openssh), pubkey(KEY_A));
+    }
+
+    #[test]
+    fn unknown_when_no_file_mentions_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("known_hosts"); // never created
+        let empty = write_known_hosts(dir.path(), "empty", &[]);
+        assert_eq!(
+            verify_host_key("example.com", 22, &pubkey(KEY_A), &[missing, empty]),
+            HostKeyStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn trusted_when_a_file_records_the_same_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_known_hosts(
+            dir.path(),
+            "known_hosts",
+            &[&format!("example.com {KEY_A}")],
+        );
+        assert_eq!(
+            verify_host_key("example.com", 22, &pubkey(KEY_A), &[path]),
+            HostKeyStatus::Trusted
+        );
+    }
+
+    #[test]
+    fn changed_when_a_file_records_a_different_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_known_hosts(
+            dir.path(),
+            "known_hosts",
+            &[&format!("example.com {KEY_A}")],
+        );
+        // Server now offers KEY_B for a host pinned to KEY_A.
+        assert_eq!(
+            verify_host_key("example.com", 22, &pubkey(KEY_B), &[path]),
+            HostKeyStatus::Changed
+        );
+    }
+
+    #[test]
+    fn a_matching_file_wins_over_a_mismatch_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        // The app store still pins the old key; the user's file has the new one.
+        let stale = write_known_hosts(dir.path(), "app", &[&format!("example.com {KEY_B}")]);
+        let good = write_known_hosts(dir.path(), "user", &[&format!("example.com {KEY_A}")]);
+        assert_eq!(
+            verify_host_key("example.com", 22, &pubkey(KEY_A), &[stale, good]),
+            HostKeyStatus::Trusted
+        );
+    }
+
+    #[test]
+    fn learning_a_key_makes_a_later_check_trust_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        // First contact: unknown. After learning: trusted — including on a
+        // non-standard port, which is recorded as `[host]:port`.
+        assert_eq!(
+            verify_host_key(
+                "db.internal",
+                2222,
+                &pubkey(KEY_A),
+                std::slice::from_ref(&path)
+            ),
+            HostKeyStatus::Unknown
+        );
+        learn_known_hosts_path("db.internal", 2222, &pubkey(KEY_A), &path).unwrap();
+        assert_eq!(
+            verify_host_key("db.internal", 2222, &pubkey(KEY_A), &[path]),
+            HostKeyStatus::Trusted
+        );
     }
 
     #[test]

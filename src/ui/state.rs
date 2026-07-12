@@ -17,7 +17,7 @@ use crate::db::{
     QueryResult, RowLocator, StatementResult, TableMeta, Value,
 };
 use crate::history::HistoryStore;
-use crate::tunnel::{Tunnel, TunnelAuth, TunnelConfig, TunnelError};
+use crate::tunnel::{HostKeyInfo, Tunnel, TunnelAuth, TunnelConfig, TunnelError};
 use crate::ui::stage::TableStage;
 
 /// Which screen the main panel shows: the connections screen or one open
@@ -258,6 +258,19 @@ pub struct PasswordPrompt {
     pub tunnel: Option<TunnelConfig>,
 }
 
+/// A pending host-key trust decision for a tunneled Postgres connect. The
+/// server presented a key not yet in known_hosts; the connect is parked here
+/// until the user trusts it (persist + retry) or cancels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostKeyPrompt {
+    pub url: String,
+    pub name: String,
+    /// Tunnel settings of the attempt, carried through so the retry resumes.
+    pub tunnel: TunnelConfig,
+    /// The offered key: what to display and, on trust, what to persist.
+    pub info: HostKeyInfo,
+}
+
 /// Keyring/session key for a connection's SSH key passphrase. The `#ssh`
 /// suffix keeps it disjoint from the database password stored under the
 /// bare URL (`#` cannot appear in a valid connection URL's serialized form
@@ -289,6 +302,9 @@ pub struct AppState {
     /// When set, the connections screen asks for this connection's password
     /// or SSH key passphrase.
     pub password_prompt: Signal<Option<PasswordPrompt>>,
+    /// When set, the connections screen asks the user to trust an unrecognized
+    /// SSH host key before the tunneled connect proceeds (trust-on-first-use).
+    pub host_key_prompt: Signal<Option<HostKeyPrompt>>,
     /// Live SSH tunnels, one per tunneled open connection. Removing an entry
     /// drops the [`Tunnel`], which shuts the forward down.
     pub tunnels: Signal<HashMap<ConnectionId, Tunnel>>,
@@ -402,6 +418,7 @@ impl AppState {
             connect_error: Signal::new(load_error),
             session_passwords: Signal::new(HashMap::new()),
             password_prompt: Signal::new(None),
+            host_key_prompt: Signal::new(None),
             tunnels: Signal::new(HashMap::new()),
             schemas: Signal::new(HashMap::new()),
             tab_ui: Signal::new(HashMap::new()),
@@ -671,6 +688,30 @@ impl AppState {
         }
     }
 
+    /// Completes the host-key trust prompt: records the offered key in
+    /// dataview's known_hosts store, then re-runs the connect (which now finds
+    /// the host trusted). A failure to persist surfaces as a connect error.
+    pub async fn trust_host_and_connect(mut self, prompt: HostKeyPrompt) {
+        self.host_key_prompt.set(None);
+        let Some(write_path) = crate::tunnel::app_known_hosts_path() else {
+            self.connect_error.set(Some(
+                "SSH tunnel: no config directory for known_hosts".to_string(),
+            ));
+            return;
+        };
+        if let Err(err) = crate::tunnel::trust_host_key(
+            &prompt.info.host,
+            prompt.info.port,
+            &prompt.info.key_openssh,
+            &write_path,
+        ) {
+            self.connect_error.set(Some(err.to_string()));
+            return;
+        }
+        self.connect_postgres(prompt.url, prompt.name, Some(prompt.tunnel))
+            .await;
+    }
+
     /// Puts an SSH key passphrase into session memory so the next tunnel
     /// open for `url` finds it.
     pub fn stash_ssh_passphrase(mut self, url: &str, passphrase: String) {
@@ -737,7 +778,8 @@ impl AppState {
                 return None;
             }
         };
-        match Tunnel::open(config.clone(), passphrase, target.0, target.1).await {
+        let known_hosts = crate::tunnel::default_known_hosts_read();
+        match Tunnel::open(config.clone(), passphrase, target.0, target.1, &known_hosts).await {
             Ok(live) => match url_via_local_port(url, live.local_port()) {
                 Ok(rewritten) => Some((rewritten, Some(live))),
                 Err(err) => {
@@ -760,6 +802,25 @@ impl AppState {
                     kind: PromptKind::SshPassphrase,
                     tunnel: Some(config.clone()),
                 }));
+                None
+            }
+            // First contact: park the connect behind a trust-on-first-use
+            // prompt instead of failing. Trusting persists the key and retries.
+            Err(TunnelError::HostKeyUnknown(info)) => {
+                self.connecting.write().retain(|l| l != url);
+                self.host_key_prompt.set(Some(HostKeyPrompt {
+                    url: url.to_string(),
+                    name: name.to_string(),
+                    tunnel: config.clone(),
+                    info,
+                }));
+                None
+            }
+            // A changed key is a possible MITM: refuse hard, never offer to
+            // trust it. The user must resolve it out-of-band (remove the stale
+            // known_hosts entry) before reconnecting.
+            Err(err @ TunnelError::HostKeyChanged(_)) => {
+                self.fail_connect(url, err.to_string());
                 None
             }
             Err(err) => {

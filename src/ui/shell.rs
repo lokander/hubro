@@ -477,6 +477,7 @@ fn ConnectionsScreen() -> Element {
     let mut show_pg_form = use_signal(|| false);
     let error = state.connect_error.read().clone();
     let prompt = state.password_prompt.read().clone();
+    let host_key_prompt = state.host_key_prompt.read().clone();
     let saved: Vec<SavedRow> = {
         let open = state.open_locators.read();
         state
@@ -604,6 +605,12 @@ fn ConnectionsScreen() -> Element {
                 // the db-password prompt for the same URL resets the input.
                 PasswordPromptCard { key: "{prompt.url}:{prompt.kind:?}", prompt }
             }
+            if let Some(host_key_prompt) = host_key_prompt {
+                HostKeyPromptCard {
+                    key: "{host_key_prompt.url}:{host_key_prompt.info.fingerprint}",
+                    prompt: host_key_prompt,
+                }
+            }
             div { class: "flex gap-3",
                 button {
                     class: "rounded bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500",
@@ -725,6 +732,53 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
                     onchange: move |evt| remember.set(evt.checked()),
                 }
                 "Remember in the system keyring (falls back to this session only)"
+            }
+        }
+    }
+}
+
+/// Trust-on-first-use prompt for an unrecognized SSH host key. Shows the
+/// server's fingerprint so the user can compare it out-of-band; trusting
+/// records the key in dataview's known_hosts store and retries the connect.
+#[component]
+fn HostKeyPromptCard(prompt: super::state::HostKeyPrompt) -> Element {
+    let state = use_context::<AppState>();
+    let prompt_for_trust = prompt.clone();
+    let trust = move || {
+        let prompt = prompt_for_trust.clone();
+        // spawn_forever: trusting clears `host_key_prompt`, unmounting this
+        // card — a scope-tied `spawn` would be cancelled mid-connect.
+        dioxus::core::spawn_forever(async move {
+            state.trust_host_and_connect(prompt).await;
+        });
+    };
+    rsx! {
+        div { class: "w-full max-w-xl rounded border border-amber-400 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/40 p-4",
+            p { class: "mb-1 text-sm font-medium text-amber-800 dark:text-amber-300",
+                "Unrecognized SSH host key"
+            }
+            p { class: "mb-2 text-xs text-slate-600 dark:text-slate-400",
+                "The server "
+                span { class: "font-mono text-slate-900 dark:text-slate-200",
+                    "{prompt.info.host}:{prompt.info.port}"
+                }
+                " is not in your known_hosts. Verify the fingerprint below matches the server before trusting it."
+            }
+            div { class: "mb-3 rounded bg-slate-100 dark:bg-slate-950 px-3 py-2 font-mono text-xs text-slate-800 dark:text-slate-200",
+                div { "{prompt.info.key_type}" }
+                div { class: "break-all", "{prompt.info.fingerprint}" }
+            }
+            div { class: "flex gap-2",
+                button {
+                    class: "rounded bg-amber-600 px-4 py-2 text-sm font-medium text-white hover:bg-amber-500",
+                    onclick: move |_| trust(),
+                    "Trust and connect"
+                }
+                button {
+                    class: "rounded px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
+                    onclick: move |_| state.host_key_prompt.clone().set(None),
+                    "Cancel"
+                }
             }
         }
     }
