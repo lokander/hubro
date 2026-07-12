@@ -177,7 +177,10 @@ fn verify_host_key(host: &str, port: u16, key: &PublicKey, files: &[PathBuf]) ->
 /// exactly these, so an honest server returns the recorded key type (which then
 /// verifies) while a substituted *different* type cannot silently downgrade a
 /// would-be [`HostKeyStatus::Changed`] into an [`HostKeyStatus::Unknown`] trust
-/// prompt — mirroring OpenSSH's preference for known host-key algorithms.
+/// prompt. This is stricter than OpenSSH, which merely *orders* known types
+/// first and still falls back to others: a server that legitimately rotates to
+/// a brand-new key type here fails negotiation with a generic connect error
+/// until the stale known_hosts entry is removed — a fail-closed trade-off.
 fn recorded_key_algorithms(host: &str, port: u16, files: &[PathBuf]) -> Vec<Algorithm> {
     let mut algorithms = Vec::new();
     for path in files {
