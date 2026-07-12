@@ -328,3 +328,46 @@ async fn postgres_script_commits_every_statement_on_success() {
     pool.execute("DROP TABLE script_ok").await.unwrap();
     pool.close().await;
 }
+
+#[tokio::test]
+async fn postgres_script_with_vacuum_runs_sequentially_and_keeps_prior_effects() {
+    let Some(url) = pg_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+
+    // VACUUM can't run inside a transaction block, so the script falls back to
+    // sequential autocommit — a later failure leaves earlier effects in place.
+    pool.execute("DROP TABLE IF EXISTS script_vac")
+        .await
+        .unwrap();
+    pool.execute("CREATE TABLE script_vac (a integer)")
+        .await
+        .unwrap();
+
+    let (results, outcome) = collect_script(
+        &pool,
+        "INSERT INTO script_vac VALUES (1), (2); \
+         VACUUM script_vac; \
+         SELECT * FROM missing_relation",
+    )
+    .await;
+
+    assert_eq!(results.len(), 2); // insert + vacuum ran; the select failed
+    let err = outcome.unwrap_err();
+    assert_eq!(err.statement_index, 2);
+    assert!(
+        !err.rolled_back,
+        "a VACUUM-containing script runs sequentially on Postgres too"
+    );
+
+    let rows = pool
+        .query("SELECT a FROM script_vac ORDER BY a")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.rows,
+        vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+    );
+
+    pool.execute("DROP TABLE script_vac").await.unwrap();
+    pool.close().await;
+}

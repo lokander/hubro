@@ -464,12 +464,12 @@ async fn run_script_atomic(
         }
     }
     if let Err(error) = tx.commit().await {
+        // The commit itself failed (e.g. a deferred-constraint violation), not
+        // any one statement — label it as such rather than blaming the last
+        // statement, which actually succeeded.
         return Err(ScriptError {
             statement_index: statements.len().saturating_sub(1),
-            preview: statements
-                .last()
-                .map(|s| statement_preview(s))
-                .unwrap_or_default(),
+            preview: "COMMIT".to_string(),
             error,
             rolled_back: true,
         });
@@ -498,14 +498,27 @@ fn manages_own_transaction(sql: &str) -> bool {
     )
 }
 
-/// Whether a statement cannot run inside a transaction block, so wrapping the
-/// script would make it fail. `VACUUM` applies to both backends; the rest are
-/// Postgres statements that error with "cannot run inside a transaction block".
+/// Whether a statement can't run (or won't take effect) inside a transaction
+/// block, so the script must run sequentially instead of wrapped. `VACUUM`
+/// applies to both backends; SQLite value-setting `PRAGMA`s are *silently
+/// ignored* in a transaction (worse than erroring — they'd vanish without a
+/// trace); the rest are Postgres statements that error with "cannot run inside
+/// a transaction block".
 fn is_non_transactional(dialect: Dialect, sql: &str) -> bool {
     let words = leading_words(sql, 2);
     let first = words.first().map(String::as_str).unwrap_or("");
     if first == "vacuum" {
         return true;
+    }
+    if dialect == Dialect::Sqlite && first == "pragma" {
+        // A value-setting PRAGMA (`= value` or `(value)`) is a no-op inside a
+        // transaction; keep the script sequential so it actually applies. This
+        // over-declines call-form read PRAGMAs (`PRAGMA table_info(t)`), but
+        // running those sequentially is harmless. Mirrors `needs_confirmation`.
+        let code = strip_strings_and_comments(sql);
+        if code.contains('=') || code.contains('(') {
+            return true;
+        }
     }
     if dialect == Dialect::Postgres {
         let second = words.get(1).map(String::as_str).unwrap_or("");
@@ -836,6 +849,27 @@ mod tests {
                 "INSERT INTO t VALUES ('run concurrently later')",
                 "UPDATE t SET a = 1",
             ])
+        ));
+    }
+
+    #[test]
+    fn sqlite_value_setting_pragmas_prevent_wrapping() {
+        // Setting PRAGMAs are silently ignored inside a transaction, so a
+        // script containing one must run sequentially to take effect.
+        for script in [
+            vec!["PRAGMA foreign_keys = OFF", "DELETE FROM t"],
+            vec!["PRAGMA journal_mode = WAL", "INSERT INTO t VALUES (1)"],
+            vec!["PRAGMA foreign_keys(0)", "DELETE FROM t"],
+        ] {
+            assert!(
+                !wrap_atomically(Dialect::Sqlite, &stmts(&script)),
+                "{script:?} should run sequentially so the PRAGMA applies"
+            );
+        }
+        // A bare read PRAGMA (no value) is transaction-safe, so it still wraps.
+        assert!(wrap_atomically(
+            Dialect::Sqlite,
+            &stmts(&["PRAGMA user_version", "INSERT INTO t VALUES (1)"])
         ));
     }
 
