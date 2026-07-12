@@ -308,6 +308,26 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         }
     });
 
+    // Clamp the page if the row count shrank below the current offset — e.g. a
+    // delete or an external write (via Refresh) leaves the table with fewer
+    // pages than the one being viewed. Without this the footer reads
+    // "rows 301–300 of 250" and the page sits empty (FRE-42). Only acts on a
+    // resolved count; setting the page re-runs this once with a now-valid page,
+    // so it settles without looping.
+    use_effect(move || {
+        if *count_resource.state().read() == UseResourceState::Pending {
+            return;
+        }
+        let total = match count_resource.read().as_ref() {
+            Some(Ok(total)) => *total,
+            _ => return,
+        };
+        let last_page = total.saturating_sub(1) / PAGE_SIZE as u64;
+        if page() > last_page {
+            page.set(last_page);
+        }
+    });
+
     // Keyboard-navigation model of the visible page (FRE-15): recomputed with
     // the fetched page and the stage, read by the grid container's key handler
     // for focus movement and Enter. Mirrors the render's row prep (view_rows)

@@ -899,12 +899,13 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
             let port = if port_text.is_empty() {
                 22
             } else {
-                match port_text.parse() {
-                    Ok(port) => port,
-                    Err(_) => {
+                match port_text.parse::<u16>() {
+                    // 0 parses as a valid u16 but is not a usable port.
+                    Ok(0) | Err(_) => {
                         form_error.set(Some(format!("invalid SSH port: {port_text}")));
                         return;
                     }
+                    Ok(port) => port,
                 }
             };
             let user = ssh_user.peek().trim().to_string();

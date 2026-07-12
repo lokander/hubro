@@ -455,7 +455,10 @@ impl AppState {
             history_error: Signal::new_in_scope(None, ScopeId::ROOT),
             history_nonce: Signal::new_in_scope(0, ScopeId::ROOT),
             history_recording: Signal::new_in_scope(true, ScopeId::ROOT),
-            theme: Signal::new(theme),
+            // Root-scoped: the startup detection task below (a
+            // `spawn_forever` running in the root scope) reads it, so a
+            // component-scoped signal would trip `__copy_value_hoisted`.
+            theme: Signal::new_in_scope(theme, ScopeId::ROOT),
             // Start from the persisted theme assuming a light system default;
             // the startup detection task (below) corrects `System`. Root-
             // scoped: written from that spawn_forever task.
