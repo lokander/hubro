@@ -169,12 +169,15 @@ pub enum RunStatus {
     },
     /// The statement at `statement_index` (0-based, into the script)
     /// failed. Outcomes of the statements before it stay visible in
-    /// [`SqlRun::statements`].
+    /// [`SqlRun::statements`]. `rolled_back` distinguishes an atomic run (the
+    /// whole script was undone) from a sequential one (earlier statements
+    /// persisted).
     Failed {
         error: String,
         statement_index: usize,
         preview: String,
         elapsed_ms: u64,
+        rolled_back: bool,
     },
     /// The user aborted the run. Outcomes of the statements that finished
     /// before the abort stay visible; the in-flight statement may still
@@ -1142,6 +1145,7 @@ impl AppState {
                         statement_index: err.statement_index,
                         preview: err.preview,
                         elapsed_ms,
+                        rolled_back: err.rolled_back,
                     },
                 };
             }

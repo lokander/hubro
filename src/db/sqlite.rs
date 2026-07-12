@@ -156,9 +156,37 @@ pub async fn query_capped(
     max_rows: u64,
     cell_cap: usize,
 ) -> Result<(QueryResult, bool), DbError> {
+    let stream = bind_params(sqlx::query(sql), params).fetch(pool);
+    collect_capped(stream, max_rows, cell_cap).await
+}
+
+/// [`query_capped`] against a single connection (e.g. one borrowed from a
+/// transaction) rather than the pool — the read path for statements inside an
+/// atomically-wrapped script (FRE-38). No bound params: scripts are raw text.
+pub async fn query_capped_conn(
+    conn: &mut sqlx::sqlite::SqliteConnection,
+    sql: &str,
+    max_rows: u64,
+    cell_cap: usize,
+) -> Result<(QueryResult, bool), DbError> {
+    let stream = sqlx::query(sql).fetch(&mut *conn);
+    collect_capped(stream, max_rows, cell_cap).await
+}
+
+/// Drains a row stream into a bounded [`QueryResult`], keeping at most
+/// `max_rows` rows and capping each cell to `cell_cap` bytes; the bool is
+/// whether rows existed past the cap. Shared by the pool and single-connection
+/// capped readers.
+async fn collect_capped<S>(
+    mut stream: S,
+    max_rows: u64,
+    cell_cap: usize,
+) -> Result<(QueryResult, bool), DbError>
+where
+    S: futures_util::Stream<Item = Result<SqliteRow, sqlx::Error>> + Unpin,
+{
     use futures_util::TryStreamExt as _;
 
-    let mut stream = bind_params(sqlx::query(sql), params).fetch(pool);
     let mut columns: Vec<ColumnInfo> = Vec::new();
     let mut out_rows: Vec<Vec<Value>> = Vec::new();
     let mut truncated = false;

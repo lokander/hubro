@@ -1,14 +1,17 @@
-//! Multi-statement SQL scripts: splitting, classification, and sequential
-//! execution.
+//! Multi-statement SQL scripts: splitting, classification, and execution.
 //!
 //! [`split_statements`] is a lexer-level splitter — it understands quotes,
 //! comments, and dollar-quoting well enough to find statement boundaries,
 //! without parsing SQL. [`run_script`] executes the statements one by one,
-//! stopping at the first error; there is no transaction wrapping, so
-//! earlier statements' effects persist (v1 semantics — explicit
-//! BEGIN/COMMIT in the script works as usual).
+//! stopping at the first error. A multi-statement script runs **atomically**
+//! in one transaction ([`wrap_atomically`]) — a mid-script failure rolls the
+//! whole thing back — unless it manages transactions itself (`BEGIN`/`COMMIT`)
+//! or contains a statement that can't run inside a transaction (e.g. `VACUUM`,
+//! Postgres `CREATE INDEX CONCURRENTLY`), in which case it falls back to
+//! sequential autocommit and earlier statements' effects persist.
 
 use super::error::DbError;
+use super::page::Dialect;
 use super::registry::{DbPool, MAX_QUERY_ROWS};
 use super::value::QueryResult;
 
@@ -337,8 +340,7 @@ pub struct StatementResult {
     pub truncated: bool,
 }
 
-/// Where and how a script failed. Statements before `statement_index`
-/// completed and their effects persist (no transaction wrapping).
+/// Where and how a script failed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScriptError {
     /// Index into the script's statement list.
@@ -346,12 +348,34 @@ pub struct ScriptError {
     /// Preview of the failing statement.
     pub preview: String,
     pub error: DbError,
+    /// Whether the whole script was rolled back (atomic run) rather than
+    /// leaving the statements before `statement_index` committed (sequential
+    /// run). The editor surfaces this so the user knows the database state.
+    pub rolled_back: bool,
 }
 
-/// Runs a script's statements sequentially, calling `on_result` after each
-/// successful statement (so callers can show progress), and stopping at the
-/// first failure.
+/// Runs a script's statements, calling `on_result` after each successful
+/// statement (so callers can show progress) and stopping at the first failure.
+///
+/// Multi-statement scripts run atomically in one transaction unless
+/// [`wrap_atomically`] declines (self-managed transactions or a
+/// non-transactional statement) — then they run sequentially in autocommit,
+/// as before.
 pub async fn run_script(
+    pool: &DbPool,
+    statements: &[String],
+    on_result: impl FnMut(StatementResult),
+) -> Result<(), ScriptError> {
+    if wrap_atomically(pool.dialect(), statements) {
+        run_script_atomic(pool, statements, on_result).await
+    } else {
+        run_script_sequential(pool, statements, on_result).await
+    }
+}
+
+/// The autocommit path: each statement commits on its own, so a failure leaves
+/// earlier statements' effects in place (`rolled_back: false`).
+async fn run_script_sequential(
     pool: &DbPool,
     statements: &[String],
     mut on_result: impl FnMut(StatementResult),
@@ -380,11 +404,137 @@ pub async fn run_script(
                     statement_index,
                     preview: statement_preview(statement),
                     error,
+                    rolled_back: false,
                 })
             }
         }
     }
     Ok(())
+}
+
+/// The atomic path: all statements run in one transaction, committed only if
+/// every statement succeeds. Any failure (including a failed commit) rolls the
+/// whole script back (`rolled_back: true`).
+async fn run_script_atomic(
+    pool: &DbPool,
+    statements: &[String],
+    mut on_result: impl FnMut(StatementResult),
+) -> Result<(), ScriptError> {
+    let mut tx = match pool.begin_script_tx().await {
+        Ok(tx) => tx,
+        // Opening the transaction failed: nothing ran, so nothing rolled back.
+        Err(error) => {
+            return Err(ScriptError {
+                statement_index: 0,
+                preview: statements
+                    .first()
+                    .map(|s| statement_preview(s))
+                    .unwrap_or_default(),
+                error,
+                rolled_back: false,
+            })
+        }
+    };
+    for (statement_index, statement) in statements.iter().enumerate() {
+        let outcome = match classify_statement(statement) {
+            StatementKind::Read => tx
+                .query_capped(statement, MAX_QUERY_ROWS)
+                .await
+                .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated)),
+            StatementKind::Write => tx
+                .execute(statement)
+                .await
+                .map(|affected| (StatementOutcome::Affected(affected), false)),
+        };
+        match outcome {
+            Ok((outcome, truncated)) => on_result(StatementResult {
+                preview: statement_preview(statement),
+                outcome,
+                truncated,
+            }),
+            Err(error) => {
+                tx.rollback().await;
+                return Err(ScriptError {
+                    statement_index,
+                    preview: statement_preview(statement),
+                    error,
+                    rolled_back: true,
+                });
+            }
+        }
+    }
+    if let Err(error) = tx.commit().await {
+        return Err(ScriptError {
+            statement_index: statements.len().saturating_sub(1),
+            preview: statements
+                .last()
+                .map(|s| statement_preview(s))
+                .unwrap_or_default(),
+            error,
+            rolled_back: true,
+        });
+    }
+    Ok(())
+}
+
+/// Whether a script should run atomically in one transaction. Only for
+/// multi-statement scripts, and only when none of the statements manages its
+/// own transaction ([`manages_own_transaction`]) or must run outside one
+/// ([`is_non_transactional`]) — wrapping either would error at `BEGIN` or on
+/// the offending statement.
+pub fn wrap_atomically(dialect: Dialect, statements: &[String]) -> bool {
+    statements.len() > 1
+        && !statements
+            .iter()
+            .any(|s| manages_own_transaction(s) || is_non_transactional(dialect, s))
+}
+
+/// Whether a statement issues its own transaction control, so the script is
+/// managing atomicity itself and must not be wrapped again.
+fn manages_own_transaction(sql: &str) -> bool {
+    matches!(
+        leading_words(sql, 1).first().map(String::as_str),
+        Some("begin" | "start" | "commit" | "rollback" | "savepoint" | "release" | "end")
+    )
+}
+
+/// Whether a statement cannot run inside a transaction block, so wrapping the
+/// script would make it fail. `VACUUM` applies to both backends; the rest are
+/// Postgres statements that error with "cannot run inside a transaction block".
+fn is_non_transactional(dialect: Dialect, sql: &str) -> bool {
+    let words = leading_words(sql, 2);
+    let first = words.first().map(String::as_str).unwrap_or("");
+    if first == "vacuum" {
+        return true;
+    }
+    if dialect == Dialect::Postgres {
+        let second = words.get(1).map(String::as_str).unwrap_or("");
+        if matches!(
+            (first, second),
+            ("create" | "drop", "database")
+                | ("create" | "drop", "tablespace")
+                | ("alter", "system")
+        ) {
+            return true;
+        }
+        // CREATE/DROP INDEX CONCURRENTLY, REINDEX … CONCURRENTLY.
+        if has_top_level_word(sql, |word| word.eq_ignore_ascii_case("concurrently")) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The first `n` word tokens of a statement (lowercased), with strings and
+/// comments removed so a leading comment or quoted text can't masquerade as a
+/// keyword.
+fn leading_words(sql: &str, n: usize) -> Vec<String> {
+    strip_strings_and_comments(sql)
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|word| !word.is_empty())
+        .take(n)
+        .map(|word| word.to_ascii_lowercase())
+        .collect()
 }
 
 #[cfg(test)]
@@ -603,6 +753,90 @@ mod tests {
         assert_eq!(preview.chars().count(), 61);
         assert!(preview.ends_with('…'));
         assert!(preview.starts_with("SELECT 'xxx"));
+    }
+
+    fn stmts(sqls: &[&str]) -> Vec<String> {
+        sqls.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn multi_statement_scripts_wrap_atomically_by_default() {
+        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+            assert!(wrap_atomically(
+                dialect,
+                &stmts(&["INSERT INTO t VALUES (1)", "UPDATE t SET a = 2"])
+            ));
+            // Mixed read/write still wraps.
+            assert!(wrap_atomically(
+                dialect,
+                &stmts(&["DELETE FROM t WHERE a = 1", "SELECT count(*) FROM t"])
+            ));
+        }
+    }
+
+    #[test]
+    fn single_statement_scripts_do_not_wrap() {
+        // One statement is already atomic under autocommit — nothing to wrap.
+        assert!(!wrap_atomically(
+            Dialect::Sqlite,
+            &stmts(&["DELETE FROM t"])
+        ));
+        assert!(!wrap_atomically(
+            Dialect::Postgres,
+            &stmts(&["DELETE FROM t"])
+        ));
+    }
+
+    #[test]
+    fn scripts_managing_their_own_transaction_do_not_wrap() {
+        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+            for script in [
+                vec!["BEGIN", "INSERT INTO t VALUES (1)", "COMMIT"],
+                vec!["begin transaction", "UPDATE t SET a = 1", "commit"],
+                vec!["START TRANSACTION", "DELETE FROM t", "ROLLBACK"],
+                vec!["SAVEPOINT s", "INSERT INTO t VALUES (1)"],
+            ] {
+                assert!(
+                    !wrap_atomically(dialect, &stmts(&script)),
+                    "{script:?} manages its own transaction"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_transactional_statements_prevent_wrapping() {
+        // VACUUM can't run inside a transaction on either backend.
+        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+            assert!(!wrap_atomically(
+                dialect,
+                &stmts(&["DELETE FROM t", "VACUUM"])
+            ));
+        }
+        // Postgres statements that error inside a transaction block.
+        for script in [
+            vec![
+                "CREATE TABLE t (a int)",
+                "CREATE INDEX CONCURRENTLY i ON t (a)",
+            ],
+            vec!["SELECT 1", "DROP INDEX CONCURRENTLY i"],
+            vec!["SELECT 1", "CREATE DATABASE other"],
+            vec!["SELECT 1", "DROP DATABASE other"],
+            vec!["SELECT 1", "ALTER SYSTEM SET work_mem = '64MB'"],
+        ] {
+            assert!(
+                !wrap_atomically(Dialect::Postgres, &stmts(&script)),
+                "{script:?} can't run in a transaction on Postgres"
+            );
+        }
+        // `CONCURRENTLY` inside a string/comment must not trip the check.
+        assert!(wrap_atomically(
+            Dialect::Postgres,
+            &stmts(&[
+                "INSERT INTO t VALUES ('run concurrently later')",
+                "UPDATE t SET a = 1",
+            ])
+        ));
     }
 
     #[test]
