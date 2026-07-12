@@ -967,7 +967,7 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
             None
         };
         let built = if *use_url.peek() {
-            crate::db::sanitized_url(&pasted_url.peek())
+            crate::db::normalize_pg_url(&pasted_url.peek())
         } else {
             crate::db::build_url(
                 &host.peek(),

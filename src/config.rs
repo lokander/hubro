@@ -378,12 +378,32 @@ pub struct SavedList {
     load_failed: bool,
 }
 
+/// Canonicalizes Postgres URLs (FRE-39) and drops entries that collapse to an
+/// already-present locator — upgrading a list saved before normalization
+/// existed (e.g. `postgresql://` or a portless URL) and de-duplicating it. The
+/// first entry for each locator wins, so its name is kept.
+fn normalize_and_dedup(entries: Vec<SavedConnection>) -> Vec<SavedConnection> {
+    let mut out: Vec<SavedConnection> = Vec::new();
+    for mut entry in entries {
+        if let SavedConnection::Postgres { url, .. } = &mut entry {
+            if let Ok(normalized) = crate::db::normalize_pg_url(url) {
+                *url = normalized;
+            }
+        }
+        let locator = entry.locator();
+        if !out.iter().any(|existing| existing.locator() == locator) {
+            out.push(entry);
+        }
+    }
+    out
+}
+
 impl SavedList {
     pub fn load(path: &Path) -> (Self, Option<ConfigError>) {
         match load_connections(path) {
             Ok(entries) => (
                 Self {
-                    entries,
+                    entries: normalize_and_dedup(entries),
                     load_failed: false,
                 },
                 None,
@@ -484,6 +504,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nope").join("connections.toml");
         assert_eq!(load_connections(&path).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn load_normalizes_and_dedups_equivalent_postgres_entries() {
+        // A list saved before normalization: three spellings of one server plus
+        // a distinct one.
+        let entries = vec![
+            saved_pg("primary", "postgresql://u@Host/db"),
+            saved_pg("dup-a", "postgres://u@host:5432/db"),
+            saved_pg("dup-b", "postgres://u@host/db"),
+            saved_pg("other", "postgres://u@other:5432/db2"),
+        ];
+        let deduped = normalize_and_dedup(entries);
+
+        assert_eq!(
+            deduped.len(),
+            2,
+            "the three equivalent forms collapse to one"
+        );
+        // First entry wins (its name is kept) and its URL is canonical.
+        assert_eq!(deduped[0].name(), "primary");
+        assert_eq!(deduped[0].locator(), "postgres://u@host:5432/db");
+        assert_eq!(deduped[1].name(), "other");
+        // Sqlite entries pass through untouched.
+        let mixed = normalize_and_dedup(vec![saved("m.db", "/data/m.db")]);
+        assert_eq!(mixed.len(), 1);
     }
 
     #[test]

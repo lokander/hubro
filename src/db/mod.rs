@@ -26,7 +26,9 @@ pub use page::{
     classify_column, ColumnClass, Dialect, Filter, FilterOp, Page, PageRequest, PreviewInfo,
     SortDir, PREVIEW_BYTES,
 };
-pub use postgres::{build_url, sanitized_url, url_target, url_via_local_port, url_with_password};
+pub use postgres::{
+    build_url, normalize_pg_url, url_target, url_via_local_port, url_with_password,
+};
 pub use registry::{
     CellFetch, Connection, ConnectionId, ConnectionRegistry, DbPool, FETCH_CELL_MAX_BYTES,
     MAX_QUERY_ROWS, QUERY_CELL_CAP,
