@@ -6,7 +6,7 @@ use crate::db::{
     needs_confirmation, ConnectionId, Dialect, ExportFormat, QueryResult, StatementOutcome,
     StatementResult, TableMeta, Value, MAX_QUERY_ROWS,
 };
-use crate::history::HistoryEntry;
+use crate::history::{HistoryEntry, HISTORY_CAP};
 
 use super::notice::{Banner, BannerKind, EmptyState, LoadingLine};
 use super::state::{AppState, ExportStatus, RunStatus, SchemaLoad};
@@ -200,8 +200,10 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
     }
 }
 
-/// Cap on entries the history panel fetches per query.
-const HISTORY_PANEL_LIMIT: i64 = 200;
+/// Cap on entries the history panel fetches per query. Matches the store's
+/// retention cap so every persisted entry is reachable by scrolling, not only
+/// via search (FRE-42).
+const HISTORY_PANEL_LIMIT: i64 = HISTORY_CAP;
 
 /// Right-side panel listing the current connection's persisted query
 /// history: search, per-entry Load / Run / Copy, clear-history, and the

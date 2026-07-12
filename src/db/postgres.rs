@@ -124,11 +124,14 @@ pub fn build_url(
     parsed
         .set_host(Some(host.trim()))
         .map_err(|e| DbError::Connect(format!("invalid host: {e}")))?;
+    let port_num: u16 = port
+        .parse()
+        .map_err(|_| DbError::Connect(format!("invalid port: {port}")))?;
+    if port_num == 0 {
+        return Err(DbError::Connect("port must be between 1 and 65535".into()));
+    }
     parsed
-        .set_port(Some(
-            port.parse()
-                .map_err(|_| DbError::Connect(format!("invalid port: {port}")))?,
-        ))
+        .set_port(Some(port_num))
         .map_err(|_| DbError::Connect("invalid port".into()))?;
     parsed
         .set_username(user.trim())
@@ -1003,6 +1006,13 @@ mod tests {
         // Already canonical: idempotent.
         let canonical = "postgres://user@db.example.com:5432/app";
         assert_eq!(normalize_pg_url(canonical).unwrap(), canonical);
+    }
+
+    #[test]
+    fn build_url_rejects_a_zero_port() {
+        // 0 parses as a valid u16 but is not a usable port (FRE-42).
+        assert!(build_url("host", "0", "db", "user", "").is_err());
+        assert!(build_url("host", "70000", "db", "user", "").is_err());
     }
 
     #[test]
