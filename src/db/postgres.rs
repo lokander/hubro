@@ -34,9 +34,18 @@ pub fn url_with_password(url: &str, password: &str) -> Result<String, DbError> {
     Ok(parsed.into())
 }
 
-/// Strips any password so the URL is safe to persist; also validates the
-/// scheme.
-pub fn sanitized_url(url: &str) -> Result<String, DbError> {
+/// Canonicalizes a Postgres URL into the stable form used as a saved-connection
+/// locator and keyring account key, so the same server written different ways
+/// maps to one entry and one stored secret. Validates the scheme, then:
+///
+/// - strips any password (never persisted),
+/// - rewrites `postgresql://` to `postgres://`,
+/// - lowercases the host (DNS is case-insensitive; IP literals are unaffected),
+/// - fills the default port `5432` when omitted, so `host` and `host:5432`
+///   coincide.
+///
+/// Query params (e.g. `sslmode`) and the database path are left as-is.
+pub fn normalize_pg_url(url: &str) -> Result<String, DbError> {
     let mut parsed =
         url::Url::parse(url.trim()).map_err(|e| DbError::Connect(format!("invalid URL: {e}")))?;
     if parsed.scheme() != "postgres" && parsed.scheme() != "postgresql" {
@@ -45,7 +54,24 @@ pub fn sanitized_url(url: &str) -> Result<String, DbError> {
             parsed.scheme()
         )));
     }
+    if parsed.scheme() == "postgresql" {
+        // Both are non-special schemes, so this never fails; ignore defensively.
+        let _ = parsed.set_scheme("postgres");
+    }
     let _ = parsed.set_password(None);
+    if let Some(host) = parsed.host_str() {
+        let lowered = host.to_ascii_lowercase();
+        if lowered != host {
+            parsed
+                .set_host(Some(&lowered))
+                .map_err(|e| DbError::Connect(format!("invalid host: {e}")))?;
+        }
+    }
+    if parsed.port().is_none() {
+        // postgres is a non-special scheme, so the url crate always serializes
+        // an explicit port — the bare and `:5432` forms now serialize equal.
+        let _ = parsed.set_port(Some(5432));
+    }
     Ok(parsed.into())
 }
 
@@ -111,7 +137,9 @@ pub fn build_url(
     if !sslmode.is_empty() {
         parsed.set_query(Some(&format!("sslmode={sslmode}")));
     }
-    Ok(parsed.into())
+    // Route through the normalizer so a form host typed as `MyHost` and a
+    // pasted `myhost` URL land on the same canonical locator.
+    normalize_pg_url(parsed.as_str())
 }
 
 /// Connects to Postgres from a URL (`postgres://user@host:port/db?sslmode=…`).
@@ -925,13 +953,42 @@ mod tests {
     }
 
     #[test]
-    fn sanitized_url_strips_password_and_checks_scheme() {
+    fn normalize_strips_password_and_checks_scheme() {
         assert_eq!(
-            sanitized_url(" postgres://u:secret@h:5432/db?sslmode=require ").unwrap(),
+            normalize_pg_url(" postgres://u:secret@h:5432/db?sslmode=require ").unwrap(),
             "postgres://u@h:5432/db?sslmode=require"
         );
-        assert!(sanitized_url("mysql://u@h/db").is_err());
-        assert!(sanitized_url("not a url").is_err());
+        assert!(normalize_pg_url("mysql://u@h/db").is_err());
+        assert!(normalize_pg_url("not a url").is_err());
+    }
+
+    #[test]
+    fn normalize_canonicalizes_scheme_host_and_port() {
+        // postgresql → postgres, default port filled, host lowercased.
+        assert_eq!(
+            normalize_pg_url("postgresql://user@Db.Example.COM/app").unwrap(),
+            "postgres://user@db.example.com:5432/app"
+        );
+        // Already canonical: idempotent.
+        let canonical = "postgres://user@db.example.com:5432/app";
+        assert_eq!(normalize_pg_url(canonical).unwrap(), canonical);
+    }
+
+    #[test]
+    fn equivalent_urls_normalize_to_the_same_locator() {
+        // The same server written five ways must collapse to one locator, so a
+        // saved list dedups and the keyring key matches.
+        let forms = [
+            "postgres://user@host:5432/db",
+            "postgresql://user@host:5432/db",
+            "postgres://user@host/db",
+            "postgresql://user@HOST/db",
+            "postgres://user:pw@host/db",
+        ];
+        let canonical = normalize_pg_url(forms[0]).unwrap();
+        for form in forms {
+            assert_eq!(normalize_pg_url(form).unwrap(), canonical, "{form}");
+        }
     }
 
     #[test]
