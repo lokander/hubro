@@ -233,7 +233,10 @@ async fn acquire_interactive(
         .local_addr()
         .map_err(|e| AzureError::Http(format!("reading the local port: {e}")))?
         .port();
-    let redirect_uri = format!("http://localhost:{port}/");
+    // 127.0.0.1 (not `localhost`) to match the bind exactly and follow
+    // Microsoft's loopback-redirect guidance (avoids a `::1` vs `127.0.0.1`
+    // mismatch on dual-stack hosts).
+    let redirect_uri = format!("http://127.0.0.1:{port}/");
 
     let url = authorize_url(
         &endpoints.login,
@@ -269,17 +272,35 @@ async fn wait_for_redirect(
         .map_err(|_| AzureError::Timeout)?
         .map_err(|e| AzureError::Http(format!("accepting the redirect: {e}")))?;
 
-    let mut buf = vec![0u8; 8192];
-    let n = stream
-        .read(&mut buf)
-        .await
-        .map_err(|e| AzureError::Http(format!("reading the redirect: {e}")))?;
-    let request = String::from_utf8_lossy(&buf[..n]);
-    let target = request
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("/");
+    // Read until the request line (ends at the first CRLF) is complete — a long
+    // authorization code could span more than one TCP segment. Capped so a
+    // rogue client can't stream forever.
+    let mut buf: Vec<u8> = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 2048];
+    loop {
+        if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
+            buf.truncate(pos);
+            break;
+        }
+        if buf.len() > 64 * 1024 {
+            return Err(AzureError::Http("redirect request too large".to_string()));
+        }
+        let n = stream
+            .read(&mut chunk)
+            .await
+            .map_err(|e| AzureError::Http(format!("reading the redirect: {e}")))?;
+        if n == 0 {
+            break; // connection closed before a full request line
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let request_line = String::from_utf8_lossy(&buf);
+    let target = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("/")
+        .to_string();
+    let target = target.as_str();
 
     let result = parse_redirect(target, expected_state);
     // Always answer the browser, whether the redirect was good or not.
@@ -505,6 +526,9 @@ fn oauth_error(body: &str, status: u16) -> AzureError {
 
 fn http_client() -> Result<reqwest::Client, AzureError> {
     reqwest::Client::builder()
+        // Bound every token/IMDS call so a hung endpoint (or a managed-identity
+        // probe outside Azure) can't block the connect indefinitely.
+        .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| AzureError::Http(e.to_string()))
 }
