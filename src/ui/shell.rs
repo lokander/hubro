@@ -543,6 +543,7 @@ struct SavedRow {
     is_postgres: bool,
     is_open: bool,
     tunnel: Option<crate::tunnel::TunnelConfig>,
+    auth: crate::config::PgAuth,
 }
 
 /// Launch screen: the persisted saved-connections list plus add flows for
@@ -554,6 +555,7 @@ fn ConnectionsScreen() -> Element {
     let error = state.connect_error.read().clone();
     let prompt = state.password_prompt.read().clone();
     let host_key_prompt = state.host_key_prompt.read().clone();
+    let entra_prompt = state.entra_prompt.read().clone();
     let saved: Vec<SavedRow> = {
         let open = state.open_locators.read();
         state
@@ -568,9 +570,11 @@ fn ConnectionsScreen() -> Element {
                     }
                     crate::config::SavedConnection::Postgres { url, .. } => url.clone(),
                 };
-                let tunnel = match s {
-                    crate::config::SavedConnection::Postgres { tunnel, .. } => tunnel.clone(),
-                    _ => None,
+                let (tunnel, auth) = match s {
+                    crate::config::SavedConnection::Postgres { tunnel, auth, .. } => {
+                        (tunnel.clone(), auth.clone())
+                    }
+                    _ => (None, crate::config::PgAuth::Password),
                 };
                 SavedRow {
                     name: s.name().to_string(),
@@ -578,6 +582,7 @@ fn ConnectionsScreen() -> Element {
                     is_postgres: matches!(s, crate::config::SavedConnection::Postgres { .. }),
                     is_open: open.iter().any(|(_, l)| *l == canonical_locator),
                     tunnel,
+                    auth,
                 }
             })
             .collect()
@@ -628,7 +633,12 @@ fn ConnectionsScreen() -> Element {
                                         spawn(async move {
                                             if row.is_postgres {
                                                 state
-                                                    .connect_postgres(row.locator, row.name, row.tunnel)
+                                                    .connect_postgres(
+                                                        row.locator,
+                                                        row.name,
+                                                        row.tunnel,
+                                                        row.auth,
+                                                    )
                                                     .await;
                                             } else {
                                                 state.connect(PathBuf::from(row.locator)).await;
@@ -686,6 +696,9 @@ fn ConnectionsScreen() -> Element {
                     key: "{host_key_prompt.url}:{host_key_prompt.info.fingerprint}",
                     prompt: host_key_prompt,
                 }
+            }
+            if let Some(entra_prompt) = entra_prompt {
+                EntraSignInCard { key: "{entra_prompt.url}", prompt: entra_prompt }
             }
             div { class: "flex gap-3",
                 button {
@@ -759,6 +772,7 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
                             tunnel,
                             entered,
                             remember_choice,
+                            prompt.auth,
                         )
                         .await;
                 }
@@ -860,10 +874,53 @@ fn HostKeyPromptCard(prompt: super::state::HostKeyPrompt) -> Element {
     }
 }
 
+/// Interactive Entra sign-in prompt (FRE-44). A Postgres connect needs a
+/// Microsoft browser sign-in (no cached refresh token); the button opens the
+/// browser and completes the connect, Cancel abandons it.
+#[component]
+fn EntraSignInCard(prompt: super::state::EntraPrompt) -> Element {
+    let state = use_context::<AppState>();
+    let prompt_for_signin = prompt.clone();
+    let sign_in = move || {
+        let prompt = prompt_for_signin.clone();
+        // spawn_forever: signing in clears `entra_prompt`, unmounting this card;
+        // a scope-tied spawn would be cancelled mid sign-in.
+        dioxus::core::spawn_forever(async move {
+            state.connect_postgres_with_entra_signin(prompt).await;
+        });
+    };
+    rsx! {
+        div { class: "w-full max-w-xl rounded border border-sky-300 dark:border-sky-800 bg-slate-50 dark:bg-slate-950/80 p-4",
+            p { class: "mb-1 text-sm font-medium text-slate-900 dark:text-slate-200",
+                "Sign in with Microsoft"
+            }
+            p { class: "mb-3 text-xs text-slate-600 dark:text-slate-400",
+                "Connecting to "
+                span { class: "font-mono text-cyan-700 dark:text-cyan-300", "{prompt.name}" }
+                " opens your browser to sign in to Microsoft Entra ID."
+            }
+            div { class: "flex gap-2",
+                button {
+                    class: "rounded bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500",
+                    onclick: move |_| sign_in(),
+                    "Sign in with Microsoft"
+                }
+                button {
+                    class: "rounded px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
+                    onclick: move |_| state.entra_prompt.clone().set(None),
+                    "Cancel"
+                }
+            }
+        }
+    }
+}
+
 /// Add-Postgres panel: individual fields or a pasted URL, plus an optional
 /// SSH tunnel.
 #[component]
 fn PostgresForm(on_done: EventHandler<()>) -> Element {
+    use crate::azure::EntraAuth;
+    use crate::config::PgAuth;
     use crate::tunnel::{TunnelAuth, TunnelConfig};
     let state = use_context::<AppState>();
     let mut use_url = use_signal(|| false);
@@ -875,6 +932,10 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
     let mut password = use_signal(String::new);
     let mut remember = use_signal(|| true);
     let mut sslmode = use_signal(|| "prefer".to_string());
+    // Authentication: "password" (default), "entra-interactive", or "entra-mi".
+    let mut auth_mode = use_signal(|| "password".to_string());
+    let mut entra_tenant = use_signal(|| "organizations".to_string());
+    let mut entra_client_id = use_signal(String::new);
     let mut pasted_url = use_signal(String::new);
     let mut use_tunnel = use_signal(|| false);
     let mut ssh_host = use_signal(String::new);
@@ -993,6 +1054,29 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                 entered
             }
         };
+        // Authentication mode from the selector (FRE-44). Entra takes the
+        // `user` field as the Entra principal; a token replaces the password.
+        let auth: PgAuth = match auth_mode.peek().as_str() {
+            "entra-interactive" => {
+                let tenant = entra_tenant.peek().trim().to_string();
+                if tenant.is_empty() {
+                    form_error.set(Some("the Entra tenant must not be empty".to_string()));
+                    return;
+                }
+                let client = entra_client_id.peek().trim().to_string();
+                PgAuth::Entra(EntraAuth::Interactive {
+                    tenant,
+                    client_id: (!client.is_empty()).then_some(client),
+                })
+            }
+            "entra-mi" => {
+                let client = entra_client_id.peek().trim().to_string();
+                PgAuth::Entra(EntraAuth::ManagedIdentity {
+                    client_id: (!client.is_empty()).then_some(client),
+                })
+            }
+            _ => PgAuth::Password,
+        };
         let mut entered_password = password.peek().clone();
         if entered_password.is_empty() {
             if let Some(embedded) = embedded_password {
@@ -1007,9 +1091,24 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
             if let Some(passphrase) = &entered_passphrase {
                 state.stash_ssh_passphrase(&url, passphrase.clone());
             }
+            if matches!(auth, PgAuth::Entra(_)) {
+                // Entra: the connect either succeeds silently (and the flow
+                // saves it) or raises the sign-in card (which saves on
+                // completion). Either way, close the form — the card takes over.
+                state
+                    .connect_postgres(url.clone(), display_name.clone(), tunnel.clone(), auth)
+                    .await;
+                on_done.call(());
+                return;
+            }
             if entered_password.is_empty() {
                 state
-                    .connect_postgres(url.clone(), display_name.clone(), tunnel.clone())
+                    .connect_postgres(
+                        url.clone(),
+                        display_name.clone(),
+                        tunnel.clone(),
+                        PgAuth::Password,
+                    )
                     .await;
             } else {
                 state
@@ -1027,7 +1126,7 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                 if remember_choice && entered_passphrase.is_some() {
                     state.persist_ssh_passphrase(&url).await;
                 }
-                state.add_saved_postgres(display_name, url, tunnel);
+                state.add_saved_postgres(display_name, url, tunnel, PgAuth::Password);
                 on_done.call(());
             }
         });
@@ -1100,12 +1199,50 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                         }
                     }
                 }
-                input {
-                    r#type: "password",
-                    class: field_class,
-                    placeholder: "password",
-                    value: "{password}",
-                    oninput: move |evt| password.set(evt.value()),
+                // Authentication mode (FRE-44). Entra uses the user field as the
+                // principal and a token instead of a password.
+                select {
+                    class: "rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-2 text-sm text-slate-900 dark:text-slate-300",
+                    onchange: move |evt| auth_mode.set(evt.value()),
+                    option { value: "password", selected: auth_mode() == "password", "Auth: password" }
+                    option {
+                        value: "entra-interactive",
+                        selected: auth_mode() == "entra-interactive",
+                        "Auth: Microsoft Entra ID (browser sign-in)"
+                    }
+                    option {
+                        value: "entra-mi",
+                        selected: auth_mode() == "entra-mi",
+                        "Auth: Microsoft Entra ID (managed identity)"
+                    }
+                }
+                if auth_mode() == "entra-interactive" {
+                    input {
+                        class: field_class,
+                        placeholder: "Entra tenant — id, domain, or 'organizations'",
+                        value: "{entra_tenant}",
+                        oninput: move |evt| entra_tenant.set(evt.value()),
+                    }
+                }
+                if auth_mode().starts_with("entra") {
+                    input {
+                        class: field_class,
+                        placeholder: "application (client) ID — optional",
+                        value: "{entra_client_id}",
+                        oninput: move |evt| entra_client_id.set(evt.value()),
+                    }
+                    p { class: "text-xs text-slate-500 dark:text-slate-400",
+                        "The user field is your Entra principal (e.g. you@contoso.com); a token is used instead of a password."
+                    }
+                }
+                if auth_mode() == "password" {
+                    input {
+                        r#type: "password",
+                        class: field_class,
+                        placeholder: "password",
+                        value: "{password}",
+                        oninput: move |evt| password.set(evt.value()),
+                    }
                 }
                 label { class: "flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
                     input {
