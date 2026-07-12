@@ -273,16 +273,38 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             let Some(pool) = pool else {
                 return Err(crate::db::DbError::Query("connection closed".into()));
             };
-            let total = pool.count_rows(&request).await?;
             let no_preview_refs: Vec<&str> = no_preview.iter().map(String::as_str).collect();
             let page = pool
                 .fetch_page_bounded(&request, &columns, &no_preview_refs)
                 .await?;
-            Ok::<(Page, u64, Option<String>), crate::db::DbError>((
-                page,
-                total,
-                request.extra_key_column,
-            ))
+            Ok::<(Page, Option<String>), crate::db::DbError>((page, request.extra_key_column))
+        }
+    });
+
+    // Row count, fetched separately from the page so it is NOT re-run on every
+    // page flip or sort change (FRE-40): `COUNT(*)` depends only on the table
+    // and filter. It re-runs when the filter changes or a write bumps
+    // `grid_refresh`; between those, Dioxus keeps the resolved value, so
+    // flipping pages reuses the cached count with no extra query.
+    let count_table = table.clone();
+    let count_resource = use_resource(move || {
+        let table = count_table.clone();
+        let request = PageRequest {
+            schema: table.schema.clone(),
+            table: table.name.clone(),
+            limit: PAGE_SIZE,
+            offset: 0,
+            sort: None, // COUNT(*) ignores ordering
+            filter: applied_filter(),
+            extra_key_column: None,
+        };
+        let _ = state.grid_refresh.read().get(&(id, table.key())).copied();
+        let pool = state.registry.read().get(id).map(|c| c.pool.clone());
+        async move {
+            let Some(pool) = pool else {
+                return Err(crate::db::DbError::Query("connection closed".into()));
+            };
+            pool.count_rows(&request).await
         }
     });
 
@@ -293,7 +315,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let nav_table = table.clone();
     let grid_nav = use_memo(move || {
         let current = rows_resource.read();
-        let Some(Ok((page, _total, extra_key))) = current.as_ref() else {
+        let Some(Ok((page, extra_key))) = current.as_ref() else {
             return GridNav::default();
         };
         let result = &page.result;
@@ -582,8 +604,8 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             }
             FocusOutcome::NextPage => {
                 // Don't page past the end (mirrors the Next button's guard).
-                let total = match rows_resource.peek().as_ref() {
-                    Some(Ok((_page, total, _))) => *total,
+                let total = match count_resource.peek().as_ref() {
+                    Some(Ok(total)) => *total,
                     _ => 0,
                 };
                 let p = *page.peek();
@@ -813,7 +835,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                             Banner { kind: BannerKind::Error, message: err.to_string() }
                         }
                     },
-                    Some(Ok((page_data, _total, extra_key))) => {
+                    Some(Ok((page_data, extra_key))) => {
                         let result = &page_data.result;
                         // The fetch prepended the row-identity key column
                         // (rowid) when one was requested; keep it for
@@ -1015,12 +1037,27 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             // Footer: paging + counts
             div { class: "flex items-center gap-3 border-t border-slate-200 dark:border-slate-800 px-3 py-1.5 text-xs text-slate-500 dark:text-slate-400",
                 match current.as_ref() {
-                    Some(Ok((page_data, total, _))) => {
+                    Some(Ok((page_data, _))) => {
                         let result = &page_data.result;
-                        let first = if *total == 0 { 0 } else { page() * PAGE_SIZE as u64 + 1 };
-                        let last = page() * PAGE_SIZE as u64 + result.rows.len() as u64;
+                        // The count comes from its own resource (FRE-40); it
+                        // stays resolved across page flips, and is briefly
+                        // unknown only on first load / a filter change.
+                        let total = count_resource
+                            .read()
+                            .as_ref()
+                            .and_then(|r| r.as_ref().ok().copied());
+                        let loaded = result.rows.len() as u64;
+                        let first = if loaded == 0 { 0 } else { page() * PAGE_SIZE as u64 + 1 };
+                        let last = page() * PAGE_SIZE as u64 + loaded;
+                        // While the total is unknown, don't offer Next (avoid
+                        // paging past the end); a full page implies there may be
+                        // more, so the ellipsis reads honestly.
+                        let at_end = total.map(|t| last >= t).unwrap_or(true);
                         rsx! {
-                            span { "rows {first}–{last} of {total}" }
+                            match total {
+                                Some(total) => rsx! { span { "rows {first}–{last} of {total}" } },
+                                None => rsx! { span { "rows {first}–{last} of …" } },
+                            }
                             div { class: "flex-1" }
                             button {
                                 class: "rounded px-2 py-0.5 hover:bg-slate-200 dark:hover:bg-slate-800 disabled:opacity-40",
@@ -1031,7 +1068,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                             span { "page {page() + 1}" }
                             button {
                                 class: "rounded px-2 py-0.5 hover:bg-slate-200 dark:hover:bg-slate-800 disabled:opacity-40",
-                                disabled: last >= *total,
+                                disabled: at_end,
                                 onclick: move |_| { let p = page(); page.set(p + 1); },
                                 "Next →"
                             }
