@@ -6,15 +6,17 @@
 //! Dropping the tunnel shuts the forward down and disconnects the session —
 //! the UI ties a tunnel's lifetime to its connection tab.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use russh::client;
 use russh::keys::agent::client::AgentClient;
-use russh::keys::known_hosts::learn_known_hosts_path;
+use russh::keys::known_hosts::{known_host_keys_path, learn_known_hosts_path};
 use russh::keys::{
-    check_known_hosts_path, load_secret_key, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey,
+    check_known_hosts_path, load_secret_key, Algorithm, HashAlg, PrivateKey, PrivateKeyWithHashAlg,
+    PublicKey,
 };
 use russh::Disconnect;
 use serde::{Deserialize, Serialize};
@@ -145,11 +147,14 @@ pub fn default_known_hosts_read() -> Vec<PathBuf> {
     files
 }
 
-/// Classifies `key` for `host:port` against `files`. A matching entry in any
-/// file means Trusted (that file vouches for this exact key, so it wins over a
-/// mismatch recorded elsewhere). Otherwise, if any file records the host with a
-/// different key it is Changed; if no file mentions the host it is Unknown.
-/// Unreadable or unparsable files contribute no opinion.
+/// Classifies `key` for `host:port` against `files`. A file whose matching
+/// entry comes before any conflicting one reports Trusted, and that wins over a
+/// mismatch in another file. Otherwise, if any file records the host with a
+/// different key of the same type it is Changed (russh short-circuits a file to
+/// `KeyChanged` on the first conflicting line, so a stale line *before* a good
+/// one in the same file also reads as Changed — fail-closed); if no file
+/// mentions the host it is Unknown. Unreadable or unparsable files contribute
+/// no opinion.
 fn verify_host_key(host: &str, port: u16, key: &PublicKey, files: &[PathBuf]) -> HostKeyStatus {
     let mut changed = false;
     for path in files {
@@ -165,6 +170,27 @@ fn verify_host_key(host: &str, port: u16, key: &PublicKey, files: &[PathBuf]) ->
     } else {
         HostKeyStatus::Unknown
     }
+}
+
+/// The distinct algorithms of every key recorded for `host:port` across
+/// `files`. When non-empty, [`Tunnel::open`] pins SSH host-key negotiation to
+/// exactly these, so an honest server returns the recorded key type (which then
+/// verifies) while a substituted *different* type cannot silently downgrade a
+/// would-be [`HostKeyStatus::Changed`] into an [`HostKeyStatus::Unknown`] trust
+/// prompt — mirroring OpenSSH's preference for known host-key algorithms.
+fn recorded_key_algorithms(host: &str, port: u16, files: &[PathBuf]) -> Vec<Algorithm> {
+    let mut algorithms = Vec::new();
+    for path in files {
+        if let Ok(keys) = known_host_keys_path(host, port, path) {
+            for (_, recorded) in keys {
+                let algorithm = recorded.algorithm();
+                if !algorithms.contains(&algorithm) {
+                    algorithms.push(algorithm);
+                }
+            }
+        }
+    }
+    algorithms
 }
 
 /// Builds the display/persistence info for the key the server offered.
@@ -271,7 +297,16 @@ impl Tunnel {
             TunnelAuth::Agent => None,
         };
 
-        let ssh_config = Arc::new(client::Config::default());
+        // Pin host-key negotiation to the algorithms we already trust for this
+        // host, so a MITM cannot present a *different* key type to sidestep the
+        // changed-key hard-fail (it would otherwise read as an unknown host and
+        // only raise a trust prompt). No recorded keys → offer the defaults.
+        let mut ssh_config = client::Config::default();
+        let pinned = recorded_key_algorithms(&config.host, config.port, known_hosts_read);
+        if !pinned.is_empty() {
+            ssh_config.preferred.key = Cow::Owned(pinned);
+        }
+        let ssh_config = Arc::new(ssh_config);
         let address = (config.host.as_str(), config.port);
         let verdict = Arc::new(Mutex::new(None));
         let offered_key = Arc::new(Mutex::new(None));
@@ -633,6 +668,18 @@ mod tests {
             verify_host_key("example.com", 22, &pubkey(KEY_A), &[stale, good]),
             HostKeyStatus::Trusted
         );
+    }
+
+    #[test]
+    fn recorded_algorithms_collects_pinned_types_across_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_known_hosts(dir.path(), "app", &[&format!("example.com {KEY_A}")]);
+        let b = write_known_hosts(dir.path(), "user", &[&format!("example.com {KEY_B}")]);
+        // Two ed25519 entries collapse to a single distinct algorithm.
+        let algs = recorded_key_algorithms("example.com", 22, &[a, b]);
+        assert_eq!(algs, vec![pubkey(KEY_A).algorithm()]);
+        // A host with no recorded key pins nothing (falls back to defaults).
+        assert!(recorded_key_algorithms("absent.example", 22, &[]).is_empty());
     }
 
     #[test]
