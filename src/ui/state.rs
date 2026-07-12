@@ -818,6 +818,8 @@ impl AppState {
             Err(err) => {
                 drop(live_tunnel);
                 self.fail_connect(&prompt.url, err.to_string());
+                // Re-raise the card so the user can retry the sign-in in place.
+                self.entra_prompt.set(Some(prompt));
             }
         }
     }

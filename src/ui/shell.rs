@@ -1077,6 +1077,18 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
             }
             _ => PgAuth::Password,
         };
+        // Entra needs a principal (the URL's username); an empty one would fail
+        // later at the server with an opaque error.
+        if matches!(auth, PgAuth::Entra(_))
+            && url::Url::parse(&url)
+                .ok()
+                .is_none_or(|u| u.username().is_empty())
+        {
+            form_error.set(Some(
+                "Entra needs a principal — fill the user field (e.g. you@contoso.com)".to_string(),
+            ));
+            return;
+        }
         let mut entered_password = password.peek().clone();
         if entered_password.is_empty() {
             if let Some(embedded) = embedded_password {
@@ -1311,13 +1323,17 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                         }
                     }
                 }
-                label { class: "flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
-                    input {
-                        r#type: "checkbox",
-                        checked: remember(),
-                        onchange: move |evt| remember.set(evt.checked()),
+                // Only meaningful for password auth — Entra caches its refresh
+                // token in the keyring regardless.
+                if auth_mode() == "password" {
+                    label { class: "flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
+                        input {
+                            r#type: "checkbox",
+                            checked: remember(),
+                            onchange: move |evt| remember.set(evt.checked()),
+                        }
+                        "Remember in the system keyring (falls back to this session only)"
                     }
-                    "Remember in the system keyring (falls back to this session only)"
                 }
                 div { class: "flex justify-end gap-2",
                     button {
