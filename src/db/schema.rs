@@ -5,6 +5,9 @@
 pub enum TableKind {
     Table,
     View,
+    /// A Postgres materialized view (`pg_class.relkind = 'm'`): browsable like a
+    /// table but read-only — no editing, no row-identity writes (FRE-41).
+    MaterializedView,
 }
 
 /// Whether the database assigns a column's value itself, and whether the

@@ -137,6 +137,11 @@ fn TableNode(id: ConnectionId, table: ReadSignal<TableMeta>) -> Element {
                             "view"
                         }
                     }
+                    if kind == TableKind::MaterializedView {
+                        span { class: "rounded bg-fuchsia-100 dark:bg-fuchsia-900/50 px-1 text-xs text-fuchsia-700 dark:text-fuchsia-300",
+                            "matview"
+                        }
+                    }
                 }
             }
             if expanded {

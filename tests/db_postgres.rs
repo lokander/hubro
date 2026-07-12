@@ -8,8 +8,8 @@
 //! ```
 
 use dataview::db::{
-    detect_row_identity, url_with_password, DbError, DbPool, Filter, PageRequest, RowLocator,
-    SortDir, TableKind, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
+    detect_row_identity, url_with_password, DbError, DbPool, Dialect, Filter, PageRequest,
+    RowLocator, SortDir, TableKind, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 fn test_url() -> Option<String> {
@@ -405,6 +405,11 @@ async fn postgres_multi_schema_introspection_has_parity_metadata() {
         "CREATE VIEW warehouse.stock_notes AS SELECT note FROM warehouse.stock",
         "INSERT INTO warehouse.locations VALUES ('eu', 1, 'shelf A')",
         "INSERT INTO warehouse.stock (region, slot, note) VALUES ('eu', 1, 'first')",
+        // Materialized view created after the insert so it snapshots the row;
+        // a unique index on it must NOT make it look editable (FRE-41).
+        "CREATE MATERIALIZED VIEW warehouse.stock_mv AS \
+         SELECT id, note FROM warehouse.stock",
+        "CREATE UNIQUE INDEX stock_mv_id ON warehouse.stock_mv (id)",
     ] {
         pool.query(sql).await.unwrap();
     }
@@ -467,6 +472,35 @@ async fn postgres_multi_schema_introspection_has_parity_metadata() {
         .find(|t| t.schema.as_deref() == Some("warehouse") && t.name == "stock_notes")
         .unwrap();
     assert_eq!(view.kind, TableKind::View);
+
+    // Materialized view (FRE-41): introspected with its own kind and columns
+    // (from pg_catalog, since information_schema omits matviews), and read-only
+    // — its unique index must not yield a row identity.
+    let matview = tables
+        .iter()
+        .find(|t| t.schema.as_deref() == Some("warehouse") && t.name == "stock_mv")
+        .unwrap();
+    assert_eq!(matview.kind, TableKind::MaterializedView);
+    let mv_columns: Vec<&str> = matview.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(mv_columns, ["id", "note"]);
+    assert!(
+        detect_row_identity(matview, Dialect::Postgres).is_none(),
+        "a matview must be read-only even with a unique index"
+    );
+
+    // Browsing the matview's data works through the normal paged read path.
+    let mv_request = PageRequest {
+        schema: Some("warehouse".into()),
+        table: "stock_mv".into(),
+        limit: 10,
+        offset: 0,
+        sort: None,
+        filter: None,
+        extra_key_column: None,
+    };
+    assert_eq!(pool.count_rows(&mv_request).await.unwrap(), 1);
+    let mv_page = pool.fetch_page(&mv_request).await.unwrap();
+    assert_eq!(mv_page.rows[0][1], Value::Text("first".into()));
 
     // Schema-qualified paging works end to end.
     let request = PageRequest {

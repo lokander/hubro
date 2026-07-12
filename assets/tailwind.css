@@ -65,6 +65,10 @@
     --color-violet-400: oklch(70.2% 0.183 293.541);
     --color-violet-700: oklch(49.1% 0.27 292.581);
     --color-violet-900: oklch(38% 0.189 293.745);
+    --color-fuchsia-100: oklch(95.2% 0.037 318.852);
+    --color-fuchsia-300: oklch(83.3% 0.145 321.434);
+    --color-fuchsia-700: oklch(51.8% 0.253 323.949);
+    --color-fuchsia-900: oklch(40.1% 0.17 325.612);
     --color-rose-100: oklch(94.1% 0.03 12.58);
     --color-rose-300: oklch(81% 0.117 11.638);
     --color-rose-500: oklch(64.5% 0.246 16.439);
@@ -666,6 +670,9 @@
   .bg-emerald-700 {
     background-color: var(--color-emerald-700);
   }
+  .bg-fuchsia-100 {
+    background-color: var(--color-fuchsia-100);
+  }
   .bg-red-50 {
     background-color: var(--color-red-50);
   }
@@ -874,6 +881,9 @@
   }
   .text-emerald-700 {
     color: var(--color-emerald-700);
+  }
+  .text-fuchsia-700 {
+    color: var(--color-fuchsia-700);
   }
   .text-red-600 {
     color: var(--color-red-600);
@@ -1381,6 +1391,14 @@
       }
     }
   }
+  .dark\:bg-fuchsia-900\/50 {
+    &:where(.dark, .dark *) {
+      background-color: color-mix(in srgb, oklch(40.1% 0.17 325.612) 50%, transparent);
+      @supports (color: color-mix(in lab, red, red)) {
+        background-color: color-mix(in oklab, var(--color-fuchsia-900) 50%, transparent);
+      }
+    }
+  }
   .dark\:bg-red-950\/30 {
     &:where(.dark, .dark *) {
       background-color: color-mix(in srgb, oklch(25.8% 0.092 26.042) 30%, transparent);
@@ -1533,6 +1551,11 @@
       @supports (color: color-mix(in lab, red, red)) {
         color: color-mix(in oklab, var(--color-emerald-500) 70%, transparent);
       }
+    }
+  }
+  .dark\:text-fuchsia-300 {
+    &:where(.dark, .dark *) {
+      color: var(--color-fuchsia-300);
     }
   }
   .dark\:text-red-200 {
