@@ -19,7 +19,8 @@ pub enum SavedConnection {
     Postgres {
         name: String,
         /// Connection URL **without** a password — credentials never live in
-        /// the config file (keyring persistence arrives with FRE-27).
+        /// the config file; passwords are stored in the OS keyring. Canonical
+        /// form (FRE-39), so it doubles as the keyring account key.
         url: String,
         /// Optional SSH tunnel to reach the server through. `default` +
         /// `skip_serializing_if` keep pre-tunnel config files (and files

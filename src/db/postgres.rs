@@ -133,7 +133,12 @@ pub fn build_url(
     parsed
         .set_username(user.trim())
         .map_err(|_| DbError::Connect("invalid user".into()))?;
-    parsed.set_path(&format!("/{}", database.trim()));
+    // Only set a path for a non-empty database, so an empty db field converges
+    // with a pasted URL that has no path (both → no trailing `/`).
+    let database = database.trim();
+    if !database.is_empty() {
+        parsed.set_path(&format!("/{database}"));
+    }
     if !sslmode.is_empty() {
         parsed.set_query(Some(&format!("sslmode={sslmode}")));
     }
@@ -972,6 +977,15 @@ mod tests {
         // Already canonical: idempotent.
         let canonical = "postgres://user@db.example.com:5432/app";
         assert_eq!(normalize_pg_url(canonical).unwrap(), canonical);
+    }
+
+    #[test]
+    fn form_and_paste_converge_for_an_empty_database() {
+        // An empty database field must produce the same locator as a pasted URL
+        // with no path — no phantom trailing-slash entry.
+        let from_form = build_url("host", "", "", "user", "").unwrap();
+        assert_eq!(from_form, "postgres://user@host:5432");
+        assert_eq!(from_form, normalize_pg_url("postgres://user@host").unwrap());
     }
 
     #[test]
