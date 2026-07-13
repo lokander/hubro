@@ -1,6 +1,29 @@
 # dataview
 
-A desktop app built with [Dioxus 0.7](https://dioxuslabs.com/learn/0.7) (Rust).
+A desktop **database viewer for SQLite and Postgres**, built with
+[Dioxus 0.7](https://dioxuslabs.com/learn/0.7) (Rust). Developed for Linux
+(credentials use the Secret Service keyring; releases ship as `.deb`/AppImage).
+
+## Features
+
+- **Connect** to SQLite files and Postgres servers (connection form or URL),
+  with the OS keyring remembering passwords.
+- **Browse** schemas — tables, views, Postgres materialized views, columns,
+  indexes, and foreign keys — in an expandable sidebar.
+- **Data grid** with sorting, filtering, and paging that stays fast on huge
+  tables and large values (windowed rendering, bounded memory).
+- **SQL editor** — run queries and multi-statement scripts (wrapped in a
+  transaction), with schema-aware autocomplete, syntax highlighting, query
+  history, cancellation, and a confirmation before writes.
+- **Edit** rows inline — cell edits, inserts, and deletes staged and saved
+  atomically, with primary-key/unique-index detection and confirmation before
+  destructive operations (views and materialized views are read-only).
+- **Export** query and table results to CSV or JSON (streamed).
+- **Foreign-key navigation**, keyboard shortcuts (with a cheatsheet),
+  dark/light theme, and window/session restore.
+- **Secure Postgres access** — SSH tunnels (agent or key file) with host-key
+  verification, and Microsoft Entra ID sign-in for Azure Postgres (interactive
+  browser or managed identity).
 
 ## Development
 
@@ -23,7 +46,10 @@ Tailwind is compiled automatically by `dx serve` from `tailwind.css` in the proj
 ```
 ├─ assets/       # static assets, referenced via the asset!() macro
 ├─ src/main.rs   # thin binary entry point
-├─ src/lib.rs    # library root (db + ui modules), imported by tests as dataview::
+├─ src/lib.rs    # library root, imported by tests as dataview::
+├─ src/db/       # backend-neutral DB layer (sqlite, postgres, schema, paging)
+├─ src/ui/       # Dioxus components (shell, sidebar, grid, editor, state)
+├─ src/azure.rs  # Entra ID token acquisition; tunnel.rs, secrets.rs, config.rs
 ├─ tailwind.css  # Tailwind input (compiled by dx)
 ```
 
