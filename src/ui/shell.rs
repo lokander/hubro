@@ -575,10 +575,13 @@ fn ConnectionsScreen() -> Element {
                     | crate::config::SavedConnection::SqlServer { url, .. } => url.clone(),
                 };
                 let (tunnel, auth) = match s {
-                    crate::config::SavedConnection::Postgres { tunnel, auth, .. } => {
+                    crate::config::SavedConnection::Postgres { tunnel, auth, .. }
+                    | crate::config::SavedConnection::SqlServer { tunnel, auth, .. } => {
                         (tunnel.clone(), auth.clone())
                     }
-                    _ => (None, crate::config::PgAuth::Password),
+                    crate::config::SavedConnection::Sqlite { .. } => {
+                        (None, crate::config::PgAuth::Password)
+                    }
                 };
                 SavedRow {
                     name: s.name().to_string(),
@@ -648,7 +651,12 @@ fn ConnectionsScreen() -> Element {
                                                 }
                                                 BackendKind::SqlServer => {
                                                     state
-                                                        .connect_sqlserver(row.locator, row.name)
+                                                        .connect_sqlserver(
+                                                            row.locator,
+                                                            row.name,
+                                                            row.tunnel,
+                                                            row.auth,
+                                                        )
                                                         .await;
                                                 }
                                                 BackendKind::Sqlite => {
@@ -789,6 +797,7 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
                                 prompt.name,
                                 entered,
                                 remember_choice,
+                                prompt.tunnel,
                             )
                             .await;
                     } else {
@@ -806,16 +815,29 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
                 PromptKind::SshPassphrase => {
                     // An SSH prompt always carries its tunnel config.
                     let Some(tunnel) = prompt.tunnel else { return };
-                    state
-                        .connect_postgres_with_ssh_passphrase(
-                            prompt.url,
-                            prompt.name,
-                            tunnel,
-                            entered,
-                            remember_choice,
-                            prompt.auth,
-                        )
-                        .await;
+                    if prompt.backend == BackendKind::SqlServer {
+                        state
+                            .connect_sqlserver_with_ssh_passphrase(
+                                prompt.url,
+                                prompt.name,
+                                tunnel,
+                                entered,
+                                remember_choice,
+                                prompt.auth,
+                            )
+                            .await;
+                    } else {
+                        state
+                            .connect_postgres_with_ssh_passphrase(
+                                prompt.url,
+                                prompt.name,
+                                tunnel,
+                                entered,
+                                remember_choice,
+                                prompt.auth,
+                            )
+                            .await;
+                    }
                 }
             }
         });
@@ -915,9 +937,9 @@ fn HostKeyPromptCard(prompt: super::state::HostKeyPrompt) -> Element {
     }
 }
 
-/// Interactive Entra sign-in prompt (FRE-44). A Postgres connect needs a
-/// Microsoft browser sign-in (no cached refresh token); the button opens the
-/// browser and completes the connect, Cancel abandons it.
+/// Interactive Entra sign-in prompt (FRE-44). A Postgres or SQL Server connect
+/// needs a Microsoft browser sign-in (no cached refresh token); the button
+/// opens the browser and completes the connect, Cancel abandons it.
 #[component]
 fn EntraSignInCard(prompt: super::state::EntraPrompt) -> Element {
     let state = use_context::<AppState>();
@@ -927,7 +949,11 @@ fn EntraSignInCard(prompt: super::state::EntraPrompt) -> Element {
         // spawn_forever: signing in clears `entra_prompt`, unmounting this card;
         // a scope-tied spawn would be cancelled mid sign-in.
         dioxus::core::spawn_forever(async move {
-            state.connect_postgres_with_entra_signin(prompt).await;
+            if prompt.backend == BackendKind::SqlServer {
+                state.connect_sqlserver_with_entra_signin(prompt).await;
+            } else {
+                state.connect_postgres_with_entra_signin(prompt).await;
+            }
         });
     };
     rsx! {
@@ -960,7 +986,6 @@ fn EntraSignInCard(prompt: super::state::EntraPrompt) -> Element {
 /// SSH tunnel.
 #[component]
 fn PostgresForm(on_done: EventHandler<()>) -> Element {
-    use crate::azure::EntraAuth;
     use crate::config::PgAuth;
     use crate::tunnel::{TunnelAuth, TunnelConfig};
     let state = use_context::<AppState>();
@@ -974,73 +999,36 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
     let mut remember = use_signal(|| true);
     let mut sslmode = use_signal(|| "prefer".to_string());
     // Authentication: "password" (default), "entra-interactive", or "entra-mi".
-    let mut auth_mode = use_signal(|| "password".to_string());
-    let mut entra_tenant = use_signal(|| "organizations".to_string());
-    let mut entra_client_id = use_signal(String::new);
+    let auth_mode = use_signal(|| "password".to_string());
+    let entra_tenant = use_signal(|| "organizations".to_string());
+    let entra_client_id = use_signal(String::new);
     let mut pasted_url = use_signal(String::new);
-    let mut use_tunnel = use_signal(|| false);
-    let mut ssh_host = use_signal(String::new);
-    let mut ssh_port = use_signal(String::new);
-    let mut ssh_user = use_signal(String::new);
+    let use_tunnel = use_signal(|| false);
+    let ssh_host = use_signal(String::new);
+    let ssh_port = use_signal(String::new);
+    let ssh_user = use_signal(String::new);
     // false = ssh-agent (the default), true = key file.
-    let mut ssh_use_key = use_signal(|| false);
-    let mut ssh_key_path = use_signal(String::new);
-    let mut ssh_passphrase = use_signal(String::new);
+    let ssh_use_key = use_signal(|| false);
+    let ssh_key_path = use_signal(String::new);
+    let ssh_passphrase = use_signal(String::new);
     let mut form_error = use_signal(|| Option::<String>::None);
 
     let mut submit = move || {
         // Tunnel settings are validated first so a bad SSH field fails
         // before any connect attempt.
-        let tunnel: Option<TunnelConfig> = if *use_tunnel.peek() {
-            let host = ssh_host.peek().trim().to_string();
-            if host.is_empty() {
-                form_error.set(Some("SSH host must not be empty".to_string()));
+        let tunnel: Option<TunnelConfig> = match tunnel_from_form(
+            *use_tunnel.peek(),
+            &ssh_host.peek(),
+            &ssh_port.peek(),
+            &ssh_user.peek(),
+            *ssh_use_key.peek(),
+            &ssh_key_path.peek(),
+        ) {
+            Ok(tunnel) => tunnel,
+            Err(err) => {
+                form_error.set(Some(err));
                 return;
             }
-            let port_text = ssh_port.peek().trim().to_string();
-            let port = if port_text.is_empty() {
-                22
-            } else {
-                match port_text.parse::<u16>() {
-                    // 0 parses as a valid u16 but is not a usable port.
-                    Ok(0) | Err(_) => {
-                        form_error.set(Some(format!("invalid SSH port: {port_text}")));
-                        return;
-                    }
-                    Ok(port) => port,
-                }
-            };
-            let user = ssh_user.peek().trim().to_string();
-            if user.is_empty() {
-                form_error.set(Some("SSH user must not be empty".to_string()));
-                return;
-            }
-            let auth = if *ssh_use_key.peek() {
-                let path = ssh_key_path.peek().trim().to_string();
-                if path.is_empty() {
-                    form_error.set(Some("SSH key file path must not be empty".to_string()));
-                    return;
-                }
-                // The placeholder suggests ~/.ssh/…, so honor a leading ~/.
-                let path = match path.strip_prefix("~/") {
-                    Some(rest) => match dirs::home_dir() {
-                        Some(home) => home.join(rest),
-                        None => PathBuf::from(path),
-                    },
-                    None => PathBuf::from(path),
-                };
-                TunnelAuth::KeyFile { path }
-            } else {
-                TunnelAuth::Agent
-            };
-            Some(TunnelConfig {
-                host,
-                port,
-                user,
-                auth,
-            })
-        } else {
-            None
         };
         let entered_passphrase = if matches!(
             tunnel,
@@ -1097,34 +1085,18 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
         };
         // Authentication mode from the selector (FRE-44). Entra takes the
         // `user` field as the Entra principal; a token replaces the password.
-        let auth: PgAuth = match auth_mode.peek().as_str() {
-            "entra-interactive" => {
-                let tenant = entra_tenant.peek().trim().to_string();
-                if tenant.is_empty() {
-                    form_error.set(Some("the Entra tenant must not be empty".to_string()));
-                    return;
-                }
-                let client = entra_client_id.peek().trim().to_string();
-                PgAuth::Entra(EntraAuth::Interactive {
-                    tenant,
-                    client_id: (!client.is_empty()).then_some(client),
-                })
+        let auth: PgAuth = match auth_from_form(
+            &auth_mode.peek(),
+            &entra_tenant.peek(),
+            &entra_client_id.peek(),
+        ) {
+            Ok(auth) => auth,
+            Err(err) => {
+                form_error.set(Some(err));
+                return;
             }
-            "entra-mi" => {
-                let client = entra_client_id.peek().trim().to_string();
-                PgAuth::Entra(EntraAuth::ManagedIdentity {
-                    client_id: (!client.is_empty()).then_some(client),
-                })
-            }
-            _ => PgAuth::Password,
         };
-        // Entra needs a principal (the URL's username); an empty one would fail
-        // later at the server with an opaque error.
-        if matches!(auth, PgAuth::Entra(_))
-            && url::Url::parse(&url)
-                .ok()
-                .is_none_or(|u| u.username().is_empty())
-        {
+        if matches!(auth, PgAuth::Entra(_)) && entra_principal_missing(&url) {
             form_error.set(Some(
                 "Entra needs a principal — fill the user field (e.g. you@contoso.com)".to_string(),
             ));
@@ -1254,40 +1226,7 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                 }
                 // Authentication mode (FRE-44). Entra uses the user field as the
                 // principal and a token instead of a password.
-                select {
-                    class: "rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-2 text-sm text-slate-900 dark:text-slate-300",
-                    onchange: move |evt| auth_mode.set(evt.value()),
-                    option { value: "password", selected: auth_mode() == "password", "Auth: password" }
-                    option {
-                        value: "entra-interactive",
-                        selected: auth_mode() == "entra-interactive",
-                        "Auth: Microsoft Entra ID (browser sign-in)"
-                    }
-                    option {
-                        value: "entra-mi",
-                        selected: auth_mode() == "entra-mi",
-                        "Auth: Microsoft Entra ID (managed identity)"
-                    }
-                }
-                if auth_mode() == "entra-interactive" {
-                    input {
-                        class: field_class,
-                        placeholder: "Entra tenant — id, domain, or 'organizations'",
-                        value: "{entra_tenant}",
-                        oninput: move |evt| entra_tenant.set(evt.value()),
-                    }
-                }
-                if auth_mode().starts_with("entra") {
-                    input {
-                        class: field_class,
-                        placeholder: "application (client) ID — optional",
-                        value: "{entra_client_id}",
-                        oninput: move |evt| entra_client_id.set(evt.value()),
-                    }
-                    p { class: "text-xs text-slate-500 dark:text-slate-400",
-                        "The user field is your Entra principal (e.g. you@contoso.com); a token is used instead of a password."
-                    }
-                }
+                AuthModeFields { auth_mode, entra_tenant, entra_client_id }
                 if auth_mode() == "password" {
                     input {
                         r#type: "password",
@@ -1297,72 +1236,15 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                         oninput: move |evt| password.set(evt.value()),
                     }
                 }
-                label { class: "flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
-                    input {
-                        r#type: "checkbox",
-                        checked: use_tunnel(),
-                        onchange: move |evt| use_tunnel.set(evt.checked()),
-                    }
-                    "Connect through an SSH tunnel"
-                }
-                if use_tunnel() {
-                    div { class: "flex flex-col gap-2 rounded border border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-900/60 p-3",
-                        div { class: "flex gap-2",
-                            input {
-                                class: "{field_class} flex-[3]",
-                                placeholder: "ssh host",
-                                value: "{ssh_host}",
-                                oninput: move |evt| ssh_host.set(evt.value()),
-                            }
-                            input {
-                                class: "{field_class} flex-1",
-                                placeholder: "22",
-                                value: "{ssh_port}",
-                                oninput: move |evt| ssh_port.set(evt.value()),
-                            }
-                        }
-                        input {
-                            class: field_class,
-                            placeholder: "ssh user",
-                            value: "{ssh_user}",
-                            oninput: move |evt| ssh_user.set(evt.value()),
-                        }
-                        div { class: "flex gap-4 text-xs text-slate-500 dark:text-slate-400",
-                            label { class: "flex items-center gap-2",
-                                input {
-                                    r#type: "radio",
-                                    name: "ssh-auth",
-                                    checked: !ssh_use_key(),
-                                    onchange: move |_| ssh_use_key.set(false),
-                                }
-                                "ssh-agent"
-                            }
-                            label { class: "flex items-center gap-2",
-                                input {
-                                    r#type: "radio",
-                                    name: "ssh-auth",
-                                    checked: ssh_use_key(),
-                                    onchange: move |_| ssh_use_key.set(true),
-                                }
-                                "key file"
-                            }
-                        }
-                        if ssh_use_key() {
-                            input {
-                                class: field_class,
-                                placeholder: "key file path, e.g. ~/.ssh/id_ed25519",
-                                value: "{ssh_key_path}",
-                                oninput: move |evt| ssh_key_path.set(evt.value()),
-                            }
-                            input {
-                                r#type: "password",
-                                class: field_class,
-                                placeholder: "key passphrase (if the key is encrypted)",
-                                value: "{ssh_passphrase}",
-                                oninput: move |evt| ssh_passphrase.set(evt.value()),
-                            }
-                        }
-                    }
+                SshTunnelFields {
+                    use_tunnel,
+                    ssh_host,
+                    ssh_port,
+                    ssh_user,
+                    ssh_use_key,
+                    ssh_key_path,
+                    ssh_passphrase,
+                    radio_group: "pg-ssh-auth",
                 }
                 // Only meaningful for password auth — Entra caches its refresh
                 // token in the keyring regardless.
@@ -1397,13 +1279,16 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
 }
 
 /// Add-SQL-Server panel (FRE-57): individual fields or a pasted `mssql://`
-/// URL. Deliberately close to [`PostgresForm`] but kept separate — the two
-/// share the field styling ([`FORM_FIELD_CLASS`]) and the display-name
-/// fallback, while the option sets (encrypt vs sslmode, trust-server-cert)
-/// differ enough that a shared form abstraction wasn't worth it. Password
-/// auth only, and no SSH tunnel yet — Entra and tunnels are FRE-58.
+/// URL, plus the Auth dropdown (password / Entra ID) and optional SSH tunnel
+/// (both FRE-58). Deliberately close to [`PostgresForm`] but kept separate —
+/// the two share the field styling, the auth/tunnel fieldsets
+/// ([`AuthModeFields`] / [`SshTunnelFields`] and their validation helpers),
+/// and the display-name fallback, while the option sets (encrypt vs sslmode,
+/// trust-server-cert) differ enough that one shared form wasn't worth it.
 #[component]
 fn SqlServerForm(on_done: EventHandler<()>) -> Element {
+    use crate::config::PgAuth;
+    use crate::tunnel::{TunnelAuth, TunnelConfig};
     let state = use_context::<AppState>();
     let mut use_url = use_signal(|| false);
     let mut name = use_signal(String::new);
@@ -1418,10 +1303,49 @@ fn SqlServerForm(on_done: EventHandler<()>) -> Element {
     // Accept the server's TLS certificate without CA validation — needed for
     // dev servers with self-signed certs (e.g. the stock Docker image).
     let mut trust_cert = use_signal(|| false);
+    // Authentication: "password" (default), "entra-interactive", or "entra-mi".
+    let auth_mode = use_signal(|| "password".to_string());
+    let entra_tenant = use_signal(|| "organizations".to_string());
+    let entra_client_id = use_signal(String::new);
     let mut pasted_url = use_signal(String::new);
+    let use_tunnel = use_signal(|| false);
+    let ssh_host = use_signal(String::new);
+    let ssh_port = use_signal(String::new);
+    let ssh_user = use_signal(String::new);
+    // false = ssh-agent (the default), true = key file.
+    let ssh_use_key = use_signal(|| false);
+    let ssh_key_path = use_signal(String::new);
+    let ssh_passphrase = use_signal(String::new);
     let mut form_error = use_signal(|| Option::<String>::None);
 
     let mut submit = move || {
+        // Tunnel settings are validated first so a bad SSH field fails
+        // before any connect attempt.
+        let tunnel: Option<TunnelConfig> = match tunnel_from_form(
+            *use_tunnel.peek(),
+            &ssh_host.peek(),
+            &ssh_port.peek(),
+            &ssh_user.peek(),
+            *ssh_use_key.peek(),
+            &ssh_key_path.peek(),
+        ) {
+            Ok(tunnel) => tunnel,
+            Err(err) => {
+                form_error.set(Some(err));
+                return;
+            }
+        };
+        let entered_passphrase = if matches!(
+            tunnel,
+            Some(TunnelConfig {
+                auth: TunnelAuth::KeyFile { .. },
+                ..
+            })
+        ) {
+            Some(ssh_passphrase.peek().clone()).filter(|p| !p.is_empty())
+        } else {
+            None
+        };
         // A password pasted inside the URL is used for this connect (and
         // remembered for the session on success) but never persisted.
         let embedded_password = if *use_url.peek() {
@@ -1481,6 +1405,26 @@ fn SqlServerForm(on_done: EventHandler<()>) -> Element {
                 entered
             }
         };
+        // Authentication mode from the selector (FRE-58, mirroring FRE-44).
+        // Entra takes the user field as the principal; a token replaces the
+        // password.
+        let auth: PgAuth = match auth_from_form(
+            &auth_mode.peek(),
+            &entra_tenant.peek(),
+            &entra_client_id.peek(),
+        ) {
+            Ok(auth) => auth,
+            Err(err) => {
+                form_error.set(Some(err));
+                return;
+            }
+        };
+        if matches!(auth, PgAuth::Entra(_)) && entra_principal_missing(&url) {
+            form_error.set(Some(
+                "Entra needs a principal — fill the user field (e.g. you@contoso.com)".to_string(),
+            ));
+            return;
+        }
         let mut entered_password = password.peek().clone();
         if entered_password.is_empty() {
             if let Some(embedded) = embedded_password {
@@ -1490,11 +1434,31 @@ fn SqlServerForm(on_done: EventHandler<()>) -> Element {
         let remember_choice = *remember.peek();
         form_error.set(None);
         spawn(async move {
+            // An entered passphrase seeds session memory so the tunnel open
+            // finds it, exactly as if it came from the prompt.
+            if let Some(passphrase) = &entered_passphrase {
+                state.stash_ssh_passphrase(&url, passphrase.clone());
+            }
+            if matches!(auth, PgAuth::Entra(_)) {
+                // Entra: the connect either succeeds silently (and the flow
+                // saves it) or raises the sign-in card (which saves on
+                // completion). Either way, close the form — the card takes over.
+                state
+                    .connect_sqlserver(url.clone(), display_name.clone(), tunnel.clone(), auth)
+                    .await;
+                on_done.call(());
+                return;
+            }
             if entered_password.is_empty() {
                 // No password entered: try as-is (the keyring may hold one);
                 // an auth failure raises the password prompt.
                 state
-                    .connect_sqlserver(url.clone(), display_name.clone())
+                    .connect_sqlserver(
+                        url.clone(),
+                        display_name.clone(),
+                        tunnel.clone(),
+                        PgAuth::Password,
+                    )
                     .await;
             } else {
                 state
@@ -1503,11 +1467,15 @@ fn SqlServerForm(on_done: EventHandler<()>) -> Element {
                         display_name.clone(),
                         entered_password,
                         remember_choice,
+                        tunnel.clone(),
                     )
                     .await;
             }
             // The connect flow saves on success; only close the form then.
             if state.open_locators.peek().iter().any(|(_, l)| *l == url) {
+                if remember_choice && entered_passphrase.is_some() {
+                    state.persist_ssh_passphrase(&url).await;
+                }
                 on_done.call(());
             }
         });
@@ -1588,20 +1556,39 @@ fn SqlServerForm(on_done: EventHandler<()>) -> Element {
                         "Trust the server certificate (self-signed / dev servers)"
                     }
                 }
-                input {
-                    r#type: "password",
-                    class: field_class,
-                    placeholder: "password",
-                    value: "{password}",
-                    oninput: move |evt| password.set(evt.value()),
-                }
-                label { class: "flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
+                // Authentication mode (FRE-58). Entra uses the user field as
+                // the principal and a token instead of a password.
+                AuthModeFields { auth_mode, entra_tenant, entra_client_id }
+                if auth_mode() == "password" {
                     input {
-                        r#type: "checkbox",
-                        checked: remember(),
-                        onchange: move |evt| remember.set(evt.checked()),
+                        r#type: "password",
+                        class: field_class,
+                        placeholder: "password",
+                        value: "{password}",
+                        oninput: move |evt| password.set(evt.value()),
                     }
-                    "Remember in the system keyring (falls back to this session only)"
+                }
+                SshTunnelFields {
+                    use_tunnel,
+                    ssh_host,
+                    ssh_port,
+                    ssh_user,
+                    ssh_use_key,
+                    ssh_key_path,
+                    ssh_passphrase,
+                    radio_group: "mssql-ssh-auth",
+                }
+                // Only meaningful for password auth — Entra caches its refresh
+                // token in the keyring regardless.
+                if auth_mode() == "password" {
+                    label { class: "flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
+                        input {
+                            r#type: "checkbox",
+                            checked: remember(),
+                            onchange: move |evt| remember.set(evt.checked()),
+                        }
+                        "Remember in the system keyring (falls back to this session only)"
+                    }
                 }
                 div { class: "flex justify-end gap-2",
                     button {
@@ -1625,6 +1612,239 @@ fn SqlServerForm(on_done: EventHandler<()>) -> Element {
 
 /// Text-input class shared by the Postgres and SQL Server connection forms.
 const FORM_FIELD_CLASS: &str = "w-full rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-3 py-2 font-mono text-sm text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600";
+
+/// Select class shared by the connection forms' dropdowns.
+const FORM_SELECT_CLASS: &str = "rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-2 text-sm text-slate-900 dark:text-slate-300";
+
+/// Builds the tunnel config from the SSH form fields — `Ok(None)` when the
+/// toggle is off. Shared by the Postgres and SQL Server forms; errors are
+/// user-facing form errors, raised before any connect attempt.
+fn tunnel_from_form(
+    use_tunnel: bool,
+    host: &str,
+    port: &str,
+    user: &str,
+    use_key: bool,
+    key_path: &str,
+) -> Result<Option<crate::tunnel::TunnelConfig>, String> {
+    use crate::tunnel::{TunnelAuth, TunnelConfig};
+    if !use_tunnel {
+        return Ok(None);
+    }
+    let host = host.trim().to_string();
+    if host.is_empty() {
+        return Err("SSH host must not be empty".to_string());
+    }
+    let port_text = port.trim();
+    let port = if port_text.is_empty() {
+        22
+    } else {
+        match port_text.parse::<u16>() {
+            // 0 parses as a valid u16 but is not a usable port.
+            Ok(0) | Err(_) => return Err(format!("invalid SSH port: {port_text}")),
+            Ok(port) => port,
+        }
+    };
+    let user = user.trim().to_string();
+    if user.is_empty() {
+        return Err("SSH user must not be empty".to_string());
+    }
+    let auth = if use_key {
+        let path = key_path.trim().to_string();
+        if path.is_empty() {
+            return Err("SSH key file path must not be empty".to_string());
+        }
+        // The placeholder suggests ~/.ssh/…, so honor a leading ~/.
+        let path = match path.strip_prefix("~/") {
+            Some(rest) => match dirs::home_dir() {
+                Some(home) => home.join(rest),
+                None => PathBuf::from(path),
+            },
+            None => PathBuf::from(path),
+        };
+        TunnelAuth::KeyFile { path }
+    } else {
+        TunnelAuth::Agent
+    };
+    Ok(Some(TunnelConfig {
+        host,
+        port,
+        user,
+        auth,
+    }))
+}
+
+/// Builds the auth mode from the form's Auth selector ("password",
+/// "entra-interactive", or "entra-mi") and Entra fields — the FRE-44/FRE-49
+/// validation shared by both server forms.
+fn auth_from_form(
+    mode: &str,
+    tenant: &str,
+    client_id: &str,
+) -> Result<crate::config::PgAuth, String> {
+    use crate::azure::EntraAuth;
+    use crate::config::PgAuth;
+    let client = client_id.trim().to_string();
+    match mode {
+        "entra-interactive" => {
+            let tenant = tenant.trim().to_string();
+            if tenant.is_empty() {
+                return Err("the Entra tenant must not be empty".to_string());
+            }
+            Ok(PgAuth::Entra(EntraAuth::Interactive {
+                tenant,
+                client_id: (!client.is_empty()).then_some(client),
+            }))
+        }
+        "entra-mi" => Ok(PgAuth::Entra(EntraAuth::ManagedIdentity {
+            client_id: (!client.is_empty()).then_some(client),
+        })),
+        _ => Ok(PgAuth::Password),
+    }
+}
+
+/// FRE-49 validation shared by both server forms: Entra needs the URL's
+/// username as the principal — an empty one would fail later at the server
+/// with an opaque error.
+fn entra_principal_missing(url: &str) -> bool {
+    url::Url::parse(url)
+        .ok()
+        .is_none_or(|u| u.username().is_empty())
+}
+
+/// The Auth dropdown (password / Entra interactive / Entra managed identity)
+/// plus the Entra fields it reveals — shared by the Postgres and SQL Server
+/// forms, which hand their own signals in (signals are `Copy`).
+#[component]
+fn AuthModeFields(
+    auth_mode: Signal<String>,
+    entra_tenant: Signal<String>,
+    entra_client_id: Signal<String>,
+) -> Element {
+    let field_class = FORM_FIELD_CLASS;
+    rsx! {
+        select {
+            class: FORM_SELECT_CLASS,
+            onchange: move |evt| auth_mode.set(evt.value()),
+            option { value: "password", selected: auth_mode() == "password", "Auth: password" }
+            option {
+                value: "entra-interactive",
+                selected: auth_mode() == "entra-interactive",
+                "Auth: Microsoft Entra ID (browser sign-in)"
+            }
+            option {
+                value: "entra-mi",
+                selected: auth_mode() == "entra-mi",
+                "Auth: Microsoft Entra ID (managed identity)"
+            }
+        }
+        if auth_mode() == "entra-interactive" {
+            input {
+                class: field_class,
+                placeholder: "Entra tenant — id, domain, or 'organizations'",
+                value: "{entra_tenant}",
+                oninput: move |evt| entra_tenant.set(evt.value()),
+            }
+        }
+        if auth_mode().starts_with("entra") {
+            input {
+                class: field_class,
+                placeholder: "application (client) ID — optional",
+                value: "{entra_client_id}",
+                oninput: move |evt| entra_client_id.set(evt.value()),
+            }
+            p { class: "text-xs text-slate-500 dark:text-slate-400",
+                "The user field is your Entra principal (e.g. you@contoso.com); a token is used instead of a password."
+            }
+        }
+    }
+}
+
+/// The "Connect through an SSH tunnel" toggle and its fieldset — shared by the
+/// Postgres and SQL Server forms. `radio_group` keeps the two forms' auth
+/// radios in separate groups.
+#[component]
+fn SshTunnelFields(
+    use_tunnel: Signal<bool>,
+    ssh_host: Signal<String>,
+    ssh_port: Signal<String>,
+    ssh_user: Signal<String>,
+    ssh_use_key: Signal<bool>,
+    ssh_key_path: Signal<String>,
+    ssh_passphrase: Signal<String>,
+    radio_group: String,
+) -> Element {
+    let field_class = FORM_FIELD_CLASS;
+    rsx! {
+        label { class: "flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
+            input {
+                r#type: "checkbox",
+                checked: use_tunnel(),
+                onchange: move |evt| use_tunnel.set(evt.checked()),
+            }
+            "Connect through an SSH tunnel"
+        }
+        if use_tunnel() {
+            div { class: "flex flex-col gap-2 rounded border border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-900/60 p-3",
+                div { class: "flex gap-2",
+                    input {
+                        class: "{field_class} flex-[3]",
+                        placeholder: "ssh host",
+                        value: "{ssh_host}",
+                        oninput: move |evt| ssh_host.set(evt.value()),
+                    }
+                    input {
+                        class: "{field_class} flex-1",
+                        placeholder: "22",
+                        value: "{ssh_port}",
+                        oninput: move |evt| ssh_port.set(evt.value()),
+                    }
+                }
+                input {
+                    class: field_class,
+                    placeholder: "ssh user",
+                    value: "{ssh_user}",
+                    oninput: move |evt| ssh_user.set(evt.value()),
+                }
+                div { class: "flex gap-4 text-xs text-slate-500 dark:text-slate-400",
+                    label { class: "flex items-center gap-2",
+                        input {
+                            r#type: "radio",
+                            name: "{radio_group}",
+                            checked: !ssh_use_key(),
+                            onchange: move |_| ssh_use_key.set(false),
+                        }
+                        "ssh-agent"
+                    }
+                    label { class: "flex items-center gap-2",
+                        input {
+                            r#type: "radio",
+                            name: "{radio_group}",
+                            checked: ssh_use_key(),
+                            onchange: move |_| ssh_use_key.set(true),
+                        }
+                        "key file"
+                    }
+                }
+                if ssh_use_key() {
+                    input {
+                        class: field_class,
+                        placeholder: "key file path, e.g. ~/.ssh/id_ed25519",
+                        value: "{ssh_key_path}",
+                        oninput: move |evt| ssh_key_path.set(evt.value()),
+                    }
+                    input {
+                        r#type: "password",
+                        class: field_class,
+                        placeholder: "key passphrase (if the key is encrypted)",
+                        value: "{ssh_passphrase}",
+                        oninput: move |evt| ssh_passphrase.set(evt.value()),
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Fallback display name for a server connection URL: "database @ host".
 /// Scheme-agnostic, so the Postgres and SQL Server forms share it.

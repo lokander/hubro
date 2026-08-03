@@ -28,17 +28,26 @@
 //!     chmod 700 /home/tunnel/.ssh && chmod 600 /home/tunnel/.ssh/authorized_keys &&
 //!     exec /usr/sbin/sshd -D -e"
 //!
+//! # Optional SQL Server target for the mssql-through-tunnel test (FRE-58);
+//! # skipped unless DATAVIEW_SSH_TEST_MSSQL_PASSWORD is also set:
+//! docker run -d --name dataview-mssql-test --network dataview-test-net \
+//!   -e ACCEPT_EULA=Y -e "MSSQL_SA_PASSWORD=Str0ng!Passw0rd" \
+//!   mcr.microsoft.com/mssql/server:2022-latest
+//!
 //! # Run (key paths are required; host/port/user/db-target have defaults
 //! # matching the commands above):
 //! DATAVIEW_SSH_TEST=1 \
 //! DATAVIEW_SSH_TEST_KEY="$SCRATCH/ssh-test-key" \
 //! DATAVIEW_SSH_TEST_ENC_KEY="$SCRATCH/ssh-test-key-enc" \
+//! DATAVIEW_SSH_TEST_MSSQL_PASSWORD='Str0ng!Passw0rd' \
 //! cargo test --test tunnel
 //! ```
 
 use std::path::PathBuf;
 
-use dataview::db::{DbPool, Value};
+use dataview::db::{
+    mssql_url_target, mssql_url_via_local_port, mssql_url_with_password, DbPool, MssqlAuth, Value,
+};
 use dataview::tunnel::{Tunnel, TunnelAuth, TunnelConfig, TunnelError};
 
 /// Everything the gated tests need, from the environment (with defaults
@@ -130,6 +139,40 @@ async fn postgres_connects_end_to_end_through_the_tunnel() {
     let pool = DbPool::open_postgres(&url)
         .await
         .expect("postgres should connect through the tunnel");
+    let result = pool.query("SELECT 1").await.expect("query through tunnel");
+    assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+    pool.close().await;
+}
+
+/// The SQL Server mirror of the end-to-end test above (FRE-58), exercising the
+/// exact glue `AppState::connect_sqlserver` uses: the logical URL is rewritten
+/// through the forwarded local port, and the driver gets the original hostname
+/// as its TLS server name while dialing 127.0.0.1. Needs the
+/// `dataview-mssql-test` container (see the file header); skipped unless
+/// `DATAVIEW_SSH_TEST_MSSQL_PASSWORD` is set.
+#[tokio::test]
+async fn sqlserver_connects_end_to_end_through_the_tunnel() {
+    let Some(env) = ssh_env() else { return };
+    let Ok(password) = std::env::var("DATAVIEW_SSH_TEST_MSSQL_PASSWORD") else {
+        eprintln!("skipping mssql tunnel test: DATAVIEW_SSH_TEST_MSSQL_PASSWORD not set");
+        return;
+    };
+    let mssql_host = std::env::var("DATAVIEW_SSH_TEST_MSSQL_HOST")
+        .unwrap_or_else(|_| "dataview-mssql-test".to_string());
+    let (kh, _kh_dir) = trusted_known_hosts(&env).await;
+    let tunnel = Tunnel::open(env.config(), None, mssql_host.clone(), 1433, &kh)
+        .await
+        .expect("tunnel should open");
+    // The saved URL points at the logical host. The stock container's cert is
+    // self-signed, so TLS stays on with trustServerCertificate — what the
+    // form's dev checkbox produces.
+    let url = format!("mssql://sa@{mssql_host}:1433/master?encrypt=on&trustServerCertificate=true");
+    let connect_url = mssql_url_via_local_port(&url, tunnel.local_port()).unwrap();
+    let full = mssql_url_with_password(&connect_url, &password).unwrap();
+    let (tls_host, _) = mssql_url_target(&url).unwrap();
+    let pool = DbPool::open_mssql_with(&full, &MssqlAuth::Password, Some(&tls_host))
+        .await
+        .expect("sql server should connect through the tunnel");
     let result = pool.query("SELECT 1").await.expect("query through tunnel");
     assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
     pool.close().await;

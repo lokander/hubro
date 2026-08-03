@@ -197,6 +197,27 @@ pub fn build_mssql_url(
     normalize_mssql_url(parsed.as_str())
 }
 
+/// How a SQL Server connect authenticates (FRE-58). [`open_mssql`] always uses
+/// `Password`; the Entra flow passes `AadToken` to [`open_mssql_with`].
+#[derive(Clone)]
+pub enum MssqlAuth {
+    /// SQL Server authentication with the URL's user and (possibly spliced-in)
+    /// password — the FRE-57 behavior.
+    Password,
+    /// Microsoft Entra ID: log in with this AAD access token; the URL's
+    /// user/password are ignored.
+    AadToken(String),
+}
+
+impl std::fmt::Debug for MssqlAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MssqlAuth::Password => write!(f, "Password"),
+            MssqlAuth::AadToken(_) => write!(f, "AadToken(<HIDDEN>)"),
+        }
+    }
+}
+
 /// The connection settings parsed out of an mssql URL, one step before the
 /// driver's opaque [`Config`] so parsing stays unit-testable.
 #[derive(Debug, Clone, PartialEq)]
@@ -292,11 +313,23 @@ fn parse_mssql_url(url: &str) -> Result<MssqlUrlParts, DbError> {
 }
 
 impl MssqlUrlParts {
-    fn into_config(self) -> Config {
+    /// Builds the driver config. `tls_host`, when set, replaces the URL's host
+    /// in the config — tiberius takes the TLS server name (SNI + certificate
+    /// validation) from the config's host, while dataview dials the TCP socket
+    /// itself, so an SSH-tunneled connect can dial `127.0.0.1:<forwarded>` yet
+    /// still validate the server's certificate against its real hostname.
+    fn into_config(self, auth: &MssqlAuth, tls_host: Option<&str>) -> Config {
         let mut config = Config::new();
-        config.host(&self.host);
+        config.host(tls_host.unwrap_or(&self.host));
         config.port(self.port);
-        config.authentication(AuthMethod::sql_server(&self.user, &self.password));
+        match auth {
+            MssqlAuth::Password => {
+                config.authentication(AuthMethod::sql_server(&self.user, &self.password));
+            }
+            MssqlAuth::AadToken(token) => {
+                config.authentication(AuthMethod::aad_token(token));
+            }
+        }
         if let Some(database) = &self.database {
             config.database(database);
         }
@@ -319,6 +352,12 @@ pub struct MssqlPool {
 
 struct PoolInner {
     config: Config,
+    /// The TCP address new connections dial. Matches the config's host/port
+    /// for a direct connect; differs when an SSH tunnel forwards the
+    /// connection — then this is `127.0.0.1:<forwarded port>` while the config
+    /// keeps the logical host for TLS validation (see
+    /// [`MssqlUrlParts::into_config`]).
+    addr: (String, u16),
     /// Bounds live connections at [`MAX_CONNECTIONS`]; a checkout holds one
     /// permit for its whole lifetime.
     permits: Arc<Semaphore>,
@@ -380,10 +419,11 @@ impl Drop for PooledConn {
 }
 
 impl MssqlPool {
-    fn new(config: Config) -> Self {
+    fn new(config: Config, addr: (String, u16)) -> Self {
         MssqlPool {
             inner: Arc::new(PoolInner {
                 config,
+                addr,
                 permits: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
                 idle: Mutex::new(Vec::new()),
                 closed: AtomicBool::new(false),
@@ -401,7 +441,7 @@ impl MssqlPool {
         let idle = self.inner.idle.lock().expect("pool lock poisoned").pop();
         let client = match idle {
             Some(client) => client,
-            None => connect_client(&self.inner.config).await?,
+            None => connect_client(&self.inner.config, &self.inner.addr).await?,
         };
         Ok(PooledConn {
             client: Some(client),
@@ -430,8 +470,24 @@ impl MssqlPool {
 /// session password in via [`mssql_url_with_password`]. Validates the
 /// connection with a `SELECT 1` round-trip.
 pub async fn open_mssql(url: &str) -> Result<MssqlPool, DbError> {
-    let config = parse_mssql_url(url)?.into_config();
-    let pool = MssqlPool::new(config);
+    open_mssql_with(url, &MssqlAuth::Password, None).await
+}
+
+/// [`open_mssql`] with explicit auth and an optional TLS host override
+/// (FRE-58). `tls_host` is the server's logical hostname for an SSH-tunneled
+/// connect whose URL was rewritten to `127.0.0.1:<forwarded>`: the socket
+/// dials the URL's host/port, while TLS (SNI + certificate validation) uses
+/// `tls_host` — so `encrypt=on` keeps validating the real certificate through
+/// the tunnel.
+pub async fn open_mssql_with(
+    url: &str,
+    auth: &MssqlAuth,
+    tls_host: Option<&str>,
+) -> Result<MssqlPool, DbError> {
+    let parts = parse_mssql_url(url)?;
+    let addr = (parts.host.clone(), parts.port);
+    let config = parts.into_config(auth, tls_host);
+    let pool = MssqlPool::new(config, addr);
     {
         let mut conn = pool.acquire().await?;
         run_query(conn.client(), "SELECT 1", &[])
@@ -446,17 +502,19 @@ pub async fn open_mssql(url: &str) -> Result<MssqlPool, DbError> {
     Ok(pool)
 }
 
-/// Opens a TCP connection and performs the TDS login, following at most one
-/// Azure-style routing redirect, then applies [`SESSION_SETUP`].
-async fn connect_client(config: &Config) -> Result<TdsClient, DbError> {
-    let mut client = match connect_once(config.clone()).await {
+/// Opens a TCP connection to `addr` and performs the TDS login, following at
+/// most one Azure-style routing redirect, then applies [`SESSION_SETUP`].
+async fn connect_client(config: &Config, addr: &(String, u16)) -> Result<TdsClient, DbError> {
+    let mut client = match connect_once(config.clone(), addr).await {
         // Azure SQL can answer the login with "actually, talk to this other
-        // node"; a single redirect is all the protocol calls for.
+        // node"; a single redirect is all the protocol calls for. The redirect
+        // target is dialed directly — it names a reachable gateway node.
         Err(TdsError::Routing { host, port }) => {
             let mut redirected = config.clone();
             redirected.host(&host);
             redirected.port(port);
-            connect_once(redirected).await
+            let addr = (host, port);
+            connect_once(redirected, &addr).await
         }
         other => other,
     }
@@ -467,12 +525,12 @@ async fn connect_client(config: &Config) -> Result<TdsClient, DbError> {
     }
 }
 
-async fn connect_once(config: Config) -> Result<TdsClient, TdsError> {
+async fn connect_once(config: Config, addr: &(String, u16)) -> Result<TdsClient, TdsError> {
     let io_err = |e: std::io::Error| TdsError::Io {
         kind: e.kind(),
         message: e.to_string(),
     };
-    let tcp = TcpStream::connect(config.get_addr())
+    let tcp = TcpStream::connect((addr.0.as_str(), addr.1))
         .await
         .map_err(io_err)?;
     tcp.set_nodelay(true).map_err(io_err)?;
@@ -1574,6 +1632,35 @@ mod tests {
     }
 
     #[test]
+    fn tunneled_config_keeps_the_logical_host_for_tls() {
+        // A tunneled connect parses the rewritten URL (dialing
+        // 127.0.0.1:<forwarded>) but overrides the config host with the
+        // logical one — tiberius takes the TLS server name from the config, so
+        // encrypt=on validates the real certificate through the tunnel.
+        let rewritten =
+            mssql_url_via_local_port("mssql://sa@db.example.com:1433/app?encrypt=on", 40123)
+                .unwrap();
+        let parts = parse_mssql_url(&rewritten).unwrap();
+        assert_eq!(parts.host, "127.0.0.1");
+        assert_eq!(parts.port, 40123);
+        let config = parts.into_config(&MssqlAuth::Password, Some("db.example.com"));
+        assert_eq!(config.get_addr(), "db.example.com:40123");
+        // Without an override the config host is the URL's.
+        let direct = parse_mssql_url("mssql://sa@db.example.com:1433/app")
+            .unwrap()
+            .into_config(&MssqlAuth::Password, None);
+        assert_eq!(direct.get_addr(), "db.example.com:1433");
+    }
+
+    #[test]
+    fn mssql_auth_debug_never_prints_the_token() {
+        let auth = MssqlAuth::AadToken("SECRET_TOKEN".to_string());
+        let rendered = format!("{auth:?}");
+        assert!(!rendered.contains("SECRET_TOKEN"), "{rendered}");
+        assert!(rendered.contains("AadToken"));
+    }
+
+    #[test]
     fn parse_url_extracts_all_parts() {
         let parts = parse_mssql_url(
             "mssql://sa:p%40ss@db.example.com:14330/app?encrypt=off&trustServerCertificate=true",
@@ -1701,6 +1788,7 @@ mod tests {
     fn discarded_tx() -> MssqlTx {
         let inner = Arc::new(PoolInner {
             config: Config::new(),
+            addr: ("localhost".to_string(), 1433),
             permits: Arc::new(Semaphore::new(1)),
             idle: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),

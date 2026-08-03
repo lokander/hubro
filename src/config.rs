@@ -8,9 +8,11 @@ use serde::{Deserialize, Serialize};
 use crate::azure::EntraAuth;
 use crate::tunnel::TunnelConfig;
 
-/// How a Postgres connection authenticates (FRE-43). `Password` (the default)
-/// resolves a password from session memory / the keyring / a prompt; `Entra`
-/// acquires a Microsoft Entra ID access token and uses it as the password.
+/// How a server connection (Postgres, FRE-43; SQL Server, FRE-58)
+/// authenticates. `Password` (the default) resolves a password from session
+/// memory / the keyring / a prompt; `Entra` acquires a Microsoft Entra ID
+/// access token and uses it in place of the password. (Named for the backend
+/// it landed on first; the shape is backend-neutral.)
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum PgAuth {
@@ -56,12 +58,19 @@ pub enum SavedConnection {
     /// SQL Server (FRE-57), serialized with `kind = "sqlserver"`. Like
     /// Postgres, the URL is stored **without** a password in the canonical
     /// form (see [`crate::db::normalize_mssql_url`]) and doubles as the
-    /// keyring account key. SSH tunnels and Entra auth are FRE-58; when they
-    /// land their fields must use `#[serde(default, skip_serializing_if)]`
-    /// so files written today keep deserializing unchanged.
+    /// keyring account key.
     SqlServer {
         name: String,
         url: String,
+        /// Optional SSH tunnel (FRE-58), stored exactly like the Postgres
+        /// one. `default` + `skip_serializing_if` keep FRE-57-era files (and
+        /// tunnel-less entries) deserializing and serializing unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tunnel: Option<TunnelConfig>,
+        /// Authentication mode (FRE-58), stored exactly like the Postgres
+        /// one; a missing `auth` key deserializes as `Password`.
+        #[serde(default, skip_serializing_if = "PgAuth::is_password")]
+        auth: PgAuth,
     },
 }
 
@@ -496,9 +505,9 @@ impl SavedList {
     /// Adds unless an entry with the same locator exists. Returns whether
     /// the list changed.
     ///
-    /// Re-adding an existing Postgres URL keeps the entry (and its name) but
-    /// adopts a changed tunnel config or auth mode, so reconnecting with
-    /// different tunnel/auth settings persists them.
+    /// Re-adding an existing Postgres or SQL Server URL keeps the entry (and
+    /// its name) but adopts a changed tunnel config or auth mode, so
+    /// reconnecting with different tunnel/auth settings persists them.
     pub fn add(&mut self, connection: SavedConnection) -> bool {
         let existing = self
             .entries
@@ -508,27 +517,36 @@ impl SavedList {
             self.entries.push(connection);
             return true;
         };
-        if let (
-            SavedConnection::Postgres { tunnel, auth, .. },
-            SavedConnection::Postgres {
-                tunnel: new_tunnel,
-                auth: new_auth,
-                ..
-            },
-        ) = (existing, &connection)
-        {
-            let mut changed = false;
-            if *tunnel != *new_tunnel {
-                *tunnel = new_tunnel.clone();
-                changed = true;
+        match (existing, &connection) {
+            (
+                SavedConnection::Postgres { tunnel, auth, .. },
+                SavedConnection::Postgres {
+                    tunnel: new_tunnel,
+                    auth: new_auth,
+                    ..
+                },
+            )
+            | (
+                SavedConnection::SqlServer { tunnel, auth, .. },
+                SavedConnection::SqlServer {
+                    tunnel: new_tunnel,
+                    auth: new_auth,
+                    ..
+                },
+            ) => {
+                let mut changed = false;
+                if *tunnel != *new_tunnel {
+                    *tunnel = new_tunnel.clone();
+                    changed = true;
+                }
+                if *auth != *new_auth {
+                    *auth = new_auth.clone();
+                    changed = true;
+                }
+                changed
             }
-            if *auth != *new_auth {
-                *auth = new_auth.clone();
-                changed = true;
-            }
-            return changed;
+            _ => false,
         }
-        false
     }
 
     /// Removes and returns the entry with this locator (`None` when absent).
@@ -574,6 +592,8 @@ mod tests {
         SavedConnection::SqlServer {
             name: name.into(),
             url: url.into(),
+            tunnel: None,
+            auth: PgAuth::Password,
         }
     }
 
@@ -660,6 +680,72 @@ mod tests {
         assert_eq!(deduped[0].locator(), "mssql://sa@host:1433/db");
         assert_eq!(deduped[0].backend(), BackendKind::SqlServer);
         assert_eq!(deduped[1].name(), "other");
+    }
+
+    #[test]
+    fn sqlserver_tunnel_and_entra_round_trip_and_stay_optional() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.toml");
+        // A password-only entry still writes no tunnel/auth keys (FRE-57
+        // files stay byte-compatible)…
+        save_connections(&path, &[saved_ms("plain", "mssql://sa@h:1433/db")]).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("tunnel"));
+        assert!(!text.contains("auth"));
+        // …and an FRE-57-era minimal file (no tunnel/auth keys) deserializes.
+        std::fs::write(
+            &path,
+            "[[connections]]\nkind = \"sqlserver\"\nname = \"ms\"\nurl = \"mssql://sa@h:1433/db\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_connections(&path).unwrap(),
+            vec![saved_ms("ms", "mssql://sa@h:1433/db")]
+        );
+        // Tunnel + Entra round-trip with the same tagged shapes as Postgres.
+        let entries = vec![SavedConnection::SqlServer {
+            name: "azure sql".into(),
+            url: "mssql://you@myserver.database.windows.net:1433/app?encrypt=on".into(),
+            tunnel: Some(tunnel(crate::tunnel::TunnelAuth::Agent)),
+            auth: PgAuth::Entra(EntraAuth::Interactive {
+                tenant: "contoso.onmicrosoft.com".into(),
+                client_id: None,
+            }),
+        }];
+        save_connections(&path, &entries).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("kind = \"sqlserver\""));
+        assert!(text.contains("method = \"agent\""));
+        assert!(text.contains("kind = \"entra\""));
+        assert_eq!(load_connections(&path).unwrap(), entries);
+    }
+
+    #[test]
+    fn add_adopts_changed_sqlserver_tunnel_and_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut list, _) = SavedList::load(&dir.path().join("connections.toml"));
+        assert!(list.add(saved_ms("prod", "mssql://sa@h:1433/db")));
+        // Same URL, tunnel + Entra added: the entry is updated, keeps its name.
+        let updated = SavedConnection::SqlServer {
+            name: "ignored".into(),
+            url: "mssql://sa@h:1433/db".into(),
+            tunnel: Some(tunnel(crate::tunnel::TunnelAuth::Agent)),
+            auth: PgAuth::Entra(EntraAuth::interactive_default()),
+        };
+        assert!(list.add(updated.clone()));
+        assert_eq!(list.entries().len(), 1);
+        match &list.entries()[0] {
+            SavedConnection::SqlServer {
+                name, tunnel, auth, ..
+            } => {
+                assert_eq!(name, "prod");
+                assert!(tunnel.is_some());
+                assert!(matches!(auth, PgAuth::Entra(_)));
+            }
+            other => panic!("expected sqlserver, got {other:?}"),
+        }
+        // Identical settings again: no change.
+        assert!(!list.add(updated));
     }
 
     #[test]

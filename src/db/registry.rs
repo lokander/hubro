@@ -151,6 +151,19 @@ impl DbPool {
         Ok(DbPool::SqlServer(sqlserver::open_mssql(url).await?))
     }
 
+    /// Connects to a SQL Server URL with explicit auth (password vs Entra
+    /// token) and an optional TLS host override for tunneled connects (see
+    /// [`sqlserver::open_mssql_with`]).
+    pub async fn open_mssql_with(
+        url: &str,
+        auth: &sqlserver::MssqlAuth,
+        tls_host: Option<&str>,
+    ) -> Result<DbPool, DbError> {
+        Ok(DbPool::SqlServer(
+            sqlserver::open_mssql_with(url, auth, tls_host).await?,
+        ))
+    }
+
     pub fn dialect(&self) -> Dialect {
         match self {
             DbPool::Sqlite(_) => Dialect::Sqlite,

@@ -31,6 +31,10 @@ use tokio::net::TcpListener;
 /// its `/.default` scope.
 pub const OSSRDBMS_RESOURCE: &str = "https://ossrdbms-aad.database.windows.net";
 
+/// The Azure SQL Database OAuth resource (FRE-58); tokens for SQL Server are
+/// requested for its `/.default` scope.
+pub const SQLDB_RESOURCE: &str = "https://database.windows.net";
+
 /// The Azure CLI's public client id. It has the `http://localhost` loopback
 /// redirect registered and is pre-consented in most tenants, so it works out of
 /// the box; users whose tenant disallows it can supply their own app
@@ -149,13 +153,16 @@ impl fmt::Display for AzureError {
 
 impl std::error::Error for AzureError {}
 
-/// Acquires an access token for `auth`. `cached_refresh` is an optional refresh
+/// Acquires an access token for `auth`, scoped to `resource` (the target
+/// service's OAuth resource — [`OSSRDBMS_RESOURCE`] for Azure Postgres,
+/// [`SQLDB_RESOURCE`] for Azure SQL). `cached_refresh` is an optional refresh
 /// token (from the keyring) to redeem silently before falling back to
 /// interactive sign-in. `open_browser` launches the sign-in URL — injected so
 /// tests never open a real browser; production passes a `webbrowser::open`
-/// wrapper. The scope is always [`OSSRDBMS_RESOURCE`]'s `/.default`.
+/// wrapper.
 pub async fn acquire_token(
     auth: &EntraAuth,
+    resource: &str,
     cached_refresh: Option<&str>,
     endpoints: &Endpoints,
     timeout: Duration,
@@ -163,7 +170,7 @@ pub async fn acquire_token(
 ) -> Result<AccessToken, AzureError> {
     match auth {
         EntraAuth::ManagedIdentity { client_id } => {
-            acquire_managed_identity(client_id.as_deref(), endpoints).await
+            acquire_managed_identity(client_id.as_deref(), resource, endpoints).await
         }
         EntraAuth::Interactive { tenant, client_id } => {
             if tenant.trim().is_empty() {
@@ -174,20 +181,29 @@ pub async fn acquire_token(
             let client_id = client_id.as_deref().unwrap_or(AZURE_CLI_CLIENT_ID);
             // Silent renewal first: a valid refresh token skips the browser.
             if let Some(refresh) = cached_refresh {
-                if let Ok(token) = redeem_refresh_token(endpoints, tenant, client_id, refresh).await
+                if let Ok(token) =
+                    redeem_refresh_token(endpoints, tenant, client_id, resource, refresh).await
                 {
                     return Ok(token);
                 }
             }
-            acquire_interactive(endpoints, tenant, client_id, timeout, open_browser).await
+            acquire_interactive(
+                endpoints,
+                tenant,
+                client_id,
+                resource,
+                timeout,
+                open_browser,
+            )
+            .await
         }
     }
 }
 
-/// The `/.default` scope for the Postgres resource, plus `offline_access` so the
-/// token endpoint returns a refresh token.
-fn scope() -> String {
-    format!("{OSSRDBMS_RESOURCE}/.default offline_access")
+/// The `/.default` scope for a resource, plus `offline_access` so the token
+/// endpoint returns a refresh token.
+fn scope(resource: &str) -> String {
+    format!("{resource}/.default offline_access")
 }
 
 /// Builds the authorization-code request URL.
@@ -195,6 +211,7 @@ fn authorize_url(
     login: &str,
     tenant: &str,
     client_id: &str,
+    resource: &str,
     redirect_uri: &str,
     code_challenge: &str,
     state: &str,
@@ -204,7 +221,7 @@ fn authorize_url(
         .append_pair("response_type", "code")
         .append_pair("redirect_uri", redirect_uri)
         .append_pair("response_mode", "query")
-        .append_pair("scope", &scope())
+        .append_pair("scope", &scope(resource))
         .append_pair("code_challenge", code_challenge)
         .append_pair("code_challenge_method", "S256")
         .append_pair("state", state)
@@ -219,6 +236,7 @@ async fn acquire_interactive(
     endpoints: &Endpoints,
     tenant: &str,
     client_id: &str,
+    resource: &str,
     timeout: Duration,
     open_browser: impl FnOnce(&str) -> Result<(), AzureError>,
 ) -> Result<AccessToken, AzureError> {
@@ -242,6 +260,7 @@ async fn acquire_interactive(
         &endpoints.login,
         tenant,
         client_id,
+        resource,
         &redirect_uri,
         &challenge,
         &state,
@@ -253,6 +272,7 @@ async fn acquire_interactive(
         endpoints,
         tenant,
         client_id,
+        resource,
         &code,
         &verifier,
         &redirect_uri,
@@ -370,6 +390,7 @@ async fn exchange_code(
     endpoints: &Endpoints,
     tenant: &str,
     client_id: &str,
+    resource: &str,
     code: &str,
     verifier: &str,
     redirect_uri: &str,
@@ -380,7 +401,7 @@ async fn exchange_code(
         ("code", code),
         ("redirect_uri", redirect_uri),
         ("code_verifier", verifier),
-        ("scope", &scope()),
+        ("scope", &scope(resource)),
     ];
     post_token(endpoints, tenant, &form).await
 }
@@ -390,13 +411,14 @@ async fn redeem_refresh_token(
     endpoints: &Endpoints,
     tenant: &str,
     client_id: &str,
+    resource: &str,
     refresh_token: &str,
 ) -> Result<AccessToken, AzureError> {
     let form = [
         ("client_id", client_id),
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
-        ("scope", &scope()),
+        ("scope", &scope(resource)),
     ];
     post_token(endpoints, tenant, &form).await
 }
@@ -436,6 +458,7 @@ async fn post_token(
 /// when present, otherwise IMDS.
 async fn acquire_managed_identity(
     client_id: Option<&str>,
+    resource: &str,
     endpoints: &Endpoints,
 ) -> Result<AccessToken, AzureError> {
     // App Service / Container Apps expose a per-instance endpoint + header
@@ -449,6 +472,7 @@ async fn acquire_managed_identity(
             "2019-08-01",
             Some(("X-IDENTITY-HEADER", &header)),
             client_id,
+            resource,
         )
         .await;
     }
@@ -458,6 +482,7 @@ async fn acquire_managed_identity(
         "2018-02-01",
         Some(("Metadata", "true")),
         client_id,
+        resource,
     )
     .await
 }
@@ -469,10 +494,11 @@ async fn imds_get(
     api_version: &str,
     header: Option<(&str, &str)>,
     client_id: Option<&str>,
+    resource: &str,
 ) -> Result<AccessToken, AzureError> {
     let mut query = vec![
         ("api-version", api_version.to_string()),
-        ("resource", OSSRDBMS_RESOURCE.to_string()),
+        ("resource", resource.to_string()),
     ];
     if let Some(client_id) = client_id {
         query.push(("client_id", client_id.to_string()));
@@ -642,6 +668,7 @@ mod tests {
             "https://login.microsoftonline.com",
             "organizations",
             AZURE_CLI_CLIENT_ID,
+            OSSRDBMS_RESOURCE,
             "http://localhost:12345/",
             "CHALLENGE",
             "STATE",
@@ -657,6 +684,19 @@ mod tests {
         assert_eq!(pairs["redirect_uri"], "http://localhost:12345/");
         assert!(pairs["scope"].contains("ossrdbms-aad.database.windows.net/.default"));
         assert!(pairs["scope"].contains("offline_access"));
+    }
+
+    #[test]
+    fn scope_parameterizes_on_the_resource() {
+        // Postgres keeps its historical scope; Azure SQL gets its own.
+        assert_eq!(
+            scope(OSSRDBMS_RESOURCE),
+            "https://ossrdbms-aad.database.windows.net/.default offline_access"
+        );
+        assert_eq!(
+            scope(SQLDB_RESOURCE),
+            "https://database.windows.net/.default offline_access"
+        );
     }
 
     #[test]
