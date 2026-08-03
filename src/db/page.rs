@@ -43,9 +43,18 @@ pub enum ColumnClass {
 /// worse, any locator built from it).
 pub fn classify_column(type_name: &str) -> ColumnClass {
     let t = type_name.trim().to_ascii_lowercase();
-    // "binary" covers SQL Server binary/varbinary; "image" is its legacy
-    // blob type.
-    if t.contains("blob") || t.contains("bytea") || t.contains("binary") || t.contains("image") {
+    if t.contains("blob") || t.contains("bytea") {
+        return ColumnClass::Binary;
+    }
+    // SQL Server binary types match by exact base name (any `(n)`/`(max)`
+    // parameter suffix stripped), NOT by substring: Postgres type names
+    // include user-defined types, and an enum/domain merely *containing*
+    // these words (an `image_format` enum, a `binary_state` domain) must
+    // stay Text — a Binary classification would emit byte-preview SQL
+    // (`substring(… from … for …)`, `octet_length`) that errors on such
+    // columns and makes the whole table unbrowsable.
+    let base = t.split('(').next().unwrap_or("").trim_end();
+    if matches!(base, "binary" | "varbinary" | "image") {
         return ColumnClass::Binary;
     }
     // A declared scalar keeps its native decoded type. Checked before the
@@ -933,16 +942,26 @@ mod tests {
     #[test]
     fn classify_column_separates_scalars_text_and_binary() {
         use ColumnClass::*;
-        // Binary.
+        // Binary. SQL Server types match on the exact base name, with any
+        // parameter suffix stripped and case ignored.
         for t in [
             "BLOB",
             "bytea",
             "BLOB SUB_TYPE TEXT",
             "varbinary(max)",
+            "VARBINARY(255)",
             "binary(16)",
+            "BINARY(16)",
             "image",
+            "varbinary (max)",
         ] {
             assert_eq!(classify_column(t), Binary, "{t}");
+        }
+        // Postgres user-defined types (enums/domains) that merely CONTAIN a
+        // binary-ish word are NOT binary — byte-preview SQL would error on
+        // them. They fall through to Text like any user-defined type.
+        for t in ["image_format", "binary_state", "imagery", "combinary"] {
+            assert_eq!(classify_column(t), Text, "{t}");
         }
         // Scalars keep their native decoded type (never previewed).
         for t in [
