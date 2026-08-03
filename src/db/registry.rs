@@ -65,6 +65,11 @@ pub enum DbPool {
 /// A backend-neutral transaction handle for atomically running a script
 /// (FRE-38): every statement runs on the one held connection, so they share a
 /// transaction that [`Self::commit`] or [`Self::rollback`] resolves as a unit.
+///
+/// Each method body is pure per-variant dispatch into that backend's module
+/// helpers — nothing here assumes sqlx, so a variant with a completely
+/// different shape (e.g. an owned pooled connection driving `BEGIN`/`COMMIT`
+/// as manual SQL) can be added without touching the existing arms.
 pub enum ScriptTx<'p> {
     Sqlite(sqlx::Transaction<'p, sqlx::Sqlite>),
     Postgres(sqlx::Transaction<'p, sqlx::Postgres>),
@@ -73,25 +78,11 @@ pub enum ScriptTx<'p> {
 impl ScriptTx<'_> {
     /// Runs a non-row statement in the transaction, returning affected rows.
     pub async fn execute(&mut self, sql: &str) -> Result<u64, DbError> {
-        // `&mut Transaction` isn't itself an `Executor`; deref-coerce to the
-        // underlying `&mut Connection`, which is.
-        let affected = match self {
-            ScriptTx::Sqlite(tx) => {
-                let conn: &mut sqlx::sqlite::SqliteConnection = tx;
-                sqlx::query(sql)
-                    .execute(conn)
-                    .await
-                    .map(|d| d.rows_affected())
-            }
-            ScriptTx::Postgres(tx) => {
-                let conn: &mut sqlx::postgres::PgConnection = tx;
-                sqlx::query(sql)
-                    .execute(conn)
-                    .await
-                    .map(|d| d.rows_affected())
-            }
-        };
-        affected.map_err(|e| DbError::Query(e.to_string()))
+        // `tx` deref-coerces to the `&mut Connection` these helpers take.
+        match self {
+            ScriptTx::Sqlite(tx) => sqlite::execute_conn(tx, sql).await,
+            ScriptTx::Postgres(tx) => postgres::execute_conn(tx, sql).await,
+        }
     }
 
     /// Runs a row-returning statement in the transaction, bounded exactly like
@@ -115,10 +106,9 @@ impl ScriptTx<'_> {
     /// Commits the transaction — the script's statements all take effect.
     pub async fn commit(self) -> Result<(), DbError> {
         match self {
-            ScriptTx::Sqlite(tx) => tx.commit().await,
-            ScriptTx::Postgres(tx) => tx.commit().await,
+            ScriptTx::Sqlite(tx) => sqlite::commit_tx(tx).await,
+            ScriptTx::Postgres(tx) => postgres::commit_tx(tx).await,
         }
-        .map_err(|e| DbError::Query(e.to_string()))
     }
 
     /// Rolls the transaction back — none of the script's statements persist.
@@ -126,10 +116,10 @@ impl ScriptTx<'_> {
     /// transaction also rolls back on drop), so the original error is what the
     /// caller reports.
     pub async fn rollback(self) {
-        let _ = match self {
-            ScriptTx::Sqlite(tx) => tx.rollback().await,
-            ScriptTx::Postgres(tx) => tx.rollback().await,
-        };
+        match self {
+            ScriptTx::Sqlite(tx) => sqlite::rollback_tx(tx).await,
+            ScriptTx::Postgres(tx) => postgres::rollback_tx(tx).await,
+        }
     }
 }
 

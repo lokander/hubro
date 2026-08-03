@@ -6,7 +6,9 @@ use dioxus::desktop::tao::event::{Event, WindowEvent};
 use dioxus::desktop::{use_window, use_wry_event_handler, DesktopService, WindowCloseBehaviour};
 use dioxus::prelude::*;
 
-use crate::config::{default_settings_path, save_window_geometry, Theme, WindowGeometry};
+use crate::config::{
+    default_settings_path, save_window_geometry, BackendKind, Theme, WindowGeometry,
+};
 use crate::db::ConnectionId;
 
 use super::editor::SqlEditor;
@@ -540,7 +542,7 @@ fn PaneButton(
 struct SavedRow {
     name: String,
     locator: String,
-    is_postgres: bool,
+    backend: BackendKind,
     is_open: bool,
     tunnel: Option<crate::tunnel::TunnelConfig>,
     auth: crate::config::PgAuth,
@@ -579,7 +581,7 @@ fn ConnectionsScreen() -> Element {
                 SavedRow {
                     name: s.name().to_string(),
                     locator: s.locator(),
-                    is_postgres: matches!(s, crate::config::SavedConnection::Postgres { .. }),
+                    backend: s.backend(),
                     is_open: open.iter().any(|(_, l)| *l == canonical_locator),
                     tunnel,
                     auth,
@@ -631,17 +633,20 @@ fn ConnectionsScreen() -> Element {
                                     move |_| {
                                         let row = row.clone();
                                         spawn(async move {
-                                            if row.is_postgres {
-                                                state
-                                                    .connect_postgres(
-                                                        row.locator,
-                                                        row.name,
-                                                        row.tunnel,
-                                                        row.auth,
-                                                    )
-                                                    .await;
-                                            } else {
-                                                state.connect(PathBuf::from(row.locator)).await;
+                                            match row.backend {
+                                                BackendKind::Postgres => {
+                                                    state
+                                                        .connect_postgres(
+                                                            row.locator,
+                                                            row.name,
+                                                            row.tunnel,
+                                                            row.auth,
+                                                        )
+                                                        .await;
+                                                }
+                                                BackendKind::Sqlite => {
+                                                    state.connect(PathBuf::from(row.locator)).await;
+                                                }
                                             }
                                         });
                                     }
@@ -651,12 +656,14 @@ fn ConnectionsScreen() -> Element {
                                         "{row.name}"
                                     }
                                     span {
-                                        class: if row.is_postgres {
-                                            "rounded bg-cyan-100 dark:bg-cyan-900/50 px-1.5 py-0.5 text-xs text-cyan-700 dark:text-cyan-300"
-                                        } else {
-                                            "rounded bg-slate-200 dark:bg-slate-800 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400"
+                                        class: match row.backend {
+                                            BackendKind::Postgres => "rounded bg-cyan-100 dark:bg-cyan-900/50 px-1.5 py-0.5 text-xs text-cyan-700 dark:text-cyan-300",
+                                            BackendKind::Sqlite => "rounded bg-slate-200 dark:bg-slate-800 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400",
                                         },
-                                        if row.is_postgres { "postgres" } else { "sqlite" }
+                                        match row.backend {
+                                            BackendKind::Postgres => "postgres",
+                                            BackendKind::Sqlite => "sqlite",
+                                        }
                                     }
                                     if row.tunnel.is_some() {
                                         span { class: "rounded bg-teal-100 dark:bg-teal-900/50 px-1.5 py-0.5 text-xs text-teal-700 dark:text-teal-300",

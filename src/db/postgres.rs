@@ -279,6 +279,31 @@ pub async fn query_capped_conn(
     collect_capped(stream, sql, max_rows, cell_cap).await
 }
 
+/// Runs a non-row statement on a single connection (e.g. one borrowed from a
+/// transaction) rather than the pool, returning affected rows — the write
+/// path for statements inside an atomically-wrapped script (FRE-38).
+pub async fn execute_conn(
+    conn: &mut sqlx::postgres::PgConnection,
+    sql: &str,
+) -> Result<u64, DbError> {
+    sqlx::query(sql)
+        .execute(conn)
+        .await
+        .map(|done| done.rows_affected())
+        .map_err(|e| DbError::Query(e.to_string()))
+}
+
+/// Commits a script transaction — its statements all take effect.
+pub async fn commit_tx(tx: sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(), DbError> {
+    tx.commit().await.map_err(|e| DbError::Query(e.to_string()))
+}
+
+/// Rolls a script transaction back. Best-effort: a rollback failure leaves
+/// nothing committed anyway (the transaction also rolls back on drop).
+pub async fn rollback_tx(tx: sqlx::Transaction<'_, sqlx::Postgres>) {
+    let _ = tx.rollback().await;
+}
+
 /// Drains a row stream into a bounded [`QueryResult`], keeping at most
 /// `max_rows` rows and capping each cell to `cell_cap` bytes; the bool is
 /// whether rows existed past the cap. Shared by the pool and single-connection
