@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use dataview::azure::{acquire_token, AzureError, Endpoints, EntraAuth};
+use dataview::azure::{
+    acquire_token, AzureError, Endpoints, EntraAuth, OSSRDBMS_RESOURCE, SQLDB_RESOURCE,
+};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -75,6 +77,7 @@ async fn interactive_flow_exchanges_the_code_for_a_token() {
 
     let token = acquire_token(
         &EntraAuth::interactive_default(),
+        OSSRDBMS_RESOURCE,
         None,
         &endpoints,
         Duration::from_secs(5),
@@ -102,6 +105,7 @@ async fn a_cached_refresh_token_is_redeemed_without_opening_a_browser() {
     // browser_must_not_open panics if the interactive flow is reached.
     let token = acquire_token(
         &EntraAuth::interactive_default(),
+        OSSRDBMS_RESOURCE,
         Some("CACHED_REFRESH"),
         &endpoints,
         Duration::from_secs(5),
@@ -134,6 +138,7 @@ async fn managed_identity_reads_the_token_from_imds() {
 
     let token = acquire_token(
         &EntraAuth::ManagedIdentity { client_id: None },
+        SQLDB_RESOURCE,
         None,
         &endpoints,
         Duration::from_secs(5),
@@ -162,6 +167,7 @@ async fn a_token_endpoint_error_surfaces_as_an_oauth_error() {
     // token exchange fails with a 400 the provider describes.
     let err = acquire_token(
         &EntraAuth::interactive_default(),
+        OSSRDBMS_RESOURCE,
         None,
         &endpoints,
         Duration::from_secs(5),

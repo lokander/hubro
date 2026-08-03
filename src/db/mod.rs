@@ -43,7 +43,7 @@ pub use script::{
 pub use sqlite::open_sqlite;
 pub use sqlserver::{
     build_mssql_url, mssql_url_target, mssql_url_via_local_port, mssql_url_with_password,
-    normalize_mssql_url, open_mssql, MssqlPool, MssqlTx,
+    normalize_mssql_url, open_mssql, open_mssql_with, MssqlAuth, MssqlPool, MssqlTx,
 };
 pub use staged::{
     apply_staged, AppliedCounts, CheckedStatement, RowLocator, StagedChange, StagedError,
