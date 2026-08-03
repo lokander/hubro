@@ -53,6 +53,16 @@ pub enum SavedConnection {
         #[serde(default, skip_serializing_if = "PgAuth::is_password")]
         auth: PgAuth,
     },
+    /// SQL Server (FRE-57), serialized with `kind = "sqlserver"`. Like
+    /// Postgres, the URL is stored **without** a password in the canonical
+    /// form (see [`crate::db::normalize_mssql_url`]) and doubles as the
+    /// keyring account key. SSH tunnels and Entra auth are FRE-58; when they
+    /// land their fields must use `#[serde(default, skip_serializing_if)]`
+    /// so files written today keep deserializing unchanged.
+    SqlServer {
+        name: String,
+        url: String,
+    },
 }
 
 /// Which database backend a connection targets. Purely in-memory — the config
@@ -62,12 +72,15 @@ pub enum SavedConnection {
 pub enum BackendKind {
     Sqlite,
     Postgres,
+    SqlServer,
 }
 
 impl SavedConnection {
     pub fn name(&self) -> &str {
         match self {
-            SavedConnection::Sqlite { name, .. } | SavedConnection::Postgres { name, .. } => name,
+            SavedConnection::Sqlite { name, .. }
+            | SavedConnection::Postgres { name, .. }
+            | SavedConnection::SqlServer { name, .. } => name,
         }
     }
 
@@ -75,6 +88,7 @@ impl SavedConnection {
         match self {
             SavedConnection::Sqlite { .. } => BackendKind::Sqlite,
             SavedConnection::Postgres { .. } => BackendKind::Postgres,
+            SavedConnection::SqlServer { .. } => BackendKind::SqlServer,
         }
     }
 
@@ -83,7 +97,9 @@ impl SavedConnection {
     pub fn locator(&self) -> String {
         match self {
             SavedConnection::Sqlite { path, .. } => path.display().to_string(),
-            SavedConnection::Postgres { url, .. } => url.clone(),
+            SavedConnection::Postgres { url, .. } | SavedConnection::SqlServer { url, .. } => {
+                url.clone()
+            }
         }
     }
 }
@@ -390,21 +406,23 @@ pub struct RestoreCandidate {
 ///
 /// A tab is reopened only when its locator still matches a saved connection —
 /// ad-hoc connections the user never saved are not resurrected. SQLite
-/// reconnects unconditionally; Postgres reconnects only when a password is
-/// available (`pg_password_available`: session memory or keyring), so startup
-/// never pops a wall of password prompts. Session order (and any duplicates)
-/// is preserved.
+/// reconnects unconditionally; server backends (Postgres, SQL Server)
+/// reconnect only when a password is available (`password_available`: session
+/// memory or keyring), so startup never pops a wall of password prompts.
+/// Session order (and any duplicates) is preserved.
 pub fn plan_session_restore(
     tabs: &[SessionTab],
     candidates: &[RestoreCandidate],
-    pg_password_available: impl Fn(&str) -> bool,
+    password_available: impl Fn(&str) -> bool,
 ) -> Vec<SessionTab> {
     tabs.iter()
         .filter(
             |tab| match candidates.iter().find(|c| c.locator == tab.locator) {
                 None => false,
                 Some(c) => match c.backend {
-                    BackendKind::Postgres => pg_password_available(&tab.locator),
+                    BackendKind::Postgres | BackendKind::SqlServer => {
+                        password_available(&tab.locator)
+                    }
                     BackendKind::Sqlite => true,
                 },
             },
@@ -422,17 +440,26 @@ pub struct SavedList {
     load_failed: bool,
 }
 
-/// Canonicalizes Postgres URLs (FRE-39) and drops entries that collapse to an
-/// already-present locator — upgrading a list saved before normalization
-/// existed (e.g. `postgresql://` or a portless URL) and de-duplicating it. The
-/// first entry for each locator wins, so its name is kept.
+/// Canonicalizes Postgres (FRE-39) and SQL Server URLs and drops entries that
+/// collapse to an already-present locator — upgrading a list saved before
+/// normalization existed (e.g. `postgresql://` or a portless URL) and
+/// de-duplicating it. The first entry for each locator wins, so its name is
+/// kept.
 fn normalize_and_dedup(entries: Vec<SavedConnection>) -> Vec<SavedConnection> {
     let mut out: Vec<SavedConnection> = Vec::new();
     for mut entry in entries {
-        if let SavedConnection::Postgres { url, .. } = &mut entry {
-            if let Ok(normalized) = crate::db::normalize_pg_url(url) {
-                *url = normalized;
+        match &mut entry {
+            SavedConnection::Postgres { url, .. } => {
+                if let Ok(normalized) = crate::db::normalize_pg_url(url) {
+                    *url = normalized;
+                }
             }
+            SavedConnection::SqlServer { url, .. } => {
+                if let Ok(normalized) = crate::db::normalize_mssql_url(url) {
+                    *url = normalized;
+                }
+            }
+            SavedConnection::Sqlite { .. } => {}
         }
         let locator = entry.locator();
         if !out.iter().any(|existing| existing.locator() == locator) {
@@ -543,6 +570,13 @@ mod tests {
         }
     }
 
+    fn saved_ms(name: &str, url: &str) -> SavedConnection {
+        SavedConnection::SqlServer {
+            name: name.into(),
+            url: url.into(),
+        }
+    }
+
     fn tunnel(auth: crate::tunnel::TunnelAuth) -> TunnelConfig {
         TunnelConfig {
             host: "bastion.example.com".into(),
@@ -586,6 +620,86 @@ mod tests {
     }
 
     #[test]
+    fn sqlserver_entries_round_trip_with_the_sqlserver_kind_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.toml");
+        let entries = vec![saved_ms(
+            "mssql prod",
+            "mssql://sa@db.example.com:1433/app?encrypt=on",
+        )];
+        save_connections(&path, &entries).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("kind = \"sqlserver\""));
+        assert!(!text.contains("password"));
+        assert_eq!(load_connections(&path).unwrap(), entries);
+        // A hand-written minimal entry (the on-disk shape) deserializes too.
+        std::fs::write(
+            &path,
+            "[[connections]]\nkind = \"sqlserver\"\nname = \"ms\"\nurl = \"mssql://sa@h:1433/db\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_connections(&path).unwrap(),
+            vec![saved_ms("ms", "mssql://sa@h:1433/db")]
+        );
+    }
+
+    #[test]
+    fn load_normalizes_and_dedups_equivalent_sqlserver_entries() {
+        // Three spellings of one server (sqlserver:// scheme, portless, cased
+        // host) plus a distinct one.
+        let entries = vec![
+            saved_ms("primary", "sqlserver://sa@Host/db"),
+            saved_ms("dup-a", "mssql://sa@host:1433/db"),
+            saved_ms("dup-b", "mssql://sa@host/db"),
+            saved_ms("other", "mssql://sa@other:1433/db2"),
+        ];
+        let deduped = normalize_and_dedup(entries);
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].name(), "primary");
+        assert_eq!(deduped[0].locator(), "mssql://sa@host:1433/db");
+        assert_eq!(deduped[0].backend(), BackendKind::SqlServer);
+        assert_eq!(deduped[1].name(), "other");
+    }
+
+    #[test]
+    fn plan_restore_treats_sqlserver_like_postgres() {
+        let tabs = vec![
+            SessionTab {
+                locator: "mssql://sa@h:1433/withpw".into(),
+                ..Default::default()
+            },
+            SessionTab {
+                locator: "mssql://sa@h:1433/nopw".into(),
+                ..Default::default()
+            },
+        ];
+        let candidates = vec![
+            RestoreCandidate {
+                locator: "mssql://sa@h:1433/withpw".into(),
+                backend: BackendKind::SqlServer,
+            },
+            RestoreCandidate {
+                locator: "mssql://sa@h:1433/nopw".into(),
+                backend: BackendKind::SqlServer,
+            },
+        ];
+        let plan = plan_session_restore(&tabs, &candidates, |loc| loc.ends_with("withpw"));
+        let locators: Vec<&str> = plan.iter().map(|t| t.locator.as_str()).collect();
+        assert_eq!(locators, vec!["mssql://sa@h:1433/withpw"]);
+    }
+
+    #[test]
+    fn add_dedupes_sqlserver_by_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut list, _) = SavedList::load(&dir.path().join("connections.toml"));
+        assert!(list.add(saved_ms("prod", "mssql://sa@h:1433/db")));
+        assert!(!list.add(saved_ms("other name", "mssql://sa@h:1433/db")));
+        assert!(list.remove("mssql://sa@h:1433/db").is_some());
+        assert!(list.entries().is_empty());
+    }
+
+    #[test]
     fn save_and_load_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("deep").join("connections.toml");
@@ -595,6 +709,10 @@ mod tests {
             saved_pg(
                 "prod",
                 "postgres://user@db.example.com:5432/app?sslmode=require",
+            ),
+            saved_ms(
+                "ms prod",
+                "mssql://sa@db.example.com:1433/app?encrypt=on&trustServerCertificate=true",
             ),
         ];
         save_connections(&path, &connections).unwrap();
