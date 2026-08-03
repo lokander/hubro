@@ -341,12 +341,26 @@ impl PooledConn {
         self.client.as_mut().expect("connection already discarded")
     }
 
+    /// True once [`Self::discard`] ran. A [`MssqlTx`] can outlive its
+    /// connection this way (a fatal mid-script error discards it), so the
+    /// transaction entry points must check before touching the client.
+    fn is_discarded(&self) -> bool {
+        self.client.is_none()
+    }
+
     /// Drops the client instead of returning it to the pool — for connections
     /// whose TDS stream may be left mid-response (driver-level errors, capped
     /// reads that abandoned a result set).
     fn discard(&mut self) {
         self.client = None;
     }
+}
+
+/// The error for operations on a transaction whose connection was already
+/// discarded by an earlier fatal failure. Not a new failure: the server rolls
+/// the abandoned transaction back when the dead connection goes away.
+fn lost_connection() -> DbError {
+    DbError::Query("the connection was lost — the transaction was rolled back by the server".into())
 }
 
 impl Drop for PooledConn {
@@ -549,12 +563,15 @@ fn bind_params(query: &mut Query<'_>, params: &[Value]) {
     }
 }
 
-/// Runs a parameterized query and buffers the first result set.
+/// Runs a parameterized query and buffers the first result set. The bool is
+/// whether the stream was abandoned with data still unread (a second result
+/// set arrived): tiberius would silently drain the leftovers before the next
+/// query on this connection, so pool-owning callers must discard it.
 async fn run_query(
     client: &mut TdsClient,
     sql: &str,
     params: &[Value],
-) -> Result<QueryResult, TdsError> {
+) -> Result<(QueryResult, bool), TdsError> {
     let mut query = Query::new(sql.to_string());
     bind_params(&mut query, params);
     let mut stream = query.query(client).await?;
@@ -564,6 +581,7 @@ async fn run_query(
     };
     let mut rows = Vec::new();
     let mut result_sets = 0usize;
+    let mut abandoned = false;
     while let Some(item) = stream.try_next().await? {
         match item {
             QueryItem::Metadata(_) => {
@@ -571,13 +589,14 @@ async fn run_query(
                 // Only the first result set is kept — mirrors the sqlx
                 // backends, where one statement yields one result.
                 if result_sets > 1 {
+                    abandoned = true;
                     break;
                 }
             }
             QueryItem::Row(row) => rows.push(decode_row(&row)),
         }
     }
-    Ok(QueryResult { columns, rows })
+    Ok((QueryResult { columns, rows }, abandoned))
 }
 
 /// Runs a parameterized non-row statement via the driver's RPC path,
@@ -605,7 +624,13 @@ pub async fn query_with(
 ) -> Result<QueryResult, DbError> {
     let mut conn = pool.acquire().await?;
     let result = run_query(conn.client(), sql, params).await;
-    settle(&mut conn, result, sql)
+    let (result, abandoned) = settle(&mut conn, result, sql)?;
+    // Unread result sets left on the stream must not ride back to the pool —
+    // the next borrower would pay for draining them.
+    if abandoned {
+        conn.discard();
+    }
+    Ok(result)
 }
 
 /// Executes a statement without decoding rows, returning the driver's
@@ -621,11 +646,11 @@ pub async fn execute(pool: &MssqlPool, sql: &str) -> Result<u64, DbError> {
 /// with table or value size (FRE-33). Returns the (bounded) result and
 /// whether more rows existed beyond the cap.
 ///
-/// A truncated read abandons the rest of the server's response mid-stream;
-/// tiberius would silently drain it before the *next* query on that
-/// connection, which for a huge result would defer the whole download to some
-/// innocent later query — so the connection is discarded instead (one
-/// reconnect is far cheaper).
+/// A truncated read (or an abandoned second result set) leaves the rest of
+/// the server's response mid-stream; tiberius would silently drain it before
+/// the *next* query on that connection, which for a huge result would defer
+/// the whole download to some innocent later query — so the connection is
+/// discarded instead (one reconnect is far cheaper).
 pub async fn query_capped(
     pool: &MssqlPool,
     sql: &str,
@@ -635,11 +660,11 @@ pub async fn query_capped(
 ) -> Result<(QueryResult, bool), DbError> {
     let mut conn = pool.acquire().await?;
     let result = run_query_capped(conn.client(), sql, params, max_rows, cell_cap).await;
-    let outcome = settle(&mut conn, result, sql)?;
-    if outcome.1 {
+    let (result, truncated, abandoned) = settle(&mut conn, result, sql)?;
+    if truncated || abandoned {
         conn.discard();
     }
-    Ok(outcome)
+    Ok((result, truncated))
 }
 
 /// [`query_capped`] against the connection held by a script transaction — the
@@ -653,20 +678,26 @@ pub async fn query_capped_conn(
     max_rows: u64,
     cell_cap: usize,
 ) -> Result<(QueryResult, bool), DbError> {
+    if tx.conn.is_discarded() {
+        return Err(lost_connection());
+    }
     let result = run_query_capped(tx.conn.client(), sql, &[], max_rows, cell_cap).await;
-    settle(&mut tx.conn, result, sql)
+    let (result, truncated, _abandoned) = settle(&mut tx.conn, result, sql)?;
+    Ok((result, truncated))
 }
 
 /// Drains a query's row stream into a bounded [`QueryResult`], keeping at
-/// most `max_rows` rows and capping each cell to `cell_cap` bytes; the bool
-/// is whether rows existed past the cap.
+/// most `max_rows` rows and capping each cell to `cell_cap` bytes. The first
+/// bool is whether rows existed past the cap; the second is whether the
+/// stream was abandoned with data still unread (extra result set — the row
+/// cap breaking early always leaves data, so `truncated` implies it).
 async fn run_query_capped(
     client: &mut TdsClient,
     sql: &str,
     params: &[Value],
     max_rows: u64,
     cell_cap: usize,
-) -> Result<(QueryResult, bool), TdsError> {
+) -> Result<(QueryResult, bool, bool), TdsError> {
     let mut query = Query::new(sql.to_string());
     bind_params(&mut query, params);
     let mut stream = query.query(client).await?;
@@ -676,12 +707,14 @@ async fn run_query_capped(
     };
     let mut rows: Vec<Vec<Value>> = Vec::new();
     let mut truncated = false;
+    let mut abandoned = false;
     let mut result_sets = 0usize;
     while let Some(item) = stream.try_next().await? {
         match item {
             QueryItem::Metadata(_) => {
                 result_sets += 1;
                 if result_sets > 1 {
+                    abandoned = true;
                     break;
                 }
             }
@@ -690,6 +723,7 @@ async fn run_query_capped(
                 // before decoding it so exactly `max_rows` rows are retained.
                 if rows.len() as u64 >= max_rows {
                     truncated = true;
+                    abandoned = true;
                     break;
                 }
                 let values = decode_row(&row)
@@ -700,7 +734,7 @@ async fn run_query_capped(
             }
         }
     }
-    Ok((QueryResult { columns, rows }, truncated))
+    Ok((QueryResult { columns, rows }, truncated, abandoned))
 }
 
 /// Executes parameterized writes inside ONE transaction, committing only
@@ -737,8 +771,16 @@ pub async fn execute_all_checked(
             ));
         }
     }
-    let commit = run_batch(conn.client(), "COMMIT TRAN").await;
-    settle(&mut conn, commit, "COMMIT TRAN").map_err(|e| (None, e))
+    match run_batch(conn.client(), "COMMIT TRAN").await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Any commit failure — fatal or a server error like a doomed
+            // transaction (3930) — may leave the session inside a transaction;
+            // never return such a connection to the pool.
+            conn.discard();
+            Err((None, query_error(&e, "COMMIT TRAN")))
+        }
+    }
 }
 
 /// Best-effort rollback after a failure mid-transaction. When the failure was
@@ -787,16 +829,25 @@ pub async fn begin_tx(pool: &MssqlPool) -> Result<MssqlTx, DbError> {
 }
 
 /// Runs a non-row statement in the script transaction, returning affected
-/// rows.
+/// rows. Errors (instead of panicking) when an earlier fatal failure already
+/// discarded the transaction's connection.
 pub async fn execute_conn(tx: &mut MssqlTx, sql: &str) -> Result<u64, DbError> {
+    if tx.conn.is_discarded() {
+        return Err(lost_connection());
+    }
     let result = run_execute(tx.conn.client(), sql, &[]).await;
     settle(&mut tx.conn, result, sql)
 }
 
 /// Commits a script transaction — its statements all take effect. A failed
 /// commit discards the connection (nothing was committed; the server rolls
-/// the transaction back with the session).
+/// the transaction back with the session). A transaction whose connection was
+/// already discarded by an earlier fatal failure cannot commit and errors.
 pub async fn commit_tx(mut tx: MssqlTx) -> Result<(), DbError> {
+    if tx.conn.is_discarded() {
+        tx.resolved = true;
+        return Err(lost_connection());
+    }
     let commit = run_batch(tx.conn.client(), "COMMIT TRAN").await;
     let result = settle(&mut tx.conn, commit, "COMMIT TRAN");
     match result {
@@ -815,8 +866,16 @@ pub async fn commit_tx(mut tx: MssqlTx) -> Result<(), DbError> {
 }
 
 /// Rolls a script transaction back. Best-effort: a rollback failure discards
-/// the connection, which rolls the transaction back server-side anyway.
+/// the connection, which rolls the transaction back server-side anyway. On a
+/// connection an earlier fatal failure already discarded this is a no-op
+/// success — the server rolls the abandoned transaction back when the dead
+/// connection goes away (the script runner rolls back unconditionally after
+/// any statement error, so this path must not panic).
 pub async fn rollback_tx(mut tx: MssqlTx) {
+    if tx.conn.is_discarded() {
+        tx.resolved = true;
+        return;
+    }
     let rollback = run_batch(tx.conn.client(), "IF @@TRANCOUNT > 0 ROLLBACK TRAN").await;
     if rollback.is_ok() {
         tx.resolved = true;
@@ -842,6 +901,7 @@ pub async fn export(
     // The stream borrows the client, so driver errors are collected and
     // settled after the stream is dropped.
     let mut written = 0u64;
+    let mut abandoned = false;
     let outcome: Result<(), TdsError> = async {
         let mut stream = query.query(conn.client()).await?;
         let columns: Vec<String> = match stream.columns().await? {
@@ -856,6 +916,7 @@ pub async fn export(
                 QueryItem::Metadata(_) => {
                     result_sets += 1;
                     if result_sets > 1 {
+                        abandoned = true;
                         break;
                     }
                 }
@@ -870,6 +931,10 @@ pub async fn export(
     }
     .await;
     settle(&mut conn, outcome, sql)?;
+    // An abandoned second result set must not ride back to the pool.
+    if abandoned {
+        conn.discard();
+    }
     Ok(written)
 }
 
@@ -1369,6 +1434,54 @@ mod tests {
             )),
             "9999999999999999999999999999999999.9999"
         );
+    }
+
+    /// A transaction whose connection an earlier fatal failure discarded —
+    /// the state the script runner hits when a driver-level error happens
+    /// mid-script and then unconditionally rolls back.
+    fn discarded_tx() -> MssqlTx {
+        let inner = Arc::new(PoolInner {
+            config: Config::new(),
+            permits: Arc::new(Semaphore::new(1)),
+            idle: Mutex::new(Vec::new()),
+            closed: AtomicBool::new(false),
+        });
+        let permit = Arc::clone(&inner.permits)
+            .try_acquire_owned()
+            .expect("fresh semaphore has a permit");
+        MssqlTx {
+            conn: PooledConn {
+                client: None,
+                pool: inner,
+                _permit: permit,
+            },
+            resolved: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_of_a_discarded_tx_is_a_noop_not_a_panic() {
+        // The server rolls the abandoned transaction back when the dead
+        // connection goes away; client-side there is nothing left to do.
+        rollback_tx(discarded_tx()).await;
+    }
+
+    #[tokio::test]
+    async fn commit_of_a_discarded_tx_errors_instead_of_panicking() {
+        let err = commit_tx(discarded_tx()).await.unwrap_err();
+        assert!(err.to_string().contains("connection was lost"));
+    }
+
+    #[tokio::test]
+    async fn statements_on_a_discarded_tx_error_instead_of_panicking() {
+        let mut tx = discarded_tx();
+        let err = execute_conn(&mut tx, "SELECT 1").await.unwrap_err();
+        assert!(err.to_string().contains("connection was lost"));
+        let err = query_capped_conn(&mut tx, "SELECT 1", 10, 100)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("connection was lost"));
+        rollback_tx(tx).await;
     }
 
     #[test]
