@@ -12,10 +12,11 @@ use crate::config::{
     SavedConnection, SavedList, Session, SessionPane, SessionTab, Theme,
 };
 use crate::db::{
-    apply_staged, build_fk_filter, detect_row_identity, needs_confirmation, run_script,
-    split_statements, url_target, url_via_local_port, url_with_password, write_result, CellFetch,
-    ConnectionId, ConnectionRegistry, DbError, DbPool, ExportFormat, Filter, ForeignKeyMeta,
-    QueryResult, RowLocator, StatementResult, TableMeta, Value,
+    apply_staged, build_fk_filter, detect_row_identity, mssql_url_with_password,
+    needs_confirmation, run_script, split_statements, url_target, url_via_local_port,
+    url_with_password, write_result, CellFetch, ConnectionId, ConnectionRegistry, DbError, DbPool,
+    ExportFormat, Filter, ForeignKeyMeta, QueryResult, RowLocator, StatementResult, TableMeta,
+    Value,
 };
 use crate::history::HistoryStore;
 use crate::tunnel::{HostKeyInfo, Tunnel, TunnelAuth, TunnelConfig, TunnelError};
@@ -251,14 +252,18 @@ pub enum PromptKind {
     SshPassphrase,
 }
 
-/// A pending secret request for a saved Postgres connection.
+/// A pending secret request for a saved Postgres or SQL Server connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PasswordPrompt {
     pub url: String,
     pub name: String,
     pub kind: PromptKind,
+    /// Which backend the retry must reconnect with (Postgres or SqlServer —
+    /// SQLite never prompts).
+    pub backend: BackendKind,
     /// Tunnel settings of the connect attempt, carried through the prompt so
-    /// the retry resumes the same flow.
+    /// the retry resumes the same flow. Always `None` for SQL Server until
+    /// FRE-58.
     pub tunnel: Option<TunnelConfig>,
     /// Auth mode of the attempt, carried through so the retry (e.g. after an
     /// SSH passphrase) resumes the same Entra/password flow.
@@ -571,13 +576,29 @@ impl AppState {
         }
     }
 
+    /// Adds a SQL Server connection to the saved list (URL stored without a
+    /// password, like Postgres) and persists.
+    pub fn add_saved_sqlserver(mut self, name: String, url: String) {
+        let added = self
+            .saved
+            .write()
+            .add(SavedConnection::SqlServer { name, url });
+        if added {
+            self.persist_saved();
+        }
+    }
+
     /// Removes a saved connection (open tabs are unaffected) and persists.
-    /// Postgres entries also drop their keyring credentials (database
-    /// password, SSH key passphrase, and cached Entra refresh token).
+    /// Postgres and SQL Server entries also drop their keyring credentials
+    /// (database password, SSH key passphrase, and cached Entra refresh
+    /// token — the latter two exist only for Postgres today; deleting a
+    /// missing entry is a no-op).
     pub fn remove_saved(mut self, locator: &str) {
         let removed = self.saved.write().remove(locator);
         if let Some(entry) = removed {
-            if let SavedConnection::Postgres { url, .. } = entry {
+            if let SavedConnection::Postgres { url, .. } | SavedConnection::SqlServer { url, .. } =
+                entry
+            {
                 // Best-effort, off-thread: a missing keyring just means
                 // nothing was stored.
                 spawn_forever(async move {
@@ -684,6 +705,7 @@ impl AppState {
                     url,
                     name,
                     kind: PromptKind::DbPassword,
+                    backend: BackendKind::Postgres,
                     tunnel,
                     auth: PgAuth::Password,
                 }));
@@ -897,6 +919,110 @@ impl AppState {
         }
     }
 
+    /// Opens a saved SQL Server connection (FRE-57). Mirrors
+    /// [`Self::connect_postgres`] minus tunnels and Entra (both FRE-58):
+    /// uses the session password when one is known, then the OS keyring,
+    /// otherwise tries without and falls back to a password prompt on
+    /// authentication failure.
+    pub async fn connect_sqlserver(mut self, url: String, name: String) {
+        self.connect_error.set(None);
+        if self.focus_or_reserve(&url) {
+            return;
+        }
+        // Session memory first, then the OS keyring (off-thread, and only
+        // after the session read guard is dropped); errors mean "no keyring"
+        // and fall through to the prompt flow.
+        let mut session_password = self.session_passwords.read().get(&url).cloned();
+        if session_password.is_none() {
+            session_password = crate::secrets::get_password_async(url.clone())
+                .await
+                .ok()
+                .flatten();
+        }
+        let had_password = session_password.is_some();
+        let result = match &session_password {
+            Some(password) => match mssql_url_with_password(&url, password) {
+                Ok(full) => DbPool::open_mssql(&full).await,
+                Err(err) => Err(err),
+            },
+            None => DbPool::open_mssql(&url).await,
+        };
+        match result {
+            Err(DbError::Connect(msg)) if msg.contains("authentication failed") => {
+                self.connecting.write().retain(|l| l != &url);
+                if had_password {
+                    // Stored password is stale; drop it everywhere and re-ask.
+                    self.session_passwords.write().remove(&url);
+                    let _ = crate::secrets::delete_password_async(url.clone()).await;
+                    self.connect_error
+                        .set(Some(format!("connection failed: {msg}")));
+                }
+                self.password_prompt.set(Some(PasswordPrompt {
+                    url,
+                    name,
+                    kind: PromptKind::DbPassword,
+                    backend: BackendKind::SqlServer,
+                    tunnel: None,
+                    auth: PgAuth::Password,
+                }));
+            }
+            result => {
+                self.finish_connect(url.clone(), name.clone(), result, None);
+                self.save_sqlserver_if_open(&url, &name);
+            }
+        }
+    }
+
+    /// Completes the password prompt for a SQL Server connection: connects
+    /// with the entered password. On success the password always lives in
+    /// session memory; with `remember` it is also stored in the OS keyring
+    /// (silently staying session-only when no keyring is available).
+    pub async fn connect_sqlserver_with_password(
+        mut self,
+        url: String,
+        name: String,
+        password: String,
+        remember: bool,
+    ) {
+        self.connect_error.set(None);
+        // The prompt replaces the reservation made by connect_sqlserver, so
+        // re-reserve here.
+        if self.focus_or_reserve(&url) {
+            return;
+        }
+        let result = match mssql_url_with_password(&url, &password) {
+            Ok(full) => DbPool::open_mssql(&full).await,
+            Err(err) => Err(err),
+        };
+        if result.is_ok() {
+            if remember {
+                let store =
+                    crate::secrets::store_password_async(url.clone(), password.clone()).await;
+                if store.is_err() {
+                    self.connect_error.set(Some(
+                        "connected, but the password could not be stored in the system \
+                         keyring — it is remembered for this session only"
+                            .to_string(),
+                    ));
+                }
+            }
+            self.session_passwords.write().insert(url.clone(), password);
+            self.password_prompt.set(None);
+        }
+        self.finish_connect(url.clone(), name.clone(), result, None);
+        self.save_sqlserver_if_open(&url, &name);
+    }
+
+    /// A successful SQL Server connect always joins the saved list (a no-op
+    /// when the URL is already saved) — the same "connect first, save on
+    /// success" contract as [`Self::save_postgres_if_open`].
+    fn save_sqlserver_if_open(self, url: &str, name: &str) {
+        let is_open = self.open_locators.read().iter().any(|(_, l)| l == url);
+        if is_open {
+            self.add_saved_sqlserver(name.to_string(), url.to_string());
+        }
+    }
+
     /// Completes the host-key trust prompt: records the offered key in
     /// dataview's known_hosts store, then re-runs the connect (which now finds
     /// the host trusted). A failure to persist surfaces as a connect error.
@@ -1010,6 +1136,7 @@ impl AppState {
                     url: url.to_string(),
                     name: name.to_string(),
                     kind: PromptKind::SshPassphrase,
+                    backend: BackendKind::Postgres,
                     tunnel: Some(config.clone()),
                     auth: auth.clone(),
                 }));
@@ -2176,15 +2303,22 @@ impl AppState {
                 backend: s.backend(),
             })
             .collect();
-        // Which Postgres locators can connect silently (so startup never blocks
-        // on a prompt or pops a browser)? Password auth needs a stored/session
-        // password; Entra managed identity always can; Entra interactive only
-        // with a cached refresh token. The keyring reads are off-thread and the
+        // Which server-backend locators (Postgres, SQL Server) can connect
+        // silently, so startup never blocks on a prompt or pops a browser?
+        // Password auth needs a stored/session password; Entra managed
+        // identity (Postgres only) always can; Entra interactive only with a
+        // cached refresh token. The keyring reads are off-thread and the
         // session-memory borrow is dropped before the await.
-        let mut pg_ready: HashSet<String> = HashSet::new();
+        let mut ready_locators: HashSet<String> = HashSet::new();
         for candidate in &candidates {
-            if candidate.backend != BackendKind::Postgres {
-                continue;
+            match candidate.backend {
+                // SQLite needs no credentials; plan_session_restore always
+                // keeps it.
+                BackendKind::Sqlite => continue,
+                // Both fall through to the password-availability check below
+                // (SQL Server has no Entra mode until FRE-58, so its auth
+                // lookup finds nothing and lands in the password arm).
+                BackendKind::Postgres | BackendKind::SqlServer => {}
             }
             let auth = saved.iter().find_map(|s| match s {
                 SavedConnection::Postgres { auth, .. }
@@ -2218,10 +2352,12 @@ impl AppState {
                 }
             };
             if ready {
-                pg_ready.insert(candidate.locator.clone());
+                ready_locators.insert(candidate.locator.clone());
             }
         }
-        let plan = plan_session_restore(&session.tabs, &candidates, |loc| pg_ready.contains(loc));
+        let plan = plan_session_restore(&session.tabs, &candidates, |loc| {
+            ready_locators.contains(loc)
+        });
         for tab in &plan {
             let saved_conn = saved
                 .iter()
@@ -2238,6 +2374,7 @@ impl AppState {
                     tunnel,
                     auth,
                 } => self.connect_postgres(url, name, tunnel, auth).await,
+                SavedConnection::SqlServer { url, name } => self.connect_sqlserver(url, name).await,
             }
             // Apply the remembered table + pane to the freshly opened tab.
             let id = self
@@ -2298,12 +2435,14 @@ pub(crate) fn canonical(path: &Path) -> PathBuf {
 
 /// The open-locator form of a saved connection: the canonical file path for
 /// SQLite (matching what [`AppState::connect`] stores in `open_locators`) or
-/// the URL for Postgres. Used to match saved connections against remembered
-/// session tabs at restore time.
+/// the URL for Postgres / SQL Server. Used to match saved connections against
+/// remembered session tabs at restore time.
 fn saved_open_locator(saved: &SavedConnection) -> String {
     match saved {
         SavedConnection::Sqlite { path, .. } => canonical(path).display().to_string(),
-        SavedConnection::Postgres { url, .. } => url.clone(),
+        SavedConnection::Postgres { url, .. } | SavedConnection::SqlServer { url, .. } => {
+            url.clone()
+        }
     }
 }
 

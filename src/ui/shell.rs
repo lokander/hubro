@@ -554,6 +554,7 @@ struct SavedRow {
 fn ConnectionsScreen() -> Element {
     let state = use_context::<AppState>();
     let mut show_pg_form = use_signal(|| false);
+    let mut show_mssql_form = use_signal(|| false);
     let error = state.connect_error.read().clone();
     let prompt = state.password_prompt.read().clone();
     let host_key_prompt = state.host_key_prompt.read().clone();
@@ -570,7 +571,8 @@ fn ConnectionsScreen() -> Element {
                     crate::config::SavedConnection::Sqlite { path, .. } => {
                         super::state::canonical(path).display().to_string()
                     }
-                    crate::config::SavedConnection::Postgres { url, .. } => url.clone(),
+                    crate::config::SavedConnection::Postgres { url, .. }
+                    | crate::config::SavedConnection::SqlServer { url, .. } => url.clone(),
                 };
                 let (tunnel, auth) = match s {
                     crate::config::SavedConnection::Postgres { tunnel, auth, .. } => {
@@ -619,7 +621,7 @@ fn ConnectionsScreen() -> Element {
                 EmptyState {
                     icon: "\u{1F50C}", // 🔌 plug
                     title: "No connections yet",
-                    hint: "Add a SQLite file or Postgres server to get started.",
+                    hint: "Add a SQLite file, Postgres server, or SQL Server to get started.",
                 }
             }
             if !saved.is_empty() {
@@ -644,6 +646,11 @@ fn ConnectionsScreen() -> Element {
                                                         )
                                                         .await;
                                                 }
+                                                BackendKind::SqlServer => {
+                                                    state
+                                                        .connect_sqlserver(row.locator, row.name)
+                                                        .await;
+                                                }
                                                 BackendKind::Sqlite => {
                                                     state.connect(PathBuf::from(row.locator)).await;
                                                 }
@@ -658,10 +665,12 @@ fn ConnectionsScreen() -> Element {
                                     span {
                                         class: match row.backend {
                                             BackendKind::Postgres => "rounded bg-cyan-100 dark:bg-cyan-900/50 px-1.5 py-0.5 text-xs text-cyan-700 dark:text-cyan-300",
+                                            BackendKind::SqlServer => "rounded bg-red-100 dark:bg-red-900/50 px-1.5 py-0.5 text-xs text-red-700 dark:text-red-300",
                                             BackendKind::Sqlite => "rounded bg-slate-200 dark:bg-slate-800 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400",
                                         },
                                         match row.backend {
                                             BackendKind::Postgres => "postgres",
+                                            BackendKind::SqlServer => "sql server",
                                             BackendKind::Sqlite => "sqlite",
                                         }
                                     }
@@ -718,12 +727,25 @@ fn ConnectionsScreen() -> Element {
                     onclick: move |_| {
                         let showing = *show_pg_form.read();
                         show_pg_form.set(!showing);
+                        show_mssql_form.set(false);
                     },
                     "Add Postgres…"
+                }
+                button {
+                    class: "rounded bg-red-800 px-4 py-2 text-sm font-medium text-white hover:bg-red-700",
+                    onclick: move |_| {
+                        let showing = *show_mssql_form.read();
+                        show_mssql_form.set(!showing);
+                        show_pg_form.set(false);
+                    },
+                    "Add SQL Server…"
                 }
             }
             if show_pg_form() {
                 PostgresForm { on_done: move |_| show_pg_form.set(false) }
+            }
+            if show_mssql_form() {
+                SqlServerForm { on_done: move |_| show_mssql_form.set(false) }
             }
             if let Some(err) = error {
                 div { class: "w-full max-w-xl px-8",
@@ -738,10 +760,11 @@ fn ConnectionsScreen() -> Element {
     }
 }
 
-/// Inline secret prompt for a saved Postgres connection: the database
-/// password, or the SSH key passphrase when the tunnel's key is encrypted.
-/// "Remember" stores the secret in the OS keyring; without it (or when no
-/// keyring is available) it lives in session memory only.
+/// Inline secret prompt for a saved Postgres or SQL Server connection: the
+/// database password, or the SSH key passphrase when the tunnel's key is
+/// encrypted (Postgres only). "Remember" stores the secret in the OS keyring;
+/// without it (or when no keyring is available) it lives in session memory
+/// only.
 #[component]
 fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
     use super::state::PromptKind;
@@ -759,15 +782,26 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
         dioxus::core::spawn_forever(async move {
             match prompt.kind {
                 PromptKind::DbPassword => {
-                    state
-                        .connect_postgres_with_password(
-                            prompt.url,
-                            prompt.name,
-                            entered,
-                            remember_choice,
-                            prompt.tunnel,
-                        )
-                        .await;
+                    if prompt.backend == BackendKind::SqlServer {
+                        state
+                            .connect_sqlserver_with_password(
+                                prompt.url,
+                                prompt.name,
+                                entered,
+                                remember_choice,
+                            )
+                            .await;
+                    } else {
+                        state
+                            .connect_postgres_with_password(
+                                prompt.url,
+                                prompt.name,
+                                entered,
+                                remember_choice,
+                                prompt.tunnel,
+                            )
+                            .await;
+                    }
                 }
                 PromptKind::SshPassphrase => {
                     // An SSH prompt always carries its tunnel config.
@@ -1056,7 +1090,7 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
         let display_name = {
             let entered = name.peek().trim().to_string();
             if entered.is_empty() {
-                default_pg_name(&url)
+                default_server_name(&url)
             } else {
                 entered
             }
@@ -1151,7 +1185,7 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
         });
     };
 
-    let field_class = "w-full rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-3 py-2 font-mono text-sm text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600";
+    let field_class = FORM_FIELD_CLASS;
     rsx! {
         div { class: "w-full max-w-xl rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/80 p-4",
             div { class: "mb-3 flex items-center justify-between",
@@ -1362,8 +1396,239 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
     }
 }
 
-/// Fallback display name: "database @ host".
-fn default_pg_name(url: &str) -> String {
+/// Add-SQL-Server panel (FRE-57): individual fields or a pasted `mssql://`
+/// URL. Deliberately close to [`PostgresForm`] but kept separate — the two
+/// share the field styling ([`FORM_FIELD_CLASS`]) and the display-name
+/// fallback, while the option sets (encrypt vs sslmode, trust-server-cert)
+/// differ enough that a shared form abstraction wasn't worth it. Password
+/// auth only, and no SSH tunnel yet — Entra and tunnels are FRE-58.
+#[component]
+fn SqlServerForm(on_done: EventHandler<()>) -> Element {
+    let state = use_context::<AppState>();
+    let mut use_url = use_signal(|| false);
+    let mut name = use_signal(String::new);
+    let mut host = use_signal(String::new);
+    let mut port = use_signal(String::new);
+    let mut database = use_signal(String::new);
+    let mut user = use_signal(String::new);
+    let mut password = use_signal(String::new);
+    let mut remember = use_signal(|| true);
+    // Matches the URL params the backend accepts: encrypt=on|off|plaintext.
+    let mut encrypt = use_signal(|| "on".to_string());
+    // Accept the server's TLS certificate without CA validation — needed for
+    // dev servers with self-signed certs (e.g. the stock Docker image).
+    let mut trust_cert = use_signal(|| false);
+    let mut pasted_url = use_signal(String::new);
+    let mut form_error = use_signal(|| Option::<String>::None);
+
+    let mut submit = move || {
+        // A password pasted inside the URL is used for this connect (and
+        // remembered for the session on success) but never persisted.
+        let embedded_password = if *use_url.peek() {
+            url::Url::parse(pasted_url.peek().trim())
+                .ok()
+                .and_then(|u| {
+                    // Url::password() returns the still-encoded form.
+                    u.password().map(|p| {
+                        percent_encoding::percent_decode_str(p)
+                            .decode_utf8_lossy()
+                            .into_owned()
+                    })
+                })
+        } else {
+            None
+        };
+        let built = if *use_url.peek() {
+            crate::db::normalize_mssql_url(&pasted_url.peek())
+        } else {
+            crate::db::build_mssql_url(
+                &host.peek(),
+                &port.peek(),
+                &database.peek(),
+                &user.peek(),
+                &encrypt.peek(),
+            )
+            .map(|built| {
+                if *trust_cert.peek() {
+                    // build_mssql_url writes only the encrypt param; splice the
+                    // trust flag in after it. The URL it returned always parses.
+                    match url::Url::parse(&built) {
+                        Ok(mut parsed) => {
+                            parsed
+                                .query_pairs_mut()
+                                .append_pair("trustServerCertificate", "true");
+                            String::from(parsed)
+                        }
+                        Err(_) => built,
+                    }
+                } else {
+                    built
+                }
+            })
+        };
+        let url = match built {
+            Ok(url) => url,
+            Err(err) => {
+                form_error.set(Some(err.to_string()));
+                return;
+            }
+        };
+        let display_name = {
+            let entered = name.peek().trim().to_string();
+            if entered.is_empty() {
+                default_server_name(&url)
+            } else {
+                entered
+            }
+        };
+        let mut entered_password = password.peek().clone();
+        if entered_password.is_empty() {
+            if let Some(embedded) = embedded_password {
+                entered_password = embedded;
+            }
+        }
+        let remember_choice = *remember.peek();
+        form_error.set(None);
+        spawn(async move {
+            if entered_password.is_empty() {
+                // No password entered: try as-is (the keyring may hold one);
+                // an auth failure raises the password prompt.
+                state
+                    .connect_sqlserver(url.clone(), display_name.clone())
+                    .await;
+            } else {
+                state
+                    .connect_sqlserver_with_password(
+                        url.clone(),
+                        display_name.clone(),
+                        entered_password,
+                        remember_choice,
+                    )
+                    .await;
+            }
+            // The connect flow saves on success; only close the form then.
+            if state.open_locators.peek().iter().any(|(_, l)| *l == url) {
+                on_done.call(());
+            }
+        });
+    };
+
+    let field_class = FORM_FIELD_CLASS;
+    rsx! {
+        div { class: "w-full max-w-xl rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/80 p-4",
+            div { class: "mb-3 flex items-center justify-between",
+                span { class: "text-sm font-medium text-slate-900 dark:text-slate-200", "Add a SQL Server connection" }
+                button {
+                    class: "text-xs text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
+                    onclick: move |_| {
+                        let flip = !*use_url.read();
+                        use_url.set(flip);
+                    },
+                    if use_url() { "Use individual fields" } else { "Paste a URL instead" }
+                }
+            }
+            div { class: "flex flex-col gap-2",
+                input {
+                    class: field_class,
+                    placeholder: "display name (optional)",
+                    value: "{name}",
+                    oninput: move |evt| name.set(evt.value()),
+                }
+                if use_url() {
+                    input {
+                        class: field_class,
+                        placeholder: "mssql://user@host:1433/database?encrypt=on",
+                        value: "{pasted_url}",
+                        oninput: move |evt| pasted_url.set(evt.value()),
+                    }
+                } else {
+                    div { class: "flex gap-2",
+                        input {
+                            class: "{field_class} flex-[3]",
+                            placeholder: "host",
+                            value: "{host}",
+                            oninput: move |evt| host.set(evt.value()),
+                        }
+                        input {
+                            class: "{field_class} flex-1",
+                            placeholder: "1433",
+                            value: "{port}",
+                            oninput: move |evt| port.set(evt.value()),
+                        }
+                    }
+                    div { class: "flex gap-2",
+                        input {
+                            class: field_class,
+                            placeholder: "database",
+                            value: "{database}",
+                            oninput: move |evt| database.set(evt.value()),
+                        }
+                        input {
+                            class: field_class,
+                            placeholder: "user",
+                            value: "{user}",
+                            oninput: move |evt| user.set(evt.value()),
+                        }
+                    }
+                    div { class: "flex gap-2",
+                        select {
+                            class: "rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-2 text-sm text-slate-900 dark:text-slate-300",
+                            onchange: move |evt| encrypt.set(evt.value()),
+                            option { value: "on", selected: *encrypt.read() == "on", "encrypt: on" }
+                            option { value: "off", selected: *encrypt.read() == "off", "encrypt: off (login only)" }
+                            option { value: "plaintext", selected: *encrypt.read() == "plaintext", "encrypt: plaintext" }
+                        }
+                    }
+                    label { class: "flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
+                        input {
+                            r#type: "checkbox",
+                            checked: trust_cert(),
+                            onchange: move |evt| trust_cert.set(evt.checked()),
+                        }
+                        "Trust the server certificate (self-signed / dev servers)"
+                    }
+                }
+                input {
+                    r#type: "password",
+                    class: field_class,
+                    placeholder: "password",
+                    value: "{password}",
+                    oninput: move |evt| password.set(evt.value()),
+                }
+                label { class: "flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
+                    input {
+                        r#type: "checkbox",
+                        checked: remember(),
+                        onchange: move |evt| remember.set(evt.checked()),
+                    }
+                    "Remember in the system keyring (falls back to this session only)"
+                }
+                div { class: "flex justify-end gap-2",
+                    button {
+                        class: "rounded px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
+                        onclick: move |_| on_done.call(()),
+                        "Cancel"
+                    }
+                    button {
+                        class: "rounded bg-red-800 px-4 py-2 text-sm font-medium text-white hover:bg-red-700",
+                        onclick: move |_| submit(),
+                        "Connect & save"
+                    }
+                }
+                if let Some(err) = form_error() {
+                    p { class: "text-sm text-red-600 dark:text-red-400", "{err}" }
+                }
+            }
+        }
+    }
+}
+
+/// Text-input class shared by the Postgres and SQL Server connection forms.
+const FORM_FIELD_CLASS: &str = "w-full rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-3 py-2 font-mono text-sm text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600";
+
+/// Fallback display name for a server connection URL: "database @ host".
+/// Scheme-agnostic, so the Postgres and SQL Server forms share it.
+fn default_server_name(url: &str) -> String {
     match url::Url::parse(url) {
         Ok(parsed) => {
             let db = parsed.path().trim_start_matches('/');
