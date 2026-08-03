@@ -1,6 +1,6 @@
+use chrono::{DateTime, Local};
 use dioxus::prelude::*;
 use serde::Deserialize;
-use sqlx::types::chrono::{DateTime, Local};
 
 use crate::db::{
     needs_confirmation, ConnectionId, Dialect, ExportFormat, QueryResult, StatementOutcome,
