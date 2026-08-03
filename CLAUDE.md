@@ -25,7 +25,11 @@ Git pushes use SSH; the key is passphrase-protected. If pushes fail with "Permis
 
 ## Interactive testing (screenshots + clicking)
 
-The dev machine runs KDE Plasma on Wayland. To drive the app (click, type, screenshot) without touching the user's real cursor, run it inside a nested Xephyr X server:
+Development happens on two machines; pick the recipe for the current platform (`uname`).
+
+### Linux (KDE Plasma on Wayland)
+
+To drive the app (click, type, screenshot) without touching the user's real cursor, run it inside a nested Xephyr X server:
 
 ```bash
 Xephyr :2 -screen 900x700 &
@@ -38,6 +42,21 @@ import -display :2 -window root shot.png                                     # s
 Driving the app directly on the desktop half-works and isn't worth it: `spectacle -b -n -a -o shot.png` captures windows and `xdotool key` reaches XWayland windows (after a one-time KDE "Remote Control" approval), but KWin ignores XTEST pointer events, so mouse control is impossible outside Xephyr.
 
 Gotchas: native `<select>` dropdowns are driven by click → `key Down/Up` → `key Return` (options aren't clickable elements). Xephyr runs no window manager, so nothing delivers `WindowEvent::CloseRequested` — send a synthetic `WM_DELETE_WINDOW` ClientMessage (a ~30-line Xlib/`gcc -lX11` helper) to test the window-close guard.
+
+### macOS
+
+The app is a native Cocoa bundle — there is no display server to nest, so **synthetic input drives the real cursor** (no Xephyr-style isolation exists). Keep interactions short: screenshot → verify → act, and save/restore the pointer around clicks. Tools: `brew install cliclick smokris/getwindowid/getwindowid`. One-time grants for the terminal app in System Settings → Privacy & Security: **Accessibility** (cliclick/System Events) and **Screen Recording** (screencapture).
+
+```bash
+dx build    # bundle: target/dx/dataview/debug/macos/Dataview.app
+target/dx/dataview/debug/macos/Dataview.app/Contents/MacOS/Dataview &     # launch (foreground binary, easy to kill)
+GetWindowID Dataview --list     # titles list as "(null)" — pick the id with the main window's size
+screencapture -x -l <id> shot.png                                         # crisp per-window capture, works unfocused
+osascript -e 'tell app "System Events" to tell (first process whose unix id is '$(pgrep -x Dataview)') to get {position, size} of window 1'
+POS=$(cliclick p | tr -d ' '); cliclick c:X,Y; cliclick "m:$POS"          # click, then restore the cursor
+```
+
+Gotchas: click targets are **window position + logical (point) coordinates** from the osascript line — don't derive them from screenshot pixels, which are 2x Retina and include shadow margins. The first click on an unfocused window only focuses it (the webview doesn't accept click-through) — click twice or activate the app first. Keystrokes go via System Events (`keystroke`/`key code`) to the focused window. The window-close guard is testable directly: macOS has a real window manager, so the red button or Cmd+W delivers `CloseRequested` — no synthetic-event helper needed.
 
 ## Issue workflow
 
