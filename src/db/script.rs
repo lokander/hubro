@@ -698,10 +698,7 @@ mod tests {
             ["SELECT $a$ x $b$ ; $a$", "SELECT 2"]
         );
         // $1 is a parameter, not a delimiter.
-        assert_eq!(
-            split("SELECT $1; SELECT $2"),
-            ["SELECT $1", "SELECT $2"]
-        );
+        assert_eq!(split("SELECT $1; SELECT $2"), ["SELECT $1", "SELECT $2"]);
     }
 
     #[test]
@@ -753,7 +750,10 @@ mod tests {
         assert_eq!(split_mssql("SELECT 1\nGO"), ["SELECT 1"]);
         assert_eq!(split_mssql("SELECT 1\nGO\n"), ["SELECT 1"]);
         // GO after a semicolon-terminated statement adds nothing.
-        assert_eq!(split_mssql("SELECT 1;\nGO\nSELECT 2"), ["SELECT 1", "SELECT 2"]);
+        assert_eq!(
+            split_mssql("SELECT 1;\nGO\nSELECT 2"),
+            ["SELECT 1", "SELECT 2"]
+        );
         // Consecutive GO lines produce no empty statements.
         assert_eq!(split_mssql("GO\nGO\nSELECT 1\nGO\nGO"), ["SELECT 1"]);
     }
@@ -772,16 +772,10 @@ mod tests {
     #[test]
     fn go_not_alone_on_its_line_does_not_split() {
         // Inside a string literal (even across lines).
-        assert_eq!(
-            split_mssql("SELECT 'a\nGO\nb'"),
-            ["SELECT 'a\nGO\nb'"]
-        );
+        assert_eq!(split_mssql("SELECT 'a\nGO\nb'"), ["SELECT 'a\nGO\nb'"]);
         assert_eq!(split_mssql("SELECT 'GO'"), ["SELECT 'GO'"]);
         // Inside comments.
-        assert_eq!(
-            split_mssql("SELECT 1 -- GO\n+ 2"),
-            ["SELECT 1 -- GO\n+ 2"]
-        );
+        assert_eq!(split_mssql("SELECT 1 -- GO\n+ 2"), ["SELECT 1 -- GO\n+ 2"]);
         assert_eq!(
             split_mssql("SELECT 1 /*\nGO\n*/ + 2"),
             ["SELECT 1 /*\nGO\n*/ + 2"]
@@ -1024,7 +1018,10 @@ mod tests {
             vec!["SELECT 1", "BACKUP DATABASE db TO DISK = 'x.bak'"],
             vec!["SELECT 1", "RESTORE DATABASE db FROM DISK = 'x.bak'"],
             vec!["SELECT 1", "backup log db to disk = 'x.trn'"],
-            vec!["CREATE TABLE t (a int)", "CREATE FULLTEXT INDEX ON t (a) KEY INDEX pk"],
+            vec![
+                "CREATE TABLE t (a int)",
+                "CREATE FULLTEXT INDEX ON t (a) KEY INDEX pk",
+            ],
         ] {
             assert!(
                 !wrap_atomically(Dialect::SqlServer, &stmts(&script)),

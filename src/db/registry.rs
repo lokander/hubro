@@ -507,7 +507,13 @@ mod tests {
         let table = cell_table(None);
         // SQLite: substr/length for text and binary alike.
         assert_eq!(
-            cell_fetch_sql(Dialect::Sqlite, &table, ColumnClass::Text, "c", " WHERE \"id\" = ?"),
+            cell_fetch_sql(
+                Dialect::Sqlite,
+                &table,
+                ColumnClass::Text,
+                "c",
+                " WHERE \"id\" = ?"
+            ),
             format!(
                 "SELECT substr(\"c\", 1, {cap}), length(\"c\") FROM \"t\" WHERE \"id\" = ? LIMIT 1"
             )

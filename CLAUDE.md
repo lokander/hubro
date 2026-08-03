@@ -11,6 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `dx serve` — run the desktop app with hot reload.
 - `dx build` — build the app via the Dioxus CLI.
 - `cargo check` / `cargo clippy` — type-check and lint without the Dioxus CLI.
+- `cargo fmt --check` — CI enforces rustfmt (the Actions job runs fmt, clippy, and test); run it before every push.
 - Tailwind is compiled automatically by `dx serve` (Dioxus 0.7+): it picks up `tailwind.css` next to Cargo.toml and outputs to `assets/tailwind.css`. No npm/Tailwind CLI setup is needed.
 
 - `cargo test` — run all tests: unit tests live in `#[cfg(test)]` modules next to the code, integration tests in `tests/`. Test fixture files go in `tests/fixtures/`. Run a single test with `cargo test <name>`.
@@ -65,7 +66,7 @@ Work is tracked in Linear (team FRE). Docs-only changes (CLAUDE.md, README, etc.
 1. Move the Linear issue to In Progress. Create a **git worktree** on the issue's branch (use Linear's suggested branch name, e.g. `lokander/fre-5-set-up-async-database-layer`), and do all work there.
 2. Commit (conventional, subject-only), push the branch, and open a **GitHub PR** with `gh pr create`. Reference the issue ID (e.g. FRE-5) in the PR so Linear links it.
 3. Spawn a **subagent to review the PR** (correctness, the Dioxus 0.7 rules above, scope vs the issue). `gh pr review --approve` is blocked as self-approval — post findings with `gh pr comment`. Fix blocking findings and re-review by resuming the *same* review subagent via SendMessage (keeps its context). Only proceed once it approves.
-4. **Remove the worktree first**, then rebase-merge (`gh pr merge --rebase --delete-branch`) from the main checkout — merging from inside the worktree fails trying to check out `main`. Run the merge as its own step (chaining a `gh pr comment` + merge in one command trips the self-merge classifier). Move the issue to Done with the PR linked.
+4. **Wait for CI to pass** (`gh pr checks <n> --watch`) before merging — local clippy/test runs don't cover everything CI checks (e.g. rustfmt). Then **remove the worktree first**, and rebase-merge (`gh pr merge --rebase --delete-branch`) from the main checkout — merging from inside the worktree fails trying to check out `main`. Run the merge as its own step (chaining a `gh pr comment` + merge in one command trips the self-merge classifier). Move the issue to Done with the PR linked.
 
 ## Commits
 

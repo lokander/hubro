@@ -749,10 +749,7 @@ mod tests {
     #[test]
     fn cast_expr_is_postfix_on_postgres_and_prefix_on_sqlserver() {
         assert_eq!(Dialect::Postgres.cast_expr("\"c\"", "text"), "\"c\"::text");
-        assert_eq!(
-            Dialect::Postgres.cast_expr("$1", "integer"),
-            "$1::integer"
-        );
+        assert_eq!(Dialect::Postgres.cast_expr("$1", "integer"), "$1::integer");
         // The dialect-neutral "text" stringify target maps to nvarchar(max).
         assert_eq!(
             Dialect::SqlServer.cast_expr("\"c\"", "text"),
