@@ -40,6 +40,7 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
     let dialect_name = match dialect {
         Dialect::Postgres => "postgres",
         Dialect::Sqlite => "sqlite",
+        Dialect::SqlServer => "mssql",
     };
 
     // Mount CodeMirror once and pump its messages. The eval channel stays
@@ -407,15 +408,16 @@ fn HistoryRow(id: ConnectionId, editor_element: String, entry: HistoryEntry) -> 
 
 /// Builds the completion namespace handed to lang-sql (its `SQLNamespace`
 /// shape): an object mapping table names — `"table"` on SQLite,
-/// `"schema.table"` on Postgres — to arrays of column names. lang-sql splits
-/// keys on unescaped dots, so literal dots inside identifiers are escaped as
-/// `\.`; it also quote-applies any completion whose label needs quoting, so
-/// weird identifiers can be passed through as plain strings.
+/// `"schema.table"` on Postgres and SQL Server — to arrays of column names.
+/// lang-sql splits keys on unescaped dots, so literal dots inside
+/// identifiers are escaped as `\.`; it also quote-applies any completion
+/// whose label needs quoting, so weird identifiers can be passed through as
+/// plain strings.
 fn completion_schema(tables: &[TableMeta], dialect: Dialect) -> serde_json::Value {
     let mut namespace = serde_json::Map::new();
     for table in tables {
         let key = match (&dialect, &table.schema) {
-            (Dialect::Postgres, Some(schema)) => {
+            (Dialect::Postgres | Dialect::SqlServer, Some(schema)) => {
                 format!("{}.{}", escape_dots(schema), escape_dots(&table.name))
             }
             _ => escape_dots(&table.name),
@@ -707,6 +709,21 @@ mod tests {
             json!({
                 "public.users": ["id", "email"],
                 "audit.events": ["id", "at"],
+            })
+        );
+    }
+
+    #[test]
+    fn sqlserver_schema_qualifies_table_names() {
+        let tables = [
+            table(Some("dbo"), "users", &["id", "email"]),
+            table(None, "loners", &["id"]),
+        ];
+        assert_eq!(
+            completion_schema(&tables, Dialect::SqlServer),
+            json!({
+                "dbo.users": ["id", "email"],
+                "loners": ["id"],
             })
         );
     }

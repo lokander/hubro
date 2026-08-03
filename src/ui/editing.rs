@@ -124,9 +124,11 @@ pub fn editor_kind(type_name: &str) -> EditorKind {
 /// - Postgres `boolean` columns reject a bound integer; stage the text
 ///   `"true"`/`"false"`, which the staged SQL's `::boolean` cast (and
 ///   Postgres' own literal parsing) accepts.
+/// - SQL Server `bit` columns take `0`/`1` (T-SQL has no true/false
+///   literals), so stage [`Value::Integer`] like SQLite.
 pub fn bool_value(dialect: Dialect, checked: bool) -> Value {
     match dialect {
-        Dialect::Sqlite => Value::Integer(i64::from(checked)),
+        Dialect::Sqlite | Dialect::SqlServer => Value::Integer(i64::from(checked)),
         Dialect::Postgres => Value::Text(if checked { "true" } else { "false" }.into()),
     }
 }
@@ -571,6 +573,18 @@ mod tests {
         assert_eq!(
             bool_value(Dialect::Postgres, false),
             Value::Text("false".into())
+        );
+        // SQL Server BIT wants 0/1, like SQLite.
+        assert_eq!(bool_value(Dialect::SqlServer, true), Value::Integer(1));
+        assert_eq!(bool_value(Dialect::SqlServer, false), Value::Integer(0));
+        // The same staging applies through parse_input's bool path.
+        assert_eq!(
+            parse_input(EditorKind::Bool, Dialect::SqlServer, "true"),
+            Ok(Value::Integer(1))
+        );
+        assert_eq!(
+            parse_input(EditorKind::Bool, Dialect::SqlServer, "no"),
+            Ok(Value::Integer(0))
         );
     }
 

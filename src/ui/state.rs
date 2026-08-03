@@ -1231,7 +1231,11 @@ impl AppState {
     /// the editor shows a confirmation banner.
     pub fn run_sql(mut self, id: ConnectionId, sql: String) {
         self.pending_sql.write().remove(&id);
-        let statements = split_statements(&sql);
+        let dialect = match self.registry.read().get(id) {
+            Some(connection) => connection.pool.dialect(),
+            None => return, // connection closed underneath the editor
+        };
+        let statements = split_statements(&sql, dialect);
         if statements.is_empty() {
             return;
         }

@@ -27,7 +27,7 @@ async fn collect_script(
     pool: &DbPool,
     sql: &str,
 ) -> (Vec<StatementResult>, Result<(), dataview::db::ScriptError>) {
-    let statements = split_statements(sql);
+    let statements = split_statements(sql, pool.dialect());
     let mut results = Vec::new();
     let outcome = run_script(pool, &statements, |r| results.push(r)).await;
     (results, outcome)

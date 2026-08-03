@@ -43,7 +43,9 @@ pub enum ColumnClass {
 /// worse, any locator built from it).
 pub fn classify_column(type_name: &str) -> ColumnClass {
     let t = type_name.trim().to_ascii_lowercase();
-    if t.contains("blob") || t.contains("bytea") {
+    // "binary" covers SQL Server binary/varbinary; "image" is its legacy
+    // blob type.
+    if t.contains("blob") || t.contains("bytea") || t.contains("binary") || t.contains("image") {
         return ColumnClass::Binary;
     }
     // A declared scalar keeps its native decoded type. Checked before the
@@ -275,16 +277,19 @@ pub struct PageRequest {
 pub enum Dialect {
     Sqlite,
     Postgres,
+    SqlServer,
 }
 
 impl Dialect {
     /// The `n`th bound-parameter placeholder (1-based): SQLite placeholders
     /// are positional so every one renders as `?`; Postgres numbers them
-    /// `$n`. Every SQL builder routes its placeholders through here.
+    /// `$n`; SQL Server numbers them `@Pn` (the tiberius convention). Every
+    /// SQL builder routes its placeholders through here.
     pub(crate) fn placeholder(self, n: usize) -> String {
         match self {
             Dialect::Sqlite => "?".to_string(),
             Dialect::Postgres => format!("${n}"),
+            Dialect::SqlServer => format!("@P{n}"),
         }
     }
 
@@ -292,11 +297,24 @@ impl Dialect {
     /// or a placeholder) to `target` (an introspected/static type name).
     /// Postgres uses the postfix `expr::type` shape; SQLite shares the arm
     /// but no builder ever casts there (its type affinity coerces on its
-    /// own). A dialect with prefix-only casts (`CAST(expr AS type)`) adds
-    /// its arm here without touching call sites.
+    /// own). SQL Server uses the prefix `CAST(expr AS type)` shape.
+    ///
+    /// Callers pass a **dialect-neutral** target for the generic cases and
+    /// this method translates it: the stringify target `"text"` becomes
+    /// `nvarchar(max)` on SQL Server (T-SQL has no `text`-as-cast-target
+    /// worth using — the legacy `text` type is deprecated and not
+    /// comparable). Any other target renders verbatim.
     pub(crate) fn cast_expr(self, expr: &str, target: &str) -> String {
         match self {
             Dialect::Sqlite | Dialect::Postgres => format!("{expr}::{target}"),
+            Dialect::SqlServer => {
+                let target = if target == "text" {
+                    "nvarchar(max)"
+                } else {
+                    target
+                };
+                format!("CAST({expr} AS {target})")
+            }
         }
     }
 }
@@ -326,13 +344,28 @@ impl PageRequest {
         }
     }
 
-    /// The paging tail shared by the paged selects. SQLite and Postgres
-    /// share the ` LIMIT n OFFSET m` shape; a dialect that pages differently
-    /// (e.g. `OFFSET … FETCH`) adds its arm here.
+    /// The paging tail shared by the paged selects, appended right after
+    /// [`Self::order_clause`]. SQLite and Postgres share the
+    /// ` LIMIT n OFFSET m` shape. SQL Server pages with
+    /// ` OFFSET n ROWS FETCH NEXT m ROWS ONLY`, which is only valid after an
+    /// ORDER BY — so when the request is unsorted (no order clause was
+    /// emitted) the tail supplies a synthetic ` ORDER BY (SELECT NULL)`
+    /// first, keeping the SQL valid without imposing an actual order.
     fn limit_offset(&self, dialect: Dialect) -> String {
         match dialect {
             Dialect::Sqlite | Dialect::Postgres => {
                 format!(" LIMIT {} OFFSET {}", self.limit, self.offset)
+            }
+            Dialect::SqlServer => {
+                let order = if self.sort.is_some() {
+                    ""
+                } else {
+                    " ORDER BY (SELECT NULL)"
+                };
+                format!(
+                    "{order} OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
+                    self.offset, self.limit
+                )
             }
         }
     }
@@ -413,6 +446,18 @@ impl PageRequest {
                     value_exprs.push(format!("substring({q} from 1 for {n}) AS {q}"));
                     length_exprs.push(format!("octet_length({q})"));
                 }
+                (Dialect::SqlServer, ColumnClass::Text) => {
+                    // Cast to nvarchar(max) so xml/legacy types preview too;
+                    // LEN counts characters (like Postgres length()).
+                    let cast = dialect.cast_expr(&q, "text");
+                    value_exprs.push(format!("SUBSTRING({cast}, 1, {n}) AS {q}"));
+                    length_exprs.push(format!("LEN({cast})"));
+                }
+                (Dialect::SqlServer, ColumnClass::Binary) => {
+                    // SUBSTRING works on varbinary; DATALENGTH is bytes.
+                    value_exprs.push(format!("SUBSTRING({q}, 1, {n}) AS {q}"));
+                    length_exprs.push(format!("DATALENGTH({q})"));
+                }
                 (_, ColumnClass::Scalar) => value_exprs.push(q),
             }
         }
@@ -477,11 +522,14 @@ impl PageRequest {
             Some(Filter::Column { column, op, value }) => {
                 // Postgres compares strictly by type, so the column is cast to
                 // text to match the text filter value (SQLite's affinity
-                // handles this implicitly). Fine for a viewer; indexes aren't a
-                // concern yet.
+                // handles this implicitly; SQL Server casts to nvarchar(max)
+                // the same way). Fine for a viewer; indexes aren't a concern
+                // yet.
                 let quoted = match dialect {
                     Dialect::Sqlite => quote_ident(column),
-                    Dialect::Postgres => dialect.cast_expr(&quote_ident(column), "text"),
+                    Dialect::Postgres | Dialect::SqlServer => {
+                        dialect.cast_expr(&quote_ident(column), "text")
+                    }
                 };
                 let placeholder = dialect.placeholder(1);
                 match op {
@@ -501,8 +549,8 @@ impl PageRequest {
 }
 
 /// A ` WHERE k1 = ? AND k2 = ?` clause pinning one row by its identity
-/// columns, with each value bound as text (Postgres casts the column to text;
-/// SQLite affinity coerces) — the same strategy the equals filter and
+/// columns, with each value bound as text (Postgres/SQL Server cast the
+/// column to text; SQLite affinity coerces) — the same strategy the equals filter and
 /// foreign-key navigation use, so exotic key types (uuid, enums, timestamps)
 /// still compare. An empty list matches every row (no clause). Shared by the
 /// [`Filter::Equalities`] page filter and [`super::DbPool::fetch_cell`].
@@ -518,7 +566,9 @@ pub(crate) fn equalities_where(
     for (column, value) in pairs {
         let quoted = match dialect {
             Dialect::Sqlite => quote_ident(column),
-            Dialect::Postgres => dialect.cast_expr(&quote_ident(column), "text"),
+            Dialect::Postgres | Dialect::SqlServer => {
+                dialect.cast_expr(&quote_ident(column), "text")
+            }
         };
         let placeholder = dialect.placeholder(params.len() + 1);
         clauses.push(format!("{quoted} = {placeholder}"));
@@ -680,6 +730,109 @@ mod tests {
     }
 
     #[test]
+    fn sqlserver_placeholders_are_numbered_at_p() {
+        assert_eq!(Dialect::SqlServer.placeholder(1), "@P1");
+        assert_eq!(Dialect::SqlServer.placeholder(12), "@P12");
+        assert_eq!(Dialect::Sqlite.placeholder(3), "?");
+        assert_eq!(Dialect::Postgres.placeholder(3), "$3");
+    }
+
+    #[test]
+    fn cast_expr_is_postfix_on_postgres_and_prefix_on_sqlserver() {
+        assert_eq!(Dialect::Postgres.cast_expr("\"c\"", "text"), "\"c\"::text");
+        assert_eq!(
+            Dialect::Postgres.cast_expr("$1", "integer"),
+            "$1::integer"
+        );
+        // The dialect-neutral "text" stringify target maps to nvarchar(max).
+        assert_eq!(
+            Dialect::SqlServer.cast_expr("\"c\"", "text"),
+            "CAST(\"c\" AS nvarchar(max))"
+        );
+        // Any other target renders verbatim.
+        assert_eq!(
+            Dialect::SqlServer.cast_expr("@P1", "int"),
+            "CAST(@P1 AS int)"
+        );
+    }
+
+    #[test]
+    fn sqlserver_unsorted_page_gets_a_synthetic_order_by() {
+        // OFFSET/FETCH is only valid after an ORDER BY; unsorted requests
+        // must emit ORDER BY (SELECT NULL), never invalid SQL.
+        let (sql, params) = base().select_sql(Dialect::SqlServer);
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"tracks\" ORDER BY (SELECT NULL) \
+             OFFSET 200 ROWS FETCH NEXT 100 ROWS ONLY"
+        );
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn sqlserver_sorted_page_uses_the_real_order_by() {
+        let mut req = base();
+        req.sort = Some(("name".into(), SortDir::Desc));
+        let (sql, _) = req.select_sql(Dialect::SqlServer);
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"tracks\" ORDER BY \"name\" DESC \
+             OFFSET 200 ROWS FETCH NEXT 100 ROWS ONLY"
+        );
+    }
+
+    #[test]
+    fn sqlserver_filter_casts_and_numbers_placeholders() {
+        let mut req = base();
+        req.filter = Some(Filter::equals("name", "7"));
+        let (sql, params) = req.select_sql(Dialect::SqlServer);
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"tracks\" WHERE CAST(\"name\" AS nvarchar(max)) = @P1 \
+             ORDER BY (SELECT NULL) OFFSET 200 ROWS FETCH NEXT 100 ROWS ONLY"
+        );
+        assert_eq!(params, vec![Value::Text("7".into())]);
+        // COUNT(*) shares the filter but never pages (no ORDER BY needed).
+        let (count_sql, _) = req.count_sql(Dialect::SqlServer);
+        assert_eq!(
+            count_sql,
+            "SELECT COUNT(*) FROM \"tracks\" WHERE CAST(\"name\" AS nvarchar(max)) = @P1"
+        );
+    }
+
+    #[test]
+    fn sqlserver_equalities_filter_casts_and_numbers_placeholders() {
+        let mut req = base();
+        req.filter = Some(Filter::Equalities(vec![
+            ("region".into(), Value::Text("eu".into())),
+            ("slot".into(), Value::Integer(3)),
+        ]));
+        let (sql, params) = req.select_sql(Dialect::SqlServer);
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"tracks\" \
+             WHERE CAST(\"region\" AS nvarchar(max)) = @P1 \
+             AND CAST(\"slot\" AS nvarchar(max)) = @P2 \
+             ORDER BY (SELECT NULL) OFFSET 200 ROWS FETCH NEXT 100 ROWS ONLY"
+        );
+        assert_eq!(
+            params,
+            vec![Value::Text("eu".into()), Value::Text("3".into())]
+        );
+    }
+
+    #[test]
+    fn sqlserver_export_has_no_paging_and_no_synthetic_order() {
+        let mut req = base();
+        req.filter = Some(Filter::equals("name", "x"));
+        let (sql, _) = req.export_sql(Dialect::SqlServer);
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"tracks\" WHERE CAST(\"name\" AS nvarchar(max)) = @P1"
+        );
+    }
+
+    #[test]
     fn count_shares_the_filter_but_not_paging() {
         let mut req = base();
         req.filter = Some(Filter::contains("name", "abc"));
@@ -781,7 +934,14 @@ mod tests {
     fn classify_column_separates_scalars_text_and_binary() {
         use ColumnClass::*;
         // Binary.
-        for t in ["BLOB", "bytea", "BLOB SUB_TYPE TEXT"] {
+        for t in [
+            "BLOB",
+            "bytea",
+            "BLOB SUB_TYPE TEXT",
+            "varbinary(max)",
+            "binary(16)",
+            "image",
+        ] {
             assert_eq!(classify_column(t), Binary, "{t}");
         }
         // Scalars keep their native decoded type (never previewed).
@@ -861,6 +1021,26 @@ mod tests {
              substring(\"blob\" from 1 for 512) AS \"blob\", \
              length(\"body\"::text), octet_length(\"blob\") \
              FROM \"tracks\" LIMIT 100 OFFSET 200"
+        );
+        assert_eq!(plan.length_columns, 2);
+    }
+
+    #[test]
+    fn bounded_select_uses_substring_len_and_datalength_on_sqlserver() {
+        let req = base();
+        let columns = [
+            col("id", "int", Some(1)),
+            col("body", "nvarchar(max)", None),
+            col("blob", "varbinary(max)", None),
+        ];
+        let (sql, _params, plan) =
+            req.select_bounded_sql(Dialect::SqlServer, &columns, &["id"], 512);
+        assert_eq!(
+            sql,
+            "SELECT \"id\", SUBSTRING(CAST(\"body\" AS nvarchar(max)), 1, 512) AS \"body\", \
+             SUBSTRING(\"blob\", 1, 512) AS \"blob\", \
+             LEN(CAST(\"body\" AS nvarchar(max))), DATALENGTH(\"blob\") \
+             FROM \"tracks\" ORDER BY (SELECT NULL) OFFSET 200 ROWS FETCH NEXT 100 ROWS ONLY"
         );
         assert_eq!(plan.length_columns, 2);
     }

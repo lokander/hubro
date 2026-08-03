@@ -314,6 +314,9 @@ impl TableStage {
 ///   stored generated columns (`GENERATED ALWAYS AS (expr) STORED`) have a
 ///   NULL `column_default` but are flagged via [`ColumnMeta::generated`].
 ///   All fall out via [`ColumnMeta::is_auto_assigned`].
+/// - **SQL Server**: no rowid-alias exemption; `IDENTITY` (and computed)
+///   columns are flagged via [`ColumnMeta::generated`] by introspection, so
+///   they too fall out via [`ColumnMeta::is_auto_assigned`], like Postgres.
 pub fn required_insert_columns(meta: &TableMeta, dialect: Dialect) -> HashSet<String> {
     let single_pk = meta.primary_key().len() == 1;
     meta.columns
@@ -671,6 +674,24 @@ mod tests {
             required_insert_columns(&pg, Dialect::Postgres),
             HashSet::from(["plain_pk".to_string(), "label".to_string()])
         );
+
+        // SQL Server: no rowid-alias exemption either (an "int" PK without
+        // IDENTITY must be provided); IDENTITY columns come flagged as
+        // generated, so they are exempt — exactly the Postgres rules.
+        let mssql = meta(vec![
+            column("plain_pk", "int", false, Some(1), None),
+            generated_column("identity_id", "int", crate::db::Generated::Always),
+            column("label", "nvarchar(80)", false, None, None),
+            column("state", "nvarchar(10)", false, None, Some("('new')")),
+        ]);
+        assert_eq!(
+            required_insert_columns(&mssql, Dialect::SqlServer),
+            HashSet::from(["plain_pk".to_string(), "label".to_string()])
+        );
+        // Even an exact INTEGER single-column PK is NOT auto-assigned on SQL
+        // Server — the rowid alias is a SQLite-only concept.
+        let integer_pk = meta(vec![column("id", "INTEGER", false, Some(1), None)]);
+        assert!(required_insert_columns(&integer_pk, Dialect::SqlServer).contains("id"));
     }
 
     #[test]

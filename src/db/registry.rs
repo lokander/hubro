@@ -289,20 +289,6 @@ impl DbPool {
             .find(|c| c.name == column)
             .map(|c| classify_column(&c.type_name))
             .unwrap_or(ColumnClass::Text);
-        let cap = FETCH_CELL_MAX_BYTES as i64;
-        let q = quote_ident(column);
-        let (value_expr, length_expr): (String, String) = match (dialect, class) {
-            (_, ColumnClass::Scalar) => (q.clone(), "NULL".to_string()),
-            (Dialect::Sqlite, _) => (format!("substr({q}, 1, {cap})"), format!("length({q})")),
-            (Dialect::Postgres, ColumnClass::Text) => (
-                format!("left({q}::text, {cap})"),
-                format!("length({q}::text)"),
-            ),
-            (Dialect::Postgres, ColumnClass::Binary) => (
-                format!("substring({q} from 1 for {cap})"),
-                format!("octet_length({q})"),
-            ),
-        };
         // Bind the row's key values as text, mirroring how the equalities page
         // filter / foreign-key jumps pin a row (exotic key types compare too).
         let pairs: Vec<(String, Value)> = identity
@@ -312,10 +298,7 @@ impl DbPool {
             .map(|(col, value)| ((*col).to_string(), value.clone()))
             .collect();
         let (where_clause, params) = equalities_where(&pairs, dialect);
-        let sql = format!(
-            "SELECT {value_expr}, {length_expr} FROM {}{where_clause} LIMIT 1",
-            qualified_table(table),
-        );
+        let sql = cell_fetch_sql(dialect, table, class, column, &where_clause);
         let result = self.query_with(&sql, &params).await?;
         let Some(row) = result.rows.into_iter().next() else {
             // The row is gone (concurrent delete): report an empty value
@@ -389,6 +372,55 @@ fn qualified_table(table: &TableMeta) -> String {
     }
 }
 
+/// Builds the single-row SELECT [`DbPool::fetch_cell`] runs: a bounded
+/// `(value, length)` expression pair for `column` (capped at
+/// [`FETCH_CELL_MAX_BYTES`]), the row-pinning `where_clause`, and a one-row
+/// limit — a ` LIMIT 1` tail on SQLite/Postgres, but `SELECT TOP 1 …` on SQL
+/// Server (T-SQL puts the row cap right after SELECT). Text casts route
+/// through [`Dialect::cast_expr`] so each dialect renders its own stringify
+/// form (`::text` vs `CAST(… AS nvarchar(max))`).
+fn cell_fetch_sql(
+    dialect: Dialect,
+    table: &TableMeta,
+    class: ColumnClass,
+    column: &str,
+    where_clause: &str,
+) -> String {
+    let cap = FETCH_CELL_MAX_BYTES as i64;
+    let q = quote_ident(column);
+    let (value_expr, length_expr): (String, String) = match (dialect, class) {
+        (_, ColumnClass::Scalar) => (q.clone(), "NULL".to_string()),
+        (Dialect::Sqlite, _) => (format!("substr({q}, 1, {cap})"), format!("length({q})")),
+        (Dialect::Postgres, ColumnClass::Text) => {
+            let cast = dialect.cast_expr(&q, "text");
+            (format!("left({cast}, {cap})"), format!("length({cast})"))
+        }
+        (Dialect::Postgres, ColumnClass::Binary) => (
+            format!("substring({q} from 1 for {cap})"),
+            format!("octet_length({q})"),
+        ),
+        (Dialect::SqlServer, ColumnClass::Text) => {
+            let cast = dialect.cast_expr(&q, "text");
+            (
+                format!("SUBSTRING({cast}, 1, {cap})"),
+                format!("LEN({cast})"),
+            )
+        }
+        (Dialect::SqlServer, ColumnClass::Binary) => (
+            format!("SUBSTRING({q}, 1, {cap})"),
+            format!("DATALENGTH({q})"),
+        ),
+    };
+    let (top, tail) = match dialect {
+        Dialect::Sqlite | Dialect::Postgres => ("", " LIMIT 1"),
+        Dialect::SqlServer => ("TOP 1 ", ""),
+    };
+    format!(
+        "SELECT {top}{value_expr}, {length_expr} FROM {}{where_clause}{tail}",
+        qualified_table(table),
+    )
+}
+
 /// Fallback full-length for a value when the `length` column came back NULL
 /// or non-integer (chars for text, bytes for blob, else 0).
 fn value_len(value: &Value) -> u64 {
@@ -456,6 +488,91 @@ impl ConnectionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::schema::TableKind;
+
+    fn cell_table(schema: Option<&str>) -> TableMeta {
+        TableMeta {
+            schema: schema.map(str::to_string),
+            name: "t".into(),
+            kind: TableKind::Table,
+            columns: vec![],
+            indexes: vec![],
+            foreign_keys: vec![],
+        }
+    }
+
+    #[test]
+    fn cell_fetch_sql_bounds_previews_per_dialect() {
+        let cap = FETCH_CELL_MAX_BYTES as i64;
+        let table = cell_table(None);
+        // SQLite: substr/length for text and binary alike.
+        assert_eq!(
+            cell_fetch_sql(Dialect::Sqlite, &table, ColumnClass::Text, "c", " WHERE \"id\" = ?"),
+            format!(
+                "SELECT substr(\"c\", 1, {cap}), length(\"c\") FROM \"t\" WHERE \"id\" = ? LIMIT 1"
+            )
+        );
+        // Postgres: text cast routed through cast_expr.
+        assert_eq!(
+            cell_fetch_sql(
+                Dialect::Postgres,
+                &table,
+                ColumnClass::Text,
+                "c",
+                " WHERE \"id\"::text = $1"
+            ),
+            format!(
+                "SELECT left(\"c\"::text, {cap}), length(\"c\"::text) \
+                 FROM \"t\" WHERE \"id\"::text = $1 LIMIT 1"
+            )
+        );
+        assert_eq!(
+            cell_fetch_sql(Dialect::Postgres, &table, ColumnClass::Binary, "c", ""),
+            format!(
+                "SELECT substring(\"c\" from 1 for {cap}), octet_length(\"c\") \
+                 FROM \"t\" LIMIT 1"
+            )
+        );
+        // Scalars are fetched whole, with a NULL length placeholder.
+        assert_eq!(
+            cell_fetch_sql(Dialect::Sqlite, &table, ColumnClass::Scalar, "c", ""),
+            "SELECT \"c\", NULL FROM \"t\" LIMIT 1"
+        );
+    }
+
+    #[test]
+    fn cell_fetch_sql_uses_top_1_and_tsql_functions_on_sqlserver() {
+        let cap = FETCH_CELL_MAX_BYTES as i64;
+        let table = cell_table(Some("dbo"));
+        // Text: SUBSTRING preview + LEN (characters) over an nvarchar cast;
+        // TOP 1 right after SELECT, no LIMIT tail.
+        assert_eq!(
+            cell_fetch_sql(
+                Dialect::SqlServer,
+                &table,
+                ColumnClass::Text,
+                "c",
+                " WHERE CAST(\"id\" AS nvarchar(max)) = @P1"
+            ),
+            format!(
+                "SELECT TOP 1 SUBSTRING(CAST(\"c\" AS nvarchar(max)), 1, {cap}), \
+                 LEN(CAST(\"c\" AS nvarchar(max))) \
+                 FROM \"dbo\".\"t\" WHERE CAST(\"id\" AS nvarchar(max)) = @P1"
+            )
+        );
+        // Binary: raw SUBSTRING + DATALENGTH (bytes).
+        assert_eq!(
+            cell_fetch_sql(Dialect::SqlServer, &table, ColumnClass::Binary, "c", ""),
+            format!(
+                "SELECT TOP 1 SUBSTRING(\"c\", 1, {cap}), DATALENGTH(\"c\") FROM \"dbo\".\"t\""
+            )
+        );
+        // Scalar: whole value, still TOP 1.
+        assert_eq!(
+            cell_fetch_sql(Dialect::SqlServer, &table, ColumnClass::Scalar, "c", ""),
+            "SELECT TOP 1 \"c\", NULL FROM \"dbo\".\"t\""
+        );
+    }
 
     fn dummy_pool() -> DbPool {
         // A lazily-connecting pool is fine for registry bookkeeping tests,

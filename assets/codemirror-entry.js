@@ -2,7 +2,7 @@ import { EditorView, keymap, lineNumbers, highlightActiveLine } from "@codemirro
 import { EditorState, Compartment, Prec } from "@codemirror/state";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { autocompletion } from "@codemirror/autocomplete";
-import { sql, SQLite, PostgreSQL } from "@codemirror/lang-sql";
+import { sql, SQLite, PostgreSQL, MSSQL } from "@codemirror/lang-sql";
 import { oneDark } from "@codemirror/theme-one-dark";
 
 const views = new Map();
@@ -11,14 +11,17 @@ const sqlCompartments = new Map();
 
 // Builds the sql() language support for a dialect plus a schema namespace
 // object (lang-sql SQLNamespace: "table" or "schema.table" keys mapping to
-// column-name arrays). Postgres gets defaultSchema so `public` tables
-// complete unqualified.
+// column-name arrays). Postgres/SQL Server get a defaultSchema so
+// `public`/`dbo` tables complete unqualified.
 function sqlSupport(dialectName, schema) {
-  const postgres = dialectName === "postgres";
+  const dialect =
+    dialectName === "postgres" ? PostgreSQL : dialectName === "mssql" ? MSSQL : SQLite;
+  const defaultSchema =
+    dialectName === "postgres" ? "public" : dialectName === "mssql" ? "dbo" : undefined;
   return sql({
-    dialect: postgres ? PostgreSQL : SQLite,
+    dialect,
     schema: schema || {},
-    defaultSchema: postgres ? "public" : undefined,
+    defaultSchema,
     upperCaseKeywords: true,
   });
 }

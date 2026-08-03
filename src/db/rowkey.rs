@@ -66,7 +66,8 @@ impl RowIdentity {
 ///   implicit rowid addresses their rows — unless user columns shadow every
 ///   accessor name (`rowid`, `_rowid_`, `oid`), a pathological case that
 ///   yields `None` rather than risking a write against the wrong column.
-/// - Postgres tables with neither yield `None`.
+/// - Postgres and SQL Server tables with neither yield `None` (neither has
+///   a rowid analogue reachable through plain SQL).
 pub fn detect_row_identity(table: &TableMeta, dialect: Dialect) -> Option<RowIdentity> {
     // Views and materialized views are read-only; even if a matview carries a
     // unique index, we must not offer editing that UPDATE/DELETE can't perform.
@@ -92,7 +93,7 @@ pub fn detect_row_identity(table: &TableMeta, dialect: Dialect) -> Option<RowIde
     }
     match dialect {
         Dialect::Sqlite => rowid_accessor(table).map(|column| RowIdentity::Rowid { column }),
-        Dialect::Postgres => None,
+        Dialect::Postgres | Dialect::SqlServer => None,
     }
 }
 
@@ -243,7 +244,7 @@ mod tests {
             vec![col("id", false, Some(1)), col("name", true, None)],
             vec![index("uniq_name", true, &["name"])],
         );
-        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+        for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
             assert_eq!(
                 detect_row_identity(&t, dialect),
                 Some(RowIdentity::PrimaryKey {
@@ -436,12 +437,34 @@ mod tests {
     }
 
     #[test]
+    fn keyless_sqlserver_table_is_read_only() {
+        // No rowid analogue: PK (or usable unique index) or refuse, like
+        // Postgres.
+        let t = table(TableKind::Table, vec![col("data", true, None)], vec![]);
+        assert_eq!(detect_row_identity(&t, Dialect::SqlServer), None);
+        // A usable unique index still qualifies.
+        let indexed = table(
+            TableKind::Table,
+            vec![col("email", false, None)],
+            vec![index("uniq_email", true, &["email"])],
+        );
+        assert_eq!(
+            detect_row_identity(&indexed, Dialect::SqlServer),
+            Some(RowIdentity::UniqueIndex {
+                name: "uniq_email".into(),
+                columns: vec!["email".into()]
+            })
+        );
+    }
+
+    #[test]
     fn views_are_never_addressable() {
         // Even when introspection reports PK-ish columns (it doesn't today),
         // a view must stay read-only.
         let t = table(TableKind::View, vec![col("id", false, Some(1))], vec![]);
-        assert_eq!(detect_row_identity(&t, Dialect::Sqlite), None);
-        assert_eq!(detect_row_identity(&t, Dialect::Postgres), None);
+        for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
+            assert_eq!(detect_row_identity(&t, dialect), None);
+        }
     }
 
     #[test]
@@ -520,6 +543,26 @@ mod tests {
         let (sql, params) = delete_sql(&t, &identity, Dialect::Sqlite);
         assert_eq!(sql, "DELETE FROM \"t\" WHERE \"rowid\" = ?");
         assert_eq!(params, ["rowid"]);
+    }
+
+    #[test]
+    fn update_and_delete_sql_use_at_p_placeholders_on_sqlserver() {
+        let mut t = table(
+            TableKind::Table,
+            vec![col("id", false, Some(1)), col("title", true, None)],
+            vec![],
+        );
+        t.schema = Some("dbo".into());
+        let identity = detect_row_identity(&t, Dialect::SqlServer).unwrap();
+        let (sql, params) = update_sql(&t, &identity, &["title".into()], Dialect::SqlServer);
+        assert_eq!(
+            sql,
+            "UPDATE \"dbo\".\"t\" SET \"title\" = @P1 WHERE \"id\" = @P2"
+        );
+        assert_eq!(params, ["title", "id"]);
+        let (sql, params) = delete_sql(&t, &identity, Dialect::SqlServer);
+        assert_eq!(sql, "DELETE FROM \"dbo\".\"t\" WHERE \"id\" = @P1");
+        assert_eq!(params, ["id"]);
     }
 
     #[test]
