@@ -55,10 +55,26 @@ pub enum SavedConnection {
     },
 }
 
+/// Which database backend a connection targets. Purely in-memory — the config
+/// file keys `SavedConnection` on its serde `kind` tag instead — so adding a
+/// variant here never touches the on-disk format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    Sqlite,
+    Postgres,
+}
+
 impl SavedConnection {
     pub fn name(&self) -> &str {
         match self {
             SavedConnection::Sqlite { name, .. } | SavedConnection::Postgres { name, .. } => name,
+        }
+    }
+
+    pub fn backend(&self) -> BackendKind {
+        match self {
+            SavedConnection::Sqlite { .. } => BackendKind::Sqlite,
+            SavedConnection::Postgres { .. } => BackendKind::Postgres,
         }
     }
 
@@ -362,11 +378,11 @@ pub fn save_session(path: &Path, session: &Session) -> Result<(), ConfigError> {
 }
 
 /// A saved connection reduced to what session-restore planning needs: its
-/// open-locator (canonical) form and whether it is Postgres.
+/// open-locator (canonical) form and which backend it targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreCandidate {
     pub locator: String,
-    pub is_postgres: bool,
+    pub backend: BackendKind,
 }
 
 /// Decides which remembered tabs to auto-reopen (pure, so it is unit-testable
@@ -387,8 +403,10 @@ pub fn plan_session_restore(
         .filter(
             |tab| match candidates.iter().find(|c| c.locator == tab.locator) {
                 None => false,
-                Some(c) if c.is_postgres => pg_password_available(&tab.locator),
-                Some(_) => true,
+                Some(c) => match c.backend {
+                    BackendKind::Postgres => pg_password_available(&tab.locator),
+                    BackendKind::Sqlite => true,
+                },
             },
         )
         .cloned()
@@ -1048,15 +1066,15 @@ mod tests {
         let candidates = vec![
             RestoreCandidate {
                 locator: "/data/a.db".into(),
-                is_postgres: false,
+                backend: BackendKind::Sqlite,
             },
             RestoreCandidate {
                 locator: "postgres://u@h:5432/withpw".into(),
-                is_postgres: true,
+                backend: BackendKind::Postgres,
             },
             RestoreCandidate {
                 locator: "postgres://u@h:5432/nopw".into(),
-                is_postgres: true,
+                backend: BackendKind::Postgres,
             },
             // "/data/gone.db" is in the session but NOT saved anymore.
         ];

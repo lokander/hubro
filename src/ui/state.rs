@@ -8,8 +8,8 @@ use dioxus::prelude::*;
 use crate::azure::{self, EntraAuth};
 use crate::config::{
     default_config_path, default_session_path, default_settings_path, load_session, load_settings,
-    plan_session_restore, save_session, save_theme, PgAuth, RestoreCandidate, SavedConnection,
-    SavedList, Session, SessionPane, SessionTab, Theme,
+    plan_session_restore, save_session, save_theme, BackendKind, PgAuth, RestoreCandidate,
+    SavedConnection, SavedList, Session, SessionPane, SessionTab, Theme,
 };
 use crate::db::{
     apply_staged, build_fk_filter, detect_row_identity, needs_confirmation, run_script,
@@ -2169,7 +2169,7 @@ impl AppState {
             .iter()
             .map(|s| RestoreCandidate {
                 locator: saved_open_locator(s),
-                is_postgres: matches!(s, SavedConnection::Postgres { .. }),
+                backend: s.backend(),
             })
             .collect();
         // Which Postgres locators can connect silently (so startup never blocks
@@ -2179,7 +2179,7 @@ impl AppState {
         // session-memory borrow is dropped before the await.
         let mut pg_ready: HashSet<String> = HashSet::new();
         for candidate in &candidates {
-            if !candidate.is_postgres {
+            if candidate.backend != BackendKind::Postgres {
                 continue;
             }
             let auth = saved.iter().find_map(|s| match s {
