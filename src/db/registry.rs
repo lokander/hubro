@@ -14,6 +14,7 @@ use super::postgres;
 use super::rowkey::RowIdentity;
 use super::schema::{ColumnMeta, TableMeta};
 use super::sqlite;
+use super::sqlserver::{self, MssqlPool, MssqlTx};
 use super::staged::{CheckedStatement, RowLocator};
 use super::value::{QueryResult, Value};
 
@@ -60,6 +61,7 @@ pub struct ConnectionId(u64);
 pub enum DbPool {
     Sqlite(SqlitePool),
     Postgres(PgPool),
+    SqlServer(MssqlPool),
 }
 
 /// A backend-neutral transaction handle for atomically running a script
@@ -73,6 +75,10 @@ pub enum DbPool {
 pub enum ScriptTx<'p> {
     Sqlite(sqlx::Transaction<'p, sqlx::Sqlite>),
     Postgres(sqlx::Transaction<'p, sqlx::Postgres>),
+    // Not an sqlx transaction: an owned pooled connection driving
+    // BEGIN/COMMIT as manual SQL (tiberius has no transaction API). Boxed:
+    // the checked-out client is large next to the slim sqlx handles.
+    SqlServer(Box<MssqlTx>),
 }
 
 impl ScriptTx<'_> {
@@ -82,6 +88,7 @@ impl ScriptTx<'_> {
         match self {
             ScriptTx::Sqlite(tx) => sqlite::execute_conn(tx, sql).await,
             ScriptTx::Postgres(tx) => postgres::execute_conn(tx, sql).await,
+            ScriptTx::SqlServer(tx) => sqlserver::execute_conn(tx, sql).await,
         }
     }
 
@@ -100,6 +107,9 @@ impl ScriptTx<'_> {
             ScriptTx::Postgres(tx) => {
                 postgres::query_capped_conn(tx, sql, max_rows, QUERY_CELL_CAP).await
             }
+            ScriptTx::SqlServer(tx) => {
+                sqlserver::query_capped_conn(tx, sql, max_rows, QUERY_CELL_CAP).await
+            }
         }
     }
 
@@ -108,6 +118,7 @@ impl ScriptTx<'_> {
         match self {
             ScriptTx::Sqlite(tx) => sqlite::commit_tx(tx).await,
             ScriptTx::Postgres(tx) => postgres::commit_tx(tx).await,
+            ScriptTx::SqlServer(tx) => sqlserver::commit_tx(*tx).await,
         }
     }
 
@@ -119,6 +130,7 @@ impl ScriptTx<'_> {
         match self {
             ScriptTx::Sqlite(tx) => sqlite::rollback_tx(tx).await,
             ScriptTx::Postgres(tx) => postgres::rollback_tx(tx).await,
+            ScriptTx::SqlServer(tx) => sqlserver::rollback_tx(*tx).await,
         }
     }
 }
@@ -134,10 +146,16 @@ impl DbPool {
         Ok(DbPool::Postgres(postgres::open_postgres(url).await?))
     }
 
+    /// Connects to a SQL Server URL (password already spliced in if any).
+    pub async fn open_mssql(url: &str) -> Result<DbPool, DbError> {
+        Ok(DbPool::SqlServer(sqlserver::open_mssql(url).await?))
+    }
+
     pub fn dialect(&self) -> Dialect {
         match self {
             DbPool::Sqlite(_) => Dialect::Sqlite,
             DbPool::Postgres(_) => Dialect::Postgres,
+            DbPool::SqlServer(_) => Dialect::SqlServer,
         }
     }
 
@@ -145,6 +163,7 @@ impl DbPool {
         match self {
             DbPool::Sqlite(pool) => sqlite::query(pool, sql).await,
             DbPool::Postgres(pool) => postgres::query_with(pool, sql, &[]).await,
+            DbPool::SqlServer(pool) => sqlserver::query_with(pool, sql, &[]).await,
         }
     }
 
@@ -154,6 +173,7 @@ impl DbPool {
         match self {
             DbPool::Sqlite(pool) => sqlite::execute(pool, sql).await,
             DbPool::Postgres(pool) => postgres::execute(pool, sql).await,
+            DbPool::SqlServer(pool) => sqlserver::execute(pool, sql).await,
         }
     }
 
@@ -172,6 +192,9 @@ impl DbPool {
                 .await
                 .map(ScriptTx::Postgres)
                 .map_err(|e| DbError::Query(e.to_string())),
+            DbPool::SqlServer(pool) => sqlserver::begin_tx(pool)
+                .await
+                .map(|tx| ScriptTx::SqlServer(Box::new(tx))),
         }
     }
 
@@ -211,6 +234,7 @@ impl DbPool {
         match self {
             DbPool::Sqlite(pool) => sqlite::execute_all_checked(pool, statements).await,
             DbPool::Postgres(pool) => postgres::execute_all_checked(pool, statements).await,
+            DbPool::SqlServer(pool) => sqlserver::execute_all_checked(pool, statements).await,
         }
     }
 
@@ -218,6 +242,7 @@ impl DbPool {
         match self {
             DbPool::Sqlite(pool) => sqlite::query_with(pool, sql, params).await,
             DbPool::Postgres(pool) => postgres::query_with(pool, sql, params).await,
+            DbPool::SqlServer(pool) => sqlserver::query_with(pool, sql, params).await,
         }
     }
 
@@ -264,6 +289,9 @@ impl DbPool {
             }
             DbPool::Postgres(pool) => {
                 postgres::query_capped(pool, sql, params, max_rows, QUERY_CELL_CAP).await
+            }
+            DbPool::SqlServer(pool) => {
+                sqlserver::query_capped(pool, sql, params, max_rows, QUERY_CELL_CAP).await
             }
         }
     }
@@ -346,6 +374,7 @@ impl DbPool {
         match self {
             DbPool::Sqlite(pool) => sqlite::export(pool, sql, params, format, out).await,
             DbPool::Postgres(pool) => postgres::export(pool, sql, params, format, out).await,
+            DbPool::SqlServer(pool) => sqlserver::export(pool, sql, params, format, out).await,
         }
     }
 
@@ -353,6 +382,8 @@ impl DbPool {
         match self {
             DbPool::Sqlite(pool) => sqlite::introspect(pool).await,
             DbPool::Postgres(pool) => postgres::introspect(pool).await,
+            // Minimal stub (tables/views + columns); full parity is FRE-56.
+            DbPool::SqlServer(pool) => sqlserver::introspect(pool).await,
         }
     }
 
@@ -360,6 +391,7 @@ impl DbPool {
         match self {
             DbPool::Sqlite(pool) => pool.close().await,
             DbPool::Postgres(pool) => pool.close().await,
+            DbPool::SqlServer(pool) => pool.close().await,
         }
     }
 }

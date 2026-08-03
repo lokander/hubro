@@ -16,6 +16,7 @@ mod rowkey;
 mod schema;
 mod script;
 mod sqlite;
+mod sqlserver;
 mod staged;
 mod value;
 
@@ -40,6 +41,10 @@ pub use script::{
     ScriptError, StatementKind, StatementOutcome, StatementResult,
 };
 pub use sqlite::open_sqlite;
+pub use sqlserver::{
+    build_mssql_url, mssql_url_target, mssql_url_via_local_port, mssql_url_with_password,
+    normalize_mssql_url, open_mssql, MssqlPool, MssqlTx,
+};
 pub use staged::{
     apply_staged, AppliedCounts, CheckedStatement, RowLocator, StagedChange, StagedError,
 };
