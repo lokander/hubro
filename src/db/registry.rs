@@ -382,7 +382,6 @@ impl DbPool {
         match self {
             DbPool::Sqlite(pool) => sqlite::introspect(pool).await,
             DbPool::Postgres(pool) => postgres::introspect(pool).await,
-            // Minimal stub (tables/views + columns); full parity is FRE-56.
             DbPool::SqlServer(pool) => sqlserver::introspect(pool).await,
         }
     }

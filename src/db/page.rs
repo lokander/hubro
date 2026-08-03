@@ -990,6 +990,14 @@ mod tests {
         ] {
             assert_eq!(classify_column(t), Text, "{t}");
         }
+        // SQL Server sql_variant and CLR UDT columns MUST stay Text (the
+        // unknown-type fallback): selecting them raw panics inside the
+        // tiberius codec (FRE-55/FRE-56), while the Text class routes them
+        // through the `CAST(… AS nvarchar(max))` preview, which SQL Server
+        // accepts for all of them (CLR UDTs stringify via their ToString).
+        for t in ["sql_variant", "hierarchyid", "geography", "geometry"] {
+            assert_eq!(classify_column(t), Text, "{t}");
+        }
     }
 
     #[test]
