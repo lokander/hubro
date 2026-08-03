@@ -9,6 +9,14 @@ edition = "2021"
 [dependencies]
 dioxus = { version = "0.7.1", features = [] }
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "postgres", "runtime-tokio", "tls-rustls-ring", "macros", "chrono", "uuid", "json", "rust_decimal"] }
+# SQL Server driver (FRE-55). Default features are off to drop native-tls and
+# Windows auth; `rustls` keeps TLS on the same rustls stack sqlx uses (tiberius
+# 0.12 pins rustls 0.21 vs sqlx's 0.23, so two rustls *versions* coexist, but
+# no OpenSSL). `tds73` enables date/time2/datetimeoffset (SQL Server 2008+);
+# `chrono` decodes them into the chrono types the rest of the app already uses.
+tiberius = { version = "0.12", default-features = false, features = ["rustls", "tds73", "chrono"] }
+# Adapts tokio's TcpStream to the futures-io traits tiberius expects.
+tokio-util = { version = "0.7", features = ["compat"] }
 # Same crate sqlx pulls in; direct dependency so UI code (history timestamps)
 # doesn't import chrono through sqlx's re-export.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
