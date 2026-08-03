@@ -173,7 +173,7 @@ pub async fn open_postgres(url: &str) -> Result<PgPool, DbError> {
 }
 
 /// Categorizes common failure modes so the connections screen reads well:
-/// auth, network/DNS, TLS.
+/// auth, network/DNS, TLS, wrong-server.
 fn friendly_connect_error(err: &sqlx::Error) -> String {
     let msg = err.to_string();
     let lower = msg.to_lowercase();
@@ -181,6 +181,10 @@ fn friendly_connect_error(err: &sqlx::Error) -> String {
         format!("authentication failed — {msg}")
     } else if lower.contains("role") && lower.contains("does not exist") {
         format!("unknown role — {msg}")
+    } else if lower.contains("unexpected response from sslrequest") {
+        // Something answered the Postgres handshake with garbage — usually a
+        // different database server (e.g. SQL Server) on that host/port.
+        format!("the server doesn't appear to be Postgres — check the host and port — {msg}")
     } else if lower.contains("tls") || lower.contains("ssl") {
         format!("TLS error — {msg}")
     } else if lower.contains("connection refused")
@@ -1081,6 +1085,15 @@ mod tests {
         let friendly = friendly_connect_error(&role);
         assert!(friendly.starts_with("unknown role"));
         assert!(!friendly.contains("authentication failed"));
+        // A non-Postgres server answering the handshake (e.g. SQL Server on
+        // 1433) mentions SSL but is a wrong-server problem, not a TLS one.
+        let not_pg = sqlx::Error::Protocol(
+            "encountered unexpected or invalid data: unexpected response from SSLRequest: 0x00"
+                .into(),
+        );
+        let friendly = friendly_connect_error(&not_pg);
+        assert!(friendly.starts_with("the server doesn't appear to be Postgres"));
+        assert!(!friendly.starts_with("TLS error"));
     }
 
     #[test]
