@@ -278,11 +278,25 @@ pub enum Dialect {
 }
 
 impl Dialect {
-    /// First bound-parameter placeholder (at most one is ever used here).
-    fn placeholder(self) -> &'static str {
+    /// The `n`th bound-parameter placeholder (1-based): SQLite placeholders
+    /// are positional so every one renders as `?`; Postgres numbers them
+    /// `$n`. Every SQL builder routes its placeholders through here.
+    pub(crate) fn placeholder(self, n: usize) -> String {
         match self {
-            Dialect::Sqlite => "?",
-            Dialect::Postgres => "$1",
+            Dialect::Sqlite => "?".to_string(),
+            Dialect::Postgres => format!("${n}"),
+        }
+    }
+
+    /// Renders a cast of `expr` (already-safe SQL, e.g. a quoted identifier
+    /// or a placeholder) to `target` (an introspected/static type name).
+    /// Postgres uses the postfix `expr::type` shape; SQLite shares the arm
+    /// but no builder ever casts there (its type affinity coerces on its
+    /// own). A dialect with prefix-only casts (`CAST(expr AS type)`) adds
+    /// its arm here without touching call sites.
+    pub(crate) fn cast_expr(self, expr: &str, target: &str) -> String {
+        match self {
+            Dialect::Sqlite | Dialect::Postgres => format!("{expr}::{target}"),
         }
     }
 }
@@ -299,7 +313,7 @@ impl PageRequest {
             "SELECT {extra}* FROM {}{where_clause}{}{}",
             self.qualified_table(),
             self.order_clause(),
-            self.limit_offset(),
+            self.limit_offset(dialect),
         );
         (sql, params)
     }
@@ -312,9 +326,15 @@ impl PageRequest {
         }
     }
 
-    /// The ` LIMIT n OFFSET m` tail shared by the paged selects.
-    fn limit_offset(&self) -> String {
-        format!(" LIMIT {} OFFSET {}", self.limit, self.offset)
+    /// The paging tail shared by the paged selects. SQLite and Postgres
+    /// share the ` LIMIT n OFFSET m` shape; a dialect that pages differently
+    /// (e.g. `OFFSET … FETCH`) adds its arm here.
+    fn limit_offset(&self, dialect: Dialect) -> String {
+        match dialect {
+            Dialect::Sqlite | Dialect::Postgres => {
+                format!(" LIMIT {} OFFSET {}", self.limit, self.offset)
+            }
+        }
     }
 
     /// SELECT for this page that fetches a bounded preview of large columns
@@ -385,8 +405,9 @@ impl PageRequest {
                     length_exprs.push(format!("length({q})"));
                 }
                 (Dialect::Postgres, ColumnClass::Text) => {
-                    value_exprs.push(format!("left({q}::text, {n}) AS {q}"));
-                    length_exprs.push(format!("length({q}::text)"));
+                    let cast = dialect.cast_expr(&q, "text");
+                    value_exprs.push(format!("left({cast}, {n}) AS {q}"));
+                    length_exprs.push(format!("length({cast})"));
                 }
                 (Dialect::Postgres, ColumnClass::Binary) => {
                     value_exprs.push(format!("substring({q} from 1 for {n}) AS {q}"));
@@ -406,7 +427,7 @@ impl PageRequest {
             "SELECT {select_list} FROM {}{where_clause}{}{}",
             self.qualified_table(),
             self.order_clause(),
-            self.limit_offset(),
+            self.limit_offset(dialect),
         );
         (
             sql,
@@ -460,9 +481,9 @@ impl PageRequest {
                 // concern yet.
                 let quoted = match dialect {
                     Dialect::Sqlite => quote_ident(column),
-                    Dialect::Postgres => format!("{}::text", quote_ident(column)),
+                    Dialect::Postgres => dialect.cast_expr(&quote_ident(column), "text"),
                 };
-                let placeholder = dialect.placeholder();
+                let placeholder = dialect.placeholder(1);
                 match op {
                     FilterOp::Equals => (
                         format!(" WHERE {quoted} = {placeholder}"),
@@ -497,12 +518,9 @@ pub(crate) fn equalities_where(
     for (column, value) in pairs {
         let quoted = match dialect {
             Dialect::Sqlite => quote_ident(column),
-            Dialect::Postgres => format!("{}::text", quote_ident(column)),
+            Dialect::Postgres => dialect.cast_expr(&quote_ident(column), "text"),
         };
-        let placeholder = match dialect {
-            Dialect::Sqlite => "?".to_string(),
-            Dialect::Postgres => format!("${}", params.len() + 1),
-        };
+        let placeholder = dialect.placeholder(params.len() + 1);
         clauses.push(format!("{quoted} = {placeholder}"));
         params.push(Value::Text(equality_text(value)));
     }
@@ -531,6 +549,10 @@ fn escape_like(needle: &str) -> String {
         .replace('_', "\\_")
 }
 
+/// Double-quotes an identifier, doubling embedded quotes. Deliberately takes
+/// no [`Dialect`]: ANSI `"…"` quoting works on SQLite, Postgres, and SQL
+/// Server (with QUOTED_IDENTIFIER ON, which tiberius defaults to), so one
+/// dialect-independent form covers every backend we would add.
 pub(crate) fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }

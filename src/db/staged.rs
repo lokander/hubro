@@ -400,10 +400,12 @@ impl ParamSql {
             return "NULL".to_string();
         }
         self.values.push(value.clone());
-        match (self.dialect, cast) {
-            (Dialect::Sqlite, _) => "?".to_string(),
-            (Dialect::Postgres, Some(cast)) => format!("${}::{cast}", self.values.len()),
-            (Dialect::Postgres, None) => format!("${}", self.values.len()),
+        let placeholder = self.dialect.placeholder(self.values.len());
+        match cast {
+            // `cast` is only ever `Some` when [`cast_target`] decided this
+            // dialect needs one (never on SQLite).
+            Some(cast) => self.dialect.cast_expr(&placeholder, cast),
+            None => placeholder,
         }
     }
 }

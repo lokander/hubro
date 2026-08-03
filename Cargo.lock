@@ -1311,6 +1311,7 @@ name = "dataview"
 version = "0.5.0"
 dependencies = [
  "base64",
+ "chrono",
  "dioxus",
  "dirs",
  "futures-util",

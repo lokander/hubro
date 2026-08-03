@@ -183,10 +183,7 @@ fn key_clause(identity: &RowIdentity, dialect: Dialect, params: &mut Vec<String>
 /// Next placeholder (`?` / `$n`), recording which column it binds.
 fn placeholder(dialect: Dialect, params: &mut Vec<String>, column: &str) -> String {
     params.push(column.to_string());
-    match dialect {
-        Dialect::Sqlite => "?".to_string(),
-        Dialect::Postgres => format!("${}", params.len()),
-    }
+    dialect.placeholder(params.len())
 }
 
 fn qualified_table(table: &TableMeta) -> String {
