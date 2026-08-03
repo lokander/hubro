@@ -975,6 +975,44 @@ mod tests {
     }
 
     #[test]
+    fn sqlserver_statements_use_at_p_placeholders_without_casts() {
+        // Placeholders number @P1.. across SET and WHERE; no column casts
+        // are emitted (cast_target is Postgres-only — tiberius binding rules
+        // are a driver concern for the connection issue).
+        let mut t = typed_pg_table();
+        t.schema = Some("dbo".into());
+        let plan = build_statements(
+            &t,
+            &identity(),
+            Dialect::SqlServer,
+            &[
+                update(1, "flag", Value::Integer(1)),
+                update(1, "amount", Value::Text("12.5".into())),
+                StagedChange::Insert {
+                    columns: vec!["id".into(), "flag".into()],
+                    values: vec![Value::Integer(2), Value::Null],
+                },
+                StagedChange::Delete {
+                    locator: locator(9),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            plan[0].statement.sql,
+            "UPDATE \"dbo\".\"typed\" SET \"flag\" = @P1, \"amount\" = @P2 WHERE \"id\" = @P3"
+        );
+        assert_eq!(
+            plan[1].statement.sql,
+            "INSERT INTO \"dbo\".\"typed\" (\"id\", \"flag\") VALUES (@P1, NULL)"
+        );
+        assert_eq!(
+            plan[2].statement.sql,
+            "DELETE FROM \"dbo\".\"typed\" WHERE \"id\" = @P1"
+        );
+    }
+
+    #[test]
     fn plan_preserves_first_occurrence_order_across_kinds() {
         let plan = build_statements(
             &table(),

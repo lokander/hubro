@@ -16,9 +16,11 @@ npx esbuild codemirror-entry.js --bundle --format=iife \
 The bundle exposes:
 
 - `DVEditor.create(id, parentElementId, dialect, initialDoc, schema)` —
-  `schema` is a lang-sql `SQLNamespace` object mapping `"table"` (SQLite) or
-  `"schema.table"` (Postgres; literal dots in names escaped as `\.`) to
-  arrays of column names. Postgres views get `defaultSchema: "public"`.
+  `dialect` is `"sqlite"`, `"postgres"`, or `"mssql"` (anything else falls
+  back to SQLite). `schema` is a lang-sql `SQLNamespace` object mapping
+  `"table"` (SQLite) or `"schema.table"` (Postgres/SQL Server; literal dots
+  in names escaped as `\.`) to arrays of column names. Postgres views get
+  `defaultSchema: "public"`; SQL Server gets `defaultSchema: "dbo"`.
 - `DVEditor.updateSchema(id, dialect, schema)` — swaps the completion data
   in place (the sql() extension sits in a Compartment), used after schema
   reloads.

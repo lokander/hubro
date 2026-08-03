@@ -25,18 +25,46 @@ use super::value::QueryResult;
 ///   nested is harmless there)
 /// - a trailing statement without a semicolon
 ///
+/// On SQL Server, `GO` also separates statements. `GO` is a client-side
+/// batch separator (SSMS/sqlcmd), not T-SQL: it only counts when it stands
+/// alone on its own line (leading whitespace allowed), optionally followed
+/// by a repeat count — `GO 5` is treated as a plain separator with the
+/// count ignored (repeating a batch is a scripting-tool feature, not
+/// something a viewer should replay). `GO` inside strings or comments, or
+/// sharing a line with other code, never splits.
+///
 /// Statements that are empty (only whitespace and/or comments) are skipped.
 /// Known limitation: Postgres `E'…'` escape-string backslash quoting is not
 /// understood (`E'\''` misparses); standard SQL doubling (`''`) is fine.
-pub fn split_statements(sql: &str) -> Vec<String> {
+pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<String> {
     let bytes = sql.as_bytes();
     let mut statements = Vec::new();
     let mut start = 0usize;
     // True once the current statement has any non-comment, non-whitespace
     // content — comment-only statements are skipped.
     let mut significant = false;
+    // Where the current line starts, for GO detection: a separator line has
+    // nothing but whitespace before the `GO`. Newlines consumed inside
+    // strings/comments deliberately do not advance this — the stale prefix
+    // then contains non-whitespace, so a `GO` on such a line never splits.
+    let mut line_start = 0usize;
     let mut i = 0usize;
     while i < bytes.len() {
+        if dialect == Dialect::SqlServer
+            && matches!(bytes[i], b'g' | b'G')
+            && bytes[line_start..i].iter().all(u8::is_ascii_whitespace)
+        {
+            if let Some(line_end) = go_line_end(bytes, i) {
+                if significant {
+                    statements.push(sql[start..i].trim().to_string());
+                }
+                start = line_end;
+                line_start = line_end;
+                significant = false;
+                i = line_end;
+                continue;
+            }
+        }
         match bytes[i] {
             quote @ (b'\'' | b'"') => {
                 significant = true;
@@ -87,7 +115,9 @@ pub fn split_statements(sql: &str) -> Vec<String> {
                 i += 1;
             }
             other => {
-                if !other.is_ascii_whitespace() {
+                if other == b'\n' {
+                    line_start = i + 1;
+                } else if !other.is_ascii_whitespace() {
                     significant = true;
                 }
                 i += 1;
@@ -98,6 +128,40 @@ pub fn split_statements(sql: &str) -> Vec<String> {
         statements.push(sql[start..].trim().to_string());
     }
     statements
+}
+
+/// If `bytes[at]` (a `g`/`G` with only whitespace before it on its line)
+/// starts a SQL Server `GO` separator line, returns the index one past that
+/// line (past its newline, or end of input). The line may carry an optional
+/// whitespace-separated repeat count (`GO 5`); anything else after the `GO`
+/// disqualifies it (`GOTO`, `GO;`, trailing code or comments).
+fn go_line_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut j = at + 1;
+    if !matches!(bytes.get(j), Some(b'o' | b'O')) {
+        return None;
+    }
+    j += 1;
+    // Optional repeat count: whitespace, then digits.
+    let mut k = j;
+    while matches!(bytes.get(k), Some(b' ' | b'\t')) {
+        k += 1;
+    }
+    if k > j {
+        while matches!(bytes.get(k), Some(c) if c.is_ascii_digit()) {
+            k += 1;
+        }
+    }
+    j = k;
+    while matches!(bytes.get(j), Some(b' ' | b'\t')) {
+        j += 1;
+    }
+    match bytes.get(j) {
+        None => Some(bytes.len()),
+        Some(b'\n') => Some(j + 1),
+        Some(b'\r') if bytes.get(j + 1) == Some(&b'\n') => Some(j + 2),
+        Some(b'\r') => Some(j + 1),
+        _ => None,
+    }
 }
 
 /// If `bytes[at]` opens a dollar-quote delimiter (`$` + optional
@@ -500,13 +564,17 @@ fn manages_own_transaction(sql: &str) -> bool {
 
 /// Whether a statement can't run (or won't take effect) inside a transaction
 /// block, so the script must run sequentially instead of wrapped. `VACUUM`
-/// applies to both backends; SQLite value-setting `PRAGMA`s are *silently
-/// ignored* in a transaction (worse than erroring — they'd vanish without a
-/// trace); the rest are Postgres statements that error with "cannot run inside
-/// a transaction block".
+/// applies to SQLite and Postgres alike (and doesn't exist elsewhere, so the
+/// unconditional check is harmless); SQLite value-setting `PRAGMA`s are
+/// *silently ignored* in a transaction (worse than erroring — they'd vanish
+/// without a trace); the Postgres set errors with "cannot run inside a
+/// transaction block"; the SQL Server set covers server-level operations
+/// T-SQL refuses inside a user transaction (`CREATE`/`ALTER`/`DROP
+/// DATABASE`, `BACKUP`, `RESTORE`, full-text DDL).
 fn is_non_transactional(dialect: Dialect, sql: &str) -> bool {
     let words = leading_words(sql, 2);
     let first = words.first().map(String::as_str).unwrap_or("");
+    let second = words.get(1).map(String::as_str).unwrap_or("");
     if first == "vacuum" {
         return true;
     }
@@ -521,7 +589,6 @@ fn is_non_transactional(dialect: Dialect, sql: &str) -> bool {
         }
     }
     if dialect == Dialect::Postgres {
-        let second = words.get(1).map(String::as_str).unwrap_or("");
         if matches!(
             (first, second),
             ("create" | "drop", "database")
@@ -534,6 +601,16 @@ fn is_non_transactional(dialect: Dialect, sql: &str) -> bool {
         if has_top_level_word(sql, |word| word.eq_ignore_ascii_case("concurrently")) {
             return true;
         }
+    }
+    if dialect == Dialect::SqlServer
+        && matches!(
+            (first, second),
+            ("create" | "alter" | "drop", "database")
+                | ("create" | "alter" | "drop", "fulltext")
+                | ("backup" | "restore", _)
+        )
+    {
+        return true;
     }
     false
 }
@@ -554,29 +631,36 @@ fn leading_words(sql: &str, n: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// Splitting is dialect-independent except for SQL Server's GO
+    /// handling (exercised separately below); Postgres exercises dollar
+    /// quoting.
+    fn split(sql: &str) -> Vec<String> {
+        split_statements(sql, Dialect::Postgres)
+    }
+
     #[test]
     fn splits_on_semicolons_and_keeps_a_trailing_statement() {
         assert_eq!(
-            split_statements("SELECT 1; SELECT 2 ; SELECT 3"),
+            split("SELECT 1; SELECT 2 ; SELECT 3"),
             ["SELECT 1", "SELECT 2", "SELECT 3"]
         );
     }
 
     #[test]
     fn a_single_statement_needs_no_semicolon() {
-        assert_eq!(split_statements("SELECT 1"), ["SELECT 1"]);
-        assert_eq!(split_statements("  SELECT 1;  "), ["SELECT 1"]);
+        assert_eq!(split("SELECT 1"), ["SELECT 1"]);
+        assert_eq!(split("  SELECT 1;  "), ["SELECT 1"]);
     }
 
     #[test]
     fn semicolons_inside_quotes_do_not_split() {
         assert_eq!(
-            split_statements("SELECT 'a;b'; SELECT \"c;d\""),
+            split("SELECT 'a;b'; SELECT \"c;d\""),
             ["SELECT 'a;b'", "SELECT \"c;d\""]
         );
         // Doubled quotes stay inside the string.
         assert_eq!(
-            split_statements("SELECT 'it''s;fine'; SELECT 2"),
+            split("SELECT 'it''s;fine'; SELECT 2"),
             ["SELECT 'it''s;fine'", "SELECT 2"]
         );
     }
@@ -584,16 +668,16 @@ mod tests {
     #[test]
     fn semicolons_inside_comments_do_not_split() {
         assert_eq!(
-            split_statements("SELECT 1 -- trailing; comment\n; SELECT 2"),
+            split("SELECT 1 -- trailing; comment\n; SELECT 2"),
             ["SELECT 1 -- trailing; comment", "SELECT 2"]
         );
         assert_eq!(
-            split_statements("SELECT /* a;b */ 1; SELECT 2"),
+            split("SELECT /* a;b */ 1; SELECT 2"),
             ["SELECT /* a;b */ 1", "SELECT 2"]
         );
         // Nested block comments (Postgres nests; harmless for SQLite).
         assert_eq!(
-            split_statements("SELECT /* x /* y; */ z; */ 1; SELECT 2"),
+            split("SELECT /* x /* y; */ z; */ 1; SELECT 2"),
             ["SELECT /* x /* y; */ z; */ 1", "SELECT 2"]
         );
     }
@@ -601,48 +685,129 @@ mod tests {
     #[test]
     fn dollar_quoted_bodies_do_not_split() {
         assert_eq!(
-            split_statements("SELECT $$a;b$$; SELECT 2"),
+            split("SELECT $$a;b$$; SELECT 2"),
             ["SELECT $$a;b$$", "SELECT 2"]
         );
         assert_eq!(
-            split_statements("CREATE FUNCTION f() AS $fn$ BEGIN; END; $fn$; SELECT 2"),
+            split("CREATE FUNCTION f() AS $fn$ BEGIN; END; $fn$; SELECT 2"),
             ["CREATE FUNCTION f() AS $fn$ BEGIN; END; $fn$", "SELECT 2"]
         );
         // A different tag inside the body does not close the quote.
         assert_eq!(
-            split_statements("SELECT $a$ x $b$ ; $a$; SELECT 2"),
+            split("SELECT $a$ x $b$ ; $a$; SELECT 2"),
             ["SELECT $a$ x $b$ ; $a$", "SELECT 2"]
         );
         // $1 is a parameter, not a delimiter.
         assert_eq!(
-            split_statements("SELECT $1; SELECT $2"),
+            split("SELECT $1; SELECT $2"),
             ["SELECT $1", "SELECT $2"]
         );
     }
 
     #[test]
     fn unterminated_quotes_swallow_the_rest() {
-        assert_eq!(split_statements("SELECT 'a; b"), ["SELECT 'a; b"]);
-        assert_eq!(split_statements("SELECT $$a; b"), ["SELECT $$a; b"]);
+        assert_eq!(split("SELECT 'a; b"), ["SELECT 'a; b"]);
+        assert_eq!(split("SELECT $$a; b"), ["SELECT $$a; b"]);
     }
 
     #[test]
     fn empty_and_comment_only_statements_are_skipped() {
-        assert_eq!(split_statements(""), Vec::<String>::new());
-        assert_eq!(split_statements(" ;  ; ;"), Vec::<String>::new());
+        assert_eq!(split(""), Vec::<String>::new());
+        assert_eq!(split(" ;  ; ;"), Vec::<String>::new());
         assert_eq!(
-            split_statements("-- just a comment\n; /* and another */;"),
+            split("-- just a comment\n; /* and another */;"),
             Vec::<String>::new()
         );
-        assert_eq!(split_statements(";;SELECT 1;; -- done\n;"), ["SELECT 1"]);
+        assert_eq!(split(";;SELECT 1;; -- done\n;"), ["SELECT 1"]);
     }
 
     #[test]
     fn multibyte_content_splits_cleanly() {
         assert_eq!(
-            split_statements("SELECT 'смузи;ярлык'; SELECT 'ünïcödé'"),
+            split("SELECT 'смузи;ярлык'; SELECT 'ünïcödé'"),
             ["SELECT 'смузи;ярлык'", "SELECT 'ünïcödé'"]
         );
+    }
+
+    fn split_mssql(sql: &str) -> Vec<String> {
+        split_statements(sql, Dialect::SqlServer)
+    }
+
+    #[test]
+    fn go_lines_split_batches_on_sqlserver() {
+        assert_eq!(
+            split_mssql("SELECT 1\nGO\nSELECT 2"),
+            ["SELECT 1", "SELECT 2"]
+        );
+        // Mixed case and surrounding whitespace are fine.
+        assert_eq!(
+            split_mssql("SELECT 1\n  go  \nSELECT 2"),
+            ["SELECT 1", "SELECT 2"]
+        );
+        // Windows line endings.
+        assert_eq!(
+            split_mssql("SELECT 1\r\nGO\r\nSELECT 2"),
+            ["SELECT 1", "SELECT 2"]
+        );
+        // A trailing GO leaves no empty statement behind.
+        assert_eq!(split_mssql("SELECT 1\nGO"), ["SELECT 1"]);
+        assert_eq!(split_mssql("SELECT 1\nGO\n"), ["SELECT 1"]);
+        // GO after a semicolon-terminated statement adds nothing.
+        assert_eq!(split_mssql("SELECT 1;\nGO\nSELECT 2"), ["SELECT 1", "SELECT 2"]);
+        // Consecutive GO lines produce no empty statements.
+        assert_eq!(split_mssql("GO\nGO\nSELECT 1\nGO\nGO"), ["SELECT 1"]);
+    }
+
+    #[test]
+    fn go_with_a_repeat_count_is_a_plain_separator() {
+        // `GO 5` (run the batch five times in sqlcmd/SSMS) is treated as a
+        // plain separator; the count is deliberately ignored.
+        assert_eq!(
+            split_mssql("SELECT 1\nGO 5\nSELECT 2"),
+            ["SELECT 1", "SELECT 2"]
+        );
+        assert_eq!(split_mssql("SELECT 1\ngo 12  "), ["SELECT 1"]);
+    }
+
+    #[test]
+    fn go_not_alone_on_its_line_does_not_split() {
+        // Inside a string literal (even across lines).
+        assert_eq!(
+            split_mssql("SELECT 'a\nGO\nb'"),
+            ["SELECT 'a\nGO\nb'"]
+        );
+        assert_eq!(split_mssql("SELECT 'GO'"), ["SELECT 'GO'"]);
+        // Inside comments.
+        assert_eq!(
+            split_mssql("SELECT 1 -- GO\n+ 2"),
+            ["SELECT 1 -- GO\n+ 2"]
+        );
+        assert_eq!(
+            split_mssql("SELECT 1 /*\nGO\n*/ + 2"),
+            ["SELECT 1 /*\nGO\n*/ + 2"]
+        );
+        // Sharing a line with other code (GO is not a T-SQL keyword).
+        assert_eq!(split_mssql("SELECT 1 GO"), ["SELECT 1 GO"]);
+        // Identifiers that merely start with GO.
+        assert_eq!(split_mssql("SELECT 1\nGOTO x"), ["SELECT 1\nGOTO x"]);
+        assert_eq!(split_mssql("GO2 x"), ["GO2 x"]);
+        // A GO line right after a multi-line string still splits: the code
+        // newline after the closing quote resets line tracking.
+        assert_eq!(
+            split_mssql("SELECT 'a\nb'\nGO\nSELECT 2"),
+            ["SELECT 'a\nb'", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn go_lines_do_not_split_on_other_dialects() {
+        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+            assert_eq!(
+                split_statements("SELECT 1\nGO\nSELECT 2", dialect),
+                ["SELECT 1\nGO\nSELECT 2"],
+                "{dialect:?}"
+            );
+        }
     }
 
     #[test]
@@ -774,7 +939,7 @@ mod tests {
 
     #[test]
     fn multi_statement_scripts_wrap_atomically_by_default() {
-        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+        for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
             assert!(wrap_atomically(
                 dialect,
                 &stmts(&["INSERT INTO t VALUES (1)", "UPDATE t SET a = 2"])
@@ -790,19 +955,14 @@ mod tests {
     #[test]
     fn single_statement_scripts_do_not_wrap() {
         // One statement is already atomic under autocommit — nothing to wrap.
-        assert!(!wrap_atomically(
-            Dialect::Sqlite,
-            &stmts(&["DELETE FROM t"])
-        ));
-        assert!(!wrap_atomically(
-            Dialect::Postgres,
-            &stmts(&["DELETE FROM t"])
-        ));
+        for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
+            assert!(!wrap_atomically(dialect, &stmts(&["DELETE FROM t"])));
+        }
     }
 
     #[test]
     fn scripts_managing_their_own_transaction_do_not_wrap() {
-        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+        for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
             for script in [
                 vec!["BEGIN", "INSERT INTO t VALUES (1)", "COMMIT"],
                 vec!["begin transaction", "UPDATE t SET a = 1", "commit"],
@@ -819,8 +979,9 @@ mod tests {
 
     #[test]
     fn non_transactional_statements_prevent_wrapping() {
-        // VACUUM can't run inside a transaction on either backend.
-        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+        // VACUUM can't run inside a transaction on SQLite or Postgres (and
+        // doesn't exist on SQL Server, where declining to wrap is harmless).
+        for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
             assert!(!wrap_atomically(
                 dialect,
                 &stmts(&["DELETE FROM t", "VACUUM"])
@@ -850,6 +1011,55 @@ mod tests {
                 "UPDATE t SET a = 1",
             ])
         ));
+    }
+
+    #[test]
+    fn sqlserver_non_transactional_statements_prevent_wrapping() {
+        // T-SQL server-level operations that refuse to run inside a user
+        // transaction.
+        for script in [
+            vec!["SELECT 1", "CREATE DATABASE other"],
+            vec!["SELECT 1", "ALTER DATABASE other SET RECOVERY SIMPLE"],
+            vec!["SELECT 1", "DROP DATABASE other"],
+            vec!["SELECT 1", "BACKUP DATABASE db TO DISK = 'x.bak'"],
+            vec!["SELECT 1", "RESTORE DATABASE db FROM DISK = 'x.bak'"],
+            vec!["SELECT 1", "backup log db to disk = 'x.trn'"],
+            vec!["CREATE TABLE t (a int)", "CREATE FULLTEXT INDEX ON t (a) KEY INDEX pk"],
+        ] {
+            assert!(
+                !wrap_atomically(Dialect::SqlServer, &stmts(&script)),
+                "{script:?} can't run in a transaction on SQL Server"
+            );
+        }
+        // The same statements don't decline wrapping for the wrong dialect
+        // reasons on SQL Server: ordinary DDL/DML still wraps.
+        assert!(wrap_atomically(
+            Dialect::SqlServer,
+            &stmts(&["CREATE TABLE t (a int)", "INSERT INTO t VALUES (1)"])
+        ));
+        // Keywords inside strings must not trip the check.
+        assert!(wrap_atomically(
+            Dialect::SqlServer,
+            &stmts(&[
+                "INSERT INTO t VALUES ('backup this later')",
+                "UPDATE t SET a = 1",
+            ])
+        ));
+        // Postgres-only exclusions don't leak into SQL Server scripts
+        // (CONCURRENTLY is not a T-SQL concept).
+        assert!(wrap_atomically(
+            Dialect::SqlServer,
+            &stmts(&["SELECT 1", "DROP INDEX CONCURRENTLY i"])
+        ));
+        // And the SQL Server set doesn't leak into SQLite/Postgres. (CREATE
+        // DATABASE is already non-transactional on Postgres; BACKUP is the
+        // discriminating case.)
+        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+            assert!(wrap_atomically(
+                dialect,
+                &stmts(&["SELECT 1", "BACKUP DATABASE db TO DISK = 'x.bak'"])
+            ));
+        }
     }
 
     #[test]
