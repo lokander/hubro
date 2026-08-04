@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`dataview` is a **desktop-only database viewer** (SQLite and Postgres, via sqlx) built with Dioxus 0.7 (Rust). Do not add web or mobile platform support. Work is tracked in the Linear project "dataview" (team FRE).
+`dataview` is a **desktop-only database viewer** (SQLite and Postgres via sqlx, SQL Server via tiberius) built with Dioxus 0.7 (Rust). Do not add web or mobile platform support. Work is tracked in the Linear project "dataview" (team FRE).
 
 ## Commands
 
@@ -16,7 +16,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - `cargo test` — run all tests: unit tests live in `#[cfg(test)]` modules next to the code, integration tests in `tests/`. Test fixture files go in `tests/fixtures/`. Run a single test with `cargo test <name>`.
 - Don't run `cargo test` and `dx build`/`cargo build` concurrently — they contend on the `target/` lock (spurious signal/exit 144); run them sequentially.
-- Postgres integration tests skip unless `DATAVIEW_PG_TEST_URL` is set; SSH-tunnel tests need `DATAVIEW_SSH_TEST` (+ `DATAVIEW_SSH_TEST_KEY`/`_ENC_KEY`). Point them at the Docker `dataview-pg-test` (host port 5433) / `dataview-ssh-test` (2222) containers.
+- Postgres integration tests skip unless `DATAVIEW_PG_TEST_URL` is set; SQL Server tests skip unless `DATAVIEW_MSSQL_TEST_URL` is set; SSH-tunnel tests need `DATAVIEW_SSH_TEST` (+ `DATAVIEW_SSH_TEST_KEY`/`_ENC_KEY`). Point them at the Docker `dataview-pg-test` (host port 5433) / `dataview-mssql-test` (14333) / `dataview-ssh-test` (2222) containers; the exact `docker run` commands live in the test-file headers (`tests/db_postgres.rs`, `tests/db_sqlserver.rs`, `tests/tunnel.rs`).
 
 The crate is split into a library (`src/lib.rs`, holds app modules) and a thin binary (`src/main.rs`) so integration tests can import app code as `dataview::...`.
 
