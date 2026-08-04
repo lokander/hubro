@@ -15,16 +15,24 @@ env:
 
 jobs:
   check:
-    name: fmt, clippy, test
-    runs-on: ubuntu-latest
+    name: fmt, clippy, test (${{ matrix.os }})
+    # One leg per supported desktop OS; keep the others running when one
+    # fails so platform-specific breakage is diagnosed in a single run.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       # System libraries the Dioxus desktop build (wry/WebKitGTK), the tray
       # icon, and the native file dialog link against. The committed
       # assets/tailwind.css and assets/codemirror.js mean no Node/Tailwind
-      # toolchain is needed — a plain `cargo` build suffices.
+      # toolchain is needed — a plain `cargo` build suffices. macOS
+      # (WKWebView) and Windows (WebView2) need no extra system packages.
       - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -45,7 +53,9 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
+      # Formatting is platform-independent — checking it once is enough.
       - name: Formatting
+        if: runner.os == 'Linux'
         run: cargo fmt --all --check
 
       # Run from the repo root so clippy.toml (the await-holding-invalid-types
