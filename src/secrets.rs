@@ -143,7 +143,8 @@ mod tests {
     /// Credential Manager on Windows, Secret Service on Linux). Must run
     /// alone — `cargo test real_store_round_trip -- --ignored` — so no other
     /// test installs the process-wide mock builder first; under
-    /// `--include-ignored` it would silently exercise the mock instead.
+    /// `--include-ignored`, test ordering decides whether this silently
+    /// exercises the mock or the real store.
     #[test]
     #[ignore = "touches the real OS credential store; run alone, manually"]
     fn real_store_round_trip() {
