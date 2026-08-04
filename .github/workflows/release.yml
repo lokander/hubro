@@ -73,6 +73,57 @@ jobs:
           name: linux-bundles
           path: artifacts/*
 
+  macos:
+    name: Bundle macOS (dmg)
+    # Apple Silicon runner → arm64-only dmg (no Intel build). Unsigned per
+    # FRE-48: no Developer ID, so Gatekeeper needs right-click → Open on
+    # first launch (documented in the README and release notes).
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@v1.10.19
+
+      - name: Install Dioxus CLI
+        run: cargo binstall -y dioxus-cli@${{ env.DX_VERSION }}
+
+      # `macos` produces the .app the dmg wraps; the .dmg is the artifact we
+      # ship (an .app is a directory, so it can't be a release asset as-is).
+      - name: Bundle
+        run: dx bundle --release --package-types macos --package-types dmg --out-dir dist
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts
+          find dist -type f -name '*.dmg' -exec cp {} artifacts/ \;
+          ls -la artifacts
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-bundles
+          path: artifacts/*
+
+  # Single fan-in publish: two jobs creating the same release concurrently
+  # race in softprops/action-gh-release, so only this job touches the release.
+  publish:
+    name: Publish release
+    needs: [linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:

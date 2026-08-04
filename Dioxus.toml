@@ -22,3 +22,9 @@ icon = [
 
 [bundle.deb]
 depends = ["libwebkit2gtk-4.1-0", "libgtk-3-0"]
+
+# Release dmgs are built on Apple Silicon runners (arm64-only, no Intel
+# build), and every arm64 Mac runs macOS 11+. Unsigned: no Developer ID, so
+# first launch needs right-click → Open (documented in the README).
+[bundle.macos]
+minimum_system_version = "11.0"
