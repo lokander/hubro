@@ -3,7 +3,7 @@
 //!
 //! ```sh
 //! docker run -d --name dataview-mssql-test -e ACCEPT_EULA=Y \
-//!   -e "MSSQL_SA_PASSWORD=Str0ng!Passw0rd" -p 14333:1433 \
+//!   -e 'MSSQL_SA_PASSWORD=Str0ng!Passw0rd' -p 14333:1433 \
 //!   mcr.microsoft.com/mssql/server:2022-latest
 //! DATAVIEW_MSSQL_TEST_URL='mssql://sa:Str0ng!Passw0rd@localhost:14333/master?encrypt=on&trustServerCertificate=true' \
 //!   cargo test --test db_sqlserver
@@ -32,19 +32,50 @@ fn test_url() -> Option<String> {
     }
 }
 
+/// Whether an error is SQL Server picking this session as a deadlock victim
+/// (error 1205). Under cargo's parallel test execution, sibling tests' DDL and
+/// catalog reads occasionally deadlock; the server explicitly says "rerun the
+/// transaction", so [`run_all`] and [`introspect_table`] retry these a few
+/// times. Detection is on the 1205 message text and nothing else, so any real
+/// failure still fails fast.
+fn is_deadlock_victim(err: &DbError) -> bool {
+    err.to_string().contains("deadlock victim")
+}
+
+/// Bounded retry for the transient deadlocks above: up to three re-attempts
+/// with a short growing backoff.
+async fn retry_deadlocks<T, F, Fut>(mut op: F) -> Result<T, DbError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, DbError>>,
+{
+    let mut attempt = 0u32;
+    loop {
+        match op().await {
+            Err(e) if is_deadlock_victim(&e) && attempt < 3 => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50 * u64::from(attempt))).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Runs each statement on its own (CREATE VIEW must be alone in its batch, so
-/// fixtures are built statement by statement, like the Postgres suite does).
+/// fixtures are built statement by statement, like the Postgres suite does),
+/// retrying deadlock-victim kills. Fixture DDL and drops route through here.
 async fn run_all(pool: &DbPool, statements: &[&str]) {
     for sql in statements {
-        pool.query(sql)
+        retry_deadlocks(|| pool.query(sql))
             .await
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }
 
-/// The introspected metadata for one `dbo` table.
+/// The introspected metadata for one `dbo` table, retrying deadlock-victim
+/// kills (the catalog joins can deadlock with sibling tests' DDL).
 async fn introspect_table(pool: &DbPool, name: &str) -> TableMeta {
-    let tables = pool.introspect().await.unwrap();
+    let tables = retry_deadlocks(|| pool.introspect()).await.unwrap();
     tables
         .iter()
         .find(|t| t.schema.as_deref() == Some("dbo") && t.name == name)
@@ -157,7 +188,7 @@ async fn sqlserver_introspection_covers_identity_computed_rowversion_and_default
         })
     );
 
-    pool.query("DROP TABLE dbo.intro_widgets").await.unwrap();
+    run_all(&pool, &["DROP TABLE dbo.intro_widgets"]).await;
     pool.close().await;
 }
 
@@ -345,7 +376,7 @@ async fn sqlserver_paging_sorting_filtering_and_values_work() {
     assert_eq!(with_nulls.rows[0][2], Value::Null);
     assert_eq!(with_nulls.rows[0][3], Value::Null);
 
-    pool.query("DROP TABLE dbo.fruits_page").await.unwrap();
+    run_all(&pool, &["DROP TABLE dbo.fruits_page"]).await;
     pool.close().await;
 }
 
@@ -435,7 +466,7 @@ async fn sqlserver_rich_types_render_correctly() {
     );
     assert_eq!(*col("x"), Value::Text("<a>1</a>".into()));
 
-    pool.query("DROP TABLE dbo.rich_types_probe").await.unwrap();
+    run_all(&pool, &["DROP TABLE dbo.rich_types_probe"]).await;
     pool.close().await;
 }
 
@@ -519,7 +550,7 @@ async fn sqlserver_staged_edits_round_trip_and_identity_stays_server_assigned() 
         ]
     );
 
-    pool.query("DROP TABLE dbo.staged_items").await.unwrap();
+    run_all(&pool, &["DROP TABLE dbo.staged_items"]).await;
     pool.close().await;
 }
 
@@ -577,7 +608,7 @@ async fn sqlserver_staged_row_count_mismatch_rolls_the_batch_back() {
         .unwrap();
     assert_eq!(result.rows[0][0], Value::Text("first".into()));
 
-    pool.query("DROP TABLE dbo.staged_guard").await.unwrap();
+    run_all(&pool, &["DROP TABLE dbo.staged_guard"]).await;
     pool.close().await;
 }
 
@@ -585,9 +616,7 @@ async fn sqlserver_staged_row_count_mismatch_rolls_the_batch_back() {
 async fn sqlserver_script_go_batches_split_and_execute() {
     let Some(url) = test_url() else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
-    pool.query("DROP TABLE IF EXISTS dbo.script_go_probe")
-        .await
-        .unwrap();
+    run_all(&pool, &["DROP TABLE IF EXISTS dbo.script_go_probe"]).await;
 
     // GO is the SSMS/sqlcmd batch separator, not T-SQL — the splitter treats
     // each batch as one statement on the SqlServer dialect.
@@ -623,7 +652,7 @@ async fn sqlserver_script_go_batches_split_and_execute() {
         .unwrap();
     assert_eq!(count.rows[0][0], Value::Integer(1));
 
-    pool.query("DROP TABLE dbo.script_go_probe").await.unwrap();
+    run_all(&pool, &["DROP TABLE dbo.script_go_probe"]).await;
     pool.close().await;
 }
 
@@ -631,9 +660,7 @@ async fn sqlserver_script_go_batches_split_and_execute() {
 async fn sqlserver_script_errors_roll_the_whole_script_back() {
     let Some(url) = test_url() else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
-    pool.query("DROP TABLE IF EXISTS dbo.script_rb_probe")
-        .await
-        .unwrap();
+    run_all(&pool, &["DROP TABLE IF EXISTS dbo.script_rb_probe"]).await;
 
     // The third batch violates the PK; the whole script — the CREATE TABLE
     // included — must roll back.
@@ -774,7 +801,7 @@ async fn sqlserver_export_streams_csv_and_json() {
         .unwrap();
     assert_eq!(String::from_utf8(json).unwrap(), "[]\n");
 
-    pool.query("DROP TABLE dbo.export_rows").await.unwrap();
+    run_all(&pool, &["DROP TABLE dbo.export_rows"]).await;
     pool.close().await;
 }
 
@@ -857,7 +884,7 @@ async fn sqlserver_bounded_page_previews_large_text_and_binary() {
         panic!("expected full blob");
     }
 
-    pool.query("DROP TABLE dbo.bounded_docs").await.unwrap();
+    run_all(&pool, &["DROP TABLE dbo.bounded_docs"]).await;
     pool.close().await;
 }
 
@@ -913,6 +940,6 @@ async fn sqlserver_sql_variant_cells_browse_and_fetch_safely() {
     assert_eq!(cell.full_len, 2);
     assert!(!cell.capped);
 
-    pool.query("DROP TABLE dbo.variant_probe").await.unwrap();
+    run_all(&pool, &["DROP TABLE dbo.variant_probe"]).await;
     pool.close().await;
 }
