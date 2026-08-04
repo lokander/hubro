@@ -50,14 +50,14 @@ The app is a native Cocoa bundle — there is no display server to nest, so **sy
 
 ```bash
 dx build    # bundle: target/dx/dataview/debug/macos/Dataview.app
-target/dx/dataview/debug/macos/Dataview.app/Contents/MacOS/Dataview &     # launch (foreground binary, easy to kill)
+open target/dx/dataview/debug/macos/Dataview.app    # must go via LaunchServices — see the blank-webview gotcha; quit with pkill -x Dataview
 GetWindowID Dataview --list     # titles list as "(null)" — pick the id with the main window's size
 screencapture -x -l <id> shot.png                                         # crisp per-window capture, works unfocused
 osascript -e 'tell app "System Events" to tell (first process whose unix id is '$(pgrep -x Dataview)') to get {position, size} of window 1'
 POS=$(cliclick p | tr -d ' '); cliclick c:X,Y; cliclick "m:$POS"          # click, then restore the cursor
 ```
 
-Gotchas: click targets are **window position + logical (point) coordinates** from the osascript line — don't derive them from screenshot pixels, which are 2x Retina and include shadow margins. The first click on an unfocused window only focuses it (the webview doesn't accept click-through) — click twice or activate the app first. Keystrokes go via System Events (`keystroke`/`key code`) to the focused window. The window-close guard is testable directly: macOS has a real window manager, so the red button or Cmd+W delivers `CloseRequested` — no synthetic-event helper needed.
+Gotchas: on current macOS the webview stays **blank when the binary is exec'd directly** from a terminal (the window opens but WKWebView never paints) — launch through LaunchServices instead (`open path/to/Dataview.app`, then `pkill -x dataview` to quit; note the release bundle's process name is lowercase `dataview`, the debug bundle's is `Dataview`). Click targets are **window position + logical (point) coordinates** from the osascript line — don't derive them from screenshot pixels, which are 2x Retina and include shadow margins. The first click on an unfocused window only focuses it (the webview doesn't accept click-through) — click twice or activate the app first. Keystrokes go via System Events (`keystroke`/`key code`) to the focused window. The window-close guard is testable directly: macOS has a real window manager, so the red button or Cmd+W delivers `CloseRequested` — no synthetic-event helper needed.
 
 ## Issue workflow
 
