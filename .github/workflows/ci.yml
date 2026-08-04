@@ -50,8 +50,12 @@ jobs:
           components: rustfmt, clippy
 
       # Caches ~/.cargo and ./target keyed on the lockfile + toolchain.
+      # cache-on-failure: a leg that fails mid-compile (slow on Windows)
+      # still saves its dependency builds so the retry starts warm.
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       # Formatting is platform-independent — checking it once is enough.
       - name: Formatting
