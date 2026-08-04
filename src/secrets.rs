@@ -1,5 +1,6 @@
-//! OS-keyring storage for connection passwords (Secret Service / KWallet on
-//! Linux via the `keyring` crate).
+//! OS-keyring storage for connection passwords via the `keyring` crate
+//! (Secret Service / KWallet on Linux, Keychain on macOS, Credential
+//! Manager on Windows — see the target-specific sections in Cargo.toml).
 //!
 //! The config file never holds a password — only the connection URL, which
 //! doubles as the keyring account name under the `dataview` service. When no
@@ -136,6 +137,27 @@ mod tests {
         assert_eq!(get_password(url).unwrap(), None);
         // Deleting again is fine.
         delete_password(url).unwrap();
+    }
+
+    /// Round-trip against the real OS credential store (Keychain on macOS,
+    /// Credential Manager on Windows, Secret Service on Linux). Must run
+    /// alone — `cargo test real_store_round_trip -- --ignored` — so no other
+    /// test installs the process-wide mock builder first; under
+    /// `--include-ignored` it would silently exercise the mock instead.
+    #[test]
+    #[ignore = "touches the real OS credential store; run alone, manually"]
+    fn real_store_round_trip() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        std::env::remove_var("DATAVIEW_DISABLE_KEYRING");
+        let url = "postgres://dataview-test@localhost:5432/fre45-real-store";
+        delete_password(url).unwrap();
+        assert_eq!(get_password(url).unwrap(), None);
+        store_password(url, "s3cret-real").unwrap();
+        assert_eq!(get_password(url).unwrap(), Some("s3cret-real".to_string()));
+        store_password(url, "changed-real").unwrap();
+        assert_eq!(get_password(url).unwrap(), Some("changed-real".to_string()));
+        delete_password(url).unwrap();
+        assert_eq!(get_password(url).unwrap(), None);
     }
 
     #[test]
