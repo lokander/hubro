@@ -63,8 +63,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      # Builds every target and runs the fast suite. The Postgres/SSH
-      # integration tests skip when their env vars are unset (no server in
-      # CI); the large-fixture perf tests are `#[ignore]`d.
+      # Builds every target and runs the fast suite. The Postgres, SQL
+      # Server, and SSH integration tests skip when their env vars are unset
+      # (no server in CI); the large-fixture perf tests are `#[ignore]`d.
       - name: Test
         run: cargo test --all-targets
