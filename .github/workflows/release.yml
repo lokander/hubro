@@ -6,9 +6,10 @@ on:
     tags:
       - "v*"
 
-# Needed for softprops/action-gh-release to create the release and upload assets.
+# Default to read-only; only the publish job gets the write scope
+# softprops/action-gh-release needs to create the release and upload assets.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -72,12 +73,13 @@ jobs:
         with:
           name: linux-bundles
           path: artifacts/*
+          if-no-files-found: error
 
   macos:
     name: Bundle macOS (dmg)
     # Apple Silicon runner → arm64-only dmg (no Intel build). Unsigned per
-    # FRE-48: no Developer ID, so Gatekeeper needs right-click → Open on
-    # first launch (documented in the README and release notes).
+    # FRE-48: no Developer ID, so Gatekeeper blocks the first launch (the
+    # README documents the xattr / Open Anyway workaround).
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -110,6 +112,7 @@ jobs:
         with:
           name: macos-bundles
           path: artifacts/*
+          if-no-files-found: error
 
   # Single fan-in publish: two jobs creating the same release concurrently
   # race in softprops/action-gh-release, so only this job touches the release.
@@ -117,6 +120,8 @@ jobs:
     name: Publish release
     needs: [linux, macos]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Download build artifacts
         uses: actions/download-artifact@v4

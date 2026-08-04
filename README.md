@@ -63,10 +63,15 @@ is self-contained and runs on most distributions; the `.deb` targets
 Debian/Ubuntu and depends on `libwebkit2gtk-4.1-0` and `libgtk-3-0`.
 
 The macOS build is **unsigned** (no Apple Developer ID yet), so Gatekeeper
-blocks the first launch with "cannot be opened". Right-click the app →
-**Open** → Open to run it anyway (or clear the quarantine flag with
-`xattr -dr com.apple.quarantine /Applications/Dataview.app`). This is only
-needed once.
+blocks the first launch. Clear the quarantine flag and it starts normally:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Dataview.app
+```
+
+Alternatively, after the blocked first launch, approve the app under System
+Settings → Privacy & Security → **Open Anyway** (on macOS 14 and earlier,
+right-click → Open also works). Either way this is only needed once.
 
 Releases are cut by pushing a version tag. The
 [`release` workflow](.github/workflows/release.yml) then bundles the app with
