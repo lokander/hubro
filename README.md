@@ -1,13 +1,13 @@
 # dataview
 
-A desktop **database viewer for SQLite and Postgres**, built with
+A desktop **database viewer for SQLite, Postgres, and SQL Server**, built with
 [Dioxus 0.7](https://dioxuslabs.com/learn/0.7) (Rust). Developed for Linux
 (credentials use the Secret Service keyring; releases ship as `.deb`/AppImage).
 
 ## Features
 
-- **Connect** to SQLite files and Postgres servers (connection form or URL),
-  with the OS keyring remembering passwords.
+- **Connect** to SQLite files and Postgres or SQL Server servers (connection
+  form or URL), with the OS keyring remembering passwords.
 - **Browse** schemas — tables, views, Postgres materialized views, columns,
   indexes, and foreign keys — in an expandable sidebar.
 - **Data grid** with sorting, filtering, and paging that stays fast on huge
@@ -21,9 +21,9 @@ A desktop **database viewer for SQLite and Postgres**, built with
 - **Export** query and table results to CSV or JSON (streamed).
 - **Foreign-key navigation**, keyboard shortcuts (with a cheatsheet),
   dark/light theme, and window/session restore.
-- **Secure Postgres access** — SSH tunnels (agent or key file) with host-key
-  verification, and Microsoft Entra ID sign-in for Azure Postgres (interactive
-  browser or managed identity).
+- **Secure remote access** — SSH tunnels (agent or key file) with host-key
+  verification for Postgres and SQL Server, and Microsoft Entra ID sign-in for
+  Azure Postgres and Azure SQL (interactive browser or managed identity).
 
 ## Development
 
