@@ -25,6 +25,14 @@ use super::value::QueryResult;
 ///   nested is harmless there)
 /// - a trailing statement without a semicolon
 ///
+/// On SQL Server, `[bracketed identifiers]` are lexed too: everything up to
+/// the closing `]` is identifier text (`]]` is an escaped `]`), so `[a;b]`
+/// or `[a--b]` never split or start comments. SQLite also accepts
+/// `[brackets]` as a compat quirk, but this splitter has never lexed them
+/// there and identifiers with `;`/`--` inside are vanishingly rare outside
+/// T-SQL scripts — bracket lexing is deliberately SQL Server-only, keeping
+/// SQLite/Postgres splitting unchanged.
+///
 /// On SQL Server, `GO` also separates statements. `GO` is a client-side
 /// batch separator (SSMS/sqlcmd), not T-SQL: it only counts when it stands
 /// alone on its own line (leading whitespace allowed), optionally followed
@@ -73,6 +81,29 @@ pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<String> {
                     i += 1;
                 }
                 i += 1; // past the closing quote (or end of input)
+            }
+            b'[' if dialect == Dialect::SqlServer => {
+                // T-SQL bracketed identifier: `;`, `--`, `/*`, quotes, and
+                // GO-like lines inside are plain identifier text. `]]` is an
+                // escaped `]`; a single `]` closes. Unterminated at EOF, the
+                // rest is the identifier (like an unterminated string).
+                // Newlines consumed here don't advance `line_start`, so a GO
+                // on a line inside an open bracket never splits (same as
+                // strings/comments).
+                significant = true;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b']' {
+                        if bytes.get(i + 1) == Some(&b']') {
+                            i += 2; // escaped ]] stays inside
+                        } else {
+                            i += 1; // past the closing bracket
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
             }
             b'-' if bytes.get(i + 1) == Some(&b'-') => {
                 while i < bytes.len() && bytes[i] != b'\n' {
@@ -791,6 +822,100 @@ mod tests {
             split_mssql("SELECT 'a\nb'\nGO\nSELECT 2"),
             ["SELECT 'a\nb'", "SELECT 2"]
         );
+    }
+
+    #[test]
+    fn bracketed_identifiers_do_not_split_on_sqlserver() {
+        // A `;` inside brackets is identifier text, not a separator.
+        assert_eq!(
+            split_mssql("SELECT [a;b] FROM t; SELECT 2"),
+            ["SELECT [a;b] FROM t", "SELECT 2"]
+        );
+        // `--` and `/*` inside brackets start no comment: the `;` after the
+        // identifier still splits instead of being swallowed to end of line.
+        assert_eq!(
+            split_mssql("SELECT [a--b]; SELECT 2"),
+            ["SELECT [a--b]", "SELECT 2"]
+        );
+        assert_eq!(
+            split_mssql("SELECT [a/*b]; SELECT 2"),
+            ["SELECT [a/*b]", "SELECT 2"]
+        );
+        // Quotes inside brackets are plain characters.
+        assert_eq!(
+            split_mssql("SELECT [a'b]; SELECT 2"),
+            ["SELECT [a'b]", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn doubled_closing_brackets_stay_inside_the_identifier() {
+        // `]]` is an escaped `]`: the identifier is `a]b`, and the `;` after
+        // the real closing bracket still splits.
+        assert_eq!(
+            split_mssql("SELECT [a]]b]; SELECT 2"),
+            ["SELECT [a]]b]", "SELECT 2"]
+        );
+        assert_eq!(
+            split_mssql("SELECT [a]];b]; SELECT 2"),
+            ["SELECT [a]];b]", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn go_inside_brackets_does_not_split() {
+        assert_eq!(split_mssql("SELECT [a\nGO\nb]"), ["SELECT [a\nGO\nb]"]);
+        // A GO line right after a multi-line bracketed identifier still
+        // splits: the code newline after the `]` resets line tracking.
+        assert_eq!(
+            split_mssql("SELECT [a\nb]\nGO\nSELECT 2"),
+            ["SELECT [a\nb]", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn brackets_inside_strings_and_comments_do_not_open_bracket_mode() {
+        // A '[' in a string is literal text — the following `;` still splits.
+        assert_eq!(
+            split_mssql("SELECT '['; SELECT 2"),
+            ["SELECT '['", "SELECT 2"]
+        );
+        assert_eq!(
+            split_mssql("SELECT \"[\"; SELECT 2"),
+            ["SELECT \"[\"", "SELECT 2"]
+        );
+        // Likewise inside line and block comments.
+        assert_eq!(
+            split_mssql("SELECT 1 -- [\n; SELECT 2"),
+            ["SELECT 1 -- [", "SELECT 2"]
+        );
+        assert_eq!(
+            split_mssql("SELECT 1 /* [ */; SELECT 2"),
+            ["SELECT 1 /* [ */", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn unterminated_brackets_swallow_the_rest() {
+        // Same graceful degradation as an unterminated string: the remainder
+        // is one statement.
+        assert_eq!(split_mssql("SELECT [a; b"), ["SELECT [a; b"]);
+        assert_eq!(split_mssql("SELECT [a]]; b"), ["SELECT [a]]; b"]);
+        assert_eq!(split_mssql("SELECT [a\nGO\nb"), ["SELECT [a\nGO\nb"]);
+    }
+
+    #[test]
+    fn brackets_stay_inert_on_other_dialects() {
+        // Bracket lexing is deliberately SQL Server-only: SQLite accepts
+        // [brackets] as a compat quirk but this splitter never lexed them
+        // there, and that behavior is unchanged — a `;` inside still splits.
+        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+            assert_eq!(
+                split_statements("SELECT [a;b] FROM t", dialect),
+                ["SELECT [a", "b] FROM t"],
+                "{dialect:?}"
+            );
+        }
     }
 
     #[test]
