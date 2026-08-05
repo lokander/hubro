@@ -765,14 +765,12 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::windows::named_pipe::ServerOptions;
 
-        let mock_server = match ServerOptions::new()
+        // When creation fails, the real agent service owns the name — the
+        // test then runs against the real agent instead of the mock.
+        let mock_server = ServerOptions::new()
             .first_pipe_instance(true)
             .create(WINDOWS_AGENT_PIPE)
-        {
-            Ok(server) => Some(server),
-            // The real agent service owns the name — test against it instead.
-            Err(_) => None,
-        };
+            .ok();
 
         let server_task = mock_server.map(|mut server| {
             tokio::spawn(async move {
@@ -782,7 +780,10 @@ mod tests {
                 server.read_exact(&mut request).await.unwrap();
                 assert_eq!(request, [0, 0, 0, 1, 11]);
                 // SSH_AGENT_IDENTITIES_ANSWER: len=5, byte 12, nkeys=0.
-                server.write_all(&[0, 0, 0, 5, 12, 0, 0, 0, 0]).await.unwrap();
+                server
+                    .write_all(&[0, 0, 0, 5, 12, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
             })
         });
 
