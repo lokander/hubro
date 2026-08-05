@@ -28,3 +28,12 @@ depends = ["libwebkit2gtk-4.1-0", "libgtk-3-0"]
 # first launch needs right-click → Open (documented in the README).
 [bundle.macos]
 minimum_system_version = "11.0"
+
+# WebView2 install mode for the Windows installers: the evergreen download
+# bootstrapper keeps them small (the offline installer would embed ~130 MB).
+# Windows 11 and updated Windows 10 already ship the runtime; a clean machine
+# fetches it during install, which needs internet access. Installers are
+# unsigned (FRE-49: no Authenticode cert), so SmartScreen shows an "unknown
+# publisher" warning on first run — documented in the README.
+[bundle.windows]
+webview_install_mode = { DownloadBootstrapper = { silent = true } }

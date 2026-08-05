@@ -1,9 +1,10 @@
 # dataview
 
 A desktop **database viewer for SQLite, Postgres, and SQL Server**, built with
-[Dioxus 0.7](https://dioxuslabs.com/learn/0.7) (Rust), for Linux and macOS
-(credentials go to the OS keyring — Secret Service on Linux, Keychain on
-macOS; releases ship as `.deb`/AppImage and `.dmg`).
+[Dioxus 0.7](https://dioxuslabs.com/learn/0.7) (Rust), for Linux, macOS, and
+Windows (credentials go to the OS keyring — Secret Service on Linux, Keychain
+on macOS, Credential Manager on Windows; releases ship as `.deb`/AppImage,
+`.dmg`, and `.msi`/setup `.exe`).
 
 ## Features
 
@@ -56,8 +57,9 @@ Tailwind is compiled automatically by `dx serve` from `tailwind.css` in the proj
 
 ## Releases
 
-Prebuilt Linux packages (`.deb` and `.AppImage`) and a macOS disk image
-(`.dmg`, Apple Silicon) are attached to each
+Prebuilt Linux packages (`.deb` and `.AppImage`), a macOS disk image
+(`.dmg`, Apple Silicon), and Windows installers (`.msi` and setup `.exe`,
+x64) are attached to each
 [GitHub release](https://github.com/lokander/dataview/releases). The AppImage
 is self-contained and runs on most distributions; the `.deb` targets
 Debian/Ubuntu and depends on `libwebkit2gtk-4.1-0` and `libgtk-3-0`.
@@ -72,6 +74,13 @@ xattr -dr com.apple.quarantine /Applications/Dataview.app
 Alternatively, after the blocked first launch, approve the app under System
 Settings → Privacy & Security → **Open Anyway** (on macOS 14 and earlier,
 right-click → Open also works). Either way this is only needed once.
+
+The Windows installers are likewise **unsigned** (no Authenticode
+certificate yet), so SmartScreen shows an "unknown publisher" warning on
+first run — click **More info → Run anyway**. The app needs the WebView2
+runtime: Windows 11 and updated Windows 10 machines already have it, and on
+a machine without it the installer downloads it during setup (internet
+access required).
 
 Releases are cut by pushing a version tag. The
 [`release` workflow](.github/workflows/release.yml) then bundles the app with
