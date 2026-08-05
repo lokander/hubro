@@ -26,7 +26,7 @@ Git pushes use SSH; the key is passphrase-protected. If pushes fail with "Permis
 
 ## Interactive testing (screenshots + clicking)
 
-Development happens on two machines; pick the recipe for the current platform (`uname`).
+Development happens on multiple machines; pick the recipe for the current platform.
 
 ### Linux (KDE Plasma on Wayland)
 
@@ -58,6 +58,27 @@ POS=$(cliclick p | tr -d ' '); cliclick c:X,Y; cliclick "m:$POS"          # clic
 ```
 
 Gotchas: on current macOS the webview stays **blank when the binary is exec'd directly** from a terminal (the window opens but WKWebView never paints) — launch through LaunchServices instead (`open path/to/Dataview.app`, then `pkill -x dataview` to quit; note the release bundle's process name is lowercase `dataview`, the debug bundle's is `Dataview`). Click targets are **window position + logical (point) coordinates** from the osascript line — don't derive them from screenshot pixels, which are 2x Retina and include shadow margins. The first click on an unfocused window only focuses it (the webview doesn't accept click-through) — click twice or activate the app first. Keystrokes go via System Events (`keystroke`/`key code`) to the focused window. The window-close guard is testable directly: macOS has a real window manager, so the red button or Cmd+W delivers `CloseRequested` — no synthetic-event helper needed.
+
+### Windows
+
+Everything goes through **posted window messages** (`PostMessage` to the WebView2 child) — no real cursor movement, no focus stealing, and no permission grants needed. Dot-source the checked-in helper `scripts/winauto.ps1` (PowerShell 7) for all of it:
+
+```powershell
+dx build    # exe: target\dx\dataview\debug\windows\app\dataview.exe
+Start-Process .\target\dx\dataview\debug\windows\app\dataview.exe   # window title "dataview"
+. .\scripts\winauto.ps1
+$h = Find-AppWindow                 # top-level HWND (throws if the app isn't running)
+Save-WindowShot $h shot.png         # crisp PrintWindow capture, works while occluded; 1:1 with click coords
+Send-PostedClick $h X Y             # coords relative to the window rect = the screenshot's pixel coords
+Send-PostedText  $h "localhost"     # WM_CHAR into the focused element — click a field first
+Send-PostedKey   $h 0x28            # virtual keys: 0x0D Enter, 0x1B Esc, 0x26/0x28 Up/Down, 0x09 Tab
+Send-PostedWheel $h X Y -3          # scroll down 3 notches at that point
+Send-Close       $h                 # WM_CLOSE → delivers CloseRequested (tests the close guard)
+```
+
+Build prerequisites beyond rustup + VS Build Tools: **NASM** (`aws-lc-sys` needs it; GitHub's windows-latest runners have it preinstalled, dev machines don't — drop `nasm.exe` from nasm.us into `~\.cargo\bin`) and the WebView2 runtime (preinstalled on Win11). Install dx from the prebuilt `dx-x86_64-pc-windows-msvc.zip` GitHub release asset rather than `cargo install`.
+
+Gotchas: native `<select>` dropdowns work like on Linux — posted click, then `Send-PostedKey` Down/Up + Enter (the popup is a separate OS window that won't appear in captures; drive it blind by keyboard). **Re-screenshot before deriving coordinates** — form layouts shift as content changes and a click 5px off a field silently does nothing. Screenshots include the title bar and native menu (webview content starts ~56px down). Coordinates are 1:1 only at 100% display scaling (the helper calls `SetProcessDPIAware`; both dev monitors are at 100%). Posted input is verified with the app foreground (its normal state after launch); it never disturbs other windows either way. In the helper, Win32 `FindWindowEx` needs `[NullString]::Value` — a PowerShell `$null` string marshals as `""` and matches nothing.
 
 ## Issue workflow
 
