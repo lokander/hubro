@@ -5,12 +5,12 @@ identifier = "no.lokander.dataview"
 publisher = "Fredrik Lokander"
 copyright = "Copyright © 2026 Fredrik Lokander"
 category = "developer-tool"
-short_description = "Desktop viewer for SQLite and Postgres databases."
+short_description = "Desktop viewer for SQLite, Postgres, and SQL Server databases."
 long_description = """
-dataview is a desktop database viewer for SQLite and Postgres. Browse tables and
-schemas, run SQL with an editor that offers schema-aware completion, page through
-large result sets, edit rows inline, and export query results — all from a native
-desktop app.
+dataview is a desktop database viewer for SQLite, Postgres, and SQL Server.
+Browse tables and schemas, run SQL with an editor that offers schema-aware
+completion, page through large result sets, edit rows inline, and export query
+results — all from a native desktop app.
 """
 icon = [
     "assets/icons/32x32.png",
