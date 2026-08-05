@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use dioxus::desktop::tao::dpi::PhysicalPosition;
+use dioxus::desktop::tao::dpi::{LogicalSize, PhysicalPosition};
 use dioxus::desktop::tao::event::{Event, WindowEvent};
 use dioxus::desktop::{use_window, use_wry_event_handler, DesktopService, WindowCloseBehaviour};
 use dioxus::prelude::*;
 
 use crate::config::{
-    default_settings_path, save_window_geometry, BackendKind, Theme, WindowGeometry,
+    default_settings_path, load_settings, save_window_geometry, BackendKind, Theme, WindowGeometry,
 };
 use crate::db::ConnectionId;
 
@@ -245,6 +245,39 @@ fn WindowPersistence() -> Element {
     let state = use_context::<AppState>();
     let window = use_window();
     let mut latest = use_signal(|| read_geometry(&window));
+
+    // On Windows, the builder's `with_inner_size` treats the native menu bar
+    // as part of the requested client area while `inner_size()` reports the
+    // content area below it, so the geometry restored by main.rs reads back
+    // one menu-height short — and every launch/close cycle would shrink the
+    // window by that much (FRE-62). The runtime `set_inner_size` is
+    // menu-exclusive like `inner_size()` (verified empirically), so
+    // re-applying the requested size once at startup makes the read-back
+    // match what was saved. Only fires when a shortfall is actually measured:
+    // on platforms where builder and read-back agree nothing happens, and a
+    // window manager that *clamped* the size (negative shortfall) is left
+    // alone.
+    {
+        let window = window.clone();
+        use_effect(move || {
+            if window.is_maximized() {
+                return;
+            }
+            let requested = default_settings_path()
+                .map(|path| load_settings(&path).window.unwrap_or_default())
+                .unwrap_or_default()
+                .sanitized();
+            let scale = window.scale_factor();
+            let actual = window.inner_size().to_logical::<f64>(scale);
+            let (dw, dh) = (
+                requested.width - actual.width,
+                requested.height - actual.height,
+            );
+            if (dw > 0.5 || dh > 0.5) && dw >= 0.0 && dh >= 0.0 {
+                window.set_inner_size(LogicalSize::new(requested.width, requested.height));
+            }
+        });
+    }
 
     {
         let window = window.clone();
