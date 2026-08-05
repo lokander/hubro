@@ -114,11 +114,55 @@ jobs:
           path: artifacts/*
           if-no-files-found: error
 
-  # Single fan-in publish: two jobs creating the same release concurrently
+  windows:
+    name: Bundle Windows (msi + nsis)
+    # x64-only. Unsigned per FRE-49: no Authenticode cert, so SmartScreen
+    # shows an "unknown publisher" warning on first run (the README documents
+    # More info → Run anyway). WiX (msi) and NSIS (setup exe) are downloaded
+    # by the bundler on demand; NASM (needed by aws-lc-sys) is preinstalled
+    # on windows-latest images.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@v1.10.19
+
+      - name: Install Dioxus CLI
+        run: cargo binstall -y dioxus-cli@${{ env.DX_VERSION }}
+
+      - name: Bundle
+        run: dx bundle --release --package-types msi --package-types nsis --out-dir dist
+
+      # The nsis installer is named *-setup.exe; a bare *.exe glob would also
+      # sweep up the unbundled app binary dx drops in the out dir.
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          Get-ChildItem dist -Recurse -File |
+            Where-Object { $_.Name -like '*.msi' -or $_.Name -like '*-setup.exe' } |
+            Copy-Item -Destination artifacts
+          Get-ChildItem artifacts
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-bundles
+          path: artifacts/*
+          if-no-files-found: error
+
+  # Single fan-in publish: jobs creating the same release concurrently
   # race in softprops/action-gh-release, so only this job touches the release.
   publish:
     name: Publish release
-    needs: [linux, macos]
+    needs: [linux, macos, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
