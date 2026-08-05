@@ -112,7 +112,7 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
         pending
             .statements
             .iter()
-            .filter(|s| needs_confirmation(s))
+            .filter(|s| needs_confirmation(s, dialect))
             .count()
     });
     let mut show_history = use_signal(|| false);

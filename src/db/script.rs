@@ -259,17 +259,22 @@ const EMBEDDED_WRITE_KEYWORDS: [&str; 9] = [
 ///   over-prompts call-form read pragmas like `PRAGMA table_info(t)`: some
 ///   pragmas accept both spellings for setting, and prompting is the
 ///   fail-safe side.
-pub fn needs_confirmation(sql: &str) -> bool {
+///
+/// The dialect matters on SQL Server, where `[bracketed identifiers]` are
+/// lexed (see [`strip_strings_and_comments`]): a quote inside one
+/// (`SELECT [o'brien] * INTO t2 FROM t`) must not invert string tracking
+/// and hide the `INTO`, and `SELECT [into]` must not over-prompt.
+pub fn needs_confirmation(sql: &str, dialect: Dialect) -> bool {
     if classify_statement(sql) == StatementKind::Write {
         return true;
     }
     match first_keyword(sql).to_ascii_lowercase().as_str() {
-        "with" | "explain" => has_top_level_word(sql, |word| {
+        "with" | "explain" => has_top_level_word(sql, dialect, |word| {
             EMBEDDED_WRITE_KEYWORDS.contains(&word.to_ascii_lowercase().as_str())
         }),
-        "select" => has_top_level_word(sql, |word| word.eq_ignore_ascii_case("into")),
+        "select" => has_top_level_word(sql, dialect, |word| word.eq_ignore_ascii_case("into")),
         "pragma" => {
-            let code = strip_strings_and_comments(sql);
+            let code = strip_strings_and_comments(sql, dialect);
             code.contains('=') || code.contains('(')
         }
         _ => false,
@@ -277,9 +282,10 @@ pub fn needs_confirmation(sql: &str) -> bool {
 }
 
 /// Whether any word-ish token (identifier characters) of the statement —
-/// with strings and comments removed — matches the predicate.
-fn has_top_level_word(sql: &str, matches: impl Fn(&str) -> bool) -> bool {
-    strip_strings_and_comments(sql)
+/// with strings, comments, and (on SQL Server) bracketed identifiers
+/// removed — matches the predicate.
+fn has_top_level_word(sql: &str, dialect: Dialect, matches: impl Fn(&str) -> bool) -> bool {
+    strip_strings_and_comments(sql, dialect)
         .split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .any(|word| !word.is_empty() && matches(word))
 }
@@ -287,8 +293,12 @@ fn has_top_level_word(sql: &str, matches: impl Fn(&str) -> bool) -> bool {
 /// The statement text with quoted strings (single, double, dollar) and
 /// comments blanked out to spaces, so token scans can't be fooled by
 /// literals like `'please do not DELETE me'`. Same lexer states as
-/// [`split_statements`].
-fn strip_strings_and_comments(sql: &str) -> String {
+/// [`split_statements`], including its SQL Server-only bracket handling:
+/// `[bracketed identifiers]` are blanked like quoted identifiers (`]]` is
+/// an escaped `]`), so a quote inside one can't invert string tracking and
+/// a keyword inside one can't masquerade as a token. Brackets stay inert
+/// on SQLite/Postgres, matching the splitter.
+fn strip_strings_and_comments(sql: &str, dialect: Dialect) -> String {
     let bytes = sql.as_bytes();
     let mut out = vec![b' '; bytes.len()];
     let mut i = 0usize;
@@ -300,6 +310,21 @@ fn strip_strings_and_comments(sql: &str) -> String {
                     i += 1;
                 }
                 i += 1;
+            }
+            b'[' if dialect == Dialect::SqlServer => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b']' {
+                        if bytes.get(i + 1) == Some(&b']') {
+                            i += 2; // escaped ]] stays inside
+                        } else {
+                            i += 1; // past the closing bracket
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
             }
             b'-' if bytes.get(i + 1) == Some(&b'-') => {
                 while i < bytes.len() && bytes[i] != b'\n' {
@@ -581,14 +606,14 @@ pub fn wrap_atomically(dialect: Dialect, statements: &[String]) -> bool {
     statements.len() > 1
         && !statements
             .iter()
-            .any(|s| manages_own_transaction(s) || is_non_transactional(dialect, s))
+            .any(|s| manages_own_transaction(s, dialect) || is_non_transactional(dialect, s))
 }
 
 /// Whether a statement issues its own transaction control, so the script is
 /// managing atomicity itself and must not be wrapped again.
-fn manages_own_transaction(sql: &str) -> bool {
+fn manages_own_transaction(sql: &str, dialect: Dialect) -> bool {
     matches!(
-        leading_words(sql, 1).first().map(String::as_str),
+        leading_words(sql, dialect, 1).first().map(String::as_str),
         Some("begin" | "start" | "commit" | "rollback" | "savepoint" | "release" | "end")
     )
 }
@@ -603,7 +628,7 @@ fn manages_own_transaction(sql: &str) -> bool {
 /// T-SQL refuses inside a user transaction (`CREATE`/`ALTER`/`DROP
 /// DATABASE`, `BACKUP`, `RESTORE`, full-text DDL).
 fn is_non_transactional(dialect: Dialect, sql: &str) -> bool {
-    let words = leading_words(sql, 2);
+    let words = leading_words(sql, dialect, 2);
     let first = words.first().map(String::as_str).unwrap_or("");
     let second = words.get(1).map(String::as_str).unwrap_or("");
     if first == "vacuum" {
@@ -614,7 +639,7 @@ fn is_non_transactional(dialect: Dialect, sql: &str) -> bool {
         // transaction; keep the script sequential so it actually applies. This
         // over-declines call-form read PRAGMAs (`PRAGMA table_info(t)`), but
         // running those sequentially is harmless. Mirrors `needs_confirmation`.
-        let code = strip_strings_and_comments(sql);
+        let code = strip_strings_and_comments(sql, dialect);
         if code.contains('=') || code.contains('(') {
             return true;
         }
@@ -629,7 +654,9 @@ fn is_non_transactional(dialect: Dialect, sql: &str) -> bool {
             return true;
         }
         // CREATE/DROP INDEX CONCURRENTLY, REINDEX … CONCURRENTLY.
-        if has_top_level_word(sql, |word| word.eq_ignore_ascii_case("concurrently")) {
+        if has_top_level_word(sql, dialect, |word| {
+            word.eq_ignore_ascii_case("concurrently")
+        }) {
             return true;
         }
     }
@@ -649,8 +676,8 @@ fn is_non_transactional(dialect: Dialect, sql: &str) -> bool {
 /// The first `n` word tokens of a statement (lowercased), with strings and
 /// comments removed so a leading comment or quoted text can't masquerade as a
 /// keyword.
-fn leading_words(sql: &str, n: usize) -> Vec<String> {
-    strip_strings_and_comments(sql)
+fn leading_words(sql: &str, dialect: Dialect, n: usize) -> Vec<String> {
+    strip_strings_and_comments(sql, dialect)
         .split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .filter(|word| !word.is_empty())
         .take(n)
@@ -985,7 +1012,12 @@ mod tests {
             "PRAGMA journal_mode = WAL",
             "PRAGMA busy_timeout(5000)",
         ] {
-            assert!(needs_confirmation(sql), "{sql:?} must need confirmation");
+            for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+                assert!(
+                    needs_confirmation(sql, dialect),
+                    "{sql:?} must need confirmation on {dialect:?}"
+                );
+            }
         }
     }
 
@@ -1008,35 +1040,103 @@ mod tests {
             "WITH x AS (SELECT 1) SELECT * FROM x /* create index? */",
             "SELECT \"into\" FROM t", // quoted identifier
         ] {
-            assert!(!needs_confirmation(sql), "{sql:?} must not prompt");
+            for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+                assert!(
+                    !needs_confirmation(sql, dialect),
+                    "{sql:?} must not prompt on {dialect:?}"
+                );
+            }
         }
     }
 
     #[test]
     fn classified_writes_always_need_confirmation() {
         for sql in ["INSERT INTO t VALUES (1)", "DROP TABLE t", "BEGIN", ""] {
-            assert!(needs_confirmation(sql), "{sql:?} must need confirmation");
+            for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
+                assert!(
+                    needs_confirmation(sql, dialect),
+                    "{sql:?} must need confirmation on {dialect:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bracketed_identifiers_are_lexed_for_confirmation_on_sqlserver() {
+        // A quote inside a bracketed identifier must not invert string
+        // tracking: the INTO after it is real, and skipping the prompt here
+        // was the fail-unsafe bug this covers (FRE-61).
+        assert!(needs_confirmation(
+            "SELECT [o'brien] * INTO t2 FROM t",
+            Dialect::SqlServer
+        ));
+        // Keywords inside brackets are identifier text, not tokens — no
+        // over-prompting.
+        for sql in [
+            "SELECT [into] FROM t",
+            "WITH x AS (SELECT 1) SELECT [delete] FROM x",
+            // `]]` is an escaped `]`: the identifier is `a]into`, still text.
+            "SELECT [a]]into] FROM t",
+        ] {
+            assert!(
+                !needs_confirmation(sql, Dialect::SqlServer),
+                "{sql:?} must not prompt"
+            );
+        }
+        // A real INTO after a bracketed identifier still prompts.
+        assert!(needs_confirmation(
+            "SELECT [a], b INTO t2 FROM t",
+            Dialect::SqlServer
+        ));
+    }
+
+    #[test]
+    fn brackets_stay_inert_for_confirmation_on_other_dialects() {
+        // Pre-existing behavior preserved: without bracket lexing, `[into]`
+        // still tokenizes as the word `into` and over-prompts (fail-safe).
+        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+            assert!(
+                needs_confirmation("SELECT [into] FROM t", dialect),
+                "{dialect:?}"
+            );
         }
     }
 
     #[test]
     fn strip_strings_and_comments_blanks_only_literals_and_comments() {
-        let stripped = strip_strings_and_comments("SELECT 'a;b', \"q\" -- c\nFROM t /* x */");
+        let stripped =
+            strip_strings_and_comments("SELECT 'a;b', \"q\" -- c\nFROM t /* x */", Dialect::Sqlite);
         assert!(stripped.contains("SELECT"));
         assert!(stripped.contains("FROM t"));
         for gone in ["a;b", "q", "c", "x", "'", "\"", "--", "/*"] {
             assert!(!stripped.contains(gone), "{gone:?} should be blanked");
         }
-        let stripped = strip_strings_and_comments("SELECT $$drop$$, $t$delete$t$, $1");
+        let stripped =
+            strip_strings_and_comments("SELECT $$drop$$, $t$delete$t$, $1", Dialect::Postgres);
         assert!(!stripped.contains("drop"));
         assert!(!stripped.contains("delete"));
         assert!(stripped.contains("$1")); // parameter placeholder survives
                                           // Length in bytes is preserved and multibyte text stays valid UTF-8.
         let input = "SELECT übercol, 'смузи' FROM t";
-        let stripped = strip_strings_and_comments(input);
+        let stripped = strip_strings_and_comments(input, Dialect::Sqlite);
         assert_eq!(stripped.len(), input.len());
         assert!(stripped.contains("übercol"));
         assert!(!stripped.contains("смузи"));
+    }
+
+    #[test]
+    fn strip_blanks_bracketed_identifiers_on_sqlserver_only() {
+        let stripped = strip_strings_and_comments("SELECT [o'brien], x FROM t", Dialect::SqlServer);
+        assert!(!stripped.contains("brien"));
+        assert!(!stripped.contains('\''));
+        // Code after the bracket survives.
+        assert!(stripped.contains("x FROM t"));
+        // Unterminated bracket swallows the rest, like an unterminated string.
+        let stripped = strip_strings_and_comments("SELECT [a INTO b", Dialect::SqlServer);
+        assert!(!stripped.contains("INTO"));
+        // On other dialects brackets are plain text and stay in place.
+        let stripped = strip_strings_and_comments("SELECT [into] FROM t", Dialect::Postgres);
+        assert!(stripped.contains("[into]"));
     }
 
     #[test]

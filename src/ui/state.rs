@@ -1644,7 +1644,7 @@ impl AppState {
         if statements.is_empty() {
             return;
         }
-        if statements.iter().any(|s| needs_confirmation(s)) {
+        if statements.iter().any(|s| needs_confirmation(s, dialect)) {
             self.pending_sql.write().insert(
                 id,
                 PendingSql {
