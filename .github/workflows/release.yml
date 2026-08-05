@@ -131,11 +131,18 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@v1.10.19
-
+      # No binstall here: its action broke on the windows runner (first real
+      # run of this job, v0.6.1) while working on linux/macos. The Dioxus
+      # release ships a prebuilt Windows dx, so download that directly —
+      # deterministic and one less third-party action.
       - name: Install Dioxus CLI
-        run: cargo binstall -y dioxus-cli@${{ env.DX_VERSION }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "v${env:DX_VERSION}" --repo DioxusLabs/dioxus --pattern 'dx-x86_64-pc-windows-msvc.zip' --dir $env:TEMP
+          Expand-Archive "$env:TEMP\dx-x86_64-pc-windows-msvc.zip" -DestinationPath "$env:USERPROFILE\.cargo\bin" -Force
+          dx --version
 
       - name: Bundle
         run: dx bundle --release --package-types msi --package-types nsis --out-dir dist
