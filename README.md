@@ -76,8 +76,8 @@ Settings → Privacy & Security → **Open Anyway** (on macOS 14 and earlier,
 right-click → Open also works). Either way this is only needed once.
 
 The Windows installers are likewise **unsigned** (no Authenticode
-certificate yet), so SmartScreen shows an "unknown publisher" warning on
-first run — click **More info → Run anyway**. The app needs the WebView2
+certificate yet), so SmartScreen shows an "unknown publisher" warning when
+you run the downloaded installer — click **More info → Run anyway**. The app needs the WebView2
 runtime: Windows 11 and updated Windows 10 machines already have it, and on
 a machine without it the installer downloads it during setup (internet
 access required).
