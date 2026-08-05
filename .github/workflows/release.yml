@@ -48,9 +48,9 @@ jobs:
 
       # binstall grabs a prebuilt dx binary instead of compiling the CLI from
       # source (which would add many minutes to every release). --force because
-      # rust-cache restores the .crates.toml install metadata but not the
-      # ~/.cargo/bin binaries — on a warm cache a plain binstall no-ops with
-      # "already installed" and the Bundle step dies with dx not found.
+      # a warm rust-cache can restore .crates.toml metadata claiming dx is
+      # installed while the binary is absent (observed on the v0.6.1 re-run) —
+      # a plain binstall then no-ops and Bundle dies with dx not found.
       - name: Install cargo-binstall
         uses: cargo-bins/cargo-binstall@v1.10.19
 
