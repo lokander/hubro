@@ -47,12 +47,15 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       # binstall grabs a prebuilt dx binary instead of compiling the CLI from
-      # source (which would add many minutes to every release).
+      # source (which would add many minutes to every release). --force because
+      # rust-cache restores the .crates.toml install metadata but not the
+      # ~/.cargo/bin binaries — on a warm cache a plain binstall no-ops with
+      # "already installed" and the Bundle step dies with dx not found.
       - name: Install cargo-binstall
         uses: cargo-bins/cargo-binstall@v1.10.19
 
       - name: Install Dioxus CLI
-        run: cargo binstall -y dioxus-cli@${{ env.DX_VERSION }}
+        run: cargo binstall -y --force dioxus-cli@${{ env.DX_VERSION }}
 
       # appimagetool needs FUSE; extract-and-run avoids mounting on runners
       # where FUSE is flaky.
@@ -93,8 +96,9 @@ jobs:
       - name: Install cargo-binstall
         uses: cargo-bins/cargo-binstall@v1.10.19
 
+      # --force for the same warm-cache reason as the linux job.
       - name: Install Dioxus CLI
-        run: cargo binstall -y dioxus-cli@${{ env.DX_VERSION }}
+        run: cargo binstall -y --force dioxus-cli@${{ env.DX_VERSION }}
 
       # `macos` produces the .app the dmg wraps; the .dmg is the artifact we
       # ship (an .app is a directory, so it can't be a release asset as-is).
