@@ -29,7 +29,22 @@ on macOS, Credential Manager on Windows; releases ship as `.deb`/AppImage,
 
 ## Development
 
-Install the Dioxus CLI if you don't have it:
+Per-OS build prerequisites, on top of a stable Rust toolchain:
+
+- **Linux** — the WebKitGTK/GTK development packages CI installs (see
+  [`ci.yml`](.github/workflows/ci.yml)): `libwebkit2gtk-4.1-dev`,
+  `libgtk-3-dev`, `libxdo-dev`, `libayatana-appindicator3-dev`,
+  `librsvg2-dev`, `libssl-dev`, `pkg-config`.
+- **macOS** — nothing extra (WKWebView ships with the OS; Xcode command-line
+  tools cover the linker).
+- **Windows** — Visual Studio Build Tools (MSVC), plus
+  [NASM](https://www.nasm.us/) on PATH (`aws-lc-sys` assembles with it; the
+  GitHub runners have it preinstalled but dev machines usually don't). The
+  WebView2 runtime is preinstalled on Windows 11 / updated Windows 10.
+
+Install the Dioxus CLI if you don't have it (or grab a prebuilt `dx` from the
+[Dioxus releases](https://github.com/DioxusLabs/dioxus/releases) — on Windows
+that skips a long compile):
 
 ```bash
 curl -sSL http://dioxus.dev/install.sh | sh
