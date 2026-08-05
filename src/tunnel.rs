@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use russh::client;
-#[cfg(unix)]
-use russh::keys::agent::client::AgentClient;
+#[cfg(any(unix, windows))]
+use russh::keys::agent::client::{AgentClient, AgentStream};
 use russh::keys::known_hosts::{known_host_keys_path, learn_known_hosts_path};
 use russh::keys::{
     check_known_hosts_path, load_secret_key, Algorithm, HashAlg, PrivateKey, PrivateKeyWithHashAlg,
@@ -45,7 +45,8 @@ fn default_ssh_port() -> u16 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "lowercase")]
 pub enum TunnelAuth {
-    /// The ssh-agent at `SSH_AUTH_SOCK`.
+    /// The ssh-agent: `SSH_AUTH_SOCK` on Unix, the OpenSSH service's
+    /// `\\.\pipe\openssh-ssh-agent` named pipe on Windows.
     Agent,
     /// A private key file; an encrypted key prompts for its passphrase.
     KeyFile { path: PathBuf },
@@ -445,9 +446,44 @@ async fn authenticate_with_agent(
     handle: &mut client::Handle<HostKeyVerifier>,
     config: &TunnelConfig,
 ) -> Result<(), TunnelError> {
-    let mut agent = AgentClient::connect_env()
+    let agent = AgentClient::connect_env()
         .await
         .map_err(|e| TunnelError::Auth(format!("ssh-agent unavailable: {e}")))?;
+    try_agent_identities(handle, config, agent).await
+}
+
+/// The named pipe the Windows OpenSSH agent serves; it exists only while
+/// the "OpenSSH Authentication Agent" service is running.
+#[cfg(windows)]
+const WINDOWS_AGENT_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
+
+#[cfg(windows)]
+async fn authenticate_with_agent(
+    handle: &mut client::Handle<HostKeyVerifier>,
+    config: &TunnelConfig,
+) -> Result<(), TunnelError> {
+    let agent = connect_windows_agent().await?;
+    try_agent_identities(handle, config, agent).await
+}
+
+#[cfg(windows)]
+async fn connect_windows_agent(
+) -> Result<AgentClient<tokio::net::windows::named_pipe::NamedPipeClient>, TunnelError> {
+    AgentClient::connect_named_pipe(WINDOWS_AGENT_PIPE)
+        .await
+        .map_err(|e| {
+            TunnelError::Auth(format!(
+                "ssh-agent unavailable: {e} (is the \"OpenSSH Authentication Agent\" Windows service running?)"
+            ))
+        })
+}
+
+#[cfg(any(unix, windows))]
+async fn try_agent_identities<S: AgentStream + Send + Unpin>(
+    handle: &mut client::Handle<HostKeyVerifier>,
+    config: &TunnelConfig,
+    mut agent: AgentClient<S>,
+) -> Result<(), TunnelError> {
     let identities = agent
         .request_identities()
         .await
@@ -474,7 +510,7 @@ async fn authenticate_with_agent(
     )))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 async fn authenticate_with_agent(
     _handle: &mut client::Handle<HostKeyVerifier>,
     _config: &TunnelConfig,
@@ -715,6 +751,47 @@ mod tests {
                 .unwrap();
         assert_eq!(parsed.port, 22);
         assert_eq!(parsed.auth, TunnelAuth::Agent);
+    }
+
+    /// The Windows agent transport, end to end over a real named pipe: when
+    /// the OpenSSH agent service isn't running (its pipe name is free), host
+    /// a mock agent on that exact name and drive the production connect path
+    /// against it; when the real agent is running, just list its identities.
+    /// Either way `connect_windows_agent` + `request_identities` must
+    /// round-trip the ssh-agent protocol over the pipe.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_agent_pipe_round_trips() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let mock_server = match ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(WINDOWS_AGENT_PIPE)
+        {
+            Ok(server) => Some(server),
+            // The real agent service owns the name — test against it instead.
+            Err(_) => None,
+        };
+
+        let server_task = mock_server.map(|mut server| {
+            tokio::spawn(async move {
+                server.connect().await.unwrap();
+                // SSH_AGENTC_REQUEST_IDENTITIES: uint32 len=1, byte 11.
+                let mut request = [0u8; 5];
+                server.read_exact(&mut request).await.unwrap();
+                assert_eq!(request, [0, 0, 0, 1, 11]);
+                // SSH_AGENT_IDENTITIES_ANSWER: len=5, byte 12, nkeys=0.
+                server.write_all(&[0, 0, 0, 5, 12, 0, 0, 0, 0]).await.unwrap();
+            })
+        });
+
+        let mut agent = connect_windows_agent().await.expect("pipe connect");
+        let identities = agent.request_identities().await.expect("identities");
+        if let Some(task) = server_task {
+            task.await.unwrap();
+            assert!(identities.is_empty());
+        }
     }
 
     #[test]
