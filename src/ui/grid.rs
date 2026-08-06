@@ -1146,9 +1146,15 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                             }
                         }
                         match view {
-                            ExpandView::Text(value) => rsx! {
-                                pre { class: "whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
-                                    "{value}"
+                            // A short value already in hand is always the full
+                            // value, so JSON pretty-printing is safe (FRE-77).
+                            ExpandView::Text(value) => {
+                                let display = pretty_json(&value).unwrap_or_else(|| value.clone());
+                                rsx! {
+                                    CopyRawButton { raw: value.clone() }
+                                    pre { class: "whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
+                                        "{display}"
+                                    }
                                 }
                             },
                             ExpandView::Fetch { locator, column } => rsx! {
@@ -2361,15 +2367,58 @@ fn ExpandedValue(
             }
             let text = fetch.value.display();
             let capped = fetch.capped;
+            // A capped fetch may be cut mid-document — only pretty-print
+            // JSON when the full value is held (FRE-77).
+            let display = if capped {
+                text.clone()
+            } else {
+                pretty_json(&text).unwrap_or_else(|| text.clone())
+            };
             rsx! {
                 if capped {
                     p { class: "mb-2 rounded border border-amber-300 dark:border-amber-800/70 bg-amber-50 dark:bg-amber-950/40 px-2 py-1 text-xs text-amber-700 dark:text-amber-300",
                         "Value is very large; showing the first {human_bytes(FETCH_CELL_MAX_BYTES as u64)}."
                     }
                 }
+                CopyRawButton { raw: text.clone() }
                 pre { class: "whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
-                    "{text}"
+                    "{display}"
                 }
+            }
+        }
+    }
+}
+
+/// Pretty-printed rendering of a JSON cell value for the expand popup
+/// (FRE-77): `Some` only when the text parses as a JSON object or array —
+/// scalars re-serialize identically and everything else (including a JSON
+/// document cut off by the fetch cap) falls back to the raw text.
+fn pretty_json(text: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(text).ok()?;
+    if !matches!(
+        parsed,
+        serde_json::Value::Object(_) | serde_json::Value::Array(_)
+    ) {
+        return None;
+    }
+    serde_json::to_string_pretty(&parsed).ok()
+}
+
+/// A right-aligned "Copy raw" action for the expand popup (FRE-77): always
+/// copies the raw cell value — the pane may be showing the pretty-printed
+/// form, which is for reading, not round-tripping.
+#[component]
+fn CopyRawButton(raw: String) -> Element {
+    let raw_json = serde_json::to_string(&raw).unwrap_or_else(|_| "\"\"".into());
+    rsx! {
+        div { class: "mb-1 flex justify-end",
+            button {
+                class: "rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                title: "Copy the raw value (not the formatted view)",
+                onclick: move |_| {
+                    document::eval(&format!("navigator.clipboard.writeText({raw_json});"));
+                },
+                "Copy raw"
             }
         }
     }
@@ -2378,6 +2427,23 @@ fn ExpandedValue(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pretty_json_formats_objects_and_arrays_only() {
+        // Note: serde_json's default map sorts keys — fine for reading, and
+        // jsonb has no stable key order anyway; Copy raw keeps the original.
+        assert_eq!(
+            pretty_json(r#"{"b":1,"a":[2,3]}"#).as_deref(),
+            Some("{\n  \"a\": [\n    2,\n    3\n  ],\n  \"b\": 1\n}")
+        );
+        assert_eq!(pretty_json("[1,2]").as_deref(), Some("[\n  1,\n  2\n]"));
+        // Scalars re-serialize identically — no point reformatting.
+        assert_eq!(pretty_json("42"), None);
+        assert_eq!(pretty_json("\"hi\""), None);
+        // Non-JSON and truncated documents fall back to raw.
+        assert_eq!(pretty_json("plain text"), None);
+        assert_eq!(pretty_json(r#"{"cut": "mid-docu"#), None);
+    }
 
     #[test]
     fn empty_state_selector_distinguishes_the_four_cases() {
