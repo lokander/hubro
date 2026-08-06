@@ -1,4 +1,5 @@
 use dioxus::prelude::*;
+use dioxus_icons::lucide::{ChevronDown, ChevronRight, Database, RefreshCw};
 
 use crate::db::{ConnectionId, TableKind, TableMeta};
 
@@ -25,10 +26,11 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
                     "Schema"
                 }
                 button {
-                    class: "rounded px-2 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                    class: "flex items-center gap-1 rounded px-2 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
                     title: "Reload schema",
                     onclick: move |_| state.load_schema(id),
-                    "↻ Reload"
+                    RefreshCw { size: 12 }
+                    "Reload"
                 }
             }
             div { class: "min-h-0 flex-1 overflow-y-auto py-1",
@@ -43,7 +45,7 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
                     },
                     SchemaLoad::Ready(tables) if tables.is_empty() => rsx! {
                         EmptyState {
-                            icon: "\u{1F5C4}", // 🗄 file cabinet
+                            icon: rsx! { Database { size: 40 } },
                             title: "No tables",
                             hint: "This database has no tables yet.",
                         }
@@ -120,7 +122,11 @@ fn TableNode(id: ConnectionId, table: ReadSignal<TableMeta>) -> Element {
                     class: "w-4 shrink-0 text-xs text-slate-500 hover:text-slate-900 dark:hover:text-slate-200",
                     aria_label: if expanded { "Collapse" } else { "Expand" },
                     onclick: move |_| state.toggle_expanded(id, &toggle_key),
-                    if expanded { "▾" } else { "▸" }
+                    if expanded {
+                        ChevronDown { size: 14 }
+                    } else {
+                        ChevronRight { size: 14 }
+                    }
                 }
                 button {
                     // `dv-table-btn` + `data-selected` drive the keyboard

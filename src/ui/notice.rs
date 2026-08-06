@@ -10,6 +10,7 @@
 use std::time::Duration;
 
 use dioxus::prelude::*;
+use dioxus_icons::lucide::{Info, TriangleAlert, X};
 
 /// The severity of a [`Banner`], picking its icon and color scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,12 +24,16 @@ pub enum BannerKind {
 }
 
 impl BannerKind {
-    /// The leading glyph for this kind.
-    pub fn icon(self) -> &'static str {
+    /// The leading icon for this kind (Lucide, FRE-66). Sized to match the
+    /// banner's `text-sm` line height so the icon and first text line align.
+    pub fn icon(self) -> Element {
         match self {
-            BannerKind::Error => "\u{26A0}",   // ⚠ warning sign
-            BannerKind::Warning => "\u{26A0}", // ⚠ warning sign
-            BannerKind::Info => "\u{2139}",    // ℹ information source
+            BannerKind::Error | BannerKind::Warning => rsx! {
+                TriangleAlert { size: 16, class: "mt-0.5" }
+            },
+            BannerKind::Info => rsx! {
+                Info { size: 16, class: "mt-0.5" }
+            },
         }
     }
 
@@ -66,14 +71,14 @@ pub fn Banner(
         div {
             role: "alert",
             class: "flex items-start gap-2 rounded border px-3 py-2 text-sm {kind.container_classes()}",
-            span { class: "shrink-0 select-none leading-5", "{kind.icon()}" }
+            span { class: "shrink-0 select-none leading-5", {kind.icon()} }
             span { class: "min-w-0 flex-1 break-words leading-5", "{message}" }
             if let Some(on_dismiss) = on_dismiss {
                 button {
-                    class: "shrink-0 rounded px-1 leading-5 opacity-60 hover:opacity-100",
+                    class: "shrink-0 rounded px-1 py-1 leading-none opacity-60 hover:opacity-100",
                     aria_label: "Dismiss",
                     onclick: move |_| on_dismiss.call(()),
-                    "\u{00D7}" // ×
+                    X { size: 14 }
                 }
             }
         }
@@ -86,8 +91,8 @@ pub fn Banner(
 /// "no filter matches" views so each is distinct but consistent.
 #[component]
 pub fn EmptyState(
-    /// A large glyph shown above the title.
-    icon: String,
+    /// A large icon shown above the title (a Lucide component, FRE-66).
+    icon: Element,
     /// The bold one-line summary.
     title: String,
     /// A muted supporting sentence (omitted when empty).
@@ -97,8 +102,8 @@ pub fn EmptyState(
 ) -> Element {
     rsx! {
         div { class: "flex flex-col items-center justify-center gap-2 px-6 py-12 text-center",
-            div { class: "select-none text-4xl leading-none text-slate-300 dark:text-slate-600",
-                "{icon}"
+            div { class: "select-none leading-none text-slate-300 dark:text-slate-600",
+                {icon}
             }
             p { class: "text-sm font-medium text-slate-700 dark:text-slate-300", "{title}" }
             if !hint.is_empty() {
@@ -153,7 +158,6 @@ mod tests {
                 classes.contains("bg-") && classes.contains("border-") && classes.contains("text-"),
                 "{kind:?} is missing a border/background/text class"
             );
-            assert!(!kind.icon().is_empty(), "{kind:?} has no icon");
         }
         // The three kinds are visually distinct (different palettes).
         assert!(BannerKind::Error.container_classes().contains("red-"));

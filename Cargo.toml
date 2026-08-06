@@ -36,6 +36,7 @@ sha2 = "0.10"
 base64 = "0.22"
 webbrowser = "1"
 getrandom = "0.2"
+dioxus-icons = "0.1.0"
 
 # Credential store per OS: Secret Service / KWallet on Linux, Keychain on
 # macOS, Credential Manager on Windows. The keyring API is identical across
