@@ -1249,7 +1249,7 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                     }
                     div { class: "flex gap-2",
                         select {
-                            class: "rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-2 text-sm text-slate-900 dark:text-slate-300",
+                            class: FORM_SELECT_CLASS,
                             onchange: move |evt| sslmode.set(evt.value()),
                             option { value: "prefer", selected: *sslmode.read() == "prefer", "sslmode: prefer" }
                             option { value: "require", selected: *sslmode.read() == "require", "sslmode: require" }
@@ -1573,7 +1573,7 @@ fn SqlServerForm(on_done: EventHandler<()>) -> Element {
                     }
                     div { class: "flex gap-2",
                         select {
-                            class: "rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-2 text-sm text-slate-900 dark:text-slate-300",
+                            class: FORM_SELECT_CLASS,
                             onchange: move |evt| encrypt.set(evt.value()),
                             option { value: "on", selected: *encrypt.read() == "on", "encrypt: on" }
                             option { value: "off", selected: *encrypt.read() == "off", "encrypt: off (login only)" }
@@ -1647,7 +1647,7 @@ fn SqlServerForm(on_done: EventHandler<()>) -> Element {
 const FORM_FIELD_CLASS: &str = "w-full rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-3 py-2 font-mono text-sm text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600";
 
 /// Select class shared by the connection forms' dropdowns.
-const FORM_SELECT_CLASS: &str = "rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-2 text-sm text-slate-900 dark:text-slate-300";
+const FORM_SELECT_CLASS: &str = "rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-2 text-sm text-slate-900 dark:text-slate-200";
 
 /// Builds the tunnel config from the SSH form fields — `Ok(None)` when the
 /// toggle is off. Shared by the Postgres and SQL Server forms; errors are

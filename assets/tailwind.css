@@ -1819,6 +1819,12 @@
     }
   }
 }
+:root {
+  color-scheme: light;
+}
+.dark {
+  color-scheme: dark;
+}
 @property --tw-rotate-x {
   syntax: "*";
   inherits: false;
