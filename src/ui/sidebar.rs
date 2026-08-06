@@ -6,9 +6,10 @@ use crate::db::{ConnectionId, TableKind, TableMeta};
 use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState};
 use super::state::{AppState, SchemaLoad, TableRef};
 
-/// Sidebar for one connection: the introspected schema as an expandable
-/// tree. Tables and views expand to columns (with PK/NOT NULL markers) and
-/// indexes; clicking a name selects it for the data grid.
+/// Sidebar for one connection: a flat list of the introspected tables and
+/// views, grouped by schema. Clicking a name selects it for the data grid
+/// and the Schema pane, which is where its columns and indexes live
+/// (FRE-69).
 #[component]
 pub fn SchemaSidebar(id: ConnectionId) -> Element {
     let state = use_context::<AppState>();

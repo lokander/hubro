@@ -164,7 +164,7 @@ pub enum NavAction {
 pub struct TabUi {
     /// Table selected in the sidebar (shown in the data grid).
     pub selected_table: Option<TableRef>,
-    /// Data browser vs SQL editor.
+    /// Data browser, SQL editor, or schema.
     pub pane: Pane,
     /// SQL editor buffer, synced from the webview so it survives pane and
     /// tab switches.
@@ -1689,10 +1689,11 @@ impl AppState {
         });
     }
 
-    /// Switches a tab between the data browser and the SQL editor. Guarded:
-    /// leaving the browser while the selected table has staged edits takes
-    /// two attempts (see [`Self::nav_guard`]); the second discards them.
-    /// While that table's save is in flight the switch no-ops.
+    /// Switches a tab between the data browser, the SQL editor, and the
+    /// schema view. Guarded: leaving the browser while the selected table
+    /// has staged edits takes two attempts (see [`Self::nav_guard`]); the
+    /// second discards them. While that table's save is in flight the
+    /// switch no-ops.
     pub fn set_pane(mut self, id: ConnectionId, pane: Pane) {
         let (current_pane, selected) = {
             let tab_ui = self.tab_ui.read();
@@ -1722,10 +1723,11 @@ impl AppState {
         self.tab_ui.write().entry(id).or_default().pane = pane;
     }
 
-    /// Toggles the Data/SQL pane of the currently active connection tab
-    /// (FRE-15, the `Ctrl+E` shortcut). A no-op on the connections screen.
-    /// Routed through [`Self::set_pane`], so the unsaved-changes guard still
-    /// applies when leaving the browser with staged edits.
+    /// Cycles the currently active connection tab through Data → SQL →
+    /// Schema (FRE-15's `Ctrl+E` shortcut, extended for the third pane in
+    /// FRE-69). A no-op on the connections screen. Routed through
+    /// [`Self::set_pane`], so the unsaved-changes guard still applies when
+    /// leaving the browser with staged edits.
     pub fn toggle_active_pane(self) {
         let ActiveView::Connection(id) = *self.active.read() else {
             return;
