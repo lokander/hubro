@@ -363,16 +363,20 @@ pub enum SessionPane {
 
 /// Deserializes a [`SessionPane`], treating anything this build doesn't
 /// recognize as the default rather than failing the whole session.
+///
+/// Deliberately re-uses the derived impl rather than matching the variant
+/// names by hand: a hand-written map would compile happily after a new
+/// variant is added and silently read it back as the default, which is the
+/// exact failure this helper exists to prevent.
 fn pane_or_default<'de, D>(deserializer: D) -> Result<SessionPane, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
+    use serde::de::IntoDeserializer;
     let raw = String::deserialize(deserializer)?;
-    Ok(match raw.as_str() {
-        "sql" => SessionPane::Sql,
-        "schema" => SessionPane::Schema,
-        _ => SessionPane::Browser,
-    })
+    let by_name: serde::de::value::StringDeserializer<serde::de::value::Error> =
+        raw.into_deserializer();
+    Ok(SessionPane::deserialize(by_name).unwrap_or_default())
 }
 
 /// One open connection tab, remembered for the next launch.
@@ -1300,6 +1304,26 @@ mod tests {
         let session = load_session(&path);
         assert_eq!(session.tabs.len(), 1);
         assert_eq!(session.tabs[0].pane, SessionPane::Browser);
+    }
+
+    #[test]
+    fn every_pane_variant_survives_the_tolerant_deserializer() {
+        // Guards the reason `pane_or_default` delegates to the derive: each
+        // variant must read back as itself, not quietly as the default.
+        for pane in [SessionPane::Browser, SessionPane::Sql, SessionPane::Schema] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("session.toml");
+            let session = Session {
+                tabs: vec![SessionTab {
+                    locator: "/db".into(),
+                    pane,
+                    ..Default::default()
+                }],
+                active: None,
+            };
+            save_session(&path, &session).unwrap();
+            assert_eq!(load_session(&path).tabs[0].pane, pane, "{pane:?}");
+        }
     }
 
     #[test]
