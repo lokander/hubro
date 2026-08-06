@@ -357,6 +357,10 @@ pub enum SessionPane {
     #[default]
     Browser,
     Sql,
+    /// The schema pane (FRE-69). Older session.toml files never contain it;
+    /// a newer file read by an older build falls back to `Browser` via the
+    /// enum's `Default`, so both directions stay readable.
+    Schema,
 }
 
 /// One open connection tab, remembered for the next launch.

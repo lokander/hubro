@@ -82,6 +82,8 @@ pub enum Pane {
     #[default]
     Browser,
     Sql,
+    /// The selected table's structure — columns and indexes (FRE-69).
+    Schema,
 }
 
 impl Pane {
@@ -90,6 +92,7 @@ impl Pane {
         match self {
             Pane::Browser => SessionPane::Browser,
             Pane::Sql => SessionPane::Sql,
+            Pane::Schema => SessionPane::Schema,
         }
     }
 
@@ -97,6 +100,7 @@ impl Pane {
         match pane {
             SessionPane::Browser => Pane::Browser,
             SessionPane::Sql => Pane::Sql,
+            SessionPane::Schema => Pane::Schema,
         }
     }
 }
@@ -151,8 +155,6 @@ pub enum NavAction {
 pub struct TabUi {
     /// Table selected in the sidebar (shown in the data grid).
     pub selected_table: Option<TableRef>,
-    /// Tables expanded in the sidebar tree, by [`TableRef::key`].
-    pub expanded: HashSet<String>,
     /// Data browser vs SQL editor.
     pub pane: Pane,
     /// SQL editor buffer, synced from the webview so it survives pane and
@@ -241,15 +243,6 @@ impl ExportStatus {
 pub struct PendingSql {
     pub script: String,
     pub statements: Vec<String>,
-}
-
-impl TabUi {
-    /// Flips one table's expansion state.
-    pub fn toggle_expanded(&mut self, table: &str) {
-        if !self.expanded.remove(table) {
-            self.expanded.insert(table.to_string());
-        }
-    }
 }
 
 /// What a pending [`PasswordPrompt`] is asking for.
@@ -1612,9 +1605,11 @@ impl AppState {
             .get(&id)
             .map(|ui| ui.pane)
             .unwrap_or_default();
+        // Cycles rather than toggles now that there are three panes (FRE-69).
         let target = match current {
             Pane::Browser => Pane::Sql,
-            Pane::Sql => Pane::Browser,
+            Pane::Sql => Pane::Schema,
+            Pane::Schema => Pane::Browser,
         };
         self.set_pane(id, target);
     }
@@ -2077,15 +2072,6 @@ impl AppState {
                 .unwrap_or_default(),
             _ => Vec::new(),
         }
-    }
-
-    /// Flips a table's expansion state in one tab's sidebar tree.
-    pub fn toggle_expanded(mut self, id: ConnectionId, table: &str) {
-        self.tab_ui
-            .write()
-            .entry(id)
-            .or_default()
-            .toggle_expanded(table);
     }
 
     /// Stages a cell edit (FRE-24 pushes edits in through this). Edits
@@ -2903,16 +2889,5 @@ mod tests {
     fn canonical_falls_back_for_missing_files() {
         let missing = Path::new("/definitely/not/here.db");
         assert_eq!(canonical(missing), missing.to_path_buf());
-    }
-
-    #[test]
-    fn toggle_expanded_flips_per_table() {
-        let mut ui = TabUi::default();
-        ui.toggle_expanded("artists");
-        ui.toggle_expanded("albums");
-        assert!(ui.expanded.contains("artists"));
-        ui.toggle_expanded("artists");
-        assert!(!ui.expanded.contains("artists"));
-        assert!(ui.expanded.contains("albums"));
     }
 }

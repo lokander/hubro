@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use dioxus_icons::lucide::{ChevronDown, ChevronRight, Database, RefreshCw};
+use dioxus_icons::lucide::{Database, RefreshCw};
 
 use crate::db::{ConnectionId, TableKind, TableMeta};
 
@@ -85,8 +85,8 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
     }
 }
 
-/// One table/view in the tree: a row with expand toggle + name, and when
-/// expanded, its columns and indexes.
+/// One table/view in the list: its name plus a kind badge. Structure lives
+/// in the Schema pane now (FRE-69), so there is nothing to expand.
 #[component]
 fn TableNode(id: ConnectionId, table: ReadSignal<TableMeta>) -> Element {
     let state = use_context::<AppState>();
@@ -96,19 +96,12 @@ fn TableNode(id: ConnectionId, table: ReadSignal<TableMeta>) -> Element {
         schema: table.read().schema.clone(),
         name: name.clone(),
     };
-    let key = table_ref.key();
-    let (expanded, selected) = {
-        let tab_ui = state.tab_ui.read();
-        match tab_ui.get(&id) {
-            Some(ui) => (
-                ui.expanded.contains(&key),
-                ui.selected_table.as_ref() == Some(&table_ref),
-            ),
-            None => (false, false),
-        }
-    };
+    let selected = state
+        .tab_ui
+        .read()
+        .get(&id)
+        .is_some_and(|ui| ui.selected_table.as_ref() == Some(&table_ref));
 
-    let toggle_key = key.clone();
     let select_ref = table_ref.clone();
     rsx! {
         li {
@@ -118,16 +111,6 @@ fn TableNode(id: ConnectionId, table: ReadSignal<TableMeta>) -> Element {
                 } else {
                     "flex items-center gap-1 px-2 py-1 text-sm text-slate-900 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800/60"
                 },
-                button {
-                    class: "w-4 shrink-0 text-xs text-slate-500 hover:text-slate-900 dark:hover:text-slate-200",
-                    aria_label: if expanded { "Collapse" } else { "Expand" },
-                    onclick: move |_| state.toggle_expanded(id, &toggle_key),
-                    if expanded {
-                        ChevronDown { size: 14 }
-                    } else {
-                        ChevronRight { size: 14 }
-                    }
-                }
                 button {
                     // `dv-table-btn` + `data-selected` drive the keyboard
                     // sidebar navigation (FRE-15): the global key listener
@@ -146,51 +129,6 @@ fn TableNode(id: ConnectionId, table: ReadSignal<TableMeta>) -> Element {
                     if kind == TableKind::MaterializedView {
                         span { class: "rounded bg-fuchsia-100 dark:bg-fuchsia-900/50 px-1 text-xs text-fuchsia-700 dark:text-fuchsia-300",
                             "matview"
-                        }
-                    }
-                }
-            }
-            if expanded {
-                TableDetails { table }
-            }
-        }
-    }
-}
-
-#[component]
-fn TableDetails(table: ReadSignal<TableMeta>) -> Element {
-    let table = table.read();
-    rsx! {
-        ul { class: "border-l border-slate-200 dark:border-slate-800 pb-1 pl-3 ml-4",
-            for column in table.columns.clone() {
-                li { class: "flex items-baseline gap-2 px-2 py-0.5 text-xs",
-                    span { class: "font-mono text-slate-900 dark:text-slate-300", "{column.name}" }
-                    span { class: "font-mono text-slate-500",
-                        {if column.type_name.is_empty() { "any".to_string() } else { column.type_name.to_lowercase() }}
-                    }
-                    if column.primary_key_position.is_some() {
-                        span { class: "rounded bg-amber-100 dark:bg-amber-900/50 px-1 text-amber-700 dark:text-amber-300", "PK" }
-                    }
-                    if !column.nullable {
-                        span { class: "text-slate-400 dark:text-slate-600", "not null" }
-                    }
-                }
-            }
-            if !table.indexes.is_empty() {
-                li { class: "mt-1 px-2 text-xs uppercase tracking-wide text-slate-400 dark:text-slate-600", "Indexes" }
-                for index in table.indexes.clone() {
-                    li { class: "flex items-baseline gap-2 px-2 py-0.5 text-xs",
-                        span { class: "truncate font-mono text-slate-500 dark:text-slate-400", "{index.name}" }
-                        span { class: "font-mono text-slate-400 dark:text-slate-600",
-                            "({index.columns.join(\", \")})"
-                        }
-                        if index.unique {
-                            span { class: "rounded bg-emerald-100 dark:bg-emerald-900/50 px-1 text-emerald-700 dark:text-emerald-300",
-                                "unique"
-                            }
-                        }
-                        if index.partial {
-                            span { class: "rounded bg-slate-200 dark:bg-slate-800 px-1 text-slate-500 dark:text-slate-400", "partial" }
                         }
                     }
                 }

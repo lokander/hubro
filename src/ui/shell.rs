@@ -16,6 +16,7 @@ use super::editor::SqlEditor;
 use super::grid::DataGrid;
 use super::icons::BackendIcon;
 use super::notice::{Banner, BannerKind, EmptyState};
+use super::schema::SchemaPane;
 use super::sidebar::SchemaSidebar;
 use super::state::{ActiveView, AppState};
 
@@ -409,7 +410,7 @@ fn Cheatsheet() -> Element {
                         ShortcutRow { keys: "/", desc: "Focus the filter box" }
                         ShortcutRow { keys: "Ctrl+B", desc: "Focus the table list" }
                         ShortcutRow { keys: "↑ ↓ / Enter", desc: "Move / open a table (in the list)" }
-                        ShortcutRow { keys: "Ctrl+E", desc: "Switch Data / SQL pane" }
+                        ShortcutRow { keys: "Ctrl+E", desc: "Cycle Data / SQL / Schema pane" }
                         ShortcutRow { keys: "?", desc: "Toggle this help" }
                         ShortcutRow { keys: "Esc", desc: "Close this help" }
                     }
@@ -530,10 +531,23 @@ fn ConnectionView(id: ConnectionId) -> Element {
                 div { class: "flex gap-1 border-b border-slate-200 dark:border-slate-800 px-3 py-1.5",
                     PaneButton { id, pane, target: super::state::Pane::Browser, label: "Data" }
                     PaneButton { id, pane, target: super::state::Pane::Sql, label: "SQL" }
+                    PaneButton { id, pane, target: super::state::Pane::Schema, label: "Schema" }
                 }
                 match pane {
                     super::state::Pane::Sql => rsx! {
                         SqlEditor { key: "sql-{id:?}", id }
+                    },
+                    // Same selected-table semantics as Data, so the two panes
+                    // always describe the same table (FRE-69).
+                    super::state::Pane::Schema => match selected {
+                        Some(table) => rsx! {
+                            SchemaPane { key: "schema-{table.key()}", id, table: table.clone() }
+                        },
+                        None => rsx! {
+                            div { class: "flex flex-1 items-center justify-center",
+                                p { class: "text-slate-500", "Select a table to view its schema." }
+                            }
+                        },
                     },
                     super::state::Pane::Browser => match selected {
                         // Keyed by table so grid state (page, sort, filter)
@@ -553,7 +567,7 @@ fn ConnectionView(id: ConnectionId) -> Element {
     }
 }
 
-/// One segment of the Data / SQL pane switch.
+/// One segment of the Data / SQL / Schema pane switch.
 #[component]
 fn PaneButton(
     id: ConnectionId,
