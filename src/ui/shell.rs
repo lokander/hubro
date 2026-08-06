@@ -1063,7 +1063,10 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
                 }
                 button {
                     class: "rounded px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
-                    onclick: move |_| state.password_prompt.clone().set(None),
+                    onclick: move |_| {
+                        state.clear_pending_edit();
+                        state.password_prompt.clone().set(None);
+                    },
                     "Cancel"
                 }
             }
@@ -1118,7 +1121,10 @@ fn HostKeyPromptCard(prompt: super::state::HostKeyPrompt) -> Element {
                 }
                 button {
                     class: "rounded px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
-                    onclick: move |_| state.host_key_prompt.clone().set(None),
+                    onclick: move |_| {
+                        state.clear_pending_edit();
+                        state.host_key_prompt.clone().set(None);
+                    },
                     "Cancel"
                 }
             }
@@ -1163,7 +1169,10 @@ fn EntraSignInCard(prompt: super::state::EntraPrompt) -> Element {
                 }
                 button {
                     class: "rounded px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
-                    onclick: move |_| state.entra_prompt.clone().set(None),
+                    onclick: move |_| {
+                        state.clear_pending_edit();
+                        state.entra_prompt.clone().set(None);
+                    },
                     "Cancel"
                 }
             }
@@ -1196,7 +1205,8 @@ fn split_url(url: &str, option_key: &str) -> Option<UrlFields> {
         if key == option_key {
             option = Some(value.into_owned());
         } else if key == "trustservercertificate" {
-            trust_cert = value.eq_ignore_ascii_case("true");
+            // Same spellings the SQL Server driver accepts.
+            trust_cert = matches!(value.to_ascii_lowercase().as_str(), "true" | "yes" | "1");
         }
     }
     Some(UrlFields {
