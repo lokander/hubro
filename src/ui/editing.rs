@@ -237,25 +237,64 @@ pub fn CellEditor(
     dialect: Dialect,
     nullable: bool,
     initial: Value,
+    /// Uncommitted text restored from a previous mount whose row was
+    /// scrolled out of the virtual window while the input didn't parse
+    /// (FRE-74); seeds the input instead of `initial` and counts as
+    /// modified.
+    draft: Option<String>,
     on_commit: EventHandler<(Option<Value>, EditNav)>,
     on_cancel: EventHandler<()>,
+    /// Receives the raw text when the editor unmounts with input that does
+    /// not parse (FRE-74) — the grid stashes it on the active edit so a
+    /// remount can restore it.
+    on_draft: Option<EventHandler<String>>,
     /// Revert-to-database-default action. Existing rows have no default to
     /// revert to, so the grid only wires this for pending-insert cells.
     on_default: Option<EventHandler<()>>,
 ) -> Element {
+    let has_draft = draft.is_some();
     let initial_for_text = initial.clone();
-    let mut text = use_signal(move || match &initial_for_text {
-        Value::Null => String::new(),
-        value => value.display(),
+    let mut text = use_signal(move || match draft {
+        Some(draft) => draft,
+        None => match &initial_for_text {
+            Value::Null => String::new(),
+            value => value.display(),
+        },
     });
     let initial_for_checked = initial.clone();
     let mut checked = use_signal(move || bool_checked(&initial_for_checked));
     let mut error = use_signal(|| Option::<String>::None);
-    // Nothing typed/toggled yet: committing stages nothing (see above).
-    let mut modified = use_signal(|| false);
+    // Nothing typed/toggled yet: committing stages nothing (see above). A
+    // restored draft was typed on the previous mount, so it counts.
+    let mut modified = use_signal(|| has_draft);
     // Set once the editor committed or cancelled, so the blur that follows
     // closing (the input unmounts / loses focus) cannot double-commit.
     let mut finished = use_signal(|| false);
+
+    // Scroll-out unmount (FRE-74): windowed rendering dropping this row must
+    // not silently discard typed input. Treat it like blur: stage the parsed
+    // value; input that doesn't parse is handed to `on_draft` instead so the
+    // remount can restore it. Any committed/cancelled editor already set
+    // `finished`, so a normal close never double-commits here.
+    use_drop(move || {
+        if *finished.peek() || !*modified.peek() {
+            return;
+        }
+        let parsed = if kind == EditorKind::Bool {
+            Ok(bool_value(dialect, *checked.peek()))
+        } else {
+            let raw = text.peek().clone();
+            parse_input(kind, dialect, &raw)
+        };
+        match parsed {
+            Ok(value) => on_commit.call((Some(value), EditNav::Stay)),
+            Err(_) => {
+                if let Some(on_draft) = on_draft {
+                    on_draft.call(text.peek().clone());
+                }
+            }
+        }
+    });
 
     let mut commit = move |nav: EditNav| {
         if finished() {
