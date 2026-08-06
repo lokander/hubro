@@ -565,8 +565,10 @@ impl AppState {
             // the startup detection task (below) corrects `System`. Root-
             // scoped: written from that spawn_forever task.
             dark: Signal::new_in_scope(theme.resolve_dark(false), ScopeId::ROOT),
-            // Root-scoped: written from the spawn_forever export task.
+            // Root-scoped: resolved from the Entra sign-in task, which
+            // outlives the form that registered the edit.
             pending_edit: Signal::new_in_scope(None, ScopeId::ROOT),
+            // Root-scoped: written from the spawn_forever export task.
             export_status: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             export_generations: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             // FK navigation state is only ever touched from UI event handlers,
@@ -804,6 +806,10 @@ impl AppState {
     ) {
         self.connect_error.set(None);
         if self.focus_or_reserve(&url) {
+            // Already open (or reserved): no connect runs, so the save below
+            // never fires. An edit still has to land — save_*_if_open no-ops
+            // unless the locator is genuinely open (FRE-75).
+            self.save_postgres_if_open(&url, &name, tunnel.clone(), auth.clone());
             return;
         }
         let Some((connect_url, live_tunnel)) = self
@@ -1023,6 +1029,11 @@ impl AppState {
         // The prompt replaces the reservation made by connect_postgres, so
         // re-reserve here.
         if self.focus_or_reserve(&url) {
+            // Already open (or reserved): no connect runs, so the save
+            // below never fires. An edit still has to land —
+            // save_*_if_open no-ops unless the locator is genuinely open
+            // (FRE-75).
+            self.save_postgres_if_open(&url, &name, tunnel.clone(), PgAuth::Password);
             return;
         }
         let Some((connect_url, live_tunnel)) = self
@@ -1102,6 +1113,10 @@ impl AppState {
     ) {
         self.connect_error.set(None);
         if self.focus_or_reserve(&url) {
+            // Already open (or reserved): no connect runs, so the save below
+            // never fires. An edit still has to land — save_*_if_open no-ops
+            // unless the locator is genuinely open (FRE-75).
+            self.save_sqlserver_if_open(&url, &name, tunnel.clone(), auth.clone());
             return;
         }
         let Some((connect_url, live_tunnel)) = self
@@ -1342,6 +1357,11 @@ impl AppState {
         // The prompt replaces the reservation made by connect_sqlserver, so
         // re-reserve here.
         if self.focus_or_reserve(&url) {
+            // Already open (or reserved): no connect runs, so the save
+            // below never fires. An edit still has to land —
+            // save_*_if_open no-ops unless the locator is genuinely open
+            // (FRE-75).
+            self.save_sqlserver_if_open(&url, &name, tunnel.clone(), PgAuth::Password);
             return;
         }
         let Some((connect_url, live_tunnel)) = self
