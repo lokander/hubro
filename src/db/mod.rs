@@ -36,7 +36,7 @@ pub use registry::{
 };
 pub use rowkey::{delete_sql, detect_row_identity, update_sql, RowIdentity};
 pub use schema::{
-    ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta, TypeDetail,
+    ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta, TypeDetail, TypeRef,
 };
 pub use script::{
     classify_statement, needs_confirmation, run_script, split_statements, statement_preview,

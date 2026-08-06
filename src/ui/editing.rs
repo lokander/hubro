@@ -1,9 +1,18 @@
 //! Inline cell editing (FRE-24): type-aware editor kinds, input validation,
 //! and the in-place `CellEditor` component the grid mounts over a cell.
 //!
-//! Editor kinds derive from the introspected column type
-//! ([`ColumnMeta::type_name`](crate::db::ColumnMeta)) by **case-insensitive
-//! substring matching**, so both SQLite declared types ("INTEGER",
+//! Editor kinds derive from the introspected column type. A column whose
+//! [`TypeDetail`](crate::db::TypeDetail) resolved to an enum or an array
+//! takes that editor directly (FRE-71) — Postgres names those columns
+//! `USER-DEFINED` and `ARRAY`, which say nothing about the type:
+//!
+//! - enum → a dropdown of the type's variants, in declaration order;
+//!   picking one stages and closes, like the boolean checkbox
+//! - array → the array literal as text, checked for well-formedness
+//!   before staging (element types are left to the database)
+//!
+//! Every other column falls back to **case-insensitive substring matching**
+//! on the declared type name, so both SQLite declared types ("INTEGER",
 //! "VARCHAR(40)", possibly empty) and Postgres `data_type` strings
 //! ("integer", "timestamp without time zone", "jsonb") map without a
 //! per-backend table:
@@ -268,7 +277,9 @@ fn validate_array_literal(text: &str) -> Result<(), String> {
                 depth = depth
                     .checked_sub(1)
                     .ok_or_else(|| "unbalanced '}' in array literal".to_string())?;
-                if depth == 0 {
+                if depth == 0 && closed_at.is_none() {
+                    // Only the FIRST balanced group is the literal; anything
+                    // after it is trailing junk ({1}{2}).
                     closed_at = Some(index + ch.len_utf8());
                 }
             }
@@ -323,10 +334,11 @@ pub enum EditNav {
 ///   default": the column is then omitted from the INSERT entirely.
 /// - Validation failures (numeric, JSON) show inline and keep the editor
 ///   open; nothing is staged.
-/// - Checkbox (boolean) editors stage-and-close immediately on toggle.
+/// - Checkbox (boolean) and enum-dropdown editors stage-and-close
+///   immediately on toggle/selection.
 #[component]
 pub fn CellEditor(
-    kind: ReadOnlySignal<EditorKind>,
+    kind: ReadSignal<EditorKind>,
     dialect: Dialect,
     nullable: bool,
     initial: Value,
@@ -605,6 +617,8 @@ mod tests {
 
     /// Type-name-only derivation (no enum/array detail), which is what the
     /// name-matching rules below exercise.
+    use crate::db::TypeRef;
+
     fn plain_kind(type_name: &str) -> EditorKind {
         editor_kind(type_name, &TypeDetail::Plain)
     }
@@ -628,7 +642,10 @@ mod tests {
             editor_kind(
                 "USER-DEFINED",
                 &TypeDetail::Enum {
-                    type_name: "public.mood".into(),
+                    type_ref: TypeRef {
+                        schema: "public".into(),
+                        name: "mood".into(),
+                    },
                     variants: variants.clone(),
                 }
             ),
@@ -638,7 +655,10 @@ mod tests {
             editor_kind(
                 "ARRAY",
                 &TypeDetail::Array {
-                    type_name: "pg_catalog._text".into()
+                    type_ref: TypeRef {
+                        schema: "pg_catalog".into(),
+                        name: "_text".into(),
+                    }
                 }
             ),
             EditorKind::Array
@@ -649,7 +669,10 @@ mod tests {
             editor_kind(
                 "USER-DEFINED",
                 &TypeDetail::Enum {
-                    type_name: "public.mood".into(),
+                    type_ref: TypeRef {
+                        schema: "public".into(),
+                        name: "mood".into(),
+                    },
                     variants: vec![],
                 }
             ),
@@ -692,6 +715,10 @@ mod tests {
         assert!(!ok("{1,2}}"));
         assert!(!ok(r#"{"unterminated}"#));
         assert!(!ok("{1,2} trailing"));
+        // A second brace group is trailing junk, not a second literal.
+        assert!(!ok("{1}{2}"));
+        assert!(!ok("{1} {2}"));
+        assert!(!ok("{}{}"));
     }
 
     #[test]

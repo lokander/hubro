@@ -17,7 +17,7 @@ use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
 use super::error::DbError;
 use super::export::{export_io_err, ExportFormat, ExportSink};
 use super::schema::{
-    ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta, TypeDetail,
+    ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta, TypeDetail, TypeRef,
 };
 use super::staged::CheckedStatement;
 use super::value::{cap_value, ColumnInfo, QueryResult, Value};
@@ -733,19 +733,19 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
         let type_oid: Option<i64> = get(row, "type_oid")?;
         let type_schema: Option<String> = get(row, "type_schema")?;
         let type_base: Option<String> = get(row, "type_base")?;
-        let qualified = match (&type_schema, &type_base) {
-            (Some(schema), Some(base)) => Some(format!("{schema}.{base}")),
+        let type_ref = match (type_schema, type_base) {
+            (Some(schema), Some(name)) => Some(TypeRef { schema, name }),
             _ => None,
         };
-        let type_detail = match (typtype.as_deref(), typcategory.as_deref(), qualified) {
-            (Some("e"), _, Some(type_name)) => type_oid
+        let type_detail = match (typtype.as_deref(), typcategory.as_deref(), type_ref) {
+            (Some("e"), _, Some(type_ref)) => type_oid
                 .and_then(|oid| enum_variants.get(&oid))
                 .map(|variants| TypeDetail::Enum {
-                    type_name,
+                    type_ref,
                     variants: variants.clone(),
                 })
                 .unwrap_or_default(),
-            (_, Some("A"), Some(type_name)) => TypeDetail::Array { type_name },
+            (_, Some("A"), Some(type_ref)) => TypeDetail::Array { type_ref },
             _ => TypeDetail::Plain,
         };
         tables[idx].columns.push(ColumnMeta {
