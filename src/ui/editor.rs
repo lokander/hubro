@@ -219,6 +219,8 @@ fn HistoryPanel(id: ConnectionId, editor_element: String) -> Element {
     let mut confirm_clear = use_signal(|| false);
     let store_ready = state.history.read().is_some();
     let history_error = state.history_error.read().clone();
+    let mut record_error_signal = state.history_record_error;
+    let record_error = record_error_signal.read().clone();
     let recording = *state.history_recording.read();
 
     let entries = use_resource(move || {
@@ -266,6 +268,17 @@ fn HistoryPanel(id: ConnectionId, editor_element: String) -> Element {
                 }
             }
             div { class: "min-h-0 flex-1 overflow-y-auto",
+                // A failed write for a completed run: warn without hiding
+                // the still-readable list (FRE-72).
+                if let Some(err) = record_error {
+                    div { class: "p-2",
+                        Banner {
+                            kind: BannerKind::Warning,
+                            message: err,
+                            on_dismiss: move |_| record_error_signal.set(None),
+                        }
+                    }
+                }
                 if let Some(err) = history_error {
                     div { class: "p-2",
                         Banner { kind: BannerKind::Warning, message: format!("History is unavailable: {err}") }

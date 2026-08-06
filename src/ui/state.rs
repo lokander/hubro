@@ -410,6 +410,10 @@ pub struct AppState {
     pub history: Signal<Option<HistoryStore>>,
     /// Why the history store is unavailable, shown in the history panel.
     pub history_error: Signal<Option<String>>,
+    /// A failed history write for an otherwise-successful run (FRE-72).
+    /// Shown as a dismissible banner above the (still readable) history
+    /// list; cleared by the next record attempt that reaches the store.
+    pub history_record_error: Signal<Option<String>>,
     /// Bumped whenever a run lands in (or is cleared from) the history
     /// store, so open history panels re-query.
     pub history_nonce: Signal<u64>,
@@ -490,6 +494,7 @@ impl AppState {
             // built the state must not own them.
             history: Signal::new_in_scope(None, ScopeId::ROOT),
             history_error: Signal::new_in_scope(None, ScopeId::ROOT),
+            history_record_error: Signal::new_in_scope(None, ScopeId::ROOT),
             history_nonce: Signal::new_in_scope(0, ScopeId::ROOT),
             history_recording: Signal::new_in_scope(true, ScopeId::ROOT),
             // Root-scoped: the startup detection task below (a
@@ -1795,17 +1800,18 @@ impl AppState {
             .record(&locator, &script, success, error.as_deref())
             .await
         {
-            Ok(true) => {
-                // Record errors are transient (store-open failures leave the
-                // store None and never reach here), so a success means any
-                // shown record failure is stale.
-                self.history_error.set(None);
-                let mut nonce = self.history_nonce.write();
-                *nonce += 1;
+            Ok(recorded) => {
+                // The store answered, so any shown record failure is stale —
+                // whether this run was recorded (true) or recording is
+                // switched off (false).
+                self.history_record_error.set(None);
+                if recorded {
+                    let mut nonce = self.history_nonce.write();
+                    *nonce += 1;
+                }
             }
-            Ok(false) => {}
             Err(err) => {
-                self.history_error
+                self.history_record_error
                     .set(Some(format!("Query ran, but recording it failed: {err}")));
             }
         }
