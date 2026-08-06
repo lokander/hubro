@@ -586,13 +586,88 @@ struct SavedRow {
     auth: crate::config::PgAuth,
 }
 
+/// Which add-connection form the modal is showing (FRE-67). SQLite has no
+/// form — it goes straight to the native file picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectForm {
+    Postgres,
+    SqlServer,
+}
+
+/// Modal shell for the add-connection forms (FRE-67). Follows the app's
+/// overlay pattern (`fixed inset-0 z-50`, dimmed backdrop, centered panel)
+/// with two deliberate differences from the stateless overlays (cheatsheet,
+/// cell viewer):
+///
+/// - **A backdrop click does not dismiss.** These panels hold a half-typed
+///   connection, so only Escape or an explicit Cancel/✕ closes them.
+/// - **Escape is handled here, not by [`GLOBAL_KEYS_JS`].** That listener
+///   ignores keys while a text field has focus, which is most of the time in
+///   this form. The keydown bubbles from the fields to this container, and
+///   `stop_propagation` keeps it from also reaching the window listener (which
+///   would otherwise close the cheatsheet behind the modal).
+///
+/// The panel caps its height and scrolls internally so the tall forms (auth
+/// plus SSH tunnel) stay usable in a small window.
+#[component]
+fn ConnectFormModal(
+    on_close: EventHandler<()>,
+    /// A failed connect attempt for the form still on screen. Rendered here
+    /// because the panel's own banner sits behind the backdrop, and the form
+    /// deliberately stays open when a connect fails.
+    error: Option<String>,
+    on_dismiss_error: EventHandler<()>,
+    children: Element,
+) -> Element {
+    rsx! {
+        div {
+            class: "fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4 outline-none",
+            // Focused on mount so Escape works before the user clicks into a
+            // field; keydowns from the fields bubble here either way.
+            tabindex: "-1",
+            onmounted: move |evt: MountedEvent| {
+                spawn(async move {
+                    let _ = evt.set_focus(true).await;
+                });
+            },
+            onkeydown: move |evt: KeyboardEvent| {
+                if evt.code() == Code::Escape {
+                    evt.stop_propagation();
+                    on_close.call(());
+                }
+            },
+            div { class: "my-auto w-full max-w-xl",
+                div { class: "flex justify-end",
+                    button {
+                        class: "mb-1 rounded px-2 py-1 text-slate-300 hover:bg-white/10 hover:text-white",
+                        aria_label: "Close",
+                        onclick: move |_| on_close.call(()),
+                        X { size: 16 }
+                    }
+                }
+                if let Some(err) = error {
+                    div { class: "mb-2 rounded bg-white dark:bg-slate-900",
+                        Banner {
+                            kind: BannerKind::Error,
+                            message: err,
+                            on_dismiss: move |_| on_dismiss_error.call(()),
+                        }
+                    }
+                }
+                {children}
+            }
+        }
+    }
+}
+
 /// Launch screen: the persisted saved-connections list plus add flows for
 /// SQLite (native file picker) and Postgres (form or URL).
 #[component]
 fn ConnectionsScreen() -> Element {
     let state = use_context::<AppState>();
-    let mut show_pg_form = use_signal(|| false);
-    let mut show_mssql_form = use_signal(|| false);
+    // One open form at a time (they were a mutually-exclusive bool pair
+    // before FRE-67); `None` means no modal is up.
+    let mut open_form = use_signal(|| Option::<ConnectForm>::None);
     let error = state.connect_error.read().clone();
     let prompt = state.password_prompt.read().clone();
     let host_key_prompt = state.host_key_prompt.read().clone();
@@ -774,32 +849,35 @@ fn ConnectionsScreen() -> Element {
                 }
                 button {
                     class: "flex items-center gap-2 rounded bg-cyan-700 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-600",
-                    onclick: move |_| {
-                        let showing = *show_pg_form.read();
-                        show_pg_form.set(!showing);
-                        show_mssql_form.set(false);
-                    },
+                    onclick: move |_| open_form.set(Some(ConnectForm::Postgres)),
                     BackendIcon { dialect: Dialect::Postgres, size: 16 }
                     "Add Postgres…"
                 }
                 button {
                     class: "flex items-center gap-2 rounded bg-red-800 px-4 py-2 text-sm font-medium text-white hover:bg-red-700",
-                    onclick: move |_| {
-                        let showing = *show_mssql_form.read();
-                        show_mssql_form.set(!showing);
-                        show_pg_form.set(false);
-                    },
+                    onclick: move |_| open_form.set(Some(ConnectForm::SqlServer)),
                     BackendIcon { dialect: Dialect::SqlServer, size: 16 }
                     "Add SQL Server…"
                 }
             }
-            if show_pg_form() {
-                PostgresForm { on_done: move |_| show_pg_form.set(false) }
+            if let Some(kind) = open_form() {
+                ConnectFormModal {
+                    on_close: move |_| open_form.set(None),
+                    error: error.clone(),
+                    on_dismiss_error: move |_| state.connect_error.clone().set(None),
+                    match kind {
+                        ConnectForm::Postgres => rsx! {
+                            PostgresForm { on_done: move |_| open_form.set(None) }
+                        },
+                        ConnectForm::SqlServer => rsx! {
+                            SqlServerForm { on_done: move |_| open_form.set(None) }
+                        },
+                    }
+                }
             }
-            if show_mssql_form() {
-                SqlServerForm { on_done: move |_| show_mssql_form.set(false) }
-            }
-            if let Some(err) = error {
+            // Only when no modal is up — the modal renders it itself, so it
+            // isn't hidden behind the backdrop.
+            if let (Some(err), None) = (error, open_form()) {
                 div { class: "w-full max-w-xl px-8",
                     Banner {
                         kind: BannerKind::Error,
