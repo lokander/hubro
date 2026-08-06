@@ -1,9 +1,32 @@
 name: CI
 
+# Changes that can't affect a build never start one: docs, the license, and
+# image/source-art assets. (assets/tailwind.css and assets/codemirror.js are
+# committed build inputs, so they are deliberately *not* ignored; the icon
+# PNGs only feed `dx bundle`, which CI doesn't run.)
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
+      - "assets/**/*.png"
+      - "assets/**/*.ico"
+      - "assets/**/*.xcf"
   pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
+      - "assets/**/*.png"
+      - "assets/**/*.ico"
+      - "assets/**/*.xcf"
+  # Escape hatch for a PR that touches platform-specific code: run the full
+  # matrix on its branch with `gh workflow run ci.yml --ref <branch>`.
+  workflow_dispatch:
 
 # Cancel superseded runs on the same ref (e.g. a force-push to a PR).
 concurrency:
@@ -12,16 +35,31 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Debug info is a large share of both link time and target/ size, and CI
+  # never opens a debugger — dropping it shortens the build and shrinks the
+  # cache the runners push and pull each run (the Windows leg's two biggest
+  # costs). `dev` covers the lib and its dependencies, `test` the test
+  # binaries. Trade-off: a failing test's backtrace loses line numbers; set
+  # these to "line-tables-only" instead if that ever gets in the way.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
   check:
     name: fmt, clippy, test (${{ matrix.os }})
-    # One leg per supported desktop OS; keep the others running when one
-    # fails so platform-specific breakage is diagnosed in a single run.
+    # Pull requests check Linux only; every push to main (and a manual
+    # dispatch) checks all three desktop platforms. Tags are left out because
+    # release.yml already builds each OS. Keeping macOS and Windows off the PR
+    # path is what holds this repo inside the monthly Actions minutes — the
+    # cost is that platform-specific breakage surfaces after the merge, so
+    # dispatch the full matrix on the branch when a PR touches
+    # `cfg(windows)`/`cfg(unix)` code (see the workflow_dispatch note above).
+    # fail-fast off: when one leg fails, the others still report, so
+    # platform-specific breakage is diagnosed in a single run.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest", "windows-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
