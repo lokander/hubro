@@ -114,3 +114,13 @@ package locally:
 ```bash
 dx bundle --release --package-types deb --package-types appimage
 ```
+
+## License
+
+Hubro is free software under the [GNU General Public License v3.0](LICENSE).
+You may use, study, share and modify it; if you distribute a modified version,
+you must release your changes under the same license.
+
+Copyright © 2026 Fredrik Lokander. Holding the copyright outright means the
+GPL binds redistributors, not the author — so if the terms don't suit your
+situation, commercial licensing is available on request.
