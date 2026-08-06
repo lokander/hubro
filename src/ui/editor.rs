@@ -357,6 +357,8 @@ fn HistoryRow(id: ConnectionId, editor_element: String, entry: HistoryEntry) -> 
     let sql_for_load = entry.sql.clone();
     let json_for_load = sql_json.clone();
     let sql_for_run = entry.sql.clone();
+    let json_for_run = sql_json.clone();
+    let element_for_run = editor_element.clone();
     let title = match &entry.error {
         Some(error) => format!("{}\n\n{error}", entry.sql),
         None => entry.sql.clone(),
@@ -389,7 +391,15 @@ fn HistoryRow(id: ConnectionId, editor_element: String, entry: HistoryEntry) -> 
                 }
                 button {
                     class: "rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-cyan-700 dark:text-cyan-300 hover:bg-slate-200 dark:hover:bg-slate-800",
-                    onclick: move |_| state.run_sql(id, sql_for_run.clone()),
+                    // Load into the editor buffer first so a write-confirm
+                    // banner is confirmed against the text on screen (FRE-72).
+                    onclick: move |_| {
+                        document::eval(&format!(
+                            r#"DVEditor.setDoc("{element_for_run}", {json_for_run});"#
+                        ));
+                        state.set_sql_text(id, sql_for_run.clone());
+                        state.run_sql(id, sql_for_run.clone());
+                    },
                     "Run"
                 }
                 button {
