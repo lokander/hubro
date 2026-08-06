@@ -6,6 +6,7 @@ mod editor;
 mod grid;
 mod icons;
 mod notice;
+mod schema;
 mod shell;
 mod sidebar;
 pub mod stage;
