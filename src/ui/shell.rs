@@ -8,7 +8,8 @@ use dioxus::prelude::*;
 use dioxus_icons::lucide::{Moon, Plug, Sun, SunMoon, X};
 
 use crate::config::{
-    default_settings_path, load_settings, save_window_geometry, BackendKind, Theme, WindowGeometry,
+    default_settings_path, load_settings, save_window_geometry, BackendKind, SavedConnection,
+    Theme, WindowGeometry,
 };
 use crate::db::{ConnectionId, Dialect};
 
@@ -586,12 +587,16 @@ struct SavedRow {
     auth: crate::config::PgAuth,
 }
 
-/// Which add-connection form the modal is showing (FRE-67). SQLite has no
+/// Which connection form the modal is showing (FRE-67). SQLite has no
 /// form — it goes straight to the native file picker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ConnectForm {
     Postgres,
     SqlServer,
+    /// Editing an existing saved entry, prefilled from it (FRE-75). Carries
+    /// the entry itself so the form knows which locator to replace — the
+    /// edit may move it.
+    Edit(SavedConnection),
 }
 
 /// Modal shell for the add-connection forms (FRE-67). Follows the app's
@@ -836,6 +841,28 @@ fn ConnectionsScreen() -> Element {
                                     "{row.locator}"
                                 }
                             }
+                            if row.backend != BackendKind::Sqlite {
+                                button {
+                                    class: "rounded px-2 py-1 text-xs text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-200",
+                                    aria_label: "Edit saved connection",
+                                    onclick: {
+                                        let locator = row.locator.clone();
+                                        move |_| {
+                                            let entry = state
+                                                .saved
+                                                .read()
+                                                .entries()
+                                                .iter()
+                                                .find(|s| s.locator() == locator)
+                                                .cloned();
+                                            if let Some(entry) = entry {
+                                                open_form.set(Some(ConnectForm::Edit(entry)));
+                                            }
+                                        }
+                                    },
+                                    "Edit"
+                                }
+                            }
                             button {
                                 class: "rounded px-2 py-1 text-xs text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-200",
                                 aria_label: "Remove saved connection",
@@ -894,6 +921,20 @@ fn ConnectionsScreen() -> Element {
                         },
                         ConnectForm::SqlServer => rsx! {
                             SqlServerForm { on_done: move |_| open_form.set(None) }
+                        },
+                        // Only server connections reach here; the Edit action
+                        // isn't offered on SQLite entries.
+                        ConnectForm::Edit(saved @ SavedConnection::SqlServer { .. }) => rsx! {
+                            SqlServerForm {
+                                edit: saved.clone(),
+                                on_done: move |_| open_form.set(None),
+                            }
+                        },
+                        ConnectForm::Edit(saved) => rsx! {
+                            PostgresForm {
+                                edit: saved.clone(),
+                                on_done: move |_| open_form.set(None),
+                            }
                         },
                     }
                 }
@@ -1127,38 +1168,217 @@ fn EntraSignInCard(prompt: super::state::EntraPrompt) -> Element {
     }
 }
 
+/// A saved connection's URL split back into the form's individual fields
+/// (FRE-75). Both backends share the `scheme://user@host:port/db?opt=…`
+/// shape, so one splitter serves both; `option_key` names the query
+/// parameter the form's own dropdown owns (`sslmode` / `encrypt`).
+struct UrlFields {
+    host: String,
+    port: String,
+    database: String,
+    user: String,
+    option: Option<String>,
+    trust_cert: bool,
+}
+
+fn split_url(url: &str, option_key: &str) -> Option<UrlFields> {
+    let parsed = url::Url::parse(url).ok()?;
+    let mut option = None;
+    let mut trust_cert = false;
+    for (key, value) in parsed.query_pairs() {
+        match key.as_ref() {
+            k if k == option_key => option = Some(value.into_owned()),
+            "trust_server_certificate" => trust_cert = value == "true",
+            _ => {}
+        }
+    }
+    Some(UrlFields {
+        host: parsed.host_str().unwrap_or_default().to_string(),
+        port: parsed.port().map(|p| p.to_string()).unwrap_or_default(),
+        database: parsed.path().trim_start_matches('/').to_string(),
+        user: percent_decode(parsed.username()),
+        option,
+        trust_cert,
+    })
+}
+
+/// Percent-decodes a URL component back to what the user typed into the
+/// field (the url crate encodes on the way in).
+fn percent_decode(raw: &str) -> String {
+    percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| raw.to_string())
+}
+
+/// A saved entry decomposed into the connection forms' field values
+/// (FRE-75). Secrets are deliberately absent: the password and SSH
+/// passphrase fields always start empty, and an empty field on save means
+/// "keep whatever is in the keyring".
+#[derive(Clone, PartialEq)]
+struct EditPrefill {
+    name: String,
+    host: String,
+    port: String,
+    database: String,
+    user: String,
+    /// `sslmode` for Postgres, `encrypt` for SQL Server.
+    option: Option<String>,
+    trust_cert: bool,
+    auth_mode: String,
+    entra_tenant: String,
+    entra_client_id: String,
+    tunnel: Option<crate::tunnel::TunnelConfig>,
+    ssh_host: String,
+    ssh_port: String,
+    ssh_user: String,
+    ssh_use_key: bool,
+    ssh_key_path: String,
+}
+
+impl Default for EditPrefill {
+    /// The add flow's starting point. Note `auth_mode`/`entra_tenant` are
+    /// the forms' real defaults rather than empty strings — the password
+    /// field only renders while `auth_mode` is "password".
+    fn default() -> Self {
+        EditPrefill {
+            name: String::new(),
+            host: String::new(),
+            port: String::new(),
+            database: String::new(),
+            user: String::new(),
+            option: None,
+            trust_cert: false,
+            auth_mode: "password".to_string(),
+            entra_tenant: "organizations".to_string(),
+            entra_client_id: String::new(),
+            tunnel: None,
+            ssh_host: String::new(),
+            ssh_port: String::new(),
+            ssh_user: String::new(),
+            ssh_use_key: false,
+            ssh_key_path: String::new(),
+        }
+    }
+}
+
+impl EditPrefill {
+    fn from_saved(saved: SavedConnection) -> Self {
+        use crate::azure::EntraAuth;
+        use crate::config::PgAuth;
+        use crate::tunnel::TunnelAuth;
+        let (name, url, tunnel, auth, option_key) = match saved {
+            SavedConnection::Postgres {
+                name,
+                url,
+                tunnel,
+                auth,
+            } => (name, url, tunnel, auth, "sslmode"),
+            SavedConnection::SqlServer {
+                name,
+                url,
+                tunnel,
+                auth,
+            } => (name, url, tunnel, auth, "encrypt"),
+            // SQLite entries carry only a path; they have no edit form.
+            SavedConnection::Sqlite { name, .. } => {
+                return EditPrefill {
+                    name,
+                    ..EditPrefill::default()
+                }
+            }
+        };
+        let fields = split_url(&url, option_key);
+        let (auth_mode, entra_tenant, entra_client_id) = match auth {
+            PgAuth::Password => ("password".into(), "organizations".into(), String::new()),
+            PgAuth::Entra(EntraAuth::Interactive { tenant, client_id }) => (
+                "entra-interactive".to_string(),
+                tenant,
+                client_id.unwrap_or_default(),
+            ),
+            PgAuth::Entra(EntraAuth::ManagedIdentity { client_id }) => (
+                "entra-mi".to_string(),
+                "organizations".to_string(),
+                client_id.unwrap_or_default(),
+            ),
+        };
+        let (ssh_use_key, ssh_key_path) = match tunnel.as_ref().map(|t| &t.auth) {
+            Some(TunnelAuth::KeyFile { path }) => (true, path.display().to_string()),
+            _ => (false, String::new()),
+        };
+        EditPrefill {
+            name,
+            host: fields.as_ref().map(|f| f.host.clone()).unwrap_or_default(),
+            port: fields.as_ref().map(|f| f.port.clone()).unwrap_or_default(),
+            database: fields
+                .as_ref()
+                .map(|f| f.database.clone())
+                .unwrap_or_default(),
+            user: fields.as_ref().map(|f| f.user.clone()).unwrap_or_default(),
+            option: fields.as_ref().and_then(|f| f.option.clone()),
+            trust_cert: fields.as_ref().is_some_and(|f| f.trust_cert),
+            auth_mode,
+            entra_tenant,
+            entra_client_id,
+            ssh_host: tunnel.as_ref().map(|t| t.host.clone()).unwrap_or_default(),
+            ssh_port: tunnel
+                .as_ref()
+                .map(|t| t.port.to_string())
+                .unwrap_or_default(),
+            ssh_user: tunnel.as_ref().map(|t| t.user.clone()).unwrap_or_default(),
+            ssh_use_key,
+            ssh_key_path,
+            tunnel,
+        }
+    }
+}
+
 /// Add-Postgres panel: individual fields or a pasted URL, plus an optional
 /// SSH tunnel.
 #[component]
-fn PostgresForm(on_done: EventHandler<()>) -> Element {
+fn PostgresForm(
+    /// The saved entry being edited (FRE-75); `None` is the add flow. Its
+    /// locator is the key to replace on save — the edit may move it.
+    edit: Option<SavedConnection>,
+    on_done: EventHandler<()>,
+) -> Element {
     use crate::config::PgAuth;
     use crate::tunnel::{TunnelAuth, TunnelConfig};
     let state = use_context::<AppState>();
+    let prefill = edit.clone().map(EditPrefill::from_saved);
+    let seed = prefill.clone().unwrap_or_default();
+    let old_locator = edit.as_ref().map(|e| e.locator().to_string());
+    let editing = edit.is_some();
     let mut use_url = use_signal(|| false);
-    let mut name = use_signal(String::new);
-    let mut host = use_signal(String::new);
-    let mut port = use_signal(String::new);
-    let mut database = use_signal(String::new);
-    let mut user = use_signal(String::new);
+    let mut name = use_signal(|| seed.name.clone());
+    let mut host = use_signal(|| seed.host.clone());
+    let mut port = use_signal(|| seed.port.clone());
+    let mut database = use_signal(|| seed.database.clone());
+    let mut user = use_signal(|| seed.user.clone());
+    // Never prefilled: the stored secret isn't shown, and an empty field on
+    // save means "keep the existing keyring entry" (FRE-75).
     let mut password = use_signal(String::new);
     let mut remember = use_signal(|| true);
-    let mut sslmode = use_signal(|| "prefer".to_string());
+    let mut sslmode = use_signal(|| seed.option.clone().unwrap_or_else(|| "prefer".to_string()));
     // Authentication: "password" (default), "entra-interactive", or "entra-mi".
-    let auth_mode = use_signal(|| "password".to_string());
-    let entra_tenant = use_signal(|| "organizations".to_string());
-    let entra_client_id = use_signal(String::new);
+    let auth_mode = use_signal(|| seed.auth_mode.clone());
+    let entra_tenant = use_signal(|| seed.entra_tenant.clone());
+    let entra_client_id = use_signal(|| seed.entra_client_id.clone());
     let mut pasted_url = use_signal(String::new);
-    let use_tunnel = use_signal(|| false);
-    let ssh_host = use_signal(String::new);
-    let ssh_port = use_signal(String::new);
-    let ssh_user = use_signal(String::new);
+    let use_tunnel = use_signal(|| seed.tunnel.is_some());
+    let ssh_host = use_signal(|| seed.ssh_host.clone());
+    let ssh_port = use_signal(|| seed.ssh_port.clone());
+    let ssh_user = use_signal(|| seed.ssh_user.clone());
     // false = ssh-agent (the default), true = key file.
-    let ssh_use_key = use_signal(|| false);
-    let ssh_key_path = use_signal(String::new);
+    let ssh_use_key = use_signal(|| seed.ssh_use_key);
+    let ssh_key_path = use_signal(|| seed.ssh_key_path.clone());
     let ssh_passphrase = use_signal(String::new);
     let mut form_error = use_signal(|| Option::<String>::None);
 
     let mut submit = move || {
+        // Cloned per attempt: the async block below takes ownership, and
+        // `submit` has to stay FnMut.
+        let old_locator = old_locator.clone();
         // Tunnel settings are validated first so a bad SSH field fails
         // before any connect attempt.
         let tunnel: Option<TunnelConfig> = match tunnel_from_form(
@@ -1256,6 +1476,18 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
         let remember_choice = *remember.peek();
         form_error.set(None);
         spawn(async move {
+            // "Leave the password empty to keep the existing one" has to keep
+            // working when the edit moves the locator: the stored secret is
+            // still filed under the OLD one, and the connect below looks up
+            // the new. Carry it over first (FRE-75).
+            if entered_password.is_empty() {
+                if let Some(old) = old_locator.as_ref().filter(|old| **old != url) {
+                    if let Ok(Some(stored)) = crate::secrets::get_password_async(old.clone()).await
+                    {
+                        entered_password = stored;
+                    }
+                }
+            }
             // An entered passphrase seeds session memory so the tunnel open
             // finds it, exactly as if it came from the prompt.
             if let Some(passphrase) = &entered_passphrase {
@@ -1296,7 +1528,22 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                 if remember_choice && entered_passphrase.is_some() {
                     state.persist_ssh_passphrase(&url).await;
                 }
-                state.add_saved_postgres(display_name, url, tunnel, PgAuth::Password);
+                match &old_locator {
+                    // An edit replaces the original entry outright — name
+                    // included, and re-keyed when the locator moved. Any
+                    // entry the connect flow itself added under the new
+                    // locator is folded into it (FRE-75).
+                    Some(old) => state.update_saved(
+                        old.clone(),
+                        SavedConnection::Postgres {
+                            name: display_name,
+                            url,
+                            tunnel,
+                            auth: PgAuth::Password,
+                        },
+                    ),
+                    None => state.add_saved_postgres(display_name, url, tunnel, PgAuth::Password),
+                }
                 on_done.call(());
             }
         });
@@ -1306,7 +1553,9 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
     rsx! {
         div { class: "w-full max-w-xl rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/80 p-4",
             div { class: "mb-3 flex items-center justify-between",
-                span { class: "text-sm font-medium text-slate-900 dark:text-slate-200", "Add a Postgres connection" }
+                span { class: "text-sm font-medium text-slate-900 dark:text-slate-200",
+                    if editing { "Edit a Postgres connection" } else { "Add a Postgres connection" }
+                }
                 button {
                     class: "text-xs text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
                     onclick: move |_| {
@@ -1376,7 +1625,7 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                     input {
                         r#type: "password",
                         class: field_class,
-                        placeholder: "password",
+                        placeholder: if editing { "password (unchanged if left empty)" } else { "password" },
                         value: "{password}",
                         oninput: move |evt| password.set(evt.value()),
                     }
@@ -1412,7 +1661,7 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
                     button {
                         class: "rounded bg-cyan-700 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-600",
                         onclick: move |_| submit(),
-                        "Connect & save"
+                        if editing { "Save & connect" } else { "Connect & save" }
                     }
                 }
                 if let Some(err) = form_error() {
@@ -1431,32 +1680,43 @@ fn PostgresForm(on_done: EventHandler<()>) -> Element {
 /// and the display-name fallback, while the option sets (encrypt vs sslmode,
 /// trust-server-cert) differ enough that one shared form wasn't worth it.
 #[component]
-fn SqlServerForm(on_done: EventHandler<()>) -> Element {
+fn SqlServerForm(
+    /// The saved entry being edited (FRE-75); `None` is the add flow.
+    edit: Option<SavedConnection>,
+    on_done: EventHandler<()>,
+) -> Element {
     use crate::config::PgAuth;
     use crate::tunnel::{TunnelAuth, TunnelConfig};
     let state = use_context::<AppState>();
+    let seed = edit
+        .clone()
+        .map(EditPrefill::from_saved)
+        .unwrap_or_default();
+    let old_locator = edit.as_ref().map(|e| e.locator().to_string());
+    let editing = edit.is_some();
     let mut use_url = use_signal(|| false);
-    let mut name = use_signal(String::new);
-    let mut host = use_signal(String::new);
-    let mut port = use_signal(String::new);
-    let mut database = use_signal(String::new);
-    let mut user = use_signal(String::new);
+    let mut name = use_signal(|| seed.name.clone());
+    let mut host = use_signal(|| seed.host.clone());
+    let mut port = use_signal(|| seed.port.clone());
+    let mut database = use_signal(|| seed.database.clone());
+    let mut user = use_signal(|| seed.user.clone());
+    // Never prefilled: an empty field on save keeps the keyring entry.
     let mut password = use_signal(String::new);
     let mut remember = use_signal(|| true);
     // Matches the URL params the backend accepts: encrypt=on|off|plaintext.
-    let mut encrypt = use_signal(|| "on".to_string());
+    let mut encrypt = use_signal(|| seed.option.clone().unwrap_or_else(|| "on".to_string()));
     // Accept the server's TLS certificate without CA validation — needed for
     // dev servers with self-signed certs (e.g. the stock Docker image).
-    let mut trust_cert = use_signal(|| false);
+    let mut trust_cert = use_signal(|| seed.trust_cert);
     // Authentication: "password" (default), "entra-interactive", or "entra-mi".
-    let auth_mode = use_signal(|| "password".to_string());
-    let entra_tenant = use_signal(|| "organizations".to_string());
-    let entra_client_id = use_signal(String::new);
+    let auth_mode = use_signal(|| seed.auth_mode.clone());
+    let entra_tenant = use_signal(|| seed.entra_tenant.clone());
+    let entra_client_id = use_signal(|| seed.entra_client_id.clone());
     let mut pasted_url = use_signal(String::new);
-    let use_tunnel = use_signal(|| false);
-    let ssh_host = use_signal(String::new);
-    let ssh_port = use_signal(String::new);
-    let ssh_user = use_signal(String::new);
+    let use_tunnel = use_signal(|| seed.tunnel.is_some());
+    let ssh_host = use_signal(|| seed.ssh_host.clone());
+    let ssh_port = use_signal(|| seed.ssh_port.clone());
+    let ssh_user = use_signal(|| seed.ssh_user.clone());
     // false = ssh-agent (the default), true = key file.
     let ssh_use_key = use_signal(|| false);
     let ssh_key_path = use_signal(String::new);
@@ -1464,6 +1724,9 @@ fn SqlServerForm(on_done: EventHandler<()>) -> Element {
     let mut form_error = use_signal(|| Option::<String>::None);
 
     let mut submit = move || {
+        // Cloned per attempt: the async block below takes ownership, and
+        // `submit` has to stay FnMut.
+        let old_locator = old_locator.clone();
         // Tunnel settings are validated first so a bad SSH field fails
         // before any connect attempt.
         let tunnel: Option<TunnelConfig> = match tunnel_from_form(
@@ -1579,6 +1842,18 @@ fn SqlServerForm(on_done: EventHandler<()>) -> Element {
         let remember_choice = *remember.peek();
         form_error.set(None);
         spawn(async move {
+            // "Leave the password empty to keep the existing one" has to keep
+            // working when the edit moves the locator: the stored secret is
+            // still filed under the OLD one, and the connect below looks up
+            // the new. Carry it over first (FRE-75).
+            if entered_password.is_empty() {
+                if let Some(old) = old_locator.as_ref().filter(|old| **old != url) {
+                    if let Ok(Some(stored)) = crate::secrets::get_password_async(old.clone()).await
+                    {
+                        entered_password = stored;
+                    }
+                }
+            }
             // An entered passphrase seeds session memory so the tunnel open
             // finds it, exactly as if it came from the prompt.
             if let Some(passphrase) = &entered_passphrase {
@@ -1621,6 +1896,21 @@ fn SqlServerForm(on_done: EventHandler<()>) -> Element {
                 if remember_choice && entered_passphrase.is_some() {
                     state.persist_ssh_passphrase(&url).await;
                 }
+                // An edit replaces the original entry outright — name
+                // included, and re-keyed when the locator moved. The entry
+                // the connect flow just added under the new locator is
+                // folded into it (FRE-75).
+                if let Some(old) = &old_locator {
+                    state.update_saved(
+                        old.clone(),
+                        SavedConnection::SqlServer {
+                            name: display_name,
+                            url: url.clone(),
+                            tunnel,
+                            auth: PgAuth::Password,
+                        },
+                    );
+                }
                 on_done.call(());
             }
         });
@@ -1630,7 +1920,9 @@ fn SqlServerForm(on_done: EventHandler<()>) -> Element {
     rsx! {
         div { class: "w-full max-w-xl rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/80 p-4",
             div { class: "mb-3 flex items-center justify-between",
-                span { class: "text-sm font-medium text-slate-900 dark:text-slate-200", "Add a SQL Server connection" }
+                span { class: "text-sm font-medium text-slate-900 dark:text-slate-200",
+                    if editing { "Edit a SQL Server connection" } else { "Add a SQL Server connection" }
+                }
                 button {
                     class: "text-xs text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
                     onclick: move |_| {
@@ -1708,7 +2000,7 @@ fn SqlServerForm(on_done: EventHandler<()>) -> Element {
                     input {
                         r#type: "password",
                         class: field_class,
-                        placeholder: "password",
+                        placeholder: if editing { "password (unchanged if left empty)" } else { "password" },
                         value: "{password}",
                         oninput: move |evt| password.set(evt.value()),
                     }
@@ -1744,7 +2036,7 @@ fn SqlServerForm(on_done: EventHandler<()>) -> Element {
                     button {
                         class: "rounded bg-red-800 px-4 py-2 text-sm font-medium text-white hover:bg-red-700",
                         onclick: move |_| submit(),
-                        "Connect & save"
+                        if editing { "Save & connect" } else { "Connect & save" }
                     }
                 }
                 if let Some(err) = form_error() {
