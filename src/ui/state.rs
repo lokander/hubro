@@ -1737,10 +1737,14 @@ impl AppState {
             let elapsed_ms = started.elapsed().as_millis() as u64;
             // History is recorded even when a newer run made this one stale —
             // the script did execute. Cancelled runs never reach this point
-            // (the future is dropped), so they are not recorded.
+            // (the future is dropped), so they are not recorded. Recorded
+            // fire-and-forget: a wedged history.db must never delay the
+            // status update below (FRE-72).
             let error_text = result.as_ref().err().map(|e| e.error.to_string());
-            self.record_history(id, script, result.is_ok(), error_text)
-                .await;
+            let success = result.is_ok();
+            spawn_forever(async move {
+                self.record_history(id, script, success, error_text).await;
+            });
             // Stale-run guard: a newer run (or a close) owns the slot now.
             if self.sql_generation(id) != generation {
                 return;
@@ -1768,7 +1772,9 @@ impl AppState {
 
     /// Best-effort history write for a completed run: never blocks or fails
     /// the run itself. All signal reads are scoped before the await; the
-    /// nonce bump afterwards tells open history panels to re-query.
+    /// nonce bump afterwards tells open history panels to re-query. A write
+    /// failure surfaces in the history panel via [`Self::history_error`]
+    /// (and clears again on the next successful write).
     async fn record_history(
         mut self,
         id: ConnectionId,
@@ -1785,12 +1791,23 @@ impl AppState {
         let Some(locator) = locator else { return };
         let store = self.history.read().clone();
         let Some(store) = store else { return };
-        let recorded = store
+        match store
             .record(&locator, &script, success, error.as_deref())
-            .await;
-        if recorded.unwrap_or(false) {
-            let mut nonce = self.history_nonce.write();
-            *nonce += 1;
+            .await
+        {
+            Ok(true) => {
+                // Record errors are transient (store-open failures leave the
+                // store None and never reach here), so a success means any
+                // shown record failure is stale.
+                self.history_error.set(None);
+                let mut nonce = self.history_nonce.write();
+                *nonce += 1;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                self.history_error
+                    .set(Some(format!("Query ran, but recording it failed: {err}")));
+            }
         }
     }
 
