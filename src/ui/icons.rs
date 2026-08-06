@@ -22,8 +22,9 @@ use dioxus_icons::lucide::Server;
 
 use crate::db::Dialect;
 
-/// Default rendered size (px) for a brand mark — matches the Lucide icons
-/// alongside them in tabs and list entries.
+/// Default rendered size (px) for a brand mark: the tab-bar size, chosen to
+/// sit with the tab's text rather than to match its 12px close ✕. The connect
+/// panel passes 16 explicitly.
 const DEFAULT_SIZE: u32 = 14;
 
 /// The brand mark for a connection's engine, sized in pixels.
@@ -38,11 +39,10 @@ pub fn BackendIcon(dialect: Dialect, #[props(default = DEFAULT_SIZE)] size: u32)
 
 /// SQLite mark (see the module docs for source and license).
 #[component]
-fn SqliteMark(#[props(default = DEFAULT_SIZE)] size: u32) -> Element {
+fn SqliteMark(size: u32) -> Element {
     rsx! {
         svg {
             xmlns: "http://www.w3.org/2000/svg",
-            role: "img",
             width: "{size}",
             height: "{size}",
             view_box: "0 0 24 24",
@@ -55,11 +55,10 @@ fn SqliteMark(#[props(default = DEFAULT_SIZE)] size: u32) -> Element {
 
 /// PostgreSQL mark (see the module docs for source and license).
 #[component]
-fn PostgresMark(#[props(default = DEFAULT_SIZE)] size: u32) -> Element {
+fn PostgresMark(size: u32) -> Element {
     rsx! {
         svg {
             xmlns: "http://www.w3.org/2000/svg",
-            role: "img",
             width: "{size}",
             height: "{size}",
             view_box: "0 0 24 24",
