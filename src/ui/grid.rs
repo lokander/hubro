@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use dioxus::prelude::*;
+use dioxus_icons::lucide::{File, RefreshCw, SearchX, X};
 
 use crate::db::{
     detect_row_identity, ConnectionId, Dialect, ExportFormat, Filter, FilterOp, ForeignKeyMeta,
@@ -753,10 +754,11 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     }
                 }
                 button {
-                    class: "rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                    class: "flex items-center gap-1 rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
                     title: "Re-run the current query",
                     onclick: move |_| state.bump_grid_refresh(id, &refresh_table.key()),
-                    "↻ Refresh"
+                    RefreshCw { size: 12 }
+                    "Refresh"
                 }
             }
             // Save/Discard bar: appears while this table has staged changes.
@@ -928,7 +930,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                 // table, with a Clear-filter action.
                                 Some(GridEmpty::NoMatch) => rsx! {
                                     EmptyState {
-                                        icon: "\u{1F50D}", // 🔍 magnifying glass
+                                        icon: rsx! { SearchX { size: 40 } },
                                         title: "No rows match the filter",
                                         hint: "No rows in this table match the current filter.",
                                         button {
@@ -946,7 +948,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                 // stays available for editable tables.
                                 Some(GridEmpty::Table) => rsx! {
                                     EmptyState {
-                                        icon: "\u{1F4C4}", // 📄 page
+                                        icon: rsx! { File { size: 40 } },
                                         title: "This table has no rows",
                                         hint: "There is no data here yet.",
                                     }
@@ -1142,7 +1144,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                 class: "rounded px-2 py-0.5 text-sm text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
                                 aria_label: "Close",
                                 onclick: move |_| expanded.set(None),
-                                "✕"
+                                X { size: 16 }
                             }
                         }
                         match view {
@@ -2022,7 +2024,7 @@ fn InsertRow(
                         class: "rounded px-1.5 text-xs text-emerald-700 dark:text-emerald-300/80 hover:bg-red-100 dark:hover:bg-red-900/40 hover:text-red-600 dark:hover:text-red-300",
                         title: "Remove this pending insert (stages nothing)",
                         onclick: move |_| state.remove_pending_insert(id, &remove_table, insert_id),
-                        "✕"
+                        X { size: 12 }
                     }
                 }
             }

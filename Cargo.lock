@@ -1348,6 +1348,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "dioxus",
+ "dioxus-icons",
  "dirs",
  "futures-util",
  "getrandom 0.2.17",
@@ -1762,6 +1763,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "dioxus-icons"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ae929a4cdde2e51fca98ccb8a8fe2ea11640e5026c57486b15dbd5618ba7e56"
+dependencies = [
+ "dioxus",
+ "dioxus-signals",
+ "lazy-js-bundle",
 ]
 
 [[package]]

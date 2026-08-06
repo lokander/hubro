@@ -1,5 +1,6 @@
 use chrono::{DateTime, Local};
 use dioxus::prelude::*;
+use dioxus_icons::lucide::Play;
 use serde::Deserialize;
 
 use crate::db::{
@@ -175,7 +176,7 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
                 match run {
                     None => rsx! {
                         EmptyState {
-                            icon: "\u{25B6}", // ▶ play
+                            icon: rsx! { Play { size: 40 } },
                             title: "Results appear here",
                             hint: "Write SQL above and press Ctrl+Enter to run it.",
                         }
@@ -501,7 +502,7 @@ fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
             // Shares the Banner error palette; keeps the structured
             // statement/error/note layout a single message can't hold.
             div { class: "m-3 flex items-start gap-2 rounded border px-3 py-2 {BannerKind::Error.container_classes()}",
-                span { class: "shrink-0 select-none leading-5", "{BannerKind::Error.icon()}" }
+                span { class: "shrink-0 select-none leading-5", {BannerKind::Error.icon()} }
                 div { class: "min-w-0 flex-1",
                     p { class: "mb-1 truncate font-mono text-xs opacity-80",
                         "{statement_index + 1} · {preview}"

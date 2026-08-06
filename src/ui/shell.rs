@@ -5,6 +5,7 @@ use dioxus::desktop::tao::dpi::{LogicalSize, PhysicalPosition};
 use dioxus::desktop::tao::event::{Event, WindowEvent};
 use dioxus::desktop::{use_window, use_wry_event_handler, DesktopService, WindowCloseBehaviour};
 use dioxus::prelude::*;
+use dioxus_icons::lucide::{Moon, Plug, Sun, SunMoon, X};
 
 use crate::config::{
     default_settings_path, load_settings, save_window_geometry, BackendKind, Theme, WindowGeometry,
@@ -391,7 +392,7 @@ fn Cheatsheet() -> Element {
                         class: "rounded px-2 py-1 text-sm text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
                         aria_label: "Close",
                         onclick: move |_| state.close_cheatsheet(),
-                        "✕"
+                        X { size: 16 }
                     }
                 }
                 div { class: "grid grid-cols-1 gap-5 sm:grid-cols-2",
@@ -461,10 +462,10 @@ fn TabBar() -> Element {
                         "{name}"
                     }
                     button {
-                        class: "rounded px-1 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
+                        class: "rounded px-1 py-1 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
                         aria_label: "Close connection",
                         onclick: move |_| state.close_connection(id),
-                        "×"
+                        X { size: 12 }
                     }
                 }
             }
@@ -479,17 +480,18 @@ fn ThemeToggle() -> Element {
     let state = use_context::<AppState>();
     let theme = *state.theme.read();
     let icon = match theme {
-        Theme::System => "◐",
-        Theme::Light => "☀",
-        Theme::Dark => "☾",
+        Theme::System => rsx! { SunMoon { size: 13 } },
+        Theme::Light => rsx! { Sun { size: 13 } },
+        Theme::Dark => rsx! { Moon { size: 13 } },
     };
     rsx! {
         button {
-            class: "ml-auto rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+            class: "ml-auto flex items-center gap-1 rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
             title: "Theme (click to cycle System / Light / Dark)",
             aria_label: "Toggle theme",
             onclick: move |_| state.set_theme(theme.next()),
-            "{icon} {theme.label()}"
+            {icon}
+            "{theme.label()}"
         }
     }
 }
@@ -655,7 +657,7 @@ fn ConnectionsScreen() -> Element {
             if saved.is_empty() {
                 // Designed empty state; the Add buttons below are its action.
                 EmptyState {
-                    icon: "\u{1F50C}", // 🔌 plug
+                    icon: rsx! { Plug { size: 40 } },
                     title: "No connections yet",
                     hint: "Add a SQLite file, Postgres server, or SQL Server to get started.",
                 }
