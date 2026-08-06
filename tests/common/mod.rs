@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use dataview::db::DbPool;
+use hubro::db::DbPool;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use sqlx::SqlitePool;
@@ -251,7 +251,7 @@ fn perf_cache_dir() -> PathBuf {
 
 impl FixtureDb {
     /// Returns a cached fixture at `target/perf-fixtures/<name>.db`, building it
-    /// with `build` on the first call (or when `DATAVIEW_PERF_REBUILD` is set).
+    /// with `build` on the first call (or when `HUBRO_PERF_REBUILD` is set).
     /// The database is built to a temp path and atomically renamed, so an
     /// interrupted build never leaves a half-written cache behind.
     async fn cached<F, Fut>(name: &str, build: F) -> FixtureDb
@@ -262,7 +262,7 @@ impl FixtureDb {
         let dir = perf_cache_dir();
         std::fs::create_dir_all(&dir).expect("create perf cache dir");
         let path = dir.join(format!("{name}.db"));
-        let rebuild = std::env::var_os("DATAVIEW_PERF_REBUILD").is_some();
+        let rebuild = std::env::var_os("HUBRO_PERF_REBUILD").is_some();
         if rebuild || !path.exists() {
             let tmp = dir.join(format!("{name}.db.building"));
             let _ = std::fs::remove_file(&tmp);

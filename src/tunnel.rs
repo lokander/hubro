@@ -126,17 +126,17 @@ enum HostKeyStatus {
     Changed,
 }
 
-/// dataview's own known_hosts store (writable): `~/.config/dataview/known_hosts`.
+/// hubro's own known_hosts store (writable): `~/.config/hubro/known_hosts`.
 /// New trust decisions are recorded here; the user's `~/.ssh/known_hosts` is
 /// read but never modified.
 pub fn app_known_hosts_path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("dataview").join("known_hosts"))
+    Some(dirs::config_dir()?.join("hubro").join("known_hosts"))
 }
 
 /// The app's default set of files consulted to decide whether a server host
 /// key is trusted. Reads honor the user's OpenSSH `~/.ssh/known_hosts` (so
 /// hosts already trusted via `ssh` connect without a prompt) in addition to
-/// dataview's own store. Passed into [`Tunnel::open`] by the UI; tests inject
+/// hubro's own store. Passed into [`Tunnel::open`] by the UI; tests inject
 /// their own paths instead.
 pub fn default_known_hosts_read() -> Vec<PathBuf> {
     let mut files = Vec::new();

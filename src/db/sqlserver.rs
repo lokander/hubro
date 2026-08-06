@@ -317,7 +317,7 @@ fn parse_mssql_url(url: &str) -> Result<MssqlUrlParts, DbError> {
 impl MssqlUrlParts {
     /// Builds the driver config. `tls_host`, when set, replaces the URL's host
     /// in the config — tiberius takes the TLS server name (SNI + certificate
-    /// validation) from the config's host, while dataview dials the TCP socket
+    /// validation) from the config's host, while hubro dials the TCP socket
     /// itself, so an SSH-tunneled connect can dial `127.0.0.1:<forwarded>` yet
     /// still validate the server's certificate against its real hostname.
     fn into_config(self, auth: &MssqlAuth, tls_host: Option<&str>) -> Config {
@@ -339,7 +339,7 @@ impl MssqlUrlParts {
         if self.trust_server_certificate {
             config.trust_cert();
         }
-        config.application_name("dataview");
+        config.application_name("hubro");
         config
     }
 }

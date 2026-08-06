@@ -1,5 +1,5 @@
 {
-  "name": "dataview-editor-bundle",
+  "name": "hubro-editor-bundle",
   "private": true,
   "description": "Pinned deps for rebuilding assets/codemirror.js (see codemirror-README.md)",
   "dependencies": {

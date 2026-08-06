@@ -1,11 +1,11 @@
 //! SQL Server integration tests. They need a running server (Docker only, per
-//! CLAUDE.md) and are skipped unless `DATAVIEW_MSSQL_TEST_URL` is set, e.g.:
+//! CLAUDE.md) and are skipped unless `HUBRO_MSSQL_TEST_URL` is set, e.g.:
 //!
 //! ```sh
-//! docker run -d --name dataview-mssql-test -e ACCEPT_EULA=Y \
+//! docker run -d --name hubro-mssql-test -e ACCEPT_EULA=Y \
 //!   -e 'MSSQL_SA_PASSWORD=Str0ng!Passw0rd' -p 14333:1433 \
 //!   mcr.microsoft.com/mssql/server:2022-latest
-//! DATAVIEW_MSSQL_TEST_URL='mssql://sa:Str0ng!Passw0rd@localhost:14333/master?encrypt=on&trustServerCertificate=true' \
+//! HUBRO_MSSQL_TEST_URL='mssql://sa:Str0ng!Passw0rd@localhost:14333/master?encrypt=on&trustServerCertificate=true' \
 //!   cargo test --test db_sqlserver
 //! ```
 //!
@@ -15,7 +15,7 @@
 //! Every test creates and drops its own uniquely-named objects in `dbo`, so
 //! the suite is re-runnable and tests stay independent of each other.
 
-use dataview::db::{
+use hubro::db::{
     apply_staged, detect_row_identity, mssql_url_with_password, run_script, split_statements,
     DbError, DbPool, Dialect, ExportFormat, Filter, Generated, PageRequest, RowIdentity,
     RowLocator, SortDir, StagedChange, StatementOutcome, TableKind, TableMeta, Value,
@@ -23,10 +23,10 @@ use dataview::db::{
 };
 
 fn test_url() -> Option<String> {
-    match std::env::var("DATAVIEW_MSSQL_TEST_URL") {
+    match std::env::var("HUBRO_MSSQL_TEST_URL") {
         Ok(url) => Some(url),
         Err(_) => {
-            eprintln!("skipping sql server test: DATAVIEW_MSSQL_TEST_URL not set");
+            eprintln!("skipping sql server test: HUBRO_MSSQL_TEST_URL not set");
             None
         }
     }

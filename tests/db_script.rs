@@ -3,20 +3,20 @@
 //! batch back — FRE-38), and Postgres error position enrichment.
 //!
 //! Postgres tests need a running server (Docker only, per CLAUDE.md) and are
-//! skipped unless `DATAVIEW_PG_TEST_URL` is set — see tests/db_postgres.rs.
+//! skipped unless `HUBRO_PG_TEST_URL` is set — see tests/db_postgres.rs.
 
 mod common;
 
 use common::FixtureDb;
-use dataview::db::{
+use hubro::db::{
     run_script, split_statements, DbError, DbPool, StatementOutcome, StatementResult, Value,
 };
 
 fn pg_url() -> Option<String> {
-    match std::env::var("DATAVIEW_PG_TEST_URL") {
+    match std::env::var("HUBRO_PG_TEST_URL") {
         Ok(url) => Some(url),
         Err(_) => {
-            eprintln!("skipping postgres test: DATAVIEW_PG_TEST_URL not set");
+            eprintln!("skipping postgres test: HUBRO_PG_TEST_URL not set");
             None
         }
     }
@@ -26,7 +26,7 @@ fn pg_url() -> Option<String> {
 async fn collect_script(
     pool: &DbPool,
     sql: &str,
-) -> (Vec<StatementResult>, Result<(), dataview::db::ScriptError>) {
+) -> (Vec<StatementResult>, Result<(), hubro::db::ScriptError>) {
     let statements = split_statements(sql, pool.dialect());
     let mut results = Vec::new();
     let outcome = run_script(pool, &statements, |r| results.push(r)).await;

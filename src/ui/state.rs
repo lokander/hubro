@@ -1418,7 +1418,7 @@ impl AppState {
     }
 
     /// Completes the host-key trust prompt: records the offered key in
-    /// dataview's known_hosts store, then re-runs the connect (which now finds
+    /// hubro's known_hosts store, then re-runs the connect (which now finds
     /// the host trusted). A failure to persist surfaces as a connect error.
     pub async fn trust_host_and_connect(mut self, prompt: HostKeyPrompt) {
         self.host_key_prompt.set(None);

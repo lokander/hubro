@@ -767,7 +767,7 @@ fn ConnectionsScreen() -> Element {
     rsx! {
         div { class: "flex h-full flex-col items-center justify-center gap-6 overflow-y-auto py-8",
             div { class: "text-center",
-                h1 { class: "text-2xl font-semibold text-slate-900 dark:text-slate-200", "dataview" }
+                h1 { class: "text-2xl font-semibold text-slate-900 dark:text-slate-200", "Hubro" }
                 if !saved.is_empty() {
                     p { class: "mt-1 text-sm text-slate-500 dark:text-slate-400",
                         "Pick a saved connection, or add another database."
@@ -1098,7 +1098,7 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
 
 /// Trust-on-first-use prompt for an unrecognized SSH host key. Shows the
 /// server's fingerprint so the user can compare it out-of-band; trusting
-/// records the key in dataview's known_hosts store and retries the connect.
+/// records the key in hubro's known_hosts store and retries the connect.
 #[component]
 fn HostKeyPromptCard(prompt: super::state::HostKeyPrompt) -> Element {
     let state = use_context::<AppState>();

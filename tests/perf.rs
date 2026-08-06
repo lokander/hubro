@@ -17,18 +17,18 @@
 //!
 //! The full-scale fixtures are cached under `target/perf-fixtures/`; the first
 //! run builds them (tens of seconds; the wide table is ~0.95 GB on disk) and
-//! later runs reuse them. Force a rebuild with `DATAVIEW_PERF_REBUILD=1`, or
+//! later runs reuse them. Force a rebuild with `HUBRO_PERF_REBUILD=1`, or
 //! reclaim the space with `cargo clean` / by deleting that directory.
 //!
 //! Budgets and their rationale live in `common::budgets`; recorded baseline
 //! numbers live in `docs/PERFORMANCE.md`. SQLite is the priority (deterministic,
 //! no server needed); an optional Postgres parity check is gated on
-//! `DATAVIEW_PG_TEST_URL` and uses a smaller, un-cached table.
+//! `HUBRO_PG_TEST_URL` and uses a smaller, un-cached table.
 
 mod common;
 
 use common::{budgets, perf_scale, FixtureDb, Timings};
-use dataview::db::{DbPool, PageRequest, Value, PREVIEW_BYTES};
+use hubro::db::{DbPool, PageRequest, Value, PREVIEW_BYTES};
 
 fn request(table: &str) -> PageRequest {
     PageRequest {
@@ -69,7 +69,7 @@ async fn big_values_generator_stores_multi_kb_payloads() {
     let page = pool.fetch_page(&request("big_values")).await.unwrap();
     assert_eq!(page.rows.len(), 3);
     // payload is the third column; each holds `bytes` bytes.
-    if let dataview::db::Value::Text(text) = &page.rows[0][2] {
+    if let hubro::db::Value::Text(text) = &page.rows[0][2] {
         assert_eq!(text.len(), 8 * 1024);
     } else {
         panic!("expected TEXT payload");
@@ -274,12 +274,12 @@ async fn budget_big_value_page_bounded() {
 
 /// Postgres is parity-only: SQLite is the repeatable, no-dependency budget.
 /// This builds a smaller, un-cached table on the server named by
-/// `DATAVIEW_PG_TEST_URL` and reports (does not assert) its timings.
+/// `HUBRO_PG_TEST_URL` and reports (does not assert) its timings.
 #[tokio::test]
-#[ignore = "needs DATAVIEW_PG_TEST_URL; run with --ignored"]
+#[ignore = "needs HUBRO_PG_TEST_URL; run with --ignored"]
 async fn budget_postgres_parity() {
-    let Ok(url) = std::env::var("DATAVIEW_PG_TEST_URL") else {
-        eprintln!("skipping postgres parity: DATAVIEW_PG_TEST_URL not set");
+    let Ok(url) = std::env::var("HUBRO_PG_TEST_URL") else {
+        eprintln!("skipping postgres parity: HUBRO_PG_TEST_URL not set");
         return;
     };
     let pool = DbPool::open_postgres(&url).await.unwrap();

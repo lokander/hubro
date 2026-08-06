@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`dataview` is a **desktop-only database viewer** (SQLite and Postgres via sqlx, SQL Server via tiberius) built with Dioxus 0.7 (Rust), shipping on Linux, macOS, and Windows. Do not add web or mobile platform support. Work is tracked in the Linear project "dataview" (team FRE).
+`hubro` is a **desktop-only database viewer** (SQLite and Postgres via sqlx, SQL Server via tiberius) built with Dioxus 0.7 (Rust), shipping on Linux, macOS, and Windows. Do not add web or mobile platform support. Work is tracked in the Linear project "hubro" (team FRE).
 
 ## Commands
 
@@ -16,9 +16,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - `cargo test` — run all tests: unit tests live in `#[cfg(test)]` modules next to the code, integration tests in `tests/`. Test fixture files go in `tests/fixtures/`. Run a single test with `cargo test <name>`.
 - Don't run `cargo test` and `dx build`/`cargo build` concurrently — they contend on the `target/` lock (spurious signal/exit 144); run them sequentially.
-- Postgres integration tests skip unless `DATAVIEW_PG_TEST_URL` is set; SQL Server tests skip unless `DATAVIEW_MSSQL_TEST_URL` is set; SSH-tunnel tests need `DATAVIEW_SSH_TEST` (+ `DATAVIEW_SSH_TEST_KEY`/`_ENC_KEY`). Point them at the Docker `dataview-pg-test` (host port 5433) / `dataview-mssql-test` (14333) / `dataview-ssh-test` (2222) containers; the exact `docker run` commands live in the test-file headers (`tests/db_postgres.rs`, `tests/db_sqlserver.rs`, `tests/tunnel.rs`).
+- Postgres integration tests skip unless `HUBRO_PG_TEST_URL` is set; SQL Server tests skip unless `HUBRO_MSSQL_TEST_URL` is set; SSH-tunnel tests need `HUBRO_SSH_TEST` (+ `HUBRO_SSH_TEST_KEY`/`_ENC_KEY`). Point them at the Docker `hubro-pg-test` (host port 5433) / `hubro-mssql-test` (14333) / `hubro-ssh-test` (2222) containers; the exact `docker run` commands live in the test-file headers (`tests/db_postgres.rs`, `tests/db_sqlserver.rs`, `tests/tunnel.rs`).
 
-The crate is split into a library (`src/lib.rs`, holds app modules) and a thin binary (`src/main.rs`) so integration tests can import app code as `dataview::...`.
+The crate is split into a library (`src/lib.rs`, holds app modules) and a thin binary (`src/main.rs`) so integration tests can import app code as `hubro::...`.
 
 When a live database server (e.g. Postgres) is needed for testing or development, run it in Docker — never install or run database servers directly on the host.
 
@@ -34,8 +34,8 @@ To drive the app (click, type, screenshot) without touching the user's real curs
 
 ```bash
 Xephyr :2 -screen 900x700 &
-DISPLAY=:2 GDK_BACKEND=x11 ./target/dx/dataview/debug/linux/app/dataview &   # binary path from `dx build`
-DISPLAY=:2 xdotool search --name "dataview" windowmove 50 50                  # window is named "dataview"; may spawn offscreen
+DISPLAY=:2 GDK_BACKEND=x11 ./target/dx/hubro/debug/linux/app/hubro &   # binary path from `dx build`
+DISPLAY=:2 xdotool search --name "Hubro" windowmove 50 50                  # window is named "Hubro"; may spawn offscreen
 DISPLAY=:2 xdotool mousemove X Y click 1                                     # full pointer control
 import -display :2 -window root shot.png                                     # screenshot the nested display
 ```
@@ -49,23 +49,23 @@ Gotchas: native `<select>` dropdowns are driven by click → `key Down/Up` → `
 The app is a native Cocoa bundle — there is no display server to nest, so **synthetic input drives the real cursor** (no Xephyr-style isolation exists). Keep interactions short: screenshot → verify → act, and save/restore the pointer around clicks. Tools: `brew install cliclick smokris/getwindowid/getwindowid`. One-time grants for the terminal app in System Settings → Privacy & Security: **Accessibility** (cliclick/System Events) and **Screen Recording** (screencapture).
 
 ```bash
-dx build    # bundle: target/dx/dataview/debug/macos/Dataview.app
-open target/dx/dataview/debug/macos/Dataview.app    # must go via LaunchServices — see the blank-webview gotcha; quit with pkill -x Dataview
-GetWindowID Dataview --list     # titles list as "(null)" — pick the id with the main window's size
+dx build    # bundle: target/dx/hubro/debug/macos/Hubro.app
+open target/dx/hubro/debug/macos/Hubro.app    # must go via LaunchServices — see the blank-webview gotcha; quit with pkill -x Hubro
+GetWindowID Hubro --list     # titles list as "(null)" — pick the id with the main window's size
 screencapture -x -l <id> shot.png                                         # crisp per-window capture, works unfocused
-osascript -e 'tell app "System Events" to tell (first process whose unix id is '$(pgrep -x Dataview)') to get {position, size} of window 1'
+osascript -e 'tell app "System Events" to tell (first process whose unix id is '$(pgrep -x Hubro)') to get {position, size} of window 1'
 POS=$(cliclick p | tr -d ' '); cliclick c:X,Y; cliclick "m:$POS"          # click, then restore the cursor
 ```
 
-Gotchas: on current macOS the webview stays **blank when the binary is exec'd directly** from a terminal (the window opens but WKWebView never paints) — launch through LaunchServices instead (`open path/to/Dataview.app`, then `pkill -x dataview` to quit; note the release bundle's process name is lowercase `dataview`, the debug bundle's is `Dataview`). Click targets are **window position + logical (point) coordinates** from the osascript line — don't derive them from screenshot pixels, which are 2x Retina and include shadow margins. The first click on an unfocused window only focuses it (the webview doesn't accept click-through) — click twice or activate the app first. Keystrokes go via System Events (`keystroke`/`key code`) to the focused window. The window-close guard is testable directly: macOS has a real window manager, so the red button or Cmd+W delivers `CloseRequested` — no synthetic-event helper needed.
+Gotchas: on current macOS the webview stays **blank when the binary is exec'd directly** from a terminal (the window opens but WKWebView never paints) — launch through LaunchServices instead (`open path/to/Hubro.app`, then `pkill -x hubro` to quit; note the release bundle's process name is lowercase `hubro`, the debug bundle's is `Hubro`). Click targets are **window position + logical (point) coordinates** from the osascript line — don't derive them from screenshot pixels, which are 2x Retina and include shadow margins. The first click on an unfocused window only focuses it (the webview doesn't accept click-through) — click twice or activate the app first. Keystrokes go via System Events (`keystroke`/`key code`) to the focused window. The window-close guard is testable directly: macOS has a real window manager, so the red button or Cmd+W delivers `CloseRequested` — no synthetic-event helper needed.
 
 ### Windows
 
 Everything goes through **posted window messages** (`PostMessage` to the WebView2 child) — no real cursor movement, no focus stealing, and no permission grants needed. Dot-source the checked-in helper `scripts/winauto.ps1` (PowerShell 7) for all of it:
 
 ```powershell
-dx build    # exe: target\dx\dataview\debug\windows\app\dataview.exe
-Start-Process .\target\dx\dataview\debug\windows\app\dataview.exe   # window title "dataview"
+dx build    # exe: target\dx\hubro\debug\windows\app\hubro.exe
+Start-Process .\target\dx\hubro\debug\windows\app\hubro.exe   # window title "Hubro"
 . .\scripts\winauto.ps1
 $h = Find-AppWindow                 # top-level HWND (throws if the app isn't running)
 Save-WindowShot $h shot.png         # crisp PrintWindow capture, works while occluded; 1:1 with click coords
@@ -99,6 +99,7 @@ Use [Conventional Commits](https://www.conventionalcommits.org/) with **subject 
 - Static files live in `assets/` and are referenced via the `asset!("/assets/...")` macro (paths are relative to the project root). Stylesheets/favicons are injected with `document::Link` in `App`.
 - `Dioxus.toml` holds Dioxus CLI app configuration (currently just the empty `[application]` section).
 - New fields on `SavedConnection`/`Settings` use `#[serde(default, skip_serializing_if = ...)]` so older config files still deserialize and unaffected entries serialize unchanged.
+- The app was renamed from `dataview` (FRE-64) before it had any users, so there is deliberately no migration code. The name is load-bearing in `$XDG_CONFIG_HOME/hubro/` (connections, settings, session, SSH known_hosts), `$XDG_DATA_HOME/hubro/history.db`, the `hubro` keyring service, and the `no.lokander.hubro` bundle id — changing it again would strand all four.
 
 ## Dioxus 0.7 — critical API notes
 

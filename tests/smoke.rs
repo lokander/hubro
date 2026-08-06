@@ -1,7 +1,7 @@
 //! Smoke test proving the integration-test layout works: the library crate
 //! compiles, links, and is callable from `tests/`.
 
-use dataview::util::human_bytes;
+use hubro::util::human_bytes;
 
 #[test]
 fn library_crate_is_importable() {

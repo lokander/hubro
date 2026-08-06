@@ -144,13 +144,9 @@ struct ConnectionsFile {
     connections: Vec<SavedConnection>,
 }
 
-/// Default location: `$XDG_CONFIG_HOME/dataview/connections.toml`.
+/// Default location: `$XDG_CONFIG_HOME/hubro/connections.toml`.
 pub fn default_config_path() -> Option<PathBuf> {
-    Some(
-        dirs::config_dir()?
-            .join("dataview")
-            .join("connections.toml"),
-    )
+    Some(dirs::config_dir()?.join("hubro").join("connections.toml"))
 }
 
 /// Loads the saved connections. A missing file is an empty list, not an
@@ -302,9 +298,9 @@ pub struct Settings {
     pub window: Option<WindowGeometry>,
 }
 
-/// Default location: `$XDG_CONFIG_HOME/dataview/settings.toml`.
+/// Default location: `$XDG_CONFIG_HOME/hubro/settings.toml`.
 pub fn default_settings_path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("dataview").join("settings.toml"))
+    Some(dirs::config_dir()?.join("hubro").join("settings.toml"))
 }
 
 /// Loads settings. A missing *or* malformed file yields defaults — these are
@@ -408,12 +404,12 @@ pub struct Session {
     pub active: Option<String>,
 }
 
-/// Default location: `$XDG_CONFIG_HOME/dataview/session.toml`. Kept separate
+/// Default location: `$XDG_CONFIG_HOME/hubro/session.toml`. Kept separate
 /// from `settings.toml` because it is transient, churns often, and is fine to
 /// lose — whereas a corrupt settings file must not take user preferences with
 /// it.
 pub fn default_session_path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("dataview").join("session.toml"))
+    Some(dirs::config_dir()?.join("hubro").join("session.toml"))
 }
 
 /// Loads the last session. A missing *or* malformed file yields an empty

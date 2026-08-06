@@ -6,7 +6,7 @@
 //! alongside) the way the grid stages them.
 //!
 //! Postgres cases need a running server (Docker only, per CLAUDE.md) and are
-//! skipped unless `DATAVIEW_PG_TEST_URL` is set — see tests/db_postgres.rs
+//! skipped unless `HUBRO_PG_TEST_URL` is set — see tests/db_postgres.rs
 //! for the docker run recipe.
 
 mod common;
@@ -14,19 +14,19 @@ mod common;
 use std::collections::HashSet;
 
 use common::FixtureDb;
-use dataview::db::{
+use hubro::db::{
     apply_staged, detect_row_identity, DbPool, Dialect, PageRequest, RowIdentity, RowLocator,
     StagedChange, TableMeta, Value,
 };
-use dataview::ui::editing::bool_value;
-use dataview::ui::stage::required_insert_columns;
-use dataview::ui::TableStage;
+use hubro::ui::editing::bool_value;
+use hubro::ui::stage::required_insert_columns;
+use hubro::ui::TableStage;
 
 fn test_url() -> Option<String> {
-    match std::env::var("DATAVIEW_PG_TEST_URL") {
+    match std::env::var("HUBRO_PG_TEST_URL") {
         Ok(url) => Some(url),
         Err(_) => {
-            eprintln!("skipping postgres test: DATAVIEW_PG_TEST_URL not set");
+            eprintln!("skipping postgres test: HUBRO_PG_TEST_URL not set");
             None
         }
     }
@@ -813,7 +813,7 @@ async fn sqlite_staged_insert_leaves_defaults_to_the_database() {
 /// flagged required (filling it would make the INSERT fail unconditionally).
 #[tokio::test]
 async fn postgres_staged_insert_gets_serial_and_identity_values() {
-    use dataview::db::Generated;
+    use hubro::db::Generated;
 
     let Some(url) = test_url() else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();

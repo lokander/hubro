@@ -1,7 +1,7 @@
-use dataview::config::{default_settings_path, load_settings};
-use dataview::ui::App;
 use dioxus::desktop::tao::dpi::{LogicalPosition, LogicalSize};
 use dioxus::desktop::{Config, WindowBuilder};
+use hubro::config::{default_settings_path, load_settings};
+use hubro::ui::App;
 
 fn main() {
     // Restore the last window geometry (FRE-30), falling back to the historical
@@ -12,7 +12,7 @@ fn main() {
         .unwrap_or_default()
         .sanitized();
     let mut window = WindowBuilder::new()
-        .with_title("dataview")
+        .with_title("Hubro")
         .with_inner_size(LogicalSize::new(geometry.width, geometry.height));
     if let (Some(x), Some(y)) = (geometry.x, geometry.y) {
         window = window.with_position(LogicalPosition::new(x, y));

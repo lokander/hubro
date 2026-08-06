@@ -1,4 +1,4 @@
-//! Library crate backing the `dataview` binary. Exists so integration tests
+//! Library crate backing the `hubro` binary. Exists so integration tests
 //! (and eventually other tooling) can import app code; `main.rs` remains the
 //! binary entry point.
 

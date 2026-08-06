@@ -1,4 +1,4 @@
-# winauto.ps1 — drive the dataview app on Windows for interactive testing:
+# winauto.ps1 — drive the hubro app on Windows for interactive testing:
 # per-window screenshots and synthetic input via posted window messages.
 # Nothing here moves the real cursor or types into other windows (except the
 # explicit Send-RealClick fallback). Dot-source it: . .\scripts\winauto.ps1
@@ -30,8 +30,8 @@ public class WinAuto {
 "@
 [WinAuto]::SetProcessDPIAware() | Out-Null
 
-# First visible, titled top-level window owned by the process (the app window is titled "dataview").
-function Find-AppWindow([string]$ProcName = 'dataview') {
+# First visible, titled top-level window owned by the process (the app window is titled "Hubro").
+function Find-AppWindow([string]$ProcName = 'hubro') {
     $procs = @(Get-Process $ProcName -ErrorAction SilentlyContinue)
     if (-not $procs) { throw "no process '$ProcName'" }
     $script:found = [IntPtr]::Zero

@@ -1,22 +1,22 @@
 //! Postgres integration tests. They need a running server (Docker only, per
-//! CLAUDE.md) and are skipped unless `DATAVIEW_PG_TEST_URL` is set, e.g.:
+//! CLAUDE.md) and are skipped unless `HUBRO_PG_TEST_URL` is set, e.g.:
 //!
 //! ```sh
-//! docker run -d --name dataview-pg-test -e POSTGRES_PASSWORD=testpass \
+//! docker run -d --name hubro-pg-test -e POSTGRES_PASSWORD=testpass \
 //!   -e POSTGRES_USER=tester -e POSTGRES_DB=demo -p 5433:5432 postgres:17-alpine
-//! DATAVIEW_PG_TEST_URL=postgres://tester:testpass@localhost:5433/demo cargo test
+//! HUBRO_PG_TEST_URL=postgres://tester:testpass@localhost:5433/demo cargo test
 //! ```
 
-use dataview::db::{
+use hubro::db::{
     detect_row_identity, url_with_password, DbError, DbPool, Dialect, Filter, PageRequest,
     RowLocator, SortDir, TableKind, TypeDetail, TypeRef, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 fn test_url() -> Option<String> {
-    match std::env::var("DATAVIEW_PG_TEST_URL") {
+    match std::env::var("HUBRO_PG_TEST_URL") {
         Ok(url) => Some(url),
         Err(_) => {
-            eprintln!("skipping postgres test: DATAVIEW_PG_TEST_URL not set");
+            eprintln!("skipping postgres test: HUBRO_PG_TEST_URL not set");
             None
         }
     }
@@ -786,11 +786,11 @@ async fn postgres_quoted_camelcase_enum_saves_through_the_staged_cast() {
 
     // The staged UPDATE has to survive the round trip, not just introspect.
     let identity = detect_row_identity(table, Dialect::Postgres).unwrap();
-    let applied = dataview::db::apply_staged(
+    let applied = hubro::db::apply_staged(
         &pool,
         table,
         &identity,
-        &[dataview::db::StagedChange::Update {
+        &[hubro::db::StagedChange::Update {
             locator: RowLocator {
                 identity_values: vec![Value::Integer(1)],
             },

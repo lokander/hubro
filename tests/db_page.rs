@@ -4,7 +4,7 @@
 mod common;
 
 use common::FixtureDb;
-use dataview::db::{Filter, PageRequest, SortDir, Value};
+use hubro::db::{Filter, PageRequest, SortDir, Value};
 
 fn request(table: &str) -> PageRequest {
     PageRequest {

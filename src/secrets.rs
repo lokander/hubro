@@ -3,7 +3,7 @@
 //! Manager on Windows — see the target-specific sections in Cargo.toml).
 //!
 //! The config file never holds a password — only the connection URL, which
-//! doubles as the keyring account name under the `dataview` service. When no
+//! doubles as the keyring account name under the `hubro` service. When no
 //! keyring is available every call degrades to an error the caller treats as
 //! "fall back to session-only memory".
 
@@ -42,13 +42,13 @@ pub async fn delete_password_async(url: String) -> Result<(), String> {
     run_blocking(move || delete_password(&url)).await
 }
 
-const SERVICE: &str = "dataview";
+const SERVICE: &str = "hubro";
 
-/// Set `DATAVIEW_DISABLE_KEYRING=1` to force the session-only fallback
+/// Set `HUBRO_DISABLE_KEYRING=1` to force the session-only fallback
 /// (useful headless and in the nested-X test setup, where talking to the
 /// real desktop's wallet daemon would be intrusive).
 fn disabled() -> bool {
-    std::env::var_os("DATAVIEW_DISABLE_KEYRING").is_some_and(|v| v == "1")
+    std::env::var_os("HUBRO_DISABLE_KEYRING").is_some_and(|v| v == "1")
 }
 
 /// Entries are cached per URL. Real backends don't need this, but the
@@ -56,7 +56,7 @@ fn disabled() -> bool {
 /// repeated lookups must reuse the same one.
 fn entry(url: &str) -> Result<Arc<Entry>, String> {
     if disabled() {
-        return Err("keyring disabled by DATAVIEW_DISABLE_KEYRING".to_string());
+        return Err("keyring disabled by HUBRO_DISABLE_KEYRING".to_string());
     }
     static ENTRIES: OnceLock<Mutex<HashMap<String, Arc<Entry>>>> = OnceLock::new();
     let mut cache = ENTRIES
@@ -126,7 +126,7 @@ mod tests {
         use_mock();
         // Hermetic even when the developer's shell exports the disable flag
         // (the headless test recipe suggests it).
-        std::env::remove_var("DATAVIEW_DISABLE_KEYRING");
+        std::env::remove_var("HUBRO_DISABLE_KEYRING");
         let url = "postgres://u@h:5432/roundtrip";
         assert_eq!(get_password(url).unwrap(), None);
         store_password(url, "s3cret").unwrap();
@@ -149,8 +149,8 @@ mod tests {
     #[ignore = "touches the real OS credential store; run alone, manually"]
     fn real_store_round_trip() {
         let _guard = TEST_LOCK.lock().unwrap();
-        std::env::remove_var("DATAVIEW_DISABLE_KEYRING");
-        let url = "postgres://dataview-test@localhost:5432/fre45-real-store";
+        std::env::remove_var("HUBRO_DISABLE_KEYRING");
+        let url = "postgres://hubro-test@localhost:5432/fre45-real-store";
         delete_password(url).unwrap();
         assert_eq!(get_password(url).unwrap(), None);
         store_password(url, "s3cret-real").unwrap();
@@ -165,9 +165,9 @@ mod tests {
     fn disable_flag_forces_fallback_errors() {
         let _guard = TEST_LOCK.lock().unwrap();
         use_mock();
-        std::env::set_var("DATAVIEW_DISABLE_KEYRING", "1");
+        std::env::set_var("HUBRO_DISABLE_KEYRING", "1");
         let result = get_password("postgres://u@h/db");
-        std::env::remove_var("DATAVIEW_DISABLE_KEYRING");
+        std::env::remove_var("HUBRO_DISABLE_KEYRING");
         assert!(result.is_err());
     }
 }
