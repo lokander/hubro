@@ -692,27 +692,6 @@ impl AppState {
         }
     }
 
-    /// Adds a SQL Server connection to the saved list (URL stored without a
-    /// password; tunnel settings and auth mode stored alongside, like
-    /// Postgres) and persists.
-    pub fn add_saved_sqlserver(
-        mut self,
-        name: String,
-        url: String,
-        tunnel: Option<TunnelConfig>,
-        auth: PgAuth,
-    ) {
-        let added = self.saved.write().add(SavedConnection::SqlServer {
-            name,
-            url,
-            tunnel,
-            auth,
-        });
-        if added {
-            self.persist_saved();
-        }
-    }
-
     /// Applies an edit to a saved connection (FRE-75): overwrites the entry
     /// at `old_locator` — name included, which [`Self::add_saved_postgres`]
     /// deliberately never does — and persists.
