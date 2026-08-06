@@ -18,6 +18,9 @@
 //! form, text verbatim, blobs → a `\x`-prefixed hex string), then quoted if
 //! needed. Because `NULL` and the empty string both render to an empty field,
 //! CSV cannot distinguish them — a documented, standard CSV limitation.
+//! Text values starting with `=` `+` `-` `@` are prefixed with an apostrophe
+//! so spreadsheet apps don't execute them as formulas (see
+//! [`harden_csv_text`]).
 //!
 //! JSON is a top-level array of objects keyed by column name, streamed
 //! element by element. `NULL` → `null`, integers/reals → JSON numbers (a
@@ -171,8 +174,21 @@ fn csv_cell(value: &Value) -> String {
         Value::Null => String::new(),
         Value::Integer(i) => i.to_string(),
         Value::Real(r) => r.to_string(),
-        Value::Text(t) => t.clone(),
+        Value::Text(t) => harden_csv_text(t),
         Value::Blob(b) => hex_literal(b),
+    }
+}
+
+/// Neutralizes CSV formula injection (FRE-73): Excel and LibreOffice execute
+/// cells starting with `=` `+` `-` `@` as live formulas on open, so a text
+/// value starting with one gets the standard leading-apostrophe prefix.
+/// Text only — numbers render bare (`-7` must stay a number) and blobs are
+/// `\x`-prefixed; JSON is not an executable format and stays verbatim.
+fn harden_csv_text(text: &str) -> String {
+    if text.starts_with(['=', '+', '-', '@']) {
+        format!("'{text}")
+    } else {
+        text.to_string()
     }
 }
 
@@ -291,6 +307,34 @@ mod tests {
         assert_eq!(
             to_string(&r, ExportFormat::Csv),
             "n,i,r,b\n,-7,1.5,\\x00ff10\n"
+        );
+    }
+
+    #[test]
+    fn csv_neutralizes_formula_prefixes_in_text_only() {
+        let r = result(
+            &["a", "b", "c", "d", "e"],
+            vec![vec![
+                Value::Text("=cmd|'/C calc'!A0".into()),
+                Value::Text("+1".into()),
+                Value::Text("-danger".into()),
+                Value::Text("@SUM(A1)".into()),
+                Value::Integer(-7),
+            ]],
+        );
+        // Text cells get the apostrophe; the negative integer stays bare.
+        assert_eq!(
+            to_string(&r, ExportFormat::Csv),
+            "a,b,c,d,e\n'=cmd|'/C calc'!A0,'+1,'-danger,'@SUM(A1),-7\n"
+        );
+    }
+
+    #[test]
+    fn json_keeps_formula_prefixes_verbatim() {
+        let r = result(&["x"], vec![vec![Value::Text("=1+1".into())]]);
+        assert_eq!(
+            to_string(&r, ExportFormat::Json),
+            "[\n  {\"x\":\"=1+1\"}\n]\n"
         );
     }
 

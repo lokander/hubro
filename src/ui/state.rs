@@ -195,7 +195,16 @@ pub struct SqlRun {
     pub status: RunStatus,
 }
 
-/// Progress of the most recent export (grid or SQL result) per connection.
+/// Which pane an export belongs to. Statuses are keyed per connection AND
+/// per pane so a grid export and a SQL-result export never overwrite each
+/// other's toolbar line (FRE-73).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExportPane {
+    Grid,
+    Sql,
+}
+
+/// Progress of the most recent export in one pane of one connection.
 /// Shown as a small transient line in the pane's toolbar; it stays until the
 /// next export replaces it.
 #[derive(Debug, Clone, PartialEq)]
@@ -426,9 +435,13 @@ pub struct AppState {
     /// `theme` and — for `System` — a one-time startup read of the OS
     /// preference. Root-scoped: written from the startup detection task.
     pub dark: Signal<bool>,
-    /// Latest export progress per connection (grid or SQL result). Root-
-    /// scoped: written from the `spawn_forever` export task.
-    pub export_status: Signal<HashMap<ConnectionId, ExportStatus>>,
+    /// Latest export progress per connection and pane. Root-scoped: written
+    /// from the `spawn_forever` export task.
+    pub export_status: Signal<HashMap<(ConnectionId, ExportPane), ExportStatus>>,
+    /// Monotonic id per export slot; a finishing task only records its
+    /// outcome while it is still the slot's latest export, so a slow export
+    /// can't overwrite the status of one started after it (FRE-73).
+    pub export_generations: Signal<HashMap<(ConnectionId, ExportPane), u64>>,
     /// Pending foreign-key focus per connection (FRE-29): a target table plus
     /// the filter to seed. Set by [`Self::navigate_fk`] / [`Self::navigate_back`]
     /// right before the target grid is selected; the grid consumes the entry
@@ -507,6 +520,7 @@ impl AppState {
             dark: Signal::new_in_scope(theme.resolve_dark(false), ScopeId::ROOT),
             // Root-scoped: written from the spawn_forever export task.
             export_status: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            export_generations: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             // FK navigation state is only ever touched from UI event handlers,
             // so component scope is fine (like tab_ui / nav_guard).
             pending_focus: Signal::new(HashMap::new()),
@@ -2393,14 +2407,16 @@ impl AppState {
         format: ExportFormat,
         path: PathBuf,
     ) {
+        let slot = (id, ExportPane::Grid);
         let pool = self.registry.read().get(id).map(|c| c.pool.clone());
         let Some(pool) = pool else {
+            self.begin_export(slot);
             self.export_status
                 .write()
-                .insert(id, ExportStatus::Failed("connection closed".into()));
+                .insert(slot, ExportStatus::Failed("connection closed".into()));
             return;
         };
-        self.export_status.write().insert(id, ExportStatus::Running);
+        let generation = self.begin_export(slot);
         // spawn_forever: the export must survive the grid unmounting (a pane
         // or tab switch) — a plain spawn would cancel it mid-write.
         spawn_forever(async move {
@@ -2424,7 +2440,7 @@ impl AppState {
             if outcome.is_err() {
                 let _ = std::fs::remove_file(&tmp);
             }
-            self.finish_export(id, outcome);
+            self.finish_export(slot, generation, outcome);
         });
     }
 
@@ -2432,13 +2448,14 @@ impl AppState {
     /// result) to `path` in `format`, in a background task. Shares the row
     /// formatters with [`Self::export_query`]; no database round-trip.
     pub fn export_result(
-        mut self,
+        self,
         id: ConnectionId,
         result: QueryResult,
         format: ExportFormat,
         path: PathBuf,
     ) {
-        self.export_status.write().insert(id, ExportStatus::Running);
+        let slot = (id, ExportPane::Sql);
+        let generation = self.begin_export(slot);
         spawn_forever(async move {
             use std::io::Write as _;
             let tmp = export_temp_path(&path);
@@ -2454,17 +2471,41 @@ impl AppState {
             if outcome.is_err() {
                 let _ = std::fs::remove_file(&tmp);
             }
-            self.finish_export(id, outcome);
+            self.finish_export(slot, generation, outcome);
         });
     }
 
-    /// Records an export's terminal status.
-    fn finish_export(mut self, id: ConnectionId, outcome: Result<u64, String>) {
+    /// Marks a slot Running and returns the new export's generation.
+    fn begin_export(mut self, slot: (ConnectionId, ExportPane)) -> u64 {
+        let generation = {
+            let mut generations = self.export_generations.write();
+            let entry = generations.entry(slot).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        self.export_status
+            .write()
+            .insert(slot, ExportStatus::Running);
+        generation
+    }
+
+    /// Records an export's terminal status — unless a newer export owns the
+    /// slot, in which case this outcome is stale and dropped.
+    fn finish_export(
+        mut self,
+        slot: (ConnectionId, ExportPane),
+        generation: u64,
+        outcome: Result<u64, String>,
+    ) {
+        let latest = self.export_generations.read().get(&slot).copied();
+        if latest != Some(generation) {
+            return;
+        }
         let status = match outcome {
             Ok(rows) => ExportStatus::Done { rows },
             Err(err) => ExportStatus::Failed(err),
         };
-        self.export_status.write().insert(id, status);
+        self.export_status.write().insert(slot, status);
     }
 
     /// Records a failed save on the stage (kept intact) and re-enables Save.
@@ -2515,7 +2556,12 @@ impl AppState {
         self.tab_ui.write().remove(&id);
         self.sql_runs.write().remove(&id);
         self.pending_sql.write().remove(&id);
-        self.export_status.write().remove(&id);
+        self.export_status
+            .write()
+            .retain(|(conn, _), _| *conn != id);
+        self.export_generations
+            .write()
+            .retain(|(conn, _), _| *conn != id);
         self.pending_focus.write().remove(&id);
         self.nav_history.write().remove(&id);
         // Abort any in-flight run and drop its bookkeeping; bumping nothing

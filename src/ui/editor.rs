@@ -9,7 +9,7 @@ use crate::db::{
 use crate::history::{HistoryEntry, HISTORY_CAP};
 
 use super::notice::{Banner, BannerKind, EmptyState, LoadingLine};
-use super::state::{AppState, ExportStatus, RunStatus, SchemaLoad};
+use super::state::{AppState, ExportPane, ExportStatus, RunStatus, SchemaLoad};
 
 /// Cap on rendered result rows (per statement). The full result still sits
 /// in memory until FRE-33 introduces streaming/limits at the query layer,
@@ -544,7 +544,11 @@ fn StatementSection(id: ConnectionId, index: usize, result: StatementResult) -> 
         StatementOutcome::Rows(rows) if !rows.rows.is_empty() => Some(rows.clone()),
         _ => None,
     };
-    let export_status: Option<ExportStatus> = state.export_status.read().get(&id).cloned();
+    let export_status: Option<ExportStatus> = state
+        .export_status
+        .read()
+        .get(&(id, ExportPane::Sql))
+        .cloned();
     rsx! {
         div { class: "border-b border-slate-200 dark:border-slate-800",
             p { class: "flex items-baseline gap-2 bg-slate-100 dark:bg-slate-900/60 px-4 py-1.5 text-xs",

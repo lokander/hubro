@@ -12,7 +12,7 @@ use crate::util::human_bytes;
 use super::editing::{editor_kind, CellEditor, EditNav, EditorKind};
 use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState};
 use super::stage::{required_insert_columns, PendingInsert, TableStage};
-use super::state::{AppState, ExportStatus, SchemaLoad, TableRef};
+use super::state::{AppState, ExportPane, ExportStatus, SchemaLoad, TableRef};
 
 const PAGE_SIZE: u32 = 100;
 
@@ -555,7 +555,11 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
 
     let current = rows_resource.read();
     let sort_value = sort();
-    let export_status: Option<ExportStatus> = state.export_status.read().get(&id).cloned();
+    let export_status: Option<ExportStatus> = state
+        .export_status
+        .read()
+        .get(&(id, ExportPane::Grid))
+        .cloned();
     let export_table = table.clone();
     let refresh_table = table.clone();
     let save_table = table.clone();
