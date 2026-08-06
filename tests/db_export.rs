@@ -1,12 +1,12 @@
 //! Integration tests for streaming export (`DbPool::export`) on both
 //! backends. The SQLite cases always run; the Postgres cases need a running
-//! server and are skipped unless `DATAVIEW_PG_TEST_URL` is set (see
+//! server and are skipped unless `HUBRO_PG_TEST_URL` is set (see
 //! `tests/db_postgres.rs` for the Docker recipe).
 
 mod common;
 
 use common::FixtureDb;
-use dataview::db::{DbPool, ExportFormat, Filter, PageRequest, SortDir, Value};
+use hubro::db::{DbPool, ExportFormat, Filter, PageRequest, SortDir, Value};
 
 /// Streams an export into an in-memory buffer, returning (bytes, row_count).
 async fn export_to_string(
@@ -149,10 +149,10 @@ async fn sqlite_export_empty_result_still_writes_header_and_empty_array() {
 // ---- Postgres -------------------------------------------------------------
 
 fn pg_url() -> Option<String> {
-    match std::env::var("DATAVIEW_PG_TEST_URL") {
+    match std::env::var("HUBRO_PG_TEST_URL") {
         Ok(url) => Some(url),
         Err(_) => {
-            eprintln!("skipping postgres export test: DATAVIEW_PG_TEST_URL not set");
+            eprintln!("skipping postgres export test: HUBRO_PG_TEST_URL not set");
             None
         }
     }

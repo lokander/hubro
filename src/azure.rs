@@ -44,7 +44,7 @@ pub const AZURE_CLI_CLIENT_ID: &str = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
 /// How long to wait for the interactive sign-in redirect before giving up.
 pub const INTERACTIVE_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// How dataview authenticates a Postgres connection to Entra. Persisted with
+/// How Hubro authenticates a Postgres connection to Entra. Persisted with
 /// the saved connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "lowercase")]
@@ -327,11 +327,11 @@ async fn wait_for_redirect(
     let body = match &result {
         Ok(_) => {
             "<html><body style=\"font-family:sans-serif\"><h3>Signed in.</h3>\
-                  <p>You can close this window and return to dataview.</p></body></html>"
+                  <p>You can close this window and return to Hubro.</p></body></html>"
         }
         Err(_) => {
             "<html><body style=\"font-family:sans-serif\"><h3>Sign-in failed.</h3>\
-                   <p>Return to dataview for details.</p></body></html>"
+                   <p>Return to Hubro for details.</p></body></html>"
         }
     };
     let response = format!(

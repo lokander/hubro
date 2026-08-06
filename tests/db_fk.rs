@@ -10,7 +10,7 @@ mod common;
 use std::collections::HashMap;
 
 use common::FixtureDb;
-use dataview::db::{
+use hubro::db::{
     build_fk_filter, DbPool, ForeignKeyMeta, PageRequest, QueryResult, TableMeta, Value,
 };
 
@@ -213,8 +213,8 @@ async fn sqlite_fk_jump_selects_the_referenced_rows() {
 
 #[tokio::test]
 async fn postgres_fk_jump_selects_the_referenced_rows() {
-    let Some(url) = std::env::var("DATAVIEW_PG_TEST_URL").ok() else {
-        eprintln!("skipping postgres FK test: DATAVIEW_PG_TEST_URL not set");
+    let Some(url) = std::env::var("HUBRO_PG_TEST_URL").ok() else {
+        eprintln!("skipping postgres FK test: HUBRO_PG_TEST_URL not set");
         return;
     };
     let pool = DbPool::open_postgres(&url).await.unwrap();

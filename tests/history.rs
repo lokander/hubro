@@ -1,7 +1,7 @@
 //! Integration tests for the query-history store, against a temp-dir
 //! history database.
 
-use dataview::history::{HistoryStore, HISTORY_CAP};
+use hubro::history::{HistoryStore, HISTORY_CAP};
 
 async fn temp_store() -> (tempfile::TempDir, HistoryStore) {
     let dir = tempfile::tempdir().unwrap();

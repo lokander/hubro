@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use dataview::azure::{
+use hubro::azure::{
     acquire_token, AzureError, Endpoints, EntraAuth, OSSRDBMS_RESOURCE, SQLDB_RESOURCE,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};

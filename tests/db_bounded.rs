@@ -6,7 +6,7 @@
 mod common;
 
 use common::FixtureDb;
-use dataview::db::{
+use hubro::db::{
     detect_row_identity, Generated, PageRequest, RowLocator, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
@@ -16,7 +16,7 @@ fn request(table: &str) -> PageRequest {
         table: table.into(),
         limit: 100,
         offset: 0,
-        sort: Some(("id".into(), dataview::db::SortDir::Asc)),
+        sort: Some(("id".into(), hubro::db::SortDir::Asc)),
         filter: None,
         extra_key_column: None,
     }

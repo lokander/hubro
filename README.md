@@ -1,4 +1,4 @@
-# dataview
+# Hubro
 
 A desktop **database viewer for SQLite, Postgres, and SQL Server**, built with
 [Dioxus 0.7](https://dioxuslabs.com/learn/0.7) (Rust), for Linux, macOS, and
@@ -63,7 +63,7 @@ Tailwind is compiled automatically by `dx serve` from `tailwind.css` in the proj
 ```
 ├─ assets/       # static assets, referenced via the asset!() macro
 ├─ src/main.rs   # thin binary entry point
-├─ src/lib.rs    # library root, imported by tests as dataview::
+├─ src/lib.rs    # library root, imported by tests as hubro::
 ├─ src/db/       # backend-neutral DB layer (sqlite, postgres, schema, paging)
 ├─ src/ui/       # Dioxus components (shell, sidebar, grid, editor, state)
 ├─ src/azure.rs  # Entra ID token acquisition; tunnel.rs, secrets.rs, config.rs
@@ -75,7 +75,7 @@ Tailwind is compiled automatically by `dx serve` from `tailwind.css` in the proj
 Prebuilt Linux packages (`.deb` and `.AppImage`), a macOS disk image
 (`.dmg`, Apple Silicon), and Windows installers (`.msi` and setup `.exe`,
 x64) are attached to each
-[GitHub release](https://github.com/lokander/dataview/releases). The AppImage
+[GitHub release](https://github.com/lokander/hubro/releases). The AppImage
 is self-contained and runs on most distributions; the `.deb` targets
 Debian/Ubuntu and depends on `libwebkit2gtk-4.1-0` and `libgtk-3-0`.
 
@@ -83,7 +83,7 @@ The macOS build is **unsigned** (no Apple Developer ID yet), so Gatekeeper
 blocks the first launch. Clear the quarantine flag and it starts normally:
 
 ```bash
-xattr -dr com.apple.quarantine /Applications/Dataview.app
+xattr -dr com.apple.quarantine /Applications/Hubro.app
 ```
 
 Alternatively, after the blocked first launch, approve the app under System

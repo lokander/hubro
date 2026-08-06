@@ -1,6 +1,6 @@
 # Performance budgets and baseline (FRE-34)
 
-This document records the performance **budgets** dataview commits to and the
+This document records the performance **budgets** Hubro commits to and the
 **baseline** measured on the dev machine. The budgets are the contract that
 FRE-32 (virtual scrolling) and FRE-33 (bounded memory / streaming) must keep
 meeting — they turn "feels fast" into a number a test can fail on.
@@ -37,7 +37,7 @@ The large fixtures are generated once and cached under `target/perf-fixtures/`
 Generation uses `synchronous=OFF` + `journal_mode=MEMORY` and large multi-row
 INSERT batches in a single transaction, so the wide table builds in tens of
 seconds. Those pragmas apply only to the throwaway generation connection. Force
-a rebuild with `DATAVIEW_PERF_REBUILD=1`; reclaim the disk by deleting
+a rebuild with `HUBRO_PERF_REBUILD=1`; reclaim the disk by deleting
 `target/perf-fixtures/`.
 
 ## Budgets and rationale
@@ -58,7 +58,7 @@ flaking, yet still fail on an order-of-magnitude regression.
 | `big_value_page` | `fetch_page(LIMIT 100)` over 4× (4 MiB TEXT + 4 MiB BLOB) rows | 500 ms | Fetching fat rows must not stall; the budget for FRE-33 to keep meeting while it bounds memory. |
 
 Postgres is **parity-only**: SQLite is the deterministic, no-dependency budget.
-An optional `budget_postgres_parity` test (gated on `DATAVIEW_PG_TEST_URL`,
+An optional `budget_postgres_parity` test (gated on `HUBRO_PG_TEST_URL`,
 `#[ignore]`d) builds a smaller un-cached table and *reports* time-to-first-rows
 and deep-nav without asserting, since server hardware varies.
 

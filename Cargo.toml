@@ -1,5 +1,5 @@
 [package]
-name = "dataview"
+name = "hubro"
 version = "0.6.1"
 authors = ["Fredrik Lokander <fredrik@lokander.no>"]
 edition = "2021"

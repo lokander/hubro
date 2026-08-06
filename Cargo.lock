@@ -1342,35 +1342,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
-name = "dataview"
-version = "0.6.1"
-dependencies = [
- "base64 0.22.1",
- "chrono",
- "dioxus",
- "dioxus-icons",
- "dirs",
- "futures-util",
- "getrandom 0.2.17",
- "keyring",
- "percent-encoding",
- "reqwest",
- "rfd 0.15.4",
- "russh",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "tempfile",
- "tiberius",
- "tokio",
- "tokio-util",
- "toml",
- "url",
- "webbrowser",
-]
-
-[[package]]
 name = "dbus"
 version = "0.9.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3073,6 +3044,35 @@ name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
+
+[[package]]
+name = "hubro"
+version = "0.6.1"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "dioxus",
+ "dioxus-icons",
+ "dirs",
+ "futures-util",
+ "getrandom 0.2.17",
+ "keyring",
+ "percent-encoding",
+ "reqwest",
+ "rfd 0.15.4",
+ "russh",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tempfile",
+ "tiberius",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "url",
+ "webbrowser",
+]
 
 [[package]]
 name = "hybrid-array"

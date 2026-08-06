@@ -3,7 +3,7 @@
 mod common;
 
 use common::FixtureDb;
-use dataview::db::{DbError, DbPool, TableKind, TableMeta, Value};
+use hubro::db::{DbError, DbPool, TableKind, TableMeta, Value};
 
 fn table<'a>(tables: &'a [TableMeta], name: &str) -> &'a TableMeta {
     tables

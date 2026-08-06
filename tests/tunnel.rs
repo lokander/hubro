@@ -1,11 +1,11 @@
 //! SSH tunnel integration tests. They need Docker containers (Docker only,
-//! per CLAUDE.md) and are skipped unless `DATAVIEW_SSH_TEST` is set.
+//! per CLAUDE.md) and are skipped unless `HUBRO_SSH_TEST` is set.
 //!
 //! Exact setup (throwaway keys live in a scratch dir, nothing is checked in):
 //!
 //! ```sh
 //! # Postgres server (shared with tests/db_postgres.rs):
-//! docker run -d --name dataview-pg-test -e POSTGRES_PASSWORD=testpass \
+//! docker run -d --name hubro-pg-test -e POSTGRES_PASSWORD=testpass \
 //!   -e POSTGRES_USER=tester -e POSTGRES_DB=demo -p 5433:5432 postgres:17-alpine
 //!
 //! # Throwaway keys (the encrypted key's passphrase must be "letmein"):
@@ -13,9 +13,9 @@
 //! ssh-keygen -t ed25519 -N "letmein" -f "$SCRATCH/ssh-test-key-enc"
 //!
 //! # SSH server that can reach the Postgres container by name:
-//! docker network create dataview-test-net
-//! docker network connect dataview-test-net dataview-pg-test
-//! docker run -d --name dataview-ssh-test --network dataview-test-net \
+//! docker network create hubro-test-net
+//! docker network connect hubro-test-net hubro-pg-test
+//! docker run -d --name hubro-ssh-test --network hubro-test-net \
 //!   -p 2222:22 alpine:3 sh -c "
 //!     apk add --no-cache openssh >/dev/null &&
 //!     ssh-keygen -A &&
@@ -29,26 +29,26 @@
 //!     exec /usr/sbin/sshd -D -e"
 //!
 //! # Optional SQL Server target for the mssql-through-tunnel test (FRE-58);
-//! # skipped unless DATAVIEW_SSH_TEST_MSSQL_PASSWORD is also set:
-//! docker run -d --name dataview-mssql-test --network dataview-test-net \
+//! # skipped unless HUBRO_SSH_TEST_MSSQL_PASSWORD is also set:
+//! docker run -d --name hubro-mssql-test --network hubro-test-net \
 //!   -e ACCEPT_EULA=Y -e "MSSQL_SA_PASSWORD=Str0ng!Passw0rd" \
 //!   mcr.microsoft.com/mssql/server:2022-latest
 //!
 //! # Run (key paths are required; host/port/user/db-target have defaults
 //! # matching the commands above):
-//! DATAVIEW_SSH_TEST=1 \
-//! DATAVIEW_SSH_TEST_KEY="$SCRATCH/ssh-test-key" \
-//! DATAVIEW_SSH_TEST_ENC_KEY="$SCRATCH/ssh-test-key-enc" \
-//! DATAVIEW_SSH_TEST_MSSQL_PASSWORD='Str0ng!Passw0rd' \
+//! HUBRO_SSH_TEST=1 \
+//! HUBRO_SSH_TEST_KEY="$SCRATCH/ssh-test-key" \
+//! HUBRO_SSH_TEST_ENC_KEY="$SCRATCH/ssh-test-key-enc" \
+//! HUBRO_SSH_TEST_MSSQL_PASSWORD='Str0ng!Passw0rd' \
 //! cargo test --test tunnel
 //! ```
 
 use std::path::PathBuf;
 
-use dataview::db::{
+use hubro::db::{
     mssql_url_target, mssql_url_via_local_port, mssql_url_with_password, DbPool, MssqlAuth, Value,
 };
-use dataview::tunnel::{Tunnel, TunnelAuth, TunnelConfig, TunnelError};
+use hubro::tunnel::{Tunnel, TunnelAuth, TunnelConfig, TunnelError};
 
 /// Everything the gated tests need, from the environment (with defaults
 /// matching the docker commands in the file header).
@@ -64,25 +64,24 @@ struct SshTestEnv {
 }
 
 fn ssh_env() -> Option<SshTestEnv> {
-    if std::env::var("DATAVIEW_SSH_TEST").is_err() {
-        eprintln!("skipping ssh tunnel test: DATAVIEW_SSH_TEST not set");
+    if std::env::var("HUBRO_SSH_TEST").is_err() {
+        eprintln!("skipping ssh tunnel test: HUBRO_SSH_TEST not set");
         return None;
     }
     let var =
         |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.to_string());
     Some(SshTestEnv {
-        host: var("DATAVIEW_SSH_TEST_HOST", "127.0.0.1"),
-        port: var("DATAVIEW_SSH_TEST_PORT", "2222").parse().unwrap(),
-        user: var("DATAVIEW_SSH_TEST_USER", "tunnel"),
+        host: var("HUBRO_SSH_TEST_HOST", "127.0.0.1"),
+        port: var("HUBRO_SSH_TEST_PORT", "2222").parse().unwrap(),
+        user: var("HUBRO_SSH_TEST_USER", "tunnel"),
         key: PathBuf::from(
-            std::env::var("DATAVIEW_SSH_TEST_KEY").expect("DATAVIEW_SSH_TEST_KEY must be set"),
+            std::env::var("HUBRO_SSH_TEST_KEY").expect("HUBRO_SSH_TEST_KEY must be set"),
         ),
         encrypted_key: PathBuf::from(
-            std::env::var("DATAVIEW_SSH_TEST_ENC_KEY")
-                .expect("DATAVIEW_SSH_TEST_ENC_KEY must be set"),
+            std::env::var("HUBRO_SSH_TEST_ENC_KEY").expect("HUBRO_SSH_TEST_ENC_KEY must be set"),
         ),
-        db_host: var("DATAVIEW_SSH_TEST_DB_HOST", "dataview-pg-test"),
-        db_port: var("DATAVIEW_SSH_TEST_DB_PORT", "5432").parse().unwrap(),
+        db_host: var("HUBRO_SSH_TEST_DB_HOST", "hubro-pg-test"),
+        db_port: var("HUBRO_SSH_TEST_DB_PORT", "5432").parse().unwrap(),
     })
 }
 
@@ -118,7 +117,7 @@ async fn trusted_known_hosts(env: &SshTestEnv) -> (Vec<PathBuf>, tempfile::TempD
     let TunnelError::HostKeyUnknown(info) = err else {
         panic!("expected HostKeyUnknown on first contact, got {err:?}");
     };
-    dataview::tunnel::trust_host_key(&info.host, info.port, &info.key_openssh, &kh)
+    hubro::tunnel::trust_host_key(&info.host, info.port, &info.key_openssh, &kh)
         .expect("trusting the discovered key should persist it");
     (vec![kh], dir)
 }
@@ -148,17 +147,17 @@ async fn postgres_connects_end_to_end_through_the_tunnel() {
 /// exact glue `AppState::connect_sqlserver` uses: the logical URL is rewritten
 /// through the forwarded local port, and the driver gets the original hostname
 /// as its TLS server name while dialing 127.0.0.1. Needs the
-/// `dataview-mssql-test` container (see the file header); skipped unless
-/// `DATAVIEW_SSH_TEST_MSSQL_PASSWORD` is set.
+/// `hubro-mssql-test` container (see the file header); skipped unless
+/// `HUBRO_SSH_TEST_MSSQL_PASSWORD` is set.
 #[tokio::test]
 async fn sqlserver_connects_end_to_end_through_the_tunnel() {
     let Some(env) = ssh_env() else { return };
-    let Ok(password) = std::env::var("DATAVIEW_SSH_TEST_MSSQL_PASSWORD") else {
-        eprintln!("skipping mssql tunnel test: DATAVIEW_SSH_TEST_MSSQL_PASSWORD not set");
+    let Ok(password) = std::env::var("HUBRO_SSH_TEST_MSSQL_PASSWORD") else {
+        eprintln!("skipping mssql tunnel test: HUBRO_SSH_TEST_MSSQL_PASSWORD not set");
         return;
     };
-    let mssql_host = std::env::var("DATAVIEW_SSH_TEST_MSSQL_HOST")
-        .unwrap_or_else(|_| "dataview-mssql-test".to_string());
+    let mssql_host = std::env::var("HUBRO_SSH_TEST_MSSQL_HOST")
+        .unwrap_or_else(|_| "hubro-mssql-test".to_string());
     let (kh, _kh_dir) = trusted_known_hosts(&env).await;
     let tunnel = Tunnel::open(env.config(), None, mssql_host.clone(), 1433, &kh)
         .await
@@ -314,7 +313,7 @@ async fn unknown_host_key_is_refused_then_trusted_and_connects() {
     );
 
     // Trusting persists the key; the same connect then succeeds.
-    dataview::tunnel::trust_host_key(&info.host, info.port, &info.key_openssh, &kh)
+    hubro::tunnel::trust_host_key(&info.host, info.port, &info.key_openssh, &kh)
         .expect("trusting the key should persist it");
     let tunnel = Tunnel::open(
         env.config(),

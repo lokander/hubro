@@ -1,5 +1,5 @@
 //! Persisted query history, one SQLite file for the whole app
-//! (`$XDG_DATA_HOME/dataview/history.db`).
+//! (`$XDG_DATA_HOME/hubro/history.db`).
 //!
 //! Executed scripts are recorded per connection locator (file path / URL)
 //! with a timestamp and their overall success/failure. The store keeps the
@@ -32,9 +32,9 @@ pub struct HistoryEntry {
     pub error: Option<String>,
 }
 
-/// Default location: `$XDG_DATA_HOME/dataview/history.db`.
+/// Default location: `$XDG_DATA_HOME/hubro/history.db`.
 pub fn default_history_path() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("dataview").join("history.db"))
+    Some(dirs::data_dir()?.join("hubro").join("history.db"))
 }
 
 /// Handle to the history database. Cheap to clone (wraps a pool).

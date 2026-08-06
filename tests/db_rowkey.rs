@@ -3,22 +3,22 @@
 //! `execute_checked` commits only when the affected-row count matches.
 //!
 //! Postgres cases need a running server (Docker only, per CLAUDE.md) and are
-//! skipped unless `DATAVIEW_PG_TEST_URL` is set — see tests/db_postgres.rs
+//! skipped unless `HUBRO_PG_TEST_URL` is set — see tests/db_postgres.rs
 //! for the docker run recipe.
 
 mod common;
 
 use common::FixtureDb;
-use dataview::db::{
+use hubro::db::{
     delete_sql, detect_row_identity, update_sql, DbError, DbPool, Dialect, RowIdentity, TableKind,
     TableMeta, Value,
 };
 
 fn test_url() -> Option<String> {
-    match std::env::var("DATAVIEW_PG_TEST_URL") {
+    match std::env::var("HUBRO_PG_TEST_URL") {
         Ok(url) => Some(url),
         Err(_) => {
-            eprintln!("skipping postgres test: DATAVIEW_PG_TEST_URL not set");
+            eprintln!("skipping postgres test: HUBRO_PG_TEST_URL not set");
             None
         }
     }
