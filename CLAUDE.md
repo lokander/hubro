@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `hubro` is a **desktop-only database viewer** (SQLite and Postgres via sqlx, SQL Server via tiberius) built with Dioxus 0.7 (Rust), shipping on Linux, macOS, and Windows. Do not add web or mobile platform support. Work is tracked in the Linear project "hubro" (team FRE).
 
+Licensed **GPL-3.0-only** (FRE-83), with copyright held solely by Fredrik Lokander — which is what keeps commercial dual-licensing possible. Two consequences: don't add dependencies under licenses GPL-3.0 can't incorporate (AGPL, or proprietary/source-available terms; permissive and MPL are fine), and don't merge outside contributions without a CLA or copyright assignment, since divided copyright permanently removes the ability to relicense.
+
 ## Commands
 
 - `dx serve` — run the desktop app with hot reload.

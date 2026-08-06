@@ -3,6 +3,8 @@ name = "hubro"
 version = "0.6.1"
 authors = ["Fredrik Lokander <fredrik@lokander.no>"]
 edition = "2021"
+license = "GPL-3.0-only"
+repository = "https://github.com/lokander/hubro"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
