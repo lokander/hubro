@@ -4,3 +4,13 @@
    ancestor is present. Overrides Tailwind v4's default prefers-color-scheme
    dark mode because the theme is a manual, persisted toggle (FRE-16). */
 @custom-variant dark (&:where(.dark, .dark *));
+
+/* Native widget chrome (select faces, option popups, checkbox glyphs,
+   scrollbars) follows color-scheme, not CSS classes — keep it in lockstep
+   with the manual .dark toggle (FRE-68). */
+:root {
+  color-scheme: light;
+}
+.dark {
+  color-scheme: dark;
+}
