@@ -912,7 +912,10 @@ fn ConnectionsScreen() -> Element {
             }
             if let Some(kind) = open_form() {
                 ConnectFormModal {
-                    on_close: move |_| open_form.set(None),
+                    on_close: move |_| {
+                        state.clear_pending_edit();
+                        open_form.set(None);
+                    },
                     error: error.clone(),
                     on_dismiss_error: move |_| state.connect_error.clone().set(None),
                     match kind {
@@ -1185,11 +1188,15 @@ fn split_url(url: &str, option_key: &str) -> Option<UrlFields> {
     let parsed = url::Url::parse(url).ok()?;
     let mut option = None;
     let mut trust_cert = false;
+    // Query keys are compared case-insensitively: the app writes
+    // `trustServerCertificate`, and a hand-pasted URL may use any casing.
+    let option_key = option_key.to_ascii_lowercase();
     for (key, value) in parsed.query_pairs() {
-        match key.as_ref() {
-            k if k == option_key => option = Some(value.into_owned()),
-            "trust_server_certificate" => trust_cert = value == "true",
-            _ => {}
+        let key = key.to_ascii_lowercase();
+        if key == option_key {
+            option = Some(value.into_owned());
+        } else if key == "trustservercertificate" {
+            trust_cert = value.eq_ignore_ascii_case("true");
         }
     }
     Some(UrlFields {
@@ -1476,6 +1483,13 @@ fn PostgresForm(
         let remember_choice = *remember.peek();
         form_error.set(None);
         spawn(async move {
+            // An edit is saved by whichever path confirms the connect —
+            // including the Entra sign-in card, which resolves after this
+            // form has closed — so the intent is registered up front rather
+            // than applied here (FRE-75).
+            if let Some(old) = &old_locator {
+                state.set_pending_edit(old.clone(), url.clone());
+            }
             // "Leave the password empty to keep the existing one" has to keep
             // working when the edit moves the locator: the stored secret is
             // still filed under the OLD one, and the connect below looks up
@@ -1528,22 +1542,7 @@ fn PostgresForm(
                 if remember_choice && entered_passphrase.is_some() {
                     state.persist_ssh_passphrase(&url).await;
                 }
-                match &old_locator {
-                    // An edit replaces the original entry outright — name
-                    // included, and re-keyed when the locator moved. Any
-                    // entry the connect flow itself added under the new
-                    // locator is folded into it (FRE-75).
-                    Some(old) => state.update_saved(
-                        old.clone(),
-                        SavedConnection::Postgres {
-                            name: display_name,
-                            url,
-                            tunnel,
-                            auth: PgAuth::Password,
-                        },
-                    ),
-                    None => state.add_saved_postgres(display_name, url, tunnel, PgAuth::Password),
-                }
+                state.add_saved_postgres(display_name, url, tunnel, PgAuth::Password);
                 on_done.call(());
             }
         });
@@ -1718,8 +1717,8 @@ fn SqlServerForm(
     let ssh_port = use_signal(|| seed.ssh_port.clone());
     let ssh_user = use_signal(|| seed.ssh_user.clone());
     // false = ssh-agent (the default), true = key file.
-    let ssh_use_key = use_signal(|| false);
-    let ssh_key_path = use_signal(String::new);
+    let ssh_use_key = use_signal(|| seed.ssh_use_key);
+    let ssh_key_path = use_signal(|| seed.ssh_key_path.clone());
     let ssh_passphrase = use_signal(String::new);
     let mut form_error = use_signal(|| Option::<String>::None);
 
@@ -1842,6 +1841,13 @@ fn SqlServerForm(
         let remember_choice = *remember.peek();
         form_error.set(None);
         spawn(async move {
+            // An edit is saved by whichever path confirms the connect —
+            // including the Entra sign-in card, which resolves after this
+            // form has closed — so the intent is registered up front rather
+            // than applied here (FRE-75).
+            if let Some(old) = &old_locator {
+                state.set_pending_edit(old.clone(), url.clone());
+            }
             // "Leave the password empty to keep the existing one" has to keep
             // working when the edit moves the locator: the stored secret is
             // still filed under the OLD one, and the connect below looks up
@@ -1895,21 +1901,6 @@ fn SqlServerForm(
             if state.open_locators.peek().iter().any(|(_, l)| *l == url) {
                 if remember_choice && entered_passphrase.is_some() {
                     state.persist_ssh_passphrase(&url).await;
-                }
-                // An edit replaces the original entry outright — name
-                // included, and re-keyed when the locator moved. The entry
-                // the connect flow just added under the new locator is
-                // folded into it (FRE-75).
-                if let Some(old) = &old_locator {
-                    state.update_saved(
-                        old.clone(),
-                        SavedConnection::SqlServer {
-                            name: display_name,
-                            url: url.clone(),
-                            tunnel,
-                            auth: PgAuth::Password,
-                        },
-                    );
                 }
                 on_done.call(());
             }

@@ -76,6 +76,15 @@ pub struct FocusTarget {
     pub filter: Option<Filter>,
 }
 
+/// A saved-connection edit that has been submitted but not yet confirmed by
+/// a successful connect (FRE-75). Matched on `new_locator` so an abandoned
+/// edit can never rewrite an unrelated connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingEdit {
+    pub old_locator: String,
+    pub new_locator: String,
+}
+
 /// Which pane a connection tab shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Pane {
@@ -320,13 +329,27 @@ async fn migrate_secret(old: String, new: String) {
     let Ok(Some(secret)) = crate::secrets::get_password_async(old.clone()).await else {
         return;
     };
-    if matches!(
-        crate::secrets::get_password_async(new.clone()).await,
-        Ok(None)
-    ) {
-        let _ = crate::secrets::store_password_async(new, secret).await;
+    match crate::secrets::get_password_async(new.clone()).await {
+        // Nothing under the new key yet: carry the secret across, and only
+        // drop the old copy once the new one is safely written — deleting
+        // after a failed store would lose the password outright.
+        Ok(None) => {
+            if crate::secrets::store_password_async(new, secret)
+                .await
+                .is_ok()
+            {
+                let _ = crate::secrets::delete_password_async(old).await;
+            }
+        }
+        // The connect that just succeeded already wrote a newer secret;
+        // the old one is now redundant.
+        Ok(Some(_)) => {
+            let _ = crate::secrets::delete_password_async(old).await;
+        }
+        // Keyring unreadable — leave both alone rather than risk the only
+        // copy.
+        Err(_) => {}
     }
-    let _ = crate::secrets::delete_password_async(old).await;
 }
 
 /// Keyring/session key for a connection's SSH key passphrase. The `#ssh`
@@ -455,6 +478,10 @@ pub struct AppState {
     /// `theme` and — for `System` — a one-time startup read of the OS
     /// preference. Root-scoped: written from the startup detection task.
     pub dark: Signal<bool>,
+    /// A saved-connection edit awaiting the connect that confirms it
+    /// (FRE-75). Root-scoped: the Entra sign-in card resolves it from a
+    /// background task after the form has closed.
+    pub pending_edit: Signal<Option<PendingEdit>>,
     /// Latest export progress per connection and pane. Root-scoped: written
     /// from the `spawn_forever` export task.
     pub export_status: Signal<HashMap<(ConnectionId, ExportPane), ExportStatus>>,
@@ -539,6 +566,7 @@ impl AppState {
             // scoped: written from that spawn_forever task.
             dark: Signal::new_in_scope(theme.resolve_dark(false), ScopeId::ROOT),
             // Root-scoped: written from the spawn_forever export task.
+            pending_edit: Signal::new_in_scope(None, ScopeId::ROOT),
             export_status: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             export_generations: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             // FK navigation state is only ever touched from UI event handlers,
@@ -595,6 +623,49 @@ impl AppState {
         });
         if added {
             self.persist_saved();
+        }
+    }
+
+    /// Records that the next successful connect to `new_locator` is an edit
+    /// of `old_locator` rather than a new connection (FRE-75). Consumed by
+    /// [`Self::save_postgres_if_open`] / [`Self::save_sqlserver_if_open`],
+    /// the one place every connect path saves through — including the Entra
+    /// sign-in card, which completes long after the form has closed.
+    pub fn set_pending_edit(mut self, old_locator: String, new_locator: String) {
+        self.pending_edit.set(Some(PendingEdit {
+            old_locator,
+            new_locator,
+        }));
+    }
+
+    /// Drops a pending edit (the form was cancelled or the connect failed).
+    pub fn clear_pending_edit(mut self) {
+        if self.pending_edit.peek().is_some() {
+            self.pending_edit.set(None);
+        }
+    }
+
+    /// Saves a just-opened connection, applying a pending edit when one is
+    /// waiting for exactly this locator. Matching on the locator keeps a
+    /// stale intent (a failed edit the user abandoned) from rewriting an
+    /// unrelated connection.
+    fn save_or_apply_edit(mut self, connection: SavedConnection) {
+        let pending = self
+            .pending_edit
+            .peek()
+            .clone()
+            .filter(|edit| edit.new_locator == connection.locator());
+        match pending {
+            Some(edit) => {
+                self.pending_edit.set(None);
+                self.update_saved(edit.old_locator, connection);
+            }
+            None => {
+                let added = self.saved.write().add(connection);
+                if added {
+                    self.persist_saved();
+                }
+            }
         }
     }
 
@@ -1345,7 +1416,12 @@ impl AppState {
     ) {
         let is_open = self.open_locators.read().iter().any(|(_, l)| l == url);
         if is_open {
-            self.add_saved_sqlserver(name.to_string(), url.to_string(), tunnel, auth);
+            self.save_or_apply_edit(SavedConnection::SqlServer {
+                name: name.to_string(),
+                url: url.to_string(),
+                tunnel,
+                auth,
+            });
         }
     }
 
@@ -1537,7 +1613,12 @@ impl AppState {
     ) {
         let is_open = self.open_locators.read().iter().any(|(_, l)| l == url);
         if is_open {
-            self.add_saved_postgres(name.to_string(), url.to_string(), tunnel, auth);
+            self.save_or_apply_edit(SavedConnection::Postgres {
+                name: name.to_string(),
+                url: url.to_string(),
+                tunnel,
+                auth,
+            });
         }
     }
 
