@@ -425,18 +425,22 @@ impl ParamSql {
 ///
 /// Enum and array columns are the exception to "use `data_type` verbatim":
 /// they report `USER-DEFINED` and `ARRAY`, which name no type at all. For
-/// those the introspected [`TypeDetail`] supplies the schema-qualified real
-/// name instead (`public.mood`, `pg_catalog._text`) — qualified because a
-/// user enum lives in its own schema while built-in array types live in
-/// `pg_catalog`, so neither is guaranteed to resolve through `search_path`
-/// (FRE-71).
+/// those the introspected [`TypeDetail`] supplies the real type name as its
+/// two identifier halves, each double-quoted here (`"public"."mood"`,
+/// `"pg_catalog"."_text"`). Quoted rather than lowercased because both are
+/// arbitrary identifiers — `CREATE TYPE "Mood"` is case-sensitive — and
+/// schema-qualified because a user enum lives in its own schema while
+/// built-in array types live in `pg_catalog`, so neither is guaranteed to
+/// resolve through `search_path` (FRE-71).
 ///
 /// Skipped (`None`) — the placeholder then binds as before:
 /// - on SQLite (its type affinity coerces on its own);
 /// - when the column is unknown or its type name is empty;
 /// - for `data_type` strings that are not usable/plain type names:
 ///   `ARRAY` and `USER-DEFINED` whose real name didn't resolve, or anything
-///   outside `[a-z0-9 _]` (plus `.` for a qualified name) after lowercasing
+///   outside `[a-z0-9 _.]` after lowercasing — `.` is allowed because the
+///   materialized-view half of the introspection UNION fills `type_name`
+///   from `format_type()`, which can legitimately emit `myschema.mytype`
 ///   (the charset gate also guarantees the interpolated cast text is inert);
 /// - for type names whose **bare form implies a restrictive default
 ///   modifier**: `data_type` drops length modifiers, so a `character(3)`
