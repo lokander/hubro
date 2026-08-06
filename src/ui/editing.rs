@@ -35,10 +35,10 @@
 use dioxus::prelude::*;
 use dioxus_icons::lucide::RotateCcw;
 
-use crate::db::{Dialect, Value};
+use crate::db::{Dialect, TypeDetail, Value};
 
 /// Which editor a column gets, derived by [`editor_kind`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorKind {
     /// Free-form text (also the fallback for unknown declared types).
     Text,
@@ -55,11 +55,17 @@ pub enum EditorKind {
     /// Database-assigned `GENERATED ALWAYS` identity/stored columns: not
     /// writable through ordinary SQL, so read-only in the editor.
     Generated,
+    /// A Postgres enum column: a dropdown of the type's variants, in
+    /// declaration order (FRE-71).
+    Enum { variants: Vec<String> },
+    /// A Postgres array column: the array literal as text, validated for
+    /// well-formedness before staging (FRE-71).
+    Array,
 }
 
 impl EditorKind {
     /// Whether cells of this kind are read-only (never open an editor).
-    pub fn is_read_only(self) -> bool {
+    pub fn is_read_only(&self) -> bool {
         matches!(self, EditorKind::Blob | EditorKind::Generated)
     }
 }
@@ -77,9 +83,23 @@ pub enum NumericKind {
     Exact,
 }
 
-/// Derives the editor kind from a declared column type (see the module docs
-/// for the exact rules and their order).
-pub fn editor_kind(type_name: &str) -> EditorKind {
+/// Derives the editor kind from a column's declared type and its
+/// introspected [`TypeDetail`] (see the module docs for the exact rules and
+/// their order). The detail wins where it applies: Postgres names enum and
+/// array columns `USER-DEFINED` and `ARRAY`, which carry no type information
+/// at all.
+pub fn editor_kind(type_name: &str, detail: &TypeDetail) -> EditorKind {
+    match detail {
+        // An enum type whose variants failed to resolve falls through to the
+        // name-based rules rather than offering an empty dropdown.
+        TypeDetail::Enum { variants, .. } if !variants.is_empty() => {
+            return EditorKind::Enum {
+                variants: variants.clone(),
+            }
+        }
+        TypeDetail::Array { .. } => return EditorKind::Array,
+        _ => {}
+    }
     let t = type_name.to_ascii_lowercase();
     if t.is_empty() {
         return EditorKind::Text;
@@ -153,20 +173,30 @@ pub fn bool_checked(value: &Value) -> bool {
 /// Parses committed editor text into the [`Value`] to stage, per kind.
 /// `Err` is the human-readable validation message shown inline; nothing is
 /// staged then.
-pub fn parse_input(kind: EditorKind, dialect: Dialect, text: &str) -> Result<Value, String> {
+pub fn parse_input(kind: &EditorKind, dialect: Dialect, text: &str) -> Result<Value, String> {
     match kind {
         EditorKind::Text | EditorKind::DateTime => Ok(Value::Text(text.to_string())),
         EditorKind::Json => match serde_json::from_str::<serde_json::Value>(text) {
             Ok(_) => Ok(Value::Text(text.to_string())),
             Err(err) => Err(format!("invalid JSON: {err}")),
         },
-        EditorKind::Numeric { kind } => parse_numeric(text, kind),
+        EditorKind::Numeric { kind } => parse_numeric(text, *kind),
         EditorKind::Bool => Ok(bool_value(
             dialect,
             bool_checked(&Value::Text(text.trim().to_string())),
         )),
         EditorKind::Blob => Err("blobs are read-only".to_string()),
         EditorKind::Generated => Err("generated columns are read-only".to_string()),
+        // The dropdown only offers real variants, so anything else here came
+        // from a stale schema; reject rather than stage a bad label.
+        EditorKind::Enum { variants } => {
+            if variants.iter().any(|v| v == text) {
+                Ok(Value::Text(text.to_string()))
+            } else {
+                Err(format!("not a variant of this enum: {text}"))
+            }
+        }
+        EditorKind::Array => validate_array_literal(text).map(|_| Value::Text(text.to_string())),
     }
 }
 
@@ -193,6 +223,68 @@ fn parse_numeric(text: &str, kind: NumericKind) -> Result<Value, String> {
         (NumericKind::Float, Ok(f)) if f.is_finite() => Ok(Value::Real(f)),
         (NumericKind::Exact, Ok(f)) if f.is_finite() => Ok(Value::Text(t.to_string())),
         _ => Err(format!("not a number: {t}")),
+    }
+}
+
+/// Validates a Postgres array literal well enough to keep a malformed one
+/// from reaching the database (FRE-71). This is a structural check, not a
+/// full parser: it verifies the value is brace-delimited, that braces nest
+/// and close, that double-quoted elements are terminated (with `\` escapes
+/// honoured inside them), and that no content trails the closing brace.
+/// Element *types* are left to the database — a wrong element type is a
+/// clear server-side error, whereas an unbalanced literal is not.
+///
+/// `NULL` (the whole value) is handled by the ∅ button, not here.
+fn validate_array_literal(text: &str) -> Result<(), String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Err("enter an array literal, e.g. {a,b} (or use the ∅ NULL button)".to_string());
+    }
+    if !t.starts_with('{') {
+        return Err("an array literal must start with '{'".to_string());
+    }
+    let mut depth = 0usize;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut closed_at = None;
+    for (index, ch) in t.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_quotes {
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_quotes = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_quotes = true,
+            '\\' => escaped = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| "unbalanced '}' in array literal".to_string())?;
+                if depth == 0 {
+                    closed_at = Some(index + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    if in_quotes {
+        return Err("unterminated quoted element in array literal".to_string());
+    }
+    if escaped {
+        return Err("array literal ends with a dangling '\\'".to_string());
+    }
+    match closed_at {
+        None => Err("unclosed '{' in array literal".to_string()),
+        Some(end) if t[end..].trim().is_empty() => Ok(()),
+        Some(_) => Err("unexpected text after the closing '}'".to_string()),
     }
 }
 
@@ -234,7 +326,7 @@ pub enum EditNav {
 /// - Checkbox (boolean) editors stage-and-close immediately on toggle.
 #[component]
 pub fn CellEditor(
-    kind: EditorKind,
+    kind: ReadOnlySignal<EditorKind>,
     dialect: Dialect,
     nullable: bool,
     initial: Value,
@@ -281,11 +373,11 @@ pub fn CellEditor(
         if *finished.peek() || !*modified.peek() {
             return;
         }
-        let parsed = if kind == EditorKind::Bool {
+        let parsed = if *kind.peek() == EditorKind::Bool {
             Ok(bool_value(dialect, *checked.peek()))
         } else {
             let raw = text.peek().clone();
-            parse_input(kind, dialect, &raw)
+            parse_input(&kind.peek(), dialect, &raw)
         };
         match parsed {
             Ok(value) => on_commit.call((Some(value), EditNav::Stay)),
@@ -309,10 +401,10 @@ pub fn CellEditor(
             }
             return;
         }
-        let parsed = if kind == EditorKind::Bool {
+        let parsed = if *kind.read() == EditorKind::Bool {
             Ok(bool_value(dialect, checked()))
         } else {
-            parse_input(kind, dialect, &text())
+            parse_input(&kind.read(), dialect, &text())
         };
         match parsed {
             Ok(value) => {
@@ -323,7 +415,7 @@ pub fn CellEditor(
         }
     };
 
-    let multiline = kind == EditorKind::Json;
+    let multiline = *kind.read() == EditorKind::Json;
     // Match on the physical key code, not `key()`: WebKitGTK reports
     // Shift+Tab with a non-"Tab" key name (ISO_Left_Tab), which would fall
     // through to native backward tab-navigation and close the editor via
@@ -388,7 +480,34 @@ pub fn CellEditor(
     rsx! {
         td { class: "bg-amber-100 dark:bg-amber-900/30 px-1 py-0.5 align-top",
             div { class: "flex items-start gap-1",
-                if kind == EditorKind::Bool {
+                if let EditorKind::Enum { variants } = &*kind.read() {
+                    select {
+                        id: "dv-cell-editor",
+                        class: "{input_class}",
+                        onmounted: focus_on_mount,
+                        onchange: move |evt| {
+                            text.set(evt.value());
+                            modified.set(true);
+                            error.set(None);
+                            commit(EditNav::Stay);
+                        },
+                        onkeydown: on_key,
+                        onblur: move |_| commit(EditNav::Stay),
+                        // A NULL (or otherwise unmatched) cell needs a
+                        // selectable resting state, else the browser shows
+                        // the first variant as though it were the value.
+                        if !variants.iter().any(|v| *v == *text.read()) {
+                            option { value: "", selected: true, disabled: true, "—" }
+                        }
+                        for variant in variants.clone() {
+                            option {
+                                value: "{variant}",
+                                selected: variant == *text.read(),
+                                "{variant}"
+                            }
+                        }
+                    }
+                } else if *kind.read() == EditorKind::Bool {
                     input {
                         r#type: "checkbox",
                         id: "dv-cell-editor",
@@ -484,6 +603,12 @@ pub fn CellEditor(
 mod tests {
     use super::*;
 
+    /// Type-name-only derivation (no enum/array detail), which is what the
+    /// name-matching rules below exercise.
+    fn plain_kind(type_name: &str) -> EditorKind {
+        editor_kind(type_name, &TypeDetail::Plain)
+    }
+
     const INTEGER: EditorKind = EditorKind::Numeric {
         kind: NumericKind::Integer,
     };
@@ -495,6 +620,90 @@ mod tests {
     };
 
     #[test]
+    fn enum_and_array_detail_wins_over_the_type_name() {
+        // Postgres names these columns 'USER-DEFINED' and 'ARRAY', which
+        // carry no type information — the introspected detail decides.
+        let variants = vec!["sad".to_string(), "happy".to_string()];
+        assert_eq!(
+            editor_kind(
+                "USER-DEFINED",
+                &TypeDetail::Enum {
+                    type_name: "public.mood".into(),
+                    variants: variants.clone(),
+                }
+            ),
+            EditorKind::Enum { variants }
+        );
+        assert_eq!(
+            editor_kind(
+                "ARRAY",
+                &TypeDetail::Array {
+                    type_name: "pg_catalog._text".into()
+                }
+            ),
+            EditorKind::Array
+        );
+        // An enum whose variants didn't resolve falls back to the name rules
+        // rather than offering an empty dropdown.
+        assert_eq!(
+            editor_kind(
+                "USER-DEFINED",
+                &TypeDetail::Enum {
+                    type_name: "public.mood".into(),
+                    variants: vec![],
+                }
+            ),
+            EditorKind::Text
+        );
+        // Detail never overrides a plain column's derived kind.
+        assert_eq!(editor_kind("integer", &TypeDetail::Plain), INTEGER);
+    }
+
+    #[test]
+    fn enum_input_must_be_a_declared_variant() {
+        let kind = EditorKind::Enum {
+            variants: vec!["sad".to_string(), "happy".to_string()],
+        };
+        assert_eq!(
+            parse_input(&kind, Dialect::Postgres, "happy"),
+            Ok(Value::Text("happy".into()))
+        );
+        // Anything the dropdown couldn't have produced (a stale schema)
+        // is refused rather than staged.
+        assert!(parse_input(&kind, Dialect::Postgres, "elated").is_err());
+        assert!(parse_input(&kind, Dialect::Postgres, "").is_err());
+    }
+
+    #[test]
+    fn array_literals_are_validated_structurally() {
+        let ok = |s: &str| validate_array_literal(s).is_ok();
+        assert!(ok("{}"));
+        assert!(ok("{1,2,3}"));
+        assert!(ok("{a,b}"));
+        assert!(ok(r#"{"has,comma","has\"quote"}"#));
+        assert!(ok("{{1,2},{3,4}}"));
+        assert!(ok("  {1,2}  "));
+        // Braces inside a quoted element don't affect nesting.
+        assert!(ok(r#"{"{not nested}"}"#));
+
+        assert!(!ok(""));
+        assert!(!ok("1,2"));
+        assert!(!ok("{1,2"));
+        assert!(!ok("{1,2}}"));
+        assert!(!ok(r#"{"unterminated}"#));
+        assert!(!ok("{1,2} trailing"));
+    }
+
+    #[test]
+    fn array_input_stages_the_literal_verbatim() {
+        assert_eq!(
+            parse_input(&EditorKind::Array, Dialect::Postgres, "{a,b}"),
+            Ok(Value::Text("{a,b}".into()))
+        );
+        assert!(parse_input(&EditorKind::Array, Dialect::Postgres, "{a,b").is_err());
+    }
+
+    #[test]
     fn read_only_kinds_are_blobs_and_generated_columns() {
         assert!(EditorKind::Blob.is_read_only());
         assert!(EditorKind::Generated.is_read_only());
@@ -503,45 +712,45 @@ mod tests {
         assert!(!INTEGER.is_read_only());
         // A generated column never opens an editor, but parse_input must
         // still refuse rather than silently stage.
-        assert!(parse_input(EditorKind::Generated, Dialect::Postgres, "1").is_err());
+        assert!(parse_input(&EditorKind::Generated, Dialect::Postgres, "1").is_err());
     }
 
     #[test]
     fn editor_kinds_derive_from_type_substrings() {
         // SQLite declared types (arbitrary case, may carry parens).
-        assert_eq!(editor_kind("INTEGER"), INTEGER);
-        assert_eq!(editor_kind("VARCHAR(40)"), EditorKind::Text);
-        assert_eq!(editor_kind("BOOLEAN"), EditorKind::Bool);
-        assert_eq!(editor_kind("BLOB"), EditorKind::Blob);
-        assert_eq!(editor_kind("DATETIME"), EditorKind::DateTime);
-        assert_eq!(editor_kind("DECIMAL(10,5)"), EXACT);
+        assert_eq!(plain_kind("INTEGER"), INTEGER);
+        assert_eq!(plain_kind("VARCHAR(40)"), EditorKind::Text);
+        assert_eq!(plain_kind("BOOLEAN"), EditorKind::Bool);
+        assert_eq!(plain_kind("BLOB"), EditorKind::Blob);
+        assert_eq!(plain_kind("DATETIME"), EditorKind::DateTime);
+        assert_eq!(plain_kind("DECIMAL(10,5)"), EXACT);
         // SQLite columns may have no declared type at all.
-        assert_eq!(editor_kind(""), EditorKind::Text);
+        assert_eq!(plain_kind(""), EditorKind::Text);
 
         // Postgres information_schema data_type strings.
-        assert_eq!(editor_kind("integer"), INTEGER);
-        assert_eq!(editor_kind("smallint"), INTEGER);
-        assert_eq!(editor_kind("bigserial"), INTEGER);
-        assert_eq!(editor_kind("double precision"), FLOAT);
-        assert_eq!(editor_kind("real"), FLOAT);
-        assert_eq!(editor_kind("numeric"), EXACT);
-        assert_eq!(editor_kind("boolean"), EditorKind::Bool);
-        assert_eq!(editor_kind("json"), EditorKind::Json);
-        assert_eq!(editor_kind("jsonb"), EditorKind::Json);
-        assert_eq!(editor_kind("date"), EditorKind::DateTime);
+        assert_eq!(plain_kind("integer"), INTEGER);
+        assert_eq!(plain_kind("smallint"), INTEGER);
+        assert_eq!(plain_kind("bigserial"), INTEGER);
+        assert_eq!(plain_kind("double precision"), FLOAT);
+        assert_eq!(plain_kind("real"), FLOAT);
+        assert_eq!(plain_kind("numeric"), EXACT);
+        assert_eq!(plain_kind("boolean"), EditorKind::Bool);
+        assert_eq!(plain_kind("json"), EditorKind::Json);
+        assert_eq!(plain_kind("jsonb"), EditorKind::Json);
+        assert_eq!(plain_kind("date"), EditorKind::DateTime);
         assert_eq!(
-            editor_kind("timestamp without time zone"),
+            plain_kind("timestamp without time zone"),
             EditorKind::DateTime
         );
-        assert_eq!(editor_kind("time with time zone"), EditorKind::DateTime);
-        assert_eq!(editor_kind("interval"), EditorKind::DateTime);
-        assert_eq!(editor_kind("bytea"), EditorKind::Blob);
-        assert_eq!(editor_kind("character varying"), EditorKind::Text);
-        assert_eq!(editor_kind("uuid"), EditorKind::Text);
-        assert_eq!(editor_kind("USER-DEFINED"), EditorKind::Text);
+        assert_eq!(plain_kind("time with time zone"), EditorKind::DateTime);
+        assert_eq!(plain_kind("interval"), EditorKind::DateTime);
+        assert_eq!(plain_kind("bytea"), EditorKind::Blob);
+        assert_eq!(plain_kind("character varying"), EditorKind::Text);
+        assert_eq!(plain_kind("uuid"), EditorKind::Text);
+        assert_eq!(plain_kind("USER-DEFINED"), EditorKind::Text);
         // "point" contains "int" but must not get a numeric editor;
         // "interval" contains "int" but is temporal.
-        assert_eq!(editor_kind("point"), EditorKind::Text);
+        assert_eq!(plain_kind("point"), EditorKind::Text);
     }
 
     #[test]
@@ -581,16 +790,16 @@ mod tests {
         assert!(integer("abc").is_err());
         assert!(integer("").is_err());
         // Same rule through the public parse_input path.
-        assert!(parse_input(INTEGER, Dialect::Postgres, "2.75").is_err());
+        assert!(parse_input(&INTEGER, Dialect::Postgres, "2.75").is_err());
         assert_eq!(
-            parse_input(INTEGER, Dialect::Sqlite, "12"),
+            parse_input(&INTEGER, Dialect::Sqlite, "12"),
             Ok(Value::Integer(12))
         );
     }
 
     #[test]
     fn json_input_is_validated_and_staged_as_typed_text() {
-        let parse = |s| parse_input(EditorKind::Json, Dialect::Postgres, s);
+        let parse = |s| parse_input(&EditorKind::Json, Dialect::Postgres, s);
         // Valid JSON keeps the user's exact formatting.
         assert_eq!(
             parse("{\n  \"a\": 1\n}"),
@@ -620,11 +829,11 @@ mod tests {
         assert_eq!(bool_value(Dialect::SqlServer, false), Value::Integer(0));
         // The same staging applies through parse_input's bool path.
         assert_eq!(
-            parse_input(EditorKind::Bool, Dialect::SqlServer, "true"),
+            parse_input(&EditorKind::Bool, Dialect::SqlServer, "true"),
             Ok(Value::Integer(1))
         );
         assert_eq!(
-            parse_input(EditorKind::Bool, Dialect::SqlServer, "no"),
+            parse_input(&EditorKind::Bool, Dialect::SqlServer, "no"),
             Ok(Value::Integer(0))
         );
     }
@@ -643,14 +852,14 @@ mod tests {
     #[test]
     fn text_and_datetime_input_stage_as_text_unvalidated() {
         assert_eq!(
-            parse_input(EditorKind::Text, Dialect::Sqlite, "hello"),
+            parse_input(&EditorKind::Text, Dialect::Sqlite, "hello"),
             Ok(Value::Text("hello".into()))
         );
         // Date/time text is staged as-is; the backend validates on save.
         assert_eq!(
-            parse_input(EditorKind::DateTime, Dialect::Postgres, "2024-06-01 12:30"),
+            parse_input(&EditorKind::DateTime, Dialect::Postgres, "2024-06-01 12:30"),
             Ok(Value::Text("2024-06-01 12:30".into()))
         );
-        assert!(parse_input(EditorKind::Blob, Dialect::Sqlite, "x").is_err());
+        assert!(parse_input(&EditorKind::Blob, Dialect::Sqlite, "x").is_err());
     }
 }

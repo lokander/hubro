@@ -207,6 +207,7 @@ mod tests {
             primary_key_position: pk,
             default: None,
             generated: Generated::Never,
+            type_detail: crate::db::TypeDetail::Plain,
         }
     }
 

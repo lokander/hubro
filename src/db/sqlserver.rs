@@ -36,7 +36,9 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt as _};
 
 use super::error::DbError;
 use super::export::{export_io_err, ExportFormat, ExportSink};
-use super::schema::{ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta};
+use super::schema::{
+    ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta, TypeDetail,
+};
 use super::staged::CheckedStatement;
 use super::value::{cap_value, ColumnInfo, QueryResult, Value};
 
@@ -1183,6 +1185,8 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
             primary_key_position: pk_position,
             default,
             generated,
+            // SQL Server has neither enum nor array types.
+            type_detail: TypeDetail::Plain,
         });
     }
 

@@ -9,7 +9,7 @@
 
 use dataview::db::{
     detect_row_identity, url_with_password, DbError, DbPool, Dialect, Filter, PageRequest,
-    RowLocator, SortDir, TableKind, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
+    RowLocator, SortDir, TableKind, TypeDetail, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 fn test_url() -> Option<String> {
@@ -678,5 +678,64 @@ async fn postgres_query_capped_stops_and_bounds_cells() {
         panic!("expected text");
     }
 
+    pool.close().await;
+}
+
+/// Enum and array columns are reported by information_schema as the opaque
+/// `USER-DEFINED` / `ARRAY`, so introspection resolves the real structure
+/// from pg_catalog for the type-aware editors (FRE-71).
+#[tokio::test]
+async fn postgres_introspection_resolves_enum_variants_and_array_columns() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.query("DROP TABLE IF EXISTS enum_intro").await.unwrap();
+    pool.query("DROP TYPE IF EXISTS intro_mood").await.unwrap();
+    pool.query("CREATE TYPE intro_mood AS ENUM ('sad', 'ok', 'happy')")
+        .await
+        .unwrap();
+    pool.query(
+        "CREATE TABLE enum_intro (
+            id serial PRIMARY KEY,
+            feeling intro_mood,
+            tags text[],
+            plain text
+        )",
+    )
+    .await
+    .unwrap();
+
+    let tables = pool.introspect().await.unwrap();
+    let table = tables.iter().find(|t| t.name == "enum_intro").unwrap();
+    let col = |name: &str| {
+        table
+            .columns
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no column {name}"))
+    };
+
+    // Variants come back in declaration order, not alphabetical.
+    assert_eq!(
+        col("feeling").type_detail,
+        TypeDetail::Enum {
+            // Schema-qualified so the staged cast resolves regardless of
+            // search_path.
+            type_name: "public.intro_mood".into(),
+            variants: vec!["sad".into(), "ok".into(), "happy".into()],
+        }
+    );
+    // Built-in array types live in pg_catalog, not the table's schema.
+    assert_eq!(
+        col("tags").type_detail,
+        TypeDetail::Array {
+            type_name: "pg_catalog._text".into()
+        }
+    );
+    // Ordinary columns are unaffected.
+    assert_eq!(col("plain").type_detail, TypeDetail::Plain);
+    assert_eq!(col("id").type_detail, TypeDetail::Plain);
+
+    pool.query("DROP TABLE enum_intro").await.unwrap();
+    pool.query("DROP TYPE intro_mood").await.unwrap();
     pool.close().await;
 }

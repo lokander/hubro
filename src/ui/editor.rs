@@ -704,6 +704,7 @@ mod tests {
                     primary_key_position: None,
                     default: None,
                     generated: crate::db::Generated::Never,
+                    type_detail: crate::db::TypeDetail::Plain,
                 })
                 .collect(),
             indexes: vec![],

@@ -9,7 +9,9 @@ use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
 use super::error::DbError;
 use super::export::{export_io_err, ExportFormat, ExportSink};
 use super::page::quote_ident;
-use super::schema::{ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta};
+use super::schema::{
+    ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta, TypeDetail,
+};
 use super::staged::CheckedStatement;
 use super::value::{cap_value, ColumnInfo, QueryResult, Value};
 
@@ -386,6 +388,8 @@ async fn table_columns(pool: &SqlitePool, table: &str) -> Result<Vec<ColumnMeta>
             } else {
                 Generated::Never
             },
+            // SQLite has no enum or array types.
+            type_detail: TypeDetail::Plain,
         });
     }
     Ok(columns)
