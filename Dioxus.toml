@@ -12,12 +12,18 @@ Browse tables and schemas, run SQL with an editor that offers schema-aware
 completion, page through large result sets, edit rows inline, and export query
 results — all from a native desktop app.
 """
+# ORDER IS LOAD-BEARING — largest first (FRE-65). The macOS .icns is built
+# entirely from the *first* entry: dx fills all twelve icns slots (up to
+# 1024px) by Lanczos-resizing it, skipping any slot already occupied, so
+# later entries are decoded and discarded. Listing 32x32 first therefore
+# upscales a 32px image across the whole Dock/Finder icon set. Linux is
+# unaffected either way — it routes each PNG by its decoded dimensions.
 icon = [
-    "assets/icons/32x32.png",
-    "assets/icons/64x64.png",
-    "assets/icons/128x128.png",
-    "assets/icons/256x256.png",
     "assets/icons/512x512.png",
+    "assets/icons/256x256.png",
+    "assets/icons/128x128.png",
+    "assets/icons/64x64.png",
+    "assets/icons/32x32.png",
 ]
 
 [bundle.deb]
@@ -37,3 +43,8 @@ minimum_system_version = "11.0"
 # publisher" warning on first run — documented in the README.
 [bundle.windows]
 webview_install_mode = { DownloadBootstrapper = { silent = true } }
+# Required for the executable and MSI to carry our icon at all (FRE-65): dx
+# only reads `.ico` entries when embedding Windows resources, and every path
+# in `bundle.icon` above is a `.png`. Without this it silently falls back to
+# dx's own bundled logo.
+icon_path = "assets/icons/icon.ico"
