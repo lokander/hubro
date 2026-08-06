@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::azure::EntraAuth;
+use crate::db::Dialect;
 use crate::tunnel::TunnelConfig;
 
 /// How a server connection (Postgres, FRE-43; SQL Server, FRE-58)
@@ -82,6 +83,19 @@ pub enum BackendKind {
     Sqlite,
     Postgres,
     SqlServer,
+}
+
+impl From<BackendKind> for Dialect {
+    /// A saved connection's backend and an open connection's SQL dialect name
+    /// the same three engines, so converting lets both address one per-engine
+    /// lookup (e.g. the brand marks, FRE-70).
+    fn from(kind: BackendKind) -> Self {
+        match kind {
+            BackendKind::Sqlite => Dialect::Sqlite,
+            BackendKind::Postgres => Dialect::Postgres,
+            BackendKind::SqlServer => Dialect::SqlServer,
+        }
+    }
 }
 
 impl SavedConnection {

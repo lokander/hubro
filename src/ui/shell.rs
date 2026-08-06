@@ -10,10 +10,11 @@ use dioxus_icons::lucide::{Moon, Plug, Sun, SunMoon, X};
 use crate::config::{
     default_settings_path, load_settings, save_window_geometry, BackendKind, Theme, WindowGeometry,
 };
-use crate::db::ConnectionId;
+use crate::db::{ConnectionId, Dialect};
 
 use super::editor::SqlEditor;
 use super::grid::DataGrid;
+use super::icons::BackendIcon;
 use super::notice::{Banner, BannerKind, EmptyState};
 use super::sidebar::SchemaSidebar;
 use super::state::{ActiveView, AppState};
@@ -433,11 +434,11 @@ fn TabBar() -> Element {
     let mut state = use_context::<AppState>();
     let active = *state.active.read();
     // Owned copies so the loop can hand ids/names to event handlers.
-    let tabs: Vec<(ConnectionId, String)> = state
+    let tabs: Vec<(ConnectionId, String, Dialect)> = state
         .registry
         .read()
         .iter()
-        .map(|c| (c.id, c.name.clone()))
+        .map(|c| (c.id, c.name.clone(), c.pool.dialect()))
         .collect();
     rsx! {
         header { class: "flex items-center gap-1 border-b border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 pt-1",
@@ -450,7 +451,7 @@ fn TabBar() -> Element {
                 onclick: move |_| state.active.set(ActiveView::Connections),
                 "Connections"
             }
-            for (id, name) in tabs {
+            for (id, name, dialect) in tabs {
                 div {
                     class: if active == ActiveView::Connection(id) {
                         "flex items-center gap-1 rounded-t bg-white dark:bg-slate-900 px-3 py-1.5 text-sm text-slate-900 dark:text-slate-100"
@@ -458,7 +459,9 @@ fn TabBar() -> Element {
                         "flex items-center gap-1 rounded-t px-3 py-1.5 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100"
                     },
                     button {
+                        class: "flex items-center gap-1.5",
                         onclick: move |_| state.active.set(ActiveView::Connection(id)),
+                        BackendIcon { dialect }
                         "{name}"
                     }
                     button {
@@ -702,6 +705,9 @@ fn ConnectionsScreen() -> Element {
                                     }
                                 },
                                 div { class: "flex items-center gap-2",
+                                    span { class: "shrink-0 text-slate-500 dark:text-slate-400",
+                                        BackendIcon { dialect: Dialect::from(row.backend), size: 16 }
+                                    }
                                     span { class: "truncate text-sm font-medium text-slate-900 dark:text-slate-200",
                                         "{row.name}"
                                     }
@@ -761,26 +767,29 @@ fn ConnectionsScreen() -> Element {
             }
             div { class: "flex gap-3",
                 button {
-                    class: "rounded bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500",
+                    class: "flex items-center gap-2 rounded bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500",
                     onclick: pick_file,
+                    BackendIcon { dialect: Dialect::Sqlite, size: 16 }
                     "Add SQLite file…"
                 }
                 button {
-                    class: "rounded bg-cyan-700 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-600",
+                    class: "flex items-center gap-2 rounded bg-cyan-700 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-600",
                     onclick: move |_| {
                         let showing = *show_pg_form.read();
                         show_pg_form.set(!showing);
                         show_mssql_form.set(false);
                     },
+                    BackendIcon { dialect: Dialect::Postgres, size: 16 }
                     "Add Postgres…"
                 }
                 button {
-                    class: "rounded bg-red-800 px-4 py-2 text-sm font-medium text-white hover:bg-red-700",
+                    class: "flex items-center gap-2 rounded bg-red-800 px-4 py-2 text-sm font-medium text-white hover:bg-red-700",
                     onclick: move |_| {
                         let showing = *show_mssql_form.read();
                         show_mssql_form.set(!showing);
                         show_pg_form.set(false);
                     },
+                    BackendIcon { dialect: Dialect::SqlServer, size: 16 }
                     "Add SQL Server…"
                 }
             }
