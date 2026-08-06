@@ -614,11 +614,10 @@ pub fn CellEditor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::TypeRef;
 
     /// Type-name-only derivation (no enum/array detail), which is what the
     /// name-matching rules below exercise.
-    use crate::db::TypeRef;
-
     fn plain_kind(type_name: &str) -> EditorKind {
         editor_kind(type_name, &TypeDetail::Plain)
     }
