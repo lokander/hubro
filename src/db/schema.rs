@@ -29,6 +29,16 @@ pub enum Generated {
     Always,
 }
 
+/// A schema-qualified type name straight from `pg_catalog`. Both halves are
+/// arbitrary SQL identifiers — `CREATE TYPE "Mood"` and quoted names with
+/// spaces or hyphens are all legal — so they are kept apart and quoted at
+/// the point of use rather than pre-joined into one string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeRef {
+    pub schema: String,
+    pub name: String,
+}
+
 /// Type structure that the declared type name alone doesn't convey, used to
 /// pick a richer editor (FRE-71). Postgres reports both of these as opaque
 /// `information_schema` strings (`USER-DEFINED`, `ARRAY`), so the detail is
@@ -39,27 +49,25 @@ pub enum TypeDetail {
     /// Nothing beyond the type name — the editor follows from it alone.
     #[default]
     Plain,
-    /// An enum type: its variants in declaration order, plus the
-    /// schema-qualified type name (e.g. `public.mood`) that staged values
-    /// must be cast to, since `data_type` only says `USER-DEFINED`.
+    /// An enum type: its variants in declaration order, plus the real type
+    /// name staged values must be cast to, since `data_type` only says
+    /// `USER-DEFINED`.
     Enum {
-        type_name: String,
+        type_ref: TypeRef,
         variants: Vec<String>,
     },
-    /// An array type, with the schema-qualified type name to cast to (e.g.
+    /// An array type, with the real type name to cast to (e.g.
     /// `pg_catalog._text`); `data_type` only says `ARRAY`.
-    Array { type_name: String },
+    Array { type_ref: TypeRef },
 }
 
 impl TypeDetail {
-    /// The schema-qualified type name staged values must be cast to, when
-    /// the declared `type_name` isn't itself a usable cast target.
-    pub fn cast_name(&self) -> Option<&str> {
+    /// The real type name staged values must be cast to, when the declared
+    /// `type_name` isn't itself a usable cast target.
+    pub fn cast_type(&self) -> Option<&TypeRef> {
         match self {
             TypeDetail::Plain => None,
-            TypeDetail::Enum { type_name, .. } | TypeDetail::Array { type_name } => {
-                Some(type_name.as_str())
-            }
+            TypeDetail::Enum { type_ref, .. } | TypeDetail::Array { type_ref } => Some(type_ref),
         }
     }
 }

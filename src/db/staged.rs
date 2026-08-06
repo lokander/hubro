@@ -454,13 +454,19 @@ fn cast_target(table: &TableMeta, dialect: Dialect, column: &str) -> Option<Stri
         return None;
     }
     let column = table.columns.iter().find(|c| c.name == column)?;
-    // An enum/array column's real, schema-qualified type name; `data_type`
-    // for these is the useless `USER-DEFINED`/`ARRAY` (FRE-71).
-    let type_name = column
-        .type_detail
-        .cast_name()
-        .unwrap_or(column.type_name.as_str());
-    let lowered = type_name.trim().to_ascii_lowercase();
+    // An enum/array column casts to its real type name, which `data_type`
+    // doesn't carry (FRE-71). Both halves are arbitrary identifiers — a
+    // `CREATE TYPE "Mood"` is case-sensitive and would not resolve
+    // lowercased — so they are quoted rather than run through the
+    // lowercase/charset gate that the `data_type` vocabulary below needs.
+    if let Some(type_ref) = column.type_detail.cast_type() {
+        return Some(format!(
+            "{}.{}",
+            quote_ident(&type_ref.schema),
+            quote_ident(&type_ref.name)
+        ));
+    }
+    let lowered = column.type_name.trim().to_ascii_lowercase();
     let plain = !lowered.is_empty()
         && lowered != "array"
         && lowered != "character"
@@ -938,13 +944,19 @@ mod tests {
             match column.name.as_str() {
                 "mood" => {
                     column.type_detail = crate::db::TypeDetail::Enum {
-                        type_name: "app.mood".into(),
+                        type_ref: crate::db::TypeRef {
+                            schema: "app".into(),
+                            name: "mood".into(),
+                        },
                         variants: vec!["sad".into(), "happy".into()],
                     }
                 }
                 "tags" => {
                     column.type_detail = crate::db::TypeDetail::Array {
-                        type_name: "pg_catalog._text".into(),
+                        type_ref: crate::db::TypeRef {
+                            schema: "pg_catalog".into(),
+                            name: "_text".into(),
+                        },
                     }
                 }
                 _ => {}
@@ -963,8 +975,8 @@ mod tests {
         assert_eq!(
             plan[0].statement.sql,
             "UPDATE \"app\".\"typed\" SET \
-             \"mood\" = $1::app.mood, \
-             \"tags\" = $2::pg_catalog._text \
+             \"mood\" = $1::\"app\".\"mood\", \
+             \"tags\" = $2::\"pg_catalog\".\"_text\" \
              WHERE \"id\" = $3::integer"
         );
     }

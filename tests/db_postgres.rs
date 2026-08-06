@@ -9,7 +9,7 @@
 
 use dataview::db::{
     detect_row_identity, url_with_password, DbError, DbPool, Dialect, Filter, PageRequest,
-    RowLocator, SortDir, TableKind, TypeDetail, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
+    RowLocator, SortDir, TableKind, TypeDetail, TypeRef, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 fn test_url() -> Option<String> {
@@ -718,9 +718,12 @@ async fn postgres_introspection_resolves_enum_variants_and_array_columns() {
     assert_eq!(
         col("feeling").type_detail,
         TypeDetail::Enum {
-            // Schema-qualified so the staged cast resolves regardless of
-            // search_path.
-            type_name: "public.intro_mood".into(),
+            // Kept schema-qualified so the staged cast resolves regardless
+            // of search_path.
+            type_ref: TypeRef {
+                schema: "public".into(),
+                name: "intro_mood".into(),
+            },
             variants: vec!["sad".into(), "ok".into(), "happy".into()],
         }
     );
@@ -728,7 +731,10 @@ async fn postgres_introspection_resolves_enum_variants_and_array_columns() {
     assert_eq!(
         col("tags").type_detail,
         TypeDetail::Array {
-            type_name: "pg_catalog._text".into()
+            type_ref: TypeRef {
+                schema: "pg_catalog".into(),
+                name: "_text".into(),
+            }
         }
     );
     // Ordinary columns are unaffected.
@@ -737,5 +743,71 @@ async fn postgres_introspection_resolves_enum_variants_and_array_columns() {
 
     pool.query("DROP TABLE enum_intro").await.unwrap();
     pool.query("DROP TYPE intro_mood").await.unwrap();
+    pool.close().await;
+}
+
+/// A case-sensitive (quoted) enum type in its own schema: the staged cast
+/// must be quoted per identifier, or it resolves to a lowercased name that
+/// doesn't exist. Regression test for the FRE-71 review.
+#[tokio::test]
+async fn postgres_quoted_camelcase_enum_saves_through_the_staged_cast() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.query("DROP TABLE IF EXISTS camel_intro")
+        .await
+        .unwrap();
+    pool.query("DROP SCHEMA IF EXISTS camel_ns CASCADE")
+        .await
+        .unwrap();
+    pool.query("CREATE SCHEMA camel_ns").await.unwrap();
+    pool.query(r#"CREATE TYPE camel_ns."Mood" AS ENUM ('sad', 'happy')"#)
+        .await
+        .unwrap();
+    pool.query(r#"CREATE TABLE camel_intro (id int PRIMARY KEY, m camel_ns."Mood")"#)
+        .await
+        .unwrap();
+    pool.query("INSERT INTO camel_intro VALUES (1, 'sad')")
+        .await
+        .unwrap();
+
+    let tables = pool.introspect().await.unwrap();
+    let table = tables.iter().find(|t| t.name == "camel_intro").unwrap();
+    let column = table.columns.iter().find(|c| c.name == "m").unwrap();
+    assert_eq!(
+        column.type_detail,
+        TypeDetail::Enum {
+            type_ref: TypeRef {
+                schema: "camel_ns".into(),
+                name: "Mood".into(),
+            },
+            variants: vec!["sad".into(), "happy".into()],
+        }
+    );
+
+    // The staged UPDATE has to survive the round trip, not just introspect.
+    let identity = detect_row_identity(table, Dialect::Postgres).unwrap();
+    let applied = dataview::db::apply_staged(
+        &pool,
+        table,
+        &identity,
+        &[dataview::db::StagedChange::Update {
+            locator: RowLocator {
+                identity_values: vec![Value::Integer(1)],
+            },
+            column: "m".into(),
+            value: Value::Text("happy".into()),
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(applied.updated_rows, 1);
+    let after = pool
+        .query("SELECT m::text FROM camel_intro WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(after.rows[0][0], Value::Text("happy".into()));
+
+    pool.query("DROP TABLE camel_intro").await.unwrap();
+    pool.query("DROP SCHEMA camel_ns CASCADE").await.unwrap();
     pool.close().await;
 }
