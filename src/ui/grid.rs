@@ -1879,11 +1879,19 @@ fn GridCellSlot(
                 },
                 on_cancel: move |_| editing.set(None),
                 on_draft: move |text: String| {
-                    editing.set(Some(ActiveEdit {
-                        row_key: draft_row_key.clone(),
-                        column: draft_column.clone(),
-                        draft: Some(text),
-                    }));
+                    // Stash only while this cell is still the active edit —
+                    // a deliberate switch to another cell or a sort/filter
+                    // reset must not be hijacked back to the invalid editor.
+                    let still_active = editing.peek().as_ref().is_some_and(|active| {
+                        active.row_key == draft_row_key && active.column == draft_column
+                    });
+                    if still_active {
+                        editing.set(Some(ActiveEdit {
+                            row_key: draft_row_key.clone(),
+                            column: draft_column.clone(),
+                            draft: Some(text),
+                        }));
+                    }
                 },
             }
         }
@@ -2088,11 +2096,19 @@ fn InsertCellSlot(
                 initial: override_value.clone().unwrap_or(Value::Null),
                 draft,
                 on_draft: move |text: String| {
-                    editing.set(Some(ActiveEdit {
-                        row_key: draft_row_key.clone(),
-                        column: draft_column.clone(),
-                        draft: Some(text),
-                    }));
+                    // Stash only while this cell is still the active edit —
+                    // a deliberate switch to another cell or a sort/filter
+                    // reset must not be hijacked back to the invalid editor.
+                    let still_active = editing.peek().as_ref().is_some_and(|active| {
+                        active.row_key == draft_row_key && active.column == draft_column
+                    });
+                    if still_active {
+                        editing.set(Some(ActiveEdit {
+                            row_key: draft_row_key.clone(),
+                            column: draft_column.clone(),
+                            draft: Some(text),
+                        }));
+                    }
                 },
                 on_commit: move |(value, nav): (Option<Value>, EditNav)| {
                     if let Some(value) = value {
@@ -2269,11 +2285,20 @@ fn TruncatedCellEditor(
                     initial,
                     draft,
                     on_draft: move |text: String| {
-                        editing.set(Some(ActiveEdit {
-                            row_key: draft_row_key.clone(),
-                            column: draft_column.clone(),
-                            draft: Some(text),
-                        }));
+                        // Stash only while this cell is still the active
+                        // edit — a deliberate switch to another cell or a
+                        // sort/filter reset must not be hijacked back to
+                        // the invalid editor.
+                        let still_active = editing.peek().as_ref().is_some_and(|active| {
+                            active.row_key == draft_row_key && active.column == draft_column
+                        });
+                        if still_active {
+                            editing.set(Some(ActiveEdit {
+                                row_key: draft_row_key.clone(),
+                                column: draft_column.clone(),
+                                draft: Some(text),
+                            }));
+                        }
                     },
                     on_commit: move |(value, nav): (Option<Value>, EditNav)| {
                         if let Some(value) = value {
