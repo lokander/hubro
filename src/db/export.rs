@@ -180,12 +180,13 @@ fn csv_cell(value: &Value) -> String {
 }
 
 /// Neutralizes CSV formula injection (FRE-73): Excel and LibreOffice execute
-/// cells starting with `=` `+` `-` `@` as live formulas on open, so a text
-/// value starting with one gets the standard leading-apostrophe prefix.
-/// Text only — numbers render bare (`-7` must stay a number) and blobs are
-/// `\x`-prefixed; JSON is not an executable format and stays verbatim.
+/// cells starting with `=` `+` `-` `@` (or a tab, per OWASP's list) as live
+/// formulas on open, so a text value starting with one gets the standard
+/// leading-apostrophe prefix. Text only — numbers render bare (`-7` must
+/// stay a number) and blobs are `\x`-prefixed; JSON is not an executable
+/// format and stays verbatim.
 fn harden_csv_text(text: &str) -> String {
-    if text.starts_with(['=', '+', '-', '@']) {
+    if text.starts_with(['=', '+', '-', '@', '\t']) {
         format!("'{text}")
     } else {
         text.to_string()
@@ -327,6 +328,14 @@ mod tests {
             to_string(&r, ExportFormat::Csv),
             "a,b,c,d,e\n'=cmd|'/C calc'!A0,'+1,'-danger,'@SUM(A1),-7\n"
         );
+    }
+
+    #[test]
+    fn csv_neutralizes_a_leading_tab() {
+        // A leading tab is on OWASP's injection list but does not trigger
+        // RFC-4180 quoting, so it must be apostrophe-prefixed too.
+        let r = result(&["a"], vec![vec![Value::Text("\t=1+1".into())]]);
+        assert_eq!(to_string(&r, ExportFormat::Csv), "a\n'\t=1+1\n");
     }
 
     #[test]
