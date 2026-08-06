@@ -66,6 +66,11 @@ const GRID_SCROLL_JS: &str = r#"
 struct ActiveEdit {
     row_key: String,
     column: String,
+    /// Uncommitted editor text stashed when the open editor's row was
+    /// scrolled out of the virtual window while its input didn't parse
+    /// (FRE-74); the remounting editor seeds from it instead of the cell
+    /// value.
+    draft: Option<String>,
 }
 
 /// What the value-expand popup shows: a short value already in hand, or a
@@ -601,6 +606,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     (true, Some(key)) => editing.set(Some(ActiveEdit {
                         row_key: key,
                         column: cell.column.clone(),
+                        draft: None,
                     })),
                     _ => {
                         let view = match (cell.truncated, nav.rows[r].locator.clone()) {
@@ -1843,12 +1849,19 @@ fn GridCellSlot(
             };
         }
         let commit_table = table.clone();
+        let draft = editing
+            .read()
+            .as_ref()
+            .and_then(|active| active.draft.clone());
+        let draft_row_key = row_key.clone();
+        let draft_column = column.clone();
         rsx! {
             CellEditor {
                 kind,
                 dialect,
                 nullable,
                 initial: cell.value.clone(),
+                draft,
                 on_commit: move |(value, nav): (Option<Value>, EditNav)| {
                     if let Some(value) = value {
                         state.stage_cell_edit(id, &commit_table, locator.clone(), &column, value);
@@ -1861,9 +1874,17 @@ fn GridCellSlot(
                     editing.set(next.map(|column| ActiveEdit {
                         row_key: row_key.clone(),
                         column,
+                        draft: None,
                     }));
                 },
                 on_cancel: move |_| editing.set(None),
+                on_draft: move |text: String| {
+                    editing.set(Some(ActiveEdit {
+                        row_key: draft_row_key.clone(),
+                        column: draft_column.clone(),
+                        draft: Some(text),
+                    }));
+                },
             }
         }
     } else {
@@ -1874,6 +1895,7 @@ fn GridCellSlot(
                 editing.set(Some(ActiveEdit {
                     row_key: row_key.clone(),
                     column: column.clone(),
+                    draft: None,
                 }));
             }
         };
@@ -2052,12 +2074,26 @@ fn InsertCellSlot(
         let commit_row_key = row_key.clone();
         let default_table = table.clone();
         let default_column = column.clone();
+        let draft = editing
+            .read()
+            .as_ref()
+            .and_then(|active| active.draft.clone());
+        let draft_row_key = row_key.clone();
+        let draft_column = column.clone();
         rsx! {
             CellEditor {
                 kind,
                 dialect,
                 nullable,
                 initial: override_value.clone().unwrap_or(Value::Null),
+                draft,
+                on_draft: move |text: String| {
+                    editing.set(Some(ActiveEdit {
+                        row_key: draft_row_key.clone(),
+                        column: draft_column.clone(),
+                        draft: Some(text),
+                    }));
+                },
                 on_commit: move |(value, nav): (Option<Value>, EditNav)| {
                     if let Some(value) = value {
                         state.stage_insert_value(id, &commit_table, insert_id, &commit_column, value);
@@ -2070,6 +2106,7 @@ fn InsertCellSlot(
                     editing.set(next.map(|column| ActiveEdit {
                         row_key: commit_row_key.clone(),
                         column,
+                        draft: None,
                     }));
                 },
                 on_cancel: move |_| editing.set(None),
@@ -2086,6 +2123,7 @@ fn InsertCellSlot(
             editing.set(Some(ActiveEdit {
                 row_key: activate_key.clone(),
                 column: activate_column.clone(),
+                draft: None,
             }));
         };
         let mut open_on_enter = activate.clone();
@@ -2217,12 +2255,26 @@ fn TruncatedCellEditor(
             let commit_row_key = row_key.clone();
             let commit_columns = editable_columns.clone();
             let commit_locator = locator.clone();
+            let draft = editing
+                .read()
+                .as_ref()
+                .and_then(|active| active.draft.clone());
+            let draft_row_key = row_key.clone();
+            let draft_column = column.clone();
             rsx! {
                 CellEditor {
                     kind,
                     dialect,
                     nullable,
                     initial,
+                    draft,
+                    on_draft: move |text: String| {
+                        editing.set(Some(ActiveEdit {
+                            row_key: draft_row_key.clone(),
+                            column: draft_column.clone(),
+                            draft: Some(text),
+                        }));
+                    },
                     on_commit: move |(value, nav): (Option<Value>, EditNav)| {
                         if let Some(value) = value {
                             state.stage_cell_edit(id, &commit_table, commit_locator.clone(), &commit_column, value);
@@ -2235,6 +2287,7 @@ fn TruncatedCellEditor(
                         editing.set(next.map(|column| ActiveEdit {
                             row_key: commit_row_key.clone(),
                             column,
+                            draft: None,
                         }));
                     },
                     on_cancel: move |_| editing.set(None),
