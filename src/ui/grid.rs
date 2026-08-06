@@ -1385,7 +1385,7 @@ fn column_kinds_of(meta: Option<&TableMeta>) -> HashMap<String, (EditorKind, boo
                 let kind = if c.generated == Generated::Always {
                     EditorKind::Generated
                 } else {
-                    editor_kind(&c.type_name)
+                    editor_kind(&c.type_name, &c.type_detail)
                 };
                 (c.name.clone(), (kind, c.nullable))
             })
@@ -1409,7 +1409,7 @@ fn cell_kind(
 ) -> (EditorKind, bool) {
     column_kinds
         .get(&cell.column)
-        .copied()
+        .cloned()
         .unwrap_or((EditorKind::Text, true))
 }
 
@@ -2037,7 +2037,7 @@ fn InsertRow(
                     row_key: row_key.clone(),
                     column: column.clone(),
                     override_value: insert.value(&column).cloned(),
-                    kind: column_kinds.get(&column).map(|(kind, _)| *kind).unwrap_or(EditorKind::Text),
+                    kind: column_kinds.get(&column).map(|(kind, _)| kind.clone()).unwrap_or(EditorKind::Text),
                     nullable: column_kinds.get(&column).map(|(_, nullable)| *nullable).unwrap_or(true),
                     missing: required.contains(&column) && insert.lacks_value(&column),
                     dialect,

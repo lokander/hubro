@@ -423,14 +423,21 @@ impl ParamSql {
 /// type is used verbatim. Casts also apply to WHERE key values, where e.g.
 /// a uuid or timestamp key arrives from the grid as text.
 ///
+/// Enum and array columns are the exception to "use `data_type` verbatim":
+/// they report `USER-DEFINED` and `ARRAY`, which name no type at all. For
+/// those the introspected [`TypeDetail`] supplies the schema-qualified real
+/// name instead (`public.mood`, `pg_catalog._text`) — qualified because a
+/// user enum lives in its own schema while built-in array types live in
+/// `pg_catalog`, so neither is guaranteed to resolve through `search_path`
+/// (FRE-71).
+///
 /// Skipped (`None`) — the placeholder then binds as before:
 /// - on SQLite (its type affinity coerces on its own);
 /// - when the column is unknown or its type name is empty;
 /// - for `data_type` strings that are not usable/plain type names:
-///   `ARRAY` and `USER-DEFINED` (enums — `data_type` doesn't carry the
-///   actual type name), or anything outside `[a-z0-9 _]` after
-///   lowercasing (the charset gate also guarantees the interpolated cast
-///   text is inert);
+///   `ARRAY` and `USER-DEFINED` whose real name didn't resolve, or anything
+///   outside `[a-z0-9 _]` (plus `.` for a qualified name) after lowercasing
+///   (the charset gate also guarantees the interpolated cast text is inert);
 /// - for type names whose **bare form implies a restrictive default
 ///   modifier**: `data_type` drops length modifiers, so a `character(3)`
 ///   column reports just "character" — and `::character` means `char(1)`,
@@ -446,15 +453,21 @@ fn cast_target(table: &TableMeta, dialect: Dialect, column: &str) -> Option<Stri
     if dialect != Dialect::Postgres {
         return None;
     }
-    let type_name = &table.columns.iter().find(|c| c.name == column)?.type_name;
+    let column = table.columns.iter().find(|c| c.name == column)?;
+    // An enum/array column's real, schema-qualified type name; `data_type`
+    // for these is the useless `USER-DEFINED`/`ARRAY` (FRE-71).
+    let type_name = column
+        .type_detail
+        .cast_name()
+        .unwrap_or(column.type_name.as_str());
     let lowered = type_name.trim().to_ascii_lowercase();
     let plain = !lowered.is_empty()
         && lowered != "array"
         && lowered != "character"
         && lowered != "bit"
-        && lowered
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == ' ' || c == '_');
+        && lowered.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || c == ' ' || c == '_' || c == '.'
+        });
     plain.then_some(lowered)
 }
 
@@ -596,6 +609,7 @@ mod tests {
             primary_key_position: pk,
             default: None,
             generated: Generated::Never,
+            type_detail: crate::db::TypeDetail::Plain,
         }
     }
 
@@ -840,6 +854,7 @@ mod tests {
             primary_key_position: pk,
             default: None,
             generated: Generated::Never,
+            type_detail: crate::db::TypeDetail::Plain,
         };
         TableMeta {
             schema: Some("app".into()),
@@ -914,9 +929,52 @@ mod tests {
     }
 
     #[test]
+    fn enum_and_array_columns_cast_to_their_qualified_type_name() {
+        // `data_type` is USER-DEFINED/ARRAY for these, so the cast comes
+        // from the introspected TypeDetail instead (FRE-71). Without it
+        // Postgres rejects the text-bound parameter outright.
+        let mut table = typed_pg_table();
+        for column in &mut table.columns {
+            match column.name.as_str() {
+                "mood" => {
+                    column.type_detail = crate::db::TypeDetail::Enum {
+                        type_name: "app.mood".into(),
+                        variants: vec!["sad".into(), "happy".into()],
+                    }
+                }
+                "tags" => {
+                    column.type_detail = crate::db::TypeDetail::Array {
+                        type_name: "pg_catalog._text".into(),
+                    }
+                }
+                _ => {}
+            }
+        }
+        let plan = build_statements(
+            &table,
+            &identity(),
+            Dialect::Postgres,
+            &[
+                update(1, "mood", Value::Text("happy".into())),
+                update(1, "tags", Value::Text("{a,b}".into())),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            plan[0].statement.sql,
+            "UPDATE \"app\".\"typed\" SET \
+             \"mood\" = $1::app.mood, \
+             \"tags\" = $2::pg_catalog._text \
+             WHERE \"id\" = $3::integer"
+        );
+    }
+
+    #[test]
     fn casts_are_skipped_for_unusable_or_unknown_types_and_on_sqlite() {
-        // ARRAY / USER-DEFINED are not cast targets; an empty type name and
-        // a column missing from the metadata have nothing to cast to.
+        // ARRAY / USER-DEFINED with no resolved detail are not cast targets
+        // (see the test above for when the detail does resolve); an empty
+        // type name and a column missing from the metadata have nothing to
+        // cast to.
         let plan = build_statements(
             &typed_pg_table(),
             &identity(),

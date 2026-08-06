@@ -2,6 +2,7 @@
 //! (multi-schema, indexes, FKs) lands with FRE-11; until then only tables
 //! and columns of the `public` schema are listed.
 
+use std::collections::HashMap;
 use std::io::Write;
 
 use sqlx::postgres::types::{PgInterval, PgTimeTz};
@@ -15,7 +16,9 @@ use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
 
 use super::error::DbError;
 use super::export::{export_io_err, ExportFormat, ExportSink};
-use super::schema::{ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta};
+use super::schema::{
+    ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta, TypeDetail,
+};
 use super::staged::CheckedStatement;
 use super::value::{cap_value, ColumnInfo, QueryResult, Value};
 
@@ -562,8 +565,13 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
                 c.is_nullable, c.column_default, \
                 c.is_identity, c.identity_generation, c.is_generated, \
                 pk.ordinal_position AS pk_position, \
-                c.ordinal_position AS ord \
+                c.ordinal_position AS ord, \
+                ut.typtype::text AS typtype, ut.typcategory::text AS typcategory, \
+                ut.oid::int8 AS type_oid, \
+                c.udt_schema AS type_schema, c.udt_name AS type_base \
          FROM information_schema.columns c \
+         LEFT JOIN pg_namespace un ON un.nspname = c.udt_schema \
+         LEFT JOIN pg_type ut ON ut.typname = c.udt_name AND ut.typnamespace = un.oid \
          LEFT JOIN ( \
              SELECT kcu.table_schema, kcu.table_name, kcu.column_name, kcu.ordinal_position \
              FROM information_schema.table_constraints tc \
@@ -582,10 +590,14 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
                 format_type(a.atttypid, a.atttypmod), \
                 CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END, \
                 NULL::text, 'NO', NULL::text, 'NEVER', \
-                NULL::int, a.attnum::int \
+                NULL::int, a.attnum::int, \
+                t.typtype::text, t.typcategory::text, t.oid::int8, \
+                tn.nspname, t.typname \
          FROM pg_attribute a \
          JOIN pg_class c ON c.oid = a.attrelid \
          JOIN pg_namespace n ON n.oid = c.relnamespace \
+         JOIN pg_type t ON t.oid = a.atttypid \
+         JOIN pg_namespace tn ON tn.oid = t.typnamespace \
          WHERE c.relkind = 'm' AND a.attnum > 0 AND NOT a.attisdropped \
            AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
          ORDER BY table_schema, table_name, ord",
@@ -593,6 +605,24 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
     .fetch_all(pool)
     .await
     .map_err(map_err)?;
+
+    // Enum variants for every enum type in the database, keyed by type OID
+    // (FRE-71). One query rather than per-column: enum types are few and a
+    // type is typically shared by several columns. `enumsortorder` is
+    // declaration order, which is the order the editor's dropdown offers.
+    let enum_rows = sqlx::query(
+        "SELECT enumtypid::int8 AS type_oid, enumlabel::text AS label \
+         FROM pg_enum ORDER BY enumtypid, enumsortorder",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(map_err)?;
+    let mut enum_variants: HashMap<i64, Vec<String>> = HashMap::new();
+    for row in &enum_rows {
+        let type_oid: i64 = get(row, "type_oid")?;
+        let label: String = get(row, "label")?;
+        enum_variants.entry(type_oid).or_default().push(label);
+    }
 
     // Indexes from pg_catalog (information_schema has no index view).
     // Expression-index entries have a 0 attnum and no attribute row; those
@@ -696,6 +726,28 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
         } else {
             Generated::Never
         };
+        // `data_type` is opaque for these two ('USER-DEFINED', 'ARRAY'), so
+        // the editor's structure comes from pg_type instead (FRE-71).
+        let typtype: Option<String> = get(row, "typtype")?;
+        let typcategory: Option<String> = get(row, "typcategory")?;
+        let type_oid: Option<i64> = get(row, "type_oid")?;
+        let type_schema: Option<String> = get(row, "type_schema")?;
+        let type_base: Option<String> = get(row, "type_base")?;
+        let qualified = match (&type_schema, &type_base) {
+            (Some(schema), Some(base)) => Some(format!("{schema}.{base}")),
+            _ => None,
+        };
+        let type_detail = match (typtype.as_deref(), typcategory.as_deref(), qualified) {
+            (Some("e"), _, Some(type_name)) => type_oid
+                .and_then(|oid| enum_variants.get(&oid))
+                .map(|variants| TypeDetail::Enum {
+                    type_name,
+                    variants: variants.clone(),
+                })
+                .unwrap_or_default(),
+            (_, Some("A"), Some(type_name)) => TypeDetail::Array { type_name },
+            _ => TypeDetail::Plain,
+        };
         tables[idx].columns.push(ColumnMeta {
             name: get(row, "column_name")?,
             type_name: get(row, "data_type")?,
@@ -703,6 +755,7 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
             primary_key_position: pk_position.map(|p| p as u32),
             default: get::<Option<String>>(row, "column_default")?,
             generated,
+            type_detail,
         });
     }
 

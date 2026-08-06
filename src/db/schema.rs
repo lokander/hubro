@@ -29,6 +29,41 @@ pub enum Generated {
     Always,
 }
 
+/// Type structure that the declared type name alone doesn't convey, used to
+/// pick a richer editor (FRE-71). Postgres reports both of these as opaque
+/// `information_schema` strings (`USER-DEFINED`, `ARRAY`), so the detail is
+/// resolved during introspection; backends without these types report
+/// [`TypeDetail::Plain`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TypeDetail {
+    /// Nothing beyond the type name — the editor follows from it alone.
+    #[default]
+    Plain,
+    /// An enum type: its variants in declaration order, plus the
+    /// schema-qualified type name (e.g. `public.mood`) that staged values
+    /// must be cast to, since `data_type` only says `USER-DEFINED`.
+    Enum {
+        type_name: String,
+        variants: Vec<String>,
+    },
+    /// An array type, with the schema-qualified type name to cast to (e.g.
+    /// `pg_catalog._text`); `data_type` only says `ARRAY`.
+    Array { type_name: String },
+}
+
+impl TypeDetail {
+    /// The schema-qualified type name staged values must be cast to, when
+    /// the declared `type_name` isn't itself a usable cast target.
+    pub fn cast_name(&self) -> Option<&str> {
+        match self {
+            TypeDetail::Plain => None,
+            TypeDetail::Enum { type_name, .. } | TypeDetail::Array { type_name } => {
+                Some(type_name.as_str())
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnMeta {
     pub name: String,
@@ -44,6 +79,8 @@ pub struct ColumnMeta {
     pub default: Option<String>,
     /// Whether the database assigns this column's value — see [`Generated`].
     pub generated: Generated,
+    /// Enum/array structure behind an opaque `type_name` — see [`TypeDetail`].
+    pub type_detail: TypeDetail,
 }
 
 impl ColumnMeta {
@@ -115,6 +152,7 @@ mod tests {
             primary_key_position: pk,
             default: None,
             generated: Generated::Never,
+            type_detail: TypeDetail::Plain,
         }
     }
 

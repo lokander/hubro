@@ -591,6 +591,7 @@ mod tests {
             primary_key_position: pk,
             default: default.map(String::from),
             generated: crate::db::Generated::Never,
+            type_detail: crate::db::TypeDetail::Plain,
         }
     }
 
@@ -606,6 +607,7 @@ mod tests {
             primary_key_position: None,
             default: None,
             generated,
+            type_detail: crate::db::TypeDetail::Plain,
         }
     }
 

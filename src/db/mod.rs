@@ -35,7 +35,9 @@ pub use registry::{
     MAX_QUERY_ROWS, QUERY_CELL_CAP,
 };
 pub use rowkey::{delete_sql, detect_row_identity, update_sql, RowIdentity};
-pub use schema::{ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta};
+pub use schema::{
+    ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta, TypeDetail,
+};
 pub use script::{
     classify_statement, needs_confirmation, run_script, split_statements, statement_preview,
     ScriptError, StatementKind, StatementOutcome, StatementResult,
