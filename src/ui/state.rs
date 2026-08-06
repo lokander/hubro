@@ -309,6 +309,26 @@ pub struct EntraPrompt {
     pub backend: BackendKind,
 }
 
+/// Moves one keyring secret from `old` to `new` (FRE-75). Best-effort: a
+/// missing secret, or a keyring that refuses, just means nothing to carry.
+/// An existing secret under `new` is left alone — it came from the connect
+/// that just succeeded and is therefore the more current one.
+async fn migrate_secret(old: String, new: String) {
+    if old == new {
+        return;
+    }
+    let Ok(Some(secret)) = crate::secrets::get_password_async(old.clone()).await else {
+        return;
+    };
+    if matches!(
+        crate::secrets::get_password_async(new.clone()).await,
+        Ok(None)
+    ) {
+        let _ = crate::secrets::store_password_async(new, secret).await;
+    }
+    let _ = crate::secrets::delete_password_async(old).await;
+}
+
 /// Keyring/session key for a connection's SSH key passphrase. The `#ssh`
 /// suffix keeps it disjoint from the database password stored under the
 /// bare URL (`#` cannot appear in a valid connection URL's serialized form
@@ -617,6 +637,37 @@ impl AppState {
         });
         if added {
             self.persist_saved();
+        }
+    }
+
+    /// Applies an edit to a saved connection (FRE-75): overwrites the entry
+    /// at `old_locator` — name included, which [`Self::add_saved_postgres`]
+    /// deliberately never does — and persists.
+    ///
+    /// When the edit changes host/port/database the normalized locator moves
+    /// with it, and that locator keys the keyring account too. The stored
+    /// secrets are carried across to the new key so an untouched password
+    /// keeps working, then dropped from the old one; a secret already stored
+    /// under the new locator (the connect that just succeeded wrote one) wins.
+    pub fn update_saved(mut self, old_locator: String, connection: SavedConnection) {
+        let new_locator = connection.locator().to_string();
+        let updated = self.saved.write().update(&old_locator, connection);
+        if updated {
+            self.persist_saved();
+        }
+        if new_locator != old_locator {
+            spawn_forever(async move {
+                for (old, new) in [
+                    (old_locator.clone(), new_locator.clone()),
+                    (ssh_secret_key(&old_locator), ssh_secret_key(&new_locator)),
+                    (
+                        entra_secret_key(&old_locator),
+                        entra_secret_key(&new_locator),
+                    ),
+                ] {
+                    migrate_secret(old, new).await;
+                }
+            });
         }
     }
 

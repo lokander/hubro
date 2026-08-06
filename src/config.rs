@@ -563,6 +563,29 @@ impl SavedList {
         }
     }
 
+    /// Replaces the entry at `old_locator` with `connection`, keeping its
+    /// position in the list (FRE-75). Unlike [`Self::add`], this overwrites
+    /// every field — including the display name — which is the whole point
+    /// of an edit. When the edit moves the entry onto another entry's
+    /// locator, that duplicate is dropped so the list stays keyed one-to-one.
+    /// Returns false when `old_locator` names no entry.
+    pub fn update(&mut self, old_locator: &str, connection: SavedConnection) -> bool {
+        let Some(index) = self.entries.iter().position(|s| s.locator() == old_locator) else {
+            return false;
+        };
+        let new_locator = connection.locator().to_string();
+        self.entries[index] = connection;
+        // Drop any *other* entry the edit now collides with, keeping the one
+        // just written.
+        let mut position = 0;
+        self.entries.retain(|s| {
+            let keep = position == index || s.locator() != new_locator;
+            position += 1;
+            keep
+        });
+        true
+    }
+
     /// Removes and returns the entry with this locator (`None` when absent).
     pub fn remove(&mut self, locator: &str) -> Option<SavedConnection> {
         let index = self.entries.iter().position(|s| s.locator() == locator)?;
@@ -998,6 +1021,57 @@ mod tests {
         assert!(!list.add(saved_pg("other name", "postgres://u@h:5432/db")));
         assert!(list.remove("postgres://u@h:5432/db").is_some());
         assert!(list.entries().is_empty());
+    }
+
+    #[test]
+    fn update_replaces_the_entry_in_place_including_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut list, _) = SavedList::load(&dir.path().join("connections.toml"));
+        list.add(saved_pg("first", "postgres://u@a:5432/db"));
+        list.add(saved_pg("prod", "postgres://u@h:5432/db"));
+        list.add(saved_pg("last", "postgres://u@z:5432/db"));
+
+        // A rename with no locator change: `add` would have ignored this.
+        assert!(list.update(
+            "postgres://u@h:5432/db",
+            saved_pg("renamed", "postgres://u@h:5432/db")
+        ));
+        assert_eq!(list.entries()[1].name(), "renamed");
+        // Position is preserved, so the list doesn't reshuffle under the user.
+        assert_eq!(list.entries().len(), 3);
+        assert_eq!(list.entries()[0].name(), "first");
+        assert_eq!(list.entries()[2].name(), "last");
+    }
+
+    #[test]
+    fn update_moves_the_locator_and_absorbs_a_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut list, _) = SavedList::load(&dir.path().join("connections.toml"));
+        list.add(saved_pg("prod", "postgres://u@h:5432/db"));
+        list.add(saved_pg("staging", "postgres://u@s:5432/db"));
+
+        // Editing "prod" onto "staging"'s locator leaves one entry, not two
+        // sharing a key.
+        assert!(list.update(
+            "postgres://u@h:5432/db",
+            saved_pg("merged", "postgres://u@s:5432/db")
+        ));
+        assert_eq!(list.entries().len(), 1);
+        assert_eq!(list.entries()[0].name(), "merged");
+        assert_eq!(list.entries()[0].locator(), "postgres://u@s:5432/db");
+    }
+
+    #[test]
+    fn update_of_a_missing_entry_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut list, _) = SavedList::load(&dir.path().join("connections.toml"));
+        list.add(saved_pg("prod", "postgres://u@h:5432/db"));
+        assert!(!list.update(
+            "postgres://u@gone:5432/db",
+            saved_pg("x", "postgres://u@x:5432/db")
+        ));
+        assert_eq!(list.entries().len(), 1);
+        assert_eq!(list.entries()[0].name(), "prod");
     }
 
     #[test]
