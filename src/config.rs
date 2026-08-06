@@ -357,10 +357,22 @@ pub enum SessionPane {
     #[default]
     Browser,
     Sql,
-    /// The schema pane (FRE-69). Older session.toml files never contain it;
-    /// a newer file read by an older build falls back to `Browser` via the
-    /// enum's `Default`, so both directions stay readable.
+    /// The schema pane (FRE-69).
     Schema,
+}
+
+/// Deserializes a [`SessionPane`], treating anything this build doesn't
+/// recognize as the default rather than failing the whole session.
+fn pane_or_default<'de, D>(deserializer: D) -> Result<SessionPane, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(match raw.as_str() {
+        "sql" => SessionPane::Sql,
+        "schema" => SessionPane::Schema,
+        _ => SessionPane::Browser,
+    })
 }
 
 /// One open connection tab, remembered for the next launch.
@@ -373,7 +385,12 @@ pub struct SessionTab {
     pub selected_schema: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_table: Option<String>,
-    #[serde(default)]
+    /// Tolerant of values this build doesn't know: serde treats an unknown
+    /// enum variant as a hard error, and [`load_session`] discards the whole
+    /// session on any parse failure — so a build that predates a new pane
+    /// would silently drop every restored tab, not just the pane. Unknown
+    /// values fall back to the default instead (FRE-69).
+    #[serde(default, deserialize_with = "pane_or_default")]
     pub pane: SessionPane,
 }
 
@@ -1257,11 +1274,52 @@ mod tests {
                     selected_table: Some("orders".into()),
                     pane: SessionPane::Sql,
                 },
+                SessionTab {
+                    locator: "postgres://u@h:5432/other".into(),
+                    selected_schema: None,
+                    selected_table: Some("stock".into()),
+                    pane: SessionPane::Schema,
+                },
             ],
             active: Some("postgres://u@h:5432/app".into()),
         };
         save_session(&path, &session).unwrap();
         assert_eq!(load_session(&path), session);
+    }
+
+    #[test]
+    fn session_without_a_pane_key_loads_as_the_default() {
+        // Files written before panes were persisted at all.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.toml");
+        std::fs::write(
+            &path,
+            "active = \"/data/music.db\"\n\n[[tabs]]\nlocator = \"/data/music.db\"\n",
+        )
+        .unwrap();
+        let session = load_session(&path);
+        assert_eq!(session.tabs.len(), 1);
+        assert_eq!(session.tabs[0].pane, SessionPane::Browser);
+    }
+
+    #[test]
+    fn an_unknown_pane_keeps_the_rest_of_the_session() {
+        // A pane added by a newer build must not cost this one every tab:
+        // serde treats an unknown enum variant as a hard error, and
+        // `load_session` discards the whole file on any parse failure.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.toml");
+        std::fs::write(
+            &path,
+            "active = \"/data/music.db\"\n\n[[tabs]]\nlocator = \"/data/music.db\"\n\
+             selected_table = \"artists\"\npane = \"telemetry\"\n",
+        )
+        .unwrap();
+        let session = load_session(&path);
+        assert_eq!(session.tabs.len(), 1, "the tab must survive");
+        assert_eq!(session.tabs[0].selected_table.as_deref(), Some("artists"));
+        assert_eq!(session.tabs[0].pane, SessionPane::Browser);
+        assert_eq!(session.active.as_deref(), Some("/data/music.db"));
     }
 
     #[test]

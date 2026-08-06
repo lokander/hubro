@@ -9,7 +9,7 @@
 
 use dioxus::prelude::*;
 
-use crate::db::{ColumnMeta, ConnectionId, TableKind, TableMeta, TypeDetail};
+use crate::db::{ColumnMeta, ConnectionId, Generated, TableKind, TableMeta, TypeDetail};
 
 use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState};
 use super::state::{AppState, SchemaLoad, TableRef};
@@ -76,9 +76,11 @@ fn SchemaBody(meta: TableMeta) -> Element {
         Some(schema) => format!("{schema}.{}", meta.name),
         None => meta.name.clone(),
     };
-    // Indexes are a table-only concept here: neither view kind reports any,
-    // so the section would always be an empty heading.
-    let show_indexes = meta.kind == TableKind::Table;
+    // Plain views have no indexes, so the section (and its "No indexes."
+    // line) would just be noise. Materialized views are indexed on purpose,
+    // and SQL Server indexed views report them as well, so anything that
+    // actually has indexes shows them whatever its kind.
+    let show_indexes = meta.kind == TableKind::Table || !meta.indexes.is_empty();
     rsx! {
         div { class: "p-4",
             div { class: "mb-3 flex items-baseline gap-2",
@@ -163,9 +165,23 @@ fn ColumnRow(column: ColumnMeta) -> Element {
                     }
                 }
             }
-            td { class: "max-w-xs truncate px-3 py-1 font-mono text-xs text-slate-500",
-                title: column.default.clone().unwrap_or_default(),
-                {column.default.clone().unwrap_or_default()}
+            td { class: "px-3 py-1 font-mono text-xs text-slate-500",
+                // Identity and generated columns carry no literal default;
+                // saying so beats an empty cell.
+                match column.generated {
+                    Generated::Always => rsx! {
+                        span { class: "italic", "generated always" }
+                    },
+                    Generated::ByDefault => rsx! {
+                        span { class: "italic", "identity" }
+                    },
+                    Generated::Never => rsx! {
+                        div { class: "max-w-xs truncate",
+                            title: column.default.clone().unwrap_or_default(),
+                            {column.default.clone().unwrap_or_default()}
+                        }
+                    },
+                }
             }
         }
     }
@@ -177,7 +193,13 @@ fn ColumnRow(column: ColumnMeta) -> Element {
 /// it.
 fn display_type(column: &ColumnMeta) -> String {
     match &column.type_detail {
-        TypeDetail::Enum { type_ref, .. } | TypeDetail::Array { type_ref } => type_ref.name.clone(),
+        TypeDetail::Enum { type_ref, .. } => type_ref.name.clone(),
+        // pg_catalog names an array type `_elem`; `elem[]` is how it is
+        // written everywhere else.
+        TypeDetail::Array { type_ref } => match type_ref.name.strip_prefix('_') {
+            Some(element) => format!("{element}[]"),
+            None => type_ref.name.clone(),
+        },
         TypeDetail::Plain if column.type_name.is_empty() => "any".to_string(),
         TypeDetail::Plain => column.type_name.to_lowercase(),
     }
@@ -186,7 +208,7 @@ fn display_type(column: &ColumnMeta) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{Generated, TypeRef};
+    use crate::db::TypeRef;
 
     fn column(name: &str, type_name: &str, detail: TypeDetail) -> ColumnMeta {
         ColumnMeta {
@@ -228,7 +250,7 @@ mod tests {
                     }
                 }
             )),
-            "_text"
+            "text[]"
         );
     }
 
