@@ -603,12 +603,19 @@ enum ConnectForm {
 ///   connection, so only Escape or an explicit Cancel/✕ closes them.
 /// - **Escape is handled here, not by [`GLOBAL_KEYS_JS`].** That listener
 ///   ignores keys while a text field has focus, which is most of the time in
-///   this form. The keydown bubbles from the fields to this container, and
-///   `stop_propagation` keeps it from also reaching the window listener (which
-///   would otherwise close the cheatsheet behind the modal).
+///   this form, so it would never fire for the modal. The keydown bubbles
+///   from the fields to this container instead.
 ///
-/// The panel caps its height and scrolls internally so the tall forms (auth
-/// plus SSH tunnel) stay usable in a small window.
+/// Note that the same Escape still reaches `GLOBAL_KEYS_JS`:
+/// `dioxus-desktop` 0.7.9 serializes only `preventDefault` back to the
+/// interpreter, so `stop_propagation` on a synthetic event does not stop the
+/// real one. Harmless here — the only global Escape action is
+/// `close_cheatsheet`, which no-ops unless the cheatsheet is open — and the
+/// call below documents the intent for when that changes.
+///
+/// The overlay scrolls (`overflow-y-auto` with the panel's `my-auto` margins
+/// collapsing on overflow) so the tall forms (auth plus SSH tunnel) stay
+/// reachable in a small window without clipping at the top.
 #[component]
 fn ConnectFormModal(
     on_close: EventHandler<()>,
@@ -632,6 +639,8 @@ fn ConnectFormModal(
             },
             onkeydown: move |evt: KeyboardEvent| {
                 if evt.code() == Code::Escape {
+                    // Intent only — see the note above on why this does not
+                    // actually stop the window listener today.
                     evt.stop_propagation();
                     on_close.call(());
                 }
@@ -672,6 +681,20 @@ fn ConnectionsScreen() -> Element {
     let prompt = state.password_prompt.read().clone();
     let host_key_prompt = state.host_key_prompt.read().clone();
     let entra_prompt = state.entra_prompt.read().clone();
+    // A connect that parks on a prompt — password, SSH passphrase, host-key
+    // trust, Entra sign-in — hands the flow to that card, which renders in
+    // the panel. The form modal has to step aside for it: left up, the card
+    // would sit invisible behind the backdrop, and its autofocus would pull
+    // focus out of the modal (taking Escape with it). The Entra branch of
+    // the submit path already closes the form for exactly this reason.
+    use_effect(move || {
+        let pending = state.password_prompt.read().is_some()
+            || state.host_key_prompt.read().is_some()
+            || state.entra_prompt.read().is_some();
+        if pending && open_form.peek().is_some() {
+            open_form.set(None);
+        }
+    });
     let saved: Vec<SavedRow> = {
         let open = state.open_locators.read();
         state
