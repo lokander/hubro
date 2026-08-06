@@ -5,6 +5,18 @@ on:
   push:
     tags:
       - "v*"
+  # Escape hatch for an existing tag. A tag pushed while Actions is disabled
+  # (e.g. the monthly minutes ran out) never produces a run, and deleting and
+  # re-pushing that same tag afterwards does not reliably create one either —
+  # observed on v0.7.0, where GitHub logged the deletes but no create. Build
+  # and publish it by hand instead:
+  #   gh workflow run release.yml --ref main -f tag=v0.7.0
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish, e.g. v0.7.0"
+        required: true
+        type: string
 
 # Default to read-only; only the publish job gets the write scope
 # softprops/action-gh-release needs to create the release and upload assets.
@@ -22,7 +34,12 @@ jobs:
     name: Bundle Linux (deb + AppImage)
     runs-on: ubuntu-latest
     steps:
+      # On a dispatch run, build the tag named in the input rather than the
+      # branch the run was started from; on a tag push, `inputs.tag` is empty
+      # and this is the tag ref as usual.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       # Same desktop libraries as CI, plus the AppImage tooling deps: FUSE for
       # appimagetool and file/desktop-file utilities it shells out to.
@@ -86,6 +103,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -128,6 +147,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -187,6 +208,9 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
+          # `github.ref_name` is the tag on a push run and the dispatch branch
+          # otherwise, so a dispatch has to name the tag explicitly.
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: artifacts/*
           generate_release_notes: true
           fail_on_unmatched_files: true
