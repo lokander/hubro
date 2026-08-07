@@ -1,6 +1,8 @@
 //! Backend-neutral schema metadata. Captures primary keys, unique indexes,
 //! and foreign keys up front — editing and FK navigation depend on them.
 
+use super::caps::Restriction;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableKind {
     Table,
@@ -133,6 +135,19 @@ pub struct TableMeta {
     pub columns: Vec<ColumnMeta>,
     pub indexes: Vec<IndexMeta>,
     pub foreign_keys: Vec<ForeignKeyMeta>,
+    /// Per-object narrowing of the connection's capabilities, resolved during
+    /// introspection (FRE-87) — `None` when the object follows its
+    /// connection's defaults.
+    ///
+    /// Only for limits the driver knows and the resolver cannot derive on its
+    /// own: [`TableKind`] and row identity are already handled by
+    /// [`TableAccess::resolve`], so the three current backends leave this
+    /// `None`. It exists for engines whose writability varies per object — a
+    /// StarRocks duplicate-key table, a DuckDB view over a Parquet file, a
+    /// Materialize source.
+    ///
+    /// [`TableAccess::resolve`]: super::caps::TableAccess::resolve
+    pub restriction: Option<Restriction>,
 }
 
 impl TableMeta {
@@ -173,6 +188,7 @@ mod tests {
             columns: vec![col("a", Some(2)), col("b", None), col("c", Some(1))],
             indexes: vec![],
             foreign_keys: vec![],
+            restriction: None,
         };
         let pk: Vec<&str> = table
             .primary_key()

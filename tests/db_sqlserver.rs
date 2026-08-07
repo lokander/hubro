@@ -17,9 +17,9 @@
 
 use hubro::db::{
     apply_staged, detect_row_identity, mssql_url_with_password, run_script, split_statements,
-    DbError, DbPool, Dialect, ExportFormat, Filter, Generated, PageRequest, RowIdentity,
-    RowLocator, SortDir, StagedChange, StatementOutcome, TableKind, TableMeta, Value,
-    PREVIEW_BYTES, QUERY_CELL_CAP,
+    Capabilities, DbError, DbPool, Dialect, ExportFormat, Filter, Generated, PageRequest,
+    Restriction, RowIdentity, RowLocator, SortDir, StagedChange, StatementOutcome, TableKind,
+    TableMeta, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 fn test_url() -> Option<String> {
@@ -290,6 +290,27 @@ async fn sqlserver_introspection_covers_indexes_fks_and_views() {
     assert!(
         detect_row_identity(&filtered_only, Dialect::SqlServer).is_none(),
         "a filtered unique index must not address rows"
+    );
+
+    // Capabilities (FRE-87): full at the connection level, resolved per
+    // object, with each narrowing carrying its own reason.
+    assert_eq!(pool.capabilities(), Capabilities::FULL);
+    let children_access = pool.access(&children);
+    assert_eq!(children_access.caps, Capabilities::FULL);
+    assert_eq!(children_access.restriction, None);
+
+    let view_access = pool.access(&view);
+    assert!(!view_access.can_mutate());
+    assert_eq!(view_access.restriction, Some(Restriction::View));
+    // Reduced, not disabled — a view still reads and pages.
+    assert!(view_access.caps.read_query);
+    assert!(view_access.caps.offset_paging);
+
+    let filtered_access = pool.access(&filtered_only);
+    assert!(!filtered_access.can_mutate());
+    assert_eq!(
+        filtered_access.restriction,
+        Some(Restriction::NoRowIdentity)
     );
 
     run_all(

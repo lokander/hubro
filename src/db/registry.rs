@@ -4,6 +4,7 @@ use std::path::Path;
 use sqlx::postgres::PgPool;
 use sqlx::sqlite::SqlitePool;
 
+use super::caps::{self, Capabilities, TableAccess};
 use super::error::DbError;
 use super::export::ExportFormat;
 use super::page::{
@@ -172,6 +173,25 @@ impl DbPool {
         }
     }
 
+    /// This connection's default capabilities (FRE-87). All three current
+    /// backends are full-featured OLTP engines — they query, write, run DDL,
+    /// hold transactions and page by `LIMIT`/`OFFSET` — so each declares
+    /// [`Capabilities::FULL`]. Objects that are nonetheless not writable
+    /// (views, key-less tables) narrow this per object in
+    /// [`TableAccess::resolve`]; a backend that is read-only or
+    /// non-transactional as a whole declares the narrower set right here.
+    pub fn capabilities(&self) -> Capabilities {
+        match self {
+            DbPool::Sqlite(_) | DbPool::Postgres(_) | DbPool::SqlServer(_) => Capabilities::FULL,
+        }
+    }
+
+    /// Resolves this connection's capabilities for one object — the single
+    /// entry point the UI and the write paths gate on.
+    pub fn access(&self, table: &TableMeta) -> TableAccess {
+        TableAccess::resolve(self.capabilities(), table, self.dialect())
+    }
+
     pub async fn query(&self, sql: &str) -> Result<QueryResult, DbError> {
         match self {
             DbPool::Sqlite(pool) => sqlite::query(pool, sql).await,
@@ -259,8 +279,21 @@ impl DbPool {
         }
     }
 
+    /// Refuses the paged reads when this connection can't express them
+    /// (FRE-87). Both paged selects below append a `LIMIT`/`OFFSET` tail
+    /// unconditionally, so a backend that pages by cursor instead must not
+    /// reach them; the unpaged reads (`count_rows`, `export`) are unaffected.
+    fn require_offset_paging(&self) -> Result<(), DbError> {
+        if self.capabilities().offset_paging {
+            Ok(())
+        } else {
+            Err(DbError::Unsupported(caps::NO_OFFSET_PAGING.to_string()))
+        }
+    }
+
     /// One page of a table, honoring the request's sort and filter.
     pub async fn fetch_page(&self, request: &PageRequest) -> Result<QueryResult, DbError> {
+        self.require_offset_paging()?;
         let (sql, params) = request.select_sql(self.dialect());
         self.query_with(&sql, &params).await
     }
@@ -279,6 +312,7 @@ impl DbPool {
         columns: &[ColumnMeta],
         no_preview: &[&str],
     ) -> Result<Page, DbError> {
+        self.require_offset_paging()?;
         let (sql, params, plan) =
             request.select_bounded_sql(self.dialect(), columns, no_preview, PREVIEW_BYTES);
         let raw = self.query_with(&sql, &params).await?;
@@ -542,6 +576,7 @@ mod tests {
             columns: vec![],
             indexes: vec![],
             foreign_keys: vec![],
+            restriction: None,
         }
     }
 

@@ -6,6 +6,7 @@
 //! `DbPool` futures inside `use_resource`/spawned tasks and store the
 //! resulting values in signals — never hold a signal borrow across an await.
 
+mod caps;
 mod error;
 mod export;
 mod fk;
@@ -20,6 +21,10 @@ mod sqlserver;
 mod staged;
 mod value;
 
+pub use caps::{
+    Capabilities, Restriction, TableAccess, CONNECTION_READ_ONLY, NO_DDL, NO_MUTATE,
+    NO_OFFSET_PAGING, NO_QUERY,
+};
 pub use error::DbError;
 pub use export::{write_result, ExportFormat};
 pub use fk::{build_fk_filter, resolve_referenced_column};
@@ -39,8 +44,9 @@ pub use schema::{
     ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta, TypeDetail, TypeRef,
 };
 pub use script::{
-    classify_statement, needs_confirmation, run_script, split_statements, statement_preview,
-    ScriptError, StatementKind, StatementOutcome, StatementResult,
+    classify_statement, needs_confirmation, run_script, script_refusal, split_statements,
+    statement_needs, statement_preview, ScriptError, StatementKind, StatementNeeds,
+    StatementOutcome, StatementResult,
 };
 pub use sqlite::open_sqlite;
 pub use sqlserver::{
