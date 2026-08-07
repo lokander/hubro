@@ -1640,7 +1640,13 @@ fn PostgresForm(
                 // a dropped scope's storage and panic. The Entra path yields
                 // after opening the tab (it caches the refresh token), so the
                 // unmount really does land first.
-                on_done.call(());
+                //
+                // Guarded because ordering alone is not a guarantee: a *second*
+                // focus-taking connect finishing mid-submit can unmount the
+                // screen at any await here. The screen is mounted exactly when
+                // this view is active, and when it is not, closing the form is
+                // a no-op anyway — it went with the screen.
+                close_form(&state, &on_done);
                 state
                     .connect_postgres(url.clone(), display_name.clone(), tunnel.clone(), auth)
                     .await;
@@ -1672,7 +1678,7 @@ fn PostgresForm(
             // `on_done` is gone. Everything after it is on `AppState`, whose
             // signals are root-owned and outlive this task.
             if state.open_locators.peek().iter().any(|(_, l)| *l == url) {
-                on_done.call(());
+                close_form(&state, &on_done);
                 if remember_choice && entered_passphrase.is_some() {
                     state.persist_ssh_passphrase(&url).await;
                 }
@@ -2011,7 +2017,7 @@ fn SqlServerForm(
                 // Closed before the await, for the same reason as the Postgres
                 // form: a successful connect unmounts the screen that owns
                 // `on_done`, and this task outlives it.
-                on_done.call(());
+                close_form(&state, &on_done);
                 state
                     .connect_sqlserver(url.clone(), display_name.clone(), tunnel.clone(), auth)
                     .await;
@@ -2043,7 +2049,7 @@ fn SqlServerForm(
             // and close before `persist_ssh_passphrase` awaits, since the
             // screen owning `on_done` is gone once the new tab is up.
             if state.open_locators.peek().iter().any(|(_, l)| *l == url) {
-                on_done.call(());
+                close_form(&state, &on_done);
                 if remember_choice && entered_passphrase.is_some() {
                     state.persist_ssh_passphrase(&url).await;
                 }
@@ -2183,8 +2189,26 @@ fn SqlServerForm(
     }
 }
 
+/// Closes a connection form from inside its submit task.
+///
+/// The task is root-spawned so closing the modal cannot abandon the connect,
+/// which means it outlives the form — and `on_done` is a [`Callback`] owned by
+/// the connections screen's scope, whose storage is freed when that scope is
+/// dropped. Calling it then panics rather than no-oping (dioxus has no
+/// `Callback::try_call`), and any connect that opens a focused tab drops the
+/// screen. Calls are ordered to land before that happens; this is the backstop
+/// for the case ordering cannot cover, a *sibling* connect finishing mid-submit.
+///
+/// `ActiveView::Connections` holds exactly while the screen is mounted, and
+/// when it does not, the form is already gone with it.
+fn close_form(state: &AppState, on_done: &EventHandler<()>) {
+    if matches!(*state.active.peek(), ActiveView::Connections) {
+        on_done.call(());
+    }
+}
+
 /// Text-input class shared by the Postgres and SQL Server connection forms.
-const FORM_FIELD_CLASS: &str = "w-full rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-3 py-2 font-mono text-sm text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600";
+const FORM_FIELD_CLASS: &str ="w-full rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-3 py-2 font-mono text-sm text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600";
 
 /// Select class shared by the connection forms' dropdowns.
 const FORM_SELECT_CLASS: &str = "rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-2 text-sm text-slate-900 dark:text-slate-200";
