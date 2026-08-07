@@ -740,13 +740,7 @@ fn ConnectionsScreen() -> Element {
             .entries()
             .iter()
             .map(|s| {
-                let canonical_locator = match s {
-                    crate::config::SavedConnection::Sqlite { path, .. } => {
-                        super::state::canonical(path).display().to_string()
-                    }
-                    crate::config::SavedConnection::Postgres { url, .. }
-                    | crate::config::SavedConnection::SqlServer { url, .. } => url.clone(),
-                };
+                let canonical_locator = super::state::saved_open_locator(s);
                 let (tunnel, auth) = match s {
                     crate::config::SavedConnection::Postgres { tunnel, auth, .. }
                     | crate::config::SavedConnection::SqlServer { tunnel, auth, .. } => {
@@ -885,7 +879,11 @@ fn ConnectionsScreen() -> Element {
                                 // the locator is already on screen in the name,
                                 // and the phase is what the user needs.
                                 if let Some(step) = row.connecting {
-                                    div { class: "truncate text-xs text-slate-500 dark:text-slate-400",
+                                    div {
+                                        class: "truncate text-xs text-slate-500 dark:text-slate-400",
+                                        // Announced as it advances: the row is
+                                        // otherwise silent for the whole connect.
+                                        aria_live: "polite",
                                         "{step.label()}"
                                     }
                                 } else {
@@ -1596,7 +1594,11 @@ fn PostgresForm(
         }
         let remember_choice = *remember.peek();
         form_error.set(None);
-        spawn(async move {
+        // spawn_forever: closing the modal (X or Escape) unmounts this form,
+        // and a scope-tied `spawn` would be cancelled at its next await —
+        // abandoning the connect with its reservation still held, which
+        // leaves the row stuck showing progress it can no longer cancel.
+        dioxus::core::spawn_forever(async move {
             // An edit is saved by whichever path confirms the connect —
             // including the Entra sign-in card, which resolves after this
             // form has closed — so the intent is registered up front rather
@@ -1956,7 +1958,11 @@ fn SqlServerForm(
         }
         let remember_choice = *remember.peek();
         form_error.set(None);
-        spawn(async move {
+        // spawn_forever: closing the modal (X or Escape) unmounts this form,
+        // and a scope-tied `spawn` would be cancelled at its next await —
+        // abandoning the connect with its reservation still held, which
+        // leaves the row stuck showing progress it can no longer cancel.
+        dioxus::core::spawn_forever(async move {
             // An edit is saved by whichever path confirms the connect —
             // including the Entra sign-in card, which resolves after this
             // form has closed — so the intent is registered up front rather
