@@ -279,21 +279,9 @@ impl DbPool {
         }
     }
 
-    /// Refuses the paged reads when this connection can't express them
-    /// (FRE-87). Both paged selects below append a `LIMIT`/`OFFSET` tail
-    /// unconditionally, so a backend that pages by cursor instead must not
-    /// reach them; the unpaged reads (`count_rows`, `export`) are unaffected.
-    fn require_offset_paging(&self) -> Result<(), DbError> {
-        if self.capabilities().offset_paging {
-            Ok(())
-        } else {
-            Err(DbError::Unsupported(caps::NO_OFFSET_PAGING.to_string()))
-        }
-    }
-
     /// One page of a table, honoring the request's sort and filter.
     pub async fn fetch_page(&self, request: &PageRequest) -> Result<QueryResult, DbError> {
-        self.require_offset_paging()?;
+        refuse_paged_read(self.capabilities())?;
         let (sql, params) = request.select_sql(self.dialect());
         self.query_with(&sql, &params).await
     }
@@ -312,7 +300,7 @@ impl DbPool {
         columns: &[ColumnMeta],
         no_preview: &[&str],
     ) -> Result<Page, DbError> {
-        self.require_offset_paging()?;
+        refuse_paged_read(self.capabilities())?;
         let (sql, params, plan) =
             request.select_bounded_sql(self.dialect(), columns, no_preview, PREVIEW_BYTES);
         let raw = self.query_with(&sql, &params).await?;
@@ -440,6 +428,22 @@ impl DbPool {
             DbPool::SqlServer(pool) => pool.close().await,
         }
     }
+}
+
+/// Refuses the grid's paged reads when `caps` can't express them (FRE-87).
+///
+/// A connection that can't query at all has nothing to page; and both paged
+/// selects append a `LIMIT`/`OFFSET` tail unconditionally, so a backend that
+/// pages by cursor instead must not reach them. The unpaged reads
+/// (`count_rows`, `export`) are unaffected by the paging half.
+fn refuse_paged_read(caps: Capabilities) -> Result<(), DbError> {
+    if !caps.read_query {
+        return Err(DbError::Unsupported(caps::NO_QUERY.to_string()));
+    }
+    if !caps.offset_paging {
+        return Err(DbError::Unsupported(caps::NO_OFFSET_PAGING.to_string()));
+    }
+    Ok(())
 }
 
 /// Schema-qualified, quoted table name for a targeted single-row read.
@@ -656,6 +660,34 @@ mod tests {
         assert_eq!(
             cell_fetch_sql(Dialect::SqlServer, &table, ColumnClass::Scalar, "c", ""),
             "SELECT TOP 1 \"c\", NULL FROM \"dbo\".\"t\""
+        );
+    }
+
+    #[test]
+    fn paged_reads_are_refused_without_querying_or_offset_paging() {
+        // The three current backends are fully capable, so this gate is only
+        // reachable through a synthetic set — which is exactly why it is
+        // tested here rather than through a pool.
+        assert_eq!(refuse_paged_read(Capabilities::FULL), Ok(()));
+        // Writing has nothing to do with reading a page.
+        assert_eq!(refuse_paged_read(Capabilities::FULL.read_only()), Ok(()));
+
+        let no_paging = Capabilities {
+            offset_paging: false,
+            ..Capabilities::FULL
+        };
+        assert_eq!(
+            refuse_paged_read(no_paging),
+            Err(DbError::Unsupported(caps::NO_OFFSET_PAGING.to_string()))
+        );
+
+        let no_query = Capabilities {
+            read_query: false,
+            ..Capabilities::FULL
+        };
+        assert_eq!(
+            refuse_paged_read(no_query),
+            Err(DbError::Unsupported(caps::NO_QUERY.to_string()))
         );
     }
 
