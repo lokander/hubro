@@ -15,3 +15,8 @@
 # (see assets/codemirror-README.md); the bundle itself is committed.
 /assets/node_modules
 /assets/package-lock.json
+
+# Throwaway SQLite database built by scripts/seed/seed-sqlite.sh
+/scripts/seed/*.db
+/scripts/seed/*.db-wal
+/scripts/seed/*.db-shm

@@ -1,0 +1,49 @@
+# Throwaway database servers for manual testing of hubro.
+#
+# Deliberately on different ports and container names than the integration-test
+# containers in tests/ (5433 / 14333), so seeding demo data never disturbs a
+# test run.
+#
+#   docker compose -f scripts/seed/docker-compose.yml up -d postgres
+#   docker compose -f scripts/seed/docker-compose.yml down -v   # forget everything
+#
+# The seed scripts start these for you; you only need the compose file directly
+# to stop them or wipe their volumes.
+name: hubro-seed
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: hubro-pg-dev
+    environment:
+      POSTGRES_USER: hubro
+      POSTGRES_PASSWORD: hubropass
+      POSTGRES_DB: demo
+    ports:
+      - "5434:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hubro -d demo"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: hubro-mssql-dev
+    # No arm64 image exists; on Apple Silicon uncomment this to run it under
+    # emulation (slow, and not all builds work).
+    # platform: linux/amd64
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Str0ng!Passw0rd"
+      MSSQL_PID: Developer
+    ports:
+      - "14334:1433"
+    volumes:
+      - mssqldata:/var/opt/mssql
+
+volumes:
+  pgdata:
+  mssqldata:
