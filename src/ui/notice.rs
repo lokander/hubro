@@ -141,7 +141,7 @@ pub fn LoadingLine(label: String) -> Element {
 
 /// How long a load must run before its spinner appears. Fast queries finish
 /// under this and never flash an indicator; only genuinely slow ones show it.
-const SPINNER_DELAY: Duration = Duration::from_millis(300);
+pub(crate) const SPINNER_DELAY: Duration = Duration::from_millis(300);
 
 #[cfg(test)]
 mod tests {

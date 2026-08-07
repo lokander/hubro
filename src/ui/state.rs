@@ -20,6 +20,7 @@ use crate::db::{
 };
 use crate::history::HistoryStore;
 use crate::tunnel::{HostKeyInfo, Tunnel, TunnelAuth, TunnelConfig, TunnelError};
+use crate::ui::notice::SPINNER_DELAY;
 use crate::ui::stage::TableStage;
 
 /// Which screen the main panel shows: the connections screen or one open
@@ -369,6 +370,73 @@ fn staged_has_dirty(staged: &HashMap<ConnectionId, HashMap<String, TableStage>>)
         .any(|tables| tables.values().any(|stage| !stage.is_empty()))
 }
 
+/// Which phase of a connect is running, so the connections list can say more
+/// than "working". The slow, hang-prone steps are the ones worth naming: a
+/// tunnel to an unreachable jump host and a locked keyring both stall for a
+/// long time, and "connecting…" alone gives the user nothing to act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectStep {
+    /// Bringing up the SSH tunnel the connection goes through.
+    Tunnel,
+    /// Reading the saved password from this session or the OS keyring — a
+    /// locked wallet blocks here until the user answers its own dialog.
+    Credentials,
+    /// Acquiring a Microsoft Entra token.
+    SigningIn,
+    /// Opening the database connection itself.
+    Opening,
+}
+
+impl ConnectStep {
+    /// Lowercase, trailing ellipsis: this renders as a status line under the
+    /// connection name, not as a sentence.
+    pub fn label(self) -> &'static str {
+        match self {
+            ConnectStep::Tunnel => "opening SSH tunnel…",
+            ConnectStep::Credentials => "reading saved password…",
+            ConnectStep::SigningIn => "signing in…",
+            ConnectStep::Opening => "connecting…",
+        }
+    }
+}
+
+/// The key a connect is tracked under: the locator as an open tab would
+/// report it (what [`AppState::connect`] stores in `open_locators`). Only
+/// SQLite differs from the saved form — its locator is the canonicalized
+/// path, so a row keyed on the saved spelling would never match its own
+/// in-flight progress.
+pub fn connect_key(locator: &str, backend: BackendKind) -> String {
+    match backend {
+        BackendKind::Sqlite => canonical(Path::new(locator)).display().to_string(),
+        _ => locator.to_string(),
+    }
+}
+
+/// A connect in flight, from the reservation until the tab opens or the
+/// attempt fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Connecting {
+    /// Canonical locator, the same key [`AppState::open_locators`] uses.
+    pub locator: String,
+    pub step: ConnectStep,
+    /// Whether the row should show progress yet. Stays false for
+    /// [`SPINNER_DELAY`] so a local SQLite open — which finishes in
+    /// milliseconds — never flashes a spinner.
+    pub visible: bool,
+}
+
+/// A connect started from the connections list, as opposed to one started by
+/// submitting a form: the list can cancel it, and a shift-click asks for the
+/// tab to open without stealing focus.
+#[derive(Clone, Copy)]
+pub struct ConnectRequest {
+    /// Root-scope task running the connect. Cancelling drops it mid-await,
+    /// which drops any half-open tunnel with it.
+    task: Task,
+    /// False for a shift-click: open the tab, but stay on the list.
+    focus: bool,
+}
+
 /// App-wide state provided via context. `Copy` because it only holds signals.
 #[derive(Clone, Copy)]
 pub struct AppState {
@@ -379,9 +447,13 @@ pub struct AppState {
     /// Locator (canonical file path / URL) each open tab came from, for
     /// "already open" detection.
     pub open_locators: Signal<Vec<(ConnectionId, String)>>,
-    /// Locators with a connect in flight, reserved before the pool open
-    /// await.
-    pub connecting: Signal<Vec<String>>,
+    /// Connects in flight, reserved before the pool open await. Drives the
+    /// connections list's per-row progress.
+    pub connecting: Signal<Vec<Connecting>>,
+    /// Cancel handle and focus intent for connects started from the
+    /// connections list, keyed by locator. Connects started by submitting a
+    /// form have no entry — they still show progress, just no cancel.
+    pub connect_requests: Signal<HashMap<String, ConnectRequest>>,
     /// Error from the most recent connect/config operation, shown on the
     /// connections screen.
     pub connect_error: Signal<Option<String>>,
@@ -525,6 +597,7 @@ impl AppState {
             saved: Signal::new(saved),
             open_locators: Signal::new(Vec::new()),
             connecting: Signal::new(Vec::new()),
+            connect_requests: Signal::new(HashMap::new()),
             connect_error: Signal::new(load_error),
             session_passwords: Signal::new(HashMap::new()),
             password_prompt: Signal::new(None),
@@ -809,6 +882,7 @@ impl AppState {
         // off-thread (a locked wallet can block on a user dialog) and only
         // after the session read guard is dropped; errors mean "no keyring"
         // and fall through to the prompt flow.
+        self.set_step(&url, ConnectStep::Credentials);
         let mut session_password = self.session_passwords.read().get(&url).cloned();
         if session_password.is_none() {
             session_password = crate::secrets::get_password_async(url.clone())
@@ -817,6 +891,7 @@ impl AppState {
                 .flatten();
         }
         let had_password = session_password.is_some();
+        self.set_step(&url, ConnectStep::Opening);
         let result = match &session_password {
             Some(password) => match url_with_password(&connect_url, password) {
                 Ok(full) => DbPool::open_postgres(&full).await,
@@ -826,7 +901,7 @@ impl AppState {
         };
         match result {
             Err(DbError::Connect(msg)) if msg.contains("authentication failed") => {
-                self.connecting.write().retain(|l| l != &url);
+                self.release_connect(&url);
                 if had_password {
                     // Stored password is stale; drop it everywhere and re-ask.
                     self.session_passwords.write().remove(&url);
@@ -862,6 +937,7 @@ impl AppState {
         connect_url: String,
         live_tunnel: Option<Tunnel>,
     ) {
+        self.set_step(&pending.url, ConnectStep::SigningIn);
         let cached = crate::secrets::get_password_async(entra_secret_key(&pending.url))
             .await
             .ok()
@@ -889,7 +965,7 @@ impl AppState {
             // Interactive with no usable refresh token: park behind the sign-in
             // card. Drop the tunnel; the sign-in retry re-opens it.
             Err(_) if matches!(pending.entra, EntraAuth::Interactive { .. }) => {
-                self.connecting.write().retain(|l| l != &pending.url);
+                self.release_connect(&pending.url);
                 drop(live_tunnel);
                 self.entra_prompt.set(Some(pending));
             }
@@ -1116,6 +1192,7 @@ impl AppState {
         // Session memory first, then the OS keyring (off-thread, and only
         // after the session read guard is dropped); errors mean "no keyring"
         // and fall through to the prompt flow.
+        self.set_step(&url, ConnectStep::Credentials);
         let mut session_password = self.session_passwords.read().get(&url).cloned();
         if session_password.is_none() {
             session_password = crate::secrets::get_password_async(url.clone())
@@ -1124,6 +1201,7 @@ impl AppState {
                 .flatten();
         }
         let had_password = session_password.is_some();
+        self.set_step(&url, ConnectStep::Opening);
         let result = match &session_password {
             Some(password) => match mssql_url_with_password(&connect_url, password) {
                 Ok(full) => {
@@ -1138,7 +1216,7 @@ impl AppState {
         };
         match result {
             Err(DbError::Connect(msg)) if msg.contains("authentication failed") => {
-                self.connecting.write().retain(|l| l != &url);
+                self.release_connect(&url);
                 if had_password {
                     // Stored password is stale; drop it everywhere and re-ask.
                     self.session_passwords.write().remove(&url);
@@ -1174,6 +1252,7 @@ impl AppState {
         tls_host: Option<String>,
         live_tunnel: Option<Tunnel>,
     ) {
+        self.set_step(&pending.url, ConnectStep::SigningIn);
         let cached = crate::secrets::get_password_async(entra_secret_key(&pending.url))
             .await
             .ok()
@@ -1205,7 +1284,7 @@ impl AppState {
             // Interactive with no usable refresh token: park behind the sign-in
             // card. Drop the tunnel; the sign-in retry re-opens it.
             Err(_) if matches!(pending.entra, EntraAuth::Interactive { .. }) => {
-                self.connecting.write().retain(|l| l != &pending.url);
+                self.release_connect(&pending.url);
                 drop(live_tunnel);
                 self.entra_prompt.set(Some(pending));
             }
@@ -1497,6 +1576,7 @@ impl AppState {
         let Some(config) = tunnel else {
             return Some((url.to_string(), None));
         };
+        self.set_step(url, ConnectStep::Tunnel);
         // The passphrase flows like the database password: session memory,
         // then keyring (off-thread, guard dropped before the await), then a
         // prompt. Only key-file auth can need one.
@@ -1539,7 +1619,7 @@ impl AppState {
                 }
             }
             Err(err @ TunnelError::NeedsPassphrase(_)) => {
-                self.connecting.write().retain(|l| l != url);
+                self.release_connect(url);
                 if had_passphrase {
                     // Stored passphrase is stale; drop it everywhere and
                     // re-ask.
@@ -1560,7 +1640,7 @@ impl AppState {
             // First contact: park the connect behind a trust-on-first-use
             // prompt instead of failing. Trusting persists the key and retries.
             Err(TunnelError::HostKeyUnknown(info)) => {
-                self.connecting.write().retain(|l| l != url);
+                self.release_connect(url);
                 self.host_key_prompt.set(Some(HostKeyPrompt {
                     url: url.to_string(),
                     name: name.to_string(),
@@ -1587,7 +1667,7 @@ impl AppState {
 
     /// Releases a connect reservation and surfaces its error.
     fn fail_connect(mut self, locator: &str, message: String) {
-        self.connecting.write().retain(|l| l != locator);
+        self.release_connect(locator);
         self.connect_error.set(Some(message));
     }
 
@@ -1614,6 +1694,80 @@ impl AppState {
         }
     }
 
+    /// Starts a connect for a row in the connections list. `focus` is false
+    /// for a shift-click, which opens the tab in the background.
+    ///
+    /// The connect runs on a **root** task, not the caller's: with connects
+    /// running in parallel, the first one to finish switches to its tab and
+    /// unmounts the connections screen, which would take every sibling
+    /// connect's task down with it (the same trap [`Self::load_schema`]
+    /// documents). Keeping the handle is also what makes cancelling possible.
+    pub fn start_connect(
+        mut self,
+        locator: String,
+        name: String,
+        backend: BackendKind,
+        tunnel: Option<TunnelConfig>,
+        auth: PgAuth,
+        focus: bool,
+    ) {
+        // SQLite reserves under the canonicalized path, so key on that or the
+        // row would never match its own progress.
+        let key = connect_key(&locator, backend);
+        // A second click while the first is still in flight would otherwise
+        // overwrite the task handle and strand the running connect.
+        if self.connect_requests.read().contains_key(&key) {
+            return;
+        }
+        let task = spawn_forever(async move {
+            match backend {
+                BackendKind::Postgres => {
+                    self.connect_postgres(locator, name, tunnel, auth).await;
+                }
+                BackendKind::SqlServer => {
+                    self.connect_sqlserver(locator, name, tunnel, auth).await;
+                }
+                BackendKind::Sqlite => self.connect(PathBuf::from(locator)).await,
+            }
+        });
+        self.connect_requests
+            .write()
+            .insert(key, ConnectRequest { task, focus });
+    }
+
+    /// Aborts a connect started from the list. Dropping the task mid-await
+    /// unwinds everything it owns — including a half-open tunnel — so there
+    /// is nothing else to tear down.
+    pub fn cancel_connect(mut self, locator: &str) {
+        if let Some(request) = self.connect_requests.write().remove(locator) {
+            request.task.cancel();
+        }
+        self.connecting.write().retain(|c| c.locator != locator);
+    }
+
+    /// Clears a connect's in-flight state. Returns whether the tab it
+    /// produced should be focused — false only when a shift-click asked for
+    /// the background. Connects with no request (started from a form, or
+    /// resumed after a password prompt) focus as before.
+    fn release_connect(mut self, locator: &str) -> bool {
+        self.connecting.write().retain(|c| c.locator != locator);
+        let request = self.connect_requests.write().remove(locator);
+        request.is_none_or(|r| r.focus)
+    }
+
+    /// Advances the step shown on a connecting row. A no-op once the connect
+    /// has finished or been cancelled.
+    fn set_step(mut self, locator: &str, step: ConnectStep) {
+        if let Some(entry) = self
+            .connecting
+            .write()
+            .iter_mut()
+            .find(|c| c.locator == locator)
+        {
+            entry.step = step;
+        }
+    }
+
     /// Focuses the tab if the locator is already open, or reserves it for a
     /// new connect. Returns true when the caller should stop (already open
     /// or connect already in flight). The write borrow is scoped — nothing
@@ -1626,14 +1780,40 @@ impl AppState {
             .find(|(_, l)| l == locator)
             .map(|(id, _)| *id);
         if let Some(id) = already_open {
-            self.active.set(ActiveView::Connection(id));
+            // Honours a shift-click here too: re-clicking an open connection
+            // in the background should not yank the view to it.
+            if self.release_connect(locator) {
+                self.active.set(ActiveView::Connection(id));
+            }
             return true;
         }
-        let mut connecting = self.connecting.write();
-        if connecting.iter().any(|l| l == locator) {
-            return true;
+        {
+            let mut connecting = self.connecting.write();
+            if connecting.iter().any(|c| c.locator == locator) {
+                return true;
+            }
+            connecting.push(Connecting {
+                locator: locator.to_string(),
+                step: ConnectStep::Opening,
+                visible: false,
+            });
         }
-        connecting.push(locator.to_string());
+        // Reveal the row's progress only once the connect has run long
+        // enough to be worth reporting; opening a local SQLite file beats
+        // this timer and shows nothing at all.
+        let locator = locator.to_string();
+        spawn_forever(async move {
+            tokio::time::sleep(SPINNER_DELAY).await;
+            // No borrow is held across the await above.
+            if let Some(entry) = self
+                .connecting
+                .write()
+                .iter_mut()
+                .find(|c| c.locator == locator)
+            {
+                entry.visible = true;
+            }
+        });
         false
     }
 
@@ -1647,7 +1827,7 @@ impl AppState {
         result: Result<DbPool, DbError>,
         tunnel: Option<Tunnel>,
     ) {
-        self.connecting.write().retain(|l| l != &locator);
+        let focus = self.release_connect(&locator);
         match result {
             Ok(pool) => {
                 let id = self.registry.write().insert(name, pool);
@@ -1655,7 +1835,11 @@ impl AppState {
                     self.tunnels.write().insert(id, tunnel);
                 }
                 self.open_locators.write().push((id, locator));
-                self.active.set(ActiveView::Connection(id));
+                if focus {
+                    self.active.set(ActiveView::Connection(id));
+                }
+                // Runs either way: a background tab should be ready to use
+                // the moment the user switches to it.
                 self.load_schema(id);
             }
             Err(err) => {
@@ -2916,17 +3100,10 @@ pub(crate) fn canonical(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// The open-locator form of a saved connection: the canonical file path for
-/// SQLite (matching what [`AppState::connect`] stores in `open_locators`) or
-/// the URL for Postgres / SQL Server. Used to match saved connections against
-/// remembered session tabs at restore time.
+/// The open-locator form of a saved connection. Used to match saved
+/// connections against remembered session tabs at restore time.
 fn saved_open_locator(saved: &SavedConnection) -> String {
-    match saved {
-        SavedConnection::Sqlite { path, .. } => canonical(path).display().to_string(),
-        SavedConnection::Postgres { url, .. } | SavedConnection::SqlServer { url, .. } => {
-            url.clone()
-        }
-    }
+    connect_key(&saved.locator(), saved.backend())
 }
 
 /// Sibling temp path for an atomic export write (`foo.csv` → `foo.csv.part`).
@@ -3022,5 +3199,51 @@ mod tests {
     fn canonical_falls_back_for_missing_files() {
         let missing = Path::new("/definitely/not/here.db");
         assert_eq!(canonical(missing), missing.to_path_buf());
+    }
+
+    #[test]
+    fn connect_key_canonicalizes_only_sqlite_paths() {
+        // A server URL is already the open-locator form: canonicalizing it as
+        // a path would mangle it, and the connections list would then never
+        // match a row against its own in-flight connect.
+        let url = "postgres://user@host:5432/db";
+        assert_eq!(connect_key(url, BackendKind::Postgres), url);
+        assert_eq!(connect_key(url, BackendKind::SqlServer), url);
+
+        // SQLite keys on the canonical path, matching what `connect` reserves
+        // and what `open_locators` records. Uses a real file, since
+        // `canonical` falls back verbatim for missing ones.
+        let dir = std::env::temp_dir().join("hubro-connect-key-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("demo.db");
+        std::fs::write(&db, b"").unwrap();
+        let indirect = dir.join(".").join("demo.db");
+        assert_eq!(
+            connect_key(&indirect.display().to_string(), BackendKind::Sqlite),
+            canonical(&db).display().to_string(),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connect_step_labels_are_distinct_and_lowercase() {
+        let steps = [
+            ConnectStep::Tunnel,
+            ConnectStep::Credentials,
+            ConnectStep::SigningIn,
+            ConnectStep::Opening,
+        ];
+        let labels: HashSet<&str> = steps.iter().map(|s| s.label()).collect();
+        assert_eq!(labels.len(), steps.len(), "two steps read the same");
+        for step in steps {
+            let label = step.label();
+            // These render as a status line under the connection name, not as
+            // a sentence, so they stay lowercase and unfinished.
+            assert!(label.ends_with('…'), "{label:?} lacks a trailing ellipsis");
+            assert!(
+                !label.starts_with(|c: char| c.is_uppercase()),
+                "{label:?} is capitalized"
+            );
+        }
     }
 }

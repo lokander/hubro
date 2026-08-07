@@ -5,7 +5,7 @@ use dioxus::desktop::tao::dpi::{LogicalSize, PhysicalPosition};
 use dioxus::desktop::tao::event::{Event, WindowEvent};
 use dioxus::desktop::{use_window, use_wry_event_handler, DesktopService, WindowCloseBehaviour};
 use dioxus::prelude::*;
-use dioxus_icons::lucide::{Moon, Plug, Sun, SunMoon, X};
+use dioxus_icons::lucide::{Moon, Pencil, Plug, Sun, SunMoon, Trash2, X};
 
 use crate::config::{
     default_settings_path, load_settings, save_window_geometry, BackendKind, SavedConnection,
@@ -16,10 +16,10 @@ use crate::db::{ConnectionId, Dialect};
 use super::editor::SqlEditor;
 use super::grid::DataGrid;
 use super::icons::BackendIcon;
-use super::notice::{Banner, BannerKind, EmptyState};
+use super::notice::{Banner, BannerKind, EmptyState, Spinner};
 use super::schema::SchemaPane;
 use super::sidebar::SchemaSidebar;
-use super::state::{ActiveView, AppState};
+use super::state::{ActiveView, AppState, ConnectStep};
 
 /// The window-level keyboard listener (FRE-15). Installed once as a plain
 /// `keydown` handler on `window` — a webview-robust way to capture app-global
@@ -595,8 +595,19 @@ fn PaneButton(
 struct SavedRow {
     name: String,
     locator: String,
+    /// Canonical locator — the key open tabs and in-flight connects are
+    /// tracked under. Differs from `locator` for a SQLite path that is not
+    /// already canonical.
+    key: String,
     backend: BackendKind,
     is_open: bool,
+    /// The step of a connect in flight for this row, once it has run long
+    /// enough to be worth showing. `None` means idle (or still too fast to
+    /// report).
+    connecting: Option<ConnectStep>,
+    /// Whether that connect can be cancelled — true when it was started from
+    /// this list rather than by submitting a form.
+    cancellable: bool,
     tunnel: Option<crate::tunnel::TunnelConfig>,
     auth: crate::config::PgAuth,
 }
@@ -696,6 +707,11 @@ fn ConnectionsScreen() -> Element {
     // One open form at a time (they were a mutually-exclusive bool pair
     // before FRE-67); `None` means no modal is up.
     let mut open_form = use_signal(|| Option::<ConnectForm>::None);
+    // Locator of the row whose Remove is armed, if any. Removing is instant
+    // and unrecoverable (a server entry takes its keyring password with it),
+    // so the trash icon only arms the confirmation — one row at a time, since
+    // arming another replaces this.
+    let mut confirm_remove = use_signal(|| Option::<String>::None);
     let error = state.connect_error.read().clone();
     let prompt = state.password_prompt.read().clone();
     let host_key_prompt = state.host_key_prompt.read().clone();
@@ -716,6 +732,8 @@ fn ConnectionsScreen() -> Element {
     });
     let saved: Vec<SavedRow> = {
         let open = state.open_locators.read();
+        let connecting = state.connecting.read();
+        let requests = state.connect_requests.read();
         state
             .saved
             .read()
@@ -741,8 +759,14 @@ fn ConnectionsScreen() -> Element {
                 SavedRow {
                     name: s.name().to_string(),
                     locator: s.locator(),
+                    key: canonical_locator.clone(),
                     backend: s.backend(),
                     is_open: open.iter().any(|(_, l)| *l == canonical_locator),
+                    connecting: connecting
+                        .iter()
+                        .find(|c| c.visible && c.locator == canonical_locator)
+                        .map(|c| c.step),
+                    cancellable: requests.contains_key(&canonical_locator),
                     tunnel,
                     auth,
                 }
@@ -785,45 +809,49 @@ fn ConnectionsScreen() -> Element {
             if !saved.is_empty() {
                 ul { class: "w-full max-w-xl divide-y divide-slate-200 dark:divide-slate-800 rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/60",
                     for row in saved {
-                        li { class: "flex items-center gap-3 px-4 py-3",
+                        // Same row-hover shade as the sidebar's table list. The
+                        // Edit/Remove buttons hover one step further so they
+                        // stay visible on top of it. Rounding the end rows
+                        // keeps the highlight inside the list's rounded border.
+                        //
+                        // The row's padding lives on the connect button, not on
+                        // the li: as li padding it was dead space that lit up on
+                        // hover but swallowed the click.
+                        li { class: "flex items-stretch first:rounded-t last:rounded-b hover:bg-slate-200 dark:hover:bg-slate-800/60",
                             button {
-                                class: "min-w-0 flex-1 text-left",
+                                // Dimmed and inert while its connect runs, so
+                                // the row reads as busy rather than ignored.
+                                class: if row.connecting.is_some() {
+                                    "min-w-0 flex-1 cursor-default px-4 py-3 text-left opacity-60"
+                                } else {
+                                    "min-w-0 flex-1 cursor-pointer px-4 py-3 text-left"
+                                },
+                                disabled: row.connecting.is_some(),
+                                title: "Shift-click to open in the background",
                                 onclick: {
                                     let row = row.clone();
-                                    move |_| {
-                                        let row = row.clone();
-                                        spawn(async move {
-                                            match row.backend {
-                                                BackendKind::Postgres => {
-                                                    state
-                                                        .connect_postgres(
-                                                            row.locator,
-                                                            row.name,
-                                                            row.tunnel,
-                                                            row.auth,
-                                                        )
-                                                        .await;
-                                                }
-                                                BackendKind::SqlServer => {
-                                                    state
-                                                        .connect_sqlserver(
-                                                            row.locator,
-                                                            row.name,
-                                                            row.tunnel,
-                                                            row.auth,
-                                                        )
-                                                        .await;
-                                                }
-                                                BackendKind::Sqlite => {
-                                                    state.connect(PathBuf::from(row.locator)).await;
-                                                }
-                                            }
-                                        });
+                                    move |evt: MouseEvent| {
+                                        // Shift-click opens the tab without
+                                        // switching to it, for queueing up
+                                        // several connections at once.
+                                        state
+                                            .start_connect(
+                                                row.locator.clone(),
+                                                row.name.clone(),
+                                                row.backend,
+                                                row.tunnel.clone(),
+                                                row.auth.clone(),
+                                                !evt.modifiers().shift(),
+                                            );
                                     }
                                 },
                                 div { class: "flex items-center gap-2",
                                     span { class: "shrink-0 text-slate-500 dark:text-slate-400",
-                                        BackendIcon { dialect: Dialect::from(row.backend), size: 16 }
+                                        if row.connecting.is_some() {
+                                            Spinner {}
+                                        } else {
+                                            BackendIcon { dialect: Dialect::from(row.backend), size: 16 }
+                                        }
                                     }
                                     span { class: "truncate text-sm font-medium text-slate-900 dark:text-slate-200",
                                         "{row.name}"
@@ -832,7 +860,9 @@ fn ConnectionsScreen() -> Element {
                                         class: match row.backend {
                                             BackendKind::Postgres => "rounded bg-cyan-100 dark:bg-cyan-900/50 px-1.5 py-0.5 text-xs text-cyan-700 dark:text-cyan-300",
                                             BackendKind::SqlServer => "rounded bg-red-100 dark:bg-red-900/50 px-1.5 py-0.5 text-xs text-red-700 dark:text-red-300",
-                                            BackendKind::Sqlite => "rounded bg-slate-200 dark:bg-slate-800 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400",
+                                            // A step darker than the row's hover shade; at
+                                            // bg-slate-200 the badge disappeared into it.
+                                            BackendKind::Sqlite => "rounded bg-slate-300 dark:bg-slate-700 px-1.5 py-0.5 text-xs text-slate-600 dark:text-slate-300",
                                         },
                                         match row.backend {
                                             BackendKind::Postgres => "postgres",
@@ -851,40 +881,100 @@ fn ConnectionsScreen() -> Element {
                                         }
                                     }
                                 }
-                                div { class: "truncate font-mono text-xs text-slate-500",
-                                    "{row.locator}"
+                                // The step replaces the locator while connecting:
+                                // the locator is already on screen in the name,
+                                // and the phase is what the user needs.
+                                if let Some(step) = row.connecting {
+                                    div { class: "truncate text-xs text-slate-500 dark:text-slate-400",
+                                        "{step.label()}"
+                                    }
+                                } else {
+                                    div { class: "truncate font-mono text-xs text-slate-500",
+                                        "{row.locator}"
+                                    }
                                 }
                             }
-                            if row.backend != BackendKind::Sqlite {
-                                button {
-                                    class: "rounded px-2 py-1 text-xs text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-200",
-                                    aria_label: "Edit saved connection",
-                                    onclick: {
-                                        let locator = row.locator.clone();
-                                        move |_| {
-                                            let entry = state
-                                                .saved
-                                                .read()
-                                                .entries()
-                                                .iter()
-                                                .find(|s| s.locator() == locator)
-                                                .cloned();
-                                            if let Some(entry) = entry {
-                                                open_form.set(Some(ConnectForm::Edit(entry)));
-                                            }
+                            // Only the row actions sit outside the connect
+                            // button; everything left of them is one click
+                            // target spanning the full row height.
+                            // Icon-only to keep the row narrow; `title` carries
+                            // the label the text used to, and `aria_label`
+                            // keeps it named for screen readers.
+                            div { class: "flex shrink-0 items-center gap-1 pr-2",
+                                if row.connecting.is_some() {
+                                    // Editing or removing a connection mid-connect
+                                    // would fight the attempt in flight, so the
+                                    // only action offered is calling it off.
+                                    if row.cancellable {
+                                        button {
+                                            class: "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
+                                            title: "Cancel",
+                                            aria_label: "Cancel connecting",
+                                            onclick: {
+                                                let key = row.key.clone();
+                                                move |_| state.cancel_connect(&key)
+                                            },
+                                            X { size: 14 }
                                         }
-                                    },
-                                    "Edit"
+                                    }
+                                } else if confirm_remove().as_deref() == Some(row.locator.as_str()) {
+                                    // Armed: the icons step aside for the
+                                    // confirmation, same shape as the editor's
+                                    // "Clear this connection's history?".
+                                    div { class: "flex items-center gap-2",
+                                        span { class: "text-xs text-amber-700 dark:text-amber-300", "Remove?" }
+                                        button {
+                                            class: "cursor-pointer rounded bg-amber-600 px-2 py-0.5 text-xs font-semibold text-slate-950 hover:bg-amber-500",
+                                            onclick: {
+                                                let locator = row.locator.clone();
+                                                move |_| {
+                                                    state.remove_saved(&locator);
+                                                    confirm_remove.set(None);
+                                                }
+                                            },
+                                            "Remove"
+                                        }
+                                        button {
+                                            class: "cursor-pointer rounded border border-slate-400 dark:border-slate-600 px-2 py-0.5 text-xs text-slate-900 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
+                                            onclick: move |_| confirm_remove.set(None),
+                                            "Keep"
+                                        }
+                                    }
+                                } else {
+                                    if row.backend != BackendKind::Sqlite {
+                                        button {
+                                            class: "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
+                                            title: "Edit",
+                                            aria_label: "Edit saved connection",
+                                            onclick: {
+                                                let locator = row.locator.clone();
+                                                move |_| {
+                                                    let entry = state
+                                                        .saved
+                                                        .read()
+                                                        .entries()
+                                                        .iter()
+                                                        .find(|s| s.locator() == locator)
+                                                        .cloned();
+                                                    if let Some(entry) = entry {
+                                                        open_form.set(Some(ConnectForm::Edit(entry)));
+                                                    }
+                                                }
+                                            },
+                                            Pencil { size: 14 }
+                                        }
+                                    }
+                                    button {
+                                        class: "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
+                                        title: "Remove",
+                                        aria_label: "Remove saved connection",
+                                        onclick: {
+                                            let locator = row.locator.clone();
+                                            move |_| confirm_remove.set(Some(locator.clone()))
+                                        },
+                                        Trash2 { size: 14 }
+                                    }
                                 }
-                            }
-                            button {
-                                class: "rounded px-2 py-1 text-xs text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-200",
-                                aria_label: "Remove saved connection",
-                                onclick: {
-                                    let locator = row.locator.clone();
-                                    move |_| state.remove_saved(&locator)
-                                },
-                                "Remove"
                             }
                         }
                     }
@@ -1574,7 +1664,9 @@ fn PostgresForm(
 
     let field_class = FORM_FIELD_CLASS;
     rsx! {
-        div { class: "w-full max-w-xl rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/80 p-4",
+        // Opaque, and a step above the page's slate-950: this renders over the
+        // modal backdrop, and at 80% the connections list showed through it.
+        div { class: "w-full max-w-xl rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 p-4",
             div { class: "mb-3 flex items-center justify-between",
                 span { class: "text-sm font-medium text-slate-900 dark:text-slate-200",
                     if editing { "Edit a Postgres connection" } else { "Add a Postgres connection" }
@@ -1933,7 +2025,8 @@ fn SqlServerForm(
 
     let field_class = FORM_FIELD_CLASS;
     rsx! {
-        div { class: "w-full max-w-xl rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/80 p-4",
+        // Opaque over the modal backdrop, matching the Postgres form.
+        div { class: "w-full max-w-xl rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 p-4",
             div { class: "mb-3 flex items-center justify-between",
                 span { class: "text-sm font-medium text-slate-900 dark:text-slate-200",
                     if editing { "Edit a SQL Server connection" } else { "Add a SQL Server connection" }
