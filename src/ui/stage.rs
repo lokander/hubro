@@ -619,6 +619,7 @@ mod tests {
             columns,
             indexes: vec![],
             foreign_keys: vec![],
+            restriction: None,
         }
     }
 

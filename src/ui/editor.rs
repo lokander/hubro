@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 use crate::db::{
     needs_confirmation, ConnectionId, Dialect, ExportFormat, QueryResult, StatementOutcome,
-    StatementResult, TableMeta, Value, MAX_QUERY_ROWS,
+    StatementResult, TableMeta, Value, MAX_QUERY_ROWS, NO_DDL, NO_MUTATE, NO_QUERY,
 };
 use crate::history::{HistoryEntry, HISTORY_CAP};
 
@@ -109,6 +109,20 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
 
     let run = state.sql_runs.read().get(&id).cloned();
     let running = matches!(run.as_ref().map(|r| &r.status), Some(RunStatus::Running));
+    // What this connection won't run, stated before the user writes it
+    // (FRE-87). `run_sql` refuses the same cases, so the note explains a
+    // refusal that would otherwise arrive only after pressing Ctrl+Enter.
+    let capability_note: Option<&'static str> = match state
+        .registry
+        .read()
+        .get(id)
+        .map(|connection| connection.pool.capabilities())
+    {
+        Some(caps) if !caps.read_query => Some(NO_QUERY),
+        Some(caps) if !caps.mutate => Some(NO_MUTATE),
+        Some(caps) if !caps.ddl => Some(NO_DDL),
+        _ => None,
+    };
     let pending_writes = state.pending_sql.read().get(&id).map(|pending| {
         pending
             .statements
@@ -122,8 +136,17 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
         div { class: "flex h-full min-h-0",
         div { class: "flex min-w-0 flex-1 flex-col",
             div { class: "flex items-center justify-between border-b border-slate-200 dark:border-slate-800 px-3 py-1.5",
-                span { class: "text-xs text-slate-500",
-                    "Ctrl+Enter runs the buffer — or just the selection."
+                div { class: "flex min-w-0 items-center gap-2",
+                    span { class: "text-xs text-slate-500",
+                        "Ctrl+Enter runs the buffer — or just the selection."
+                    }
+                    if let Some(note) = capability_note {
+                        span {
+                            class: "truncate rounded border border-amber-300 dark:border-amber-900/50 px-1.5 py-0.5 text-xs text-amber-700 dark:text-amber-300",
+                            title: "{note}",
+                            "{note}"
+                        }
+                    }
                 }
                 div { class: "flex items-center gap-2",
                     if running {
@@ -709,6 +732,7 @@ mod tests {
                 .collect(),
             indexes: vec![],
             foreign_keys: vec![],
+            restriction: None,
         }
     }
 

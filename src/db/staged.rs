@@ -21,6 +21,8 @@
 use std::fmt;
 use std::fmt::Write as _;
 
+use super::caps;
+use super::error::DbError;
 use super::page::{quote_ident, Dialect};
 use super::registry::DbPool;
 use super::rowkey::RowIdentity;
@@ -190,6 +192,12 @@ pub struct CheckedStatement {
 ///   safety net, batch-wide).
 /// - NULL values are rendered inline as literal `NULL` (never as bound
 ///   parameters) in SET lists and INSERT values — see [`ParamSql::value_sql`].
+///
+/// The connection's resolved capabilities for `table` are checked first
+/// (FRE-87): without `mutate`, nothing is built or sent and the returned
+/// [`StagedError`] carries the same sentence the UI shows on the disabled
+/// Save button. The UI never offers staging on such a table, so reaching
+/// this means a gate was missed.
 pub async fn apply_staged(
     pool: &DbPool,
     table: &TableMeta,
@@ -198,6 +206,20 @@ pub async fn apply_staged(
 ) -> Result<AppliedCounts, StagedError> {
     if changes.is_empty() {
         return Ok(AppliedCounts::default());
+    }
+    let access = pool.access(table);
+    if !access.can_mutate() {
+        return Err(StagedError {
+            change_index: None,
+            change_summary: None,
+            message: DbError::Unsupported(
+                access
+                    .read_only_notice()
+                    .unwrap_or(caps::NO_MUTATE)
+                    .to_string(),
+            )
+            .to_string(),
+        });
     }
     let plan = build_statements(table, identity, pool.dialect(), changes)?;
     let statements: Vec<CheckedStatement> = plan.iter().map(|s| s.statement.clone()).collect();
@@ -631,6 +653,7 @@ mod tests {
             columns: vec![col("id", Some(1)), col("a", None), col("b", None)],
             indexes: vec![],
             foreign_keys: vec![],
+            restriction: None,
         }
     }
 
@@ -885,6 +908,7 @@ mod tests {
             ],
             indexes: vec![],
             foreign_keys: vec![],
+            restriction: None,
         }
     }
 

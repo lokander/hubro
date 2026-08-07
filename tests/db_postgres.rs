@@ -8,8 +8,9 @@
 //! ```
 
 use hubro::db::{
-    detect_row_identity, url_with_password, DbError, DbPool, Dialect, Filter, PageRequest,
-    RowLocator, SortDir, TableKind, TypeDetail, TypeRef, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
+    detect_row_identity, url_with_password, Capabilities, DbError, DbPool, Dialect, Filter,
+    PageRequest, Restriction, RowLocator, SortDir, TableKind, TypeDetail, TypeRef, Value,
+    PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 fn test_url() -> Option<String> {
@@ -410,6 +411,8 @@ async fn postgres_multi_schema_introspection_has_parity_metadata() {
         "CREATE MATERIALIZED VIEW warehouse.stock_mv AS \
          SELECT id, note FROM warehouse.stock",
         "CREATE UNIQUE INDEX stock_mv_id ON warehouse.stock_mv (id)",
+        // No PK and no usable unique index: nothing addresses one row.
+        "CREATE TABLE warehouse.keyless (a integer, b text)",
     ] {
         pool.query(sql).await.unwrap();
     }
@@ -496,6 +499,35 @@ async fn postgres_multi_schema_introspection_has_parity_metadata() {
         detect_row_identity(matview, Dialect::Postgres).is_none(),
         "a matview must be read-only even with a unique index"
     );
+
+    // Capabilities (FRE-87). Postgres declares the full set at the
+    // connection level; the per-object resolution is what differs, and each
+    // narrowing states its own reason.
+    assert_eq!(pool.capabilities(), Capabilities::FULL);
+    let stock_access = pool.access(stock);
+    assert_eq!(stock_access.caps, Capabilities::FULL);
+    assert_eq!(stock_access.restriction, None);
+    assert!(stock_access.identity.is_some());
+
+    let view_access = pool.access(view);
+    assert!(!view_access.can_mutate());
+    assert_eq!(view_access.restriction, Some(Restriction::View));
+
+    let mv_access = pool.access(matview);
+    assert!(!mv_access.can_mutate());
+    assert_eq!(mv_access.restriction, Some(Restriction::MaterializedView));
+    // Reduced, not disabled: browsing and paging a matview still work.
+    assert!(mv_access.caps.read_query);
+    assert!(mv_access.caps.offset_paging);
+
+    let keyless = tables
+        .iter()
+        .find(|t| t.schema.as_deref() == Some("warehouse") && t.name == "keyless")
+        .unwrap();
+    let keyless_access = pool.access(keyless);
+    assert!(!keyless_access.can_mutate());
+    assert_eq!(keyless_access.restriction, Some(Restriction::NoRowIdentity));
+    assert_eq!(keyless_access.identity, None);
 
     // Browsing the matview's data works through the normal paged read path.
     let mv_request = PageRequest {

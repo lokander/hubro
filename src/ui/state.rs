@@ -12,11 +12,11 @@ use crate::config::{
     SavedConnection, SavedList, Session, SessionPane, SessionTab, Theme,
 };
 use crate::db::{
-    apply_staged, build_fk_filter, detect_row_identity, mssql_url_target, mssql_url_via_local_port,
-    mssql_url_with_password, needs_confirmation, run_script, split_statements, url_target,
-    url_via_local_port, url_with_password, write_result, CellFetch, ConnectionId,
-    ConnectionRegistry, DbError, DbPool, ExportFormat, Filter, ForeignKeyMeta, MssqlAuth,
-    QueryResult, RowLocator, StatementResult, TableMeta, Value,
+    apply_staged, build_fk_filter, mssql_url_target, mssql_url_via_local_port,
+    mssql_url_with_password, needs_confirmation, run_script, script_refusal, split_statements,
+    statement_preview, url_target, url_via_local_port, url_with_password, write_result, CellFetch,
+    ConnectionId, ConnectionRegistry, DbError, DbPool, ExportFormat, Filter, ForeignKeyMeta,
+    MssqlAuth, QueryResult, RowLocator, StatementResult, TableMeta, Value,
 };
 use crate::history::HistoryStore;
 use crate::tunnel::{HostKeyInfo, Tunnel, TunnelAuth, TunnelConfig, TunnelError};
@@ -1989,14 +1989,35 @@ impl AppState {
     /// any statement can mutate the database (see [`needs_confirmation`])
     /// are not executed yet: they are stashed in [`Self::pending_sql`] and
     /// the editor shows a confirmation banner.
+    ///
+    /// A statement the connection's capabilities forbid (FRE-87) is refused
+    /// here, *before* the confirmation banner — being asked to confirm a
+    /// write that can never run is a prompt with no right answer.
     pub fn run_sql(mut self, id: ConnectionId, sql: String) {
         self.pending_sql.write().remove(&id);
-        let dialect = match self.registry.read().get(id) {
-            Some(connection) => connection.pool.dialect(),
+        let (dialect, caps) = match self.registry.read().get(id) {
+            Some(connection) => (connection.pool.dialect(), connection.pool.capabilities()),
             None => return, // connection closed underneath the editor
         };
         let statements = split_statements(&sql, dialect);
         if statements.is_empty() {
+            return;
+        }
+        if let Some((statement_index, reason)) = script_refusal(caps, &statements, dialect) {
+            self.sql_runs.write().insert(
+                id,
+                SqlRun {
+                    statements: Vec::new(),
+                    status: RunStatus::Failed {
+                        error: reason.to_string(),
+                        statement_index,
+                        preview: statement_preview(&statements[statement_index]),
+                        elapsed_ms: 0,
+                        // Nothing ran, so there is nothing to have rolled back.
+                        rolled_back: false,
+                    },
+                },
+            );
             return;
         }
         if statements.iter().any(|s| needs_confirmation(s, dialect)) {
@@ -2394,7 +2415,10 @@ impl AppState {
         let (Some(pool), Some(meta)) = (pool, meta) else {
             return Err("connection or schema no longer available".into());
         };
-        let Some(identity) = detect_row_identity(&meta, pool.dialect()) else {
+        // A read path: it only needs the row to be addressable, so it uses
+        // the resolved identity rather than the write capability — a
+        // read-only connection still expands cells (FRE-87).
+        let Some(identity) = pool.access(&meta).identity else {
             return Err("this table has no usable row identity".into());
         };
         pool.fetch_cell(&meta, &identity, &locator, &column)
@@ -2663,11 +2687,18 @@ impl AppState {
             );
             return;
         };
-        let Some(identity) = detect_row_identity(&meta, pool.dialect()) else {
+        // The same resolution the grid gated its editors on (FRE-87); if a
+        // stage exists here anyway, the failure states the resolver's reason
+        // rather than a second, differently-worded one.
+        let access = pool.access(&meta);
+        let Some(identity) = access.identity.clone().filter(|_| access.can_mutate()) else {
             self.fail_save(
                 id,
                 &table_key,
-                "this table has no usable row identity — it is read-only".into(),
+                access
+                    .read_only_notice()
+                    .unwrap_or("This table has no usable row identity.")
+                    .to_string(),
             );
             return;
         };

@@ -10,6 +10,7 @@
 //! Postgres `CREATE INDEX CONCURRENTLY`), in which case it falls back to
 //! sequential autocommit and earlier statements' effects persist.
 
+use super::caps::{self, Capabilities};
 use super::error::DbError;
 use super::page::Dialect;
 use super::registry::{DbPool, MAX_QUERY_ROWS};
@@ -213,36 +214,113 @@ fn dollar_tag_end(bytes: &[u8], at: usize) -> Option<usize> {
     (bytes.get(j) == Some(&b'$')).then_some(j + 1)
 }
 
-/// Whether a statement returns rows (executed via fetch) or not (executed
-/// via execute, reporting an affected-row count). This is an execution-mode
-/// choice only — see [`needs_confirmation`] for the "can this mutate?"
-/// question, which is deliberately stricter.
+/// What a statement does, by first keyword. [`StatementKind::Read`] means it
+/// returns rows (executed via fetch); the other two are executed via
+/// `execute`, reporting an affected-row count. `Write` and `Ddl` are split
+/// because a connection can permit one and refuse the other — a read-only
+/// analytics backend refuses both, but the flags are separate in
+/// [`Capabilities`](super::caps::Capabilities).
+///
+/// This is a first-keyword classification only. For the stricter "can this
+/// change anything?" question — which also catches writes buried inside a
+/// fetch-classified statement — see [`needs_confirmation`] and
+/// [`statement_needs`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatementKind {
     Read,
     Write,
+    Ddl,
+}
+
+impl StatementKind {
+    /// Whether the statement is executed by fetching rows rather than by
+    /// `execute`. `Ddl` runs exactly like `Write` here — the split matters
+    /// for capabilities, not for how the statement is dispatched.
+    fn returns_rows(self) -> bool {
+        self == StatementKind::Read
+    }
 }
 
 /// Classifies by the first significant keyword. The read set is
-/// deliberately small; anything unrecognized counts as a write. `WITH` is
+/// deliberately small; anything unrecognized counts as a plain write, which
+/// is the safe side (a write needs the broader `mutate` capability, and
+/// unknown statements are refused on a read-only connection). `WITH` is
 /// classified as a read even though Postgres allows data-modifying CTEs —
 /// the rows such a statement returns are still worth showing, and `fetch`
-/// executes it all the same (the confirmation banner is handled separately
-/// by [`needs_confirmation`]).
+/// executes it all the same (the confirmation banner and the capability
+/// check handle the embedded write separately).
 pub fn classify_statement(sql: &str) -> StatementKind {
     match first_keyword(sql).to_ascii_lowercase().as_str() {
         "select" | "with" | "values" | "show" | "explain" | "pragma" | "table" => {
             StatementKind::Read
         }
+        word if DDL_KEYWORDS.contains(&word) => StatementKind::Ddl,
         _ => StatementKind::Write,
     }
 }
 
 /// Keywords that mark a fetch-classified statement as potentially mutating
-/// when they appear anywhere outside strings and comments.
-const EMBEDDED_WRITE_KEYWORDS: [&str; 9] = [
-    "insert", "update", "delete", "merge", "create", "drop", "alter", "truncate", "replace",
+/// when they appear anywhere outside strings and comments. Split into the
+/// DML and DDL halves so an embedded write can be attributed to the
+/// capability it actually needs.
+const EMBEDDED_DML_KEYWORDS: [&str; 5] = ["insert", "update", "delete", "merge", "replace"];
+const EMBEDDED_DDL_KEYWORDS: [&str; 4] = ["create", "drop", "alter", "truncate"];
+
+/// First keywords that make a statement schema-changing rather than a plain
+/// write. `grant`/`revoke` and `comment` are included: they change the
+/// database's definition, not its rows, so a connection that permits data
+/// edits but not schema changes must refuse them.
+const DDL_KEYWORDS: [&str; 7] = [
+    "create", "drop", "alter", "truncate", "rename", "grant", "revoke",
 ];
+
+/// Which capabilities a statement needs to run. `read_query` is required by
+/// everything (even a write is dispatched through the same connection), so
+/// only the two that vary are reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StatementNeeds {
+    /// Needs [`Capabilities::mutate`](super::caps::Capabilities::mutate):
+    /// the statement can change rows.
+    pub mutate: bool,
+    /// Needs [`Capabilities::ddl`](super::caps::Capabilities::ddl): the
+    /// statement can change the schema.
+    pub ddl: bool,
+}
+
+/// What `sql` needs from a connection's capabilities.
+///
+/// Built on the same token scan as [`needs_confirmation`], so it is not
+/// fooled by a write hidden in a fetch-classified statement: on a connection
+/// that refuses writes, `WITH x AS (DELETE …) SELECT * FROM x` is refused
+/// too, not waved through because it starts with `WITH`.
+///
+/// A statement that [`needs_confirmation`] flags but whose effect no token
+/// attributes — `SELECT … INTO new_table`, a value-setting `PRAGMA`, an
+/// unclassifiable statement — needs **both** capabilities. It can change
+/// something, and guessing which of the two would be the one place this
+/// module lets an unwanted change through.
+pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
+    if !needs_confirmation(sql, dialect) {
+        return StatementNeeds::default();
+    }
+    let kind = classify_statement(sql);
+    let has = |set: &[&str]| {
+        has_top_level_word(sql, dialect, |word| {
+            set.contains(&word.to_ascii_lowercase().as_str())
+        })
+    };
+    // A DDL statement can carry DML and vice versa, so both halves are
+    // scanned regardless of which keyword opened the statement.
+    let mutate = kind == StatementKind::Write || has(&EMBEDDED_DML_KEYWORDS);
+    let ddl = kind == StatementKind::Ddl || has(&EMBEDDED_DDL_KEYWORDS);
+    if !mutate && !ddl {
+        return StatementNeeds {
+            mutate: true,
+            ddl: true,
+        };
+    }
+    StatementNeeds { mutate, ddl }
+}
 
 /// Whether running this statement can mutate the database, i.e. whether the
 /// editor must ask before running it. Everything [`classify_statement`]
@@ -250,7 +328,8 @@ const EMBEDDED_WRITE_KEYWORDS: [&str; 9] = [
 /// statements are token-scanned (outside strings/comments, so quoted
 /// literals never trigger) for embedded write forms:
 ///
-/// - `WITH` / `EXPLAIN`: any [`EMBEDDED_WRITE_KEYWORDS`] token anywhere —
+/// - `WITH` / `EXPLAIN`: any [`EMBEDDED_DML_KEYWORDS`] or
+///   [`EMBEDDED_DDL_KEYWORDS`] token anywhere —
 ///   catches data-modifying CTEs (`WITH x AS (DELETE …) SELECT …`) and
 ///   `EXPLAIN ANALYZE UPDATE …`, which Postgres actually executes. Plain
 ///   `EXPLAIN SELECT` / `EXPLAIN ANALYZE SELECT` do not prompt.
@@ -265,12 +344,14 @@ const EMBEDDED_WRITE_KEYWORDS: [&str; 9] = [
 /// (`SELECT [o'brien] * INTO t2 FROM t`) must not invert string tracking
 /// and hide the `INTO`, and `SELECT [into]` must not over-prompt.
 pub fn needs_confirmation(sql: &str, dialect: Dialect) -> bool {
-    if classify_statement(sql) == StatementKind::Write {
+    if classify_statement(sql) != StatementKind::Read {
         return true;
     }
     match first_keyword(sql).to_ascii_lowercase().as_str() {
         "with" | "explain" => has_top_level_word(sql, dialect, |word| {
-            EMBEDDED_WRITE_KEYWORDS.contains(&word.to_ascii_lowercase().as_str())
+            let word = word.to_ascii_lowercase();
+            EMBEDDED_DML_KEYWORDS.contains(&word.as_str())
+                || EMBEDDED_DDL_KEYWORDS.contains(&word.as_str())
         }),
         "select" => has_top_level_word(sql, dialect, |word| word.eq_ignore_ascii_case("into")),
         "pragma" => {
@@ -478,19 +559,73 @@ pub struct ScriptError {
 /// statement (so callers can show progress) and stopping at the first failure.
 ///
 /// Multi-statement scripts run atomically in one transaction unless
-/// [`wrap_atomically`] declines (self-managed transactions or a
-/// non-transactional statement) — then they run sequentially in autocommit,
-/// as before.
+/// [`wrap_atomically`] declines (self-managed transactions, a
+/// non-transactional statement, or a connection without the `transactions`
+/// capability) — then they run sequentially in autocommit, as before.
+///
+/// Every statement is checked against the connection's
+/// [`Capabilities`](super::caps::Capabilities) *before* any of them runs
+/// (FRE-87), so a script that the UI should have gated fails with a clear
+/// [`DbError::Unsupported`] and an untouched database, rather than part-way
+/// through. The UI disables the run affordance for these cases; this is the
+/// backstop for reaching the path anyway.
 pub async fn run_script(
     pool: &DbPool,
     statements: &[String],
     on_result: impl FnMut(StatementResult),
 ) -> Result<(), ScriptError> {
-    if wrap_atomically(pool.dialect(), statements) {
+    let caps = pool.capabilities();
+    if let Some(refusal) = refuse_script(caps, statements, pool.dialect()) {
+        return Err(refusal);
+    }
+    if wrap_atomically(caps, pool.dialect(), statements) {
         run_script_atomic(pool, statements, on_result).await
     } else {
         run_script_sequential(pool, statements, on_result).await
     }
+}
+
+/// The first statement of `statements` that `caps` doesn't permit: its index
+/// and the sentence explaining the refusal, or `None` when the whole script
+/// may run.
+///
+/// The UI calls this before offering to run a script — so a script that
+/// can't run is refused up front rather than after a write-confirmation
+/// prompt the user can only answer wrongly — and [`run_script`] calls it
+/// again as the backstop.
+pub fn script_refusal(
+    caps: Capabilities,
+    statements: &[String],
+    dialect: Dialect,
+) -> Option<(usize, &'static str)> {
+    for (statement_index, statement) in statements.iter().enumerate() {
+        if !caps.read_query {
+            return Some((statement_index, caps::NO_QUERY));
+        }
+        let needs = statement_needs(statement, dialect);
+        if needs.mutate && !caps.mutate {
+            return Some((statement_index, caps::NO_MUTATE));
+        }
+        if needs.ddl && !caps.ddl {
+            return Some((statement_index, caps::NO_DDL));
+        }
+    }
+    None
+}
+
+/// [`script_refusal`] as a ready-to-return error. Nothing has run at this
+/// point, so `rolled_back` is false: the database is untouched either way.
+fn refuse_script(
+    caps: Capabilities,
+    statements: &[String],
+    dialect: Dialect,
+) -> Option<ScriptError> {
+    script_refusal(caps, statements, dialect).map(|(statement_index, message)| ScriptError {
+        statement_index,
+        preview: statement_preview(&statements[statement_index]),
+        error: DbError::Unsupported(message.to_string()),
+        rolled_back: false,
+    })
 }
 
 /// The autocommit path: each statement commits on its own, so a failure leaves
@@ -503,15 +638,14 @@ async fn run_script_sequential(
     for (statement_index, statement) in statements.iter().enumerate() {
         // Reads stream through the row cap so a huge result never buffers in
         // full; writes report an affected-row count as before.
-        let outcome = match classify_statement(statement) {
-            StatementKind::Read => pool
-                .query_capped(statement, &[], MAX_QUERY_ROWS)
+        let outcome = if classify_statement(statement).returns_rows() {
+            pool.query_capped(statement, &[], MAX_QUERY_ROWS)
                 .await
-                .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated)),
-            StatementKind::Write => pool
-                .execute(statement)
+                .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated))
+        } else {
+            pool.execute(statement)
                 .await
-                .map(|affected| (StatementOutcome::Affected(affected), false)),
+                .map(|affected| (StatementOutcome::Affected(affected), false))
         };
         match outcome {
             Ok((outcome, truncated)) => on_result(StatementResult {
@@ -556,15 +690,14 @@ async fn run_script_atomic(
         }
     };
     for (statement_index, statement) in statements.iter().enumerate() {
-        let outcome = match classify_statement(statement) {
-            StatementKind::Read => tx
-                .query_capped(statement, MAX_QUERY_ROWS)
+        let outcome = if classify_statement(statement).returns_rows() {
+            tx.query_capped(statement, MAX_QUERY_ROWS)
                 .await
-                .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated)),
-            StatementKind::Write => tx
-                .execute(statement)
+                .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated))
+        } else {
+            tx.execute(statement)
                 .await
-                .map(|affected| (StatementOutcome::Affected(affected), false)),
+                .map(|affected| (StatementOutcome::Affected(affected), false))
         };
         match outcome {
             Ok((outcome, truncated)) => on_result(StatementResult {
@@ -597,13 +730,16 @@ async fn run_script_atomic(
     Ok(())
 }
 
-/// Whether a script should run atomically in one transaction. Only for
+/// Whether a script should run atomically in one transaction. Only when the
+/// connection has the `transactions` capability at all, only for
 /// multi-statement scripts, and only when none of the statements manages its
 /// own transaction ([`manages_own_transaction`]) or must run outside one
 /// ([`is_non_transactional`]) — wrapping either would error at `BEGIN` or on
-/// the offending statement.
-pub fn wrap_atomically(dialect: Dialect, statements: &[String]) -> bool {
-    statements.len() > 1
+/// the offending statement. A non-transactional backend falls back to the
+/// sequential autocommit path rather than failing.
+pub fn wrap_atomically(caps: Capabilities, dialect: Dialect, statements: &[String]) -> bool {
+    caps.transactions
+        && statements.len() > 1
         && !statements
             .iter()
             .any(|s| manages_own_transaction(s, dialect) || is_non_transactional(dialect, s))
@@ -688,6 +824,13 @@ fn leading_words(sql: &str, dialect: Dialect, n: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`wrap_atomically`] on a fully capable connection — the only shape
+    /// the three current backends have. The capability itself is covered by
+    /// `a_non_transactional_connection_never_wraps`.
+    fn wraps(dialect: Dialect, statements: &[String]) -> bool {
+        wrap_atomically(Capabilities::FULL, dialect, statements)
+    }
 
     /// Splitting is dialect-independent except for SQL Server's GO
     /// handling (exercised separately below); Postgres exercises dollar
@@ -976,22 +1119,133 @@ mod tests {
     }
 
     #[test]
+    fn schema_changing_statements_are_classified_as_ddl() {
+        for sql in [
+            "CREATE TABLE t (a int)",
+            "create index i on t (a)",
+            "DROP TABLE t",
+            "ALTER TABLE t ADD b int",
+            "TRUNCATE t",
+            "GRANT ALL ON t TO x",
+            "REVOKE ALL ON t FROM x",
+            "-- comment first\nDROP TABLE t",
+        ] {
+            assert_eq!(classify_statement(sql), StatementKind::Ddl, "{sql:?}");
+        }
+    }
+
+    #[test]
     fn everything_else_is_a_write() {
         for sql in [
             "INSERT INTO t VALUES (1)",
             "UPDATE t SET a = 1",
             "DELETE FROM t",
-            "CREATE TABLE t (a int)",
-            "DROP TABLE t",
-            "ALTER TABLE t ADD b int",
-            "TRUNCATE t",
             "BEGIN",
             "VACUUM",
-            "GRANT ALL ON t TO x",
             "COPY t FROM stdin",
             "", // unclassifiable: err on the safe side
         ] {
             assert_eq!(classify_statement(sql), StatementKind::Write, "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn reads_need_no_capability_beyond_querying() {
+        for sql in [
+            "SELECT 1",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            "EXPLAIN SELECT 1",
+            "VALUES (1)",
+            "TABLE t",
+        ] {
+            assert_eq!(
+                statement_needs(sql, Dialect::Postgres),
+                StatementNeeds::default(),
+                "{sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn statement_needs_separates_data_changes_from_schema_changes() {
+        let needs = |sql| statement_needs(sql, Dialect::Postgres);
+        // Plain DML needs mutate only.
+        for sql in ["INSERT INTO t VALUES (1)", "UPDATE t SET a = 1", "DELETE t"] {
+            assert_eq!(
+                needs(sql),
+                StatementNeeds {
+                    mutate: true,
+                    ddl: false
+                },
+                "{sql:?}"
+            );
+        }
+        // Plain DDL needs ddl only, so a connection that permits row edits
+        // but not schema changes can still run its INSERTs.
+        for sql in ["CREATE TABLE t (a int)", "DROP TABLE t", "TRUNCATE t"] {
+            assert_eq!(
+                needs(sql),
+                StatementNeeds {
+                    mutate: false,
+                    ddl: true
+                },
+                "{sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_write_buried_in_a_read_still_needs_the_capability() {
+        // The first keyword says WITH, but the statement deletes rows.
+        assert!(
+            statement_needs(
+                "WITH gone AS (DELETE FROM t RETURNING *) SELECT * FROM gone",
+                Dialect::Postgres
+            )
+            .mutate
+        );
+        // EXPLAIN ANALYZE really runs the statement on Postgres.
+        assert!(statement_needs("EXPLAIN ANALYZE UPDATE t SET a = 1", Dialect::Postgres).mutate);
+        // A CTE that creates a table needs the ddl capability.
+        assert!(
+            statement_needs(
+                "WITH x AS (SELECT 1) CREATE TABLE t AS SELECT * FROM x",
+                Dialect::Postgres
+            )
+            .ddl
+        );
+        // A quoted keyword is not a write.
+        assert_eq!(
+            statement_needs("SELECT 'please do not DELETE me'", Dialect::Postgres),
+            StatementNeeds::default()
+        );
+    }
+
+    #[test]
+    fn an_unattributable_change_needs_both_capabilities() {
+        // SELECT … INTO creates a table and names neither keyword set; a
+        // PRAGMA changes state without naming either. Both are charged to
+        // both capabilities rather than guessed at.
+        //
+        // Call-form pragmas (`PRAGMA table_info(t)`) are read-only in fact
+        // but land here too, inheriting `needs_confirmation`'s deliberate
+        // over-prompt: some pragmas set through the call form, and refusing
+        // a read is the safe way to be wrong. Only SQLite and its dialect
+        // relatives have pragmas at all, and none of them is a read-only
+        // connection today.
+        for sql in [
+            "SELECT * INTO backup FROM t",
+            "PRAGMA journal_mode = WAL",
+            "PRAGMA table_info(t)",
+        ] {
+            assert_eq!(
+                statement_needs(sql, Dialect::Sqlite),
+                StatementNeeds {
+                    mutate: true,
+                    ddl: true
+                },
+                "{sql:?}"
+            );
         }
     }
 
@@ -1159,12 +1413,12 @@ mod tests {
     #[test]
     fn multi_statement_scripts_wrap_atomically_by_default() {
         for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
-            assert!(wrap_atomically(
+            assert!(wraps(
                 dialect,
                 &stmts(&["INSERT INTO t VALUES (1)", "UPDATE t SET a = 2"])
             ));
             // Mixed read/write still wraps.
-            assert!(wrap_atomically(
+            assert!(wraps(
                 dialect,
                 &stmts(&["DELETE FROM t WHERE a = 1", "SELECT count(*) FROM t"])
             ));
@@ -1172,10 +1426,80 @@ mod tests {
     }
 
     #[test]
+    fn a_non_transactional_connection_never_wraps() {
+        // Without the capability there is no transaction to wrap in, so the
+        // script falls back to sequential autocommit instead of failing.
+        let caps = Capabilities {
+            transactions: false,
+            ..Capabilities::FULL
+        };
+        let script = stmts(&["INSERT INTO t VALUES (1)", "UPDATE t SET a = 2"]);
+        for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
+            assert!(wraps(dialect, &script));
+            assert!(!wrap_atomically(caps, dialect, &script));
+        }
+    }
+
+    #[test]
+    fn a_read_only_connection_refuses_writes_before_running_anything() {
+        let caps = Capabilities::FULL.read_only();
+        let script = stmts(&["SELECT 1", "DELETE FROM t", "SELECT 2"]);
+        let refusal = refuse_script(caps, &script, Dialect::Postgres).expect("must refuse");
+        // The refusal names the offending statement, and nothing ran.
+        assert_eq!(refusal.statement_index, 1);
+        assert_eq!(refusal.preview, "DELETE FROM t");
+        assert!(!refusal.rolled_back);
+        assert_eq!(refusal.error, DbError::Unsupported(caps::NO_MUTATE.into()));
+    }
+
+    #[test]
+    fn read_query_without_mutate_still_permits_select() {
+        let caps = Capabilities::FULL.read_only();
+        let script = stmts(&["SELECT 1", "WITH x AS (SELECT 1) SELECT * FROM x", "SHOW x"]);
+        assert_eq!(refuse_script(caps, &script, Dialect::Postgres), None);
+    }
+
+    #[test]
+    fn refusal_distinguishes_schema_changes_from_row_changes() {
+        let no_ddl = Capabilities {
+            ddl: false,
+            ..Capabilities::FULL
+        };
+        // Row edits are still allowed…
+        assert_eq!(
+            refuse_script(no_ddl, &stmts(&["DELETE FROM t"]), Dialect::Postgres),
+            None
+        );
+        // …but schema changes are refused, with the schema-specific reason.
+        let refusal =
+            refuse_script(no_ddl, &stmts(&["DROP TABLE t"]), Dialect::Postgres).expect("refuses");
+        assert_eq!(refusal.error, DbError::Unsupported(caps::NO_DDL.into()));
+    }
+
+    #[test]
+    fn a_connection_that_cannot_query_refuses_everything() {
+        let caps = Capabilities {
+            read_query: false,
+            ..Capabilities::FULL
+        };
+        let refusal =
+            refuse_script(caps, &stmts(&["SELECT 1"]), Dialect::Postgres).expect("refuses");
+        assert_eq!(refusal.error, DbError::Unsupported(caps::NO_QUERY.into()));
+    }
+
+    #[test]
+    fn a_fully_capable_connection_refuses_nothing() {
+        let script = stmts(&["SELECT 1", "DELETE FROM t", "CREATE TABLE u (a int)"]);
+        for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
+            assert_eq!(refuse_script(Capabilities::FULL, &script, dialect), None);
+        }
+    }
+
+    #[test]
     fn single_statement_scripts_do_not_wrap() {
         // One statement is already atomic under autocommit — nothing to wrap.
         for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
-            assert!(!wrap_atomically(dialect, &stmts(&["DELETE FROM t"])));
+            assert!(!wraps(dialect, &stmts(&["DELETE FROM t"])));
         }
     }
 
@@ -1189,7 +1513,7 @@ mod tests {
                 vec!["SAVEPOINT s", "INSERT INTO t VALUES (1)"],
             ] {
                 assert!(
-                    !wrap_atomically(dialect, &stmts(&script)),
+                    !wraps(dialect, &stmts(&script)),
                     "{script:?} manages its own transaction"
                 );
             }
@@ -1201,10 +1525,7 @@ mod tests {
         // VACUUM can't run inside a transaction on SQLite or Postgres (and
         // doesn't exist on SQL Server, where declining to wrap is harmless).
         for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
-            assert!(!wrap_atomically(
-                dialect,
-                &stmts(&["DELETE FROM t", "VACUUM"])
-            ));
+            assert!(!wraps(dialect, &stmts(&["DELETE FROM t", "VACUUM"])));
         }
         // Postgres statements that error inside a transaction block.
         for script in [
@@ -1218,12 +1539,12 @@ mod tests {
             vec!["SELECT 1", "ALTER SYSTEM SET work_mem = '64MB'"],
         ] {
             assert!(
-                !wrap_atomically(Dialect::Postgres, &stmts(&script)),
+                !wraps(Dialect::Postgres, &stmts(&script)),
                 "{script:?} can't run in a transaction on Postgres"
             );
         }
         // `CONCURRENTLY` inside a string/comment must not trip the check.
-        assert!(wrap_atomically(
+        assert!(wraps(
             Dialect::Postgres,
             &stmts(&[
                 "INSERT INTO t VALUES ('run concurrently later')",
@@ -1249,18 +1570,18 @@ mod tests {
             ],
         ] {
             assert!(
-                !wrap_atomically(Dialect::SqlServer, &stmts(&script)),
+                !wraps(Dialect::SqlServer, &stmts(&script)),
                 "{script:?} can't run in a transaction on SQL Server"
             );
         }
         // The same statements don't decline wrapping for the wrong dialect
         // reasons on SQL Server: ordinary DDL/DML still wraps.
-        assert!(wrap_atomically(
+        assert!(wraps(
             Dialect::SqlServer,
             &stmts(&["CREATE TABLE t (a int)", "INSERT INTO t VALUES (1)"])
         ));
         // Keywords inside strings must not trip the check.
-        assert!(wrap_atomically(
+        assert!(wraps(
             Dialect::SqlServer,
             &stmts(&[
                 "INSERT INTO t VALUES ('backup this later')",
@@ -1269,7 +1590,7 @@ mod tests {
         ));
         // Postgres-only exclusions don't leak into SQL Server scripts
         // (CONCURRENTLY is not a T-SQL concept).
-        assert!(wrap_atomically(
+        assert!(wraps(
             Dialect::SqlServer,
             &stmts(&["SELECT 1", "DROP INDEX CONCURRENTLY i"])
         ));
@@ -1277,7 +1598,7 @@ mod tests {
         // DATABASE is already non-transactional on Postgres; BACKUP is the
         // discriminating case.)
         for dialect in [Dialect::Sqlite, Dialect::Postgres] {
-            assert!(wrap_atomically(
+            assert!(wraps(
                 dialect,
                 &stmts(&["SELECT 1", "BACKUP DATABASE db TO DISK = 'x.bak'"])
             ));
@@ -1294,12 +1615,12 @@ mod tests {
             vec!["PRAGMA foreign_keys(0)", "DELETE FROM t"],
         ] {
             assert!(
-                !wrap_atomically(Dialect::Sqlite, &stmts(&script)),
+                !wraps(Dialect::Sqlite, &stmts(&script)),
                 "{script:?} should run sequentially so the PRAGMA applies"
             );
         }
         // A bare read PRAGMA (no value) is transaction-safe, so it still wraps.
-        assert!(wrap_atomically(
+        assert!(wraps(
             Dialect::Sqlite,
             &stmts(&["PRAGMA user_version", "INSERT INTO t VALUES (1)"])
         ));

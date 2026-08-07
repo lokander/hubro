@@ -4,9 +4,9 @@ use dioxus::prelude::*;
 use dioxus_icons::lucide::{File, RefreshCw, SearchX, X};
 
 use crate::db::{
-    detect_row_identity, ConnectionId, Dialect, ExportFormat, Filter, FilterOp, ForeignKeyMeta,
-    Generated, Page, PageRequest, PreviewInfo, QueryResult, RowIdentity, RowLocator, SortDir,
-    StagedChange, TableKind, TableMeta, Value, FETCH_CELL_MAX_BYTES,
+    ConnectionId, Dialect, ExportFormat, Filter, FilterOp, ForeignKeyMeta, Generated, Page,
+    PageRequest, PreviewInfo, QueryResult, RowIdentity, RowLocator, SortDir, StagedChange,
+    TableAccess, TableMeta, Value, FETCH_CELL_MAX_BYTES,
 };
 use crate::util::human_bytes;
 
@@ -242,12 +242,15 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         // foreign-key columns, whose truncation would misaddress rows or
         // misdirect a jump (FRE-33).
         let (columns, no_preview, extra_key_column) = {
-            let dialect = state.registry.read().get(id).map(|c| c.pool.dialect());
+            let registry = state.registry.read();
             let schemas = state.schemas.read();
             let meta = find_table(schemas.get(&id), &table);
-            match (meta, dialect) {
-                (Some(meta), Some(dialect)) => {
-                    let identity = detect_row_identity(meta, dialect);
+            match (meta, registry.get(id)) {
+                (Some(meta), Some(connection)) => {
+                    // Row identity is a read concern here — it decides which
+                    // columns must be fetched whole — so it comes from the
+                    // resolved access, not from whether editing is allowed.
+                    let identity = connection.pool.access(meta).identity;
                     let extra = match &identity {
                         Some(RowIdentity::Rowid { column }) => Some(column.clone()),
                         _ => None,
@@ -345,12 +348,15 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             return GridNav::default();
         };
         let result = &page.result;
-        let dialect = state.registry.read().get(id).map(|c| c.pool.dialect());
         let table_meta = find_table(state.schemas.read().get(&id), &nav_table).cloned();
-        let identity = match (&table_meta, dialect) {
-            (Some(meta), Some(dialect)) => detect_row_identity(meta, dialect),
+        // Same resolution the render uses, so keyboard navigation offers
+        // exactly the editors the grid shows.
+        let access = match (&table_meta, state.registry.read().get(id)) {
+            (Some(meta), Some(connection)) => Some(connection.pool.access(meta)),
             _ => None,
         };
+        let identity = access.as_ref().and_then(|a| a.identity.clone());
+        let can_mutate = access.as_ref().is_some_and(TableAccess::can_mutate);
         let column_kinds = column_kinds_of(table_meta.as_ref());
         let stage = state.table_stage(id, &nav_table);
         let hidden = usize::from(extra_key.is_some());
@@ -373,6 +379,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             hidden,
             identity.as_ref(),
             stage.as_ref(),
+            can_mutate,
         );
         GridNav::build(headers, &rows, &column_kinds)
     });
@@ -500,31 +507,24 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let can_back = state.can_go_back(id);
 
     let dialect: Option<Dialect> = state.registry.read().get(id).map(|c| c.pool.dialect());
-    let identity: Option<RowIdentity> = match (&table_meta, dialect) {
-        (Some(meta), Some(dialect)) => detect_row_identity(meta, dialect),
+    // The connection's capabilities resolved for this table (FRE-87): one
+    // answer for whether editing is possible, how rows are addressed, and —
+    // when it isn't possible — which sentence explains it. Every editing
+    // affordance below gates on this rather than re-deriving the rules.
+    let access: Option<TableAccess> = match (&table_meta, state.registry.read().get(id)) {
+        (Some(meta), Some(connection)) => Some(connection.pool.access(meta)),
         _ => None,
     };
+    let identity: Option<RowIdentity> = access.as_ref().and_then(|a| a.identity.clone());
+    let can_mutate = access.as_ref().is_some_and(TableAccess::can_mutate);
     // Per-column editor kind + nullability, from introspection. Cells whose
     // column is missing here (transient schema/result mismatch) fall back
     // to a plain text editor on a nullable column.
     let column_kinds: HashMap<String, (EditorKind, bool)> = column_kinds_of(table_meta.as_ref());
-    // Editing consults the same identity detection: no identity → no
-    // editors; the notice explains up front why the rows are read-only.
-    let read_only_notice: Option<&'static str> = match (&table_meta, identity.is_none()) {
-        (Some(meta), true) => {
-            if meta.kind == TableKind::MaterializedView {
-                Some("Materialized views are read-only.")
-            } else if meta.kind == TableKind::View {
-                Some("Views are read-only.")
-            } else {
-                Some(
-                    "This table has no primary key or usable unique index — \
-                     editing will be disabled.",
-                )
-            }
-        }
-        _ => None,
-    };
+    // Stated up front, so the absent editors are explained rather than just
+    // missing.
+    let read_only_notice: Option<&'static str> =
+        access.as_ref().and_then(TableAccess::read_only_notice);
 
     // Staged (unsaved) changes of this table, if any.
     let stage: Option<TableStage> = state.table_stage(id, &table);
@@ -532,7 +532,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let saving = stage.as_ref().is_some_and(|s| s.saving);
     let save_error = stage.as_ref().and_then(|s| s.last_error.clone());
     // Insert/delete affordances only exist where editing works at all.
-    let select_enabled = identity.is_some();
+    let select_enabled = can_mutate;
     // Required-column flagging for pending inserts: NOT NULL + no default +
     // not auto-assigned (see required_insert_columns for the per-backend
     // rules). Unfilled required cells red-flag and block Save.
@@ -780,6 +780,9 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     if let Some(message) = required_missing_message(missing_required) {
                         span { class: "text-red-600 dark:text-red-300", "{message}" }
                     }
+                    if let Some(notice) = read_only_notice {
+                        span { class: "text-red-600 dark:text-red-300", "{notice}" }
+                    }
                     if let Some(error) = save_error {
                         span { class: "min-w-0 flex-1 truncate text-red-600 dark:text-red-400", title: "{error}", "{error}" }
                     } else {
@@ -791,7 +794,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                         } else {
                             "rounded bg-emerald-700 px-3 py-1 font-semibold text-white hover:bg-emerald-600 disabled:opacity-40"
                         },
-                        disabled: save_disabled(saving, missing_required),
+                        disabled: save_disabled(saving, missing_required, can_mutate),
                         // Two-step save when deletes are staged: the first
                         // click arms the exact-count confirmation, the second
                         // (with the stage unchanged) saves. Stages without
@@ -885,7 +888,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                         } else {
                             result.columns.iter().skip(hidden).map(|c| c.name.clone()).collect()
                         };
-                        let rows = view_rows(result, &page_data.previews, hidden, identity.as_ref(), stage.as_ref());
+                        let rows = view_rows(result, &page_data.previews, hidden, identity.as_ref(), stage.as_ref(), can_mutate);
                         let pending_inserts: Vec<PendingInsert> = stage
                             .as_ref()
                             .map(|s| s.inserts().to_vec())
@@ -1240,12 +1243,18 @@ struct RowView {
 /// substitutes staged cell values (dirty) and flags pending deletes. Rows
 /// whose key columns are missing from the result (transient schema/result
 /// mismatch) render clean and read-only — they can't be addressed.
+///
+/// `can_mutate` is the table's resolved write capability (FRE-87). Locators
+/// are still built when it is false: addressing a row is a read concern too
+/// (cell expand fetches a single value through the same key), so a read-only
+/// connection keeps working — only `editable` turns off.
 fn view_rows(
     result: &QueryResult,
     previews: &[Vec<Option<PreviewInfo>>],
     hidden: usize,
     identity: Option<&RowIdentity>,
     stage: Option<&TableStage>,
+    can_mutate: bool,
 ) -> Vec<RowView> {
     // Indices of the identity's key columns within the result (`None` when
     // any key column is missing from the fetched page).
@@ -1287,7 +1296,10 @@ fn view_rows(
                 };
                 CellView {
                     dirty: staged.is_some(),
-                    editable: locator.is_some() && !deleted && !matches!(value, Value::Blob(_)),
+                    editable: can_mutate
+                        && locator.is_some()
+                        && !deleted
+                        && !matches!(value, Value::Blob(_)),
                     value: staged.unwrap_or(value).clone(),
                     preview,
                     column,
@@ -1334,10 +1346,13 @@ fn selection_locators(selected: &HashMap<String, RowLocator>) -> Vec<RowLocator>
     keys.into_iter().map(|key| selected[key].clone()).collect()
 }
 
-/// Save is blocked while a save is in flight or any pending insert still
-/// lacks a required column.
-fn save_disabled(saving: bool, missing_required: usize) -> bool {
-    saving || missing_required > 0
+/// Save is blocked while a save is in flight, while any pending insert still
+/// lacks a required column, or when the table's resolved capabilities forbid
+/// writing (FRE-87). The last case shouldn't arise — changes can only be
+/// staged where cells are editable — but a Save button that can only fail is
+/// worse than a disabled one carrying the reason.
+fn save_disabled(saving: bool, missing_required: usize, can_mutate: bool) -> bool {
+    saving || missing_required > 0 || !can_mutate
 }
 
 /// The red inline message shown while required insert cells are unfilled.
@@ -2512,7 +2527,7 @@ mod tests {
             identity_values: vec![Value::Integer(2)],
         });
         let result = two_column_result();
-        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), Some(&stage));
+        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), Some(&stage), true);
         assert_eq!(rows.len(), 2);
         // Row 1: title cell dirty, showing the staged value; id cell clean.
         assert!(!rows[0].deleted);
@@ -2550,7 +2565,7 @@ mod tests {
             "body",
             Value::Text("edited".into()),
         );
-        let rows = view_rows(&result, &[], 1, Some(&identity), Some(&stage));
+        let rows = view_rows(&result, &[], 1, Some(&identity), Some(&stage), true);
         // The rowid column is hidden; the one visible cell is the dirty body.
         assert_eq!(rows[0].cells.len(), 1);
         assert!(rows[0].cells[0].dirty);
@@ -2568,7 +2583,7 @@ mod tests {
             Value::Text("edited".into()),
         );
         let result = two_column_result();
-        let rows = view_rows(&result, &[], 0, None, Some(&stage));
+        let rows = view_rows(&result, &[], 0, None, Some(&stage), true);
         assert!(rows.iter().all(|r| !r.deleted));
         assert!(rows.iter().flat_map(|r| r.cells.iter()).all(|c| !c.dirty));
     }
@@ -2593,7 +2608,7 @@ mod tests {
 
         // With an identity, plain cells are editable…
         let result = two_column_result();
-        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), None);
+        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), None, true);
         assert!(rows[0].locator.is_some());
         assert!(cell_editable(&rows[0].cells[1], &kinds));
         // …a column missing from the metadata falls back to editable text…
@@ -2601,16 +2616,23 @@ mod tests {
         assert_eq!(kind, EditorKind::Text);
         assert!(nullable);
         // …but without an identity nothing is.
-        let rows = view_rows(&result, &[], 0, None, None);
+        let rows = view_rows(&result, &[], 0, None, None, true);
         assert!(rows[0].locator.is_none());
         assert!(!rows[0].cells[1].editable);
+
+        // Without the write capability nothing is editable either, even
+        // though the rows stay addressable — a read-only connection can
+        // still expand a cell, which needs the locator (FRE-87).
+        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), None, false);
+        assert!(rows[0].locator.is_some());
+        assert!(rows.iter().all(|r| r.cells.iter().all(|c| !c.editable)));
 
         // Rows pending deletion are not editable.
         let mut stage = TableStage::default();
         stage.mark_delete(RowLocator {
             identity_values: vec![Value::Integer(1)],
         });
-        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), Some(&stage));
+        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), Some(&stage), true);
         assert!(rows[0].deleted);
         assert!(rows[0].cells.iter().all(|c| !c.editable));
         assert!(rows[1].cells.iter().all(|c| c.editable));
@@ -2625,13 +2647,13 @@ mod tests {
             ],
             rows: vec![vec![Value::Integer(1), Value::Blob(vec![1, 2])]],
         };
-        let rows = view_rows(&blob_result, &[], 0, Some(&pk_identity()), None);
+        let rows = view_rows(&blob_result, &[], 0, Some(&pk_identity()), None, true);
         assert!(!rows[0].cells[1].editable, "blob value cell");
         let null_blob = QueryResult {
             rows: vec![vec![Value::Integer(1), Value::Null]],
             ..blob_result
         };
-        let rows = view_rows(&null_blob, &[], 0, Some(&pk_identity()), None);
+        let rows = view_rows(&null_blob, &[], 0, Some(&pk_identity()), None, true);
         assert!(
             rows[0].cells[1].editable,
             "row-level check passes for a NULL in a blob column…"
@@ -2680,9 +2702,10 @@ mod tests {
 
     #[test]
     fn save_is_blocked_while_required_cells_are_missing_or_a_save_runs() {
-        assert!(!save_disabled(false, 0));
-        assert!(save_disabled(true, 0), "in-flight save");
-        assert!(save_disabled(false, 2), "missing required cells");
+        assert!(!save_disabled(false, 0, true));
+        assert!(save_disabled(true, 0, true), "in-flight save");
+        assert!(save_disabled(false, 2, true), "missing required cells");
+        assert!(save_disabled(false, 0, false), "table can't be written");
         assert_eq!(required_missing_message(0), None);
         assert_eq!(
             required_missing_message(2),
@@ -2796,7 +2819,7 @@ mod tests {
         .into_iter()
         .collect();
         let result = two_column_result();
-        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), None);
+        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), None, true);
         let nav = GridNav::build(vec!["id".into(), "title".into()], &rows, &kinds);
         assert_eq!(nav.dims(), (2, 2));
         // Both cells of an identified table are editable text here.
@@ -2804,7 +2827,7 @@ mod tests {
         assert_eq!(nav.rows[0].cells[1].column, "title");
         assert_eq!(nav.rows[0].cells[0].display, "1");
         // Without an identity, nothing is editable and rows have no key.
-        let rows = view_rows(&result, &[], 0, None, None);
+        let rows = view_rows(&result, &[], 0, None, None, true);
         let nav = GridNav::build(vec!["id".into(), "title".into()], &rows, &kinds);
         assert!(nav.rows[0].key.is_none());
         assert!(nav.rows.iter().all(|r| r.cells.iter().all(|c| !c.editable)));

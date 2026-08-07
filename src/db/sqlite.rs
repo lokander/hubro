@@ -353,6 +353,9 @@ pub async fn introspect(pool: &SqlitePool) -> Result<Vec<TableMeta>, DbError> {
             foreign_keys: table_foreign_keys(pool, &name).await?,
             name,
             kind,
+            // No per-object narrowing: kind and row identity already carry
+            // everything this backend knows about writability (FRE-87).
+            restriction: None,
         });
     }
     Ok(tables)

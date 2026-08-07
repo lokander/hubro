@@ -3,7 +3,10 @@
 mod common;
 
 use common::FixtureDb;
-use hubro::db::{DbError, DbPool, TableKind, TableMeta, Value};
+use hubro::db::{
+    apply_staged, Capabilities, DbError, DbPool, Restriction, RowIdentity, RowLocator,
+    StagedChange, TableKind, TableMeta, Value,
+};
 
 fn table<'a>(tables: &'a [TableMeta], name: &str) -> &'a TableMeta {
     tables
@@ -56,6 +59,75 @@ async fn introspection_lists_all_tables_and_views_sorted_by_name() {
     for name in ["albums", "artists", "order", "settings", "tracks"] {
         assert_eq!(table(&tables, name).kind, TableKind::Table);
     }
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn capabilities_are_full_on_tables_and_reduced_on_views() {
+    let fixture = FixtureDb::full().await;
+    let pool = fixture.open().await;
+    let tables = pool.introspect().await.unwrap();
+
+    // SQLite is a full-featured engine: the connection declares everything.
+    assert_eq!(pool.capabilities(), Capabilities::FULL);
+
+    // Ordinary tables resolve to the connection's full capability, with no
+    // reason to state.
+    for name in ["artists", "albums", "settings", "order"] {
+        let access = pool.access(table(&tables, name));
+        assert_eq!(access.caps, Capabilities::FULL, "{name}");
+        assert_eq!(access.restriction, None, "{name}");
+        assert!(access.identity.is_some(), "{name}");
+    }
+
+    // The view resolves narrower — and says why — while staying readable.
+    let view = pool.access(table(&tables, "artist_overview"));
+    assert!(!view.can_mutate());
+    assert_eq!(view.restriction, Some(Restriction::View));
+    assert_eq!(view.read_only_notice(), Some("Views are read-only."));
+    assert!(view.caps.read_query);
+    assert!(view.caps.offset_paging);
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn a_view_refuses_staged_writes_with_the_stated_reason() {
+    let fixture = FixtureDb::full().await;
+    let pool = fixture.open().await;
+    let tables = pool.introspect().await.unwrap();
+    let view = table(&tables, "artist_overview");
+
+    // The UI never offers this, so reaching apply_staged means a gate was
+    // missed: it must refuse rather than build SQL against the view.
+    let err = apply_staged(
+        &pool,
+        view,
+        &RowIdentity::PrimaryKey {
+            columns: vec!["id".into()],
+        },
+        &[StagedChange::Update {
+            locator: RowLocator {
+                identity_values: vec![Value::Integer(1)],
+            },
+            column: "name".into(),
+            value: Value::Text("nope".into()),
+        }],
+    )
+    .await
+    .expect_err("a view must refuse staged writes");
+    assert!(
+        err.to_string().contains("Views are read-only."),
+        "unexpected message: {err}"
+    );
+
+    // Nothing was sent, so the underlying data is untouched.
+    let rows = pool
+        .query("SELECT name FROM artist_overview WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(rows.rows[0][0], Value::Text("Ana".into()));
 
     pool.close().await;
 }

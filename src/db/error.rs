@@ -13,6 +13,12 @@ pub enum DbError {
     /// A guarded write affected an unexpected number of rows and was rolled
     /// back (see [`DbPool::execute_checked`](super::DbPool::execute_checked)).
     RowCountMismatch(String),
+    /// The operation isn't available on this connection or object — the
+    /// capability it needs isn't declared (see
+    /// [`Capabilities`](super::caps::Capabilities)). The UI gates these paths
+    /// up front, so reaching one means a gate was missed; the message is the
+    /// same sentence the disabled affordance would have shown.
+    Unsupported(String),
 }
 
 impl DbError {
@@ -21,7 +27,8 @@ impl DbError {
             DbError::Connect(m)
             | DbError::Query(m)
             | DbError::Introspect(m)
-            | DbError::RowCountMismatch(m) => m,
+            | DbError::RowCountMismatch(m)
+            | DbError::Unsupported(m) => m,
         }
     }
 }
@@ -33,6 +40,7 @@ impl fmt::Display for DbError {
             DbError::Query(m) => write!(f, "query failed: {m}"),
             DbError::Introspect(m) => write!(f, "schema introspection failed: {m}"),
             DbError::RowCountMismatch(m) => write!(f, "write aborted: {m}"),
+            DbError::Unsupported(m) => write!(f, "not supported here: {m}"),
         }
     }
 }

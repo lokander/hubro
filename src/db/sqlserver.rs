@@ -1154,6 +1154,9 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
             columns: Vec::new(),
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            // No per-object narrowing: kind and row identity already carry
+            // everything this backend knows about writability (FRE-87).
+            restriction: None,
         });
     }
     let index_of = |schema: &str, name: &str, tables: &[TableMeta]| {
