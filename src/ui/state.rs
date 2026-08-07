@@ -1803,7 +1803,17 @@ impl AppState {
                 // or the row would offer a Cancel wired to it: cancelling
                 // would clear the row while the real connect ran on, and the
                 // next click would start a second one.
-                self.connect_requests.write().remove(locator);
+                //
+                // Only ours: a row-started connect to the same locator may
+                // already own the request, and stealing it would cost that
+                // one its Cancel button and its background-open intent.
+                let mine = dioxus::core::Runtime::current().current_task();
+                if let Some(mine) = mine {
+                    let mut requests = self.connect_requests.write();
+                    if requests.get(locator).is_some_and(|r| r.task == mine) {
+                        requests.remove(locator);
+                    }
+                }
                 return true;
             }
             connecting.push(Connecting {

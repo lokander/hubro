@@ -878,16 +878,21 @@ fn ConnectionsScreen() -> Element {
                                 // The step replaces the locator while connecting:
                                 // the locator is already on screen in the name,
                                 // and the phase is what the user needs.
-                                if let Some(step) = row.connecting {
-                                    div {
-                                        class: "truncate text-xs text-slate-500 dark:text-slate-400",
-                                        // Announced as it advances: the row is
-                                        // otherwise silent for the whole connect.
-                                        aria_live: "polite",
+                                //
+                                // One element for both, never swapped out: a
+                                // live region only announces changes made after
+                                // it exists, so a region created together with
+                                // the first step would stay silent for it.
+                                div {
+                                    class: if row.connecting.is_some() {
+                                        "truncate text-xs text-slate-500 dark:text-slate-400"
+                                    } else {
+                                        "truncate font-mono text-xs text-slate-500"
+                                    },
+                                    aria_live: "polite",
+                                    if let Some(step) = row.connecting {
                                         "{step.label()}"
-                                    }
-                                } else {
-                                    div { class: "truncate font-mono text-xs text-slate-500",
+                                    } else {
                                         "{row.locator}"
                                     }
                                 }
@@ -1627,10 +1632,18 @@ fn PostgresForm(
                 // Entra: the connect either succeeds silently (and the flow
                 // saves it) or raises the sign-in card (which saves on
                 // completion). Either way, close the form — the card takes over.
+                //
+                // Closed *before* the await, not after: `on_done` is owned by
+                // the connections screen, and a successful connect switches to
+                // the new tab and unmounts it. This task outlives that (it is
+                // root-spawned), so calling the handler afterwards would touch
+                // a dropped scope's storage and panic. The Entra path yields
+                // after opening the tab (it caches the refresh token), so the
+                // unmount really does land first.
+                on_done.call(());
                 state
                     .connect_postgres(url.clone(), display_name.clone(), tunnel.clone(), auth)
                     .await;
-                on_done.call(());
                 return;
             }
             if entered_password.is_empty() {
@@ -1653,13 +1666,17 @@ fn PostgresForm(
                     )
                     .await;
             }
-            // Only save and close the form when the connection worked.
+            // Only save and close the form when the connection worked. Closing
+            // comes first for the reason above: `persist_ssh_passphrase` awaits,
+            // and by the time it returns the connections screen that owns
+            // `on_done` is gone. Everything after it is on `AppState`, whose
+            // signals are root-owned and outlive this task.
             if state.open_locators.peek().iter().any(|(_, l)| *l == url) {
+                on_done.call(());
                 if remember_choice && entered_passphrase.is_some() {
                     state.persist_ssh_passphrase(&url).await;
                 }
                 state.add_saved_postgres(display_name, url, tunnel, PgAuth::Password);
-                on_done.call(());
             }
         });
     };
@@ -1991,10 +2008,13 @@ fn SqlServerForm(
                 // Entra: the connect either succeeds silently (and the flow
                 // saves it) or raises the sign-in card (which saves on
                 // completion). Either way, close the form — the card takes over.
+                // Closed before the await, for the same reason as the Postgres
+                // form: a successful connect unmounts the screen that owns
+                // `on_done`, and this task outlives it.
+                on_done.call(());
                 state
                     .connect_sqlserver(url.clone(), display_name.clone(), tunnel.clone(), auth)
                     .await;
-                on_done.call(());
                 return;
             }
             if entered_password.is_empty() {
@@ -2019,12 +2039,14 @@ fn SqlServerForm(
                     )
                     .await;
             }
-            // The connect flow saves on success; only close the form then.
+            // The connect flow saves on success; only close the form then —
+            // and close before `persist_ssh_passphrase` awaits, since the
+            // screen owning `on_done` is gone once the new tab is up.
             if state.open_locators.peek().iter().any(|(_, l)| *l == url) {
+                on_done.call(());
                 if remember_choice && entered_passphrase.is_some() {
                     state.persist_ssh_passphrase(&url).await;
                 }
-                on_done.call(());
             }
         });
     };
