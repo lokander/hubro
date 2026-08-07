@@ -1736,8 +1736,14 @@ impl AppState {
     }
 
     /// Aborts a connect started from the list. Dropping the task mid-await
-    /// unwinds everything it owns — including a half-open tunnel — so there
-    /// is nothing else to tear down.
+    /// unwinds everything it owns — a half-open tunnel included — so there is
+    /// nothing else to tear down.
+    ///
+    /// One step is not interruptible: the keyring read runs on
+    /// `spawn_blocking` (see [`crate::secrets`]), and dropping the future
+    /// only detaches that thread. Cancelling during `Credentials` therefore
+    /// frees the row immediately but leaves a wallet-unlock dialog on screen
+    /// until the user answers it.
     pub fn cancel_connect(mut self, locator: &str) {
         if let Some(request) = self.connect_requests.write().remove(locator) {
             request.task.cancel();
@@ -1790,6 +1796,14 @@ impl AppState {
         {
             let mut connecting = self.connecting.write();
             if connecting.iter().any(|c| c.locator == locator) {
+                drop(connecting);
+                // Someone else's connect owns this locator — a form submit,
+                // which reserves without a request. Drop the request
+                // `start_connect` just filed for this dead-on-arrival task,
+                // or the row would offer a Cancel wired to it: cancelling
+                // would clear the row while the real connect ran on, and the
+                // next click would start a second one.
+                self.connect_requests.write().remove(locator);
                 return true;
             }
             connecting.push(Connecting {
@@ -3100,10 +3114,17 @@ pub(crate) fn canonical(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// The open-locator form of a saved connection. Used to match saved
-/// connections against remembered session tabs at restore time.
-fn saved_open_locator(saved: &SavedConnection) -> String {
-    connect_key(&saved.locator(), saved.backend())
+/// The open-locator form of a saved connection: [`connect_key`] applied to a
+/// saved entry. Kept separate rather than delegating, so the SQLite path is
+/// canonicalized straight from the `PathBuf` instead of round-tripping
+/// through `locator()`'s lossy `display()` first.
+pub(crate) fn saved_open_locator(saved: &SavedConnection) -> String {
+    match saved {
+        SavedConnection::Sqlite { path, .. } => canonical(path).display().to_string(),
+        SavedConnection::Postgres { url, .. } | SavedConnection::SqlServer { url, .. } => {
+            url.clone()
+        }
+    }
 }
 
 /// Sibling temp path for an atomic export write (`foo.csv` → `foo.csv.part`).
