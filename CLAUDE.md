@@ -91,6 +91,14 @@ Work is tracked in Linear (team FRE). Docs-only changes (CLAUDE.md, README, etc.
 3. Spawn a **subagent to review the PR** (correctness, the Dioxus 0.7 rules above, scope vs the issue). `gh pr review --approve` is blocked as self-approval — post findings with `gh pr comment`. Fix blocking findings and re-review by resuming the *same* review subagent via SendMessage (keeps its context). Only proceed once it approves.
 4. **Wait for CI to pass** (`gh pr checks <n> --watch`) before merging — local clippy/test runs don't cover everything CI checks (e.g. rustfmt). Then **remove the worktree first**, and rebase-merge (`gh pr merge --rebase --delete-branch`) from the main checkout — merging from inside the worktree fails trying to check out `main`. Run the merge as its own step (chaining a `gh pr comment` + merge in one command trips the self-merge classifier). Move the issue to Done with the PR linked.
 
+### Milestones
+
+Milestones are **scoped deliverables that complete**, not categories. Three rules:
+
+- **Never add an issue to a finished milestone.** Linear computes progress from the issues, so it would drop a 100% milestone below 100% permanently — rewriting the record of what shipped when. Linear has no way to archive or un-complete a milestone, so this is not undoable.
+- **Don't create catch-all milestones.** A milestone with no completion condition ("Misc polish", "Follow-ups") sits at partial progress forever. Loose work gets **no milestone** plus a `Feature`/`Bug`/`Improvement` label and lives in the project backlog. `Nice to have (future)` is the one deliberate exception — designed-but-deferred work, not a general backlog.
+- **A long list of completed milestones is fine.** They're the project's changelog and the reason leftover work is scopeable later.
+
 ## Commits
 
 Use [Conventional Commits](https://www.conventionalcommits.org/) with **subject line only** — no body, no footers (including no Co-Authored-By trailers). Example: `feat: add csv import`.
