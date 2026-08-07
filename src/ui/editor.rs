@@ -541,6 +541,27 @@ fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
                 }
             }
         },
+        RunStatus::Refused {
+            reason,
+            statement_index,
+            preview,
+        } => rsx! {
+            // Same layout as a failure, but the footer states the one thing
+            // that matters and a timing line can't: nothing reached the
+            // database, so there is no partial state to reason about.
+            div { class: "m-3 flex items-start gap-2 rounded border px-3 py-2 {BannerKind::Error.container_classes()}",
+                span { class: "shrink-0 select-none leading-5", {BannerKind::Error.icon()} }
+                div { class: "min-w-0 flex-1",
+                    p { class: "mb-1 truncate font-mono text-xs opacity-80",
+                        "{statement_index + 1} · {preview}"
+                    }
+                    p { class: "font-mono text-sm break-words", "{reason}" }
+                    p { class: "mt-1 text-xs text-slate-500 dark:text-slate-400",
+                        "Nothing was run — the script was refused before it reached the database."
+                    }
+                }
+            }
+        },
         RunStatus::Cancelled => rsx! {
             p { class: "border-t border-amber-300 dark:border-amber-900/50 px-4 py-3 text-sm text-amber-700 dark:text-amber-300",
                 "Run cancelled — an in-flight statement may still complete on the server."

@@ -193,6 +193,15 @@ pub enum RunStatus {
         elapsed_ms: u64,
         rolled_back: bool,
     },
+    /// The connection's capabilities forbid the statement at
+    /// `statement_index` (FRE-87), so **nothing was sent**. Distinct from
+    /// [`Self::Failed`]: there is no partial state to explain and no timing
+    /// to report, because no statement ran.
+    Refused {
+        reason: String,
+        statement_index: usize,
+        preview: String,
+    },
     /// The user aborted the run. Outcomes of the statements that finished
     /// before the abort stay visible; the in-flight statement may still
     /// complete server-side (see [`AppState::cancel_sql`]).
@@ -2004,17 +2013,17 @@ impl AppState {
             return;
         }
         if let Some((statement_index, reason)) = script_refusal(caps, &statements, dialect) {
+            // Claim the run slot like a real run does: an in-flight script
+            // must not push its results into the refusal or overwrite it.
+            self.claim_run_slot(id);
             self.sql_runs.write().insert(
                 id,
                 SqlRun {
                     statements: Vec::new(),
-                    status: RunStatus::Failed {
-                        error: reason.to_string(),
+                    status: RunStatus::Refused {
+                        reason: reason.to_string(),
                         statement_index,
                         preview: statement_preview(&statements[statement_index]),
-                        elapsed_ms: 0,
-                        // Nothing ran, so there is nothing to have rolled back.
-                        rolled_back: false,
                     },
                 },
             );
@@ -2075,21 +2084,26 @@ impl AppState {
     /// Executes a split script in the background: reads fetch rows, writes
     /// report affected counts, execution stops at the first error. Each
     /// statement's outcome lands in [`Self::sql_runs`] as it finishes.
-    fn execute_script(mut self, id: ConnectionId, script: String, statements: Vec<String>) {
-        let Some(pool) = self.registry.read().get(id).map(|c| c.pool.clone()) else {
-            return;
-        };
-        // A re-run replaces any still-running task for this connection.
+    /// Takes ownership of this connection's SQL run slot: cancels any
+    /// still-running task and bumps the generation, so a run that completes
+    /// later can tell it has been superseded and leaves the new result
+    /// alone. Returns the new generation.
+    fn claim_run_slot(&mut self, id: ConnectionId) -> u64 {
         let previous = self.sql_tasks.write().remove(&id);
         if let Some(previous) = previous {
             previous.cancel();
         }
-        let generation = {
-            let mut generations = self.sql_generations.write();
-            let entry = generations.entry(id).or_insert(0);
-            *entry += 1;
-            *entry
+        let mut generations = self.sql_generations.write();
+        let entry = generations.entry(id).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    fn execute_script(mut self, id: ConnectionId, script: String, statements: Vec<String>) {
+        let Some(pool) = self.registry.read().get(id).map(|c| c.pool.clone()) else {
+            return;
         };
+        let generation = self.claim_run_slot(id);
         self.sql_runs.write().insert(
             id,
             SqlRun {

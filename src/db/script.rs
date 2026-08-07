@@ -263,15 +263,21 @@ pub fn classify_statement(sql: &str) -> StatementKind {
 /// when they appear anywhere outside strings and comments. Split into the
 /// DML and DDL halves so an embedded write can be attributed to the
 /// capability it actually needs.
-const EMBEDDED_DML_KEYWORDS: [&str; 5] = ["insert", "update", "delete", "merge", "replace"];
+///
+/// `truncate` is in both: it is DDL by classification on every engine here,
+/// but it also empties the table, so a connection that refuses row changes
+/// must refuse it too — otherwise `TRUNCATE t` would wipe every row on a
+/// connection where plain `DELETE` is blocked.
+const EMBEDDED_DML_KEYWORDS: [&str; 6] =
+    ["insert", "update", "delete", "merge", "replace", "truncate"];
 const EMBEDDED_DDL_KEYWORDS: [&str; 4] = ["create", "drop", "alter", "truncate"];
 
 /// First keywords that make a statement schema-changing rather than a plain
 /// write. `grant`/`revoke` and `comment` are included: they change the
 /// database's definition, not its rows, so a connection that permits data
 /// edits but not schema changes must refuse them.
-const DDL_KEYWORDS: [&str; 7] = [
-    "create", "drop", "alter", "truncate", "rename", "grant", "revoke",
+const DDL_KEYWORDS: [&str; 8] = [
+    "create", "drop", "alter", "truncate", "rename", "grant", "revoke", "comment",
 ];
 
 /// Which capabilities a statement needs to run. `read_query` is required by
@@ -295,24 +301,28 @@ pub struct StatementNeeds {
 /// too, not waved through because it starts with `WITH`.
 ///
 /// A statement that [`needs_confirmation`] flags but whose effect no token
-/// attributes — `SELECT … INTO new_table`, a value-setting `PRAGMA`, an
-/// unclassifiable statement — needs **both** capabilities. It can change
-/// something, and guessing which of the two would be the one place this
-/// module lets an unwanted change through.
+/// attributes — `SELECT … INTO new_table`, a value-setting `PRAGMA`, `EXEC
+/// sp_rename …`, `CALL some_proc()` — needs **both** capabilities. It can
+/// change something, and guessing which of the two would be the one place
+/// this module lets an unwanted change through. Note this covers unknown
+/// first keywords too: [`classify_statement`] calls them writes for
+/// dispatch, but nothing here knows they are *only* writes.
 pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
     if !needs_confirmation(sql, dialect) {
         return StatementNeeds::default();
     }
-    let kind = classify_statement(sql);
     let has = |set: &[&str]| {
         has_top_level_word(sql, dialect, |word| {
             set.contains(&word.to_ascii_lowercase().as_str())
         })
     };
-    // A DDL statement can carry DML and vice versa, so both halves are
-    // scanned regardless of which keyword opened the statement.
-    let mutate = kind == StatementKind::Write || has(&EMBEDDED_DML_KEYWORDS);
-    let ddl = kind == StatementKind::Ddl || has(&EMBEDDED_DDL_KEYWORDS);
+    // Both halves are scanned regardless of which keyword opened the
+    // statement: DDL can carry DML and vice versa. The first keyword is
+    // covered by the same scan (it is a top-level word), so a recognized
+    // opener needs no separate check — and an *unrecognized* one is
+    // correctly left unattributed rather than assumed to be a row write.
+    let mutate = has(&EMBEDDED_DML_KEYWORDS);
+    let ddl = classify_statement(sql) == StatementKind::Ddl || has(&EMBEDDED_DDL_KEYWORDS);
     if !mutate && !ddl {
         return StatementNeeds {
             mutate: true,
@@ -329,10 +339,13 @@ pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
 /// literals never trigger) for embedded write forms:
 ///
 /// - `WITH` / `EXPLAIN`: any [`EMBEDDED_DML_KEYWORDS`] or
-///   [`EMBEDDED_DDL_KEYWORDS`] token anywhere —
-///   catches data-modifying CTEs (`WITH x AS (DELETE …) SELECT …`) and
-///   `EXPLAIN ANALYZE UPDATE …`, which Postgres actually executes. Plain
-///   `EXPLAIN SELECT` / `EXPLAIN ANALYZE SELECT` do not prompt.
+///   [`EMBEDDED_DDL_KEYWORDS`] token anywhere, plus `INTO` —
+///   catches data-modifying CTEs (`WITH x AS (DELETE …) SELECT …`),
+///   `EXPLAIN ANALYZE UPDATE …`, which Postgres actually executes, and
+///   `WITH x AS (…) SELECT * INTO t2 FROM x`, which creates a table just as
+///   the bare `SELECT … INTO` form does. Plain `EXPLAIN SELECT` /
+///   `EXPLAIN ANALYZE SELECT` do not prompt: the only top-level `INTO` in a
+///   read is the table-creating one.
 /// - `SELECT`: an `INTO` token — `SELECT … INTO new_table` creates a table.
 /// - `PRAGMA`: a `=` or `(` — the value-setting forms. This deliberately
 ///   over-prompts call-form read pragmas like `PRAGMA table_info(t)`: some
@@ -352,6 +365,7 @@ pub fn needs_confirmation(sql: &str, dialect: Dialect) -> bool {
             let word = word.to_ascii_lowercase();
             EMBEDDED_DML_KEYWORDS.contains(&word.as_str())
                 || EMBEDDED_DDL_KEYWORDS.contains(&word.as_str())
+                || word == "into"
         }),
         "select" => has_top_level_word(sql, dialect, |word| word.eq_ignore_ascii_case("into")),
         "pragma" => {
@@ -598,10 +612,12 @@ pub fn script_refusal(
     statements: &[String],
     dialect: Dialect,
 ) -> Option<(usize, &'static str)> {
+    if !caps.read_query && !statements.is_empty() {
+        // Nothing reaches the connection at all, so the first statement
+        // carries the refusal.
+        return Some((0, caps::NO_QUERY));
+    }
     for (statement_index, statement) in statements.iter().enumerate() {
-        if !caps.read_query {
-            return Some((statement_index, caps::NO_QUERY));
-        }
         let needs = statement_needs(statement, dialect);
         if needs.mutate && !caps.mutate {
             return Some((statement_index, caps::NO_MUTATE));
@@ -1182,11 +1198,72 @@ mod tests {
         }
         // Plain DDL needs ddl only, so a connection that permits row edits
         // but not schema changes can still run its INSERTs.
-        for sql in ["CREATE TABLE t (a int)", "DROP TABLE t", "TRUNCATE t"] {
+        for sql in [
+            "CREATE TABLE t (a int)",
+            "DROP TABLE t",
+            "ALTER TABLE t ADD b int",
+        ] {
             assert_eq!(
                 needs(sql),
                 StatementNeeds {
                     mutate: false,
+                    ddl: true
+                },
+                "{sql:?}"
+            );
+        }
+        // TRUNCATE is the exception: DDL by classification, but it empties
+        // the table, so it needs the row-changing capability as well.
+        assert_eq!(
+            needs("TRUNCATE t"),
+            StatementNeeds {
+                mutate: true,
+                ddl: true
+            }
+        );
+    }
+
+    #[test]
+    fn select_into_is_caught_inside_a_cte_or_explain() {
+        // Regression: the WITH/EXPLAIN scan looked only for DML and DDL
+        // keywords, so `SELECT … INTO` — which names neither, but creates a
+        // table — slipped through and ran on a read-only connection.
+        for dialect in [Dialect::Postgres, Dialect::SqlServer] {
+            for sql in [
+                "WITH x AS (SELECT 1 AS a) SELECT * INTO t2 FROM x",
+                "EXPLAIN ANALYZE SELECT * INTO t2 FROM t",
+            ] {
+                assert!(needs_confirmation(sql, dialect), "{sql:?}");
+                assert_eq!(
+                    statement_needs(sql, dialect),
+                    StatementNeeds {
+                        mutate: true,
+                        ddl: true
+                    },
+                    "{sql:?}"
+                );
+                assert!(
+                    script_refusal(Capabilities::FULL.read_only(), &stmts(&[sql]), dialect)
+                        .is_some(),
+                    "a read-only connection must refuse {sql:?}"
+                );
+            }
+            // Reads that merely mention neither form still don't prompt.
+            for sql in ["EXPLAIN SELECT 1", "WITH x AS (SELECT 1) SELECT * FROM x"] {
+                assert!(!needs_confirmation(sql, dialect), "{sql:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_statement_needs_both_capabilities() {
+        // Nothing here knows what `EXEC`/`CALL` do, and classifying them as
+        // plain writes for dispatch must not imply they only change rows.
+        for sql in ["EXEC sp_rename 'a', 'b'", "CALL some_proc()", "VACUUM", ""] {
+            assert_eq!(
+                statement_needs(sql, Dialect::SqlServer),
+                StatementNeeds {
+                    mutate: true,
                     ddl: true
                 },
                 "{sql:?}"
