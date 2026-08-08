@@ -3,6 +3,7 @@
 
 pub mod editing;
 mod editor;
+mod filter;
 mod grid;
 mod icons;
 mod notice;

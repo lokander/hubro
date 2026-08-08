@@ -27,10 +27,10 @@ use super::state::{ActiveView, AppState, ConnectStep};
 /// wrapper would only see keys while it, and not the sidebar/grid/buttons,
 /// had focus). It self-guards against text-entry contexts (inputs, the cell
 /// editor, CodeMirror) so typing never triggers a shortcut, handles the
-/// focus-only shortcuts entirely in JS (focus the filter, focus + arrow
-/// through the sidebar table list), and forwards the state-changing ones to
-/// Rust via `dioxus.send`. The `__dvKeys` guard makes a re-install (e.g. dev
-/// hot-reload) a no-op.
+/// focus-only shortcuts entirely in JS (focus the grid filter, focus the
+/// schema filter, focus + arrow through the sidebar table list), and forwards
+/// the state-changing ones to Rust via `dioxus.send`. The `__dvKeys` guard
+/// makes a re-install (e.g. dev hot-reload) a no-op.
 const GLOBAL_KEYS_JS: &str = r#"
 (() => {
   if (window.__dvKeys) return;
@@ -61,6 +61,14 @@ const GLOBAL_KEYS_JS: &str = r#"
     if (e.key === '/') {
       const f = document.getElementById('dv-filter');
       if (f) { e.preventDefault(); f.focus(); }
+      return;
+    }
+    // Ctrl+F focuses the schema sidebar's filter (FRE-107) and selects what
+    // is already there, so a second search replaces the first by typing.
+    // preventDefault also suppresses the webview's own find-in-page.
+    if (e.ctrlKey && (e.key === 'f' || e.key === 'F')) {
+      const f = document.getElementById('dv-schema-filter');
+      if (f) { e.preventDefault(); f.focus(); f.select(); }
       return;
     }
     if (e.ctrlKey && (e.key === 'e' || e.key === 'E')) { e.preventDefault(); dioxus.send('pane'); return; }
@@ -408,7 +416,8 @@ fn Cheatsheet() -> Element {
                         ShortcutRow { keys: "Esc", desc: "Close the value popup" }
                     }
                     ShortcutGroup { title: "Navigation",
-                        ShortcutRow { keys: "/", desc: "Focus the filter box" }
+                        ShortcutRow { keys: "/", desc: "Focus the grid's filter box" }
+                        ShortcutRow { keys: "Ctrl+F", desc: "Filter the table list (Esc clears)" }
                         ShortcutRow { keys: "Ctrl+B", desc: "Focus the table list" }
                         ShortcutRow { keys: "↑ ↓ / Enter", desc: "Move / open a table (in the list)" }
                         ShortcutRow { keys: "Ctrl+E", desc: "Cycle Data / SQL / Schema pane" }
