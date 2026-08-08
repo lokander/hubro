@@ -13,7 +13,7 @@ use super::page::{
     PREVIEW_BYTES,
 };
 use super::postgres;
-use super::rowkey::RowIdentity;
+use super::rowkey::{detect_row_identity, RowIdentity};
 use super::schema::{ColumnMeta, TableMeta};
 use super::sqlite;
 use super::sqlserver::{self, MssqlPool, MssqlTx};
@@ -194,9 +194,29 @@ impl DbPool {
         }
     }
 
+    /// How a single row of `table` is addressed, or `None` when it has no
+    /// addressable identity.
+    ///
+    /// This is the *read* half of [`TableAccess`] and the only half that is
+    /// safe to take from the pool: which columns must be fetched whole, and
+    /// how a cell fetch pins one row, are facts about the table, not about
+    /// what the user is permitted to do with it. Exposing just this lets the
+    /// two legitimate callers stop reaching for a full [`TableAccess`] they
+    /// would then be tempted to read `can_mutate` off — which is how a gate
+    /// ends up silently ignoring the user's marking (FRE-111).
+    pub fn backend_row_identity(&self, table: &TableMeta) -> Option<RowIdentity> {
+        detect_row_identity(table, self.dialect())
+    }
+
     /// Resolves the *engine's* capabilities for one object, ignoring the
-    /// user's marking. See [`Self::backend_capabilities`]; gates want
-    /// [`Connection::access`].
+    /// user's marking.
+    ///
+    /// **Not a gate.** No caller in `src/` should need this: gates want
+    /// [`Connection::access`], and a read path that only needs to address a
+    /// row wants [`Self::backend_row_identity`]. It stays `pub` solely so the
+    /// integration tests in `tests/` can build an unmarked [`TableAccess`] to
+    /// drive the write paths with; if a use appears in `src/`, it is almost
+    /// certainly the FRE-111 bug this prefix exists to make visible.
     pub fn backend_access(&self, table: &TableMeta) -> TableAccess {
         TableAccess::resolve(self.backend_capabilities(), table, self.dialect())
     }

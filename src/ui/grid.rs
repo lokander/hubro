@@ -250,7 +250,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     // Row identity is a read concern here — it decides which
                     // columns must be fetched whole — so it comes from the
                     // resolved access, not from whether editing is allowed.
-                    let identity = connection.pool.backend_access(meta).identity;
+                    let identity = connection.pool.backend_row_identity(meta);
                     let extra = match &identity {
                         Some(RowIdentity::Rowid { column }) => Some(column.clone()),
                         _ => None,
@@ -350,11 +350,12 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         let result = &page.result;
         let table_meta = find_table(state.schemas.read().get(&id), &nav_table).cloned();
         // Same resolution the render uses, so keyboard navigation offers
-        // exactly the editors the grid shows.
-        let access = match (&table_meta, state.registry.read().get(id)) {
-            (Some(meta), Some(connection)) => Some(connection.pool.backend_access(meta)),
-            _ => None,
-        };
+        // exactly the editors the grid shows — the user's marking (FRE-111)
+        // included. Resolving the *backend's* answer here instead would let
+        // Enter open an editor on a cell the mouse correctly refuses.
+        let access = table_meta
+            .as_ref()
+            .and_then(|meta| state.table_access(id, meta));
         let identity = access.as_ref().and_then(|a| a.identity.clone());
         let can_mutate = access.as_ref().is_some_and(TableAccess::can_mutate);
         let column_kinds = column_kinds_of(table_meta.as_ref());
