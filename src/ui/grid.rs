@@ -174,6 +174,14 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // id, so two mounted at once fight over focus and leave one orphaned and
     // unreachable by Escape. The panel's own activation closes the grid's
     // directly; this closes the panel's whenever the grid opens one.
+    //
+    // It only ever *has* to act in one case, and that case is the whole
+    // point. Any route to the grid blurs the panel's input first, which
+    // commits and closes it — unless the text doesn't parse. So the panel
+    // still being open here means unparseable text, which is exactly when its
+    // `on_draft` would otherwise resurrect it on unmount. Clearing the signal
+    // is what makes that stash see itself as stale and decline; the two are
+    // load-bearing together, and neither works alone.
     use_effect(move || {
         if editing.read().is_some() && detail_editing.peek().is_some() {
             detail_editing.set(None);
@@ -3871,11 +3879,34 @@ fn RowDetailValue(
                 // Without it the text vanished silently, which is worse than
                 // the grid, whose editor stays open showing the parse error.
                 on_draft: move |text: String| {
-                    editing.set(Some(ActiveEdit {
-                        row_key: draft_row.clone(),
-                        column: draft_column.clone(),
-                        draft: Some(text),
-                    }));
+                    // Stash only while this field is still the active edit —
+                    // the same guard the grid's editor carries, and for a
+                    // sharper reason here. `use_drop` fires *after* whatever
+                    // closed this editor has already chosen the next one, so
+                    // an unguarded stash resurrects the invalid editor and
+                    // hijacks the switch: double-clicking another panel field
+                    // reopened this one, and double-clicking a grid cell was
+                    // swallowed entirely (the resurrected editor stole the
+                    // shared element id back, blurring the grid's).
+                    //
+                    // That also makes this guard load-bearing for the
+                    // one-editor invariant, not just for focus. Every route to
+                    // the grid blurs this input first, which commits and
+                    // closes it *unless* the text doesn't parse — so
+                    // unparseable text is precisely the case the reverse guard
+                    // in `DataGrid` has to handle, and precisely the case an
+                    // unguarded `on_draft` would undo.
+                    let still_active = editing
+                        .peek()
+                        .as_ref()
+                        .is_some_and(|active| active.is_on(&draft_row, &draft_column));
+                    if still_active {
+                        editing.set(Some(ActiveEdit {
+                            row_key: draft_row.clone(),
+                            column: draft_column.clone(),
+                            draft: Some(text),
+                        }));
+                    }
                 },
             }
         };
