@@ -9,8 +9,8 @@ use super::ddl::{Ddl, DdlObject};
 use super::error::DbError;
 use super::export::ExportFormat;
 use super::page::{
-    classify_column, equalities_where, quote_ident, ColumnClass, Dialect, Page, PageRequest,
-    PREVIEW_BYTES,
+    classify_column, equalities_where, mssql_text_len, quote_ident, ColumnClass, Dialect, Page,
+    PageRequest, PREVIEW_BYTES,
 };
 use super::postgres;
 use super::rowkey::{detect_row_identity, RowIdentity};
@@ -524,9 +524,12 @@ fn cell_fetch_sql(
         ),
         (Dialect::SqlServer, ColumnClass::Text) => {
             let cast = dialect.cast_expr(&q, "text");
+            // Code units, not `LEN` — see `page::mssql_text_len`: `LEN`
+            // ignores trailing spaces that `SUBSTRING` keeps, so a padded
+            // value would come back a prefix flagged as complete.
             (
                 format!("SUBSTRING({cast}, 1, {cap})"),
-                format!("LEN({cast})"),
+                mssql_text_len(&cast),
             )
         }
         (Dialect::SqlServer, ColumnClass::Binary) => (
@@ -738,7 +741,7 @@ mod tests {
             ),
             format!(
                 "SELECT TOP 1 SUBSTRING(CAST(\"c\" AS nvarchar(max)), 1, {cap}), \
-                 LEN(CAST(\"c\" AS nvarchar(max))) \
+                 DATALENGTH(CAST(\"c\" AS nvarchar(max))) / 2 \
                  FROM \"dbo\".\"t\" WHERE CAST(\"id\" AS nvarchar(max)) = @P1"
             )
         );

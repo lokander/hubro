@@ -926,6 +926,68 @@ async fn sqlserver_bounded_page_previews_large_text_and_binary() {
 }
 
 #[tokio::test]
+async fn sqlserver_trailing_spaces_still_count_toward_the_preview_length() {
+    // Regression (FRE-110): the bounded reader's length probe has to count the
+    // same units `SUBSTRING` slices by, or a truncated prefix is recorded as a
+    // complete value. `LEN()` ignores trailing spaces and `SUBSTRING` does
+    // not, so a value that is over the cap only *because* of its padding used
+    // to come back as a silent 2048-character prefix carrying no
+    // `PreviewInfo` — which the grid then copies to the clipboard, and worse,
+    // saves back over the real data on an inline edit.
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    let body = PREVIEW_BYTES - 48;
+    let padding = 1000;
+    let total = (body + padding) as u64;
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.padded_text",
+            "CREATE TABLE dbo.padded_text (id int NOT NULL PRIMARY KEY, v nvarchar(max) NULL)",
+            &format!(
+                "INSERT INTO dbo.padded_text VALUES (1, CONCAT(
+                     REPLICATE(CAST(N'x' AS nvarchar(max)), {body}),
+                     REPLICATE(CAST(N' ' AS nvarchar(max)), {padding})))"
+            ),
+        ],
+    )
+    .await;
+
+    let padded = introspect_table(&pool, "padded_text").await;
+    let page = pool
+        .fetch_page_bounded(&page_request("padded_text"), &padded.columns, &["id"])
+        .await
+        .unwrap();
+    // The probe must see all the characters, not the `body` count `LEN` reports.
+    let preview = page.previews[0][1].expect("a padded over-cap value is a preview");
+    assert_eq!(preview.full_len, total);
+    let Value::Text(prefix) = &page.result.rows[0][1] else {
+        panic!("expected a text preview");
+    };
+    assert_eq!(prefix.chars().count(), PREVIEW_BYTES);
+
+    // …and the on-demand fetch returns every trailing space.
+    let identity = detect_row_identity(&padded, pool.dialect()).unwrap();
+    let locator = RowLocator {
+        identity_values: vec![Value::Integer(1)],
+    };
+    let cell = pool
+        .fetch_cell(&padded, &identity, &locator, "v")
+        .await
+        .unwrap();
+    assert_eq!(cell.full_len, total);
+    assert!(!cell.capped);
+    let Value::Text(full) = &cell.value else {
+        panic!("expected the full text");
+    };
+    assert_eq!(full.chars().count(), total as usize);
+    assert_eq!(full.len() - full.trim_end().len(), padding);
+
+    run_all(&pool, &["DROP TABLE dbo.padded_text"]).await;
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn sqlserver_sql_variant_cells_browse_and_fetch_safely() {
     let Some(url) = test_url() else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();

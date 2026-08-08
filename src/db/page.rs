@@ -456,11 +456,13 @@ impl PageRequest {
                     length_exprs.push(format!("octet_length({q})"));
                 }
                 (Dialect::SqlServer, ColumnClass::Text) => {
-                    // Cast to nvarchar(max) so xml/legacy types preview too;
-                    // LEN counts characters (like Postgres length()).
+                    // Cast to nvarchar(max) so xml/legacy types preview too.
+                    // The length probe counts UTF-16 code units, matching what
+                    // SUBSTRING slices — see `mssql_text_len` for why `LEN`
+                    // would silently truncate.
                     let cast = dialect.cast_expr(&q, "text");
                     value_exprs.push(format!("SUBSTRING({cast}, 1, {n}) AS {q}"));
-                    length_exprs.push(format!("LEN({cast})"));
+                    length_exprs.push(mssql_text_len(&cast));
                 }
                 (Dialect::SqlServer, ColumnClass::Binary) => {
                     // SUBSTRING works on varbinary; DATALENGTH is bytes.
@@ -614,6 +616,38 @@ fn escape_like(needle: &str) -> String {
 /// dialect-independent form covers every backend we would add.
 pub(crate) fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Length of a SQL Server text value in the units `SUBSTRING` slices by
+/// (FRE-110). `cast` must already be an `nvarchar(max)` expression.
+///
+/// **Not `LEN()`.** A bounded read is only safe while the length probe and
+/// the slice count the same thing, because "was this truncated?" is decided
+/// by comparing one against the other. `LEN` breaks that invariant: it
+/// ignores trailing spaces, `SUBSTRING` does not. So an `nvarchar` of 3000
+/// characters ending in 1000 spaces reports `LEN = 2000`, the reader sees
+/// 2000 ≤ 2048 and records no [`PreviewInfo`] — and the 2048-character prefix
+/// it actually fetched is then treated as the whole value. That silently
+/// truncates a clipboard copy, and worse, an inline edit of that cell saves
+/// the prefix back over the real data.
+///
+/// `DATALENGTH` is bytes and `nvarchar` is UTF-16, so `/ 2` gives code units
+/// — exactly what `SUBSTRING` counts, and always an exact division.
+///
+/// Two consequences, both correct, both confined to SQL Server text columns:
+///
+/// - A fixed-width `nchar(n)`/`char(n)` column wider than the cap now always
+///   reads as truncated, because the engine really does store — and slice —
+///   the full padded width. Verified: `nchar(20)` holding `N'ab'` reports
+///   `LEN = 2`, while `SUBSTRING(…, 1, 20)` returns all 20 units. Such a cell
+///   used to render as complete while silently missing its padding.
+/// - Under a supplementary-character (`_SC`) collation `SUBSTRING` counts an
+///   astral character as one while this counts its two code units, so the
+///   probe can *over*-report. That direction is harmless: it marks a complete
+///   value as a preview, costing one redundant fetch that then returns the
+///   full value. Only under-reporting loses data.
+pub(crate) fn mssql_text_len(cast: &str) -> String {
+    format!("DATALENGTH({cast}) / 2")
 }
 
 #[cfg(test)]
@@ -1064,7 +1098,7 @@ mod tests {
             sql,
             "SELECT \"id\", SUBSTRING(CAST(\"body\" AS nvarchar(max)), 1, 512) AS \"body\", \
              SUBSTRING(\"blob\", 1, 512) AS \"blob\", \
-             LEN(CAST(\"body\" AS nvarchar(max))), DATALENGTH(\"blob\") \
+             DATALENGTH(CAST(\"body\" AS nvarchar(max))) / 2, DATALENGTH(\"blob\") \
              FROM \"tracks\" ORDER BY (SELECT NULL) OFFSET 200 ROWS FETCH NEXT 100 ROWS ONLY"
         );
         assert_eq!(plan.length_columns, 2);

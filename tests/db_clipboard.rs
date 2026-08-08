@@ -51,7 +51,8 @@ async fn paste_inserts(pool: &DbPool, dialect: Dialect, table: &str, rows: &[Vec
         columns: columns(),
         rows: rows.to_vec(),
     };
-    let script = render_copy(&block, CopyFormat::Insert, dialect);
+    let script = render_copy(&block, CopyFormat::Insert, Some(dialect))
+        .expect("INSERT renders whenever a dialect is given");
     let statements = split_statements(&script, dialect);
     assert_eq!(
         statements.len(),
@@ -177,7 +178,8 @@ async fn postgres_generated_inserts_carry_non_finite_floats() {
         columns: vec!["id".into(), "x".into()],
         rows,
     };
-    let script = render_copy(&block, CopyFormat::Insert, Dialect::Postgres);
+    let script = render_copy(&block, CopyFormat::Insert, Some(Dialect::Postgres))
+        .expect("INSERT renders whenever a dialect is given");
     for statement in split_statements(&script, Dialect::Postgres) {
         pool.execute(&statement)
             .await
