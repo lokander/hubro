@@ -70,19 +70,19 @@ async fn capabilities_are_full_on_tables_and_reduced_on_views() {
     let tables = pool.introspect().await.unwrap();
 
     // SQLite is a full-featured engine: the connection declares everything.
-    assert_eq!(pool.capabilities(), Capabilities::FULL);
+    assert_eq!(pool.backend_capabilities(), Capabilities::FULL);
 
     // Ordinary tables resolve to the connection's full capability, with no
     // reason to state.
     for name in ["artists", "albums", "settings", "order"] {
-        let access = pool.access(table(&tables, name));
+        let access = pool.backend_access(table(&tables, name));
         assert_eq!(access.caps, Capabilities::FULL, "{name}");
         assert_eq!(access.restriction, None, "{name}");
         assert!(access.identity.is_some(), "{name}");
     }
 
     // The view resolves narrower — and says why — while staying readable.
-    let view = pool.access(table(&tables, "artist_overview"));
+    let view = pool.backend_access(table(&tables, "artist_overview"));
     assert!(!view.can_mutate());
     assert_eq!(view.restriction, Some(Restriction::View));
     assert_eq!(view.read_only_notice(), Some("Views are read-only."));
@@ -103,7 +103,7 @@ async fn a_view_refuses_staged_writes_with_the_stated_reason() {
     // missed: it must refuse rather than build SQL against the view.
     let err = apply_staged(
         &pool,
-        &pool.access(view),
+        &pool.backend_access(view),
         view,
         &RowIdentity::PrimaryKey {
             columns: vec!["id".into()],

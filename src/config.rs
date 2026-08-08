@@ -717,10 +717,20 @@ impl SavedList {
     /// of an edit. When the edit moves the entry onto another entry's
     /// locator, that duplicate is dropped so the list stays keyed one-to-one.
     /// Returns false when `old_locator` names no entry.
-    pub fn update(&mut self, old_locator: &str, connection: SavedConnection) -> bool {
+    ///
+    /// **The write protection and colour (FRE-111) survive the overwrite.**
+    /// They are not part of what the edit form collects, so `connection`
+    /// always carries the defaults for them — taking those literally would
+    /// silently unprotect a connection the moment its name or sslmode was
+    /// edited, and the loss would only show up at the next launch. No caller
+    /// of `update` can intend to change the marking; the one path that does
+    /// is [`Self::set_marking`].
+    pub fn update(&mut self, old_locator: &str, mut connection: SavedConnection) -> bool {
         let Some(index) = self.entries.iter().position(|s| s.locator() == old_locator) else {
             return false;
         };
+        let previous = &self.entries[index];
+        connection.set_marking(previous.protection(), previous.color());
         let new_locator = connection.locator().to_string();
         self.entries[index] = connection;
         // Drop any *other* entry the edit now collides with, keeping the one

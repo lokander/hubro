@@ -181,16 +181,24 @@ impl DbPool {
     /// (views, key-less tables) narrow this per object in
     /// [`TableAccess::resolve`]; a backend that is read-only or
     /// non-transactional as a whole declares the narrower set right here.
-    pub fn capabilities(&self) -> Capabilities {
+    ///
+    /// **This is what the engine can do, not what this connection may do.**
+    /// It knows nothing about the user's write protection (FRE-111), so a
+    /// gate that consults it lets a write through on a connection marked
+    /// read-only. Gates want
+    /// [`Connection::capabilities`] — hence the `backend_` prefix on both of
+    /// these, which is the whole reason they carry it.
+    pub fn backend_capabilities(&self) -> Capabilities {
         match self {
             DbPool::Sqlite(_) | DbPool::Postgres(_) | DbPool::SqlServer(_) => Capabilities::FULL,
         }
     }
 
-    /// Resolves this connection's capabilities for one object — the single
-    /// entry point the UI and the write paths gate on.
-    pub fn access(&self, table: &TableMeta) -> TableAccess {
-        TableAccess::resolve(self.capabilities(), table, self.dialect())
+    /// Resolves the *engine's* capabilities for one object, ignoring the
+    /// user's marking. See [`Self::backend_capabilities`]; gates want
+    /// [`Connection::access`].
+    pub fn backend_access(&self, table: &TableMeta) -> TableAccess {
+        TableAccess::resolve(self.backend_capabilities(), table, self.dialect())
     }
 
     pub async fn query(&self, sql: &str) -> Result<QueryResult, DbError> {
@@ -282,7 +290,7 @@ impl DbPool {
 
     /// One page of a table, honoring the request's sort and filter.
     pub async fn fetch_page(&self, request: &PageRequest) -> Result<QueryResult, DbError> {
-        refuse_paged_read(self.capabilities())?;
+        refuse_paged_read(self.backend_capabilities())?;
         let (sql, params) = request.select_sql(self.dialect());
         self.query_with(&sql, &params).await
     }
@@ -301,7 +309,7 @@ impl DbPool {
         columns: &[ColumnMeta],
         no_preview: &[&str],
     ) -> Result<Page, DbError> {
-        refuse_paged_read(self.capabilities())?;
+        refuse_paged_read(self.backend_capabilities())?;
         let (sql, params, plan) =
             request.select_bounded_sql(self.dialect(), columns, no_preview, PREVIEW_BYTES);
         let raw = self.query_with(&sql, &params).await?;
@@ -551,14 +559,14 @@ impl Connection {
     /// Every capability gate should read this rather than
     /// [`DbPool::capabilities`], which reports only what the engine can do.
     pub fn capabilities(&self) -> Capabilities {
-        self.protection.apply(self.pool.capabilities())
+        self.protection.apply(self.pool.backend_capabilities())
     }
 
     /// Resolves this connection's effective capabilities for one object — the
     /// single entry point the UI and the write paths gate on.
     pub fn access(&self, table: &TableMeta) -> TableAccess {
         TableAccess::resolve_protected(
-            self.pool.capabilities(),
+            self.pool.backend_capabilities(),
             self.protection,
             table,
             self.pool.dialect(),

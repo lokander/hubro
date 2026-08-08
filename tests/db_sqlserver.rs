@@ -294,19 +294,19 @@ async fn sqlserver_introspection_covers_indexes_fks_and_views() {
 
     // Capabilities (FRE-87): full at the connection level, resolved per
     // object, with each narrowing carrying its own reason.
-    assert_eq!(pool.capabilities(), Capabilities::FULL);
-    let children_access = pool.access(&children);
+    assert_eq!(pool.backend_capabilities(), Capabilities::FULL);
+    let children_access = pool.backend_access(&children);
     assert_eq!(children_access.caps, Capabilities::FULL);
     assert_eq!(children_access.restriction, None);
 
-    let view_access = pool.access(&view);
+    let view_access = pool.backend_access(&view);
     assert!(!view_access.can_mutate());
     assert_eq!(view_access.restriction, Some(Restriction::View));
     // Reduced, not disabled — a view still reads and pages.
     assert!(view_access.caps.read_query);
     assert!(view_access.caps.offset_paging);
 
-    let filtered_access = pool.access(&filtered_only);
+    let filtered_access = pool.backend_access(&filtered_only);
     assert!(!filtered_access.can_mutate());
     assert_eq!(
         filtered_access.restriction,
@@ -542,9 +542,15 @@ async fn sqlserver_staged_edits_round_trip_and_identity_stays_server_assigned() 
             },
         },
     ];
-    let counts = apply_staged(&pool, &pool.access(&table), &table, &identity, &changes)
-        .await
-        .unwrap();
+    let counts = apply_staged(
+        &pool,
+        &pool.backend_access(&table),
+        &table,
+        &identity,
+        &changes,
+    )
+    .await
+    .unwrap();
     assert_eq!(counts.updated_rows, 1);
     assert_eq!(counts.inserted_rows, 1);
     assert_eq!(counts.deleted_rows, 1);
@@ -613,9 +619,15 @@ async fn sqlserver_staged_row_count_mismatch_rolls_the_batch_back() {
             value: Value::Text("ghost".into()),
         },
     ];
-    let err = apply_staged(&pool, &pool.access(&table), &table, &identity, &changes)
-        .await
-        .expect_err("a zero-row update must fail the batch");
+    let err = apply_staged(
+        &pool,
+        &pool.backend_access(&table),
+        &table,
+        &identity,
+        &changes,
+    )
+    .await
+    .expect_err("a zero-row update must fail the batch");
     assert_eq!(err.change_index, Some(1));
     assert!(
         err.message.contains("expected 1"),
@@ -650,9 +662,11 @@ async fn sqlserver_script_go_batches_split_and_execute() {
     assert_eq!(statements.len(), 3);
 
     let mut results = Vec::new();
-    run_script(&pool, pool.capabilities(), &statements, |r| results.push(r))
-        .await
-        .expect("the script should run to completion");
+    run_script(&pool, pool.backend_capabilities(), &statements, |r| {
+        results.push(r)
+    })
+    .await
+    .expect("the script should run to completion");
     assert_eq!(results.len(), 3);
     assert!(matches!(results[0].outcome, StatementOutcome::Affected(_)));
     assert_eq!(results[1].outcome, StatementOutcome::Affected(1));
@@ -694,9 +708,11 @@ async fn sqlserver_script_errors_roll_the_whole_script_back() {
     assert_eq!(statements.len(), 3);
 
     let mut results = Vec::new();
-    let err = run_script(&pool, pool.capabilities(), &statements, |r| results.push(r))
-        .await
-        .expect_err("the duplicate key must fail the script");
+    let err = run_script(&pool, pool.backend_capabilities(), &statements, |r| {
+        results.push(r)
+    })
+    .await
+    .expect_err("the duplicate key must fail the script");
     assert_eq!(err.statement_index, 2);
     assert!(err.rolled_back, "an atomic script failure must roll back");
     assert_eq!(results.len(), 2, "the first two statements had succeeded");

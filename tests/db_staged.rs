@@ -15,8 +15,8 @@ use std::collections::HashSet;
 
 use common::FixtureDb;
 use hubro::db::{
-    apply_staged, detect_row_identity, DbPool, Dialect, PageRequest, RowIdentity, RowLocator,
-    StagedChange, TableMeta, Value,
+    apply_staged, detect_row_identity, run_script, DbPool, Dialect, PageRequest, RowIdentity,
+    RowLocator, StagedChange, TableAccess, TableMeta, Value, WriteProtection,
 };
 use hubro::ui::editing::bool_value;
 use hubro::ui::stage::required_insert_columns;
@@ -85,9 +85,15 @@ async fn sqlite_multi_change_batch_applies_atomically() {
             locator: locator(vec![Value::Integer(2), Value::Integer(1)]),
         },
     ];
-    let counts = apply_staged(&pool, &pool.access(&albums), &albums, &identity, &changes)
-        .await
-        .unwrap();
+    let counts = apply_staged(
+        &pool,
+        &pool.backend_access(&albums),
+        &albums,
+        &identity,
+        &changes,
+    )
+    .await
+    .unwrap();
     assert_eq!(counts.updated_rows, 2);
     assert_eq!(counts.inserted_rows, 1);
     assert_eq!(counts.deleted_rows, 1);
@@ -127,9 +133,15 @@ async fn sqlite_multi_column_edits_on_one_row_apply_as_one_row_update() {
             Value::Text("edited".into()),
         ),
     ];
-    let counts = apply_staged(&pool, &pool.access(&artists), &artists, &identity, &changes)
-        .await
-        .unwrap();
+    let counts = apply_staged(
+        &pool,
+        &pool.backend_access(&artists),
+        &artists,
+        &identity,
+        &changes,
+    )
+    .await
+    .unwrap();
     assert_eq!(counts.updated_rows, 1, "grouped into one row update");
 
     let check = pool
@@ -173,9 +185,15 @@ async fn sqlite_failure_mid_batch_rolls_everything_back_and_names_the_change() {
             ],
         },
     ];
-    let err = apply_staged(&pool, &pool.access(&albums), &albums, &identity, &changes)
-        .await
-        .unwrap_err();
+    let err = apply_staged(
+        &pool,
+        &pool.backend_access(&albums),
+        &albums,
+        &identity,
+        &changes,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err.change_index, Some(1), "the second change failed");
     assert_eq!(
         err.change_summary,
@@ -225,9 +243,15 @@ async fn sqlite_sql_error_mid_batch_rolls_back_and_names_the_change() {
             ],
         },
     ];
-    let err = apply_staged(&pool, &pool.access(&albums), &albums, &identity, &changes)
-        .await
-        .unwrap_err();
+    let err = apply_staged(
+        &pool,
+        &pool.backend_access(&albums),
+        &albums,
+        &identity,
+        &changes,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err.change_index, Some(1));
 
     let check = pool
@@ -286,9 +310,15 @@ async fn sqlite_rowid_identity_table_edits_end_to_end() {
         "body",
         Value::Text("edited".into()),
     )];
-    let counts = apply_staged(&pool, &pool.access(&notes), &notes, &identity, &changes)
-        .await
-        .unwrap();
+    let counts = apply_staged(
+        &pool,
+        &pool.backend_access(&notes),
+        &notes,
+        &identity,
+        &changes,
+    )
+    .await
+    .unwrap();
     assert_eq!(counts.updated_rows, 1);
 
     let check = pool
@@ -350,9 +380,15 @@ async fn postgres_multi_change_batch_applies_atomically() {
             locator: locator(vec![Value::Integer(3)]),
         },
     ];
-    let counts = apply_staged(&pool, &pool.access(&items), &items, &identity, &changes)
-        .await
-        .unwrap();
+    let counts = apply_staged(
+        &pool,
+        &pool.backend_access(&items),
+        &items,
+        &identity,
+        &changes,
+    )
+    .await
+    .unwrap();
     assert_eq!(counts.updated_rows, 2);
     assert_eq!(counts.inserted_rows, 1);
     assert_eq!(counts.deleted_rows, 1);
@@ -392,9 +428,15 @@ async fn postgres_failure_mid_batch_rolls_everything_back_and_names_the_change()
             locator: locator(vec![Value::Integer(99)]),
         },
     ];
-    let err = apply_staged(&pool, &pool.access(&items), &items, &identity, &changes)
-        .await
-        .unwrap_err();
+    let err = apply_staged(
+        &pool,
+        &pool.backend_access(&items),
+        &items,
+        &identity,
+        &changes,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err.change_index, Some(1));
     assert_eq!(err.change_summary, Some("delete of row (99)".into()));
     assert!(
@@ -438,9 +480,15 @@ async fn sqlite_bool_checkbox_stages_integers_end_to_end() {
             bool_value(Dialect::Sqlite, false),
         ),
     ];
-    apply_staged(&pool, &pool.access(&flags), &flags, &identity, &changes)
-        .await
-        .unwrap();
+    apply_staged(
+        &pool,
+        &pool.backend_access(&flags),
+        &flags,
+        &identity,
+        &changes,
+    )
+    .await
+    .unwrap();
 
     let check = pool
         .query("SELECT ok FROM flags ORDER BY id")
@@ -500,9 +548,15 @@ async fn postgres_staged_text_values_coerce_to_column_types() {
         // stages Integer, but text must also survive the cast).
         update(key.clone(), "quantity", Value::Text("42".into())),
     ];
-    let counts = apply_staged(&pool, &pool.access(&typed), &typed, &identity, &changes)
-        .await
-        .unwrap();
+    let counts = apply_staged(
+        &pool,
+        &pool.backend_access(&typed),
+        &typed,
+        &identity,
+        &changes,
+    )
+    .await
+    .unwrap();
     assert_eq!(counts.updated_rows, 1);
 
     let check = pool
@@ -525,7 +579,7 @@ async fn postgres_staged_text_values_coerce_to_column_types() {
     // Bad text for a typed column fails at save time (the cast reports it)
     // and rolls back.
     let bad = vec![update(key, "at", Value::Text("not a date".into()))];
-    let err = apply_staged(&pool, &pool.access(&typed), &typed, &identity, &bad)
+    let err = apply_staged(&pool, &pool.backend_access(&typed), &typed, &identity, &bad)
         .await
         .unwrap_err();
     assert_eq!(err.change_index, Some(0));
@@ -579,9 +633,15 @@ async fn postgres_char_n_columns_round_trip_uncast() {
         update(key.clone(), "tag", Value::Text("xyz".into())),
         update(key, "label", Value::Text("two".into())),
     ];
-    let counts = apply_staged(&pool, &pool.access(&items), &items, &identity, &changes)
-        .await
-        .unwrap();
+    let counts = apply_staged(
+        &pool,
+        &pool.backend_access(&items),
+        &items,
+        &identity,
+        &changes,
+    )
+    .await
+    .unwrap();
     assert_eq!(counts.updated_rows, 1);
 
     let check = pool
@@ -626,9 +686,15 @@ async fn postgres_bit_n_edit_fails_loudly_and_rolls_back() {
         "mask",
         Value::Text("110".into()),
     )];
-    let err = apply_staged(&pool, &pool.access(&items), &items, &identity, &changes)
-        .await
-        .unwrap_err();
+    let err = apply_staged(
+        &pool,
+        &pool.backend_access(&items),
+        &items,
+        &identity,
+        &changes,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err.change_index, Some(0), "the edit itself is named");
 
     let check = pool
@@ -673,9 +739,15 @@ async fn postgres_staged_text_insert_coerces_to_column_types() {
             Value::Text("[1, 2]".into()),
         ],
     }];
-    let counts = apply_staged(&pool, &pool.access(&typed), &typed, &identity, &changes)
-        .await
-        .unwrap();
+    let counts = apply_staged(
+        &pool,
+        &pool.backend_access(&typed),
+        &typed,
+        &identity,
+        &changes,
+    )
+    .await
+    .unwrap();
     assert_eq!(counts.inserted_rows, 1);
 
     let check = pool
@@ -710,9 +782,15 @@ async fn postgres_set_null_on_integer_column_works_via_literal_null() {
             Value::Text("emptied".into()),
         ),
     ];
-    let counts = apply_staged(&pool, &pool.access(&items), &items, &identity, &changes)
-        .await
-        .unwrap();
+    let counts = apply_staged(
+        &pool,
+        &pool.backend_access(&items),
+        &items,
+        &identity,
+        &changes,
+    )
+    .await
+    .unwrap();
     assert_eq!(counts.updated_rows, 1);
 
     let check = pool
@@ -763,7 +841,7 @@ async fn sqlite_staged_insert_leaves_defaults_to_the_database() {
 
     let counts = apply_staged(
         &pool,
-        &pool.access(&items),
+        &pool.backend_access(&items),
         &items,
         &identity,
         &stage.changes(),
@@ -803,7 +881,7 @@ async fn sqlite_staged_insert_leaves_defaults_to_the_database() {
     );
     apply_staged(
         &pool,
-        &pool.access(&logs),
+        &pool.backend_access(&logs),
         &logs,
         &logs_identity,
         &stage.changes(),
@@ -885,7 +963,7 @@ async fn postgres_staged_insert_gets_serial_and_identity_values() {
 
     let counts = apply_staged(
         &pool,
-        &pool.access(&items),
+        &pool.backend_access(&items),
         &items,
         &identity,
         &stage.changes(),
@@ -944,7 +1022,7 @@ async fn sqlite_staged_multi_delete_with_edit_applies_exact_counts() {
 
     let counts = apply_staged(
         &pool,
-        &pool.access(&contacts),
+        &pool.backend_access(&contacts),
         &contacts,
         &identity,
         &stage.changes(),
@@ -964,5 +1042,108 @@ async fn sqlite_staged_multi_delete_with_edit_applies_exact_counts() {
     assert_eq!(check.rows[0][1], Value::Text("Sole Survivor".into()));
     assert_eq!(check.rows[1][0], Value::Integer(4), "row 4 untouched");
 
+    pool.close().await;
+}
+
+/// FRE-111: the marking is enforced in `db/`, not only in the UI. These drive
+/// the real write paths against a real database with a `ReadOnly`-resolved
+/// access, so a UI gate that someone later removes cannot let a write land.
+#[tokio::test]
+async fn a_read_only_marking_refuses_a_staged_write_and_leaves_the_row_untouched() {
+    let fixture = FixtureDb::full().await;
+    let pool = fixture.open().await;
+    let tables = pool.introspect().await.unwrap();
+    let albums = find(&tables, None, "albums").clone();
+    let identity = detect_row_identity(&albums, Dialect::Sqlite).unwrap();
+
+    let before = pool
+        .query("SELECT title FROM albums WHERE artist_id = 1 AND seq = 1")
+        .await
+        .unwrap();
+
+    let access = TableAccess::resolve_protected(
+        pool.backend_capabilities(),
+        WriteProtection::ReadOnly,
+        &albums,
+        Dialect::Sqlite,
+    );
+    let err = apply_staged(
+        &pool,
+        &access,
+        &albums,
+        &identity,
+        &[update(
+            vec![Value::Integer(1), Value::Integer(1)],
+            "title",
+            Value::Text("should never land".into()),
+        )],
+    )
+    .await
+    .expect_err("a connection marked read-only must refuse staged writes");
+    assert!(
+        err.message.contains("marked this connection read-only"),
+        "the refusal must name the marking, not the engine: {}",
+        err.message
+    );
+
+    let after = pool
+        .query("SELECT title FROM albums WHERE artist_id = 1 AND seq = 1")
+        .await
+        .unwrap();
+    assert_eq!(before.rows, after.rows, "nothing may have been written");
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn a_read_only_marking_refuses_a_delete_from_the_sql_editor() {
+    let fixture = FixtureDb::full().await;
+    let pool = fixture.open().await;
+    let caps = WriteProtection::ReadOnly.apply(pool.backend_capabilities());
+
+    let statements = vec!["DELETE FROM albums".to_string()];
+    let err = run_script(&pool, caps, &statements, |_| {})
+        .await
+        .expect_err("a script write must be refused on a marked connection");
+    assert!(!err.rolled_back, "nothing ran, so nothing was rolled back");
+
+    let count = pool.query("SELECT COUNT(*) FROM albums").await.unwrap();
+    assert_ne!(
+        count.rows[0][0],
+        Value::Integer(0),
+        "the table must still have its rows"
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn confirm_marking_does_not_itself_block_a_write() {
+    // Confirm interposes a prompt in the UI; at the db/ layer it must behave
+    // exactly like an unmarked connection, or the prompt would lead nowhere.
+    let fixture = FixtureDb::full().await;
+    let pool = fixture.open().await;
+    let tables = pool.introspect().await.unwrap();
+    let albums = find(&tables, None, "albums").clone();
+    let identity = detect_row_identity(&albums, Dialect::Sqlite).unwrap();
+
+    let access = TableAccess::resolve_protected(
+        pool.backend_capabilities(),
+        WriteProtection::Confirm,
+        &albums,
+        Dialect::Sqlite,
+    );
+    let counts = apply_staged(
+        &pool,
+        &access,
+        &albums,
+        &identity,
+        &[update(
+            vec![Value::Integer(1), Value::Integer(1)],
+            "title",
+            Value::Text("confirmed".into()),
+        )],
+    )
+    .await
+    .expect("Confirm must not block the write once it reaches db/");
+    assert_eq!(counts.updated_rows, 1);
     pool.close().await;
 }
