@@ -4,7 +4,7 @@ use dioxus_icons::lucide::{Database, RefreshCw, Search, X};
 use crate::db::{ConnectionId, TableKind, TableMeta};
 
 use super::filter::{
-    count_system_tables, filter_tables, group_by_schema, parse_query, toggle_column_mode,
+    count_internal_tables, filter_tables, group_by_schema, parse_query, toggle_column_mode,
     FilterMode,
 };
 use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState};
@@ -69,25 +69,26 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
     let columns_mode = query.mode == FilterMode::Columns;
     // The box only helps once there is a list to narrow, and it would be a
     // confusing thing to offer next to a load error. Same for the
-    // system-schema note at the foot.
+    // internal-objects note at the foot.
     let ready = list_state == ListState::Ready;
     let show_filter = ready;
-    let show_system_schemas = state.show_system_schemas;
-    let show_system = show_system_schemas();
+    let show_internal_objects = state.show_internal_objects;
+    let show_internal = show_internal_objects();
 
     // Memoized, not computed in the render body: matching runs over every
     // table (and in column mode every column) of the schema, so re-running it
     // on unrelated re-renders — selecting a table, staging an edit — would
-    // re-pay the whole cost for nothing. Reads `schemas` and `filter`, so it
-    // recomputes exactly when one of those changes.
+    // re-pay the whole cost for nothing. Reads `schemas`, `filter` and
+    // `show_internal_objects`, so it recomputes exactly when one of those
+    // changes.
     let groups = use_memo(move || {
         let query = parse_query(&filter());
-        let show_system = show_system_schemas();
+        let show_internal = show_internal_objects();
         let schemas = state.schemas.read();
         let Some(SchemaLoad::Ready(tables)) = schemas.get(&id) else {
             return FilteredGroups::new();
         };
-        let hits = filter_tables(tables, &query, show_system);
+        let hits = filter_tables(tables, &query, show_internal);
         group_by_schema(tables, &hits)
             .into_iter()
             .map(|(schema, group)| {
@@ -102,11 +103,11 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
     let groups = groups();
     // Its own memo: depends on the schema alone, so typing in the filter box
     // doesn't recount the whole list.
-    let system_count = use_memo(move || match state.schemas.read().get(&id) {
-        Some(SchemaLoad::Ready(tables)) => count_system_tables(tables),
+    let internal_count = use_memo(move || match state.schemas.read().get(&id) {
+        Some(SchemaLoad::Ready(tables)) => count_internal_tables(tables),
         _ => 0,
     });
-    let system_count = system_count();
+    let internal_count = internal_count();
     // A schema that contributed no hit contributes no header either, which is
     // what keeps the result reading as a narrowed tree rather than a flat list
     // of names.
@@ -217,7 +218,7 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
                                 // (FRE-88) — "nothing matches ''" would be a
                                 // nonsense way to say that.
                                 if query.needle.is_empty() {
-                                    "Every object here belongs to a database extension."
+                                    "Everything in this database is an internal object."
                                 } else {
                                     if columns_mode { "No columns match " } else { "No tables match " }
                                     span { class: "font-mono text-slate-700 dark:text-slate-300", "{query.needle}" }
@@ -244,25 +245,25 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
                     },
                 }
             }
-            // Only ever rendered by a database that actually has extension
-            // schemas, so the ordinary case carries no extra chrome. It says
+            // Only ever rendered by a database that actually has internal
+            // objects, so the ordinary case carries no extra chrome. It says
             // the count rather than just offering a toggle: the point is that
             // the sidebar is not claiming to list everything (FRE-88).
-            if ready && system_count > 0 {
+            if ready && internal_count > 0 {
                 div { class: "flex items-center justify-between gap-2 border-t border-slate-200 dark:border-slate-800 px-2 py-1.5 text-xs text-slate-500 dark:text-slate-400",
                     span {
-                        title: "Objects in schemas created by database extensions — TimescaleDB chunks, PostGIS's tiger, Citus's catalogs. They stay queryable in the SQL editor either way.",
-                        if show_system {
-                            "{system_count} extension objects shown"
+                        title: "Objects the database created for itself — extension schemas like TimescaleDB's chunks, extension tables like PostGIS's spatial_ref_sys, and child partitions. They stay queryable in the SQL editor either way.",
+                        if show_internal {
+                            "{internal_count} internal objects shown"
                         } else {
-                            "{system_count} extension objects hidden"
+                            "{internal_count} internal objects hidden"
                         }
                     }
                     button {
                         class: "shrink-0 rounded px-1.5 py-0.5 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
-                        title: "Show or hide objects in extension-owned schemas",
-                        onclick: move |_| state.set_show_system_schemas(!show_system),
-                        if show_system { "Hide" } else { "Show" }
+                        title: "Show or hide the database's own internal objects",
+                        onclick: move |_| state.set_show_internal_objects(!show_internal),
+                        if show_internal { "Hide" } else { "Show" }
                     }
                 }
             }
@@ -286,6 +287,9 @@ fn TableNode(
     let state = use_context::<AppState>();
     let name = table.read().name.clone();
     let kind = table.read().kind;
+    // The engine's own word for what this is, when it has one — "hypertable"
+    // rather than a table that inexplicably has chunks (FRE-88).
+    let kind_label = table.read().kind_label.clone();
     // Resolved here so the loop below doesn't hold a read borrow of the
     // signal while rendering.
     let matched: Vec<(String, String)> = columns
@@ -337,6 +341,14 @@ fn TableNode(
                     if kind == TableKind::MaterializedView {
                         span { class: "rounded bg-fuchsia-100 dark:bg-fuchsia-900/50 px-1 text-xs text-fuchsia-700 dark:text-fuchsia-300",
                             "matview"
+                        }
+                    }
+                    // Sits after the kind badge, since it refines it rather
+                    // than replacing it: a continuous aggregate really is a
+                    // view, and saying so stays true.
+                    if let Some(label) = kind_label {
+                        span { class: "shrink-0 rounded bg-teal-100 dark:bg-teal-900/50 px-1 text-xs text-teal-700 dark:text-teal-300",
+                            "{label}"
                         }
                     }
                 }

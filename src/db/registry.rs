@@ -677,7 +677,8 @@ mod tests {
             indexes: vec![],
             foreign_keys: vec![],
             restriction: None,
-            extension: None,
+            internal: None,
+            kind_label: None,
         }
     }
 

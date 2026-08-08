@@ -8,7 +8,7 @@ use dioxus::prelude::*;
 use crate::azure::{self, EntraAuth};
 use crate::config::{
     default_config_path, default_session_path, default_settings_path, load_session, load_settings,
-    plan_session_restore, save_session, save_show_system_schemas, save_theme, BackendKind,
+    plan_session_restore, save_session, save_show_internal_objects, save_theme, BackendKind,
     ConnectionColor, PgAuth, RestoreCandidate, SavedConnection, SavedList, Session, SessionPane,
     SessionTab, Theme,
 };
@@ -582,10 +582,10 @@ pub struct AppState {
     /// preference. Root-scoped: written from the startup detection task.
     pub dark: Signal<bool>,
     /// Whether the schema sidebar lists extension-owned schemas (FRE-88).
-    /// Persisted by [`Self::set_show_system_schemas`]; global rather than
+    /// Persisted by [`Self::set_show_internal_objects`]; global rather than
     /// per-connection, since it expresses what the user wants to look at
     /// rather than anything about one database.
-    pub show_system_schemas: Signal<bool>,
+    pub show_internal_objects: Signal<bool>,
     /// A saved-connection edit awaiting the connect that confirms it
     /// (FRE-75). Root-scoped: the Entra sign-in card resolves it from a
     /// background task after the form has closed.
@@ -677,7 +677,10 @@ impl AppState {
             // the startup detection task (below) corrects `System`. Root-
             // scoped: written from that spawn_forever task.
             dark: Signal::new_in_scope(theme.resolve_dark(false), ScopeId::ROOT),
-            show_system_schemas: Signal::new(settings.show_system_schemas),
+            // Component-scoped, unlike its neighbours: only the sidebar and
+            // the completion namespace read it, and its setter writes it
+            // before spawning, so no root-scoped task ever touches it.
+            show_internal_objects: Signal::new(settings.show_internal_objects),
             // Root-scoped: resolved from the Entra sign-in task, which
             // outlives the form that registered the edit.
             pending_edit: Signal::new_in_scope(None, ScopeId::ROOT),
@@ -2464,13 +2467,13 @@ impl AppState {
 
     /// Shows or hides extension-owned schemas in the sidebar (FRE-88) and
     /// persists the choice, best-effort like [`Self::set_theme`].
-    pub fn set_show_system_schemas(mut self, show: bool) {
-        self.show_system_schemas.set(show);
+    pub fn set_show_internal_objects(mut self, show: bool) {
+        self.show_internal_objects.set(show);
         let Some(path) = default_settings_path() else {
             return;
         };
         spawn_forever(async move {
-            let _ = save_show_system_schemas(&path, show);
+            let _ = save_show_internal_objects(&path, show);
         });
     }
 

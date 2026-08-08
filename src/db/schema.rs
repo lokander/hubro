@@ -148,20 +148,52 @@ pub struct TableMeta {
     ///
     /// [`TableAccess::resolve`]: super::caps::TableAccess::resolve
     pub restriction: Option<Restriction>,
-    /// The extension whose schema owns this object, when one does (FRE-88):
-    /// TimescaleDB's chunk tables in `_timescaledb_internal`, PostGIS's
-    /// `tiger`, Citus's catalogs. These are real, queryable objects — an
-    /// extension's bookkeeping rather than the user's data, and numerous
-    /// enough to bury it (a Timescale database with 40 days of daily chunks
-    /// reports 95 of them against 4 user tables).
-    ///
-    /// Recorded rather than filtered out during introspection so nothing
-    /// silently disappears: the sidebar hides these by default and says how
-    /// many it hid, and the SQL editor still completes them.
-    ///
-    /// `None` for ordinary user schemas, and always `None` on backends with
-    /// no extension concept (SQLite, SQL Server).
-    pub extension: Option<String>,
+    /// Why this object is the database's own bookkeeping rather than the
+    /// user's data, when it is — see [`Internal`] (FRE-88). `None` for
+    /// ordinary objects.
+    pub internal: Option<Internal>,
+    /// Engine-specific refinement of [`TableKind`], rendered as a badge next
+    /// to the name: `hypertable` and `continuous aggregate` on TimescaleDB
+    /// (FRE-88). A free string rather than an enum because the vocabulary is
+    /// per-engine and open-ended — MergeTree engines, distributed tables,
+    /// external tables — and nothing branches on it.
+    pub kind_label: Option<String>,
+}
+
+/// Why an object is infrastructure rather than the user's data (FRE-88).
+///
+/// Backends declare this during introspection; nothing here is inferred from
+/// name patterns, which would be both leaky and wrong the moment a user names
+/// a table `spatial_ref_sys`. Declaring it per backend is what lets each new
+/// engine inherit the sidebar's hiding for free rather than needing its own
+/// special case.
+///
+/// These objects are real and queryable — they are recorded rather than
+/// dropped during introspection, so nothing silently disappears. The sidebar
+/// hides them by default and says how many it hid; the SQL editor still
+/// completes them, ranked below the user's own tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Internal {
+    /// Created by an extension: its own schema (TimescaleDB's seven
+    /// `_timescaledb_*` schemas, PostGIS's `tiger` and `topology`, Citus's
+    /// catalogs) or an object it installs into an ordinary schema (PostGIS's
+    /// `spatial_ref_sys`, `pg_stat_statements`'s view). Carries the
+    /// extension's name.
+    Extension(String),
+    /// A child partition of a declaratively partitioned table. Legitimate to
+    /// read directly, but the parent is what you browse — and a table
+    /// partitioned by day floods the tree exactly as Timescale's chunks do.
+    Partition,
+}
+
+impl Internal {
+    /// How to name this in the UI, e.g. in a hidden object's tooltip.
+    pub fn label(&self) -> String {
+        match self {
+            Internal::Extension(name) => format!("created by the {name} extension"),
+            Internal::Partition => "a partition of another table".to_string(),
+        }
+    }
 }
 
 impl TableMeta {
@@ -203,7 +235,8 @@ mod tests {
             indexes: vec![],
             foreign_keys: vec![],
             restriction: None,
-            extension: None,
+            internal: None,
+            kind_label: None,
         };
         let pk: Vec<&str> = table
             .primary_key()

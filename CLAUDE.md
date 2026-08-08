@@ -110,6 +110,7 @@ Use [Conventional Commits](https://www.conventionalcommits.org/) with **subject 
 - Static files live in `assets/` and are referenced via the `asset!("/assets/...")` macro (paths are relative to the project root). Stylesheets/favicons are injected with `document::Link` in `App`.
 - `Dioxus.toml` holds Dioxus CLI app configuration (currently just the empty `[application]` section).
 - New fields on `SavedConnection`/`Settings` use `#[serde(default, skip_serializing_if = ...)]` so older config files still deserialize and unaffected entries serialize unchanged.
+- Objects that are the database's own bookkeeping (extension schemas and tables, child partitions) are declared per backend as `TableMeta::internal` during introspection — never inferred from name patterns (FRE-88). The sidebar hides them behind one toggle and the SQL editor demotes them in completion ranking, so every new backend inherits both by filling in that one field. `TableMeta::kind_label` is the matching hook for engine-specific vocabulary (`hypertable`, `continuous aggregate`), rendered as a badge that refines `TableKind` rather than replacing it.
 - The app was renamed from `dataview` (FRE-64) before it had any users, so there is deliberately no migration code. The name is load-bearing in `$XDG_CONFIG_HOME/hubro/` (connections, settings, session, SSH known_hosts), `$XDG_DATA_HOME/hubro/history.db`, the `hubro` keyring service, and the `no.lokander.hubro` bundle id — changing it again would strand all four.
 
 ## Dioxus 0.7 — critical API notes

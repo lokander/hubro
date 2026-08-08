@@ -21,7 +21,8 @@ use super::error::DbError;
 use super::export::{export_io_err, ExportFormat, ExportSink};
 use super::page::Dialect;
 use super::schema::{
-    ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta, TypeDetail, TypeRef,
+    ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, Internal, TableKind, TableMeta, TypeDetail,
+    TypeRef,
 };
 use super::staged::CheckedStatement;
 use super::value::{cap_value, ColumnInfo, QueryResult, Value};
@@ -528,34 +529,106 @@ fn line_col(sql: &str, position: usize) -> Option<(usize, usize)> {
 
 /// Full multi-schema introspection: every user schema's tables and views
 /// with columns, primary keys, indexes (incl. unique), and foreign keys —
-/// parity with the SQLite metadata model. Five batched queries regardless
+/// parity with the SQLite metadata model. Six batched queries regardless
 /// of table count.
 pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
     let map_err = |e: sqlx::Error| DbError::Introspect(e.to_string());
 
-    // Which schemas an extension created (FRE-88). `pg_depend` records the
-    // namespace → extension dependency, so this catches every extension's
-    // internal schemas by construction rather than by matching name
-    // patterns: TimescaleDB's seven `_timescaledb_*`/`timescaledb_*`
-    // schemas, PostGIS's `tiger`/`topology`, Citus's catalogs. A schema the
-    // user made themselves has no such dependency even if an extension puts
-    // objects in it, which is the distinction that matters — `public` holds
-    // PostGIS's functions but is still the user's schema.
-    let extension_rows = sqlx::query(
-        "SELECT n.nspname, e.extname \
+    // Objects that are the database's own bookkeeping rather than the user's
+    // data (FRE-88), from the three sources Postgres has. All three are
+    // catalog facts, never name patterns — a user table genuinely called
+    // `spatial_ref_sys` is the user's.
+    //
+    //  1. Schemas an extension created. `pg_depend` records the namespace →
+    //     extension dependency, so this catches TimescaleDB's seven schemas,
+    //     PostGIS's `tiger`/`topology` and Citus's catalogs by construction.
+    //     A schema the *user* made has no such dependency even when an
+    //     extension puts objects in it — which is the distinction that
+    //     matters, since `public` holds PostGIS's functions and is still the
+    //     user's schema.
+    //  2. Individual objects an extension installs into an ordinary schema:
+    //     PostGIS's `spatial_ref_sys`, `pg_stat_statements`'s view. Same
+    //     catalog, keyed on `pg_class` instead of `pg_namespace`.
+    //  3. Child partitions of declaratively partitioned tables. Not an
+    //     extension matter at all, but a table partitioned by day floods the
+    //     tree exactly as Timescale's chunks do.
+    let internal_rows = sqlx::query(
+        "SELECT n.nspname AS schema_name, NULL::name AS object_name, e.extname \
          FROM pg_namespace n \
          JOIN pg_depend d ON d.classid = 'pg_namespace'::regclass AND d.objid = n.oid \
          JOIN pg_extension e ON e.oid = d.refobjid \
-          AND d.refclassid = 'pg_extension'::regclass",
+          AND d.refclassid = 'pg_extension'::regclass \
+         UNION ALL \
+         SELECT n.nspname, c.relname, e.extname \
+         FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         JOIN pg_depend d ON d.classid = 'pg_class'::regclass AND d.objid = c.oid \
+         JOIN pg_extension e ON e.oid = d.refobjid \
+          AND d.refclassid = 'pg_extension'::regclass \
+         UNION ALL \
+         SELECT n.nspname, c.relname, NULL \
+         FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relispartition",
     )
     .fetch_all(pool)
     .await
     .map_err(map_err)?;
-    let mut extension_schemas: HashMap<String, String> = HashMap::new();
-    for row in &extension_rows {
-        let schema: String = get(row, "nspname")?;
-        let extension: String = get(row, "extname")?;
-        extension_schemas.insert(schema, extension);
+    // Schema-wide entries and per-object entries are kept apart so an object
+    // rule can win over its schema's — the object is the more specific fact.
+    let mut internal_schemas: HashMap<String, Internal> = HashMap::new();
+    let mut internal_objects: HashMap<(String, String), Internal> = HashMap::new();
+    for row in &internal_rows {
+        let schema: String = get(row, "schema_name")?;
+        let object: Option<String> = get(row, "object_name")?;
+        let extension: Option<String> = get(row, "extname")?;
+        let reason = match extension {
+            Some(extension) => Internal::Extension(extension),
+            None => Internal::Partition,
+        };
+        match object {
+            Some(object) => {
+                internal_objects.insert((schema, object), reason);
+            }
+            None => {
+                internal_schemas.insert(schema, reason);
+            }
+        }
+    }
+
+    // Timescale's own vocabulary for objects that are otherwise ordinary
+    // tables and views (FRE-88), so a hypertable reads as one instead of
+    // looking like a table that mysteriously has chunks. Best-effort: these
+    // information views are stable across Timescale 2.x, but a badge is not
+    // worth failing a whole introspection over if a future version moves
+    // them, and the extension is absent on nearly every Postgres database.
+    let mut kind_labels: HashMap<(String, String), String> = HashMap::new();
+    if internal_schemas
+        .values()
+        .any(|reason| matches!(reason, Internal::Extension(name) if name == "timescaledb"))
+    {
+        let labelled = [
+            (
+                "SELECT hypertable_schema AS s, hypertable_name AS n \
+                 FROM timescaledb_information.hypertables",
+                "hypertable",
+            ),
+            (
+                "SELECT view_schema AS s, view_name AS n \
+                 FROM timescaledb_information.continuous_aggregates",
+                "continuous aggregate",
+            ),
+        ];
+        for (sql, label) in labelled {
+            let Ok(rows) = sqlx::query(sql).fetch_all(pool).await else {
+                continue;
+            };
+            for row in &rows {
+                let schema: String = get(row, "s")?;
+                let name: String = get(row, "n")?;
+                kind_labels.insert((schema, name), label.to_string());
+            }
+        }
     }
 
     // Tables and views across all non-system schemas. Materialized views
@@ -712,10 +785,17 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
     for row in &table_rows {
         let table_type: String = get(row, "table_type")?;
         let schema: String = get(row, "table_schema")?;
-        let extension = extension_schemas.get(&schema).cloned();
+        let name: String = get(row, "table_name")?;
+        let key = (schema.clone(), name.clone());
+        // The object's own rule first, then its schema's — most specific wins.
+        let internal = internal_objects
+            .get(&key)
+            .or_else(|| internal_schemas.get(&schema))
+            .cloned();
+        let kind_label = kind_labels.get(&key).cloned();
         tables.push(TableMeta {
             schema: Some(schema),
-            name: get(row, "table_name")?,
+            name,
             kind: match table_type.as_str() {
                 "VIEW" => TableKind::View,
                 "MATERIALIZED VIEW" => TableKind::MaterializedView,
@@ -727,7 +807,8 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
             // No per-object narrowing: kind and row identity already carry
             // everything this backend knows about writability (FRE-87).
             restriction: None,
-            extension,
+            internal,
+            kind_label,
         });
     }
     let index_of = |schema: &str, name: &str, tables: &[TableMeta]| {

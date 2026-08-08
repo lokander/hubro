@@ -2,6 +2,7 @@ use chrono::{DateTime, Local};
 use dioxus::prelude::*;
 use dioxus_icons::lucide::Play;
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::db::{
     needs_confirmation, ConnectionId, Dialect, ExportFormat, QueryResult, StatementOutcome,
@@ -490,7 +491,18 @@ fn completion_schema(tables: &[TableMeta], dialect: Dialect) -> serde_json::Valu
             .iter()
             .map(|c| serde_json::Value::String(c.name.clone()))
             .collect();
-        namespace.insert(key, serde_json::Value::Array(columns));
+        // Internal objects stay completable — the SQL tab is exactly where you
+        // go to poke at a chunk — but demoted, so a database with a thousand
+        // Timescale chunks or daily partitions doesn't bury the user's own
+        // tables in the ranking (FRE-88).
+        let entry = match table.internal {
+            Some(_) => json!({
+                "self": demoted_completion(&table.name, dialect),
+                "children": columns,
+            }),
+            None => serde_json::Value::Array(columns),
+        };
+        namespace.insert(key, entry);
     }
     serde_json::Value::Object(namespace)
 }
@@ -498,6 +510,40 @@ fn completion_schema(tables: &[TableMeta], dialect: Dialect) -> serde_json::Valu
 /// Escapes literal dots in an identifier for use in an `SQLNamespace` key.
 fn escape_dots(name: &str) -> String {
     name.replace('.', "\\.")
+}
+
+/// How far internal objects are pushed down the completion list. lang-sql
+/// hands `boost` to CodeMirror, whose scale runs -99..99.
+const INTERNAL_BOOST: i64 = -99;
+
+/// The `self` completion for an internal object's `{self, children}`
+/// namespace entry.
+///
+/// That namespace form hands the completion to CodeMirror **verbatim**,
+/// unlike the plain-string entries the rest of the namespace uses, which
+/// lang-sql quote-applies on our behalf. So this has to mirror lang-sql's own
+/// rule: a bare lowercase identifier inserts as-is, anything else needs an
+/// explicit quoted `apply`. Deliberately stricter than lang-sql, whose
+/// case-insensitive dialects also leave `FOO` unquoted — quoting a name that
+/// didn't need it is still correct SQL, where the reverse would not be.
+fn demoted_completion(name: &str, dialect: Dialect) -> serde_json::Value {
+    let mut chars = name.chars();
+    let bare = matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if bare {
+        return json!({ "label": name, "type": "type", "boost": INTERNAL_BOOST });
+    }
+    // SQL Server brackets its identifiers; the other two double-quote.
+    let (open, close) = match dialect {
+        Dialect::SqlServer => ('[', ']'),
+        Dialect::Postgres | Dialect::Sqlite => ('"', '"'),
+    };
+    json!({
+        "label": name,
+        "type": "type",
+        "boost": INTERNAL_BOOST,
+        "apply": format!("{open}{name}{close}"),
+    })
 }
 
 /// Formats a unix timestamp in local time: bare `HH:MM:SS` for today,
@@ -747,6 +793,7 @@ fn ResultCell(value: Value) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Internal;
     use crate::db::{ColumnMeta, TableKind};
     use serde_json::json;
 
@@ -770,7 +817,8 @@ mod tests {
             indexes: vec![],
             foreign_keys: vec![],
             restriction: None,
-            extension: None,
+            internal: None,
+            kind_label: None,
         }
     }
 
@@ -846,5 +894,72 @@ mod tests {
     #[test]
     fn empty_schema_serializes_to_an_empty_object() {
         assert_eq!(completion_schema(&[], Dialect::Sqlite), json!({}));
+    }
+
+    /// A table the backend declared internal.
+    fn internal_table(schema: Option<&str>, name: &str, columns: &[&str]) -> TableMeta {
+        TableMeta {
+            internal: Some(Internal::Extension("timescaledb".into())),
+            ..table(schema, name, columns)
+        }
+    }
+
+    #[test]
+    fn internal_tables_complete_but_rank_below_the_users_own() {
+        // Still completable — the SQL tab is where you go to poke at a chunk
+        // — but demoted, so a thousand of them don't bury `readings`
+        // (FRE-88). The user's own tables keep the plain array form, which is
+        // what lets lang-sql quote-apply them for us.
+        let tables = [
+            table(Some("public"), "readings", &["time"]),
+            internal_table(Some("_timescaledb_internal"), "_hyper_1_1_chunk", &["time"]),
+        ];
+        assert_eq!(
+            completion_schema(&tables, Dialect::Postgres),
+            json!({
+                "public.readings": ["time"],
+                "_timescaledb_internal._hyper_1_1_chunk": {
+                    "self": { "label": "_hyper_1_1_chunk", "type": "type", "boost": -99 },
+                    "children": ["time"],
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_demoted_name_needing_quotes_carries_its_own_apply() {
+        // The `{self, children}` form hands the completion to CodeMirror
+        // verbatim, so unlike a plain string entry it is not quote-applied
+        // for us — the quoting has to travel with it.
+        assert_eq!(
+            demoted_completion("weird table", Dialect::Postgres),
+            json!({
+                "label": "weird table",
+                "type": "type",
+                "boost": -99,
+                "apply": "\"weird table\"",
+            })
+        );
+        // SQL Server brackets instead.
+        assert_eq!(
+            demoted_completion("weird table", Dialect::SqlServer),
+            json!({
+                "label": "weird table",
+                "type": "type",
+                "boost": -99,
+                "apply": "[weird table]",
+            })
+        );
+        // Upper case is quoted too: lang-sql would leave it alone on a
+        // case-insensitive dialect, and quoting it anyway is still correct.
+        assert_eq!(
+            demoted_completion("Chunk", Dialect::Postgres)["apply"],
+            json!("\"Chunk\"")
+        );
+        // A plain identifier needs no `apply` at all.
+        assert_eq!(
+            demoted_completion("_hyper_1_1_chunk", Dialect::Postgres),
+            json!({ "label": "_hyper_1_1_chunk", "type": "type", "boost": -99 })
+        );
     }
 }

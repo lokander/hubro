@@ -448,7 +448,7 @@ pub struct Settings {
     /// roughly twenty to one. `default` + `skip_serializing_if` keep
     /// pre-FRE-88 settings files deserializing and unchanged on rewrite.
     #[serde(default, skip_serializing_if = "is_false")]
-    pub show_system_schemas: bool,
+    pub show_internal_objects: bool,
 }
 
 /// `skip_serializing_if` predicate for `bool` fields defaulting to `false`.
@@ -497,9 +497,9 @@ pub fn save_theme(path: &Path, theme: Theme) -> Result<(), ConfigError> {
 
 /// Persists just the system-schema visibility (FRE-88), preserving the rest
 /// (see [`save_theme`] for why the file is re-read first).
-pub fn save_show_system_schemas(path: &Path, show: bool) -> Result<(), ConfigError> {
+pub fn save_show_internal_objects(path: &Path, show: bool) -> Result<(), ConfigError> {
     let mut settings = load_settings(path);
-    settings.show_system_schemas = show;
+    settings.show_internal_objects = show;
     save_settings(path, &settings)
 }
 
@@ -1696,7 +1696,9 @@ mod tests {
                 y: Some(12.0),
                 maximized: true,
             }),
-            show_system_schemas: false,
+            // Set, so the round trip pins a scalar declared after a table —
+            // TOML would otherwise emit it inside `[window]`.
+            show_internal_objects: true,
         };
         save_settings(&path, &settings).unwrap();
         assert_eq!(load_settings(&path), settings);
@@ -1721,15 +1723,15 @@ mod tests {
         // A pre-FRE-88 file loads with the flag off and, rewritten, gains no
         // key for it — an unaffected setting serializes unchanged.
         std::fs::write(&path, "theme = \"light\"\n").unwrap();
-        assert!(!load_settings(&path).show_system_schemas);
+        assert!(!load_settings(&path).show_internal_objects);
         save_theme(&path, Theme::Dark).unwrap();
         assert!(!std::fs::read_to_string(&path)
             .unwrap()
-            .contains("show_system_schemas"));
+            .contains("show_internal_objects"));
 
-        save_show_system_schemas(&path, true).unwrap();
+        save_show_internal_objects(&path, true).unwrap();
         let loaded = load_settings(&path);
-        assert!(loaded.show_system_schemas);
+        assert!(loaded.show_internal_objects);
         // Written alongside the theme rather than over it.
         assert_eq!(loaded.theme, Theme::Dark);
     }
