@@ -1,17 +1,21 @@
 use std::collections::{HashMap, HashSet};
 
 use dioxus::prelude::*;
-use dioxus_icons::lucide::{File, RefreshCw, SearchX, ShieldAlert, X};
+use dioxus_icons::lucide::{
+    ChevronDown, ChevronUp, File, PanelRight, Pencil, RefreshCw, SearchX, ShieldAlert, X,
+};
 
 use crate::db::{
-    raw_cell_text, render_copy, ConnectionId, CopyBlock, CopyFormat, Dialect, ExportFormat, Filter,
-    FilterOp, ForeignKeyMeta, Generated, Page, PageRequest, PreviewInfo, QueryResult, RowIdentity,
-    RowLocator, SortDir, StagedChange, TableAccess, TableMeta, Value, FETCH_CELL_MAX_BYTES,
+    raw_cell_text, render_copy, ColumnMeta, ConnectionId, CopyBlock, CopyFormat, Dialect,
+    ExportFormat, Filter, FilterOp, ForeignKeyMeta, Generated, Page, PageRequest, PreviewInfo,
+    QueryResult, RowIdentity, RowLocator, SortDir, StagedChange, TableAccess, TableMeta, Value,
+    FETCH_CELL_MAX_BYTES,
 };
 use crate::util::human_bytes;
 
 use super::editing::{editor_kind, CellEditor, EditNav, EditorKind};
 use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState};
+use super::schema::display_type;
 use super::selection::Selection;
 use super::stage::{required_insert_columns, PendingInsert, TableStage};
 use super::state::{AppState, ExportPane, ExportStatus, SchemaLoad, TableRef};
@@ -666,6 +670,42 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let confirm_save_table = table.clone();
     let dismiss_save_table = table.clone();
     let row_table = table.clone();
+    let detail_table = table.clone();
+    // The row detail panel (FRE-109). Open/closed and width live on the tab,
+    // not here, so they survive a table switch (which remounts this grid) —
+    // and the open flag rides the persisted session.
+    let detail_open = state.row_detail_open(id);
+    let detail_width = clamp_detail_width(state.row_detail_width(id).unwrap_or(DETAIL_WIDTH));
+    // The panel's row is derived from the selection's focus, never stored:
+    // it cannot drift from the cell the grid has focused.
+    let detail: Option<RowDetail> = detail_open
+        .then(|| {
+            row_detail(
+                &grid_nav.read(),
+                *focused_cell.read(),
+                table_meta.as_ref().map_or(&[][..], |meta| &meta.columns),
+                &column_kinds,
+                &foreign_keys,
+                &col_to_fk,
+            )
+        })
+        .flatten();
+    // Prev/Next in the panel move the GRID's focus, through the same
+    // resolution an arrow key takes — the panel steers the one selection
+    // rather than keeping a second row of its own.
+    let on_detail_step = move |step: RowStep| {
+        let (rows, cols) = grid_nav.peek().dims();
+        if rows == 0 || cols == 0 {
+            return;
+        }
+        let pos = focused_cell.peek().unwrap_or((0, 0));
+        if let FocusOutcome::Cell(next) = apply_grid_move(pos, step.grid_move(), rows, cols) {
+            // Collapses the selection, exactly like an unmodified arrow key.
+            selection_anchor.set(None);
+            focused_cell.set(Some(next));
+            copy_status.set(None);
+        }
+    };
     // Everything a clipboard copy needs besides the selection itself
     // (FRE-110). Cloned per event handler; all of it is cheap.
     let copy_ctx = CopyContext {
@@ -971,6 +1011,19 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                         "Export JSON"
                     }
                 }
+                // Row detail (FRE-109): the same toggle as Ctrl+D, here so the
+                // panel is discoverable without knowing the shortcut.
+                button {
+                    class: if detail_open {
+                        "flex items-center gap-1 rounded bg-slate-300 dark:bg-slate-700 px-2 py-1 text-xs text-slate-900 dark:text-slate-100"
+                    } else {
+                        "flex items-center gap-1 rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100"
+                    },
+                    title: "Show the focused row as a form (Ctrl+D)",
+                    onclick: move |_| state.set_row_detail(id, !detail_open),
+                    PanelRight { size: 12 }
+                    "Row detail"
+                }
                 button {
                     class: "flex items-center gap-1 rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
                     title: "Re-run the current query",
@@ -1103,245 +1156,270 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     Banner { kind: BannerKind::Info, message: notice.to_string() }
                 }
             }
-            // Grid — a single focusable region (tabindex 0) so arrow-key cell
-            // navigation works without per-cell tab stops (FRE-15). Focused on
-            // mount so the ring responds immediately; `outline-none` since the
-            // ring itself signals focus.
-            div {
-                id: "dv-grid",
-                // `select-none` (FRE-110): shift-click extends the *cell*
-                // selection, and without this the webview drags its own text
-                // highlight across the rows at the same time, striping the
-                // grid. The expand popup renders outside this container, so
-                // its text stays selectable.
-                class: "min-h-0 flex-1 select-none overflow-auto outline-none",
-                tabindex: "0",
-                onkeydown: on_grid_key,
-                match current.as_ref() {
-                    None => rsx! {
-                        DelayedLoading { label: "Loading…" }
-                    },
-                    Some(Err(err)) => rsx! {
-                        div { class: "p-3",
-                            Banner { kind: BannerKind::Error, message: err.to_string() }
-                        }
-                    },
-                    Some(Ok((page_data, extra_key))) => {
-                        let result = &page_data.result;
-                        // The fetch prepended the row-identity key column
-                        // (rowid) when one was requested; keep it for
-                        // locators, hide it from display.
-                        let hidden = usize::from(extra_key.is_some());
-                        let headers: Vec<String> = if result.columns.is_empty() {
-                            schema_columns.clone()
-                        } else {
-                            result.columns.iter().skip(hidden).map(|c| c.name.clone()).collect()
-                        };
-                        let rows = view_rows(result, &page_data.previews, hidden, identity.as_ref(), stage.as_ref(), can_mutate);
-                        let pending_inserts: Vec<PendingInsert> = stage
-                            .as_ref()
-                            .map(|s| s.inserts().to_vec())
-                            .unwrap_or_default();
-                        // This page's selectable rows (addressable and not
-                        // already pending delete), for select-all-on-page.
-                        let selectable: Vec<(String, RowLocator)> = rows
-                            .iter()
-                            .filter(|r| !r.deleted)
-                            .filter_map(|r| Some((r.key.clone()?, r.locator.clone()?)))
-                            .collect();
-                        let all_selected = !selectable.is_empty() && {
-                            let sel = selected.read();
-                            selectable.iter().all(|(key, _)| sel.contains_key(key))
-                        };
-                        let insert_headers = headers.clone();
-                        let insert_parent_table = row_table.clone();
-                        let new_row_table = row_table.clone();
-                        let empty = empty_state(
-                            rows.is_empty() && pending_inserts.is_empty(),
-                            applied_filter.read().is_some(),
-                        );
-                        // Windowed rendering (FRE-32): only rows in the visible
-                        // range go in the DOM; a top and bottom spacer row of
-                        // the elided rows' total height keeps the scrollbar and
-                        // offsets correct. `total_cols` sizes the spacers'
-                        // single colspan cell across every column.
-                        let total_rows = rows.len();
-                        let total_cols = headers.len() + usize::from(select_enabled);
-                        let (win_start, win_end) = *visible_range.read();
-                        let (win_start, win_end) = (win_start.min(total_rows), win_end.min(total_rows));
-                        let top_spacer = win_start as f64 * ROW_HEIGHT;
-                        let bottom_spacer = (total_rows - win_end) as f64 * ROW_HEIGHT;
-                        let windowed_rows: Vec<(usize, RowView)> = rows
-                            .into_iter()
-                            .enumerate()
-                            .filter(|(index, _)| *index >= win_start && *index < win_end)
-                            .collect();
-                        rsx! {
-                            match empty {
-                                // No-filter-match: distinct from an empty
-                                // table, with a Clear-filter action.
-                                Some(GridEmpty::NoMatch) => rsx! {
-                                    EmptyState {
-                                        icon: rsx! { SearchX { size: 40 } },
-                                        title: "No rows match the filter",
-                                        hint: "No rows in this table match the current filter.",
-                                        button {
-                                            class: "rounded border border-slate-300 dark:border-slate-700 px-3 py-1 text-xs text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
-                                            onclick: move |_| {
-                                                applied_filter.set(None);
-                                                filter_text.set(String::new());
-                                                page.set(0);
-                                            },
-                                            "Clear filter"
+            // The rows and, docked to their right, the row detail panel
+            // (FRE-109). The toolbar and footer above and below span both:
+            // they describe the table, while the panel describes one row.
+            div { class: "flex min-h-0 flex-1",
+                // Grid — a single focusable region (tabindex 0) so arrow-key cell
+                // navigation works without per-cell tab stops (FRE-15). Focused on
+                // mount so the ring responds immediately; `outline-none` since the
+                // ring itself signals focus.
+                div {
+                    id: "dv-grid",
+                    // `select-none` (FRE-110): shift-click extends the *cell*
+                    // selection, and without this the webview drags its own text
+                    // highlight across the rows at the same time, striping the
+                    // grid. The expand popup renders outside this container, so
+                    // its text stays selectable.
+                    class: "min-h-0 flex-1 select-none overflow-auto outline-none",
+                    tabindex: "0",
+                    onkeydown: on_grid_key,
+                    match current.as_ref() {
+                        None => rsx! {
+                            DelayedLoading { label: "Loading…" }
+                        },
+                        Some(Err(err)) => rsx! {
+                            div { class: "p-3",
+                                Banner { kind: BannerKind::Error, message: err.to_string() }
+                            }
+                        },
+                        Some(Ok((page_data, extra_key))) => {
+                            let result = &page_data.result;
+                            // The fetch prepended the row-identity key column
+                            // (rowid) when one was requested; keep it for
+                            // locators, hide it from display.
+                            let hidden = usize::from(extra_key.is_some());
+                            let headers: Vec<String> = if result.columns.is_empty() {
+                                schema_columns.clone()
+                            } else {
+                                result.columns.iter().skip(hidden).map(|c| c.name.clone()).collect()
+                            };
+                            let rows = view_rows(result, &page_data.previews, hidden, identity.as_ref(), stage.as_ref(), can_mutate);
+                            let pending_inserts: Vec<PendingInsert> = stage
+                                .as_ref()
+                                .map(|s| s.inserts().to_vec())
+                                .unwrap_or_default();
+                            // This page's selectable rows (addressable and not
+                            // already pending delete), for select-all-on-page.
+                            let selectable: Vec<(String, RowLocator)> = rows
+                                .iter()
+                                .filter(|r| !r.deleted)
+                                .filter_map(|r| Some((r.key.clone()?, r.locator.clone()?)))
+                                .collect();
+                            let all_selected = !selectable.is_empty() && {
+                                let sel = selected.read();
+                                selectable.iter().all(|(key, _)| sel.contains_key(key))
+                            };
+                            let insert_headers = headers.clone();
+                            let insert_parent_table = row_table.clone();
+                            let new_row_table = row_table.clone();
+                            let empty = empty_state(
+                                rows.is_empty() && pending_inserts.is_empty(),
+                                applied_filter.read().is_some(),
+                            );
+                            // Windowed rendering (FRE-32): only rows in the visible
+                            // range go in the DOM; a top and bottom spacer row of
+                            // the elided rows' total height keeps the scrollbar and
+                            // offsets correct. `total_cols` sizes the spacers'
+                            // single colspan cell across every column.
+                            let total_rows = rows.len();
+                            let total_cols = headers.len() + usize::from(select_enabled);
+                            let (win_start, win_end) = *visible_range.read();
+                            let (win_start, win_end) = (win_start.min(total_rows), win_end.min(total_rows));
+                            let top_spacer = win_start as f64 * ROW_HEIGHT;
+                            let bottom_spacer = (total_rows - win_end) as f64 * ROW_HEIGHT;
+                            let windowed_rows: Vec<(usize, RowView)> = rows
+                                .into_iter()
+                                .enumerate()
+                                .filter(|(index, _)| *index >= win_start && *index < win_end)
+                                .collect();
+                            rsx! {
+                                match empty {
+                                    // No-filter-match: distinct from an empty
+                                    // table, with a Clear-filter action.
+                                    Some(GridEmpty::NoMatch) => rsx! {
+                                        EmptyState {
+                                            icon: rsx! { SearchX { size: 40 } },
+                                            title: "No rows match the filter",
+                                            hint: "No rows in this table match the current filter.",
+                                            button {
+                                                class: "rounded border border-slate-300 dark:border-slate-700 px-3 py-1 text-xs text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
+                                                onclick: move |_| {
+                                                    applied_filter.set(None);
+                                                    filter_text.set(String::new());
+                                                    page.set(0);
+                                                },
+                                                "Clear filter"
+                                            }
                                         }
-                                    }
-                                },
-                                // Empty table: the "+ New row" affordance below
-                                // stays available for editable tables.
-                                Some(GridEmpty::Table) => rsx! {
-                                    EmptyState {
-                                        icon: rsx! { File { size: 40 } },
-                                        title: "This table has no rows",
-                                        hint: "There is no data here yet.",
-                                    }
-                                },
-                                None => rsx! {
-                                table { class: "w-full border-collapse text-left",
-                                    thead { class: "sticky top-0 bg-slate-100 dark:bg-slate-900",
-                                        tr {
-                                            if select_enabled {
-                                                th { class: "w-8 border-b border-slate-300 dark:border-slate-700 px-2 py-1.5",
-                                                    input {
-                                                        r#type: "checkbox",
-                                                        class: "accent-red-500",
-                                                        title: "Select all rows on this page",
-                                                        checked: all_selected,
-                                                        oninput: move |_| {
-                                                            let currently_all = !selectable.is_empty() && {
-                                                                let sel = selected.peek();
-                                                                selectable.iter().all(|(key, _)| sel.contains_key(key))
-                                                            };
-                                                            if currently_all {
-                                                                selected.set(HashMap::new());
-                                                            } else {
-                                                                let mut map = selected.peek().clone();
-                                                                for (key, locator) in &selectable {
-                                                                    map.insert(key.clone(), locator.clone());
+                                    },
+                                    // Empty table: the "+ New row" affordance below
+                                    // stays available for editable tables.
+                                    Some(GridEmpty::Table) => rsx! {
+                                        EmptyState {
+                                            icon: rsx! { File { size: 40 } },
+                                            title: "This table has no rows",
+                                            hint: "There is no data here yet.",
+                                        }
+                                    },
+                                    None => rsx! {
+                                    table { class: "w-full border-collapse text-left",
+                                        thead { class: "sticky top-0 bg-slate-100 dark:bg-slate-900",
+                                            tr {
+                                                if select_enabled {
+                                                    th { class: "w-8 border-b border-slate-300 dark:border-slate-700 px-2 py-1.5",
+                                                        input {
+                                                            r#type: "checkbox",
+                                                            class: "accent-red-500",
+                                                            title: "Select all rows on this page",
+                                                            checked: all_selected,
+                                                            oninput: move |_| {
+                                                                let currently_all = !selectable.is_empty() && {
+                                                                    let sel = selected.peek();
+                                                                    selectable.iter().all(|(key, _)| sel.contains_key(key))
+                                                                };
+                                                                if currently_all {
+                                                                    selected.set(HashMap::new());
+                                                                } else {
+                                                                    let mut map = selected.peek().clone();
+                                                                    for (key, locator) in &selectable {
+                                                                        map.insert(key.clone(), locator.clone());
+                                                                    }
+                                                                    selected.set(map);
                                                                 }
-                                                                selected.set(map);
+                                                            },
+                                                        }
+                                                    }
+                                                }
+                                                for (col_index , header) in headers.into_iter().enumerate() {
+                                                    GridHeader {
+                                                        name: header,
+                                                        sort: sort_value.clone(),
+                                                        on_sort: move |name: String| {
+                                                            let next = next_sort(&sort.peek(), &name);
+                                                            sort.set(next);
+                                                            page.set(0);
+                                                        },
+                                                        // Shift-click selects the whole column (FRE-110);
+                                                        // a plain click keeps sorting.
+                                                        on_select_column: move |_| {
+                                                            let rows = grid_nav.peek().rows.len();
+                                                            if let Some(axis) = Selection::column(col_index, rows) {
+                                                                selection_anchor.set(Some(axis.anchor));
+                                                                focused_cell.set(Some(axis.focus));
+                                                                copy_status.set(None);
                                                             }
                                                         },
                                                     }
                                                 }
                                             }
-                                            for (col_index , header) in headers.into_iter().enumerate() {
-                                                GridHeader {
-                                                    name: header,
-                                                    sort: sort_value.clone(),
-                                                    on_sort: move |name: String| {
-                                                        let next = next_sort(&sort.peek(), &name);
-                                                        sort.set(next);
-                                                        page.set(0);
+                                        }
+                                        tbody {
+                                            // Top spacer: the height of the rows
+                                            // elided above the window (FRE-32).
+                                            if top_spacer > 0.0 {
+                                                tr {
+                                                    td {
+                                                        colspan: "{total_cols}",
+                                                        style: "height:{top_spacer}px;padding:0;border:0;",
+                                                    }
+                                                }
+                                            }
+                                            for (index, row) in windowed_rows {
+                                                GridRow {
+                                                    key: "{row_render_key(&row, index)}",
+                                                    id,
+                                                    table: row_table.clone(),
+                                                    row,
+                                                    column_kinds: column_kinds.clone(),
+                                                    foreign_keys: foreign_keys.clone(),
+                                                    col_to_fk: col_to_fk.clone(),
+                                                    dialect: dialect.unwrap_or(Dialect::Sqlite),
+                                                    editing,
+                                                    // The focused column in this row (FRE-15), else None; only the
+                                                    // two rows whose focus changed re-render on a move.
+                                                    focused_col: match focused_cell() {
+                                                        Some((r, c)) if r == index => Some(c),
+                                                        _ => None,
                                                     },
-                                                    // Shift-click selects the whole column (FRE-110);
-                                                    // a plain click keeps sorting.
-                                                    on_select_column: move |_| {
-                                                        let rows = grid_nav.peek().rows.len();
-                                                        if let Some(axis) = Selection::column(col_index, rows) {
-                                                            selection_anchor.set(Some(axis.anchor));
-                                                            focused_cell.set(Some(axis.focus));
-                                                            copy_status.set(None);
+                                                    row_index: index,
+                                                    // The inclusive span of selected columns in this row
+                                                    // (FRE-110), or None when the row is outside the
+                                                    // rectangle — so only rows whose span changed re-render.
+                                                    selected_cols: selection().and_then(|sel| sel.columns_in(index)),
+                                                    on_select_cell,
+                                                    select_enabled,
+                                                    selected,
+                                                    on_fk_jump: {
+                                                        let origin = row_table.clone();
+                                                        move |(fk, row_values): (ForeignKeyMeta, HashMap<String, Value>)| {
+                                                            state.navigate_fk(id, &fk, &row_values, &origin, applied_filter.peek().clone());
                                                         }
                                                     },
                                                 }
                                             }
-                                        }
-                                    }
-                                    tbody {
-                                        // Top spacer: the height of the rows
-                                        // elided above the window (FRE-32).
-                                        if top_spacer > 0.0 {
-                                            tr {
-                                                td {
-                                                    colspan: "{total_cols}",
-                                                    style: "height:{top_spacer}px;padding:0;border:0;",
-                                                }
-                                            }
-                                        }
-                                        for (index, row) in windowed_rows {
-                                            GridRow {
-                                                key: "{row_render_key(&row, index)}",
-                                                id,
-                                                table: row_table.clone(),
-                                                row,
-                                                column_kinds: column_kinds.clone(),
-                                                foreign_keys: foreign_keys.clone(),
-                                                col_to_fk: col_to_fk.clone(),
-                                                dialect: dialect.unwrap_or(Dialect::Sqlite),
-                                                editing,
-                                                // The focused column in this row (FRE-15), else None; only the
-                                                // two rows whose focus changed re-render on a move.
-                                                focused_col: match focused_cell() {
-                                                    Some((r, c)) if r == index => Some(c),
-                                                    _ => None,
-                                                },
-                                                row_index: index,
-                                                // The inclusive span of selected columns in this row
-                                                // (FRE-110), or None when the row is outside the
-                                                // rectangle — so only rows whose span changed re-render.
-                                                selected_cols: selection().and_then(|sel| sel.columns_in(index)),
-                                                on_select_cell,
-                                                select_enabled,
-                                                selected,
-                                                on_fk_jump: {
-                                                    let origin = row_table.clone();
-                                                    move |(fk, row_values): (ForeignKeyMeta, HashMap<String, Value>)| {
-                                                        state.navigate_fk(id, &fk, &row_values, &origin, applied_filter.peek().clone());
+                                            // Bottom spacer: the height of the rows
+                                            // elided below the window (FRE-32).
+                                            if bottom_spacer > 0.0 {
+                                                tr {
+                                                    td {
+                                                        colspan: "{total_cols}",
+                                                        style: "height:{bottom_spacer}px;padding:0;border:0;",
                                                     }
-                                                },
+                                                }
                                             }
-                                        }
-                                        // Bottom spacer: the height of the rows
-                                        // elided below the window (FRE-32).
-                                        if bottom_spacer > 0.0 {
-                                            tr {
-                                                td {
-                                                    colspan: "{total_cols}",
-                                                    style: "height:{bottom_spacer}px;padding:0;border:0;",
+                                            // Pending inserts: phantom rows with
+                                            // editable "database default" cells.
+                                            for insert in pending_inserts {
+                                                InsertRow {
+                                                    key: "{insert.row_key()}",
+                                                    id,
+                                                    table: insert_parent_table.clone(),
+                                                    insert,
+                                                    headers: insert_headers.clone(),
+                                                    column_kinds: column_kinds.clone(),
+                                                    required: required.clone(),
+                                                    dialect: dialect.unwrap_or(Dialect::Sqlite),
+                                                    lead_cell: select_enabled,
+                                                    editing,
                                                 }
                                             }
                                         }
-                                        // Pending inserts: phantom rows with
-                                        // editable "database default" cells.
-                                        for insert in pending_inserts {
-                                            InsertRow {
-                                                key: "{insert.row_key()}",
-                                                id,
-                                                table: insert_parent_table.clone(),
-                                                insert,
-                                                headers: insert_headers.clone(),
-                                                column_kinds: column_kinds.clone(),
-                                                required: required.clone(),
-                                                dialect: dialect.unwrap_or(Dialect::Sqlite),
-                                                lead_cell: select_enabled,
-                                                editing,
-                                            }
-                                        }
                                     }
+                                    },
                                 }
-                                },
-                            }
-                            // Insert affordance (editable tables only):
-                            // appends a phantom row, all columns defaulted.
-                            if select_enabled {
-                                button {
-                                    class: "m-2 rounded border border-dashed border-emerald-300 dark:border-emerald-700/70 px-3 py-1 \
-                                            text-xs text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-950/40",
-                                    onclick: move |_| state.stage_insert_row(id, &new_row_table),
-                                    "+ New row"
+                                // Insert affordance (editable tables only):
+                                // appends a phantom row, all columns defaulted.
+                                if select_enabled {
+                                    button {
+                                        class: "m-2 rounded border border-dashed border-emerald-300 dark:border-emerald-700/70 px-3 py-1 \
+                                                text-xs text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-950/40",
+                                        onclick: move |_| state.stage_insert_row(id, &new_row_table),
+                                        "+ New row"
+                                    }
                                 }
                             }
                         }
+                    }
+                }
+                if detail_open {
+                    RowDetailPanel {
+                        id,
+                        table: detail_table,
+                        detail,
+                        width: detail_width,
+                        dialect: dialect.unwrap_or(Dialect::Sqlite),
+                        read_only_notice: read_only_notice.map(str::to_string),
+                        grid_editing: editing,
+                        on_step: on_detail_step,
+                        on_close: move |_| state.set_row_detail(id, false),
+                        on_width: move |width: f64| state.set_row_detail_width(id, width),
+                        on_fk_jump: {
+                            let origin = row_table.clone();
+                            move |(fk, row_values): (ForeignKeyMeta, HashMap<String, Value>)| {
+                                state.navigate_fk(id, &fk, &row_values, &origin, applied_filter.peek().clone());
+                            }
+                        },
                     }
                 }
             }
@@ -1699,16 +1777,24 @@ fn cell_editable(cell: &CellView, column_kinds: &HashMap<String, (EditorKind, bo
     cell.editable && !cell_kind(cell, column_kinds).0.is_read_only()
 }
 
-/// Editor kind + nullability for one cell; columns missing from the
+/// Editor kind + nullability for one column; columns missing from the
 /// introspected metadata edit as nullable text.
+fn column_kind(
+    column: &str,
+    column_kinds: &HashMap<String, (EditorKind, bool)>,
+) -> (EditorKind, bool) {
+    column_kinds
+        .get(column)
+        .cloned()
+        .unwrap_or((EditorKind::Text, true))
+}
+
+/// [`column_kind`] for a prepared cell.
 fn cell_kind(
     cell: &CellView,
     column_kinds: &HashMap<String, (EditorKind, bool)>,
 ) -> (EditorKind, bool) {
-    column_kinds
-        .get(&cell.column)
-        .cloned()
-        .unwrap_or((EditorKind::Text, true))
+    column_kind(&cell.column, column_kinds)
 }
 
 /// The editable column after (`+1`) or before (`-1`) `current` in a row's
@@ -1846,6 +1932,10 @@ struct GridNavRow {
 struct GridNavCell {
     column: String,
     editable: bool,
+    /// Whether the stage holds an edit for this cell — the row detail panel
+    /// (FRE-109) tints its fields from the same snapshot the grid tints its
+    /// cells from, so the two can't disagree about what is staged.
+    dirty: bool,
     display: String,
     /// The cell's value as fetched. For a cell carrying `preview` this is only
     /// the bounded prefix — a copy must fetch the full value (FRE-110).
@@ -1881,6 +1971,7 @@ impl GridNav {
                     .map(|cell| GridNavCell {
                         column: cell.column.clone(),
                         editable: cell_editable(cell, column_kinds),
+                        dirty: cell.dirty,
                         display: cell_display(cell),
                         value: cell.value.clone(),
                         preview: cell.preview,
@@ -1894,6 +1985,162 @@ impl GridNav {
     /// (rows on the page, columns); a zero in either means nothing to focus.
     fn dims(&self) -> (usize, usize) {
         (self.rows.len(), self.headers.len())
+    }
+}
+
+/// Default width of the row detail panel in CSS pixels, and the range a drag
+/// may take it to (FRE-109). The floor keeps a name/type header legible; the
+/// ceiling keeps the grid — which the panel accompanies rather than replaces
+/// — from being squeezed away.
+const DETAIL_WIDTH: f64 = 360.0;
+const DETAIL_MIN_WIDTH: f64 = 240.0;
+const DETAIL_MAX_WIDTH: f64 = 720.0;
+
+/// Clamps a dragged panel width into the allowed range. A non-finite width
+/// (a nonsense report from the drag listener) falls back to the default
+/// rather than propagating a NaN into the style attribute.
+fn clamp_detail_width(width: f64) -> f64 {
+    if !width.is_finite() {
+        return DETAIL_WIDTH;
+    }
+    width.clamp(DETAIL_MIN_WIDTH, DETAIL_MAX_WIDTH)
+}
+
+/// One field of the row detail panel (FRE-109): a column of the focused row,
+/// with everything the panel needs to show it, edit it, and follow it.
+#[derive(Debug, Clone, PartialEq)]
+struct DetailField {
+    column: String,
+    /// Declared type, shown beside the name — via the Schema pane's
+    /// [`display_type`], so the two views never disagree about what a column
+    /// is (a Postgres enum reads as its type, not `USER-DEFINED`).
+    type_name: String,
+    /// The cell as the grid holds it: for a previewed cell only the bounded
+    /// prefix, which the panel replaces with the full value (FRE-33).
+    value: Value,
+    preview: Option<PreviewInfo>,
+    dirty: bool,
+    kind: EditorKind,
+    nullable: bool,
+    /// The grid's own answer (`GridNavCell::editable`), which already folds in
+    /// the resolved capability and the user's marking (FRE-87/FRE-111) — not
+    /// a second resolution that could disagree with the cell beside it.
+    editable: bool,
+    /// The foreign key this column belongs to, when following it leads
+    /// somewhere: a NULL key references nothing (FRE-29).
+    fk: Option<ForeignKeyMeta>,
+}
+
+/// Where the focused row sits on the page — the panel's header line and its
+/// Prev/Next bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DetailPosition {
+    /// 1-based position of the row within the fetched page.
+    number: usize,
+    total: usize,
+}
+
+impl DetailPosition {
+    fn has_prev(&self) -> bool {
+        self.number > 1
+    }
+
+    /// Prev/Next stay inside the page, like the arrow keys they delegate to:
+    /// paging is PageUp/PageDown's job, and a silent page flip under an open
+    /// form would be a surprise.
+    fn has_next(&self) -> bool {
+        self.number < self.total
+    }
+}
+
+/// The focused row, reduced to what the row detail panel renders.
+#[derive(Debug, Clone, PartialEq)]
+struct RowDetail {
+    /// Identifies the row across renders so the panel's fields — each owning
+    /// a full-value fetch — remount when the focus moves to another row.
+    row_key: String,
+    /// `None` for a row that can't be addressed (a view, a keyless table):
+    /// nothing can be staged for it and its previews can't be loaded.
+    locator: Option<RowLocator>,
+    fields: Vec<DetailField>,
+    /// The whole row by column — the source of an FK jump's equality filter.
+    row_values: HashMap<String, Value>,
+    position: DetailPosition,
+}
+
+/// Reduces the focused row of `nav` to the panel's model (FRE-109).
+///
+/// The row is taken from the grid's focus (the selection model's focus
+/// corner), not from any row the panel remembers for itself — and the panel's
+/// Prev/Next move that same focus. One row, one place it lives.
+///
+/// `None` when there is nothing to show (an empty page).
+fn row_detail(
+    nav: &GridNav,
+    focused: Option<(usize, usize)>,
+    columns: &[ColumnMeta],
+    column_kinds: &HashMap<String, (EditorKind, bool)>,
+    foreign_keys: &[ForeignKeyMeta],
+    col_to_fk: &HashMap<String, usize>,
+) -> Option<RowDetail> {
+    // No focus yet means the page just arrived and the clamp effect is about
+    // to seed one at (0, 0) — show that row now rather than flashing empty.
+    let index = focused.map_or(0, |(row, _)| row);
+    let row = nav.rows.get(index)?;
+    let types: HashMap<&str, String> = columns
+        .iter()
+        .map(|column| (column.name.as_str(), display_type(column)))
+        .collect();
+    let mut fields = Vec::with_capacity(row.cells.len());
+    let mut row_values = HashMap::with_capacity(row.cells.len());
+    for cell in &row.cells {
+        let (kind, nullable) = column_kind(&cell.column, column_kinds);
+        fields.push(DetailField {
+            type_name: types.get(cell.column.as_str()).cloned().unwrap_or_default(),
+            fk: col_to_fk
+                .get(&cell.column)
+                .filter(|_| !cell.value.is_null())
+                .and_then(|&index| foreign_keys.get(index))
+                .cloned(),
+            column: cell.column.clone(),
+            value: cell.value.clone(),
+            preview: cell.preview,
+            dirty: cell.dirty,
+            editable: cell.editable,
+            kind,
+            nullable,
+        });
+        row_values.insert(cell.column.clone(), cell.value.clone());
+    }
+    Some(RowDetail {
+        // A row without a locator still needs a stable identity for keying;
+        // its position on the page is the only one available.
+        row_key: row.key.clone().unwrap_or_else(|| format!("#{index}")),
+        locator: row.locator.clone(),
+        fields,
+        row_values,
+        position: DetailPosition {
+            number: index + 1,
+            total: nav.rows.len(),
+        },
+    })
+}
+
+/// Which way the panel's Prev/Next moves the grid's focused row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowStep {
+    Prev,
+    Next,
+}
+
+impl RowStep {
+    /// The grid move this step delegates to, so a panel step and an arrow key
+    /// resolve through exactly the same bounds logic.
+    fn grid_move(self) -> GridMove {
+        match self {
+            RowStep::Prev => GridMove::Up,
+            RowStep::Next => GridMove::Down,
+        }
     }
 }
 
@@ -3103,6 +3350,479 @@ fn CopyRawButton(raw: String) -> Element {
     }
 }
 
+/// The row detail panel's drag-to-resize listener (FRE-109). Same shape as
+/// [`GRID_SCROLL_JS`]: the drag is handled entirely in JS, which moves the
+/// node itself and reports the resting width back once, on release — so a
+/// drag costs no re-renders and the width still ends up in Rust, where it
+/// survives a table switch. The move/up listeners are added on pointerdown
+/// and removed on pointerup, so closing the panel leaves nothing behind.
+fn detail_resize_js() -> String {
+    format!(
+        r#"
+(() => {{
+  const panel = document.getElementById('dv-row-detail');
+  const handle = document.getElementById('dv-row-detail-handle');
+  if (!panel || !handle) return;
+  const min = {DETAIL_MIN_WIDTH}, max = {DETAIL_MAX_WIDTH};
+  let startX = 0, startWidth = 0;
+  const onMove = (e) => {{
+    // The panel is docked to the right edge, so dragging left widens it.
+    const width = Math.min(max, Math.max(min, startWidth + (startX - e.clientX)));
+    panel.style.width = width + 'px';
+  }};
+  const onUp = () => {{
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    document.body.style.userSelect = '';
+    dioxus.send(panel.getBoundingClientRect().width);
+  }};
+  handle.addEventListener('pointerdown', (e) => {{
+    e.preventDefault();
+    startX = e.clientX;
+    startWidth = panel.getBoundingClientRect().width;
+    // Suppressed for the duration of the drag only, so a drag across the
+    // grid doesn't paint a text selection behind it.
+    document.body.style.userSelect = 'none';
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }});
+}})();
+"#
+    )
+}
+
+/// The row detail panel (FRE-109): the focused row as a vertical
+/// column → value form, docked to the right of the rows.
+///
+/// It is a companion to browsing rather than a mode: it stays open while the
+/// focus moves, so the grid keeps its context. Its Prev/Next move the
+/// **grid's** focus (through the same [`apply_grid_move`] an arrow key takes)
+/// instead of tracking a row of its own, and everything it renders — values,
+/// staged tints, editability — is read off the [`GridNav`] snapshot the grid
+/// renders from. Edits stage through [`AppState::stage_cell_edit`], so they
+/// land in the same set, and save through the same button, as a grid edit.
+#[component]
+fn RowDetailPanel(
+    id: ConnectionId,
+    table: TableRef,
+    /// The focused row, or `None` when the page has no rows.
+    detail: Option<RowDetail>,
+    width: f64,
+    dialect: Dialect,
+    /// Why editing is unavailable (FRE-87/FRE-111) — the grid's sentence,
+    /// from the grid's resolution, stated once instead of per field.
+    read_only_notice: Option<String>,
+    /// The grid's in-place editor, closed when a field here opens one: only
+    /// one cell editor can hold the keyboard at a time.
+    grid_editing: Signal<Option<ActiveEdit>>,
+    on_step: EventHandler<RowStep>,
+    on_close: EventHandler<()>,
+    on_width: EventHandler<f64>,
+    on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>)>,
+) -> Element {
+    // Install the resize listener once per mount; it reads no signals, so it
+    // never re-installs, and the eval channel dies with the panel.
+    use_effect(move || {
+        spawn(async move {
+            let mut channel = document::eval(&detail_resize_js());
+            while let Ok(dragged) = channel.recv::<f64>().await {
+                on_width.call(clamp_detail_width(dragged));
+            }
+        });
+    });
+
+    let position = detail.as_ref().map(|detail| detail.position);
+    let step_class = "rounded px-1.5 py-0.5 text-slate-500 dark:text-slate-400 \
+                      hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 \
+                      dark:hover:text-slate-100 disabled:opacity-30";
+    rsx! {
+        aside {
+            id: "dv-row-detail",
+            class: "relative flex shrink-0 flex-col border-l border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/40",
+            style: "width:{width}px;",
+            // The drag handle rides the docked edge; the content is padded
+            // clear of it.
+            div {
+                id: "dv-row-detail-handle",
+                class: "absolute inset-y-0 left-0 z-10 w-1.5 cursor-col-resize hover:bg-sky-400/50",
+                title: "Drag to resize",
+            }
+            div { class: "flex items-center gap-1 border-b border-slate-200 dark:border-slate-800 py-1.5 pl-3 pr-2 text-xs",
+                span { class: "font-semibold text-slate-700 dark:text-slate-300",
+                    match position {
+                        Some(position) => format!("Row {} of {}", position.number, position.total),
+                        None => "Row detail".to_string(),
+                    }
+                }
+                div { class: "flex-1" }
+                button {
+                    class: step_class,
+                    title: "Previous row (or ↑ in the grid)",
+                    disabled: !position.is_some_and(|position| position.has_prev()),
+                    onclick: move |_| on_step.call(RowStep::Prev),
+                    ChevronUp { size: 14 }
+                }
+                button {
+                    class: step_class,
+                    title: "Next row (or ↓ in the grid)",
+                    disabled: !position.is_some_and(|position| position.has_next()),
+                    onclick: move |_| on_step.call(RowStep::Next),
+                    ChevronDown { size: 14 }
+                }
+                button {
+                    class: step_class,
+                    aria_label: "Close the row detail panel",
+                    title: "Close (Ctrl+D)",
+                    onclick: move |_| on_close.call(()),
+                    X { size: 14 }
+                }
+            }
+            div { class: "min-h-0 flex-1 overflow-auto",
+                if let Some(notice) = read_only_notice {
+                    div { class: "p-2",
+                        Banner { kind: BannerKind::Info, message: notice }
+                    }
+                }
+                match detail {
+                    Some(detail) => rsx! {
+                        RowDetailFields {
+                            // Keyed by row: every field owns a fetch for its
+                            // full value, so a move to another row has to
+                            // remount them rather than show the last one's.
+                            key: "{detail.row_key}",
+                            id,
+                            table,
+                            dialect,
+                            fields: detail.fields,
+                            locator: detail.locator,
+                            row_values: detail.row_values,
+                            grid_editing,
+                            on_fk_jump,
+                        }
+                    },
+                    None => rsx! {
+                        p { class: "p-3 text-xs text-slate-500 dark:text-slate-400",
+                            "No row to show — this page is empty."
+                        }
+                    },
+                }
+            }
+        }
+    }
+}
+
+/// The focused row's fields. Mounted keyed by row (see [`RowDetailPanel`]),
+/// so the open editor and the per-field fetches reset when the focus moves.
+#[component]
+fn RowDetailFields(
+    id: ConnectionId,
+    table: TableRef,
+    fields: Vec<DetailField>,
+    locator: Option<RowLocator>,
+    row_values: HashMap<String, Value>,
+    dialect: Dialect,
+    grid_editing: Signal<Option<ActiveEdit>>,
+    on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>)>,
+) -> Element {
+    // Which field's editor is open. Panel-local rather than shared with the
+    // grid's `editing`: that one names a cell in the table, and two mounted
+    // editors would fight over the keyboard. What is *staged* is shared —
+    // that is the part that must be one set.
+    let editing = use_signal(|| Option::<String>::None);
+    // Tab order: the editable fields, top to bottom.
+    let editable_columns: Vec<String> = fields
+        .iter()
+        .filter(|field| field.editable)
+        .map(|field| field.column.clone())
+        .collect();
+    rsx! {
+        dl { class: "divide-y divide-slate-200 dark:divide-slate-800",
+            for field in fields {
+                RowDetailRow {
+                    key: "{field.column}",
+                    id,
+                    table: table.clone(),
+                    dialect,
+                    field,
+                    locator: locator.clone(),
+                    row_values: row_values.clone(),
+                    editable_columns: editable_columns.clone(),
+                    editing,
+                    grid_editing,
+                    on_fk_jump,
+                }
+            }
+        }
+    }
+}
+
+/// One column of the focused row: its name and type, an FK jump when it has
+/// one, and its value — the full value, not the grid's preview (FRE-109).
+#[component]
+fn RowDetailRow(
+    id: ConnectionId,
+    table: TableRef,
+    field: DetailField,
+    locator: Option<RowLocator>,
+    row_values: HashMap<String, Value>,
+    dialect: Dialect,
+    editable_columns: Vec<String>,
+    editing: Signal<Option<String>>,
+    grid_editing: Signal<Option<ActiveEdit>>,
+    on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>)>,
+) -> Element {
+    rsx! {
+        div {
+            // Staged fields carry the grid's amber, so a change made in
+            // either place reads the same in both.
+            class: if field.dirty { "px-3 py-2 bg-amber-100 dark:bg-amber-900/25" } else { "px-3 py-2" },
+            dt { class: "mb-1 flex items-baseline gap-2",
+                span { class: "min-w-0 break-all font-mono text-xs font-semibold text-slate-900 dark:text-slate-200",
+                    "{field.column}"
+                }
+                span { class: "shrink-0 font-mono text-[11px] text-slate-500 dark:text-slate-400",
+                    "{field.type_name}"
+                }
+                div { class: "flex-1" }
+                if field.dirty {
+                    span {
+                        class: "shrink-0 rounded bg-amber-200 dark:bg-amber-800/60 px-1 text-[10px] leading-tight text-amber-800 dark:text-amber-200",
+                        title: "Staged, not yet saved",
+                        "edited"
+                    }
+                }
+                // Same jump the grid's ↗ makes, from the same row values.
+                if let Some(fk) = field.fk.clone() {
+                    a {
+                        class: "shrink-0 cursor-pointer select-none text-cyan-600 dark:text-cyan-400 hover:underline",
+                        title: "Go to {fk.referenced_table}",
+                        onclick: move |_| on_fk_jump.call((fk.clone(), row_values.clone())),
+                        "↗"
+                    }
+                }
+            }
+            dd {
+                match (&field.preview, &locator) {
+                    // A truncated cell whose row can be addressed: load the
+                    // whole value through the shared cell-fetch path (FRE-33).
+                    (Some(_), Some(locator)) => rsx! {
+                        RowDetailFullValue {
+                            id,
+                            table,
+                            dialect,
+                            field: field.clone(),
+                            locator: locator.clone(),
+                            editable_columns,
+                            editing,
+                            grid_editing,
+                        }
+                    },
+                    // Truncated and unaddressable (a view, a keyless table):
+                    // the preview is all there will ever be, and the same
+                    // refusal the copy path states says why.
+                    (Some(_), None) => rsx! {
+                        Banner {
+                            kind: BannerKind::Warning,
+                            message: CopyRefusal::Unaddressable { column: field.column.clone() }.message(),
+                        }
+                        pre { class: "mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
+                            "{field.value.display()}…"
+                        }
+                    },
+                    // Already complete in the page.
+                    (None, _) => rsx! {
+                        RowDetailValue {
+                            id,
+                            table,
+                            dialect,
+                            value: field.value.clone(),
+                            field: field.clone(),
+                            locator: locator.clone(),
+                            editable_columns,
+                            editing,
+                            grid_editing,
+                        }
+                    },
+                }
+            }
+        }
+    }
+}
+
+/// A field whose grid cell holds only a bounded preview: loads the full value
+/// through [`AppState::load_cell`] — the same path the expand popup and the
+/// clipboard use (FRE-33) — and then renders and edits it like any other
+/// field. A value over [`FETCH_CELL_MAX_BYTES`] cannot be loaded whole, so it
+/// is shown as its first chunk and never opened for editing: staging the
+/// prefix would silently truncate what is stored.
+#[component]
+fn RowDetailFullValue(
+    id: ConnectionId,
+    table: TableRef,
+    field: DetailField,
+    locator: RowLocator,
+    dialect: Dialect,
+    editable_columns: Vec<String>,
+    editing: Signal<Option<String>>,
+    grid_editing: Signal<Option<ActiveEdit>>,
+) -> Element {
+    let state = use_context::<AppState>();
+    let fetch_table = table.clone();
+    let fetch_locator = locator.clone();
+    let fetch_column = field.column.clone();
+    let cell = use_resource(move || {
+        let table = fetch_table.clone();
+        let locator = fetch_locator.clone();
+        let column = fetch_column.clone();
+        async move { state.load_cell(id, table, locator, column).await }
+    });
+    let loaded = cell.read();
+    match loaded.as_ref() {
+        None => rsx! {
+            DelayedLoading { label: "Loading full value…" }
+        },
+        Some(Err(err)) => rsx! {
+            Banner { kind: BannerKind::Error, message: err.clone() }
+        },
+        Some(Ok(fetch)) if fetch.capped => {
+            let note = format!(
+                "Value is very large; showing the first {} and not offering an editor.",
+                human_bytes(FETCH_CELL_MAX_BYTES as u64),
+            );
+            rsx! {
+                Banner { kind: BannerKind::Warning, message: note }
+                pre { class: "mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
+                    "{fetch.value.display()}"
+                }
+            }
+        }
+        Some(Ok(fetch)) => rsx! {
+            RowDetailValue {
+                id,
+                table,
+                dialect,
+                value: fetch.value.clone(),
+                field,
+                locator: Some(locator),
+                editable_columns,
+                editing,
+                grid_editing,
+            }
+        },
+    }
+}
+
+/// A field's value: rendered for reading, or the shared [`CellEditor`] while
+/// this field is the panel's active edit.
+///
+/// Commits go through [`AppState::stage_cell_edit`] — the same call the grid
+/// cell makes — so an edit here joins the same staged set and is saved by the
+/// same Save button. There is deliberately no second write route.
+#[component]
+fn RowDetailValue(
+    id: ConnectionId,
+    table: TableRef,
+    field: DetailField,
+    /// The complete value: fetched for a previewed cell, `field.value`
+    /// otherwise. The editor must never start from a preview (FRE-33).
+    value: Value,
+    locator: Option<RowLocator>,
+    dialect: Dialect,
+    editable_columns: Vec<String>,
+    mut editing: Signal<Option<String>>,
+    mut grid_editing: Signal<Option<ActiveEdit>>,
+) -> Element {
+    let state = use_context::<AppState>();
+    // `field.editable` already folds in the resolved capability and the
+    // user's marking; the locator is what makes the row addressable.
+    let editable = field.editable && locator.is_some();
+    let active = editable && editing.read().as_deref() == Some(field.column.as_str());
+
+    if active {
+        let locator = locator.expect("an editable field has a locator");
+        let column = field.column.clone();
+        let step_columns = editable_columns.clone();
+        return rsx! {
+            CellEditor {
+                // A block wrapper, not a table cell: this is a form, not a row.
+                block: true,
+                kind: field.kind.clone(),
+                dialect,
+                nullable: field.nullable,
+                initial: value,
+                draft: None,
+                on_commit: move |(committed, nav): (Option<Value>, EditNav)| {
+                    if let Some(committed) = committed {
+                        state.stage_cell_edit(id, &table, locator.clone(), &column, committed);
+                    }
+                    // Tab walks the panel's fields the way it walks a row's
+                    // cells in the grid.
+                    editing.set(match nav {
+                        EditNav::Stay => None,
+                        EditNav::Next => step_column(&step_columns, &column, 1),
+                        EditNav::Prev => step_column(&step_columns, &column, -1),
+                    });
+                },
+                on_cancel: move |_| editing.set(None),
+                // No `on_draft`: unlike a grid row, a panel field is not
+                // unmounted out from under the editor by scrolling (FRE-74),
+                // so there is nothing to stash and restore.
+            }
+        };
+    }
+
+    // Captures only signals, so it is `Copy` and both affordances below can
+    // take it. Closing the grid's editor first keeps a single one mounted:
+    // two would share an element id and race for the keyboard. Guarded on one
+    // actually being open — an unconditional `set` still marks the signal
+    // dirty, and the grid's "nothing is being edited, take the focus back"
+    // effect would then yank focus off the editor mounting here.
+    let mut activate = move |column: &str| {
+        if grid_editing.peek().is_some() {
+            grid_editing.set(None);
+        }
+        editing.set(Some(column.to_string()));
+    };
+    let dbl_column = field.column.clone();
+    let button_column = field.column.clone();
+    let display = value.display();
+    rsx! {
+        div { class: "flex items-start gap-1",
+            div {
+                class: "min-w-0 flex-1",
+                ondoubleclick: move |_| {
+                    if editable {
+                        activate(&dbl_column);
+                    }
+                },
+                match &value {
+                    // NULL reads distinctly from an empty string, exactly as
+                    // it does in the grid.
+                    Value::Null => rsx! {
+                        span { class: "font-mono text-xs italic text-slate-400 dark:text-slate-600", "NULL" }
+                    },
+                    Value::Blob(_) => rsx! {
+                        span { class: "font-mono text-xs text-violet-700 dark:text-violet-400", "{display}" }
+                    },
+                    _ => rsx! {
+                        pre { class: "max-h-64 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
+                            "{display}"
+                        }
+                    },
+                }
+            }
+            if editable {
+                button {
+                    class: "shrink-0 rounded p-0.5 text-slate-400 opacity-60 hover:bg-slate-200 dark:hover:bg-slate-800 hover:opacity-100",
+                    title: "Edit this value (or double-click it)",
+                    onclick: move |_| activate(&button_column),
+                    Pencil { size: 12 }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3740,5 +4460,240 @@ mod tests {
             confirm_notice(2, 3),
             "This will delete exactly 2 rows and apply 3 other change(s). Click again to save."
         );
+    }
+
+    // ---- Row detail panel (FRE-109) --------------------------------------
+
+    /// The metadata [`row_detail`] needs beside a [`GridNav`], for a
+    /// two-column page (`id` int PK, `title` text) with a foreign key on
+    /// `title`.
+    struct DetailFixture {
+        nav: GridNav,
+        columns: Vec<ColumnMeta>,
+        kinds: HashMap<String, (EditorKind, bool)>,
+        fks: Vec<ForeignKeyMeta>,
+        col_to_fk: HashMap<String, usize>,
+    }
+
+    impl DetailFixture {
+        /// [`row_detail`] over this fixture's metadata.
+        fn detail(&self, nav: &GridNav, focused: Option<(usize, usize)>) -> Option<RowDetail> {
+            row_detail(
+                nav,
+                focused,
+                &self.columns,
+                &self.kinds,
+                &self.fks,
+                &self.col_to_fk,
+            )
+        }
+    }
+
+    fn detail_fixture() -> DetailFixture {
+        let column = |name: &str, type_name: &str, pk: Option<u32>| ColumnMeta {
+            name: name.into(),
+            type_name: type_name.into(),
+            nullable: pk.is_none(),
+            primary_key_position: pk,
+            default: None,
+            generated: Generated::Never,
+            type_detail: crate::db::TypeDetail::Plain,
+        };
+        let columns = vec![
+            column("id", "INTEGER", Some(1)),
+            column("title", "TEXT", None),
+        ];
+        let column_kinds = column_kinds_of(Some(&TableMeta {
+            schema: None,
+            name: "t".into(),
+            kind: crate::db::TableKind::Table,
+            columns: columns.clone(),
+            indexes: vec![],
+            foreign_keys: vec![],
+            restriction: None,
+        }));
+        let foreign_keys = vec![ForeignKeyMeta {
+            columns: vec!["title".into()],
+            referenced_schema: None,
+            referenced_table: "titles".into(),
+            referenced_columns: vec![Some("name".into())],
+        }];
+        let col_to_fk = [("title".to_string(), 0)].into_iter().collect();
+        let result = two_column_result();
+        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), None, true);
+        let nav = GridNav::build(vec!["id".into(), "title".into()], &rows, &column_kinds);
+        DetailFixture {
+            nav,
+            columns,
+            kinds: column_kinds,
+            fks: foreign_keys,
+            col_to_fk,
+        }
+    }
+
+    #[test]
+    fn the_detail_panel_describes_the_focused_row_and_only_that_row() {
+        let fixture = detail_fixture();
+        // The focused cell's *row* selects the row; its column is irrelevant.
+        for focus in [(1, 0), (1, 1)] {
+            let detail = fixture.detail(&fixture.nav, Some(focus)).unwrap();
+            assert_eq!(
+                detail.position,
+                DetailPosition {
+                    number: 2,
+                    total: 2
+                }
+            );
+            assert_eq!(
+                detail
+                    .fields
+                    .iter()
+                    .map(|f| f.column.as_str())
+                    .collect::<Vec<_>>(),
+                ["id", "title"]
+            );
+            assert_eq!(detail.fields[1].value, Value::Text("two".into()));
+            // The whole row travels with it, so an FK jump from any field
+            // builds the same filter the grid's ↗ would.
+            assert_eq!(detail.row_values["id"], Value::Integer(2));
+        }
+        // No focus yet (the page just arrived): the first row, not nothing.
+        let detail = fixture.detail(&fixture.nav, None).unwrap();
+        assert_eq!(detail.position.number, 1);
+        assert_eq!(detail.fields[1].value, Value::Text("one".into()));
+        // Nothing to describe on an empty page.
+        assert!(fixture.detail(&GridNav::default(), Some((0, 0))).is_none());
+    }
+
+    #[test]
+    fn detail_fields_carry_the_type_the_kind_and_the_grid_s_own_editability() {
+        let fixture = detail_fixture();
+        let detail = fixture.detail(&fixture.nav, Some((0, 0))).unwrap();
+        // Type shown beside the name, via the Schema pane's rendering.
+        assert_eq!(detail.fields[0].type_name, "integer");
+        assert_eq!(detail.fields[1].type_name, "text");
+        // Editor kind and nullability come from the same map the grid uses.
+        assert_eq!(detail.fields[1].kind, EditorKind::Text);
+        assert!(detail.fields[1].nullable);
+        assert!(!detail.fields[0].nullable);
+        // A non-NULL FK column offers the jump; a plain column doesn't.
+        assert_eq!(
+            detail.fields[1]
+                .fk
+                .as_ref()
+                .map(|fk| fk.referenced_table.as_str()),
+            Some("titles")
+        );
+        assert!(detail.fields[0].fk.is_none());
+        // Editability is the grid's answer, cell for cell — never re-derived.
+        for (field, cell) in detail.fields.iter().zip(&fixture.nav.rows[0].cells) {
+            assert_eq!(field.editable, cell.editable, "{}", field.column);
+        }
+    }
+
+    #[test]
+    fn a_read_only_table_offers_no_editors_in_the_panel_either() {
+        // `can_mutate = false` is how a read-only marking (FRE-111) reaches
+        // the grid; the panel must inherit it rather than resolve its own.
+        let fixture = detail_fixture();
+        let result = two_column_result();
+        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), None, false);
+        let nav = GridNav::build(vec!["id".into(), "title".into()], &rows, &fixture.kinds);
+        let detail = fixture.detail(&nav, Some((0, 0))).unwrap();
+        assert!(detail.fields.iter().all(|field| !field.editable));
+        // Reading still works: the row stays addressable so previews load.
+        assert!(detail.locator.is_some());
+    }
+
+    #[test]
+    fn a_staged_edit_shows_in_the_panel_as_the_same_change_the_grid_tints() {
+        let fixture = detail_fixture();
+        let mut stage = TableStage::default();
+        stage.set_cell_edit(
+            RowLocator {
+                identity_values: vec![Value::Integer(1)],
+            },
+            "title",
+            Value::Text("edited".into()),
+        );
+        let result = two_column_result();
+        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), Some(&stage), true);
+        let nav = GridNav::build(vec!["id".into(), "title".into()], &rows, &fixture.kinds);
+        let detail = fixture.detail(&nav, Some((0, 0))).unwrap();
+        assert!(detail.fields[1].dirty);
+        assert_eq!(detail.fields[1].value, Value::Text("edited".into()));
+        assert!(!detail.fields[0].dirty);
+        // …and the untouched row is untouched.
+        let detail = fixture.detail(&nav, Some((1, 0))).unwrap();
+        assert!(detail.fields.iter().all(|field| !field.dirty));
+    }
+
+    #[test]
+    fn a_previewed_field_is_marked_for_a_full_value_fetch() {
+        // The panel must show the whole value, so a truncated cell is flagged
+        // for the cell-fetch path rather than rendered from the prefix.
+        let fixture = detail_fixture();
+        let nav = previewed_nav(PREVIEW_BYTES as u64 * 4, Some(&pk_identity()));
+        let detail = fixture.detail(&nav, Some((0, 0))).unwrap();
+        let body = detail.fields.iter().find(|f| f.column == "body").unwrap();
+        assert!(
+            body.preview.is_some(),
+            "loaded through load_cell, not shown"
+        );
+        assert!(detail.locator.is_some(), "…which needs an addressable row");
+        // Without an identity the fetch is impossible and the panel says so.
+        let nav = previewed_nav(PREVIEW_BYTES as u64 * 4, None);
+        let detail = fixture.detail(&nav, Some((0, 0))).unwrap();
+        assert!(detail.locator.is_none());
+        // A row with no key still needs a stable identity for remounting.
+        assert_eq!(detail.row_key, "#0");
+    }
+
+    #[test]
+    fn prev_and_next_stop_at_the_ends_of_the_page() {
+        let ends = DetailPosition {
+            number: 1,
+            total: 1,
+        };
+        assert!(!ends.has_prev(), "first row");
+        assert!(!ends.has_next(), "…which is also the last");
+        let middle = DetailPosition {
+            number: 2,
+            total: 3,
+        };
+        assert!(middle.has_prev());
+        assert!(middle.has_next());
+        assert!(!DetailPosition {
+            number: 3,
+            total: 3
+        }
+        .has_next());
+
+        // A step resolves through the grid's own move logic, so it clamps at
+        // the page edges exactly as ↑/↓ do rather than wrapping or paging.
+        assert_eq!(
+            apply_grid_move((0, 1), RowStep::Prev.grid_move(), 3, 2),
+            FocusOutcome::Cell((0, 1)),
+        );
+        assert_eq!(
+            apply_grid_move((2, 1), RowStep::Next.grid_move(), 3, 2),
+            FocusOutcome::Cell((2, 1)),
+        );
+        // …and a step in the middle keeps the focused column.
+        assert_eq!(
+            apply_grid_move((1, 1), RowStep::Next.grid_move(), 3, 2),
+            FocusOutcome::Cell((2, 1)),
+        );
+    }
+
+    #[test]
+    fn a_dragged_panel_width_is_clamped_to_something_usable() {
+        assert_eq!(clamp_detail_width(400.0), 400.0);
+        assert_eq!(clamp_detail_width(10.0), DETAIL_MIN_WIDTH);
+        assert_eq!(clamp_detail_width(5_000.0), DETAIL_MAX_WIDTH);
+        // A nonsense report from the drag listener falls back to the default
+        // rather than writing NaN into the style attribute.
+        assert_eq!(clamp_detail_width(f64::NAN), DETAIL_WIDTH);
+        assert_eq!(clamp_detail_width(f64::INFINITY), DETAIL_WIDTH);
     }
 }

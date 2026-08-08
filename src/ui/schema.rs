@@ -337,7 +337,10 @@ fn ColumnRow(column: ColumnMeta) -> Element {
 /// the opaque `USER-DEFINED` / `ARRAY`, so the real name introspected for the
 /// editors (FRE-71) is shown instead — this pane is where a reader most wants
 /// it.
-fn display_type(column: &ColumnMeta) -> String {
+///
+/// Shared with the grid's row detail panel (FRE-109), which names each field's
+/// type beside it: the two views must not disagree about what a column is.
+pub(super) fn display_type(column: &ColumnMeta) -> String {
     match &column.type_detail {
         TypeDetail::Enum { type_ref, .. } => type_ref.name.clone(),
         // pg_catalog names an array type `_elem`; `elem[]` is how it is

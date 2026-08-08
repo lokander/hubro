@@ -72,6 +72,8 @@ const GLOBAL_KEYS_JS: &str = r#"
       return;
     }
     if (e.ctrlKey && (e.key === 'e' || e.key === 'E')) { e.preventDefault(); dioxus.send('pane'); return; }
+    // Ctrl+D docks/undocks the row detail panel beside the grid (FRE-109).
+    if (e.ctrlKey && (e.key === 'd' || e.key === 'D')) { e.preventDefault(); dioxus.send('rowdetail'); return; }
     if (e.ctrlKey && (e.key === 'b' || e.key === 'B')) {
       e.preventDefault();
       const btns = tableButtons();
@@ -103,6 +105,7 @@ pub fn Shell() -> Element {
                     "cheatsheet" => state.toggle_cheatsheet(),
                     "escape" => state.close_cheatsheet(),
                     "pane" => state.toggle_active_pane(),
+                    "rowdetail" => state.toggle_row_detail(),
                     _ => {}
                 }
             }
@@ -414,6 +417,7 @@ fn Cheatsheet() -> Element {
                         ShortcutRow { keys: "PageUp / PageDown", desc: "Previous / next page" }
                         ShortcutRow { keys: "Enter", desc: "Edit the cell, or show its full value" }
                         ShortcutRow { keys: "Esc", desc: "Close the popup / collapse the selection" }
+                        ShortcutRow { keys: "Ctrl+D", desc: "Toggle the row detail panel" }
                     }
                     ShortcutGroup { title: "Cell selection",
                         ShortcutRow { keys: "Shift+↑ ↓ ← →", desc: "Extend the selection" }

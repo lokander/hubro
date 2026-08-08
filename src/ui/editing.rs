@@ -356,6 +356,12 @@ pub fn CellEditor(
     /// Revert-to-database-default action. Existing rows have no default to
     /// revert to, so the grid only wires this for pending-insert cells.
     on_default: Option<EventHandler<()>>,
+    /// Wrap the editor in a plain `div` instead of a `td`. The grid mounts it
+    /// as the active cell of a `<table>` row; the row detail panel (FRE-109)
+    /// mounts the same editor in a vertical form, where a stray table cell
+    /// would drag in an anonymous table box around it.
+    #[props(default)]
+    block: bool,
 ) -> Element {
     let has_draft = draft.is_some();
     let initial_for_text = initial.clone();
@@ -489,124 +495,135 @@ pub fn CellEditor(
     let input_class =
         "w-full min-w-28 rounded border border-amber-500 bg-slate-100 dark:bg-slate-950 px-1.5 \
                        py-0.5 font-mono text-xs text-slate-900 dark:text-slate-100 outline-none";
-    rsx! {
-        td { class: "bg-amber-100 dark:bg-amber-900/30 px-1 py-0.5 align-top",
-            div { class: "flex items-start gap-1",
-                if let EditorKind::Enum { variants } = &*kind.read() {
-                    select {
-                        id: "dv-cell-editor",
-                        class: "{input_class}",
-                        onmounted: focus_on_mount,
-                        onchange: move |evt| {
-                            text.set(evt.value());
-                            modified.set(true);
-                            error.set(None);
-                            commit(EditNav::Stay);
-                        },
-                        onkeydown: on_key,
-                        onblur: move |_| commit(EditNav::Stay),
-                        // A NULL (or otherwise unmatched) cell needs a
-                        // selectable resting state, else the browser shows
-                        // the first variant as though it were the value.
-                        if !variants.iter().any(|v| *v == *text.read()) {
-                            option { value: "", selected: true, disabled: true, "—" }
-                        }
-                        for variant in variants.clone() {
-                            option {
-                                value: "{variant}",
-                                selected: variant == *text.read(),
-                                "{variant}"
-                            }
+    let body = rsx! {
+        div { class: "flex items-start gap-1",
+            if let EditorKind::Enum { variants } = &*kind.read() {
+                select {
+                    id: "dv-cell-editor",
+                    class: "{input_class}",
+                    onmounted: focus_on_mount,
+                    onchange: move |evt| {
+                        text.set(evt.value());
+                        modified.set(true);
+                        error.set(None);
+                        commit(EditNav::Stay);
+                    },
+                    onkeydown: on_key,
+                    onblur: move |_| commit(EditNav::Stay),
+                    // A NULL (or otherwise unmatched) cell needs a
+                    // selectable resting state, else the browser shows
+                    // the first variant as though it were the value.
+                    if !variants.iter().any(|v| *v == *text.read()) {
+                        option { value: "", selected: true, disabled: true, "—" }
+                    }
+                    for variant in variants.clone() {
+                        option {
+                            value: "{variant}",
+                            selected: variant == *text.read(),
+                            "{variant}"
                         }
                     }
-                } else if *kind.read() == EditorKind::Bool {
-                    input {
-                        r#type: "checkbox",
-                        id: "dv-cell-editor",
-                        class: "mx-1 my-0.5 accent-amber-500",
-                        checked: checked(),
-                        onmounted: focus_on_mount,
-                        oninput: move |evt| {
-                            checked.set(evt.checked());
-                            modified.set(true);
-                            commit(EditNav::Stay);
-                        },
-                        onkeydown: on_key,
-                        onblur: move |_| commit(EditNav::Stay),
-                    }
-                } else if multiline {
-                    textarea {
-                        id: "dv-cell-editor",
-                        class: "{input_class} min-w-48",
-                        rows: "3",
-                        value: "{text}",
-                        onmounted: focus_on_mount,
-                        oninput: move |evt| {
-                            text.set(evt.value());
-                            modified.set(true);
-                            error.set(None);
-                        },
-                        onkeydown: on_key,
-                        onblur: move |_| commit(EditNav::Stay),
-                    }
-                } else {
-                    input {
-                        r#type: "text",
-                        id: "dv-cell-editor",
-                        class: input_class,
-                        value: "{text}",
-                        placeholder: if initial.is_null() { "NULL" },
-                        onmounted: focus_on_mount,
-                        oninput: move |evt| {
-                            text.set(evt.value());
-                            modified.set(true);
-                            error.set(None);
-                        },
-                        onkeydown: on_key,
-                        onblur: move |_| commit(EditNav::Stay),
-                    }
                 }
-                if nullable {
-                    button {
-                        class: "shrink-0 rounded border border-slate-400 dark:border-slate-600 px-1.5 py-0.5 text-xs \
-                                text-slate-500 dark:text-slate-400 hover:border-amber-500 hover:text-amber-700 dark:hover:text-amber-300",
-                        title: "Stage NULL (distinct from an empty string)",
-                        tabindex: "-1",
-                        // prevent_default on mousedown keeps focus in the
-                        // input, so its blur-commit cannot race this button.
-                        onmousedown: move |evt| evt.prevent_default(),
-                        onclick: move |_| {
-                            if !finished() {
-                                finished.set(true);
-                                on_commit.call((Some(Value::Null), EditNav::Stay));
-                            }
-                        },
-                        "∅ NULL"
-                    }
+            } else if *kind.read() == EditorKind::Bool {
+                input {
+                    r#type: "checkbox",
+                    id: "dv-cell-editor",
+                    class: "mx-1 my-0.5 accent-amber-500",
+                    checked: checked(),
+                    onmounted: focus_on_mount,
+                    oninput: move |evt| {
+                        checked.set(evt.checked());
+                        modified.set(true);
+                        commit(EditNav::Stay);
+                    },
+                    onkeydown: on_key,
+                    onblur: move |_| commit(EditNav::Stay),
                 }
-                if let Some(on_default) = on_default {
-                    button {
-                        class: "flex shrink-0 items-center gap-1 rounded border border-slate-400 dark:border-slate-600 px-1.5 py-0.5 text-xs \
-                                text-slate-500 dark:text-slate-400 hover:border-emerald-500 hover:text-emerald-700 dark:hover:text-emerald-300",
-                        title: "Revert to database default (omit this column from the insert)",
-                        tabindex: "-1",
-                        // Same focus dance as the ∅ button: keep focus in
-                        // the input so blur-commit cannot race this click.
-                        onmousedown: move |evt| evt.prevent_default(),
-                        onclick: move |_| {
-                            if !finished() {
-                                finished.set(true);
-                                on_default.call(());
-                            }
-                        },
-                        RotateCcw { size: 12 }
-                        "default"
-                    }
+            } else if multiline {
+                textarea {
+                    id: "dv-cell-editor",
+                    class: "{input_class} min-w-48",
+                    rows: "3",
+                    value: "{text}",
+                    onmounted: focus_on_mount,
+                    oninput: move |evt| {
+                        text.set(evt.value());
+                        modified.set(true);
+                        error.set(None);
+                    },
+                    onkeydown: on_key,
+                    onblur: move |_| commit(EditNav::Stay),
+                }
+            } else {
+                input {
+                    r#type: "text",
+                    id: "dv-cell-editor",
+                    class: input_class,
+                    value: "{text}",
+                    placeholder: if initial.is_null() { "NULL" },
+                    onmounted: focus_on_mount,
+                    oninput: move |evt| {
+                        text.set(evt.value());
+                        modified.set(true);
+                        error.set(None);
+                    },
+                    onkeydown: on_key,
+                    onblur: move |_| commit(EditNav::Stay),
                 }
             }
-            if let Some(message) = error() {
-                div { class: "mt-0.5 max-w-md text-xs text-red-600 dark:text-red-400", "{message}" }
+            if nullable {
+                button {
+                    class: "shrink-0 rounded border border-slate-400 dark:border-slate-600 px-1.5 py-0.5 text-xs \
+                            text-slate-500 dark:text-slate-400 hover:border-amber-500 hover:text-amber-700 dark:hover:text-amber-300",
+                    title: "Stage NULL (distinct from an empty string)",
+                    tabindex: "-1",
+                    // prevent_default on mousedown keeps focus in the
+                    // input, so its blur-commit cannot race this button.
+                    onmousedown: move |evt| evt.prevent_default(),
+                    onclick: move |_| {
+                        if !finished() {
+                            finished.set(true);
+                            on_commit.call((Some(Value::Null), EditNav::Stay));
+                        }
+                    },
+                    "∅ NULL"
+                }
             }
+            if let Some(on_default) = on_default {
+                button {
+                    class: "flex shrink-0 items-center gap-1 rounded border border-slate-400 dark:border-slate-600 px-1.5 py-0.5 text-xs \
+                            text-slate-500 dark:text-slate-400 hover:border-emerald-500 hover:text-emerald-700 dark:hover:text-emerald-300",
+                    title: "Revert to database default (omit this column from the insert)",
+                    tabindex: "-1",
+                    // Same focus dance as the ∅ button: keep focus in
+                    // the input so blur-commit cannot race this click.
+                    onmousedown: move |evt| evt.prevent_default(),
+                    onclick: move |_| {
+                        if !finished() {
+                            finished.set(true);
+                            on_default.call(());
+                        }
+                    },
+                    RotateCcw { size: 12 }
+                    "default"
+                }
+            }
+        }
+        if let Some(message) = error() {
+            div { class: "mt-0.5 max-w-md text-xs text-red-600 dark:text-red-400", "{message}" }
+        }
+    };
+    // One editor, two wrappers (see `block`): the amber framing is the same
+    // either way, so a staged edit reads identically in the grid and in the
+    // row detail panel.
+    let frame = "bg-amber-100 dark:bg-amber-900/30 px-1 py-0.5 align-top";
+    if block {
+        rsx! {
+            div { class: "{frame} rounded", {body} }
+        }
+    } else {
+        rsx! {
+            td { class: frame, {body} }
         }
     }
 }
