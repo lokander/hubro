@@ -169,6 +169,10 @@ fn write_csv_field(field: &str, out: &mut impl Write) -> io::Result<()> {
 }
 
 /// The bare string form of a cell for CSV (before quoting).
+///
+/// The clipboard's delimited formats (FRE-110) mirror this arm for arm except
+/// for NULL, which they must keep distinct from the empty string — see
+/// [`super::clipboard`].
 fn csv_cell(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
@@ -185,7 +189,10 @@ fn csv_cell(value: &Value) -> String {
 /// leading-apostrophe prefix. Text only — numbers render bare (`-7` must
 /// stay a number) and blobs are `\x`-prefixed; JSON is not an executable
 /// format and stays verbatim.
-fn harden_csv_text(text: &str) -> String {
+///
+/// Shared with the clipboard formats (FRE-110): pasting text into a
+/// spreadsheet runs the same formulas that opening a file does.
+pub(crate) fn harden_csv_text(text: &str) -> String {
     if text.starts_with(['=', '+', '-', '@', '\t']) {
         format!("'{text}")
     } else {
@@ -236,9 +243,9 @@ fn write_json_value(value: &Value, out: &mut impl Write) -> io::Result<()> {
     }
 }
 
-/// Postgres-style `\x…` hex rendering of a blob, shared by both formats so a
-/// round-trip is unambiguous.
-fn hex_literal(bytes: &[u8]) -> String {
+/// Postgres-style `\x…` hex rendering of a blob, shared by both formats — and
+/// by the clipboard ones (FRE-110) — so a round-trip is unambiguous.
+pub(crate) fn hex_literal(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(2 + bytes.len() * 2);
     s.push_str("\\x");
     for byte in bytes {

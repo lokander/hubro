@@ -4,14 +4,15 @@ use dioxus::prelude::*;
 use dioxus_icons::lucide::{File, RefreshCw, SearchX, ShieldAlert, X};
 
 use crate::db::{
-    ConnectionId, Dialect, ExportFormat, Filter, FilterOp, ForeignKeyMeta, Generated, Page,
-    PageRequest, PreviewInfo, QueryResult, RowIdentity, RowLocator, SortDir, StagedChange,
-    TableAccess, TableMeta, Value, FETCH_CELL_MAX_BYTES,
+    raw_cell_text, render_copy, ConnectionId, CopyBlock, CopyFormat, Dialect, ExportFormat, Filter,
+    FilterOp, ForeignKeyMeta, Generated, Page, PageRequest, PreviewInfo, QueryResult, RowIdentity,
+    RowLocator, SortDir, StagedChange, TableAccess, TableMeta, Value, FETCH_CELL_MAX_BYTES,
 };
 use crate::util::human_bytes;
 
 use super::editing::{editor_kind, CellEditor, EditNav, EditorKind};
 use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState};
+use super::selection::Selection;
 use super::stage::{required_insert_columns, PendingInsert, TableStage};
 use super::state::{AppState, ExportPane, ExportStatus, SchemaLoad, TableRef};
 
@@ -118,6 +119,17 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // Keyboard focus ring in the grid (row, col into the visible page's
     // rows × columns), and the value-expand popup (FRE-15).
     let mut focused_cell = use_signal(|| Option::<(usize, usize)>::None);
+    // The other corner of a rectangular cell selection (FRE-110); the focus
+    // ring is the near corner. `None` means the selection is exactly the
+    // focused cell — the common case, and why this is a separate signal
+    // rather than a rewrite of `focused_cell`: every existing focus behaviour
+    // (clamping, scroll-into-view, Enter) keeps working untouched.
+    let mut selection_anchor = use_signal(|| Option::<(usize, usize)>::None);
+    // Outcome of the most recent copy, shown in the toolbar until the next
+    // copy or a page/selection reset. Also carries a refusal (FRE-110).
+    let mut copy_status = use_signal(|| Option::<CopyStatus>::None);
+    // Whether the copy-as menu is open.
+    let mut copy_menu = use_signal(|| false);
     // The value-expand popup (FRE-15): either an already-known short value
     // rendered inline, or a truncated cell whose full value is fetched on
     // demand (FRE-33).
@@ -212,6 +224,11 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         // Re-seed the focus ring at the first cell and drop any expand popup;
         // the clamp effect below trims it to None for an empty page.
         focused_cell.set(Some((0, 0)));
+        // …and collapse the cell selection to it (FRE-110): the rows under a
+        // rectangle spanning the old page are not the rows the user picked.
+        selection_anchor.set(None);
+        copy_status.set(None);
+        copy_menu.set(false);
         expanded.set(None);
         // Reset the windowed scroll position too (FRE-32) so a new page/sort/
         // filter starts at the top, both the tracked offset and the container.
@@ -388,19 +405,51 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // Keep the focus ring inside the current page and seed it once data
     // arrives, so it is visible and never indexes out of range after a page or
     // filter change shrinks the grid.
+    // The selection's far corner is clamped alongside the focus (FRE-110): a
+    // rectangle reaching past a page that just shrank would address rows the
+    // grid no longer has.
     use_effect(move || {
         let (rows, cols) = grid_nav.read().dims();
-        if rows == 0 || cols == 0 {
-            if focused_cell.peek().is_some() {
-                focused_cell.set(None);
+        let focus = *focused_cell.peek();
+        let anchor = *selection_anchor.peek();
+        let current = match focus {
+            Some(focus) => Selection {
+                anchor: anchor.unwrap_or(focus),
+                focus,
+            },
+            // Nothing focused yet: seed at the first cell if the page has one.
+            None => Selection::single((0, 0)),
+        };
+        match current.clamped(rows, cols) {
+            None => {
+                if focus.is_some() {
+                    focused_cell.set(None);
+                }
+                if anchor.is_some() {
+                    selection_anchor.set(None);
+                }
             }
-        } else {
-            let (r, c) = focused_cell.peek().unwrap_or((0, 0));
-            let clamped = (r.min(rows - 1), c.min(cols - 1));
-            if *focused_cell.peek() != Some(clamped) {
-                focused_cell.set(Some(clamped));
+            Some(clamped) => {
+                if focus != Some(clamped.focus) {
+                    focused_cell.set(Some(clamped.focus));
+                }
+                // Only re-pin an anchor that was actually set; a collapsed
+                // selection must stay collapsed.
+                if anchor.is_some() && anchor != Some(clamped.anchor) {
+                    selection_anchor.set(Some(clamped.anchor));
+                }
             }
         }
+    });
+
+    // The live cell selection (FRE-110): the focus ring's cell plus the
+    // anchor, when one is pinned. `None` only for a page with nothing to
+    // select. Derived rather than stored so the two corners can never drift
+    // apart from the focus the rest of the grid navigates by.
+    let selection = use_memo(move || {
+        let focus = (*focused_cell.read())?;
+        let anchor = selection_anchor.read().unwrap_or(focus);
+        Some(Selection { anchor, focus })
     });
 
     // Scroll the focused cell into view as it moves (FRE-15 + FRE-32). With
@@ -585,29 +634,102 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let confirm_save_table = table.clone();
     let dismiss_save_table = table.clone();
     let row_table = table.clone();
+    // Everything a clipboard copy needs besides the selection itself
+    // (FRE-110). Cloned per event handler; all of it is cheap.
+    let copy_ctx = CopyContext {
+        state,
+        id,
+        table: table.clone(),
+        dialect: dialect.unwrap_or(Dialect::Sqlite),
+        status: copy_status,
+    };
+    // Shape of the current selection — (rows, columns, cells) — for the Copy
+    // button's label and tooltip.
+    let selection_summary: Option<(usize, usize, usize)> = selection().map(|sel| {
+        let (rows, cols) = sel.size();
+        (rows, cols, sel.cell_count())
+    });
+
+    // Moves the focus ring to a clicked cell, extending the selection instead
+    // of collapsing it when Shift is held (FRE-110). A run of shift-clicks all
+    // extend from the same corner, because the anchor never moves.
+    let on_select_cell = move |(row, col, shift): (usize, usize, bool)| {
+        let focus = focused_cell.peek().unwrap_or((row, col));
+        let current = Selection {
+            anchor: selection_anchor.peek().unwrap_or(focus),
+            focus,
+        };
+        let next = if shift {
+            current.extended_to((row, col))
+        } else {
+            Selection::single((row, col))
+        };
+        selection_anchor.set(shift.then_some(next.anchor));
+        focused_cell.set(Some(next.focus));
+        copy_status.set(None);
+    };
 
     // Grid keyboard navigation (FRE-15). Attached to the focusable scroll
     // container, so it also receives keydowns bubbling from focused children;
     // it no-ops while an editor is open (whose own keys bubble here). Movement
     // and Enter act on `grid_nav`/`focused_cell`; PageUp/PageDown flip pages.
+    // Selection and copy (FRE-110) ride on the same model: Shift extends
+    // instead of collapsing, Ctrl+A / Shift+Space / Ctrl+Space select the
+    // page / row / column, and Ctrl+C copies.
+    let key_copy_ctx = copy_ctx.clone();
     let on_grid_key = move |evt: KeyboardEvent| {
         if editing.peek().is_some() {
             return;
         }
         let code = evt.code();
-        // Escape closes the value-expand popup, if one is open.
+        // Escape closes the value-expand popup, if one is open — and
+        // otherwise collapses a multi-cell selection back to the focus.
         if code == Code::Escape {
             if expanded.peek().is_some() {
                 evt.prevent_default();
                 expanded.set(None);
+            } else if selection_anchor.peek().is_some() {
+                evt.prevent_default();
+                selection_anchor.set(None);
             }
             return;
         }
+        let modifiers = evt.modifiers();
+        // Cmd on macOS is the same intent as Ctrl elsewhere for these.
+        let ctrl = modifiers.ctrl() || modifiers.meta();
+        let shift = modifiers.shift();
         let (rows, cols) = grid_nav.peek().dims();
         if rows == 0 || cols == 0 {
             return;
         }
         let pos = focused_cell.peek().unwrap_or((0, 0));
+        let current = Selection {
+            anchor: selection_anchor.peek().unwrap_or(pos),
+            focus: pos,
+        };
+        // Copy (FRE-110): the plain shortcut, so `None` — a single cell
+        // copies its raw value, a block copies TSV.
+        if ctrl && code == Code::KeyC {
+            evt.prevent_default();
+            copy_menu.set(false);
+            start_copy(&key_copy_ctx, &grid_nav.peek(), current, None);
+            return;
+        }
+        // Select all / whole row / whole column. Ctrl+A must also suppress
+        // the webview's own "select the page's text".
+        let axis = match code {
+            Code::KeyA if ctrl => Selection::all(rows, cols),
+            Code::Space if ctrl => Selection::column(pos.1, rows),
+            Code::Space if shift => Selection::row(pos.0, cols),
+            _ => None,
+        };
+        if let Some(axis) = axis {
+            evt.prevent_default();
+            selection_anchor.set(Some(axis.anchor));
+            focused_cell.set(Some(axis.focus));
+            copy_status.set(None);
+            return;
+        }
         if code == Code::Enter || code == Code::NumpadEnter {
             evt.prevent_default();
             let nav = grid_nav.peek();
@@ -623,7 +745,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                         draft: None,
                     })),
                     _ => {
-                        let view = match (cell.truncated, nav.rows[r].locator.clone()) {
+                        let view = match (cell.truncated(), nav.rows[r].locator.clone()) {
                             (true, Some(locator)) => ExpandView::Fetch {
                                 locator,
                                 column: cell.column.clone(),
@@ -636,12 +758,18 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             }
             return;
         }
-        let Some(mv) = grid_move_for(code, evt.modifiers().ctrl()) else {
+        let Some(mv) = grid_move_for(code, ctrl) else {
             return;
         };
         evt.prevent_default();
         match apply_grid_move(pos, mv, rows, cols) {
-            FocusOutcome::Cell(next) => focused_cell.set(Some(next)),
+            FocusOutcome::Cell(next) => {
+                // Shift extends the rectangle (the anchor stays where the
+                // selection started); an unmodified move collapses it.
+                let moved = current.extended_to(next);
+                selection_anchor.set(shift.then_some(moved.anchor));
+                focused_cell.set(Some(moved.focus));
+            }
             FocusOutcome::PrevPage => {
                 let p = *page.peek();
                 if p > 0 {
@@ -740,10 +868,58 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     }
                 }
                 div { class: "flex-1" }
+                if let Some(status) = copy_status.read().as_ref() {
+                    span {
+                        class: "min-w-0 truncate text-xs {status.class()}",
+                        title: "{status.text}",
+                        "{status.text}"
+                    }
+                }
                 if let Some(status) = export_status.as_ref() {
                     {
                         let (text, class) = status.line();
                         rsx! { span { class: "truncate text-xs {class}", title: "{text}", "{text}" } }
+                    }
+                }
+                // Copy-as menu (FRE-110). Copies the selected cells only —
+                // the Export buttons beside it cover the whole view.
+                if let Some((sel_rows, sel_cols, sel_cells)) = selection_summary {
+                    div { class: "relative shrink-0",
+                        button {
+                            class: "rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                            title: "Copy the {sel_cells} selected cell(s) — Ctrl+C copies TSV",
+                            onclick: move |_| {
+                                let open = *copy_menu.peek();
+                                copy_menu.set(!open);
+                            },
+                            "Copy {sel_rows}×{sel_cols} ▾"
+                        }
+                        if copy_menu() {
+                            // Full-screen catcher: a click anywhere else
+                            // closes the menu (no window-level listener).
+                            div {
+                                class: "fixed inset-0 z-30",
+                                onclick: move |_| copy_menu.set(false),
+                            }
+                            div { class: "absolute right-0 z-40 mt-1 w-44 overflow-hidden rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 py-1 shadow-lg",
+                                for format in COPY_FORMATS {
+                                    button {
+                                        key: "{format.label()}",
+                                        class: "block w-full px-3 py-1 text-left text-xs text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
+                                        onclick: {
+                                            let ctx = copy_ctx.clone();
+                                            move |_| {
+                                                copy_menu.set(false);
+                                                if let Some(selection) = *selection.peek() {
+                                                    start_copy(&ctx, &grid_nav.peek(), selection, Some(format));
+                                                }
+                                            }
+                                        },
+                                        "{format.label()}"
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 if let Some(export_dialect) = dialect {
@@ -904,7 +1080,12 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             // ring itself signals focus.
             div {
                 id: "dv-grid",
-                class: "min-h-0 flex-1 overflow-auto outline-none",
+                // `select-none` (FRE-110): shift-click extends the *cell*
+                // selection, and without this the webview drags its own text
+                // highlight across the rows at the same time, striping the
+                // grid. The expand popup renders outside this container, so
+                // its text stays selectable.
+                class: "min-h-0 flex-1 select-none overflow-auto outline-none",
                 tabindex: "0",
                 onkeydown: on_grid_key,
                 match current.as_ref() {
@@ -1024,12 +1205,26 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                                     }
                                                 }
                                             }
-                                            for header in headers {
-                                                GridHeader { name: header, sort: sort_value.clone(), on_sort: move |name: String| {
-                                                    let next = next_sort(&sort.peek(), &name);
-                                                    sort.set(next);
-                                                    page.set(0);
-                                                } }
+                                            for (col_index , header) in headers.into_iter().enumerate() {
+                                                GridHeader {
+                                                    name: header,
+                                                    sort: sort_value.clone(),
+                                                    on_sort: move |name: String| {
+                                                        let next = next_sort(&sort.peek(), &name);
+                                                        sort.set(next);
+                                                        page.set(0);
+                                                    },
+                                                    // Shift-click selects the whole column (FRE-110);
+                                                    // a plain click keeps sorting.
+                                                    on_select_column: move |_| {
+                                                        let rows = grid_nav.peek().rows.len();
+                                                        if let Some(axis) = Selection::column(col_index, rows) {
+                                                            selection_anchor.set(Some(axis.anchor));
+                                                            focused_cell.set(Some(axis.focus));
+                                                            copy_status.set(None);
+                                                        }
+                                                    },
+                                                }
                                             }
                                         }
                                     }
@@ -1061,6 +1256,12 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                                     Some((r, c)) if r == index => Some(c),
                                                     _ => None,
                                                 },
+                                                row_index: index,
+                                                // The inclusive span of selected columns in this row
+                                                // (FRE-110), or None when the row is outside the
+                                                // rectangle — so only rows whose span changed re-render.
+                                                selected_cols: selection().and_then(|sel| sel.columns_in(index)),
+                                                on_select_cell,
                                                 select_enabled,
                                                 selected,
                                                 on_fk_jump: {
@@ -1603,9 +1804,21 @@ struct GridNavCell {
     column: String,
     editable: bool,
     display: String,
+    /// The cell's value as fetched. For a cell carrying `preview` this is only
+    /// the bounded prefix — a copy must fetch the full value (FRE-110).
+    value: Value,
+    /// Full-value metadata when this cell is a truncated preview; drives both
+    /// the expand-on-Enter fetch (FRE-33) and the copy's fetch/refusal
+    /// decision (FRE-110).
+    preview: Option<PreviewInfo>,
+}
+
+impl GridNavCell {
     /// Whether this cell is a truncated preview — Enter expands it by fetching
     /// the full value rather than showing the in-hand preview (FRE-33).
-    truncated: bool,
+    fn truncated(&self) -> bool {
+        self.preview.is_some()
+    }
 }
 
 impl GridNav {
@@ -1626,7 +1839,8 @@ impl GridNav {
                         column: cell.column.clone(),
                         editable: cell_editable(cell, column_kinds),
                         display: cell_display(cell),
-                        truncated: cell.preview.is_some(),
+                        value: cell.value.clone(),
+                        preview: cell.preview,
                     })
                     .collect(),
             })
@@ -1638,6 +1852,279 @@ impl GridNav {
     fn dims(&self) -> (usize, usize) {
         (self.rows.len(), self.headers.len())
     }
+}
+
+/// The clipboard formats in copy-as menu order (FRE-110). TSV leads: it is
+/// what the plain shortcut produces and what spreadsheets want.
+const COPY_FORMATS: [CopyFormat; 6] = [
+    CopyFormat::Tsv { header: false },
+    CopyFormat::Tsv { header: true },
+    CopyFormat::Csv,
+    CopyFormat::Json,
+    CopyFormat::Insert,
+    CopyFormat::Markdown,
+];
+
+/// Outcome of the most recent copy, shown as a toolbar line (FRE-110). It
+/// stays until the next copy or a selection/page change, mirroring how the
+/// export status behaves.
+#[derive(Debug, Clone, PartialEq)]
+struct CopyStatus {
+    text: String,
+    error: bool,
+}
+
+impl CopyStatus {
+    fn ok(text: String) -> Self {
+        CopyStatus { text, error: false }
+    }
+
+    fn failed(text: String) -> Self {
+        CopyStatus { text, error: true }
+    }
+
+    fn class(&self) -> &'static str {
+        if self.error {
+            "text-red-600 dark:text-red-400"
+        } else {
+            "text-emerald-700 dark:text-emerald-400"
+        }
+    }
+}
+
+/// Everything a copy needs besides the selection: which connection and table
+/// the rows came from, the dialect to render SQL literals for, and where to
+/// report the outcome.
+#[derive(Clone)]
+struct CopyContext {
+    state: AppState,
+    id: ConnectionId,
+    table: TableRef,
+    dialect: Dialect,
+    status: Signal<Option<CopyStatus>>,
+}
+
+/// One cell of a planned copy: a value already held in full, or a ticket to
+/// load one the grid holds only a bounded preview of (FRE-33). Copying a
+/// preview would put silently truncated data on the clipboard, which is the
+/// one thing FRE-110 must not do.
+#[derive(Debug, Clone, PartialEq)]
+enum CopyCell {
+    Ready(Value),
+    Fetch { locator: RowLocator, column: String },
+}
+
+/// A copy reduced to what it needs: the selected column names and the
+/// selected cells, row-major.
+#[derive(Debug, Clone, PartialEq)]
+struct CopyPlan {
+    columns: Vec<String>,
+    rows: Vec<Vec<CopyCell>>,
+}
+
+/// Why a copy was refused outright (FRE-110). Refusing beats truncating: a
+/// truncated INSERT is still valid SQL and will run, writing wrong data with
+/// no error anywhere.
+#[derive(Debug, Clone, PartialEq)]
+enum CopyRefusal {
+    /// A selected cell is bigger than what a cell fetch can load.
+    TooLarge { column: String, full_len: u64 },
+    /// A selected cell is only a preview and its row has no locator (a view,
+    /// or a keyless table), so the full value can't be loaded at all.
+    Unaddressable { column: String },
+}
+
+impl CopyRefusal {
+    /// The toolbar line: names the offending column and the cap, and points
+    /// at the export, which streams and has no such limit.
+    fn message(&self) -> String {
+        match self {
+            CopyRefusal::TooLarge { column, full_len } => format!(
+                "Can't copy: \"{column}\" holds {}, over the {} copy limit. Use Export for values this large.",
+                human_bytes(*full_len),
+                human_bytes(FETCH_CELL_MAX_BYTES as u64),
+            ),
+            CopyRefusal::Unaddressable { column } => format!(
+                "Can't copy: \"{column}\" is truncated and this table's rows can't be addressed to load the full value. Use Export instead."
+            ),
+        }
+    }
+}
+
+/// Reduces a selection over the visible page to a [`CopyPlan`], or refuses it
+/// (FRE-110). Pure — the async value loading happens in [`start_copy`].
+///
+/// Cells outside the page (a selection racing a shrinking page) are skipped
+/// rather than erroring; the clamp effect normally prevents that.
+fn plan_copy(nav: &GridNav, selection: Selection) -> Result<CopyPlan, CopyRefusal> {
+    let rect = selection.bounds();
+    let columns: Vec<String> = (rect.left..=rect.right)
+        .filter_map(|col| nav.headers.get(col).cloned())
+        .collect();
+    let mut rows = Vec::new();
+    for row_index in rect.top..=rect.bottom {
+        let Some(row) = nav.rows.get(row_index) else {
+            continue;
+        };
+        let mut cells = Vec::new();
+        for col in rect.left..=rect.right {
+            let Some(cell) = row.cells.get(col) else {
+                continue;
+            };
+            let Some(preview) = cell.preview else {
+                cells.push(CopyCell::Ready(cell.value.clone()));
+                continue;
+            };
+            if preview.full_len > FETCH_CELL_MAX_BYTES as u64 {
+                return Err(CopyRefusal::TooLarge {
+                    column: cell.column.clone(),
+                    full_len: preview.full_len,
+                });
+            }
+            match row.locator.clone() {
+                Some(locator) => cells.push(CopyCell::Fetch {
+                    locator,
+                    column: cell.column.clone(),
+                }),
+                None => {
+                    return Err(CopyRefusal::Unaddressable {
+                        column: cell.column.clone(),
+                    })
+                }
+            }
+        }
+        rows.push(cells);
+    }
+    Ok(CopyPlan { columns, rows })
+}
+
+/// Copies `selection` to the clipboard in `format` — or, for `None` (the
+/// plain Ctrl+C shortcut), as the raw value of a single cell and TSV for a
+/// block (FRE-110).
+///
+/// Plans synchronously so an oversize selection is refused before anything
+/// runs, then resolves any previewed cells to their full values in a spawned
+/// task. No signal borrow crosses an await: `load_cell` clones the pool and
+/// metadata out of the signals before it awaits, and the plan is owned.
+fn start_copy(ctx: &CopyContext, nav: &GridNav, selection: Selection, format: Option<CopyFormat>) {
+    let mut status = ctx.status;
+    let plan = match plan_copy(nav, selection) {
+        Ok(plan) => plan,
+        Err(refusal) => {
+            status.set(Some(CopyStatus::failed(refusal.message())));
+            return;
+        }
+    };
+    let (format, raw) = match format {
+        Some(format) => (format, false),
+        None => (CopyFormat::Tsv { header: false }, selection.is_single()),
+    };
+    let (state, id, dialect) = (ctx.state, ctx.id, ctx.dialect);
+    let table = ctx.table.clone();
+    let (rows_selected, cols_selected) = selection.size();
+    spawn(async move {
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(plan.rows.len());
+        for planned in plan.rows {
+            let mut values = Vec::with_capacity(planned.len());
+            for cell in planned {
+                match cell {
+                    CopyCell::Ready(value) => values.push(value),
+                    CopyCell::Fetch { locator, column } => {
+                        match state
+                            .load_cell(id, table.clone(), locator, column.clone())
+                            .await
+                        {
+                            // The value grew past the cap between the page
+                            // fetch and now, or the page's length estimate was
+                            // low: refuse rather than copy the prefix.
+                            Ok(fetch) if fetch.capped => {
+                                status.set(Some(CopyStatus::failed(
+                                    CopyRefusal::TooLarge {
+                                        column,
+                                        full_len: fetch.full_len,
+                                    }
+                                    .message(),
+                                )));
+                                return;
+                            }
+                            Ok(fetch) => values.push(fetch.value),
+                            Err(err) => {
+                                status.set(Some(CopyStatus::failed(format!("Copy failed: {err}"))));
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            rows.push(values);
+        }
+        let text = if raw {
+            rows.first()
+                .and_then(|row| row.first())
+                .map(raw_cell_text)
+                .unwrap_or_default()
+        } else {
+            let block = CopyBlock {
+                schema: table.schema.clone(),
+                table: table.name.clone(),
+                columns: plan.columns,
+                rows,
+            };
+            render_copy(&block, format, dialect)
+        };
+        write_clipboard(&text);
+        status.set(Some(CopyStatus::ok(copy_summary(
+            raw,
+            format,
+            rows_selected,
+            cols_selected,
+        ))));
+    });
+}
+
+/// The success line for a finished copy.
+fn copy_summary(raw: bool, format: CopyFormat, rows: usize, cols: usize) -> String {
+    if raw {
+        return "Copied the cell value".to_string();
+    }
+    if rows == 1 && cols == 1 {
+        format!("Copied 1 cell as {}", format.label())
+    } else {
+        format!("Copied {rows}×{cols} cells as {}", format.label())
+    }
+}
+
+/// Puts `text` on the system clipboard through the webview.
+///
+/// `navigator.clipboard` is the modern path; the hidden-textarea
+/// `execCommand` fallback covers a webview that withholds it (no secure
+/// context, or a rejected permission), because a copy that silently does
+/// nothing is indistinguishable from a broken app. The fallback restores the
+/// previously focused element so the grid keeps its keyboard focus.
+fn write_clipboard(text: &str) {
+    let json = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into());
+    document::eval(&format!(
+        r#"(() => {{
+  const text = {json};
+  const fallback = () => {{
+    const prev = document.activeElement;
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.top = '-1000px';
+    document.body.appendChild(ta);
+    ta.select();
+    try {{ document.execCommand('copy'); }} catch (e) {{ /* nothing else to try */ }}
+    document.body.removeChild(ta);
+    if (prev && prev.focus) prev.focus();
+  }};
+  if (navigator.clipboard && navigator.clipboard.writeText) {{
+    navigator.clipboard.writeText(text).catch(fallback);
+  }} else {{
+    fallback();
+  }}
+}})();"#
+    ));
 }
 
 /// Opens a native save dialog and, on a chosen path, streams the current
@@ -1733,6 +2220,8 @@ fn GridHeader(
     name: String,
     sort: Option<(String, SortDir)>,
     on_sort: EventHandler<String>,
+    /// Shift-click: select this whole column instead of sorting (FRE-110).
+    on_select_column: EventHandler<()>,
 ) -> Element {
     let marker = match &sort {
         Some((c, SortDir::Asc)) if *c == name => " ▲",
@@ -1744,7 +2233,14 @@ fn GridHeader(
         th { class: "border-b border-slate-300 dark:border-slate-700 px-3 py-1.5",
             button {
                 class: "font-mono text-xs font-semibold text-slate-900 dark:text-slate-300 hover:text-slate-950 dark:hover:text-white",
-                onclick: move |_| on_sort.call(clicked_name.clone()),
+                title: "Click to sort, Shift+click to select the column",
+                onclick: move |evt: MouseEvent| {
+                    if evt.modifiers().shift() {
+                        on_select_column.call(());
+                    } else {
+                        on_sort.call(clicked_name.clone());
+                    }
+                },
                 "{name}{marker}"
             }
         }
@@ -1770,6 +2266,13 @@ fn GridRow(
     /// The keyboard-focused column in this row (FRE-15), or `None` when the
     /// focus ring is on another row.
     focused_col: Option<usize>,
+    /// This row's index on the page, so a clicked cell can address itself.
+    row_index: usize,
+    /// The inclusive span of selected columns in this row (FRE-110), or
+    /// `None` when the selection rectangle doesn't cover this row.
+    selected_cols: Option<(usize, usize)>,
+    /// A click on a cell: `(row, column, shift held)`.
+    on_select_cell: EventHandler<(usize, usize, bool)>,
     select_enabled: bool,
     mut selected: Signal<HashMap<String, RowLocator>>,
     /// Follows the FK a clicked cell belongs to, carrying that FK plus this
@@ -1836,6 +2339,11 @@ fn GridRow(
                     nullable: cell_kind(&cell, &column_kinds).1,
                     editable: cell_editable(&cell, &column_kinds),
                     focused: focused_col == Some(col_index),
+                    selected: selected_cols
+                        .is_some_and(|(left, right)| (left..=right).contains(&col_index)),
+                    row_index,
+                    col_index,
+                    on_select_cell,
                     cell: cell.clone(),
                     dialect,
                     editable_columns: editable_columns.clone(),
@@ -1870,6 +2378,12 @@ fn GridCellSlot(
     editable: bool,
     /// Whether this cell holds the grid's keyboard focus ring (FRE-15).
     focused: bool,
+    /// Whether this cell is inside the selection rectangle (FRE-110).
+    selected: bool,
+    /// This cell's page coordinates, for the click-to-select handler.
+    row_index: usize,
+    col_index: usize,
+    on_select_cell: EventHandler<(usize, usize, bool)>,
     dialect: Dialect,
     editable_columns: Vec<String>,
     mut editing: Signal<Option<ActiveEdit>>,
@@ -1995,15 +2509,26 @@ fn GridCellSlot(
         } else {
             ""
         };
-        let class = if cell.dirty {
-            format!("px-3 py-1 {text} bg-amber-100 dark:bg-amber-900/40{ring}")
-        } else {
-            format!("px-3 py-1 {text}{ring}")
+        // One background per cell — Tailwind classes can't be layered, so the
+        // four combinations of dirty × selected (FRE-110) are spelled out. A
+        // dirty cell keeps its amber, deepened while selected, so staged edits
+        // never disappear under the selection tint.
+        let background = match (cell.dirty, selected) {
+            (true, true) => " bg-amber-200 dark:bg-amber-800/60",
+            (true, false) => " bg-amber-100 dark:bg-amber-900/40",
+            (false, true) => " bg-sky-100 dark:bg-sky-900/40",
+            (false, false) => "",
         };
+        let class = format!("px-3 py-1 {text}{background}{ring}");
         rsx! {
             td {
                 class,
                 id: if focused { "dv-focused-cell" },
+                // A click moves the focus ring here; Shift extends the
+                // selection to it (FRE-110).
+                onclick: move |evt: MouseEvent| {
+                    on_select_cell.call((row_index, col_index, evt.modifiers().shift()));
+                },
                 // Double-click opens the editor with the mouse; keyboard
                 // activation (Enter) is handled centrally by the grid
                 // container via the focus ring (FRE-15).
@@ -2465,15 +2990,12 @@ fn pretty_json(text: &str) -> Option<String> {
 /// form, which is for reading, not round-tripping.
 #[component]
 fn CopyRawButton(raw: String) -> Element {
-    let raw_json = serde_json::to_string(&raw).unwrap_or_else(|_| "\"\"".into());
     rsx! {
         div { class: "mb-1 flex justify-end",
             button {
                 class: "rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
                 title: "Copy the raw value (not the formatted view)",
-                onclick: move |_| {
-                    document::eval(&format!("navigator.clipboard.writeText({raw_json});"));
-                },
+                onclick: move |_| write_clipboard(&raw),
                 "Copy raw"
             }
         }
@@ -2483,6 +3005,7 @@ fn CopyRawButton(raw: String) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::PREVIEW_BYTES;
 
     #[test]
     fn pretty_json_formats_objects_and_arrays_only() {
@@ -2902,6 +3425,148 @@ mod tests {
         let (start, end) = compute_visible_range(99_999.0, 600.0, 33.0, 40, 8);
         assert_eq!(end, 40);
         assert!(start <= end);
+    }
+
+    /// A one-row page whose `body` cell is a truncated preview of `full_len`
+    /// (FRE-110 copy planning); `identity` decides whether its row can be
+    /// addressed to load the full value.
+    fn previewed_nav(full_len: u64, identity: Option<&RowIdentity>) -> GridNav {
+        let result = QueryResult {
+            columns: vec![
+                crate::db::ColumnInfo { name: "id".into() },
+                crate::db::ColumnInfo {
+                    name: "body".into(),
+                },
+            ],
+            rows: vec![vec![Value::Integer(1), Value::Text("prefix".into())]],
+        };
+        let previews = vec![vec![
+            None,
+            Some(PreviewInfo {
+                full_len,
+                binary: false,
+            }),
+        ]];
+        let rows = view_rows(&result, &previews, 0, identity, None, true);
+        GridNav::build(vec!["id".into(), "body".into()], &rows, &HashMap::new())
+    }
+
+    #[test]
+    fn copy_plan_covers_exactly_the_selected_rectangle() {
+        let result = two_column_result();
+        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), None, true);
+        let nav = GridNav::build(vec!["id".into(), "title".into()], &rows, &HashMap::new());
+
+        // One cell: one column, one value.
+        let plan = plan_copy(&nav, Selection::single((1, 1))).unwrap();
+        assert_eq!(plan.columns, ["title"]);
+        assert_eq!(
+            plan.rows,
+            vec![vec![CopyCell::Ready(Value::Text("two".into()))]]
+        );
+
+        // The whole page, in row-major order.
+        let plan = plan_copy(&nav, Selection::all(2, 2).unwrap()).unwrap();
+        assert_eq!(plan.columns, ["id", "title"]);
+        assert_eq!(
+            plan.rows,
+            vec![
+                vec![
+                    CopyCell::Ready(Value::Integer(1)),
+                    CopyCell::Ready(Value::Text("one".into())),
+                ],
+                vec![
+                    CopyCell::Ready(Value::Integer(2)),
+                    CopyCell::Ready(Value::Text("two".into())),
+                ],
+            ]
+        );
+
+        // A whole column: both rows, one column.
+        let plan = plan_copy(&nav, Selection::column(0, 2).unwrap()).unwrap();
+        assert_eq!(plan.columns, ["id"]);
+        assert_eq!(plan.rows.len(), 2);
+        assert_eq!(plan.rows[1], vec![CopyCell::Ready(Value::Integer(2))]);
+    }
+
+    #[test]
+    fn copy_plan_tickets_previewed_cells_for_a_fetch() {
+        // A truncated cell must never be copied from the page: the plan asks
+        // for the full value through the row's locator (FRE-110).
+        let nav = previewed_nav(PREVIEW_BYTES as u64 * 4, Some(&pk_identity()));
+        let plan = plan_copy(&nav, Selection::all(1, 2).unwrap()).unwrap();
+        assert_eq!(
+            plan.rows[0],
+            vec![
+                CopyCell::Ready(Value::Integer(1)),
+                CopyCell::Fetch {
+                    locator: RowLocator {
+                        identity_values: vec![Value::Integer(1)],
+                    },
+                    column: "body".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn copy_plan_refuses_a_cell_over_the_fetch_cap() {
+        let full_len = FETCH_CELL_MAX_BYTES as u64 + 1;
+        let nav = previewed_nav(full_len, Some(&pk_identity()));
+        // The oversize column is only refused when it is actually selected.
+        assert!(plan_copy(&nav, Selection::single((0, 0))).is_ok());
+        assert_eq!(
+            plan_copy(&nav, Selection::single((0, 1))),
+            Err(CopyRefusal::TooLarge {
+                column: "body".into(),
+                full_len,
+            })
+        );
+        // The refusal names the column and the cap, and points at Export.
+        let message = CopyRefusal::TooLarge {
+            column: "body".into(),
+            full_len,
+        }
+        .message();
+        assert!(message.contains("\"body\""), "{message}");
+        assert!(message.contains("8.0 MB"), "{message}");
+        assert!(message.contains("Export"), "{message}");
+    }
+
+    #[test]
+    fn copy_plan_refuses_a_preview_it_cannot_load() {
+        // No row identity: the full value can't be fetched, and copying the
+        // prefix would silently truncate.
+        let nav = previewed_nav(PREVIEW_BYTES as u64 * 4, None);
+        assert_eq!(
+            plan_copy(&nav, Selection::single((0, 1))),
+            Err(CopyRefusal::Unaddressable {
+                column: "body".into()
+            })
+        );
+        let message = CopyRefusal::Unaddressable {
+            column: "body".into(),
+        }
+        .message();
+        assert!(message.contains("\"body\""), "{message}");
+        assert!(message.contains("Export"), "{message}");
+    }
+
+    #[test]
+    fn copy_summary_names_the_shape_and_format() {
+        assert_eq!(
+            copy_summary(false, CopyFormat::Csv, 3, 2),
+            "Copied 3×2 cells as CSV"
+        );
+        assert_eq!(
+            copy_summary(false, CopyFormat::Tsv { header: true }, 1, 1),
+            "Copied 1 cell as TSV with header"
+        );
+        // The plain shortcut on one cell copies the bare value.
+        assert_eq!(
+            copy_summary(true, CopyFormat::Tsv { header: false }, 1, 1),
+            "Copied the cell value"
+        );
     }
 
     #[test]
