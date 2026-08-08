@@ -148,6 +148,20 @@ pub struct TableMeta {
     ///
     /// [`TableAccess::resolve`]: super::caps::TableAccess::resolve
     pub restriction: Option<Restriction>,
+    /// The extension whose schema owns this object, when one does (FRE-88):
+    /// TimescaleDB's chunk tables in `_timescaledb_internal`, PostGIS's
+    /// `tiger`, Citus's catalogs. These are real, queryable objects — an
+    /// extension's bookkeeping rather than the user's data, and numerous
+    /// enough to bury it (a Timescale database with 40 days of daily chunks
+    /// reports 95 of them against 4 user tables).
+    ///
+    /// Recorded rather than filtered out during introspection so nothing
+    /// silently disappears: the sidebar hides these by default and says how
+    /// many it hid, and the SQL editor still completes them.
+    ///
+    /// `None` for ordinary user schemas, and always `None` on backends with
+    /// no extension concept (SQLite, SQL Server).
+    pub extension: Option<String>,
 }
 
 impl TableMeta {
@@ -189,6 +203,7 @@ mod tests {
             indexes: vec![],
             foreign_keys: vec![],
             restriction: None,
+            extension: None,
         };
         let pk: Vec<&str> = table
             .primary_key()

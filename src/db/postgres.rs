@@ -528,10 +528,35 @@ fn line_col(sql: &str, position: usize) -> Option<(usize, usize)> {
 
 /// Full multi-schema introspection: every user schema's tables and views
 /// with columns, primary keys, indexes (incl. unique), and foreign keys —
-/// parity with the SQLite metadata model. Four batched queries regardless
+/// parity with the SQLite metadata model. Five batched queries regardless
 /// of table count.
 pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
     let map_err = |e: sqlx::Error| DbError::Introspect(e.to_string());
+
+    // Which schemas an extension created (FRE-88). `pg_depend` records the
+    // namespace → extension dependency, so this catches every extension's
+    // internal schemas by construction rather than by matching name
+    // patterns: TimescaleDB's seven `_timescaledb_*`/`timescaledb_*`
+    // schemas, PostGIS's `tiger`/`topology`, Citus's catalogs. A schema the
+    // user made themselves has no such dependency even if an extension puts
+    // objects in it, which is the distinction that matters — `public` holds
+    // PostGIS's functions but is still the user's schema.
+    let extension_rows = sqlx::query(
+        "SELECT n.nspname, e.extname \
+         FROM pg_namespace n \
+         JOIN pg_depend d ON d.classid = 'pg_namespace'::regclass AND d.objid = n.oid \
+         JOIN pg_extension e ON e.oid = d.refobjid \
+          AND d.refclassid = 'pg_extension'::regclass",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(map_err)?;
+    let mut extension_schemas: HashMap<String, String> = HashMap::new();
+    for row in &extension_rows {
+        let schema: String = get(row, "nspname")?;
+        let extension: String = get(row, "extname")?;
+        extension_schemas.insert(schema, extension);
+    }
 
     // Tables and views across all non-system schemas. Materialized views
     // (relkind 'm') are not in information_schema, so they come from a
@@ -686,8 +711,10 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
     let mut tables: Vec<TableMeta> = Vec::with_capacity(table_rows.len());
     for row in &table_rows {
         let table_type: String = get(row, "table_type")?;
+        let schema: String = get(row, "table_schema")?;
+        let extension = extension_schemas.get(&schema).cloned();
         tables.push(TableMeta {
-            schema: Some(get(row, "table_schema")?),
+            schema: Some(schema),
             name: get(row, "table_name")?,
             kind: match table_type.as_str() {
                 "VIEW" => TableKind::View,
@@ -700,6 +727,7 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
             // No per-object narrowing: kind and row identity already carry
             // everything this backend knows about writability (FRE-87).
             restriction: None,
+            extension,
         });
     }
     let index_of = |schema: &str, name: &str, tables: &[TableMeta]| {

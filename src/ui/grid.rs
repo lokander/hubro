@@ -4715,6 +4715,7 @@ mod tests {
             indexes: vec![],
             foreign_keys: vec![],
             restriction: None,
+            extension: None,
         }));
         let foreign_keys = vec![ForeignKeyMeta {
             columns: vec!["title".into()],

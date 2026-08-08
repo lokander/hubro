@@ -1161,6 +1161,9 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
             // No per-object narrowing: kind and row identity already carry
             // everything this backend knows about writability (FRE-87).
             restriction: None,
+            // SQL Server has no extension-owned schemas; its system objects
+            // live in `sys`, which introspection already skips (FRE-88).
+            extension: None,
         });
     }
     let index_of = |schema: &str, name: &str, tables: &[TableMeta]| {
@@ -1691,6 +1694,7 @@ impl IndexDdl {
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             restriction: None,
+            extension: None,
         };
         Some(create_index_sql(Dialect::SqlServer, &table, &self.meta, &self.extras).sql)
     }
