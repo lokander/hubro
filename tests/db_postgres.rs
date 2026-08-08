@@ -503,17 +503,17 @@ async fn postgres_multi_schema_introspection_has_parity_metadata() {
     // Capabilities (FRE-87). Postgres declares the full set at the
     // connection level; the per-object resolution is what differs, and each
     // narrowing states its own reason.
-    assert_eq!(pool.capabilities(), Capabilities::FULL);
-    let stock_access = pool.access(stock);
+    assert_eq!(pool.backend_capabilities(), Capabilities::FULL);
+    let stock_access = pool.backend_access(stock);
     assert_eq!(stock_access.caps, Capabilities::FULL);
     assert_eq!(stock_access.restriction, None);
     assert!(stock_access.identity.is_some());
 
-    let view_access = pool.access(view);
+    let view_access = pool.backend_access(view);
     assert!(!view_access.can_mutate());
     assert_eq!(view_access.restriction, Some(Restriction::View));
 
-    let mv_access = pool.access(matview);
+    let mv_access = pool.backend_access(matview);
     assert!(!mv_access.can_mutate());
     assert_eq!(mv_access.restriction, Some(Restriction::MaterializedView));
     // Reduced, not disabled: browsing and paging a matview still work.
@@ -524,7 +524,7 @@ async fn postgres_multi_schema_introspection_has_parity_metadata() {
         .iter()
         .find(|t| t.schema.as_deref() == Some("warehouse") && t.name == "keyless")
         .unwrap();
-    let keyless_access = pool.access(keyless);
+    let keyless_access = pool.backend_access(keyless);
     assert!(!keyless_access.can_mutate());
     assert_eq!(keyless_access.restriction, Some(Restriction::NoRowIdentity));
     assert_eq!(keyless_access.identity, None);
@@ -820,7 +820,7 @@ async fn postgres_quoted_camelcase_enum_saves_through_the_staged_cast() {
     let identity = detect_row_identity(table, Dialect::Postgres).unwrap();
     let applied = hubro::db::apply_staged(
         &pool,
-        &pool.access(table),
+        &pool.backend_access(table),
         table,
         &identity,
         &[hubro::db::StagedChange::Update {

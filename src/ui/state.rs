@@ -732,6 +732,15 @@ impl AppState {
     /// Marking lives on the connections-list row rather than in the connect
     /// form because it has to reach SQLite entries too, and those have no
     /// edit form — the form only exists for the two server backends.
+    ///
+    /// `locator` is the entry's stored [`SavedConnection::locator`]. Open tabs
+    /// are keyed by the *canonical* [`saved_open_locator`] instead, and for a
+    /// SQLite path the two can differ (a symlinked directory, a relative path,
+    /// macOS `/tmp` → `/private/tmp`) — `normalize_and_dedup` deliberately
+    /// leaves SQLite paths alone. So the open tabs are re-marked through the
+    /// canonical form translated from the entry we just wrote, not through
+    /// `locator` directly: keying both lookups the same way would persist the
+    /// marking while leaving the open tab still accepting writes.
     pub fn set_saved_marking(
         mut self,
         locator: &str,
@@ -742,9 +751,19 @@ impl AppState {
             let mut saved = self.saved.write();
             saved.set_marking(locator, protection, color)
         };
-        if changed {
-            self.persist_saved();
-            self.remark_open_connections(locator);
+        if !changed {
+            return;
+        }
+        self.persist_saved();
+        let open_locator = self
+            .saved
+            .read()
+            .entries()
+            .iter()
+            .find(|saved| saved.locator() == locator)
+            .map(saved_open_locator);
+        if let Some(open_locator) = open_locator {
+            self.remark_open_connections(&open_locator);
         }
     }
 
@@ -1985,7 +2004,7 @@ impl AppState {
     pub fn marked_read_only(&self, id: ConnectionId) -> bool {
         self.registry.read().get(id).is_some_and(|connection| {
             connection.protection == WriteProtection::ReadOnly
-                && connection.pool.capabilities().mutate
+                && connection.pool.backend_capabilities().mutate
         })
     }
 
@@ -2143,7 +2162,7 @@ impl AppState {
     pub fn run_sql(mut self, id: ConnectionId, sql: String) {
         self.pending_sql.write().remove(&id);
         // Effective capabilities: the backend's, narrowed by the user's
-        // marking (FRE-111). Reading `pool.capabilities()` here instead would
+        // marking (FRE-111). Reading `pool.backend_capabilities()` here instead would
         // let a script write to a connection marked read-only.
         let (dialect, caps) = match self.registry.read().get(id) {
             Some(connection) => (connection.pool.dialect(), connection.capabilities()),
@@ -2578,7 +2597,7 @@ impl AppState {
         // A read path: it only needs the row to be addressable, so it uses
         // the resolved identity rather than the write capability — a
         // read-only connection still expands cells (FRE-87).
-        let Some(identity) = pool.access(&meta).identity else {
+        let Some(identity) = pool.backend_access(&meta).identity else {
             return Err("this table has no usable row identity".into());
         };
         pool.fetch_cell(&meta, &identity, &locator, &column)
@@ -2761,6 +2780,9 @@ impl AppState {
             staged.remove(&id);
         }
         drop(staged);
+        // A confirmation parked over changes that no longer exist (FRE-111)
+        // would otherwise sit there offering to apply nothing.
+        self.pending_saves.write().remove(&(id, table.key()));
         self.nav_guard.set(None);
     }
 
@@ -2849,14 +2871,16 @@ impl AppState {
     /// user nothing.
     pub fn save_staged(mut self, id: ConnectionId, table: &TableRef) {
         let key = (id, table.key());
+        // The parked intent is consumed first either way: `save_action`
+        // decides whether it still authorizes *these* changes, and a stale
+        // one is replaced rather than honoured. Taken before the empty-stage
+        // return so an emptied stage can't strand a banner offering to apply
+        // nothing.
+        let parked = self.pending_saves.write().remove(&key);
         let current = match self.table_stage(id, table) {
             Some(stage) if !stage.is_empty() => stage.changes(),
             _ => return,
         };
-        // The parked intent is consumed first either way: `save_action`
-        // decides whether it still authorizes *these* changes, and a stale
-        // one is replaced rather than honoured.
-        let parked = self.pending_saves.write().remove(&key);
         let protection = self.protection_of(id);
         match save_action(protection, parked.as_deref(), &current) {
             SaveAction::Apply => self.apply_staged_now(id, table),
@@ -3161,6 +3185,10 @@ impl AppState {
         self.tab_ui.write().remove(&id);
         self.sql_runs.write().remove(&id);
         self.pending_sql.write().remove(&id);
+        self.pending_saves
+            .write()
+            .retain(|(conn, _), _| *conn != id);
+        self.connection_colors.write().remove(&id);
         self.export_status
             .write()
             .retain(|(conn, _), _| *conn != id);

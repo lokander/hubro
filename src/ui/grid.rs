@@ -250,7 +250,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     // Row identity is a read concern here — it decides which
                     // columns must be fetched whole — so it comes from the
                     // resolved access, not from whether editing is allowed.
-                    let identity = connection.pool.access(meta).identity;
+                    let identity = connection.pool.backend_access(meta).identity;
                     let extra = match &identity {
                         Some(RowIdentity::Rowid { column }) => Some(column.clone()),
                         _ => None,
@@ -352,7 +352,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         // Same resolution the render uses, so keyboard navigation offers
         // exactly the editors the grid shows.
         let access = match (&table_meta, state.registry.read().get(id)) {
-            (Some(meta), Some(connection)) => Some(connection.pool.access(meta)),
+            (Some(meta), Some(connection)) => Some(connection.pool.backend_access(meta)),
             _ => None,
         };
         let identity = access.as_ref().and_then(|a| a.identity.clone());

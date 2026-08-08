@@ -233,23 +233,33 @@ impl TableAccess {
     /// and backend capability produce one effective answer instead of two
     /// checks that can disagree.
     ///
-    /// When the protection is what forbids the write, the reason says so
-    /// ([`USER_READ_ONLY`]) rather than blaming the backend: the user needs to
-    /// know this is a setting they can change, not a limit of the engine.
+    /// The marking takes the blame **only when it is what changed the
+    /// answer** ([`USER_READ_ONLY`]). If the object was already unwritable —
+    /// a view, a key-less table — or the backend already refused, that reason
+    /// stands. Telling someone "you marked this read-only" about a view would
+    /// send them to unmark it and find the write still refused.
+    ///
+    /// Note the asymmetry with the backend's own refusal, which [`Self::resolve`]
+    /// checks *before* the object's reason and so still wins over it. That
+    /// predates this and is left alone; the rule here is only about which
+    /// reason is actionable.
     pub fn resolve_protected(
         defaults: Capabilities,
         protection: WriteProtection,
         table: &TableMeta,
         dialect: Dialect,
     ) -> TableAccess {
+        // Resolved against the backend's own capabilities, so the object's
+        // verdict is known independently of the marking.
+        let mut access = TableAccess::resolve(defaults, table, dialect);
         let effective = protection.apply(defaults);
-        let mut access = TableAccess::resolve(effective, table, dialect);
-        if defaults.mutate && !effective.mutate {
-            // The backend would have allowed this; the marking is why it
-            // didn't. Wins over the object's own reason for the same reason
-            // the connection default does — it applies to every object here.
+        if access.restriction.is_none() && !effective.mutate {
             access.restriction = Some(USER_READ_ONLY);
         }
+        access.caps = Capabilities {
+            mutate: access.restriction.is_none() && effective.mutate,
+            ..effective
+        };
         access
     }
 
@@ -419,6 +429,36 @@ mod tests {
         // Reading is untouched, and the row stays addressable for cell fetch.
         assert!(access.caps.read_query);
         assert!(access.identity.is_some());
+    }
+
+    #[test]
+    fn an_objects_own_reason_survives_the_marking() {
+        // "You marked this read-only" about a view would send the user to
+        // unmark it and find the write still refused. The marking only takes
+        // the blame when it is what changed the answer.
+        for (kind, expected) in [
+            (TableKind::View, Restriction::View),
+            (TableKind::MaterializedView, Restriction::MaterializedView),
+        ] {
+            let t = table(kind, vec![col("id", Some(1))]);
+            let access = TableAccess::resolve_protected(
+                Capabilities::FULL,
+                WriteProtection::ReadOnly,
+                &t,
+                Dialect::Postgres,
+            );
+            assert_eq!(access.restriction, Some(expected));
+            assert!(!access.can_mutate());
+        }
+        // Same for a table with no addressable row.
+        let keyless = table(TableKind::Table, vec![col("data", None)]);
+        let access = TableAccess::resolve_protected(
+            Capabilities::FULL,
+            WriteProtection::ReadOnly,
+            &keyless,
+            Dialect::Postgres,
+        );
+        assert_eq!(access.restriction, Some(Restriction::NoRowIdentity));
     }
 
     #[test]
