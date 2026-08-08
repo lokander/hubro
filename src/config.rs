@@ -218,6 +218,25 @@ impl SavedConnection {
         }
     }
 
+    /// Folds `other`'s marking into this one, keeping whichever is stricter.
+    ///
+    /// The one merge rule, shared by every path where two entries collapse
+    /// into one: an edit that absorbs a duplicate ([`SavedList::update`]) and
+    /// the load-time dedup ([`normalize_and_dedup`]). Both used to keep the
+    /// survivor's marking and discard the other's, which is how a read-only
+    /// `prod` entry could vanish into an unmarked one still addressing
+    /// production — protection lost with the row that carried it.
+    ///
+    /// Stricter wins because the asymmetry is not close: keeping protection
+    /// the user no longer needs costs them one click, and dropping protection
+    /// they do need costs them the thing this whole feature exists to prevent.
+    pub fn merge_marking_from(&mut self, other: &SavedConnection) {
+        self.set_marking(
+            self.protection().max(other.protection()),
+            self.color().or(other.color()),
+        );
+    }
+
     /// Replaces the protection and colour, leaving everything else alone —
     /// the one write path for FRE-111's two fields, so no caller has to
     /// reconstruct a variant just to re-mark it.
@@ -616,6 +635,13 @@ pub struct SavedList {
 /// normalization existed (e.g. `postgresql://` or a portless URL) and
 /// de-duplicating it. The first entry for each locator wins, so its name is
 /// kept.
+///
+/// A dropped duplicate's **marking survives** into the entry that absorbs it
+/// ([`SavedConnection::merge_marking_from`], FRE-111). This dedup compares
+/// *normalized* URLs while `SavedList::update` compares the stored locator
+/// string, so two entries can coexist all session and only collapse at the
+/// next launch — discarding the loser's marking outright would silently
+/// unprotect a connection between one run and the next.
 fn normalize_and_dedup(entries: Vec<SavedConnection>) -> Vec<SavedConnection> {
     let mut out: Vec<SavedConnection> = Vec::new();
     for mut entry in entries {
@@ -633,8 +659,12 @@ fn normalize_and_dedup(entries: Vec<SavedConnection>) -> Vec<SavedConnection> {
             SavedConnection::Sqlite { .. } => {}
         }
         let locator = entry.locator();
-        if !out.iter().any(|existing| existing.locator() == locator) {
-            out.push(entry);
+        match out
+            .iter_mut()
+            .find(|existing| existing.locator() == locator)
+        {
+            Some(kept) => kept.merge_marking_from(&entry),
+            None => out.push(entry),
         }
     }
     out
@@ -736,21 +766,17 @@ impl SavedList {
             return false;
         };
         let new_locator = connection.locator().to_string();
-        let previous = &self.entries[index];
-        let mut protection = previous.protection();
-        let mut color = previous.color();
+        connection.set_marking(
+            self.entries[index].protection(),
+            self.entries[index].color(),
+        );
         // Fold in the marking of any entry this edit is about to absorb.
-        for absorbed in self
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(i, s)| *i != index && s.locator() == new_locator)
-            .map(|(_, s)| s)
-        {
-            protection = protection.max(absorbed.protection());
-            color = color.or(absorbed.color());
+        for i in 0..self.entries.len() {
+            if i != index && self.entries[i].locator() == new_locator {
+                let absorbed = self.entries[i].clone();
+                connection.merge_marking_from(&absorbed);
+            }
         }
-        connection.set_marking(protection, color);
         self.entries[index] = connection;
         // Drop any *other* entry the edit now collides with, keeping the one
         // just written.
@@ -1044,6 +1070,34 @@ mod tests {
             "the stricter marking survives the absorption"
         );
         assert_eq!(list.entries()[0].color(), Some(ConnectionColor::Red));
+    }
+
+    #[test]
+    fn a_marking_survives_the_load_time_dedup() {
+        // Reachable without hand-editing the file: `update` compares the
+        // stored locator string, this dedup compares *normalized* URLs. Mark
+        // prod read-only, then point staging at the same server spelled
+        // without the port — no string collision, so both persist. They only
+        // collapse at the next launch, and discarding the loser's marking
+        // there would leave an unmarked entry addressing production.
+        let mut marked = saved_pg("prod", "postgres://u@h:5432/db");
+        marked.set_marking(WriteProtection::ReadOnly, Some(ConnectionColor::Red));
+        let plain = saved_pg("staging", "postgres://u@h/db");
+
+        // Whichever order they sit in, the marking survives the collapse.
+        for entries in [
+            vec![marked.clone(), plain.clone()],
+            vec![plain.clone(), marked.clone()],
+        ] {
+            let deduped = normalize_and_dedup(entries);
+            assert_eq!(deduped.len(), 1, "the two spellings are one server");
+            assert_eq!(
+                deduped[0].protection(),
+                WriteProtection::ReadOnly,
+                "protection must not vanish between one run and the next"
+            );
+            assert_eq!(deduped[0].color(), Some(ConnectionColor::Red));
+        }
     }
 
     #[test]
