@@ -14,8 +14,10 @@ use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{Decimal, JsonValue, Uuid};
 use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
 
+use super::ddl::{create_table_sql, create_view_sql, ColumnExtra, Ddl, DdlObject, TableExtras};
 use super::error::DbError;
 use super::export::{export_io_err, ExportFormat, ExportSink};
+use super::page::Dialect;
 use super::schema::{
     ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta, TypeDetail, TypeRef,
 };
@@ -801,6 +803,219 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
     }
 
     Ok(tables)
+}
+
+/// DDL for one object (FRE-108).
+///
+/// Postgres renders view and index definitions itself (`pg_get_viewdef`,
+/// `pg_get_indexdef`), and those come back verbatim. It has no `CREATE TABLE`
+/// generator at all — `pg_dump` assembles that text in client code — so a
+/// table is rebuilt from the catalog here.
+///
+/// The rebuild deliberately re-reads `pg_attribute`/`pg_constraint` instead of
+/// leaning on the browsable [`TableMeta`]: introspection takes column types
+/// from `information_schema.columns.data_type`, which reports `varchar(20)` as
+/// a bare `character varying` and every user-defined type as `USER-DEFINED`.
+/// Reconstructing from that would emit column types that are quietly *wrong*,
+/// which is worse than not offering the feature. `pg_get_constraintdef`
+/// likewise supplies check constraints and referential actions that the
+/// browsable metadata does not carry at all.
+pub async fn fetch_ddl(
+    pool: &PgPool,
+    table: &TableMeta,
+    object: &DdlObject,
+) -> Result<Ddl, DbError> {
+    // Postgres always qualifies; `public` is only a defensive default for a
+    // TableMeta that somehow lost its schema.
+    let schema = table.schema.clone().unwrap_or_else(|| "public".into());
+    let params = [Value::Text(schema.clone())];
+
+    if let DdlObject::Index(name) = object {
+        let rows = query_with(
+            pool,
+            "SELECT pg_get_indexdef(c.oid) AS def \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname::text = $1 AND c.relname::text = $2 AND c.relkind IN ('i', 'I')",
+            &[params[0].clone(), Value::Text(name.clone())],
+        )
+        .await?;
+        let Some(def) = rows.rows.first().and_then(|r| ddl_opt_text(r, 0)) else {
+            return Err(DbError::Introspect(format!(
+                "no index named {name} in {schema}"
+            )));
+        };
+        return Ok(Ddl::native(ddl_terminate(&def)));
+    }
+
+    let params = [params[0].clone(), Value::Text(table.name.clone())];
+    if matches!(table.kind, TableKind::View | TableKind::MaterializedView) {
+        let rows = query_with(
+            pool,
+            "SELECT pg_get_viewdef(c.oid, true) AS def \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname::text = $1 AND c.relname::text = $2",
+            &params,
+        )
+        .await?;
+        let Some(body) = rows.rows.first().and_then(|r| ddl_opt_text(r, 0)) else {
+            return Err(DbError::Introspect(format!(
+                "no view definition for {schema}.{}",
+                table.name
+            )));
+        };
+        // Only the CREATE header is ours; the body is the server's own text,
+        // so this stays native (no "reconstructed" warning).
+        return Ok(Ddl::native(create_view_sql(table, &body)));
+    }
+
+    // A catalog read that fails still yields usable output: the renderer falls
+    // back to what TableMeta knows and the failure becomes a visible caveat,
+    // rather than the whole action erroring out.
+    let extras = match table_ddl_extras(pool, &params).await {
+        Ok(extras) => extras,
+        Err(err) => TableExtras {
+            caveats: vec![format!(
+                "column types, defaults, collations, constraints and indexes — reading the \
+                 catalog failed ({})",
+                err.message()
+            )],
+            ..TableExtras::default()
+        },
+    };
+    Ok(create_table_sql(Dialect::Postgres, table, &extras))
+}
+
+/// Reads the per-table facts a faithful `CREATE TABLE` needs: exact column
+/// types, defaults, identity/generated clauses, non-default collations, every
+/// constraint as the server renders it, and the indexes that do not back a
+/// constraint (those are already covered by their constraint).
+async fn table_ddl_extras(pool: &PgPool, params: &[Value]) -> Result<TableExtras, DbError> {
+    // A column's collation only matters when it differs from its type's
+    // default; emitting the default one everywhere would be noise.
+    let column_rows = query_with(
+        pool,
+        "SELECT a.attname::text AS name, \
+                format_type(a.atttypid, a.atttypmod) AS type_name, \
+                pg_get_expr(d.adbin, d.adrelid) AS default_expr, \
+                a.attidentity::text AS identity, \
+                a.attgenerated::text AS generated, \
+                CASE WHEN a.attcollation <> t.typcollation THEN co.collname::text END AS collation \
+         FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         JOIN pg_type t ON t.oid = a.atttypid \
+         LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+         LEFT JOIN pg_collation co ON co.oid = a.attcollation \
+         WHERE n.nspname::text = $1 AND c.relname::text = $2 \
+           AND a.attnum > 0 AND NOT a.attisdropped \
+         ORDER BY a.attnum",
+        params,
+    )
+    .await?;
+
+    // Not-null constraints are also in pg_constraint from PG 17 (contype
+    // 'n'); they are already rendered per column, so only the table-level
+    // types are taken.
+    let constraint_rows = query_with(
+        pool,
+        "SELECT con.conname::text AS name, pg_get_constraintdef(con.oid) AS def \
+         FROM pg_constraint con \
+         JOIN pg_class c ON c.oid = con.conrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname::text = $1 AND c.relname::text = $2 \
+           AND con.contype IN ('p', 'u', 'f', 'c', 'x') \
+         ORDER BY CASE con.contype \
+                    WHEN 'p' THEN 0 WHEN 'u' THEN 1 WHEN 'f' THEN 2 WHEN 'c' THEN 3 ELSE 4 \
+                  END, con.conname",
+        params,
+    )
+    .await?;
+
+    let index_rows = query_with(
+        pool,
+        "SELECT pg_get_indexdef(i.indexrelid) AS def \
+         FROM pg_index i \
+         JOIN pg_class c ON c.oid = i.indrelid \
+         JOIN pg_class ic ON ic.oid = i.indexrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname::text = $1 AND c.relname::text = $2 AND i.indisvalid \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid \
+           ) \
+         ORDER BY ic.relname",
+        params,
+    )
+    .await?;
+
+    let mut extras = TableExtras {
+        // What a pg_dump of the same table would carry and this rebuild does
+        // not. Named rather than implied, so a reader knows the boundary.
+        caveats: vec![
+            "sequences behind nextval() defaults".into(),
+            "storage parameters, tablespace, partitioning and inheritance".into(),
+            "triggers and row-level security policies".into(),
+            "comments, ownership and privileges".into(),
+        ],
+        ..TableExtras::default()
+    };
+    for row in &column_rows.rows {
+        let name = ddl_text(row, 0);
+        let identity = match ddl_text(row, 3).as_str() {
+            "a" => Some("GENERATED ALWAYS AS IDENTITY".to_string()),
+            "d" => Some("GENERATED BY DEFAULT AS IDENTITY".to_string()),
+            // A stored generated column keeps its expression in pg_attrdef;
+            // it is a generation clause, not a DEFAULT.
+            _ => match (ddl_text(row, 4).as_str(), ddl_opt_text(row, 2)) {
+                ("", _) => None,
+                (_, Some(expr)) => Some(format!("GENERATED ALWAYS AS ({expr}) STORED")),
+                (_, None) => None,
+            },
+        };
+        extras.columns.insert(
+            name,
+            ColumnExtra {
+                type_name: ddl_opt_text(row, 1),
+                collation: ddl_opt_text(row, 5),
+                // Postgres has no column form that replaces the type.
+                computed: None,
+                identity,
+            },
+        );
+    }
+    for row in &constraint_rows.rows {
+        extras.constraints.push(format!(
+            "CONSTRAINT {} {}",
+            super::page::quote_ident(&ddl_text(row, 0)),
+            ddl_text(row, 1)
+        ));
+    }
+    for row in &index_rows.rows {
+        extras.indexes.push(ddl_text(row, 0));
+    }
+    Ok(extras)
+}
+
+/// One decoded cell as text, `None` for SQL NULL.
+fn ddl_opt_text(row: &[Value], idx: usize) -> Option<String> {
+    match row.get(idx) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(t)) => Some(t.clone()),
+        Some(other) => Some(other.display()),
+    }
+}
+
+fn ddl_text(row: &[Value], idx: usize) -> String {
+    ddl_opt_text(row, idx).unwrap_or_default()
+}
+
+/// Adds the statement terminator the catalog generators leave off.
+fn ddl_terminate(sql: &str) -> String {
+    let trimmed = sql.trim_end();
+    if trimmed.ends_with(';') {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed};")
+    }
 }
 
 fn get<'r, T: sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>>(

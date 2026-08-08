@@ -5,6 +5,7 @@ use sqlx::postgres::PgPool;
 use sqlx::sqlite::SqlitePool;
 
 use super::caps::{self, Capabilities, TableAccess};
+use super::ddl::{Ddl, DdlObject};
 use super::error::DbError;
 use super::export::ExportFormat;
 use super::page::{
@@ -410,6 +411,18 @@ impl DbPool {
             DbPool::Sqlite(pool) => sqlite::export(pool, sql, params, format, out).await,
             DbPool::Postgres(pool) => postgres::export(pool, sql, params, format, out).await,
             DbPool::SqlServer(pool) => sqlserver::export(pool, sql, params, format, out).await,
+        }
+    }
+
+    /// DDL for one of `table`'s objects — the table/view itself, or one of
+    /// its indexes (FRE-108). Prefers the server's own definition and only
+    /// reconstructs where the backend has no generator; the returned [`Ddl`]
+    /// says which, and [`Ddl::text`] labels a reconstruction.
+    pub async fn fetch_ddl(&self, table: &TableMeta, object: &DdlObject) -> Result<Ddl, DbError> {
+        match self {
+            DbPool::Sqlite(pool) => sqlite::fetch_ddl(pool, table, object).await,
+            DbPool::Postgres(pool) => postgres::fetch_ddl(pool, table, object).await,
+            DbPool::SqlServer(pool) => sqlserver::fetch_ddl(pool, table, object).await,
         }
     }
 

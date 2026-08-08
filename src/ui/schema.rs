@@ -8,8 +8,11 @@
 //! narrow for them.
 
 use dioxus::prelude::*;
+use dioxus_icons::lucide::X;
 
-use crate::db::{ColumnMeta, ConnectionId, Generated, TableKind, TableMeta, TypeDetail};
+use crate::db::{
+    ColumnMeta, ConnectionId, DdlObject, DdlSource, Generated, TableKind, TableMeta, TypeDetail,
+};
 
 use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState};
 use super::state::{AppState, SchemaLoad, TableRef};
@@ -53,7 +56,7 @@ pub fn SchemaPane(id: ConnectionId, table: TableRef) -> Element {
                         }
                     },
                     Some(meta) => rsx! {
-                        SchemaBody { meta }
+                        SchemaBody { id, meta }
                     },
                 },
             }
@@ -71,11 +74,18 @@ fn TableIcon() -> Element {
 }
 
 #[component]
-fn SchemaBody(meta: TableMeta) -> Element {
+fn SchemaBody(id: ConnectionId, meta: TableMeta) -> Element {
     let qualified = match &meta.schema {
         Some(schema) => format!("{schema}.{}", meta.name),
         None => meta.name.clone(),
     };
+    let table = TableRef {
+        schema: meta.schema.clone(),
+        name: meta.name.clone(),
+    };
+    // Which object's DDL the overlay is showing, if any (FRE-108). Local to
+    // the pane: closing it or switching table drops the request with it.
+    let mut showing_ddl = use_signal(|| Option::<DdlObject>::None);
     // Plain views have no indexes, so the section (and its "No indexes."
     // line) would just be noise. Materialized views are indexed on purpose,
     // and SQL Server indexed views report them as well, so anything that
@@ -97,6 +107,14 @@ fn SchemaBody(meta: TableMeta) -> Element {
                         }
                     },
                     TableKind::Table => rsx! {},
+                }
+                // The object's own definition (FRE-108). Sits with the name
+                // it describes rather than in a toolbar, so it is obvious
+                // *what* the DDL will be for.
+                button {
+                    class: "ml-auto rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                    onclick: move |_| showing_ddl.set(Some(DdlObject::Object)),
+                    "Show DDL"
                 }
             }
             table { class: "w-full border-collapse text-left",
@@ -137,11 +155,139 @@ fn SchemaBody(meta: TableMeta) -> Element {
                                         "partial"
                                     }
                                 }
+                                button {
+                                    class: "ml-auto rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                                    onclick: {
+                                        let name = index.name.clone();
+                                        move |_| showing_ddl.set(Some(DdlObject::Index(name.clone())))
+                                    },
+                                    "DDL"
+                                }
                             }
                         }
                     }
                 }
             }
+        }
+        if let Some(object) = showing_ddl() {
+            DdlOverlay {
+                id,
+                table: table.clone(),
+                object,
+                on_close: move |_| showing_ddl.set(None),
+            }
+        }
+    }
+}
+
+/// The DDL overlay (FRE-108): one object's definition, read-only, with a copy
+/// action. Dismissed by the ✕, a backdrop click, or Escape — handled here
+/// rather than by the window listener, which ignores keys while the `<pre>`
+/// container has focus.
+#[component]
+fn DdlOverlay(
+    id: ConnectionId,
+    table: TableRef,
+    object: DdlObject,
+    on_close: EventHandler<()>,
+) -> Element {
+    let state = use_context::<AppState>();
+    let fetch_table = table.clone();
+    let fetch_object = object.clone();
+    let ddl = use_resource(move || {
+        let table = fetch_table.clone();
+        let object = fetch_object.clone();
+        async move { state.load_ddl(id, table, object).await }
+    });
+    let title = match &object {
+        DdlObject::Object => table.label(),
+        DdlObject::Index(name) => format!("{} · index {name}", table.label()),
+    };
+    let loaded = ddl.read();
+    rsx! {
+        div {
+            class: "fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-4 outline-none",
+            tabindex: "-1",
+            onmounted: move |evt: MountedEvent| {
+                spawn(async move {
+                    let _ = evt.set_focus(true).await;
+                });
+            },
+            onkeydown: move |evt: KeyboardEvent| {
+                if evt.code() == Code::Escape {
+                    on_close.call(());
+                }
+            },
+            onclick: move |_| on_close.call(()),
+            div {
+                class: "max-h-[80vh] w-full max-w-3xl overflow-auto rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 p-4 shadow-xl",
+                onclick: move |evt| evt.stop_propagation(),
+                div { class: "mb-2 flex items-center gap-2",
+                    span { class: "text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400",
+                        "DDL"
+                    }
+                    span { class: "min-w-0 flex-1 truncate font-mono text-xs text-slate-500", "{title}" }
+                    match loaded.as_ref() {
+                        // The provenance badge is the point of the whole
+                        // feature: a rebuilt statement must never be mistaken
+                        // for the server's own definition.
+                        Some(Ok(ddl)) => match ddl.source {
+                            DdlSource::Native => rsx! {
+                                span { class: "shrink-0 rounded bg-emerald-100 dark:bg-emerald-900/50 px-1 text-xs text-emerald-700 dark:text-emerald-300",
+                                    title: "The definition the server itself stores or generates",
+                                    "server definition"
+                                }
+                            },
+                            DdlSource::Reconstructed => rsx! {
+                                span { class: "shrink-0 rounded bg-amber-100 dark:bg-amber-900/50 px-1 text-xs text-amber-700 dark:text-amber-300",
+                                    title: "Rebuilt from catalog metadata — this backend has no DDL generator for this object",
+                                    "reconstructed"
+                                }
+                            },
+                        },
+                        _ => rsx! {},
+                    }
+                    if let Some(Ok(ddl)) = loaded.as_ref() {
+                        CopyDdlButton { text: ddl.text() }
+                    }
+                    button {
+                        class: "shrink-0 rounded px-2 py-0.5 text-sm text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                        aria_label: "Close",
+                        onclick: move |_| on_close.call(()),
+                        X { size: 16 }
+                    }
+                }
+                match loaded.as_ref() {
+                    None => rsx! {
+                        DelayedLoading { label: "Loading definition…" }
+                    },
+                    Some(Err(err)) => rsx! {
+                        Banner { kind: BannerKind::Error, message: err.clone() }
+                    },
+                    Some(Ok(ddl)) => rsx! {
+                        pre { class: "whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
+                            "{ddl.text()}"
+                        }
+                    },
+                }
+            }
+        }
+    }
+}
+
+/// Copies the DDL exactly as shown — header and all. A reconstruction's
+/// warning has to travel with the SQL, not stay behind in the window it was
+/// copied from.
+#[component]
+fn CopyDdlButton(text: String) -> Element {
+    let json = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".into());
+    rsx! {
+        button {
+            class: "shrink-0 rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+            onclick: move |_| {
+                document::eval(&format!("navigator.clipboard.writeText({json});"));
+            },
+            "Copy"
         }
     }
 }

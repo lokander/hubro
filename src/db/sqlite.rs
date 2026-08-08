@@ -6,9 +6,10 @@ use std::path::Path;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
 
+use super::ddl::{create_index_sql, Ddl, DdlObject, IndexExtras};
 use super::error::DbError;
 use super::export::{export_io_err, ExportFormat, ExportSink};
-use super::page::quote_ident;
+use super::page::{quote_ident, Dialect};
 use super::schema::{
     ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta, TypeDetail,
 };
@@ -462,6 +463,114 @@ async fn table_foreign_keys(
         }
     }
     Ok(fks.into_iter().map(|(_, fk)| fk).collect())
+}
+
+/// DDL for one object (FRE-108). SQLite stores the original `CREATE`
+/// statement text in `sqlite_master`, so tables, views, and explicitly
+/// created indexes all come back exactly as they were written — no
+/// reconstruction, no header. The one exception is an index SQLite created
+/// itself to back a `UNIQUE`/`PRIMARY KEY` constraint: those have a NULL
+/// `sqlite_master.sql`, because the constraint in the table definition *is*
+/// their definition.
+pub async fn fetch_ddl(
+    pool: &SqlitePool,
+    table: &TableMeta,
+    object: &DdlObject,
+) -> Result<Ddl, DbError> {
+    match object {
+        DdlObject::Index(name) => {
+            let stored = object_sql(pool, name, &["index"]).await?;
+            match stored {
+                Some(sql) => Ok(Ddl::native(terminate(&sql))),
+                // An implicit constraint index. Rebuilding it as a standalone
+                // CREATE INDEX would be a different object from what is
+                // there, so the caveat says where the real definition lives.
+                None => {
+                    let Some(index) = table.indexes.iter().find(|i| &i.name == name) else {
+                        return Err(DbError::Introspect(format!("no index named {name}")));
+                    };
+                    let mut ddl =
+                        create_index_sql(Dialect::Sqlite, table, index, &IndexExtras::default());
+                    ddl.caveats.insert(
+                        0,
+                        "SQLite created this index for a UNIQUE / PRIMARY KEY constraint and \
+                         stores no CREATE statement for it — the table definition is its source"
+                            .into(),
+                    );
+                    Ok(ddl)
+                }
+            }
+        }
+        DdlObject::Object => {
+            let Some(sql) = object_sql(pool, &table.name, &["table", "view"]).await? else {
+                return Err(DbError::Introspect(format!(
+                    "no stored definition for {}",
+                    table.name
+                )));
+            };
+            let mut out = terminate(&sql);
+            // A table's own indexes belong with it: showing the CREATE TABLE
+            // alone would hand the user a statement that silently loses them.
+            // Constraint-backed indexes have a NULL sql and are already part
+            // of the table text, so they drop out here on their own.
+            for index in index_sql(pool, &table.name).await? {
+                out.push_str("\n\n");
+                out.push_str(&terminate(&index));
+            }
+            Ok(Ddl::native(out))
+        }
+    }
+}
+
+/// The stored `CREATE` text of one `sqlite_master` object, or `None` when the
+/// row exists with a NULL `sql` (an implicit index). Missing rows are `Ok(None)`
+/// too; callers distinguish by looking the object up in the metadata.
+async fn object_sql(
+    pool: &SqlitePool,
+    name: &str,
+    kinds: &[&str],
+) -> Result<Option<String>, DbError> {
+    // `type` is matched in Rust rather than through a bound IN-list: sqlx has
+    // no array binding on SQLite, and the kind set is a fixed literal here.
+    let row = sqlx::query("SELECT type, sql FROM sqlite_master WHERE name = ?1")
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| DbError::Introspect(e.to_string()))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let kind: String = get(&row, "type")?;
+    if !kinds.contains(&kind.as_str()) {
+        return Ok(None);
+    }
+    get::<Option<String>>(&row, "sql")
+}
+
+/// The stored `CREATE INDEX` statements of every explicitly created index on
+/// `table`, in name order.
+async fn index_sql(pool: &SqlitePool, table: &str) -> Result<Vec<String>, DbError> {
+    let rows = sqlx::query(
+        "SELECT sql FROM sqlite_master \
+         WHERE type = 'index' AND tbl_name = ?1 AND sql IS NOT NULL \
+         ORDER BY name",
+    )
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| DbError::Introspect(e.to_string()))?;
+    rows.iter().map(|row| get(row, "sql")).collect()
+}
+
+/// `sqlite_master` stores statements without their terminator; add one so the
+/// output is runnable as-is.
+fn terminate(sql: &str) -> String {
+    let trimmed = sql.trim_end();
+    if trimmed.ends_with(';') {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed};")
+    }
 }
 
 async fn pragma(pool: &SqlitePool, pragma: &str, arg: &str) -> Result<Vec<SqliteRow>, DbError> {
