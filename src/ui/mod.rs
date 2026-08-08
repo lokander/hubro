@@ -8,6 +8,7 @@ mod grid;
 mod icons;
 mod notice;
 mod schema;
+mod selection;
 mod shell;
 mod sidebar;
 pub mod stage;

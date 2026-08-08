@@ -413,7 +413,16 @@ fn Cheatsheet() -> Element {
                         ShortcutRow { keys: "Ctrl+Home / End", desc: "First / last cell on the page" }
                         ShortcutRow { keys: "PageUp / PageDown", desc: "Previous / next page" }
                         ShortcutRow { keys: "Enter", desc: "Edit the cell, or show its full value" }
-                        ShortcutRow { keys: "Esc", desc: "Close the value popup" }
+                        ShortcutRow { keys: "Esc", desc: "Close the popup / collapse the selection" }
+                    }
+                    ShortcutGroup { title: "Cell selection",
+                        ShortcutRow { keys: "Shift+↑ ↓ ← →", desc: "Extend the selection" }
+                        ShortcutRow { keys: "Shift+click", desc: "Extend the selection to a cell" }
+                        ShortcutRow { keys: "Shift+Space", desc: "Select the whole row" }
+                        ShortcutRow { keys: "Ctrl+Space", desc: "Select the whole column" }
+                        ShortcutRow { keys: "Shift+click header", desc: "Select the whole column" }
+                        ShortcutRow { keys: "Ctrl+A", desc: "Select the whole page" }
+                        ShortcutRow { keys: "Ctrl+C", desc: "Copy (TSV; one cell copies its value)" }
                     }
                     ShortcutGroup { title: "Navigation",
                         ShortcutRow { keys: "/", desc: "Focus the grid's filter box" }

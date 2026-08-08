@@ -7,6 +7,7 @@
 //! resulting values in signals — never hold a signal borrow across an await.
 
 mod caps;
+mod clipboard;
 mod ddl;
 mod error;
 mod export;
@@ -26,6 +27,7 @@ pub use caps::{
     Capabilities, Restriction, TableAccess, WriteProtection, CONNECTION_READ_ONLY,
     MARKED_READ_ONLY, NO_DDL, NO_MUTATE, NO_OFFSET_PAGING, NO_QUERY, USER_READ_ONLY,
 };
+pub use clipboard::{raw_cell_text, render_copy, CopyBlock, CopyFormat};
 pub use ddl::{Ddl, DdlObject, DdlSource};
 pub use error::DbError;
 pub use export::{write_result, ExportFormat};
