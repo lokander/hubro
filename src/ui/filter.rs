@@ -342,13 +342,14 @@ pub struct TableHit {
 /// the result is every table in the order introspection returned them, so the
 /// sidebar renders its unfiltered tree through exactly the same code path.
 ///
-/// Unless `show_system`, objects in extension-owned schemas are dropped
-/// before matching (FRE-88) — the filter is the one gate, so a hidden object
-/// stays hidden whether the user is browsing or searching. Dropping them up
-/// front also keeps them out of the per-keystroke matching cost, which on a
-/// Timescale database is most of the candidates.
-pub fn filter_tables(tables: &[TableMeta], query: &Query, show_system: bool) -> Vec<TableHit> {
-    let visible = |table: &TableMeta| show_system || table.extension.is_none();
+/// Unless `show_internal`, objects the backend declared internal
+/// ([`TableMeta::internal`]) are dropped before matching (FRE-88) — the
+/// filter is the one gate, so a hidden object stays hidden whether the user
+/// is browsing or searching. Dropping them up front also keeps them out of
+/// the per-keystroke matching cost, which on a Timescale database or a
+/// heavily partitioned table is most of the candidates.
+pub fn filter_tables(tables: &[TableMeta], query: &Query, show_internal: bool) -> Vec<TableHit> {
+    let visible = |table: &TableMeta| show_internal || table.internal.is_none();
     if query.needle.is_empty() {
         return (0..tables.len())
             .filter(|index| visible(&tables[*index]))
@@ -419,13 +420,13 @@ pub fn filter_tables(tables: &[TableMeta], query: &Query, show_system: bool) -> 
     hits.into_iter().map(|(_, hit)| hit).collect()
 }
 
-/// How many introspected objects live in extension-owned schemas (FRE-88).
+/// How many introspected objects the backend declared internal (FRE-88).
 ///
 /// Counted over the whole schema rather than over the current filter results,
 /// so the sidebar's "N hidden" note describes the database — a stable fact —
 /// instead of flickering with each keystroke.
-pub fn count_system_tables(tables: &[TableMeta]) -> usize {
-    tables.iter().filter(|t| t.extension.is_some()).count()
+pub fn count_internal_tables(tables: &[TableMeta]) -> usize {
+    tables.iter().filter(|t| t.internal.is_some()).count()
 }
 
 /// Regroups ranked hits under their schemas for rendering, so the result
@@ -458,7 +459,7 @@ pub fn group_by_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{ColumnMeta, Generated, TableKind, TypeDetail};
+    use crate::db::{ColumnMeta, Generated, Internal, TableKind, TypeDetail};
 
     fn table(schema: Option<&str>, name: &str, columns: &[&str]) -> TableMeta {
         TableMeta {
@@ -480,7 +481,8 @@ mod tests {
             indexes: vec![],
             foreign_keys: vec![],
             restriction: None,
-            extension: None,
+            internal: None,
+            kind_label: None,
         }
     }
 
@@ -503,7 +505,16 @@ mod tests {
     /// A table in a schema an extension created.
     fn ext_table(schema: &str, name: &str, extension: &str) -> TableMeta {
         TableMeta {
-            extension: Some(extension.into()),
+            internal: Some(Internal::Extension(extension.into())),
+            ..table(Some(schema), name, &["id"])
+        }
+    }
+
+    /// A child partition of a partitioned table — internal for a different
+    /// reason than an extension's objects, and hidden by the same rule.
+    fn partition(schema: &str, name: &str) -> TableMeta {
+        TableMeta {
+            internal: Some(Internal::Partition),
             ..table(Some(schema), name, &["id"])
         }
     }
@@ -900,6 +911,23 @@ mod tests {
     }
 
     #[test]
+    fn partition_children_hide_by_the_same_rule_as_extension_objects() {
+        // Nothing about the hiding is extension-specific: the backend says
+        // an object is internal and the filter believes it (FRE-88).
+        let tables = vec![
+            table(Some("public"), "orders", &["id"]),
+            partition("public", "orders_2026_01"),
+            partition("public", "orders_2026_02"),
+        ];
+        assert_eq!(ranked(&tables, ""), ["orders"]);
+        assert_eq!(count_internal_tables(&tables), 2);
+        assert_eq!(
+            ranked_with_system(&tables, "orders"),
+            ["orders", "orders_2026_01", "orders_2026_02"]
+        );
+    }
+
+    #[test]
     fn hidden_schemas_stay_hidden_when_searching() {
         // The sidebar hides these, so a search must not resurrect them —
         // otherwise typing would contradict the toggle (FRE-88).
@@ -916,7 +944,7 @@ mod tests {
         let tables = vec![
             table(Some("public"), "readings", &["sensor_id"]),
             TableMeta {
-                extension: Some("timescaledb".into()),
+                internal: Some(Internal::Extension("timescaledb".into())),
                 ..table(
                     Some("_timescaledb_internal"),
                     "_hyper_1_1_chunk",
@@ -934,13 +962,13 @@ mod tests {
     }
 
     #[test]
-    fn system_count_covers_the_whole_schema_not_the_filter() {
+    fn internal_count_covers_the_whole_schema_not_the_filter() {
         let tables = vec![
             table(Some("public"), "readings", &["time"]),
             ext_table("_timescaledb_internal", "_hyper_1_1_chunk", "timescaledb"),
             ext_table("_timescaledb_catalog", "hypertable", "timescaledb"),
         ];
-        assert_eq!(count_system_tables(&tables), 2);
-        assert_eq!(count_system_tables(&tables[..1]), 0);
+        assert_eq!(count_internal_tables(&tables), 2);
+        assert_eq!(count_internal_tables(&tables[..1]), 0);
     }
 }

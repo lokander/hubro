@@ -9,7 +9,7 @@
 
 use hubro::db::{
     detect_row_identity, url_with_password, Capabilities, DbError, DbPool, Dialect, Filter,
-    PageRequest, Restriction, RowLocator, SortDir, TableKind, TypeDetail, TypeRef, Value,
+    Internal, PageRequest, Restriction, RowLocator, SortDir, TableKind, TypeDetail, TypeRef, Value,
     PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
@@ -842,5 +842,43 @@ async fn postgres_quoted_camelcase_enum_saves_through_the_staged_cast() {
 
     pool.query("DROP TABLE camel_intro").await.unwrap();
     pool.query("DROP SCHEMA camel_ns CASCADE").await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn partition_children_are_internal_but_their_parent_is_not() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.query("DROP TABLE IF EXISTS parted_intro CASCADE")
+        .await
+        .unwrap();
+    pool.query("CREATE TABLE parted_intro (id int, at date NOT NULL) PARTITION BY RANGE (at)")
+        .await
+        .unwrap();
+    pool.query(
+        "CREATE TABLE parted_intro_2026_01 PARTITION OF parted_intro \
+         FOR VALUES FROM ('2026-01-01') TO ('2026-02-01')",
+    )
+    .await
+    .unwrap();
+
+    let tables = pool.introspect().await.unwrap();
+    let find = |name: &str| {
+        tables
+            .iter()
+            .find(|t| t.name == name && t.schema.as_deref() == Some("public"))
+            .unwrap_or_else(|| panic!("{name} missing from introspection"))
+    };
+
+    // The parent is the table you browse, so it stays visible; the children
+    // are the flooding problem, and are hidden by the same rule that hides
+    // an extension's objects (FRE-88). Nothing here involves an extension.
+    assert_eq!(find("parted_intro").internal, None);
+    assert_eq!(
+        find("parted_intro_2026_01").internal,
+        Some(Internal::Partition)
+    );
+
+    pool.query("DROP TABLE parted_intro CASCADE").await.unwrap();
     pool.close().await;
 }

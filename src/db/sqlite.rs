@@ -357,9 +357,11 @@ pub async fn introspect(pool: &SqlitePool) -> Result<Vec<TableMeta>, DbError> {
             // No per-object narrowing: kind and row identity already carry
             // everything this backend knows about writability (FRE-87).
             restriction: None,
-            // SQLite extensions contribute functions and virtual tables, never
-            // a schema of their own — nothing to attribute (FRE-88).
-            extension: None,
+            // SQLite has no extension-owned schemas and no declarative
+            // partitioning; its extensions contribute functions and virtual
+            // tables, which are the user's to use (FRE-88).
+            internal: None,
+            kind_label: None,
         });
     }
     Ok(tables)
