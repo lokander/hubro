@@ -18,7 +18,8 @@ Licensed **GPL-3.0-only** (FRE-83), with copyright held solely by Fredrik Lokand
 
 - `cargo test` — run all tests: unit tests live in `#[cfg(test)]` modules next to the code, integration tests in `tests/`. Test fixture files go in `tests/fixtures/`. Run a single test with `cargo test <name>`.
 - Don't run `cargo test` and `dx build`/`cargo build` concurrently — they contend on the `target/` lock (spurious signal/exit 144); run them sequentially.
-- Postgres integration tests skip unless `HUBRO_PG_TEST_URL` is set; SQL Server tests skip unless `HUBRO_MSSQL_TEST_URL` is set; SSH-tunnel tests need `HUBRO_SSH_TEST` (+ `HUBRO_SSH_TEST_KEY`/`_ENC_KEY`). Point them at the Docker `hubro-pg-test` (host port 5433) / `hubro-mssql-test` (14333) / `hubro-ssh-test` (2222) containers; the exact `docker run` commands live in the test-file headers (`tests/db_postgres.rs`, `tests/db_sqlserver.rs`, `tests/tunnel.rs`).
+- Postgres integration tests skip unless `HUBRO_PG_TEST_URL` is set; SQL Server tests skip unless `HUBRO_MSSQL_TEST_URL` is set; TimescaleDB tests skip unless `HUBRO_TIMESCALE_TEST_URL` is set; SSH-tunnel tests need `HUBRO_SSH_TEST` (+ `HUBRO_SSH_TEST_KEY`/`_ENC_KEY`). Point them at the Docker `hubro-pg-test` (host port 5433) / `hubro-mssql-test` (14333) / `hubro-timescale-test` (5434) / `hubro-ssh-test` (2222) containers; the exact `docker run` commands live in the test-file headers (`tests/db_postgres.rs`, `tests/db_sqlserver.rs`, `tests/db_timescale.rs`, `tests/tunnel.rs`).
+- Engine-verification issues (FRE-88 onwards) each add one `tests/db_<engine>.rs` behind its own `HUBRO_<ENGINE>_TEST_URL`, covering only what that engine does differently — the shared surface is verified by pointing the existing suite at the same container.
 
 The crate is split into a library (`src/lib.rs`, holds app modules) and a thin binary (`src/main.rs`) so integration tests can import app code as `hubro::...`.
 

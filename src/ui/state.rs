@@ -8,8 +8,9 @@ use dioxus::prelude::*;
 use crate::azure::{self, EntraAuth};
 use crate::config::{
     default_config_path, default_session_path, default_settings_path, load_session, load_settings,
-    plan_session_restore, save_session, save_theme, BackendKind, ConnectionColor, PgAuth,
-    RestoreCandidate, SavedConnection, SavedList, Session, SessionPane, SessionTab, Theme,
+    plan_session_restore, save_session, save_show_system_schemas, save_theme, BackendKind,
+    ConnectionColor, PgAuth, RestoreCandidate, SavedConnection, SavedList, Session, SessionPane,
+    SessionTab, Theme,
 };
 use crate::db::{
     apply_staged, build_fk_filter, mssql_url_target, mssql_url_via_local_port,
@@ -580,6 +581,11 @@ pub struct AppState {
     /// `theme` and — for `System` — a one-time startup read of the OS
     /// preference. Root-scoped: written from the startup detection task.
     pub dark: Signal<bool>,
+    /// Whether the schema sidebar lists extension-owned schemas (FRE-88).
+    /// Persisted by [`Self::set_show_system_schemas`]; global rather than
+    /// per-connection, since it expresses what the user wants to look at
+    /// rather than anything about one database.
+    pub show_system_schemas: Signal<bool>,
     /// A saved-connection edit awaiting the connect that confirms it
     /// (FRE-75). Root-scoped: the Entra sign-in card resolves it from a
     /// background task after the form has closed.
@@ -623,11 +629,12 @@ impl AppState {
                 Some("no config directory found".to_string()),
             ),
         };
-        // Theme preference: best-effort load, defaults on any problem
-        // (settings are non-critical and never block the app).
-        let theme = default_settings_path()
-            .map(|path| load_settings(&path).theme)
+        // UI preferences: best-effort load, defaults on any problem (settings
+        // are non-critical and never block the app).
+        let settings = default_settings_path()
+            .map(|path| load_settings(&path))
             .unwrap_or_default();
+        let theme = settings.theme;
         let state = Self {
             registry: Signal::new(ConnectionRegistry::default()),
             active: Signal::new(ActiveView::Connections),
@@ -670,6 +677,7 @@ impl AppState {
             // the startup detection task (below) corrects `System`. Root-
             // scoped: written from that spawn_forever task.
             dark: Signal::new_in_scope(theme.resolve_dark(false), ScopeId::ROOT),
+            show_system_schemas: Signal::new(settings.show_system_schemas),
             // Root-scoped: resolved from the Entra sign-in task, which
             // outlives the form that registered the edit.
             pending_edit: Signal::new_in_scope(None, ScopeId::ROOT),
@@ -2451,6 +2459,18 @@ impl AppState {
         };
         spawn_forever(async move {
             let _ = save_theme(&path, theme);
+        });
+    }
+
+    /// Shows or hides extension-owned schemas in the sidebar (FRE-88) and
+    /// persists the choice, best-effort like [`Self::set_theme`].
+    pub fn set_show_system_schemas(mut self, show: bool) {
+        self.show_system_schemas.set(show);
+        let Some(path) = default_settings_path() else {
+            return;
+        };
+        spawn_forever(async move {
+            let _ = save_show_system_schemas(&path, show);
         });
     }
 

@@ -236,6 +236,7 @@ mod tests {
             indexes,
             foreign_keys: vec![],
             restriction: None,
+            extension: None,
         }
     }
 

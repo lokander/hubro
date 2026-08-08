@@ -442,6 +442,18 @@ pub struct Settings {
     /// resized/moved; on launch a missing value means "use the default size".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<WindowGeometry>,
+    /// Whether the schema sidebar lists objects in extension-owned schemas —
+    /// TimescaleDB chunks, PostGIS's `tiger`, Citus's catalogs (FRE-88). Off
+    /// by default: on a Timescale database they outnumber the user's tables
+    /// roughly twenty to one. `default` + `skip_serializing_if` keep
+    /// pre-FRE-88 settings files deserializing and unchanged on rewrite.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub show_system_schemas: bool,
+}
+
+/// `skip_serializing_if` predicate for `bool` fields defaulting to `false`.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Default location: `$XDG_CONFIG_HOME/hubro/settings.toml`.
@@ -480,6 +492,14 @@ pub fn save_settings(path: &Path, settings: &Settings) -> Result<(), ConfigError
 pub fn save_theme(path: &Path, theme: Theme) -> Result<(), ConfigError> {
     let mut settings = load_settings(path);
     settings.theme = theme;
+    save_settings(path, &settings)
+}
+
+/// Persists just the system-schema visibility (FRE-88), preserving the rest
+/// (see [`save_theme`] for why the file is re-read first).
+pub fn save_show_system_schemas(path: &Path, show: bool) -> Result<(), ConfigError> {
+    let mut settings = load_settings(path);
+    settings.show_system_schemas = show;
     save_settings(path, &settings)
 }
 
@@ -1676,6 +1696,7 @@ mod tests {
                 y: Some(12.0),
                 maximized: true,
             }),
+            show_system_schemas: false,
         };
         save_settings(&path, &settings).unwrap();
         assert_eq!(load_settings(&path), settings);
@@ -1690,6 +1711,27 @@ mod tests {
         let loaded = load_settings(&path);
         assert_eq!(loaded.theme, Theme::Light);
         assert_eq!(loaded.window, None);
+    }
+
+    #[test]
+    fn system_schema_visibility_round_trips_and_stays_out_of_older_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+
+        // A pre-FRE-88 file loads with the flag off and, rewritten, gains no
+        // key for it — an unaffected setting serializes unchanged.
+        std::fs::write(&path, "theme = \"light\"\n").unwrap();
+        assert!(!load_settings(&path).show_system_schemas);
+        save_theme(&path, Theme::Dark).unwrap();
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("show_system_schemas"));
+
+        save_show_system_schemas(&path, true).unwrap();
+        let loaded = load_settings(&path);
+        assert!(loaded.show_system_schemas);
+        // Written alongside the theme rather than over it.
+        assert_eq!(loaded.theme, Theme::Dark);
     }
 
     #[test]

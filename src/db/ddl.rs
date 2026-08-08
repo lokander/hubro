@@ -479,6 +479,7 @@ mod tests {
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             restriction: None,
+            extension: None,
         }
     }
 
