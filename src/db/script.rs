@@ -324,6 +324,15 @@ pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
     let mutate = has(&EMBEDDED_DML_KEYWORDS);
     let ddl = classify_statement(sql) == StatementKind::Ddl || has(&EMBEDDED_DDL_KEYWORDS);
     if !mutate && !ddl {
+        // Bare transaction control (`BEGIN`, `COMMIT`, `ROLLBACK`, …) changes
+        // nothing by itself, and the statements it brackets are each checked
+        // on their own — so it needs nothing, rather than being refused with
+        // a reason that doesn't describe it. This is only reached when no
+        // write token appears anywhere in the statement, so a T-SQL
+        // `BEGIN … DELETE … END` block is still charged for its DELETE.
+        if manages_own_transaction(sql, dialect) {
+            return StatementNeeds::default();
+        }
         return StatementNeeds {
             mutate: true,
             ddl: true,
@@ -1253,6 +1262,34 @@ mod tests {
                 assert!(!needs_confirmation(sql, dialect), "{sql:?}");
             }
         }
+    }
+
+    #[test]
+    fn bare_transaction_control_needs_nothing_but_its_contents_still_count() {
+        for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
+            for sql in [
+                "BEGIN",
+                "COMMIT",
+                "ROLLBACK",
+                "SAVEPOINT s",
+                "BEGIN TRANSACTION",
+            ] {
+                assert_eq!(
+                    statement_needs(sql, dialect),
+                    StatementNeeds::default(),
+                    "{sql:?} on {dialect:?}"
+                );
+            }
+        }
+        // A T-SQL block opening with BEGIN is not bare: its DELETE counts.
+        assert!(statement_needs("BEGIN DELETE FROM t END", Dialect::SqlServer).mutate);
+        // And a read-only connection still refuses the script as a whole.
+        assert!(script_refusal(
+            Capabilities::FULL.read_only(),
+            &stmts(&["BEGIN", "DELETE FROM t", "COMMIT"]),
+            Dialect::Postgres
+        )
+        .is_some());
     }
 
     #[test]

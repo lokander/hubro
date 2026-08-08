@@ -2081,9 +2081,6 @@ impl AppState {
         }
     }
 
-    /// Executes a split script in the background: reads fetch rows, writes
-    /// report affected counts, execution stops at the first error. Each
-    /// statement's outcome lands in [`Self::sql_runs`] as it finishes.
     /// Takes ownership of this connection's SQL run slot: cancels any
     /// still-running task and bumps the generation, so a run that completes
     /// later can tell it has been superseded and leaves the new result
@@ -2099,6 +2096,9 @@ impl AppState {
         *entry
     }
 
+    /// Executes a split script in the background: reads fetch rows, writes
+    /// report affected counts, execution stops at the first error. Each
+    /// statement's outcome lands in [`Self::sql_runs`] as it finishes.
     fn execute_script(mut self, id: ConnectionId, script: String, statements: Vec<String>) {
         let Some(pool) = self.registry.read().get(id).map(|c| c.pool.clone()) else {
             return;
