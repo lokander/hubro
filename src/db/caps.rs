@@ -128,7 +128,12 @@ pub const USER_READ_ONLY: Restriction = Restriction::Declared(MARKED_READ_ONLY);
 /// This is user intent, not a backend fact, so it *narrows* the connection's
 /// declared [`Capabilities`] rather than sitting beside them as a second
 /// check — see [`Self::apply`] and [`TableAccess::resolve_protected`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+///
+/// **The variant order is load-bearing.** `Ord` is derived, so it runs
+/// least-to-most protective, and `a.max(b)` is "the stricter of the two" —
+/// which is how a merge of two markings resolves. Reordering the variants
+/// would silently invert that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WriteProtection {
     /// No extra friction: the backend's own capabilities decide. The default
@@ -140,7 +145,14 @@ pub enum WriteProtection {
     /// the connection — the point is to make you read which database you are
     /// about to change.
     Confirm,
-    /// Writes are refused outright at the `db/` layer.
+    /// Writes are refused at the `db/` layer.
+    ///
+    /// Enforcement is by statement classification (see
+    /// [`script::statement_needs`](super::script::statement_needs)), not by
+    /// the engine, so a write reached through a function call inside a
+    /// `SELECT` is not caught. Refusing those needs a server-side read-only
+    /// transaction per backend; until then this is a guard against mistakes,
+    /// not against a determined user.
     ReadOnly,
 }
 

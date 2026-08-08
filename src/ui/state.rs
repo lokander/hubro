@@ -2594,10 +2594,11 @@ impl AppState {
         let (Some(pool), Some(meta)) = (pool, meta) else {
             return Err("connection or schema no longer available".into());
         };
-        // A read path: it only needs the row to be addressable, so it uses
-        // the resolved identity rather than the write capability — a
-        // read-only connection still expands cells (FRE-87).
-        let Some(identity) = pool.backend_access(&meta).identity else {
+        // A read path: it only needs the row to be addressable, so it asks
+        // for the identity alone rather than a full access it has no business
+        // reading a write capability off — a read-only connection, whether by
+        // engine (FRE-87) or by marking (FRE-111), still expands cells.
+        let Some(identity) = pool.backend_row_identity(&meta) else {
             return Err("this table has no usable row identity".into());
         };
         pool.fetch_cell(&meta, &identity, &locator, &column)

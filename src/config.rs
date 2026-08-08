@@ -725,13 +725,32 @@ impl SavedList {
     /// edited, and the loss would only show up at the next launch. No caller
     /// of `update` can intend to change the marking; the one path that does
     /// is [`Self::set_marking`].
+    ///
+    /// When the edit collides with another entry, the surviving entry takes
+    /// the **stricter** of the two markings. Repointing an unprotected
+    /// `staging` at production's URL would otherwise absorb the read-only
+    /// entry and leave an `Open` one addressing the same database — the
+    /// protection would vanish along with the row that carried it.
     pub fn update(&mut self, old_locator: &str, mut connection: SavedConnection) -> bool {
         let Some(index) = self.entries.iter().position(|s| s.locator() == old_locator) else {
             return false;
         };
-        let previous = &self.entries[index];
-        connection.set_marking(previous.protection(), previous.color());
         let new_locator = connection.locator().to_string();
+        let previous = &self.entries[index];
+        let mut protection = previous.protection();
+        let mut color = previous.color();
+        // Fold in the marking of any entry this edit is about to absorb.
+        for absorbed in self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| *i != index && s.locator() == new_locator)
+            .map(|(_, s)| s)
+        {
+            protection = protection.max(absorbed.protection());
+            color = color.or(absorbed.color());
+        }
+        connection.set_marking(protection, color);
         self.entries[index] = connection;
         // Drop any *other* entry the edit now collides with, keeping the one
         // just written.
@@ -973,6 +992,80 @@ mod tests {
         assert_eq!(list.entries()[0].color(), Some(ConnectionColor::Amber));
         // An unknown locator marks nothing.
         assert!(!list.set_marking("/tmp/missing.db", WriteProtection::ReadOnly, None));
+    }
+
+    #[test]
+    fn editing_a_connection_keeps_its_marking() {
+        // The edit form collects no marking, so it always supplies defaults.
+        // Taking those literally would unprotect a connection the moment its
+        // name was changed — and the loss would only surface at next launch.
+        let mut list = list_of(&[saved_pg("prod", "postgres://u@h:5432/d")]);
+        assert!(list.set_marking(
+            "postgres://u@h:5432/d",
+            WriteProtection::ReadOnly,
+            Some(ConnectionColor::Red)
+        ));
+
+        // An in-place rename, and an edit that moves the locator.
+        for edited in [
+            saved_pg("prod (renamed)", "postgres://u@h:5432/d"),
+            saved_pg("prod", "postgres://u@h:5432/other"),
+        ] {
+            let mut list = list.clone();
+            assert!(list.update("postgres://u@h:5432/d", edited));
+            assert_eq!(list.entries()[0].protection(), WriteProtection::ReadOnly);
+            assert_eq!(list.entries()[0].color(), Some(ConnectionColor::Red));
+        }
+    }
+
+    #[test]
+    fn an_edit_that_absorbs_another_entry_takes_the_stricter_marking() {
+        // Repointing unprotected `staging` at prod's URL absorbs the marked
+        // entry. Keeping the editee's marking would leave an Open entry
+        // addressing the read-only database — protection gone with the row.
+        let mut list = list_of(&[
+            saved_pg("staging", "postgres://u@h:5432/staging"),
+            saved_pg("prod", "postgres://u@h:5432/prod"),
+        ]);
+        assert!(list.set_marking(
+            "postgres://u@h:5432/prod",
+            WriteProtection::ReadOnly,
+            Some(ConnectionColor::Red)
+        ));
+
+        assert!(list.update(
+            "postgres://u@h:5432/staging",
+            saved_pg("staging", "postgres://u@h:5432/prod"),
+        ));
+        assert_eq!(list.entries().len(), 1, "the collision was absorbed");
+        assert_eq!(
+            list.entries()[0].protection(),
+            WriteProtection::ReadOnly,
+            "the stricter marking survives the absorption"
+        );
+        assert_eq!(list.entries()[0].color(), Some(ConnectionColor::Red));
+    }
+
+    #[test]
+    fn protection_orders_least_to_most_protective() {
+        // `update` merges markings with `max`, so this order is load-bearing.
+        assert!(WriteProtection::Open < WriteProtection::Confirm);
+        assert!(WriteProtection::Confirm < WriteProtection::ReadOnly);
+        assert_eq!(
+            WriteProtection::Open.max(WriteProtection::ReadOnly),
+            WriteProtection::ReadOnly
+        );
+    }
+
+    /// A `SavedList` over `entries`, via a real load so `load_failed` is false
+    /// and `persist`/`set_marking` behave as they do in the app.
+    fn list_of(entries: &[SavedConnection]) -> SavedList {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.toml");
+        save_connections(&path, entries).unwrap();
+        let (list, err) = SavedList::load(&path);
+        assert!(err.is_none());
+        list
     }
 
     #[test]

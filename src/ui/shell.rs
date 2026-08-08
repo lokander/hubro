@@ -740,8 +740,12 @@ fn protection_hint(protection: WriteProtection) -> &'static str {
         WriteProtection::Confirm => {
             "Every write asks first, naming this connection. Colour only warns — it changes nothing."
         }
+        // Deliberately not "outright": enforcement classifies statements, so
+        // a write reached through a function call in a SELECT is not caught.
+        // Promising more than that would be worse than promising less.
         WriteProtection::ReadOnly => {
-            "Writes are refused outright, including from the SQL editor."
+            "Writes are refused, including from the SQL editor. \
+             A write hidden inside a function call in a SELECT is not caught."
         }
     }
 }
