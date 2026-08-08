@@ -79,6 +79,18 @@ struct ActiveEdit {
     draft: Option<String>,
 }
 
+impl ActiveEdit {
+    /// Whether this open editor is the one for `column` of `row_key`.
+    ///
+    /// The row half matters for the detail panel (FRE-109): its editor is
+    /// owned above the row-keyed field list so a draft survives a row move,
+    /// which means an editor left open on one row would otherwise reappear on
+    /// a same-named field of the next one, seeded with the wrong row's text.
+    fn is_on(&self, row_key: &str, column: &str) -> bool {
+        self.row_key == row_key && self.column == column
+    }
+}
+
 /// What the value-expand popup shows: a short value already in hand, or a
 /// truncated cell whose full value is loaded lazily via
 /// [`AppState::load_cell`] (FRE-33).
@@ -152,6 +164,21 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let mut page = use_signal(|| 0u64);
     // Which cell's editor is open (by row key + column).
     let mut editing = use_signal(|| Option::<ActiveEdit>::None);
+    // The row detail panel's open editor (FRE-109). Lives here, above the
+    // panel, because `RowDetailFields` is keyed by row: anything held inside
+    // it is destroyed by every row move, which silently discarded whatever
+    // the user had typed. Hoisting it is what lets the FRE-74 draft survive.
+    let mut detail_editing = use_signal(|| Option::<ActiveEdit>::None);
+    // One editor open anywhere, enforced in one place rather than at each of
+    // the grid's six activation sites. Both editors render the same element
+    // id, so two mounted at once fight over focus and leave one orphaned and
+    // unreachable by Escape. The panel's own activation closes the grid's
+    // directly; this closes the panel's whenever the grid opens one.
+    use_effect(move || {
+        if editing.read().is_some() && detail_editing.peek().is_some() {
+            detail_editing.set(None);
+        }
+    });
     // Keyboard focus ring in the grid (row, col into the visible page's
     // rows × columns), and the value-expand popup (FRE-15).
     let mut focused_cell = use_signal(|| Option::<(usize, usize)>::None);
@@ -553,8 +580,12 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // container, held focus) — so arrow navigation keeps working without a
     // mouse click. Only fires on an editing → None transition, so it never
     // steals focus from the filter box or sidebar while the grid is idle.
+    //
+    // Both editors count (FRE-109): watching only the grid's left the arrow
+    // keys dead after a commit in the panel, because focus stayed on the
+    // closed panel editor's input and nothing handed it back.
     use_effect(move || {
-        if editing.read().is_none() {
+        if editing.read().is_none() && detail_editing.read().is_none() {
             document::eval(
                 "requestAnimationFrame(() => { \
                     const el = document.getElementById('dv-grid'); \
@@ -1411,6 +1442,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                         dialect: dialect.unwrap_or(Dialect::Sqlite),
                         read_only_notice: read_only_notice.map(str::to_string),
                         grid_editing: editing,
+                        editing: detail_editing,
                         on_step: on_detail_step,
                         on_close: move |_| state.set_row_detail(id, false),
                         on_width: move |width: f64| state.set_row_detail_width(id, width),
@@ -2029,6 +2061,20 @@ struct DetailField {
     /// The foreign key this column belongs to, when following it leads
     /// somewhere: a NULL key references nothing (FRE-29).
     fk: Option<ForeignKeyMeta>,
+}
+
+impl DetailField {
+    /// Whether this field's full value is past [`FETCH_CELL_MAX_BYTES`], so it
+    /// will render a note rather than an editor.
+    ///
+    /// Read off the preview the page already carries rather than recomputed,
+    /// and known before the fetch resolves — the same answer
+    /// [`CellFetch::capped`](crate::db::CellFetch) gives afterwards.
+    fn over_fetch_cap(&self) -> bool {
+        self.preview
+            .as_ref()
+            .is_some_and(|preview| preview.full_len > FETCH_CELL_MAX_BYTES as u64)
+    }
 }
 
 /// Where the focused row sits on the page — the panel's header line and its
@@ -3415,6 +3461,9 @@ fn RowDetailPanel(
     /// The grid's in-place editor, closed when a field here opens one: only
     /// one cell editor can hold the keyboard at a time.
     grid_editing: Signal<Option<ActiveEdit>>,
+    /// The panel's open editor, owned above this component so it survives the
+    /// keyed remount of `RowDetailFields` (FRE-109).
+    editing: Signal<Option<ActiveEdit>>,
     on_step: EventHandler<RowStep>,
     on_close: EventHandler<()>,
     on_width: EventHandler<f64>,
@@ -3496,7 +3545,9 @@ fn RowDetailPanel(
                             fields: detail.fields,
                             locator: detail.locator,
                             row_values: detail.row_values,
+                            row_key: detail.row_key,
                             grid_editing,
+                            editing,
                             on_fk_jump,
                         }
                     },
@@ -3522,17 +3573,24 @@ fn RowDetailFields(
     row_values: HashMap<String, Value>,
     dialect: Dialect,
     grid_editing: Signal<Option<ActiveEdit>>,
+    /// The open editor, owned by `DataGrid` rather than created here. This
+    /// component is keyed by row, so a signal created here would be destroyed
+    /// by every row move — taking the user's uncommitted text with it.
+    /// The focused row's identity, so an open editor is matched on row as well
+    /// as column and cannot reappear on a same-named field of another row.
+    row_key: String,
+    editing: Signal<Option<ActiveEdit>>,
     on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>)>,
 ) -> Element {
-    // Which field's editor is open. Panel-local rather than shared with the
-    // grid's `editing`: that one names a cell in the table, and two mounted
-    // editors would fight over the keyboard. What is *staged* is shared —
-    // that is the part that must be one set.
-    let editing = use_signal(|| Option::<String>::None);
     // Tab order: the editable fields, top to bottom.
+    //
+    // A field whose full value exceeds the fetch cap renders a note instead of
+    // an editor, so including it would dead-end the Tab walk on something that
+    // can never take focus. `PreviewInfo::full_len` predicts that before the
+    // fetch resolves, which is the same answer `CellFetch::capped` gives after.
     let editable_columns: Vec<String> = fields
         .iter()
-        .filter(|field| field.editable)
+        .filter(|field| field.editable && !field.over_fetch_cap())
         .map(|field| field.column.clone())
         .collect();
     rsx! {
@@ -3547,6 +3605,7 @@ fn RowDetailFields(
                     locator: locator.clone(),
                     row_values: row_values.clone(),
                     editable_columns: editable_columns.clone(),
+                    row_key: row_key.clone(),
                     editing,
                     grid_editing,
                     on_fk_jump,
@@ -3567,7 +3626,10 @@ fn RowDetailRow(
     row_values: HashMap<String, Value>,
     dialect: Dialect,
     editable_columns: Vec<String>,
-    editing: Signal<Option<String>>,
+    /// The focused row's identity, so an open editor is matched on row as well
+    /// as column and cannot reappear on a same-named field of another row.
+    row_key: String,
+    editing: Signal<Option<ActiveEdit>>,
     grid_editing: Signal<Option<ActiveEdit>>,
     on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>)>,
 ) -> Element {
@@ -3613,6 +3675,7 @@ fn RowDetailRow(
                             field: field.clone(),
                             locator: locator.clone(),
                             editable_columns,
+                            row_key: row_key.clone(),
                             editing,
                             grid_editing,
                         }
@@ -3620,13 +3683,25 @@ fn RowDetailRow(
                     // Truncated and unaddressable (a view, a keyless table):
                     // the preview is all there will ever be, and the same
                     // refusal the copy path states says why.
-                    (Some(_), None) => rsx! {
-                        Banner {
-                            kind: BannerKind::Warning,
-                            message: CopyRefusal::Unaddressable { column: field.column.clone() }.message(),
-                        }
-                        pre { class: "mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
-                            "{field.value.display()}…"
+                    (Some(preview), None) => {
+                        // A blob renders as `<blob N>`, and `N` derived from
+                        // the value in hand would be the *prefix's* size. The
+                        // page already reports the real length, so read it
+                        // rather than recompute it from something known to be
+                        // truncated — the re-derive trap the SQL Server length
+                        // probe fix closed on main.
+                        let shown = match &field.value {
+                            Value::Blob(_) => format!("<blob {}>", human_bytes(preview.full_len)),
+                            other => format!("{}…", other.display()),
+                        };
+                        rsx! {
+                            Banner {
+                                kind: BannerKind::Warning,
+                                message: CopyRefusal::Unaddressable { column: field.column.clone() }.message(),
+                            }
+                            pre { class: "mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
+                                "{shown}"
+                            }
                         }
                     },
                     // Already complete in the page.
@@ -3639,6 +3714,7 @@ fn RowDetailRow(
                             field: field.clone(),
                             locator: locator.clone(),
                             editable_columns,
+                            row_key: row_key.clone(),
                             editing,
                             grid_editing,
                         }
@@ -3663,7 +3739,10 @@ fn RowDetailFullValue(
     locator: RowLocator,
     dialect: Dialect,
     editable_columns: Vec<String>,
-    editing: Signal<Option<String>>,
+    /// The focused row's identity, so an open editor is matched on row as well
+    /// as column and cannot reappear on a same-named field of another row.
+    row_key: String,
+    editing: Signal<Option<ActiveEdit>>,
     grid_editing: Signal<Option<ActiveEdit>>,
 ) -> Element {
     let state = use_context::<AppState>();
@@ -3705,6 +3784,7 @@ fn RowDetailFullValue(
                 field,
                 locator: Some(locator),
                 editable_columns,
+                row_key: row_key.clone(),
                 editing,
                 grid_editing,
             }
@@ -3729,19 +3809,33 @@ fn RowDetailValue(
     locator: Option<RowLocator>,
     dialect: Dialect,
     editable_columns: Vec<String>,
-    mut editing: Signal<Option<String>>,
+    /// The focused row's identity, so an open editor is matched on row as well
+    /// as column and cannot reappear on a same-named field of another row.
+    row_key: String,
+    mut editing: Signal<Option<ActiveEdit>>,
     mut grid_editing: Signal<Option<ActiveEdit>>,
 ) -> Element {
     let state = use_context::<AppState>();
     // `field.editable` already folds in the resolved capability and the
     // user's marking; the locator is what makes the row addressable.
     let editable = field.editable && locator.is_some();
-    let active = editable && editing.read().as_deref() == Some(field.column.as_str());
+    // Matched on row *and* column: the open editor outlives a move to another
+    // row (it is owned by `DataGrid`), and must not reappear on whichever
+    // field happens to share its name over there.
+    let open = editing
+        .read()
+        .clone()
+        .filter(|open| open.is_on(&row_key, &field.column));
+    let active = editable && open.is_some();
 
     if active {
         let locator = locator.expect("an editable field has a locator");
         let column = field.column.clone();
         let step_columns = editable_columns.clone();
+        let draft = open.and_then(|open| open.draft);
+        let draft_row = row_key.clone();
+        let draft_column = field.column.clone();
+        let step_row = row_key.clone();
         return rsx! {
             CellEditor {
                 // A block wrapper, not a table cell: this is a form, not a row.
@@ -3750,23 +3844,39 @@ fn RowDetailValue(
                 dialect,
                 nullable: field.nullable,
                 initial: value,
-                draft: None,
+                draft,
                 on_commit: move |(committed, nav): (Option<Value>, EditNav)| {
                     if let Some(committed) = committed {
                         state.stage_cell_edit(id, &table, locator.clone(), &column, committed);
                     }
                     // Tab walks the panel's fields the way it walks a row's
                     // cells in the grid.
-                    editing.set(match nav {
+                    let next = match nav {
                         EditNav::Stay => None,
                         EditNav::Next => step_column(&step_columns, &column, 1),
                         EditNav::Prev => step_column(&step_columns, &column, -1),
-                    });
+                    };
+                    editing.set(next.map(|column| ActiveEdit {
+                        row_key: step_row.clone(),
+                        column,
+                        draft: None,
+                    }));
                 },
                 on_cancel: move |_| editing.set(None),
-                // No `on_draft`: unlike a grid row, a panel field is not
-                // unmounted out from under the editor by scrolling (FRE-74),
-                // so there is nothing to stash and restore.
+                // Input that doesn't parse is stashed rather than dropped
+                // (FRE-74). The grid needs this because scrolling unmounts a
+                // row mid-typing; the panel needs it because `RowDetailFields`
+                // is keyed by row, so *every* row move — Prev/Next, an arrow
+                // key, a click, the post-save refetch — remounts every field.
+                // Without it the text vanished silently, which is worse than
+                // the grid, whose editor stays open showing the parse error.
+                on_draft: move |text: String| {
+                    editing.set(Some(ActiveEdit {
+                        row_key: draft_row.clone(),
+                        column: draft_column.clone(),
+                        draft: Some(text),
+                    }));
+                },
             }
         };
     }
@@ -3777,12 +3887,21 @@ fn RowDetailValue(
     // actually being open — an unconditional `set` still marks the signal
     // dirty, and the grid's "nothing is being edited, take the focus back"
     // effect would then yank focus off the editor mounting here.
-    let mut activate = move |column: &str| {
+    // Takes the row and column rather than capturing them, so it stays
+    // `Copy` (capturing a `String` would move it into the first closure) and
+    // both affordances below can use it.
+    let mut activate = move |row_key: &str, column: &str| {
         if grid_editing.peek().is_some() {
             grid_editing.set(None);
         }
-        editing.set(Some(column.to_string()));
+        editing.set(Some(ActiveEdit {
+            row_key: row_key.to_string(),
+            column: column.to_string(),
+            draft: None,
+        }));
     };
+    let dbl_row = row_key.clone();
+    let button_row = row_key.clone();
     let dbl_column = field.column.clone();
     let button_column = field.column.clone();
     let display = value.display();
@@ -3792,7 +3911,7 @@ fn RowDetailValue(
                 class: "min-w-0 flex-1",
                 ondoubleclick: move |_| {
                     if editable {
-                        activate(&dbl_column);
+                        activate(&dbl_row, &dbl_column);
                     }
                 },
                 match &value {
@@ -3815,7 +3934,7 @@ fn RowDetailValue(
                 button {
                     class: "shrink-0 rounded p-0.5 text-slate-400 opacity-60 hover:bg-slate-200 dark:hover:bg-slate-800 hover:opacity-100",
                     title: "Edit this value (or double-click it)",
-                    onclick: move |_| activate(&button_column),
+                    onclick: move |_| activate(&button_row, &button_column),
                     Pencil { size: 12 }
                 }
             }
@@ -3826,6 +3945,60 @@ fn RowDetailValue(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_open_editor_is_matched_on_row_as_well_as_column() {
+        // The detail panel's editor outlives a row move (it is owned above the
+        // row-keyed field list, so a draft survives). Matching on column alone
+        // would reopen it on the next row's same-named field, seeded with the
+        // previous row's text.
+        let open = ActiveEdit {
+            row_key: "1".into(),
+            column: "name".into(),
+            draft: Some("half-typed".into()),
+        };
+        assert!(open.is_on("1", "name"));
+        assert!(!open.is_on("2", "name"), "same column, different row");
+        assert!(!open.is_on("1", "email"), "same row, different column");
+        assert!(!open.is_on("2", "email"));
+    }
+
+    #[test]
+    fn a_field_past_the_fetch_cap_is_left_out_of_the_tab_order() {
+        // A capped field renders a note instead of an editor, so including it
+        // would dead-end Tab on something that can never take focus.
+        let field = |preview: Option<PreviewInfo>| DetailField {
+            column: "body".into(),
+            type_name: "text".into(),
+            value: Value::Text("x".into()),
+            preview,
+            dirty: false,
+            kind: EditorKind::Text,
+            nullable: true,
+            editable: true,
+            fk: None,
+        };
+        assert!(
+            !field(None).over_fetch_cap(),
+            "a complete value is editable"
+        );
+        assert!(
+            !field(Some(PreviewInfo {
+                full_len: FETCH_CELL_MAX_BYTES as u64,
+                binary: false,
+            }))
+            .over_fetch_cap(),
+            "exactly at the cap still fetches whole"
+        );
+        assert!(
+            field(Some(PreviewInfo {
+                full_len: FETCH_CELL_MAX_BYTES as u64 + 1,
+                binary: false,
+            }))
+            .over_fetch_cap(),
+            "past the cap renders a note, not an editor"
+        );
+    }
     use crate::db::PREVIEW_BYTES;
 
     #[test]
