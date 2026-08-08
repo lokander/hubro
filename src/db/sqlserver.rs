@@ -1488,10 +1488,19 @@ async fn table_ddl_extras(pool: &MssqlPool, params: &[Value]) -> Result<TableExt
     }
 
     // A constraint the user deliberately disabled (or left untrusted with
-    // WITH NOCHECK) comes back enforced, because CREATE TABLE has no way to
-    // express either state — a behaviour change, so it is named. Only emitted
-    // when such a constraint actually exists: a caveat that fires when nothing
-    // is wrong is worse than no caveat at all.
+    // WITH NOCHECK) comes back enforced — a behaviour change, so it is named.
+    //
+    // This is a choice, not a limitation: `ALTER TABLE … NOCHECK CONSTRAINT`
+    // could be appended the same way `CREATE INDEX` already is. It is declared
+    // rather than reproduced because the two failure directions are not
+    // symmetric. Re-creating a constraint enforced fails *loudly* on the first
+    // offending row, and the user fixes it. Emitting NOCHECK hands them a
+    // constraint that looks present and quietly enforces nothing — which is
+    // this feature's own hazard, DDL that reads authoritative and isn't,
+    // relocated rather than avoided. Don't "fix" this by adding the trailer.
+    //
+    // Only emitted when such a constraint actually exists: a caveat that fires
+    // when nothing is wrong is worse than no caveat at all.
     let mut unenforced: Vec<String> = Vec::new();
     for (rows, disabled, untrusted) in [(&check_rows.rows, 2, 3), (&fk_rows.rows, 7, 8)] {
         for row in rows {
