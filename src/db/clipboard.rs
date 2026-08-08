@@ -5,10 +5,36 @@
 //! that into text for the clipboard in one of five encodings. Everything here
 //! is pure: no signals, no I/O, no Dioxus.
 //!
+//! ## Which formats are faithful
+//!
+//! **JSON and INSERT reproduce a value exactly. TSV, CSV and Markdown do
+//! not** — deliberately, and each in one specific way:
+//!
+//! - **TSV and CSV** neutralize spreadsheet formula injection (see
+//!   [`harden_csv_text`], FRE-73): a text cell holding `-1` copies as `'-1`,
+//!   and likewise for a leading `=`, `+`, `@` or tab. The destination decides
+//!   this — these two formats exist to be pasted into a spreadsheet, and a
+//!   spreadsheet executes such a cell **on paste**, not only on file open, so
+//!   the threat is live on the clipboard path and not just the file-export
+//!   one. Hardening here also keeps identical data behaving identically
+//!   whether it leaves through Export or through Ctrl+C.
+//!
+//!   Note this is the *common* case, not an exotic one: **TSV is what the
+//!   plain copy shortcut produces for a multi-cell selection**, so the
+//!   default copy is a hardened copy.
+//! - **Markdown** is a *reading* format for tickets and PR comments: it
+//!   escapes pipes, folds newlines into `<br>`, and cannot tell an actual
+//!   NULL from a text value that reads `NULL`.
+//!
+//! Nothing is lost from the feature, because there is always a faithful
+//! option: **reach for JSON or INSERT when the point is to move data
+//! unchanged.** Both leave every byte alone, and both are tested against live
+//! engines for exactly that.
+//!
 //! ## NULL is never the empty string
 //!
-//! The classic silent-corruption bug in this feature is a NULL that pastes
-//! back as `''`. Every format keeps them apart:
+//! Within those limits, the one distinction every format does keep is the
+//! classic silent-corruption bug here — a NULL that pastes back as `''`:
 //!
 //! | format   | `NULL`            | `Text("")` |
 //! |----------|-------------------|------------|
@@ -17,18 +43,16 @@
 //! | INSERT   | `NULL`            | `''`       |
 //! | Markdown | `NULL`            | empty cell |
 //!
-//! This is the one place the clipboard's CSV deliberately diverges from the
-//! file export ([`super::export`]), which renders both as an empty field and
-//! documents that as an accepted CSV limitation. A file export is read back
-//! by a tool with its own NULL convention; a clipboard copy is usually pasted
-//! straight into another database, where the difference is data loss. The
+//! The CSV row is the one place this deliberately diverges from the file
+//! export ([`super::export`]), which renders both as an empty field and
+//! documents that as an accepted CSV limitation. The encoding used here is
+//! not an invention: it is Postgres `COPY … WITH (FORMAT csv)`'s own
+//! convention, where an unquoted empty field is NULL and `""` is the empty
+//! string — verified by loading these exact bytes back through `COPY`. A file
+//! export is read by a tool that brings its own NULL convention; a clipboard
+//! copy usually lands somewhere that already agrees with this one. The
 //! quoting rule itself is identical (RFC 4180), and a test below pins the two
 //! renderings together for values where their semantics do agree.
-//!
-//! Markdown is the exception in kind rather than in NULLs: it is a *reading*
-//! format for tickets and PR comments, so a text value that happens to read
-//! `NULL` is indistinguishable from an actual NULL there. Use CSV or JSON to
-//! move data.
 //!
 //! ## INSERT statements
 //!
@@ -46,20 +70,35 @@ use super::page::{quote_ident, Dialect};
 use super::value::{ColumnInfo, QueryResult, Value};
 
 /// The clipboard encodings offered by the grid's copy-as menu.
+///
+/// Each variant records whether it is faithful; see the module docs for why
+/// the two spreadsheet formats are not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyFormat {
     /// Tab-separated — the universal spreadsheet paste target, and what the
     /// plain copy shortcut produces for a multi-cell selection. The header
     /// row is opt-in here (it is on by default for CSV and Markdown, whose
     /// consumers expect one).
+    ///
+    /// **Not faithful:** formula-hardened, like CSV. Being the default copy,
+    /// this is the hardening most users will meet.
     Tsv { header: bool },
     /// RFC 4180 comma-separated, with a header row.
+    ///
+    /// **Not faithful:** formula-hardened, like TSV.
     Csv,
     /// An array of objects keyed by column name.
+    ///
+    /// **Faithful** — every value verbatim.
     Json,
     /// One `INSERT` statement per row, in the source connection's dialect.
+    ///
+    /// **Faithful** — every value verbatim, escaped for the dialect.
     Insert,
     /// A GitHub-flavoured Markdown table, with a header row.
+    ///
+    /// **Not faithful:** pipes are escaped, newlines fold to `<br>`, and a
+    /// text value reading `NULL` is indistinguishable from a real one.
     Markdown,
 }
 
@@ -94,19 +133,32 @@ pub struct CopyBlock {
 }
 
 /// Renders a selection for the clipboard. An empty block (no columns or no
-/// rows) renders as the empty string, so copying nothing puts nothing on the
+/// rows) renders as an empty string, so copying nothing puts nothing on the
 /// clipboard rather than a stray header.
-pub fn render_copy(block: &CopyBlock, format: CopyFormat, dialect: Dialect) -> String {
-    if block.columns.is_empty() || block.rows.is_empty() {
-        return String::new();
+///
+/// Returns `None` for exactly one situation: [`CopyFormat::Insert`] without a
+/// `dialect`. Every other format is dialect-neutral and ignores it. INSERT
+/// refuses rather than falling back to a default flavour — a guessed dialect
+/// produces SQL that parses and runs, just against the wrong engine's rules,
+/// which is precisely the silent wrongness this format is guarded against.
+pub fn render_copy(
+    block: &CopyBlock,
+    format: CopyFormat,
+    dialect: Option<Dialect>,
+) -> Option<String> {
+    if format == CopyFormat::Insert && dialect.is_none() {
+        return None;
     }
-    match format {
+    if block.columns.is_empty() || block.rows.is_empty() {
+        return Some(String::new());
+    }
+    Some(match format {
         CopyFormat::Tsv { header } => render_delimited(block, '\t', header),
         CopyFormat::Csv => render_delimited(block, ',', true),
         CopyFormat::Json => render_json(block),
-        CopyFormat::Insert => render_insert(block, dialect),
+        CopyFormat::Insert => render_insert(block, dialect?),
         CopyFormat::Markdown => render_markdown(block),
-    }
+    })
 }
 
 /// The text a *single-cell* copy puts on the clipboard: the raw value alone,
@@ -116,6 +168,12 @@ pub fn render_copy(block: &CopyBlock, format: CopyFormat, dialect: Dialect) -> S
 /// field would be wrong; the delimited formats above are where NULL has to
 /// stay distinguishable. Blobs copy as the same `\x…` hex the other formats
 /// use rather than the grid's `<blob 2.0 KB>` placeholder.
+///
+/// **Faithful**, and deliberately *not* formula-hardened even though the
+/// plain shortcut routes here: this path produces one bare value with no
+/// delimiters, so it is not a spreadsheet document and pasting it into one
+/// lands in a single cell the user is looking at. Copying that same cell as
+/// TSV — a document — does harden it.
 pub fn raw_cell_text(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
@@ -376,24 +434,31 @@ mod tests {
         }
     }
 
+    /// Renders `format`, asserting it is one of the cases that always
+    /// succeeds (see [`render_copy`]: only INSERT-without-a-dialect is
+    /// `None`).
+    fn render(block: &CopyBlock, format: CopyFormat, dialect: Option<Dialect>) -> String {
+        render_copy(block, format, dialect).expect("this format always renders")
+    }
+
     fn tsv(block: &CopyBlock) -> String {
-        render_copy(block, CopyFormat::Tsv { header: false }, Dialect::Sqlite)
+        render(block, CopyFormat::Tsv { header: false }, None)
     }
 
     fn csv(block: &CopyBlock) -> String {
-        render_copy(block, CopyFormat::Csv, Dialect::Sqlite)
+        render(block, CopyFormat::Csv, None)
     }
 
     fn json(block: &CopyBlock) -> String {
-        render_copy(block, CopyFormat::Json, Dialect::Sqlite)
+        render(block, CopyFormat::Json, None)
     }
 
     fn markdown(block: &CopyBlock) -> String {
-        render_copy(block, CopyFormat::Markdown, Dialect::Sqlite)
+        render(block, CopyFormat::Markdown, None)
     }
 
     fn insert(block: &CopyBlock, dialect: Dialect) -> String {
-        render_copy(block, CopyFormat::Insert, dialect)
+        render(block, CopyFormat::Insert, Some(dialect))
     }
 
     // ---- empty / single cell -------------------------------------------
@@ -409,8 +474,8 @@ mod tests {
             CopyFormat::Insert,
             CopyFormat::Markdown,
         ] {
-            assert_eq!(render_copy(&no_rows, format, Dialect::Sqlite), "");
-            assert_eq!(render_copy(&no_columns, format, Dialect::Sqlite), "");
+            assert_eq!(render(&no_rows, format, Some(Dialect::Sqlite)), "");
+            assert_eq!(render(&no_columns, format, Some(Dialect::Sqlite)), "");
         }
     }
 
@@ -472,7 +537,7 @@ mod tests {
         );
         assert_eq!(tsv(&b), "1\tone\n2\ttwo\n");
         assert_eq!(
-            render_copy(&b, CopyFormat::Tsv { header: true }, Dialect::Sqlite),
+            render(&b, CopyFormat::Tsv { header: true }, None),
             "id\ttitle\n1\tone\n2\ttwo\n"
         );
     }
@@ -524,6 +589,23 @@ mod tests {
         // A clipboard paste into Excel runs formulas exactly like an opened
         // file does, so FRE-73's apostrophe applies here too.
         assert_eq!(tsv(&b), "'=1+1\t\\x00ff\n");
+    }
+
+    #[test]
+    fn only_the_spreadsheet_formats_harden_formula_prefixes() {
+        // The flip side of the hardening: TSV/CSV are lossy for a value
+        // starting with `=` `+` `-` `@` or a tab, and JSON/INSERT — the two
+        // formats documented as exact — must leave it completely alone.
+        let b = block(&["f"], vec![vec![Value::Text("-1".into())]]);
+        assert_eq!(tsv(&b), "'-1\n");
+        assert_eq!(csv(&b), "f\n'-1\n");
+        assert_eq!(json(&b), "[\n  {\"f\":\"-1\"}\n]\n");
+        assert_eq!(
+            insert(&b, Dialect::Sqlite),
+            "INSERT INTO \"t\" (\"f\") VALUES ('-1');\n"
+        );
+        // Markdown is lossy in other ways, but not this one.
+        assert_eq!(markdown(&b), "| f |\n| --- |\n| -1 |\n");
     }
 
     #[test]
@@ -813,6 +895,34 @@ mod tests {
                 assert!(literal.ends_with('\''), "literal not closed: {literal}");
             }
         }
+    }
+
+    #[test]
+    fn insert_without_a_dialect_refuses_instead_of_guessing_one() {
+        let b = block(&["a"], vec![vec![Value::Text("x".into())]]);
+        assert_eq!(render_copy(&b, CopyFormat::Insert, None), None);
+        // Every other format is dialect-neutral and renders regardless.
+        for format in [
+            CopyFormat::Tsv { header: false },
+            CopyFormat::Tsv { header: true },
+            CopyFormat::Csv,
+            CopyFormat::Json,
+            CopyFormat::Markdown,
+        ] {
+            assert!(
+                render_copy(&b, format, None).is_some(),
+                "{} needs no dialect",
+                format.label()
+            );
+        }
+        // An empty selection still refuses INSERT without a dialect, so the
+        // `None` return never has to be disambiguated from "nothing to copy".
+        let empty = block(&["a"], vec![]);
+        assert_eq!(render_copy(&empty, CopyFormat::Insert, None), None);
+        assert_eq!(
+            render_copy(&empty, CopyFormat::Insert, Some(Dialect::Sqlite)),
+            Some(String::new())
+        );
     }
 
     #[test]

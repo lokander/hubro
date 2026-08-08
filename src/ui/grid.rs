@@ -80,8 +80,15 @@ struct ActiveEdit {
 /// [`AppState::load_cell`] (FRE-33).
 #[derive(Debug, Clone, PartialEq)]
 enum ExpandView {
-    /// A value already fully in the page — rendered directly.
+    /// A value already fully in the page — rendered directly, and safe to
+    /// copy.
     Text(String),
+    /// A truncated cell whose row can't be addressed (a view, a keyless
+    /// table), so the full value can never be loaded. The popup shows the
+    /// preview for reading but refuses to copy it — the same call
+    /// [`plan_copy`] makes for this cell (FRE-110). Copying here would put a
+    /// prefix plus a literal `…` on the clipboard.
+    Truncated { display: String, column: String },
     /// A truncated cell: fetch and show its full value.
     Fetch { locator: RowLocator, column: String },
 }
@@ -640,7 +647,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         state,
         id,
         table: table.clone(),
-        dialect: dialect.unwrap_or(Dialect::Sqlite),
+        dialect,
         status: copy_status,
     };
     // Shape of the current selection — (rows, columns, cells) — for the Copy
@@ -750,7 +757,13 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                 locator,
                                 column: cell.column.clone(),
                             },
-                            _ => ExpandView::Text(cell.display.clone()),
+                            // Truncated but unaddressable: show the preview,
+                            // but don't offer it as a value to copy.
+                            (true, None) => ExpandView::Truncated {
+                                display: cell.display.clone(),
+                                column: cell.column.clone(),
+                            },
+                            (false, _) => ExpandView::Text(cell.display.clone()),
                         };
                         expanded.set(Some(view));
                     }
@@ -903,19 +916,25 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                             }
                             div { class: "absolute right-0 z-40 mt-1 w-44 overflow-hidden rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 py-1 shadow-lg",
                                 for format in COPY_FORMATS {
-                                    button {
-                                        key: "{format.label()}",
-                                        class: "block w-full px-3 py-1 text-left text-xs text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
-                                        onclick: {
-                                            let ctx = copy_ctx.clone();
-                                            move |_| {
-                                                copy_menu.set(false);
-                                                if let Some(selection) = *selection.peek() {
-                                                    start_copy(&ctx, &grid_nav.peek(), selection, Some(format));
+                                    // INSERT is offered only when the dialect
+                                    // is known, mirroring the Export buttons'
+                                    // gate — `start_copy` refuses it anyway,
+                                    // but an absent entry beats a failing one.
+                                    if format != CopyFormat::Insert || dialect.is_some() {
+                                        button {
+                                            key: "{format.label()}",
+                                            class: "block w-full px-3 py-1 text-left text-xs text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
+                                            onclick: {
+                                                let ctx = copy_ctx.clone();
+                                                move |_| {
+                                                    copy_menu.set(false);
+                                                    if let Some(selection) = *selection.peek() {
+                                                        start_copy(&ctx, &grid_nav.peek(), selection, Some(format));
+                                                    }
                                                 }
-                                            }
-                                        },
-                                        "{format.label()}"
+                                            },
+                                            "{format.label()}"
+                                        }
                                     }
                                 }
                             }
@@ -1400,6 +1419,19 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                     pre { class: "whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
                                         "{display}"
                                     }
+                                }
+                            },
+                            // Preview of an unloadable value: readable, but no
+                            // Copy raw — it would put a prefix on the clipboard
+                            // (FRE-110). Not pretty-printed either; the text is
+                            // cut mid-document.
+                            ExpandView::Truncated { display, column } => rsx! {
+                                Banner {
+                                    kind: BannerKind::Warning,
+                                    message: CopyRefusal::Unaddressable { column }.message(),
+                                }
+                                pre { class: "mt-2 whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
+                                    "{display}"
                                 }
                             },
                             ExpandView::Fetch { locator, column } => rsx! {
@@ -1900,7 +1932,10 @@ struct CopyContext {
     state: AppState,
     id: ConnectionId,
     table: TableRef,
-    dialect: Dialect,
+    /// `None` when the connection is gone. Only [`CopyFormat::Insert`] needs
+    /// it, and that format refuses rather than assuming a dialect — see
+    /// [`CopyRefusal::UnknownDialect`].
+    dialect: Option<Dialect>,
     status: Signal<Option<CopyStatus>>,
 }
 
@@ -1932,6 +1967,11 @@ enum CopyRefusal {
     /// A selected cell is only a preview and its row has no locator (a view,
     /// or a keyless table), so the full value can't be loaded at all.
     Unaddressable { column: String },
+    /// The connection's SQL dialect is unknown (the tab is closing), so
+    /// INSERT statements can't be rendered. Refusing beats defaulting to one:
+    /// a guessed dialect emits SQL that parses and runs in the wrong flavour,
+    /// which is the silent-wrongness this format is guarded against.
+    UnknownDialect,
 }
 
 impl CopyRefusal {
@@ -1947,6 +1987,9 @@ impl CopyRefusal {
             CopyRefusal::Unaddressable { column } => format!(
                 "Can't copy: \"{column}\" is truncated and this table's rows can't be addressed to load the full value. Use Export instead."
             ),
+            CopyRefusal::UnknownDialect => {
+                "Can't copy as INSERT: this connection's SQL dialect is unknown.".to_string()
+            }
         }
     }
 }
@@ -1956,6 +1999,17 @@ impl CopyRefusal {
 ///
 /// Cells outside the page (a selection racing a shrinking page) are skipped
 /// rather than erroring; the clamp effect normally prevents that.
+///
+/// The `full_len` compared against the byte cap here is in *characters* for
+/// text. That is not a conservative approximation — characters ≤ bytes, so as
+/// a byte test it is permissive, and a text copy can exceed 8 MB of actual
+/// bytes. What makes it correct is that it is not really a byte test: the
+/// backend measures a value and slices it in the **same unit**
+/// (`substr`/`length` on SQLite, `left`/`length` on Postgres,
+/// `SUBSTRING`/`DATALENGTH … / 2` on SQL Server), so `full_len > cap` means
+/// exactly "the fetch would truncate this". Keeping those two in step is the
+/// whole invariant — see [`page::mssql_text_len`](crate::db) for the one place
+/// it was broken.
 fn plan_copy(nav: &GridNav, selection: Selection) -> Result<CopyPlan, CopyRefusal> {
     let rect = selection.bounds();
     let columns: Vec<String> = (rect.left..=rect.right)
@@ -2020,8 +2074,15 @@ fn start_copy(ctx: &CopyContext, nav: &GridNav, selection: Selection, format: Op
         None => (CopyFormat::Tsv { header: false }, selection.is_single()),
     };
     let (state, id, dialect) = (ctx.state, ctx.id, ctx.dialect);
+    // Refuse before fetching anything: INSERT is the one format that needs a
+    // dialect, and it must never fall back to one.
+    if format == CopyFormat::Insert && dialect.is_none() {
+        status.set(Some(CopyStatus::failed(
+            CopyRefusal::UnknownDialect.message(),
+        )));
+        return;
+    }
     let table = ctx.table.clone();
-    let (rows_selected, cols_selected) = selection.size();
     spawn(async move {
         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(plan.rows.len());
         for planned in plan.rows {
@@ -2058,6 +2119,12 @@ fn start_copy(ctx: &CopyContext, nav: &GridNav, selection: Selection, format: Op
             }
             rows.push(values);
         }
+        // Report what actually landed on the clipboard, not the selection's
+        // shape: `plan_copy` skips cells outside the page, so in the (clamp-
+        // protected) race where the page shrank underneath the selection these
+        // can differ.
+        let copied_rows = rows.len();
+        let copied_cols = plan.columns.len();
         let text = if raw {
             rows.first()
                 .and_then(|row| row.first())
@@ -2070,14 +2137,24 @@ fn start_copy(ctx: &CopyContext, nav: &GridNav, selection: Selection, format: Op
                 columns: plan.columns,
                 rows,
             };
-            render_copy(&block, format, dialect)
+            match render_copy(&block, format, dialect) {
+                Some(text) => text,
+                // Only reachable for INSERT with no dialect, which the caller
+                // already gates on — belt and braces rather than a guess.
+                None => {
+                    status.set(Some(CopyStatus::failed(
+                        CopyRefusal::UnknownDialect.message(),
+                    )));
+                    return;
+                }
+            }
         };
         write_clipboard(&text);
         status.set(Some(CopyStatus::ok(copy_summary(
             raw,
             format,
-            rows_selected,
-            cols_selected,
+            copied_rows,
+            copied_cols,
         ))));
     });
 }
@@ -2955,14 +3032,27 @@ fn ExpandedValue(
             } else {
                 pretty_json(&text).unwrap_or_else(|| text.clone())
             };
-            rsx! {
-                if capped {
-                    p { class: "mb-2 rounded border border-amber-300 dark:border-amber-800/70 bg-amber-50 dark:bg-amber-950/40 px-2 py-1 text-xs text-amber-700 dark:text-amber-300",
-                        "Value is very large; showing the first {human_bytes(FETCH_CELL_MAX_BYTES as u64)}."
+            // A capped fetch holds a prefix, so Copy raw is withdrawn rather
+            // than handed a truncated value — the same refusal `plan_copy`
+            // makes for this cell, worded identically (FRE-110).
+            let capped_note = capped.then(|| {
+                format!(
+                    "Value is very large; showing the first {}. {}",
+                    human_bytes(FETCH_CELL_MAX_BYTES as u64),
+                    CopyRefusal::TooLarge {
+                        column: column.clone(),
+                        full_len: fetch.full_len,
                     }
+                    .message(),
+                )
+            });
+            rsx! {
+                if let Some(note) = capped_note {
+                    Banner { kind: BannerKind::Warning, message: note }
+                } else {
+                    CopyRawButton { raw: text.clone() }
                 }
-                CopyRawButton { raw: text.clone() }
-                pre { class: "whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
+                pre { class: "mt-2 whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
                     "{display}"
                 }
             }
