@@ -538,6 +538,12 @@ pub struct SessionTab {
     /// values fall back to the default instead (FRE-69).
     #[serde(default, deserialize_with = "pane_or_default")]
     pub pane: SessionPane,
+    /// Whether the row detail panel was docked open beside the grid
+    /// (FRE-109). `default` + `skip_serializing_if` keep sessions written
+    /// before it existed loading, and leave a tab that never opened it
+    /// serializing exactly as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub row_detail: bool,
 }
 
 /// The last session (FRE-30): open tabs in order, plus which one was active.
@@ -1790,18 +1796,21 @@ mod tests {
                     selected_schema: None,
                     selected_table: Some("artists".into()),
                     pane: SessionPane::Browser,
+                    row_detail: true,
                 },
                 SessionTab {
                     locator: "postgres://u@h:5432/app".into(),
                     selected_schema: Some("public".into()),
                     selected_table: Some("orders".into()),
                     pane: SessionPane::Sql,
+                    row_detail: false,
                 },
                 SessionTab {
                     locator: "postgres://u@h:5432/other".into(),
                     selected_schema: None,
                     selected_table: Some("stock".into()),
                     pane: SessionPane::Schema,
+                    row_detail: false,
                 },
             ],
             active: Some("postgres://u@h:5432/app".into()),
@@ -1823,6 +1832,47 @@ mod tests {
         let session = load_session(&path);
         assert_eq!(session.tabs.len(), 1);
         assert_eq!(session.tabs[0].pane, SessionPane::Browser);
+    }
+
+    #[test]
+    fn a_session_without_the_row_detail_key_loads_with_the_panel_closed() {
+        // Files written before the row detail panel existed (FRE-109): the
+        // tab must still load, with the panel simply closed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.toml");
+        std::fs::write(
+            &path,
+            "active = \"/data/music.db\"\n\n[[tabs]]\nlocator = \"/data/music.db\"\n\
+             selected_table = \"artists\"\npane = \"browser\"\n",
+        )
+        .unwrap();
+        let session = load_session(&path);
+        assert_eq!(session.tabs.len(), 1);
+        assert!(!session.tabs[0].row_detail);
+        assert_eq!(session.tabs[0].selected_table.as_deref(), Some("artists"));
+    }
+
+    #[test]
+    fn a_closed_row_detail_panel_writes_no_key_at_all() {
+        // The unaffected-entries-serialize-unchanged half of the convention:
+        // a tab that never opened the panel round-trips byte-identically to
+        // what a pre-FRE-109 build wrote.
+        let closed = Session {
+            tabs: vec![SessionTab {
+                locator: "/data/music.db".into(),
+                selected_table: Some("artists".into()),
+                ..Default::default()
+            }],
+            active: None,
+        };
+        let text = toml::to_string_pretty(&closed).unwrap();
+        assert!(!text.contains("row_detail"), "{text}");
+        // …and an open one is written, so it survives the next launch.
+        let mut open = closed.clone();
+        open.tabs[0].row_detail = true;
+        let text = toml::to_string_pretty(&open).unwrap();
+        assert!(text.contains("row_detail = true"), "{text}");
+        assert_eq!(toml::from_str::<Session>(&text).unwrap(), open);
     }
 
     #[test]

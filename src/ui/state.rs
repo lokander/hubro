@@ -171,6 +171,16 @@ pub struct TabUi {
     /// SQL editor buffer, synced from the webview so it survives pane and
     /// tab switches.
     pub sql_text: String,
+    /// Whether the row detail panel is docked open beside the grid
+    /// (FRE-109). Per tab rather than per table, so it stays open while
+    /// browsing from table to table; persisted in the session.
+    pub row_detail: bool,
+    /// The row detail panel's dragged width in CSS pixels, or `None` for the
+    /// default. Kept here (not in the grid) so a table switch — which
+    /// remounts the grid — doesn't snap the panel back. Deliberately not
+    /// persisted: the session remembers whether the panel is open, and a
+    /// width is cheap to re-drag.
+    pub row_detail_width: Option<f64>,
 }
 
 /// Where a script run currently stands. Per-statement outcomes accumulate
@@ -2121,6 +2131,42 @@ impl AppState {
         self.set_pane(id, target);
     }
 
+    /// Whether one tab has the row detail panel docked open (FRE-109).
+    pub fn row_detail_open(&self, id: ConnectionId) -> bool {
+        self.tab_ui.read().get(&id).is_some_and(|ui| ui.row_detail)
+    }
+
+    /// Opens or closes one tab's row detail panel. Unlike a pane switch this
+    /// is unguarded: the panel is docked beside the grid rather than replacing
+    /// it, so closing it navigates nowhere and can't strand staged edits.
+    pub fn set_row_detail(mut self, id: ConnectionId, open: bool) {
+        self.tab_ui.write().entry(id).or_default().row_detail = open;
+    }
+
+    /// Toggles the active tab's row detail panel (FRE-109's shortcut). A no-op
+    /// on the connections screen.
+    pub fn toggle_row_detail(self) {
+        let ActiveView::Connection(id) = *self.active.read() else {
+            return;
+        };
+        self.set_row_detail(id, !self.row_detail_open(id));
+    }
+
+    /// The row detail panel's remembered width for one tab, or `None` for the
+    /// default (FRE-109).
+    pub fn row_detail_width(&self, id: ConnectionId) -> Option<f64> {
+        self.tab_ui
+            .read()
+            .get(&id)
+            .and_then(|ui| ui.row_detail_width)
+    }
+
+    /// Remembers the width the panel was dragged to. Written once per drag
+    /// (on release), not per frame — the drag itself moves the DOM node.
+    pub fn set_row_detail_width(mut self, id: ConnectionId, width: f64) {
+        self.tab_ui.write().entry(id).or_default().row_detail_width = Some(width);
+    }
+
     /// Flips the shortcut cheatsheet overlay (FRE-15, the `?` shortcut).
     pub fn toggle_cheatsheet(mut self) {
         let showing = *self.show_cheatsheet.read();
@@ -3221,19 +3267,21 @@ impl AppState {
         let tab_ui = self.tab_ui.read();
         let mut tabs = Vec::with_capacity(open.len());
         for (id, locator) in open.iter() {
-            let (schema, table, pane) = match tab_ui.get(id) {
+            let (schema, table, pane, row_detail) = match tab_ui.get(id) {
                 Some(ui) => (
                     ui.selected_table.as_ref().and_then(|t| t.schema.clone()),
                     ui.selected_table.as_ref().map(|t| t.name.clone()),
                     ui.pane.to_session(),
+                    ui.row_detail,
                 ),
-                None => (None, None, SessionPane::default()),
+                None => (None, None, SessionPane::default(), false),
             };
             tabs.push(SessionTab {
                 locator: locator.clone(),
                 selected_schema: schema,
                 selected_table: table,
                 pane,
+                row_detail,
             });
         }
         let active = match *self.active.read() {
@@ -3363,7 +3411,8 @@ impl AppState {
                     ..
                 } => self.connect_sqlserver(url, name, tunnel, auth).await,
             }
-            // Apply the remembered table + pane to the freshly opened tab.
+            // Apply the remembered table, pane, and row detail panel (FRE-109)
+            // to the freshly opened tab.
             let id = self
                 .open_locators
                 .read()
@@ -3380,6 +3429,7 @@ impl AppState {
                 let ui = tab_ui.entry(id).or_default();
                 ui.selected_table = selected;
                 ui.pane = pane;
+                ui.row_detail = tab.row_detail;
             }
         }
         // Restore the active view: the remembered active tab if it reopened,
