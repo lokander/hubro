@@ -103,6 +103,7 @@ async fn a_view_refuses_staged_writes_with_the_stated_reason() {
     // missed: it must refuse rather than build SQL against the view.
     let err = apply_staged(
         &pool,
+        &pool.access(view),
         view,
         &RowIdentity::PrimaryKey {
             columns: vec!["id".into()],

@@ -6,8 +6,66 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::azure::EntraAuth;
-use crate::db::Dialect;
+use crate::db::{Dialect, WriteProtection};
 use crate::tunnel::TunnelConfig;
+
+/// A connection's accent colour (FRE-111): a warning you can see from across
+/// the room, on the tab, the sidebar and the connections list.
+///
+/// Deliberately a fixed palette rather than a free-form colour string. The
+/// colour is free-form in the sense the issue meant — it encodes no
+/// environment, so nothing here is named "production" and a red connection
+/// carries no behaviour — but the *values* are closed, which keeps the swatch
+/// picker simple and keeps user-supplied text out of the inline `style`
+/// attributes these render into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnectionColor {
+    Red,
+    Amber,
+    Green,
+    Blue,
+    Purple,
+    Gray,
+}
+
+impl ConnectionColor {
+    /// Every colour, in picker order.
+    pub const ALL: [ConnectionColor; 6] = [
+        ConnectionColor::Red,
+        ConnectionColor::Amber,
+        ConnectionColor::Green,
+        ConnectionColor::Blue,
+        ConnectionColor::Purple,
+        ConnectionColor::Gray,
+    ];
+
+    /// The CSS colour these render as. One mid-tone per hue, chosen to stay
+    /// legible against both the light and the dark theme rather than needing a
+    /// per-theme pair.
+    pub fn css(self) -> &'static str {
+        match self {
+            ConnectionColor::Red => "#dc2626",
+            ConnectionColor::Amber => "#d97706",
+            ConnectionColor::Green => "#059669",
+            ConnectionColor::Blue => "#2563eb",
+            ConnectionColor::Purple => "#7c3aed",
+            ConnectionColor::Gray => "#6b7280",
+        }
+    }
+
+    /// The name shown in the picker's tooltip.
+    pub fn label(self) -> &'static str {
+        match self {
+            ConnectionColor::Red => "Red",
+            ConnectionColor::Amber => "Amber",
+            ConnectionColor::Green => "Green",
+            ConnectionColor::Blue => "Blue",
+            ConnectionColor::Purple => "Purple",
+            ConnectionColor::Gray => "Gray",
+        }
+    }
+}
 
 /// How a server connection (Postgres, FRE-43; SQL Server, FRE-58)
 /// authenticates. `Password` (the default) resolves a password from session
@@ -32,12 +90,27 @@ impl PgAuth {
 
 /// One entry in the saved-connections list. Internally tagged on `kind`, so
 /// existing `kind = "sqlite"` + `path` TOML entries keep deserializing.
+///
+/// The `protection` and `color` fields (FRE-111) repeat on every variant
+/// rather than being hoisted into a shared struct: an internally-tagged enum
+/// can't `#[serde(flatten)]` one in without changing the on-disk shape, and
+/// both serialize as plain strings, so they stay safe to place anywhere in a
+/// TOML table. Read them through [`SavedConnection::protection`] and
+/// [`SavedConnection::color`] rather than matching.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum SavedConnection {
     Sqlite {
         name: String,
         path: PathBuf,
+        /// How much this connection resists writes (FRE-111). `default` +
+        /// `skip_serializing_if` keep pre-FRE-111 config files deserializing
+        /// and unprotected entries' TOML unchanged; a missing key is `Open`.
+        #[serde(default, skip_serializing_if = "WriteProtection::is_open")]
+        protection: WriteProtection,
+        /// Accent colour (FRE-111), stored exactly like `protection`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<ConnectionColor>,
     },
     Postgres {
         name: String,
@@ -55,6 +128,12 @@ pub enum SavedConnection {
         /// files (no `auth` key) deserialize as `Password`.
         #[serde(default, skip_serializing_if = "PgAuth::is_password")]
         auth: PgAuth,
+        /// Write protection (FRE-111); see the `Sqlite` variant.
+        #[serde(default, skip_serializing_if = "WriteProtection::is_open")]
+        protection: WriteProtection,
+        /// Accent colour (FRE-111); see the `Sqlite` variant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<ConnectionColor>,
     },
     /// SQL Server (FRE-57), serialized with `kind = "sqlserver"`. Like
     /// Postgres, the URL is stored **without** a password in the canonical
@@ -72,6 +151,12 @@ pub enum SavedConnection {
         /// one; a missing `auth` key deserializes as `Password`.
         #[serde(default, skip_serializing_if = "PgAuth::is_password")]
         auth: PgAuth,
+        /// Write protection (FRE-111); see the `Sqlite` variant.
+        #[serde(default, skip_serializing_if = "WriteProtection::is_open")]
+        protection: WriteProtection,
+        /// Accent colour (FRE-111); see the `Sqlite` variant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<ConnectionColor>,
     },
 }
 
@@ -112,6 +197,48 @@ impl SavedConnection {
             SavedConnection::Sqlite { .. } => BackendKind::Sqlite,
             SavedConnection::Postgres { .. } => BackendKind::Postgres,
             SavedConnection::SqlServer { .. } => BackendKind::SqlServer,
+        }
+    }
+
+    /// How much this connection resists writes (FRE-111).
+    pub fn protection(&self) -> WriteProtection {
+        match self {
+            SavedConnection::Sqlite { protection, .. }
+            | SavedConnection::Postgres { protection, .. }
+            | SavedConnection::SqlServer { protection, .. } => *protection,
+        }
+    }
+
+    /// This connection's accent colour (FRE-111), if the user set one.
+    pub fn color(&self) -> Option<ConnectionColor> {
+        match self {
+            SavedConnection::Sqlite { color, .. }
+            | SavedConnection::Postgres { color, .. }
+            | SavedConnection::SqlServer { color, .. } => *color,
+        }
+    }
+
+    /// Replaces the protection and colour, leaving everything else alone —
+    /// the one write path for FRE-111's two fields, so no caller has to
+    /// reconstruct a variant just to re-mark it.
+    pub fn set_marking(
+        &mut self,
+        new_protection: WriteProtection,
+        new_color: Option<ConnectionColor>,
+    ) {
+        match self {
+            SavedConnection::Sqlite {
+                protection, color, ..
+            }
+            | SavedConnection::Postgres {
+                protection, color, ..
+            }
+            | SavedConnection::SqlServer {
+                protection, color, ..
+            } => {
+                *protection = new_protection;
+                *color = new_color;
+            }
         }
     }
 
@@ -607,6 +734,29 @@ impl SavedList {
         true
     }
 
+    /// Re-marks one entry's write protection and accent colour (FRE-111).
+    ///
+    /// Separate from [`Self::update`] because marking is not an edit of the
+    /// connection: it touches neither the locator nor anything that could
+    /// collide with another entry, so it can't reorder or drop rows. Returns
+    /// false when `locator` names no entry, or when nothing changed — the
+    /// caller uses that to skip a pointless write to disk.
+    pub fn set_marking(
+        &mut self,
+        locator: &str,
+        protection: WriteProtection,
+        color: Option<ConnectionColor>,
+    ) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|s| s.locator() == locator) else {
+            return false;
+        };
+        if entry.protection() == protection && entry.color() == color {
+            return false;
+        }
+        entry.set_marking(protection, color);
+        true
+    }
+
     /// Removes and returns the entry with this locator (`None` when absent).
     pub fn remove(&mut self, locator: &str) -> Option<SavedConnection> {
         let index = self.entries.iter().position(|s| s.locator() == locator)?;
@@ -634,6 +784,8 @@ mod tests {
         SavedConnection::Sqlite {
             name: name.into(),
             path: PathBuf::from(path),
+            protection: WriteProtection::Open,
+            color: None,
         }
     }
 
@@ -643,6 +795,8 @@ mod tests {
             url: url.into(),
             tunnel: None,
             auth: PgAuth::Password,
+            protection: WriteProtection::Open,
+            color: None,
         }
     }
 
@@ -652,6 +806,8 @@ mod tests {
             url: url.into(),
             tunnel: None,
             auth: PgAuth::Password,
+            protection: WriteProtection::Open,
+            color: None,
         }
     }
 
@@ -723,6 +879,124 @@ mod tests {
     }
 
     #[test]
+    fn marking_stays_absent_from_the_toml_until_it_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.toml");
+        // An unmarked entry must serialize byte-for-byte as it did before
+        // FRE-111: no protection key, no color key.
+        save_connections(&path, &[saved("plain", "/tmp/a.db")]).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("protection"), "{text}");
+        assert!(!text.contains("color"), "{text}");
+
+        let mut marked = saved("prod", "/tmp/b.db");
+        marked.set_marking(WriteProtection::Confirm, Some(ConnectionColor::Red));
+        save_connections(&path, &[marked.clone()]).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("protection = \"confirm\""), "{text}");
+        assert!(text.contains("color = \"red\""), "{text}");
+        assert_eq!(load_connections(&path).unwrap(), vec![marked]);
+    }
+
+    #[test]
+    fn a_pre_fre_111_config_file_loads_as_unprotected() {
+        // The back-compat contract: a config file written before FRE-111 has
+        // neither key, and must come back as Open with no colour rather than
+        // failing to parse.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.toml");
+        std::fs::write(
+            &path,
+            "[[connections]]\nkind = \"sqlite\"\nname = \"old\"\npath = \"/tmp/old.db\"\n\
+             \n[[connections]]\nkind = \"postgres\"\nname = \"pg\"\nurl = \"postgres://u@h:5432/d\"\n",
+        )
+        .unwrap();
+        let loaded = load_connections(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        for entry in &loaded {
+            assert_eq!(entry.protection(), WriteProtection::Open);
+            assert_eq!(entry.color(), None);
+        }
+    }
+
+    #[test]
+    fn marking_round_trips_on_every_backend() {
+        for mut entry in [
+            saved("s", "/tmp/s.db"),
+            saved_pg("p", "postgres://u@h:5432/d"),
+            saved_ms("m", "mssql://sa@h:1433/d"),
+        ] {
+            entry.set_marking(WriteProtection::ReadOnly, Some(ConnectionColor::Purple));
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("connections.toml");
+            save_connections(&path, std::slice::from_ref(&entry)).unwrap();
+            assert_eq!(load_connections(&path).unwrap(), vec![entry]);
+        }
+    }
+
+    #[test]
+    fn set_marking_finds_the_entry_and_reports_whether_anything_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.toml");
+        save_connections(
+            &path,
+            &[
+                saved("a", "/tmp/a.db"),
+                saved_pg("b", "postgres://u@h:5432/d"),
+            ],
+        )
+        .unwrap();
+        let (mut list, err) = SavedList::load(&path);
+        assert!(err.is_none());
+        assert!(list.set_marking("/tmp/a.db", WriteProtection::Confirm, None));
+        assert_eq!(list.entries()[0].protection(), WriteProtection::Confirm);
+        // The other entry is untouched.
+        assert_eq!(list.entries()[1].protection(), WriteProtection::Open);
+        // Re-applying the same marking reports no change, so the caller can
+        // skip a pointless write to disk.
+        assert!(!list.set_marking("/tmp/a.db", WriteProtection::Confirm, None));
+        assert!(list.set_marking(
+            "/tmp/a.db",
+            WriteProtection::Confirm,
+            Some(ConnectionColor::Amber)
+        ));
+        assert_eq!(list.entries()[0].color(), Some(ConnectionColor::Amber));
+        // An unknown locator marks nothing.
+        assert!(!list.set_marking("/tmp/missing.db", WriteProtection::ReadOnly, None));
+    }
+
+    #[test]
+    fn marking_never_disturbs_the_rest_of_the_entry() {
+        // Marking is not an edit: the locator, name, tunnel and auth must all
+        // survive it untouched, or a marked connection would stop connecting.
+        let original = SavedConnection::Postgres {
+            name: "prod".into(),
+            url: "postgres://u@h:5432/d".into(),
+            tunnel: Some(tunnel(crate::tunnel::TunnelAuth::Agent)),
+            auth: PgAuth::Entra(EntraAuth::interactive_default()),
+            protection: WriteProtection::Open,
+            color: None,
+        };
+        let mut marked = original.clone();
+        marked.set_marking(WriteProtection::ReadOnly, Some(ConnectionColor::Red));
+        assert_eq!(marked.locator(), original.locator());
+        assert_eq!(marked.name(), original.name());
+        assert_eq!(marked.backend(), original.backend());
+        let (
+            SavedConnection::Postgres {
+                tunnel: a, auth: b, ..
+            },
+            SavedConnection::Postgres {
+                tunnel: c, auth: d, ..
+            },
+        ) = (&marked, &original)
+        else {
+            unreachable!("both are Postgres entries")
+        };
+        assert_eq!((a, b), (c, d));
+    }
+
+    #[test]
     fn load_normalizes_and_dedups_equivalent_sqlserver_entries() {
         // Three spellings of one server (sqlserver:// scheme, portless, cased
         // host) plus a distinct one.
@@ -769,6 +1043,8 @@ mod tests {
                 tenant: "contoso.onmicrosoft.com".into(),
                 client_id: None,
             }),
+            protection: WriteProtection::Open,
+            color: None,
         }];
         save_connections(&path, &entries).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -789,6 +1065,8 @@ mod tests {
             url: "mssql://sa@h:1433/db".into(),
             tunnel: Some(tunnel(crate::tunnel::TunnelAuth::Agent)),
             auth: PgAuth::Entra(EntraAuth::interactive_default()),
+            protection: WriteProtection::Open,
+            color: None,
         };
         assert!(list.add(updated.clone()));
         assert_eq!(list.entries().len(), 1);
@@ -873,6 +1151,8 @@ mod tests {
                 url: "postgres://u@db.internal:5432/app".into(),
                 tunnel: Some(tunnel(crate::tunnel::TunnelAuth::Agent)),
                 auth: PgAuth::Password,
+                protection: WriteProtection::Open,
+                color: None,
             },
             SavedConnection::Postgres {
                 name: "via key".into(),
@@ -881,6 +1161,8 @@ mod tests {
                     path: PathBuf::from("/home/u/.ssh/id_ed25519"),
                 })),
                 auth: PgAuth::Password,
+                protection: WriteProtection::Open,
+                color: None,
             },
         ];
         save_connections(&path, &connections).unwrap();
@@ -943,6 +1225,8 @@ mod tests {
                     tenant: "contoso.onmicrosoft.com".into(),
                     client_id: None,
                 }),
+                protection: WriteProtection::Open,
+                color: None,
             },
             SavedConnection::Postgres {
                 name: "azure-mi".into(),
@@ -951,6 +1235,8 @@ mod tests {
                 auth: PgAuth::Entra(EntraAuth::ManagedIdentity {
                     client_id: Some("11111111-2222-3333-4444-555555555555".into()),
                 }),
+                protection: WriteProtection::Open,
+                color: None,
             },
         ];
         save_connections(&path, &entries).unwrap();
@@ -973,6 +1259,8 @@ mod tests {
             url: "postgres://u@h:5432/db".into(),
             tunnel: None,
             auth: PgAuth::Entra(EntraAuth::interactive_default()),
+            protection: WriteProtection::Open,
+            color: None,
         };
         assert!(list.add(entra));
         assert_eq!(list.entries().len(), 1);
@@ -989,6 +1277,8 @@ mod tests {
             url: "postgres://u@h:5432/db".into(),
             tunnel: None,
             auth: PgAuth::Entra(EntraAuth::interactive_default()),
+            protection: WriteProtection::Open,
+            color: None,
         };
         assert!(!list.add(same));
     }
@@ -1004,6 +1294,8 @@ mod tests {
             url: "postgres://u@h:5432/db".into(),
             tunnel: Some(tunnel(crate::tunnel::TunnelAuth::Agent)),
             auth: PgAuth::Password,
+            protection: WriteProtection::Open,
+            color: None,
         };
         assert!(list.add(with_tunnel.clone()));
         assert_eq!(list.entries().len(), 1);

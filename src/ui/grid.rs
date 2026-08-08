@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use dioxus::prelude::*;
-use dioxus_icons::lucide::{File, RefreshCw, SearchX, X};
+use dioxus_icons::lucide::{File, RefreshCw, SearchX, ShieldAlert, X};
 
 use crate::db::{
     ConnectionId, Dialect, ExportFormat, Filter, FilterOp, ForeignKeyMeta, Generated, Page,
@@ -507,14 +507,14 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let can_back = state.can_go_back(id);
 
     let dialect: Option<Dialect> = state.registry.read().get(id).map(|c| c.pool.dialect());
-    // The connection's capabilities resolved for this table (FRE-87): one
-    // answer for whether editing is possible, how rows are addressed, and —
-    // when it isn't possible — which sentence explains it. Every editing
-    // affordance below gates on this rather than re-deriving the rules.
-    let access: Option<TableAccess> = match (&table_meta, state.registry.read().get(id)) {
-        (Some(meta), Some(connection)) => Some(connection.pool.access(meta)),
-        _ => None,
-    };
+    // The connection's capabilities resolved for this table (FRE-87, narrowed
+    // by the user's marking from FRE-111): one answer for whether editing is
+    // possible, how rows are addressed, and — when it isn't possible — which
+    // sentence explains it. Every editing affordance below gates on this
+    // rather than re-deriving the rules.
+    let access: Option<TableAccess> = table_meta
+        .as_ref()
+        .and_then(|meta| state.table_access(id, meta));
     let identity: Option<RowIdentity> = access.as_ref().and_then(|a| a.identity.clone());
     let can_mutate = access.as_ref().is_some_and(TableAccess::can_mutate);
     // Per-column editor kind + nullability, from introspection. Cells whose
@@ -525,6 +525,16 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // missing.
     let read_only_notice: Option<&'static str> =
         access.as_ref().and_then(TableAccess::read_only_notice);
+    // A save parked on the FRE-111 confirmation, and the connection name it
+    // has to state. Named rather than just "Are you sure?" — the state exists
+    // to make you read which database you are about to change.
+    let awaiting_confirm = state.save_awaiting_confirmation(id, &table.key());
+    let connection_name: String = state
+        .registry
+        .read()
+        .get(id)
+        .map(|c| c.name.clone())
+        .unwrap_or_default();
 
     // Staged (unsaved) changes of this table, if any.
     let stage: Option<TableStage> = state.table_stage(id, &table);
@@ -571,6 +581,8 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let save_table = table.clone();
     let discard_table = table.clone();
     let delete_table = table.clone();
+    let confirm_save_table = table.clone();
+    let dismiss_save_table = table.clone();
     let row_table = table.clone();
 
     // Grid keyboard navigation (FRE-15). Attached to the focusable scroll
@@ -822,6 +834,32 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                             state.discard_staged(id, &discard_table);
                         },
                         "Discard"
+                    }
+                }
+            }
+            // Write-protection confirmation (FRE-111): the connection is
+            // marked Confirm, so the apply waits here until the user has read
+            // which database it targets. The changes stay staged meanwhile —
+            // dismissing costs nothing.
+            if awaiting_confirm {
+                div { class: "flex items-center gap-3 border-b border-red-400 dark:border-red-800/60 bg-red-100 dark:bg-red-950/40 px-3 py-1.5 text-xs",
+                    ShieldAlert { size: 14 }
+                    span { class: "min-w-0 flex-1 text-red-700 dark:text-red-200",
+                        if pending_count == 1 {
+                            "Apply 1 change to \"{connection_name}\"? This connection is marked to confirm writes."
+                        } else {
+                            "Apply {pending_count} changes to \"{connection_name}\"? This connection is marked to confirm writes."
+                        }
+                    }
+                    button {
+                        class: "rounded bg-red-700 px-3 py-1 font-semibold text-white hover:bg-red-600",
+                        onclick: move |_| state.confirm_pending_save(id, &confirm_save_table),
+                        "Apply to \"{connection_name}\""
+                    }
+                    button {
+                        class: "rounded border border-slate-400 dark:border-slate-600 px-3 py-1 text-slate-900 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
+                        onclick: move |_| state.dismiss_pending_save(id, &dismiss_save_table),
+                        "Cancel"
                     }
                 }
             }

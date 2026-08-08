@@ -29,7 +29,7 @@ async fn collect_script(
 ) -> (Vec<StatementResult>, Result<(), hubro::db::ScriptError>) {
     let statements = split_statements(sql, pool.dialect());
     let mut results = Vec::new();
-    let outcome = run_script(pool, &statements, |r| results.push(r)).await;
+    let outcome = run_script(pool, pool.capabilities(), &statements, |r| results.push(r)).await;
     (results, outcome)
 }
 

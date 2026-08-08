@@ -542,7 +542,7 @@ async fn sqlserver_staged_edits_round_trip_and_identity_stays_server_assigned() 
             },
         },
     ];
-    let counts = apply_staged(&pool, &table, &identity, &changes)
+    let counts = apply_staged(&pool, &pool.access(&table), &table, &identity, &changes)
         .await
         .unwrap();
     assert_eq!(counts.updated_rows, 1);
@@ -613,7 +613,7 @@ async fn sqlserver_staged_row_count_mismatch_rolls_the_batch_back() {
             value: Value::Text("ghost".into()),
         },
     ];
-    let err = apply_staged(&pool, &table, &identity, &changes)
+    let err = apply_staged(&pool, &pool.access(&table), &table, &identity, &changes)
         .await
         .expect_err("a zero-row update must fail the batch");
     assert_eq!(err.change_index, Some(1));
@@ -650,7 +650,7 @@ async fn sqlserver_script_go_batches_split_and_execute() {
     assert_eq!(statements.len(), 3);
 
     let mut results = Vec::new();
-    run_script(&pool, &statements, |r| results.push(r))
+    run_script(&pool, pool.capabilities(), &statements, |r| results.push(r))
         .await
         .expect("the script should run to completion");
     assert_eq!(results.len(), 3);
@@ -694,7 +694,7 @@ async fn sqlserver_script_errors_roll_the_whole_script_back() {
     assert_eq!(statements.len(), 3);
 
     let mut results = Vec::new();
-    let err = run_script(&pool, &statements, |r| results.push(r))
+    let err = run_script(&pool, pool.capabilities(), &statements, |r| results.push(r))
         .await
         .expect_err("the duplicate key must fail the script");
     assert_eq!(err.statement_index, 2);

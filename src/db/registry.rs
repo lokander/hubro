@@ -4,7 +4,7 @@ use std::path::Path;
 use sqlx::postgres::PgPool;
 use sqlx::sqlite::SqlitePool;
 
-use super::caps::{self, Capabilities, TableAccess};
+use super::caps::{self, Capabilities, TableAccess, WriteProtection};
 use super::ddl::{Ddl, DdlObject};
 use super::error::DbError;
 use super::export::ExportFormat;
@@ -532,6 +532,43 @@ pub struct Connection {
     pub id: ConnectionId,
     pub name: String,
     pub pool: DbPool,
+    /// The user's write protection for this connection (FRE-111), copied from
+    /// the [`SavedConnection`](crate::config::SavedConnection) it was opened
+    /// from. It lives here rather than beside the pool because every gated
+    /// path already has the connection in hand — making it hard to resolve
+    /// capabilities while forgetting the protection.
+    ///
+    /// The connection's *accent colour* deliberately does not live here: it
+    /// warns, it doesn't enforce, so it stays a presentation concern in
+    /// `ui::state` and never reaches the `db/` layer.
+    pub protection: WriteProtection,
+}
+
+impl Connection {
+    /// This connection's **effective** capabilities: what the backend declares
+    /// (FRE-87), narrowed by the user's write protection (FRE-111).
+    ///
+    /// Every capability gate should read this rather than
+    /// [`DbPool::capabilities`], which reports only what the engine can do.
+    pub fn capabilities(&self) -> Capabilities {
+        self.protection.apply(self.pool.capabilities())
+    }
+
+    /// Resolves this connection's effective capabilities for one object — the
+    /// single entry point the UI and the write paths gate on.
+    pub fn access(&self, table: &TableMeta) -> TableAccess {
+        TableAccess::resolve_protected(
+            self.pool.capabilities(),
+            self.protection,
+            table,
+            self.pool.dialect(),
+        )
+    }
+
+    /// Whether a write through this connection must be confirmed first.
+    pub fn confirms_writes(&self) -> bool {
+        self.protection.confirms()
+    }
 }
 
 /// All simultaneously open connections, in tab order.
@@ -545,15 +582,30 @@ pub struct ConnectionRegistry {
 }
 
 impl ConnectionRegistry {
-    pub fn insert(&mut self, name: impl Into<String>, pool: DbPool) -> ConnectionId {
+    pub fn insert(
+        &mut self,
+        name: impl Into<String>,
+        pool: DbPool,
+        protection: WriteProtection,
+    ) -> ConnectionId {
         let id = ConnectionId(self.next_id);
         self.next_id += 1;
         self.connections.push(Connection {
             id,
             name: name.into(),
             pool,
+            protection,
         });
         id
+    }
+
+    /// Re-marks an open connection after the user edits its saved entry
+    /// (FRE-111), so a tab that is already open starts obeying the new
+    /// protection without being reconnected.
+    pub fn set_protection(&mut self, id: ConnectionId, protection: WriteProtection) {
+        if let Some(connection) = self.connections.iter_mut().find(|c| c.id == id) {
+            connection.protection = protection;
+        }
     }
 
     pub fn get(&self, id: ConnectionId) -> Option<&Connection> {
@@ -713,8 +765,8 @@ mod tests {
     #[tokio::test]
     async fn insert_assigns_unique_ids_in_tab_order() {
         let mut registry = ConnectionRegistry::default();
-        let a = registry.insert("a.db", dummy_pool());
-        let b = registry.insert("b.db", dummy_pool());
+        let a = registry.insert("a.db", dummy_pool(), WriteProtection::Open);
+        let b = registry.insert("b.db", dummy_pool(), WriteProtection::Open);
         assert_ne!(a, b);
         let names: Vec<&str> = registry.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["a.db", "b.db"]);
@@ -723,11 +775,11 @@ mod tests {
     #[tokio::test]
     async fn remove_frees_the_entry_but_never_reuses_ids() {
         let mut registry = ConnectionRegistry::default();
-        let a = registry.insert("a.db", dummy_pool());
+        let a = registry.insert("a.db", dummy_pool(), WriteProtection::Open);
         assert!(registry.remove(a).is_some());
         assert!(registry.remove(a).is_none());
         assert!(registry.is_empty());
-        let b = registry.insert("b.db", dummy_pool());
+        let b = registry.insert("b.db", dummy_pool(), WriteProtection::Open);
         assert_ne!(a, b);
         assert_eq!(registry.len(), 1);
         assert_eq!(registry.get(b).unwrap().name, "b.db");

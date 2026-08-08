@@ -586,18 +586,24 @@ pub struct ScriptError {
 /// non-transactional statement, or a connection without the `transactions`
 /// capability) — then they run sequentially in autocommit, as before.
 ///
-/// Every statement is checked against the connection's
-/// [`Capabilities`](super::caps::Capabilities) *before* any of them runs
+/// Every statement is checked against `caps` *before* any of them runs
 /// (FRE-87), so a script that the UI should have gated fails with a clear
 /// [`DbError::Unsupported`] and an untouched database, rather than part-way
 /// through. The UI disables the run affordance for these cases; this is the
 /// backstop for reaching the path anyway.
+///
+/// `caps` is passed in rather than read from `pool` because the connection's
+/// *effective* capabilities are the backend's narrowed by the user's write
+/// protection (FRE-111) — see
+/// [`Connection::capabilities`](super::registry::Connection::capabilities).
+/// Taking it as an argument means a caller cannot accidentally consult the
+/// engine's own answer and skip the marking.
 pub async fn run_script(
     pool: &DbPool,
+    caps: Capabilities,
     statements: &[String],
     on_result: impl FnMut(StatementResult),
 ) -> Result<(), ScriptError> {
-    let caps = pool.capabilities();
     if let Some(refusal) = refuse_script(caps, statements, pool.dialect()) {
         return Err(refusal);
     }

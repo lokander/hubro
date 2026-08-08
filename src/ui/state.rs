@@ -8,15 +8,16 @@ use dioxus::prelude::*;
 use crate::azure::{self, EntraAuth};
 use crate::config::{
     default_config_path, default_session_path, default_settings_path, load_session, load_settings,
-    plan_session_restore, save_session, save_theme, BackendKind, PgAuth, RestoreCandidate,
-    SavedConnection, SavedList, Session, SessionPane, SessionTab, Theme,
+    plan_session_restore, save_session, save_theme, BackendKind, ConnectionColor, PgAuth,
+    RestoreCandidate, SavedConnection, SavedList, Session, SessionPane, SessionTab, Theme,
 };
 use crate::db::{
     apply_staged, build_fk_filter, mssql_url_target, mssql_url_via_local_port,
     mssql_url_with_password, needs_confirmation, run_script, script_refusal, split_statements,
-    statement_preview, url_target, url_via_local_port, url_with_password, write_result, CellFetch,
-    ConnectionId, ConnectionRegistry, DbError, DbPool, Ddl, DdlObject, ExportFormat, Filter,
-    ForeignKeyMeta, MssqlAuth, QueryResult, RowLocator, StatementResult, TableMeta, Value,
+    statement_preview, url_target, url_via_local_port, url_with_password, write_result,
+    Capabilities, CellFetch, Connection, ConnectionId, ConnectionRegistry, DbError, DbPool, Ddl,
+    DdlObject, ExportFormat, Filter, ForeignKeyMeta, MssqlAuth, QueryResult, RowLocator,
+    StagedChange, StatementResult, TableAccess, TableMeta, Value, WriteProtection,
 };
 use crate::history::HistoryStore;
 use crate::tunnel::{HostKeyInfo, Tunnel, TunnelAuth, TunnelConfig, TunnelError};
@@ -522,6 +523,23 @@ pub struct AppState {
     /// Scripts containing writes, held here until the user confirms (or
     /// dismisses) the write-confirmation banner.
     pub pending_sql: Signal<HashMap<ConnectionId, PendingSql>>,
+    /// Staged saves waiting on the FRE-111 confirmation, one per table, each
+    /// holding the exact change list the prompt named.
+    ///
+    /// Only populated for connections marked [`WriteProtection::Confirm`];
+    /// an unmarked connection saves straight through as before. The staged
+    /// changes themselves stay in [`Self::staged`] — this holds only a copy,
+    /// so dismissing loses nothing, and the copy is what makes a confirmation
+    /// stale once the stage moves on (see `take_pending_save`).
+    pub pending_saves: Signal<HashMap<(ConnectionId, String), Vec<StagedChange>>>,
+    /// Per-connection accent colour (FRE-111), seeded from the saved entry at
+    /// connect time.
+    ///
+    /// Kept beside the registry rather than inside it because a colour warns
+    /// and never enforces: nothing in `db/` should be able to read it and act
+    /// on it. Its enforcing counterpart, [`WriteProtection`], lives on
+    /// [`Connection`] for the opposite reason.
+    pub connection_colors: Signal<HashMap<ConnectionId, ConnectionColor>>,
     /// Handle of the in-flight run per connection, kept so the Cancel
     /// button can abort it. Entries are removed when a run completes.
     pub sql_tasks: Signal<HashMap<ConnectionId, Task>>,
@@ -622,6 +640,8 @@ impl AppState {
             nav_guard: Signal::new(None),
             sql_runs: Signal::new(HashMap::new()),
             pending_sql: Signal::new(HashMap::new()),
+            pending_saves: Signal::new(HashMap::new()),
+            connection_colors: Signal::new(HashMap::new()),
             sql_tasks: Signal::new(HashMap::new()),
             sql_generations: Signal::new(HashMap::new()),
             // Root-scoped: these are written from `spawn_forever` tasks
@@ -697,9 +717,34 @@ impl AppState {
         let added = self.saved.write().add(SavedConnection::Sqlite {
             name: tab_title(&path),
             path,
+            protection: WriteProtection::Open,
+            color: None,
         });
         if added {
             self.persist_saved();
+        }
+    }
+
+    /// Marks a saved connection's write protection and accent colour
+    /// (FRE-111), persists the list, and re-marks any tab already open on it
+    /// so the change takes effect now rather than on the next reconnect.
+    ///
+    /// Marking lives on the connections-list row rather than in the connect
+    /// form because it has to reach SQLite entries too, and those have no
+    /// edit form — the form only exists for the two server backends.
+    pub fn set_saved_marking(
+        mut self,
+        locator: &str,
+        protection: WriteProtection,
+        color: Option<ConnectionColor>,
+    ) {
+        let changed = {
+            let mut saved = self.saved.write();
+            saved.set_marking(locator, protection, color)
+        };
+        if changed {
+            self.persist_saved();
+            self.remark_open_connections(locator);
         }
     }
 
@@ -761,6 +806,8 @@ impl AppState {
             url,
             tunnel,
             auth,
+            protection: WriteProtection::Open,
+            color: None,
         });
         if added {
             self.persist_saved();
@@ -1501,6 +1548,8 @@ impl AppState {
                 url: url.to_string(),
                 tunnel,
                 auth,
+                protection: WriteProtection::Open,
+                color: None,
             });
         }
     }
@@ -1699,6 +1748,8 @@ impl AppState {
                 url: url.to_string(),
                 tunnel,
                 auth,
+                protection: WriteProtection::Open,
+                color: None,
             });
         }
     }
@@ -1863,7 +1914,15 @@ impl AppState {
         let focus = self.release_connect(&locator);
         match result {
             Ok(pool) => {
-                let id = self.registry.write().insert(name, pool);
+                // The marking (FRE-111) is read here rather than threaded
+                // through each connect_* signature: every path — first
+                // connect, reconnect, session restore — funnels through this
+                // one place, so a new connect path cannot forget it.
+                let marking = self.saved_marking(&locator);
+                let id = self.registry.write().insert(name, pool, marking.0);
+                if let Some(color) = marking.1 {
+                    self.connection_colors.write().insert(id, color);
+                }
                 if let Some(tunnel) = tunnel {
                     self.tunnels.write().insert(id, tunnel);
                 }
@@ -1878,6 +1937,85 @@ impl AppState {
             Err(err) => {
                 drop(tunnel); // a tunnel without its database is useless
                 self.connect_error.set(Some(err.to_string()));
+            }
+        }
+    }
+
+    /// The write protection and accent colour saved for `locator` (FRE-111),
+    /// or the defaults when the connection was opened ad hoc rather than from
+    /// the saved list.
+    fn saved_marking(&self, locator: &str) -> (WriteProtection, Option<ConnectionColor>) {
+        self.saved
+            .read()
+            .entries()
+            .iter()
+            .find(|saved| saved_open_locator(saved) == locator)
+            .map(|saved| (saved.protection(), saved.color()))
+            .unwrap_or_default()
+    }
+
+    /// This connection's *effective* capabilities resolved for one object —
+    /// the backend's (FRE-87) narrowed by the user's marking (FRE-111).
+    /// `None` when the connection is gone.
+    ///
+    /// Every UI gate reads through here so the disabled button, the refused
+    /// script and the rejected save all state one reason from one resolution.
+    pub fn table_access(&self, id: ConnectionId, table: &TableMeta) -> Option<TableAccess> {
+        self.registry.read().get(id).map(|c| c.access(table))
+    }
+
+    /// This connection's effective capabilities, ignoring any single object.
+    pub fn connection_caps(&self, id: ConnectionId) -> Option<Capabilities> {
+        self.registry.read().get(id).map(Connection::capabilities)
+    }
+
+    /// Whether writes through this connection must be confirmed first
+    /// (FRE-111). False for a connection that is gone.
+    pub fn confirms_writes(&self, id: ConnectionId) -> bool {
+        self.registry
+            .read()
+            .get(id)
+            .is_some_and(Connection::confirms_writes)
+    }
+
+    /// Whether the *user's marking* — rather than the backend — is what makes
+    /// this connection unwritable (FRE-111), so the UI can name the right
+    /// culprit. False when the engine refuses writes on its own: then the
+    /// marking changed nothing and mustn't claim the credit.
+    pub fn marked_read_only(&self, id: ConnectionId) -> bool {
+        self.registry.read().get(id).is_some_and(|connection| {
+            connection.protection == WriteProtection::ReadOnly
+                && connection.pool.capabilities().mutate
+        })
+    }
+
+    /// This connection's accent colour, if the user set one (FRE-111).
+    pub fn connection_color(&self, id: ConnectionId) -> Option<ConnectionColor> {
+        self.connection_colors.read().get(&id).copied()
+    }
+
+    /// Re-marks every open tab on `locator` after its saved entry is edited
+    /// (FRE-111), so an open connection starts obeying a new protection
+    /// immediately instead of on the next reconnect — the opposite would
+    /// leave the tab you just protected still writable.
+    fn remark_open_connections(&mut self, locator: &str) {
+        let (protection, color) = self.saved_marking(locator);
+        let ids: Vec<ConnectionId> = self
+            .open_locators
+            .read()
+            .iter()
+            .filter(|(_, open)| open == locator)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.registry.write().set_protection(id, protection);
+            match color {
+                Some(color) => {
+                    self.connection_colors.write().insert(id, color);
+                }
+                None => {
+                    self.connection_colors.write().remove(&id);
+                }
             }
         }
     }
@@ -2004,8 +2142,11 @@ impl AppState {
     /// write that can never run is a prompt with no right answer.
     pub fn run_sql(mut self, id: ConnectionId, sql: String) {
         self.pending_sql.write().remove(&id);
+        // Effective capabilities: the backend's, narrowed by the user's
+        // marking (FRE-111). Reading `pool.capabilities()` here instead would
+        // let a script write to a connection marked read-only.
         let (dialect, caps) = match self.registry.read().get(id) {
-            Some(connection) => (connection.pool.dialect(), connection.pool.capabilities()),
+            Some(connection) => (connection.pool.dialect(), connection.capabilities()),
             None => return, // connection closed underneath the editor
         };
         let statements = split_statements(&sql, dialect);
@@ -2100,7 +2241,12 @@ impl AppState {
     /// report affected counts, execution stops at the first error. Each
     /// statement's outcome lands in [`Self::sql_runs`] as it finishes.
     fn execute_script(mut self, id: ConnectionId, script: String, statements: Vec<String>) {
-        let Some(pool) = self.registry.read().get(id).map(|c| c.pool.clone()) else {
+        let Some((pool, caps)) = self
+            .registry
+            .read()
+            .get(id)
+            .map(|c| (c.pool.clone(), c.capabilities()))
+        else {
             return;
         };
         let generation = self.claim_run_slot(id);
@@ -2116,7 +2262,7 @@ impl AppState {
         // the pool is cloned out above and every write below is scoped.
         let task = spawn_forever(async move {
             let started = std::time::Instant::now();
-            let result = run_script(&pool, &statements, |statement| {
+            let result = run_script(&pool, caps, &statements, |statement| {
                 if self.sql_generation(id) == generation {
                     if let Some(run) = self.sql_runs.write().get_mut(&id) {
                         run.statements.push(statement);
@@ -2695,7 +2841,63 @@ impl AppState {
     /// the stage ([`TableStage::remove_applied`]), so later edits survive
     /// and keep the Save bar visible. Only a second save and discard are
     /// blocked while `saving` is set.
+    /// On a connection marked [`WriteProtection::Confirm`] (FRE-111) the
+    /// first call parks the intent in [`Self::pending_saves`] and returns —
+    /// the grid then shows a confirmation naming the connection, and
+    /// [`Self::confirm_pending_save`] calls back in to do the work. Nothing
+    /// is staged, unstaged or sent in the meantime, so dismissing costs the
+    /// user nothing.
     pub fn save_staged(mut self, id: ConnectionId, table: &TableRef) {
+        let key = (id, table.key());
+        let current = match self.table_stage(id, table) {
+            Some(stage) if !stage.is_empty() => stage.changes(),
+            _ => return,
+        };
+        // The parked intent is consumed first either way: `save_action`
+        // decides whether it still authorizes *these* changes, and a stale
+        // one is replaced rather than honoured.
+        let parked = self.pending_saves.write().remove(&key);
+        let protection = self.protection_of(id);
+        match save_action(protection, parked.as_deref(), &current) {
+            SaveAction::Apply => self.apply_staged_now(id, table),
+            SaveAction::Park => {
+                self.pending_saves.write().insert(key, current);
+            }
+        }
+    }
+
+    /// Confirms the FRE-111 save banner: applies the staged changes.
+    ///
+    /// Routed through [`Self::save_staged`] rather than applying directly, so
+    /// the staleness check runs here too — the Confirm button and a second
+    /// Save click must not be able to disagree about what was authorized.
+    pub fn confirm_pending_save(self, id: ConnectionId, table: &TableRef) {
+        self.save_staged(id, table);
+    }
+
+    /// Dismisses the FRE-111 save banner, leaving the staged changes alone.
+    pub fn dismiss_pending_save(mut self, id: ConnectionId, table: &TableRef) {
+        self.pending_saves.write().remove(&(id, table.key()));
+    }
+
+    /// Whether this table's save is waiting on the FRE-111 confirmation.
+    pub fn save_awaiting_confirmation(&self, id: ConnectionId, table_key: &str) -> bool {
+        self.pending_saves
+            .read()
+            .contains_key(&(id, table_key.to_string()))
+    }
+
+    /// This connection's write protection, defaulting to `Open` for a
+    /// connection that is gone.
+    fn protection_of(&self, id: ConnectionId) -> WriteProtection {
+        self.registry
+            .read()
+            .get(id)
+            .map(|c| c.protection)
+            .unwrap_or_default()
+    }
+
+    fn apply_staged_now(mut self, id: ConnectionId, table: &TableRef) {
         let table_key = table.key();
         // Snapshot the normalized change list and flip the in-flight flag —
         // one scoped write, nothing spans the await below.
@@ -2728,10 +2930,14 @@ impl AppState {
             );
             return;
         };
-        // The same resolution the grid gated its editors on (FRE-87); if a
-        // stage exists here anyway, the failure states the resolver's reason
-        // rather than a second, differently-worded one.
-        let access = pool.access(&meta);
+        // The same resolution the grid gated its editors on (FRE-87, and the
+        // user's marking from FRE-111); if a stage exists here anyway, the
+        // failure states the resolver's reason rather than a second,
+        // differently-worded one.
+        let Some(access) = self.table_access(id, &meta) else {
+            self.fail_save(id, &table_key, "connection no longer available".into());
+            return;
+        };
         let Some(identity) = access.identity.clone().filter(|_| access.can_mutate()) else {
             self.fail_save(
                 id,
@@ -2746,7 +2952,7 @@ impl AppState {
         // spawn_forever: the save must survive the grid unmounting (e.g. a
         // guarded navigation completing while the apply runs).
         spawn_forever(async move {
-            let result = apply_staged(&pool, &meta, &identity, &changes).await;
+            let result = apply_staged(&pool, &access, &meta, &identity, &changes).await;
             match result {
                 Ok(_counts) => {
                     {
@@ -3118,12 +3324,14 @@ impl AppState {
                     name,
                     tunnel,
                     auth,
+                    ..
                 } => self.connect_postgres(url, name, tunnel, auth).await,
                 SavedConnection::SqlServer {
                     url,
                     name,
                     tunnel,
                     auth,
+                    ..
                 } => self.connect_sqlserver(url, name, tunnel, auth).await,
             }
             // Apply the remembered table + pane to the freshly opened tab.
@@ -3218,6 +3426,44 @@ fn export_temp_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// What a Save click should do on a write-protected connection (FRE-111).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveAction {
+    /// Send the changes now.
+    Apply,
+    /// Hold them and show the connection-naming confirmation first.
+    Park,
+}
+
+/// Resolves a Save click: `protection` is the connection's marking, `parked`
+/// the change list a previous click already confirmed (if any), and `current`
+/// what the stage holds now.
+///
+/// The comparison between `parked` and `current` is the substance here.
+/// Confirming authorizes a *specific* set of changes, so editing, discarding
+/// or staging more after the prompt appears has to send the user back through
+/// it — otherwise the prompt would launder whatever the stage happened to
+/// contain by the time they clicked, which is exactly the accident FRE-111
+/// exists to prevent.
+///
+/// `ReadOnly` returns `Apply` rather than a third variant: there is nothing to
+/// confirm, and the write is refused underneath by the capability resolution
+/// (see [`TableAccess::resolve_protected`]) with a message naming the marking.
+/// Parking it instead would offer a prompt whose only outcome is a failure.
+fn save_action(
+    protection: WriteProtection,
+    parked: Option<&[StagedChange]>,
+    current: &[StagedChange],
+) -> SaveAction {
+    if !protection.confirms() {
+        return SaveAction::Apply;
+    }
+    match parked {
+        Some(confirmed) if confirmed == current => SaveAction::Apply,
+        _ => SaveAction::Park,
+    }
+}
+
 /// Tab label for a database file: the file name, or the whole path when
 /// there is no file name component.
 pub fn tab_title(path: &Path) -> String {
@@ -3236,7 +3482,7 @@ mod tests {
         let mut registry = ConnectionRegistry::default();
         let pool =
             DbPool::Sqlite(sqlx::sqlite::SqlitePool::connect_lazy("sqlite::memory:").unwrap());
-        let id = registry.insert("t.db", pool);
+        let id = registry.insert("t.db", pool, WriteProtection::Open);
 
         // Empty map: nothing to lose.
         let mut staged: HashMap<ConnectionId, HashMap<String, TableStage>> = HashMap::new();
@@ -3267,7 +3513,7 @@ mod tests {
         let mut registry = ConnectionRegistry::default();
         let pool =
             DbPool::Sqlite(sqlx::sqlite::SqlitePool::connect_lazy("sqlite::memory:").unwrap());
-        let id = registry.insert("t.db", pool);
+        let id = registry.insert("t.db", pool, WriteProtection::Open);
 
         let action = NavAction::CloseConnection;
         let fresh = PendingNav::new(id, action.clone());
@@ -3285,6 +3531,69 @@ mod tests {
             !aged.matches(id, &NavAction::SetPane(Pane::Sql)),
             "a different action never confirms a parked intent"
         );
+    }
+
+    #[test]
+    fn a_confirm_marked_connection_parks_the_first_save_and_applies_the_confirmed_one() {
+        let changes = vec![delete(1)];
+        // First click: nothing parked yet, so the prompt goes up.
+        assert_eq!(
+            save_action(WriteProtection::Confirm, None, &changes),
+            SaveAction::Park
+        );
+        // Second click, stage unchanged: the confirmation stands.
+        assert_eq!(
+            save_action(WriteProtection::Confirm, Some(&changes), &changes),
+            SaveAction::Apply
+        );
+    }
+
+    #[test]
+    fn a_confirmation_goes_stale_when_the_stage_moves_on() {
+        // The hole this closes: a parked confirmation named ONE change. If the
+        // stage grows, shrinks or changes before the user clicks through,
+        // applying without re-prompting would write something they never read.
+        let confirmed = vec![delete(1)];
+        for moved_on in [
+            vec![delete(1), delete(2)], // staged more
+            vec![delete(2)],            // swapped for a different row
+            vec![],                     // discarded
+        ] {
+            assert_eq!(
+                save_action(WriteProtection::Confirm, Some(&confirmed), &moved_on),
+                SaveAction::Park,
+                "{moved_on:?} must send the user back through the prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unmarked_connection_never_parks_a_save() {
+        let changes = vec![delete(1)];
+        assert_eq!(
+            save_action(WriteProtection::Open, None, &changes),
+            SaveAction::Apply,
+            "Open must behave exactly as it did before FRE-111"
+        );
+    }
+
+    #[test]
+    fn a_read_only_marking_does_not_prompt_because_there_is_nothing_to_confirm() {
+        // The write is refused underneath by the capability resolution; a
+        // prompt here would have only one possible outcome — failure.
+        let changes = vec![delete(1)];
+        assert_eq!(
+            save_action(WriteProtection::ReadOnly, None, &changes),
+            SaveAction::Apply
+        );
+    }
+
+    fn delete(id: i64) -> StagedChange {
+        StagedChange::Delete {
+            locator: crate::db::RowLocator {
+                identity_values: vec![Value::Integer(id)],
+            },
+        }
     }
 
     #[test]

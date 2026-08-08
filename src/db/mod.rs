@@ -23,8 +23,8 @@ mod staged;
 mod value;
 
 pub use caps::{
-    Capabilities, Restriction, TableAccess, CONNECTION_READ_ONLY, NO_DDL, NO_MUTATE,
-    NO_OFFSET_PAGING, NO_QUERY,
+    Capabilities, Restriction, TableAccess, WriteProtection, CONNECTION_READ_ONLY,
+    MARKED_READ_ONLY, NO_DDL, NO_MUTATE, NO_OFFSET_PAGING, NO_QUERY, USER_READ_ONLY,
 };
 pub use ddl::{Ddl, DdlObject, DdlSource};
 pub use error::DbError;
