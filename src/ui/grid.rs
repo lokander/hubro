@@ -82,7 +82,13 @@ struct ActiveEdit {
 enum ExpandView {
     /// A value already fully in the page — rendered directly, and safe to
     /// copy.
-    Text(String),
+    ///
+    /// Carries the [`Value`], not its display string: the popup shows
+    /// `Value::display` (so a blob still reads as `<blob 12 B>`), but "Copy
+    /// raw" has to put the same text on the clipboard as a Ctrl+C over that
+    /// cell — [`raw_cell_text`], i.e. the blob's hex and nothing at all for
+    /// NULL. Holding only the display string copied the placeholder.
+    Text(Value),
     /// A truncated cell whose row can't be addressed (a view, a keyless
     /// table), so the full value can never be loaded. The popup shows the
     /// preview for reading but refuses to copy it — the same call
@@ -91,6 +97,25 @@ enum ExpandView {
     Truncated { display: String, column: String },
     /// A truncated cell: fetch and show its full value.
     Fetch { locator: RowLocator, column: String },
+}
+
+/// What Enter on a non-editable focused cell expands to: the value already in
+/// hand, or — for a truncated preview — a fetch of the full value (FRE-33),
+/// which needs the row to be addressable.
+fn expand_view(cell: &GridNavCell, locator: Option<RowLocator>) -> ExpandView {
+    match (cell.truncated(), locator) {
+        (true, Some(locator)) => ExpandView::Fetch {
+            locator,
+            column: cell.column.clone(),
+        },
+        // Truncated but unaddressable: show the preview, but don't offer it
+        // as a value to copy.
+        (true, None) => ExpandView::Truncated {
+            display: cell.display.clone(),
+            column: cell.column.clone(),
+        },
+        (false, _) => ExpandView::Text(cell.value.clone()),
+    }
 }
 
 /// Paged grid for one table: sortable headers, per-column contains/equals
@@ -751,22 +776,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                         column: cell.column.clone(),
                         draft: None,
                     })),
-                    _ => {
-                        let view = match (cell.truncated(), nav.rows[r].locator.clone()) {
-                            (true, Some(locator)) => ExpandView::Fetch {
-                                locator,
-                                column: cell.column.clone(),
-                            },
-                            // Truncated but unaddressable: show the preview,
-                            // but don't offer it as a value to copy.
-                            (true, None) => ExpandView::Truncated {
-                                display: cell.display.clone(),
-                                column: cell.column.clone(),
-                            },
-                            (false, _) => ExpandView::Text(cell.display.clone()),
-                        };
-                        expanded.set(Some(view));
-                    }
+                    _ => expanded.set(Some(expand_view(cell, nav.rows[r].locator.clone()))),
                 }
             }
             return;
@@ -1413,9 +1423,10 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                             // A short value already in hand is always the full
                             // value, so JSON pretty-printing is safe (FRE-77).
                             ExpandView::Text(value) => {
-                                let display = pretty_json(&value).unwrap_or_else(|| value.clone());
+                                let shown = value.display();
+                                let display = pretty_json(&shown).unwrap_or_else(|| shown.clone());
                                 rsx! {
-                                    CopyRawButton { raw: value.clone() }
+                                    CopyRawButton { raw: raw_cell_text(&value) }
                                     pre { class: "whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
                                         "{display}"
                                     }
@@ -3539,6 +3550,59 @@ mod tests {
         ]];
         let rows = view_rows(&result, &previews, 0, identity, None, true);
         GridNav::build(vec!["id".into(), "body".into()], &rows, &HashMap::new())
+    }
+
+    #[test]
+    fn expanding_an_in_hand_cell_keeps_the_value_so_copy_raw_matches_a_grid_copy() {
+        // A small blob is not truncated, so Enter expands it from the page.
+        // The popup must still copy what Ctrl+C over that cell copies — the
+        // hex, never the `<blob 2 B>` placeholder it displays.
+        let result = QueryResult {
+            columns: vec![
+                crate::db::ColumnInfo { name: "id".into() },
+                crate::db::ColumnInfo {
+                    name: "cover".into(),
+                },
+            ],
+            rows: vec![vec![Value::Null, Value::Blob(vec![0xde, 0xad])]],
+        };
+        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), None, true);
+        let nav = GridNav::build(vec!["id".into(), "cover".into()], &rows, &HashMap::new());
+        let blob = &nav.rows[0].cells[1];
+        assert_eq!(blob.display, "<blob 2 B>", "the grid shows a placeholder");
+        let ExpandView::Text(value) = expand_view(blob, nav.rows[0].locator.clone()) else {
+            panic!("a complete value expands in hand");
+        };
+        assert_eq!(raw_cell_text(&value), "\\xdead");
+        // Same for NULL: the popup reads "NULL", a copy yields nothing —
+        // exactly as `plan_copy` + `raw_cell_text` do for the same cell.
+        let ExpandView::Text(value) = expand_view(&nav.rows[0].cells[0], None) else {
+            panic!("a complete value expands in hand");
+        };
+        assert_eq!(value.display(), "NULL");
+        assert_eq!(raw_cell_text(&value), "");
+    }
+
+    #[test]
+    fn expanding_a_truncated_cell_fetches_it_or_refuses_to_copy_it() {
+        let nav = previewed_nav(PREVIEW_BYTES as u64 * 4, Some(&pk_identity()));
+        assert_eq!(
+            expand_view(&nav.rows[0].cells[1], nav.rows[0].locator.clone()),
+            ExpandView::Fetch {
+                locator: RowLocator {
+                    identity_values: vec![Value::Integer(1)],
+                },
+                column: "body".into(),
+            }
+        );
+        // Unaddressable: the preview is readable but not copyable.
+        assert_eq!(
+            expand_view(&nav.rows[0].cells[1], None),
+            ExpandView::Truncated {
+                display: "prefix…".into(),
+                column: "body".into(),
+            }
+        );
     }
 
     #[test]
