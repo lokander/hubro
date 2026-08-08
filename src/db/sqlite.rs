@@ -6,7 +6,7 @@ use std::path::Path;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
 
-use super::ddl::{create_index_sql, Ddl, DdlObject, IndexExtras};
+use super::ddl::{create_index_sql, terminate, Ddl, DdlObject, IndexExtras};
 use super::error::DbError;
 use super::export::{export_io_err, ExportFormat, ExportSink};
 use super::page::{quote_ident, Dialect};
@@ -560,17 +560,6 @@ async fn index_sql(pool: &SqlitePool, table: &str) -> Result<Vec<String>, DbErro
     .await
     .map_err(|e| DbError::Introspect(e.to_string()))?;
     rows.iter().map(|row| get(row, "sql")).collect()
-}
-
-/// `sqlite_master` stores statements without their terminator; add one so the
-/// output is runnable as-is.
-fn terminate(sql: &str) -> String {
-    let trimmed = sql.trim_end();
-    if trimmed.ends_with(';') {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed};")
-    }
 }
 
 async fn pragma(pool: &SqlitePool, pragma: &str, arg: &str) -> Result<Vec<SqliteRow>, DbError> {

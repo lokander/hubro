@@ -6,14 +6,29 @@
 //! headers of `tests/db_postgres.rs` and `tests/db_sqlserver.rs`.
 //!
 //! The important assertions are round-trips: create an object, read its DDL,
-//! drop it, run the DDL back, and require the re-introspected metadata to be
-//! identical. A reconstruction that quietly drops a `DEFAULT`, a collation, or
-//! an `ON DELETE CASCADE` fails there rather than in someone's migration.
+//! drop it, run the DDL back, and require what comes out to match. A
+//! reconstruction that quietly drops a `DEFAULT`, a collation, or an
+//! `ON DELETE CASCADE` fails here rather than in someone's migration.
+//!
+//! Two kinds of round-trip assertion, and the difference matters:
+//!
+//! - **Re-introspected [`TableMeta`] equality** is the weaker one. `TableMeta`
+//!   carries no collation, no check constraints, no referential actions, no
+//!   identity seed and no generated-column storage kind, so an equal
+//!   `TableMeta` proves considerably less than it reads like it does.
+//! - **Regenerated DDL text equality** is the strong one: it compares every
+//!   attribute the renderer emits, so anything the reconstruction can express
+//!   is covered. Where a table is worth round-tripping at all, it gets this.
+//!
+//! On top of both, the behavioural checks — a rebuilt `CHECK` must still
+//! reject the value it was written to reject — and per-attribute catalog
+//! probes, which is how the generated-column storage kind is verified against
+//! what the server actually recorded rather than against an assumption.
 
 mod common;
 
 use common::FixtureDb;
-use hubro::db::{split_statements, DbPool, DdlObject, DdlSource, TableKind, TableMeta};
+use hubro::db::{split_statements, DbPool, DdlObject, DdlSource, TableKind, TableMeta, Value};
 
 fn table<'a>(tables: &'a [TableMeta], schema: Option<&str>, name: &str) -> &'a TableMeta {
     tables
@@ -37,6 +52,39 @@ async fn run_ddl(pool: &DbPool, sql: &str) {
     for statement in split_statements(sql, pool.dialect()) {
         run_one(pool, &statement).await;
     }
+}
+
+/// Every cell of the first result row, for catalog probes.
+async fn probe(pool: &DbPool, sql: &str) -> Vec<Vec<Value>> {
+    pool.query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("probe failed: {e}\n---\n{sql}"))
+        .rows
+}
+
+/// Asserts that `sql` violates a constraint on the rebuilt table. A `CHECK`
+/// that survived as *text* but no longer *rejects* anything would pass every
+/// metadata comparison in this file.
+async fn assert_rejected(pool: &DbPool, sql: &str) {
+    let err = pool
+        .query(sql)
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("the rebuilt table accepted a row it must reject:\n{sql}"));
+    let message = err.to_string().to_lowercase();
+    assert!(
+        message.contains("constraint") || message.contains("check"),
+        "rejected, but not by a constraint: {err}"
+    );
+}
+
+/// The line of a generated `CREATE TABLE` that defines `column`.
+fn column_line<'a>(sql: &'a str, column: &str) -> &'a str {
+    let needle = format!("\"{column}\" ");
+    sql.lines()
+        .map(str::trim)
+        .find(|line| line.starts_with(&needle))
+        .unwrap_or_else(|| panic!("no line for column {column:?} in:\n{sql}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +163,39 @@ async fn sqlite_constraint_backed_index_says_where_its_definition_lives() {
         format!("CREATE UNIQUE INDEX \"{name}\" ON \"t\" (\"a\");")
     );
     assert!(ddl.text().contains("UNIQUE / PRIMARY KEY constraint"));
+}
+
+#[tokio::test]
+async fn sqlite_statements_ending_in_a_line_comment_stay_runnable() {
+    // `sqlite_master` stores the statement exactly as written, comment and
+    // all. Appending `;` to a trailing `--` line comments the terminator out,
+    // and the two indexes then arrive as one unparseable statement.
+    let fixture = FixtureDb::with_sql(
+        "CREATE TABLE t (a INTEGER, b INTEGER);\n\
+         CREATE INDEX ix1 ON t(a) -- first\n;\n\
+         CREATE INDEX ix2 ON t(b) -- second\n;",
+    )
+    .await;
+    let pool = fixture.open().await;
+    let tables = pool.introspect().await.unwrap();
+    let ddl = pool
+        .fetch_ddl(table(&tables, None, "t"), &DdlObject::Object)
+        .await
+        .unwrap();
+    assert!(ddl.sql.contains("-- first\n;"), "{}", ddl.sql);
+
+    // The real assertion: the emitted text runs, and rebuilds both indexes.
+    let target = FixtureDb::with_sql("").await;
+    let target_pool = target.open().await;
+    run_ddl(&target_pool, &ddl.sql).await;
+    let rebuilt = target_pool.introspect().await.unwrap();
+    let mut names: Vec<&str> = table(&rebuilt, None, "t")
+        .indexes
+        .iter()
+        .map(|i| i.name.as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["ix1", "ix2"]);
 }
 
 #[tokio::test]
@@ -262,8 +343,129 @@ async fn postgres_table_ddl_round_trips_through_the_server() {
     // The header is comments, so the copied text runs as-is.
     run_ddl(&pool, &ddl.text()).await;
 
+    // The weak assertion (see the module docs): TableMeta carries no
+    // collation, checks, referential actions or generated storage kind.
     let rebuilt = pool.introspect().await.unwrap();
     assert_eq!(table(&rebuilt, Some("public"), "ddl_child_trip"), &meta);
+
+    // The strong one: regenerating the DDL from the rebuilt table must give
+    // back the same text, which compares every attribute the renderer emits.
+    let regenerated = pool
+        .fetch_ddl(
+            table(&rebuilt, Some("public"), "ddl_child_trip"),
+            &DdlObject::Object,
+        )
+        .await
+        .unwrap();
+    assert_eq!(regenerated.text(), ddl.text());
+
+    // And the rebuilt CHECK still rejects what it was written to reject —
+    // no metadata comparison in this file can see that.
+    run_one(&pool, "INSERT INTO ddl_parent_trip (label) VALUES ('p')").await;
+    assert_rejected(
+        &pool,
+        "INSERT INTO ddl_child_trip (parent_id, code, amount) \
+         SELECT id, 'x', -1 FROM ddl_parent_trip LIMIT 1",
+    )
+    .await;
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_generated_column_storage_matches_the_catalog() {
+    let Some(url) = pg_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    run_one(&pool, "DROP TABLE IF EXISTS ddl_gen").await;
+    run_one(
+        &pool,
+        "CREATE TABLE ddl_gen (n integer, s integer GENERATED ALWAYS AS (n * 2) STORED)",
+    )
+    .await;
+    // PG 18 made a bare GENERATED ALWAYS AS (…) *virtual* and only accepts
+    // this there; on 17 and earlier it is a syntax error, so the failure is
+    // ignored and the test still covers the STORED half.
+    let _ = pool
+        .query("ALTER TABLE ddl_gen ADD COLUMN v integer GENERATED ALWAYS AS (n * 3)")
+        .await;
+
+    let tables = pool.introspect().await.unwrap();
+    let ddl = pool
+        .fetch_ddl(
+            table(&tables, Some("public"), "ddl_gen"),
+            &DdlObject::Object,
+        )
+        .await
+        .unwrap();
+
+    // Ask the catalog what storage each generated column actually has and
+    // require the emitted keyword to match, rather than assuming STORED:
+    // rendering a virtual column as STORED silently materializes it.
+    let rows = probe(
+        &pool,
+        "SELECT a.attname::text, a.attgenerated::text \
+         FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'public' AND c.relname = 'ddl_gen' AND a.attgenerated <> ''",
+    )
+    .await;
+    assert!(!rows.is_empty(), "no generated columns to check");
+    for row in &rows {
+        let name = row[0].display();
+        let expected = match row[1].display().as_str() {
+            "s" => "STORED",
+            "v" => "VIRTUAL",
+            other => panic!("unhandled pg_attribute.attgenerated {other:?}"),
+        };
+        let line = column_line(&ddl.sql, &name);
+        assert!(line.contains("GENERATED ALWAYS AS ("), "{line}");
+        assert!(
+            line.trim_end_matches(',').ends_with(expected),
+            "column {name} is {expected} in the catalog but hubro emitted: {line}"
+        );
+    }
+    // Whatever the server said, the statement must run back.
+    run_one(&pool, "DROP TABLE ddl_gen").await;
+    run_ddl(&pool, &ddl.text()).await;
+    run_one(&pool, "DROP TABLE ddl_gen").await;
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_plain_table_claims_no_missing_constraints() {
+    let Some(url) = pg_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    run_one(&pool, "DROP TABLE IF EXISTS ddl_plain").await;
+    run_one(&pool, "CREATE TABLE ddl_plain (a integer, b text)").await;
+    let tables = pool.introspect().await.unwrap();
+    let ddl = pool
+        .fetch_ddl(
+            table(&tables, Some("public"), "ddl_plain"),
+            &DdlObject::Object,
+        )
+        .await
+        .unwrap();
+
+    // The catalog read succeeded and found no constraints, which is not the
+    // same as failing to read them. Claiming otherwise on the commonest table
+    // shape in a database teaches people to skim past the header.
+    let text = ddl.text();
+    for lie in [
+        "check constraints",
+        "unique constraints",
+        "foreign-key ON DELETE",
+        "constraint names",
+    ] {
+        assert!(!text.contains(lie), "false caveat {lie:?} in:\n{text}");
+    }
+    // The standing, genuinely-true caveats are still there.
+    assert!(
+        text.contains("triggers and row-level security policies"),
+        "{text}"
+    );
+    run_one(&pool, "DROP TABLE ddl_plain").await;
 
     pool.close().await;
 }
@@ -325,9 +527,11 @@ fn mssql_url() -> Option<String> {
     }
 }
 
-/// The T-SQL counterpart of [`pg_fixture`], plus the two things only SQL
-/// Server has: a non-unit identity seed/increment and a persisted computed
-/// column. Per-test `tag` for the same reason.
+/// The T-SQL counterpart of [`pg_fixture`], plus the three things only SQL
+/// Server has: a non-unit identity seed/increment, a persisted computed
+/// column, and a persisted computed column that is `NOT NULL` (T-SQL only
+/// accepts the nullability on a persisted one, and dropping it turns the
+/// column nullable). Per-test `tag` for the same reason.
 async fn mssql_fixture(pool: &DbPool, tag: &str) {
     for statement in [
         format!("DROP VIEW IF EXISTS dbo.ddl_view_{tag}"),
@@ -352,7 +556,9 @@ CREATE TABLE dbo.ddl_child_{tag} (
     code nvarchar(20) COLLATE Latin1_General_BIN NOT NULL
         CONSTRAINT UQ_ddl_child_code_{tag} UNIQUE,
     amount decimal(10,2) CONSTRAINT DF_ddl_child_amount_{tag} DEFAULT (0),
+    qty int NOT NULL CONSTRAINT DF_ddl_child_qty_{tag} DEFAULT (1),
     doubled AS (amount * 2) PERSISTED,
+    qty2 AS (qty * 2) PERSISTED NOT NULL,
     CONSTRAINT CK_ddl_child_amount_{tag} CHECK (amount >= 0)
 );
 CREATE INDEX IX_ddl_child_big_{tag} ON dbo.ddl_child_{tag} (parent_id DESC)
@@ -394,10 +600,19 @@ async fn sqlserver_table_ddl_carries_every_attribute_the_catalog_knows() {
         sql.contains("\"code\" nvarchar(20) COLLATE Latin1_General_BIN NOT NULL"),
         "{sql}"
     );
-    assert!(sql.contains("\"amount\" decimal(10,2) DEFAULT 0"), "{sql}");
+    // The default keeps the name you would need in order to drop it.
     assert!(
-        sql.contains("\"doubled\" AS ([amount]*(2)) PERSISTED"),
+        sql.contains("\"amount\" decimal(10,2) CONSTRAINT \"DF_ddl_child_amount_attrs\" DEFAULT 0"),
         "{sql}"
+    );
+    assert_eq!(
+        column_line(sql, "doubled"),
+        "\"doubled\" AS ([amount]*(2)) PERSISTED,"
+    );
+    // A persisted computed column carries its own nullability.
+    assert_eq!(
+        column_line(sql, "qty2"),
+        "\"qty2\" AS ([qty]*(2)) PERSISTED NOT NULL,"
     );
     assert!(
         sql.contains("CONSTRAINT \"PK_ddl_child_attrs\" PRIMARY KEY CLUSTERED (\"id\" ASC)"),
@@ -439,8 +654,130 @@ async fn sqlserver_table_ddl_round_trips_through_the_server() {
     run_one(&pool, "DROP TABLE dbo.ddl_child_trip").await;
     run_ddl(&pool, &ddl.text()).await;
 
+    // Weak assertion first (see the module docs), then the strong one:
+    // regenerating the DDL compares every attribute the renderer emits,
+    // including collation, checks, referential actions and identity seed.
     let rebuilt = pool.introspect().await.unwrap();
     assert_eq!(table(&rebuilt, Some("dbo"), "ddl_child_trip"), &meta);
+    let regenerated = pool
+        .fetch_ddl(
+            table(&rebuilt, Some("dbo"), "ddl_child_trip"),
+            &DdlObject::Object,
+        )
+        .await
+        .unwrap();
+    assert_eq!(regenerated.text(), ddl.text());
+
+    // The identity seed survived as behaviour, not just as text.
+    run_one(
+        &pool,
+        "INSERT INTO dbo.ddl_parent_trip (label) VALUES (N'p')",
+    )
+    .await;
+    run_one(
+        &pool,
+        "INSERT INTO dbo.ddl_child_trip (parent_id, code, amount) \
+         SELECT TOP 1 id, N'x', 1 FROM dbo.ddl_parent_trip",
+    )
+    .await;
+    let ids = probe(&pool, "SELECT id FROM dbo.ddl_child_trip").await;
+    assert_eq!(ids[0][0], Value::Integer(10));
+    // And the rebuilt CHECK still rejects what it was written to reject.
+    assert_rejected(
+        &pool,
+        "INSERT INTO dbo.ddl_child_trip (parent_id, code, amount) \
+         SELECT TOP 1 id, N'y', -1 FROM dbo.ddl_parent_trip",
+    )
+    .await;
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_plain_table_claims_no_missing_constraints() {
+    let Some(url) = mssql_url() else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_one(&pool, "DROP TABLE IF EXISTS dbo.ddl_plain").await;
+    run_one(&pool, "CREATE TABLE dbo.ddl_plain (a int, b nvarchar(10))").await;
+    let tables = pool.introspect().await.unwrap();
+    let ddl = pool
+        .fetch_ddl(table(&tables, Some("dbo"), "ddl_plain"), &DdlObject::Object)
+        .await
+        .unwrap();
+
+    let text = ddl.text();
+    for lie in [
+        "check constraints",
+        "unique constraints",
+        "foreign-key ON DELETE",
+        "constraint names",
+    ] {
+        assert!(!text.contains(lie), "false caveat {lie:?} in:\n{text}");
+    }
+    assert!(text.contains("triggers and system-versioning"), "{text}");
+    run_one(&pool, "DROP TABLE dbo.ddl_plain").await;
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_declares_what_it_cannot_express_instead_of_faking_it() {
+    let Some(url) = mssql_url() else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_one(&pool, "DROP TABLE IF EXISTS dbo.ddl_exotic").await;
+    // An unnamed default (SQL Server invents `DF__ddl_exot__n__…`), a check
+    // that is deliberately disabled, and a columnstore index.
+    run_ddl(
+        &pool,
+        "CREATE TABLE dbo.ddl_exotic (n int DEFAULT (7), m int);\n\
+         ALTER TABLE dbo.ddl_exotic WITH NOCHECK ADD CONSTRAINT CK_ddl_exotic CHECK (m > 0);\n\
+         ALTER TABLE dbo.ddl_exotic NOCHECK CONSTRAINT CK_ddl_exotic;\n\
+         CREATE NONCLUSTERED COLUMNSTORE INDEX CSI_ddl_exotic ON dbo.ddl_exotic (n, m);",
+    )
+    .await;
+    let tables = pool.introspect().await.unwrap();
+    let meta = table(&tables, Some("dbo"), "ddl_exotic");
+    let ddl = pool.fetch_ddl(meta, &DdlObject::Object).await.unwrap();
+    let text = ddl.text();
+
+    // The auto-generated default-constraint name is kept, not silently
+    // replaced by a fresh random one on the next run.
+    let auto_name = probe(
+        &pool,
+        "SELECT d.name FROM sys.default_constraints d \
+         JOIN sys.objects o ON o.object_id = d.parent_object_id \
+         WHERE o.name = 'ddl_exotic'",
+    )
+    .await[0][0]
+        .display();
+    assert!(auto_name.starts_with("DF__"), "{auto_name}");
+    assert!(
+        text.contains(&format!("CONSTRAINT \"{auto_name}\" DEFAULT 7")),
+        "{text}"
+    );
+
+    // A disabled constraint cannot be expressed in CREATE TABLE, so the
+    // behaviour change is named rather than performed silently.
+    assert!(text.contains("CK_ddl_exotic"), "{text}");
+    assert!(
+        text.contains("disabled / untrusted state of CK_ddl_exotic"),
+        "{text}"
+    );
+
+    // A columnstore index has no key list this renderer can produce, so it is
+    // declared missing rather than emitted as `CREATE INDEX … ()`.
+    assert!(!text.contains("CSI_ddl_exotic\" ON"), "{text}");
+    assert!(text.contains("not a rowstore index"), "{text}");
+    let refused = pool
+        .fetch_ddl(meta, &DdlObject::Index("CSI_ddl_exotic".into()))
+        .await
+        .expect_err("a columnstore index must be refused, not faked");
+    assert!(refused.to_string().contains("rowstore"), "{refused}");
+
+    // Whatever it did emit still runs.
+    run_one(&pool, "DROP TABLE dbo.ddl_exotic").await;
+    run_ddl(&pool, &text).await;
+    run_one(&pool, "DROP TABLE dbo.ddl_exotic").await;
 
     pool.close().await;
 }

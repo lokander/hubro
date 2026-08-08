@@ -1304,17 +1304,33 @@ pub async fn fetch_ddl(
     let extras = match table_ddl_extras(pool, &params).await {
         Ok(extras) => extras,
         // A failed catalog read degrades to the metadata-only rebuild rather
-        // than failing the action outright; the caveat says what was lost.
-        Err(err) => TableExtras {
-            caveats: vec![format!(
+        // than failing the action outright. The standing caveats are extended,
+        // never replaced: the worse output must not claim to reproduce more
+        // than the good one.
+        Err(err) => {
+            let mut caveats = mssql_standing_caveats();
+            caveats.push(format!(
                 "column collations, identity seeds, computed columns, constraints and indexes \
                  — reading the sys catalog failed ({})",
                 err.message()
-            )],
-            ..TableExtras::default()
-        },
+            ));
+            TableExtras {
+                caveats,
+                ..TableExtras::default()
+            }
+        }
     };
     Ok(create_table_sql(Dialect::SqlServer, table, &extras))
+}
+
+/// What SSMS would script and this rebuild does not, however the catalog read
+/// went.
+fn mssql_standing_caveats() -> Vec<String> {
+    vec![
+        "filegroup, partition scheme and index options (FILLFACTOR, compression)".into(),
+        "triggers and system-versioning (temporal) settings".into(),
+        "extended properties and permissions".into(),
+    ]
 }
 
 /// Per-table facts for the `CREATE TABLE` rebuild: column collations,
@@ -1331,7 +1347,7 @@ async fn table_ddl_extras(pool: &MssqlPool, params: &[Value]) -> Result<TableExt
                           CONVERT(nvarchar(128), DATABASEPROPERTYEX(DB_NAME(), 'Collation')) \
                      THEN c.collation_name END, \
                 CAST(ic.seed_value AS bigint), CAST(ic.increment_value AS bigint), \
-                cc.definition, cc.is_persisted \
+                cc.definition, cc.is_persisted, d.name, d.definition \
          FROM sys.columns c \
          JOIN sys.objects o ON o.object_id = c.object_id \
          JOIN sys.schemas s ON s.schema_id = o.schema_id \
@@ -1340,6 +1356,8 @@ async fn table_ddl_extras(pool: &MssqlPool, params: &[Value]) -> Result<TableExt
            ON ic.object_id = c.object_id AND ic.column_id = c.column_id \
          LEFT JOIN sys.computed_columns cc \
            ON cc.object_id = c.object_id AND cc.column_id = c.column_id \
+         LEFT JOIN sys.default_constraints d \
+           ON d.parent_object_id = c.object_id AND d.parent_column_id = c.column_id \
          WHERE s.name = @P1 AND o.name = @P2 \
          ORDER BY c.column_id",
         params,
@@ -1372,7 +1390,8 @@ async fn table_ddl_extras(pool: &MssqlPool, params: &[Value]) -> Result<TableExt
     let fk_rows = query_with(
         pool,
         "SELECT fk.name, rs.name, ro.name, pc.name, rc.name, \
-                fk.delete_referential_action_desc, fk.update_referential_action_desc \
+                fk.delete_referential_action_desc, fk.update_referential_action_desc, \
+                fk.is_disabled, fk.is_not_trusted \
          FROM sys.foreign_keys fk \
          JOIN sys.objects o ON o.object_id = fk.parent_object_id \
          JOIN sys.schemas s ON s.schema_id = o.schema_id \
@@ -1393,7 +1412,7 @@ async fn table_ddl_extras(pool: &MssqlPool, params: &[Value]) -> Result<TableExt
     // come back here too and are re-emitted as such.
     let check_rows = query_with(
         pool,
-        "SELECT cc.name, cc.definition \
+        "SELECT cc.name, cc.definition, cc.is_disabled, cc.is_not_trusted \
          FROM sys.check_constraints cc \
          JOIN sys.objects o ON o.object_id = cc.parent_object_id \
          JOIN sys.schemas s ON s.schema_id = o.schema_id \
@@ -1414,19 +1433,21 @@ async fn table_ddl_extras(pool: &MssqlPool, params: &[Value]) -> Result<TableExt
     .await?;
 
     let mut extras = TableExtras {
-        caveats: vec![
-            "filegroup, partition scheme and index options (FILLFACTOR, compression)".into(),
-            "triggers and system-versioning (temporal) settings".into(),
-            "extended properties and permissions".into(),
-        ],
+        caveats: mssql_standing_caveats(),
+        // The read succeeded, so an empty list means "no table-level
+        // constraints", not "we could not tell".
+        constraints: Some(Vec::new()),
         ..TableExtras::default()
     };
 
     for row in &column_rows.rows {
+        let persisted = ddl_flag(row, 9);
         let computed = ddl_opt_text(row, 8).map(|definition| {
-            let persisted = if ddl_flag(row, 9) { " PERSISTED" } else { "" };
             // The catalog already parenthesizes the expression.
-            format!("AS {definition}{persisted}")
+            format!(
+                "AS {definition}{}",
+                if persisted { " PERSISTED" } else { "" }
+            )
         });
         let identity = ddl_opt_int(row, 6).map(|seed| {
             let increment = ddl_opt_int(row, 7).unwrap_or(1);
@@ -1443,24 +1464,67 @@ async fn table_ddl_extras(pool: &MssqlPool, params: &[Value]) -> Result<TableExt
                 )),
                 collation: ddl_opt_text(row, 5),
                 computed,
+                computed_persisted: persisted,
                 identity,
+                // Unwrapped from the catalog's parenthesis armor, same as
+                // introspection does, then re-emitted under its own name:
+                // dropping a default on SQL Server needs that name, and an
+                // unnamed one gets a random `DF__tbl__col__…`.
+                default: ddl_opt_text(row, 11).map(|d| strip_default_parens(&d).to_string()),
+                default_constraint: ddl_opt_text(row, 10),
             },
         );
     }
 
-    extras.constraints.extend(key_constraints(&key_rows.rows));
-    extras.constraints.extend(fk_constraints(&fk_rows.rows));
+    let constraints = extras.constraints.get_or_insert_with(Vec::new);
+    constraints.extend(key_constraints(&key_rows.rows));
+    constraints.extend(fk_constraints(&fk_rows.rows));
     for row in &check_rows.rows {
-        extras.constraints.push(format!(
+        constraints.push(format!(
             "CONSTRAINT {} CHECK {}",
             quote_ident(&ddl_text(row, 0)),
             ddl_text(row, 1)
         ));
     }
+
+    // A constraint the user deliberately disabled (or left untrusted with
+    // WITH NOCHECK) comes back enforced, because CREATE TABLE has no way to
+    // express either state — a behaviour change, so it is named. Only emitted
+    // when such a constraint actually exists: a caveat that fires when nothing
+    // is wrong is worse than no caveat at all.
+    let mut unenforced: Vec<String> = Vec::new();
+    for (rows, disabled, untrusted) in [(&check_rows.rows, 2, 3), (&fk_rows.rows, 7, 8)] {
+        for row in rows {
+            let name = ddl_text(row, 0);
+            if (ddl_flag(row, disabled) || ddl_flag(row, untrusted)) && !unenforced.contains(&name)
+            {
+                unenforced.push(name);
+            }
+        }
+    }
+    if !unenforced.is_empty() {
+        extras.caveats.push(format!(
+            "the disabled / untrusted state of {} — {} re-created enforced and trusted",
+            unenforced.join(", "),
+            if unenforced.len() == 1 {
+                "it is"
+            } else {
+                "they are"
+            }
+        ));
+    }
+
     for index in collect_index_ddl(&index_rows.rows) {
-        extras
-            .indexes
-            .push(index.render(params.first(), params.get(1)));
+        match index.rowstore_ddl(params.first(), params.get(1)) {
+            Some(sql) => extras.indexes.push(sql),
+            // A columnstore/XML/spatial/hash index has no key list this
+            // renderer can produce; emitting `CREATE INDEX … ()` would be a
+            // syntax error dressed up as output.
+            None => extras.caveats.push(format!(
+                "index {} ({} — not a rowstore index)",
+                index.meta.name, index.type_desc
+            )),
+        }
     }
     Ok(extras)
 }
@@ -1579,6 +1643,10 @@ const INDEX_DDL_SELECT: &str = "\
 struct IndexDdl {
     meta: IndexMeta,
     extras: IndexExtras,
+    /// `sys.indexes.type_desc` verbatim, so the caller can tell a rowstore
+    /// index (the only shape this renderer speaks) from a columnstore, XML,
+    /// spatial, or hash one.
+    type_desc: String,
     /// Whether the index exists only because a PRIMARY KEY / UNIQUE
     /// constraint created it — a `CREATE INDEX` is not how it came to be, so
     /// the caller says so rather than pretending otherwise.
@@ -1586,9 +1654,22 @@ struct IndexDdl {
 }
 
 impl IndexDdl {
-    /// The rendered `CREATE INDEX` statement without the reconstruction
-    /// header: this one is embedded in a table's DDL, which carries its own.
-    fn render(&self, schema: Option<&Value>, name: Option<&Value>) -> String {
+    /// Whether this is a plain b-tree index. Everything else (columnstore, XML,
+    /// spatial, memory-optimized hash) has a different `CREATE` grammar; a
+    /// columnstore's columns are all non-key, so pushing one through the
+    /// rowstore renderer yields `CREATE INDEX … ()` — a syntax error dressed
+    /// up as output.
+    fn is_rowstore(&self) -> bool {
+        matches!(self.type_desc.as_str(), "CLUSTERED" | "NONCLUSTERED")
+    }
+
+    /// The rendered `CREATE INDEX` statement without the reconstruction header
+    /// (this one is embedded in a table's DDL, which carries its own), or
+    /// `None` when the index is not a rowstore index.
+    fn rowstore_ddl(&self, schema: Option<&Value>, name: Option<&Value>) -> Option<String> {
+        if !self.is_rowstore() {
+            return None;
+        }
         let text = |value: Option<&Value>| match value {
             Some(Value::Text(t)) => Some(t.clone()),
             _ => None,
@@ -1602,7 +1683,7 @@ impl IndexDdl {
             foreign_keys: Vec::new(),
             restriction: None,
         };
-        create_index_sql(Dialect::SqlServer, &table, &self.meta, &self.extras).sql
+        Some(create_index_sql(Dialect::SqlServer, &table, &self.meta, &self.extras).sql)
     }
 }
 
@@ -1614,6 +1695,7 @@ fn collect_index_ddl(rows: &[Vec<Value>]) -> Vec<IndexDdl> {
         let name = ddl_text(row, 0);
         if out.last().map(|i| i.meta.name.as_str()) != Some(name.as_str()) {
             let filter = ddl_opt_text(row, 3);
+            let type_desc = ddl_text(row, 2).trim().to_string();
             out.push(IndexDdl {
                 meta: IndexMeta {
                     name: name.clone(),
@@ -1625,9 +1707,10 @@ fn collect_index_ddl(rows: &[Vec<Value>]) -> Vec<IndexDdl> {
                 },
                 extras: IndexExtras {
                     filter,
-                    clustered: ddl_text(row, 2).trim() == "CLUSTERED",
+                    clustered: type_desc == "CLUSTERED",
                     ..IndexExtras::default()
                 },
+                type_desc,
                 constraint_backed: ddl_flag(row, 4) || ddl_flag(row, 5),
             });
         }
@@ -1673,6 +1756,16 @@ async fn index_ddl(
             table.name
         )));
     };
+    if !index.is_rowstore() {
+        // Declining is the honest answer: this renderer only speaks the
+        // rowstore `CREATE INDEX` grammar, and forcing a columnstore through
+        // it produces an empty key list — invalid SQL.
+        return Err(DbError::Unsupported(format!(
+            "{name} is a {} index; hubro can only script rowstore \
+             (CLUSTERED / NONCLUSTERED) indexes",
+            index.type_desc
+        )));
+    }
     let mut ddl = create_index_sql(Dialect::SqlServer, table, &index.meta, &index.extras);
     if index.constraint_backed {
         ddl.caveats.insert(

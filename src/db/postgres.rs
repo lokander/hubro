@@ -14,7 +14,9 @@ use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{Decimal, JsonValue, Uuid};
 use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
 
-use super::ddl::{create_table_sql, create_view_sql, ColumnExtra, Ddl, DdlObject, TableExtras};
+use super::ddl::{
+    create_table_sql, create_view_sql, terminate, ColumnExtra, Ddl, DdlObject, TableExtras,
+};
 use super::error::DbError;
 use super::export::{export_io_err, ExportFormat, ExportSink};
 use super::page::Dialect;
@@ -812,14 +814,17 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
 /// generator at all — `pg_dump` assembles that text in client code — so a
 /// table is rebuilt from the catalog here.
 ///
-/// The rebuild deliberately re-reads `pg_attribute`/`pg_constraint` instead of
-/// leaning on the browsable [`TableMeta`]: introspection takes column types
-/// from `information_schema.columns.data_type`, which reports `varchar(20)` as
-/// a bare `character varying` and every user-defined type as `USER-DEFINED`.
+/// The rebuild deliberately re-reads `pg_attribute`/`pg_attrdef`/`pg_constraint`
+/// instead of leaning on the browsable [`TableMeta`]: introspection takes column
+/// types from `information_schema.columns.data_type`, which reports `varchar(20)`
+/// as a bare `character varying` and every user-defined type as `USER-DEFINED`.
 /// Reconstructing from that would emit column types that are quietly *wrong*,
 /// which is worse than not offering the feature. `pg_get_constraintdef`
 /// likewise supplies check constraints and referential actions that the
-/// browsable metadata does not carry at all.
+/// browsable metadata does not carry at all, and `pg_get_expr(adbin, adrelid)`
+/// supplies both the column defaults and the generation expressions — the same
+/// call `information_schema.columns.column_default` is built from, read here so
+/// one source covers both.
 pub async fn fetch_ddl(
     pool: &PgPool,
     table: &TableMeta,
@@ -844,7 +849,7 @@ pub async fn fetch_ddl(
                 "no index named {name} in {schema}"
             )));
         };
-        return Ok(Ddl::native(ddl_terminate(&def)));
+        return Ok(Ddl::native(terminate(&def)));
     }
 
     let params = [params[0].clone(), Value::Text(table.name.clone())];
@@ -870,19 +875,37 @@ pub async fn fetch_ddl(
 
     // A catalog read that fails still yields usable output: the renderer falls
     // back to what TableMeta knows and the failure becomes a visible caveat,
-    // rather than the whole action erroring out.
+    // rather than the whole action erroring out. The standing caveats are
+    // *extended*, never replaced — the degraded output must not claim to
+    // reproduce more than the good one.
     let extras = match table_ddl_extras(pool, &params).await {
         Ok(extras) => extras,
-        Err(err) => TableExtras {
-            caveats: vec![format!(
+        Err(err) => {
+            let mut caveats = pg_standing_caveats();
+            caveats.push(format!(
                 "column types, defaults, collations, constraints and indexes — reading the \
                  catalog failed ({})",
                 err.message()
-            )],
-            ..TableExtras::default()
-        },
+            ));
+            TableExtras {
+                caveats,
+                ..TableExtras::default()
+            }
+        }
     };
     Ok(create_table_sql(Dialect::Postgres, table, &extras))
+}
+
+/// What a `pg_dump` of the same table carries and this rebuild does not,
+/// regardless of how the catalog read went. Named rather than implied, so a
+/// reader knows the boundary.
+fn pg_standing_caveats() -> Vec<String> {
+    vec![
+        "sequences behind nextval() defaults".into(),
+        "storage parameters, tablespace, partitioning and inheritance".into(),
+        "triggers and row-level security policies".into(),
+        "comments, ownership and privileges".into(),
+    ]
 }
 
 /// Reads the per-table facts a faithful `CREATE TABLE` needs: exact column
@@ -948,27 +971,42 @@ async fn table_ddl_extras(pool: &PgPool, params: &[Value]) -> Result<TableExtras
     .await?;
 
     let mut extras = TableExtras {
-        // What a pg_dump of the same table would carry and this rebuild does
-        // not. Named rather than implied, so a reader knows the boundary.
-        caveats: vec![
-            "sequences behind nextval() defaults".into(),
-            "storage parameters, tablespace, partitioning and inheritance".into(),
-            "triggers and row-level security policies".into(),
-            "comments, ownership and privileges".into(),
-        ],
+        caveats: pg_standing_caveats(),
+        // The read succeeded, so an empty list here means "this table has no
+        // table-level constraints", not "we could not tell".
+        constraints: Some(Vec::new()),
         ..TableExtras::default()
     };
     for row in &column_rows.rows {
         let name = ddl_text(row, 0);
-        let identity = match ddl_text(row, 3).as_str() {
-            "a" => Some("GENERATED ALWAYS AS IDENTITY".to_string()),
-            "d" => Some("GENERATED BY DEFAULT AS IDENTITY".to_string()),
-            // A stored generated column keeps its expression in pg_attrdef;
-            // it is a generation clause, not a DEFAULT.
-            _ => match (ddl_text(row, 4).as_str(), ddl_opt_text(row, 2)) {
-                ("", _) => None,
-                (_, Some(expr)) => Some(format!("GENERATED ALWAYS AS ({expr}) STORED")),
-                (_, None) => None,
+        let default_expr = ddl_opt_text(row, 2);
+        // A generated column keeps its generation expression in pg_attrdef
+        // too, so it must render as a generation clause and NOT as a DEFAULT.
+        let (identity, generation_used) = match ddl_text(row, 3).as_str() {
+            "a" => (Some("GENERATED ALWAYS AS IDENTITY".to_string()), false),
+            "d" => (Some("GENERATED BY DEFAULT AS IDENTITY".to_string()), false),
+            _ => match (ddl_text(row, 4).as_str(), &default_expr) {
+                ("", _) => (None, false),
+                (kind, Some(expr)) => {
+                    // attgenerated: 's' = STORED, 'v' = VIRTUAL (PG 18, and
+                    // the default for a bare GENERATED ALWAYS AS there).
+                    // Guessing STORED for a virtual column would silently
+                    // materialize it, so an unrecognized kind is written
+                    // without a storage keyword and caveated instead.
+                    let storage = match kind {
+                        "s" => " STORED",
+                        "v" => " VIRTUAL",
+                        other => {
+                            extras.caveats.push(format!(
+                                "the storage kind of generated column {name} \
+                                 (unrecognized pg_attribute.attgenerated {other:?})"
+                            ));
+                            ""
+                        }
+                    };
+                    (Some(format!("GENERATED ALWAYS AS ({expr}){storage}")), true)
+                }
+                (_, None) => (None, false),
             },
         };
         extras.columns.insert(
@@ -978,12 +1016,17 @@ async fn table_ddl_extras(pool: &PgPool, params: &[Value]) -> Result<TableExtras
                 collation: ddl_opt_text(row, 5),
                 // Postgres has no column form that replaces the type.
                 computed: None,
+                computed_persisted: false,
                 identity,
+                default: if generation_used { None } else { default_expr },
+                // Postgres does not name defaults.
+                default_constraint: None,
             },
         );
     }
+    let constraints = extras.constraints.get_or_insert_with(Vec::new);
     for row in &constraint_rows.rows {
-        extras.constraints.push(format!(
+        constraints.push(format!(
             "CONSTRAINT {} {}",
             super::page::quote_ident(&ddl_text(row, 0)),
             ddl_text(row, 1)
@@ -1006,16 +1049,6 @@ fn ddl_opt_text(row: &[Value], idx: usize) -> Option<String> {
 
 fn ddl_text(row: &[Value], idx: usize) -> String {
     ddl_opt_text(row, idx).unwrap_or_default()
-}
-
-/// Adds the statement terminator the catalog generators leave off.
-fn ddl_terminate(sql: &str) -> String {
-    let trimmed = sql.trim_end();
-    if trimmed.ends_with(';') {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed};")
-    }
 }
 
 fn get<'r, T: sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>>(
