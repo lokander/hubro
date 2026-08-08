@@ -21,7 +21,7 @@
 use std::fmt;
 use std::fmt::Write as _;
 
-use super::caps;
+use super::caps::{self, TableAccess};
 use super::error::DbError;
 use super::page::{quote_ident, Dialect};
 use super::registry::DbPool;
@@ -193,13 +193,19 @@ pub struct CheckedStatement {
 /// - NULL values are rendered inline as literal `NULL` (never as bound
 ///   parameters) in SET lists and INSERT values — see [`ParamSql::value_sql`].
 ///
-/// The connection's resolved capabilities for `table` are checked first
-/// (FRE-87): without `mutate`, nothing is built or sent and the returned
+/// `access` — the connection's capabilities resolved for `table` (FRE-87),
+/// including the user's own write protection (FRE-111) — is checked first:
+/// without `mutate`, nothing is built or sent and the returned
 /// [`StagedError`] carries the same sentence the UI shows on the disabled
 /// Save button. The UI never offers staging on such a table, so reaching
 /// this means a gate was missed.
+///
+/// It is passed in rather than re-resolved from `pool` so that this backstop
+/// and the UI's gate cannot answer differently: `pool` alone doesn't know
+/// what the user marked the connection.
 pub async fn apply_staged(
     pool: &DbPool,
+    access: &TableAccess,
     table: &TableMeta,
     identity: &RowIdentity,
     changes: &[StagedChange],
@@ -207,7 +213,6 @@ pub async fn apply_staged(
     if changes.is_empty() {
         return Ok(AppliedCounts::default());
     }
-    let access = pool.access(table);
     if !access.can_mutate() {
         return Err(StagedError {
             change_index: None,

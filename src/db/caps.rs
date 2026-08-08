@@ -10,10 +10,12 @@
 //! the connection default, so a backend declaring `mutate: false` can't have
 //! an object argue its way back into being writable.
 //!
-//! Per-connection write protection (FRE-111) is user intent layered onto this
-//! same resolution: it narrows the [`Capabilities`] passed to
-//! [`TableAccess::resolve`] and supplies its own [`Restriction`], rather than
-//! becoming a second, parallel way to disable editing.
+//! Per-connection write protection ([`WriteProtection`], FRE-111) is user
+//! intent layered onto this same resolution: it narrows the [`Capabilities`]
+//! passed to [`TableAccess::resolve`] and supplies its own [`Restriction`],
+//! rather than becoming a second, parallel way to disable editing.
+
+use serde::{Deserialize, Serialize};
 
 use super::page::Dialect;
 use super::rowkey::{detect_row_identity, RowIdentity};
@@ -106,6 +108,81 @@ pub const NO_OFFSET_PAGING: &str = "This connection can't page through rows with
 /// The connection-level explanation when a backend declares `mutate: false`.
 pub const CONNECTION_READ_ONLY: Restriction = Restriction::Declared(NO_MUTATE);
 
+/// What the user chose, as opposed to what the backend imposes — worded so the
+/// two are never confused. A backend that can't write says "is read-only"; a
+/// connection the user marked says "you marked".
+pub const MARKED_READ_ONLY: &str = "You marked this connection read-only.";
+
+/// The connection-level explanation when [`WriteProtection::ReadOnly`] — not
+/// the backend — is what forbids the write.
+pub const USER_READ_ONLY: Restriction = Restriction::Declared(MARKED_READ_ONLY);
+
+/// How much the user wants this connection to resist writes (FRE-111).
+///
+/// Three states rather than a boolean, because a boolean forces a production
+/// connection to be either unprotected or unusable for writes — and people
+/// then leave protection off. [`Confirm`](Self::Confirm) is the state that
+/// actually gets used: you do occasionally need to write to production, just
+/// never by accident.
+///
+/// This is user intent, not a backend fact, so it *narrows* the connection's
+/// declared [`Capabilities`] rather than sitting beside them as a second
+/// check — see [`Self::apply`] and [`TableAccess::resolve_protected`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WriteProtection {
+    /// No extra friction: the backend's own capabilities decide. The default
+    /// for new connections, and what a config file with no `protection` key
+    /// deserializes as.
+    #[default]
+    Open,
+    /// Writes still run, but each one is confirmed first, and the prompt names
+    /// the connection — the point is to make you read which database you are
+    /// about to change.
+    Confirm,
+    /// Writes are refused outright at the `db/` layer.
+    ReadOnly,
+}
+
+impl WriteProtection {
+    /// Whether this is the default state — lets the config skip writing a
+    /// `protection` key for ordinary connections (back-compat).
+    pub fn is_open(&self) -> bool {
+        matches!(self, WriteProtection::Open)
+    }
+
+    /// Whether a write through this connection must be confirmed first.
+    ///
+    /// False for [`ReadOnly`](Self::ReadOnly): there is nothing to confirm
+    /// when the write is refused outright.
+    pub fn confirms(self) -> bool {
+        matches!(self, WriteProtection::Confirm)
+    }
+
+    /// `defaults` narrowed by this protection — the connection's *effective*
+    /// capabilities.
+    ///
+    /// [`Confirm`](Self::Confirm) narrows nothing: it interposes a prompt
+    /// rather than removing the capability, so every affordance stays enabled
+    /// and the confirmation is what the user meets.
+    pub fn apply(self, defaults: Capabilities) -> Capabilities {
+        match self {
+            WriteProtection::Open | WriteProtection::Confirm => defaults,
+            WriteProtection::ReadOnly => defaults.read_only(),
+        }
+    }
+
+    /// The short label the UI shows on a connection carrying this protection,
+    /// or `None` when there is nothing to say.
+    pub fn badge(self) -> Option<&'static str> {
+        match self {
+            WriteProtection::Open => None,
+            WriteProtection::Confirm => Some("confirm writes"),
+            WriteProtection::ReadOnly => Some("read-only"),
+        }
+    }
+}
+
 /// One object's resolved capabilities: the connection defaults narrowed by
 /// what this particular object supports, plus how its rows are addressed.
 ///
@@ -149,6 +226,31 @@ impl TableAccess {
             identity,
             restriction,
         }
+    }
+
+    /// [`Self::resolve`] with the user's own write protection folded in
+    /// (FRE-111) — the entry point every gated path should use, so protection
+    /// and backend capability produce one effective answer instead of two
+    /// checks that can disagree.
+    ///
+    /// When the protection is what forbids the write, the reason says so
+    /// ([`USER_READ_ONLY`]) rather than blaming the backend: the user needs to
+    /// know this is a setting they can change, not a limit of the engine.
+    pub fn resolve_protected(
+        defaults: Capabilities,
+        protection: WriteProtection,
+        table: &TableMeta,
+        dialect: Dialect,
+    ) -> TableAccess {
+        let effective = protection.apply(defaults);
+        let mut access = TableAccess::resolve(effective, table, dialect);
+        if defaults.mutate && !effective.mutate {
+            // The backend would have allowed this; the marking is why it
+            // didn't. Wins over the object's own reason for the same reason
+            // the connection default does — it applies to every object here.
+            access.restriction = Some(USER_READ_ONLY);
+        }
+        access
     }
 
     /// Whether rows of this object can be edited, inserted or deleted.
@@ -268,6 +370,107 @@ mod tests {
             access.read_only_notice(),
             Some("Duplicate-key tables are read-only.")
         );
+    }
+
+    #[test]
+    fn open_protection_leaves_the_backends_answer_untouched() {
+        let table = keyed_table();
+        assert_eq!(
+            TableAccess::resolve_protected(
+                Capabilities::FULL,
+                WriteProtection::Open,
+                &table,
+                Dialect::Postgres
+            ),
+            TableAccess::resolve(Capabilities::FULL, &table, Dialect::Postgres)
+        );
+    }
+
+    #[test]
+    fn confirm_protection_narrows_nothing_and_only_interposes_a_prompt() {
+        // Confirm must leave the affordance enabled — the confirmation is
+        // what the user meets, not a disabled button.
+        let access = TableAccess::resolve_protected(
+            Capabilities::FULL,
+            WriteProtection::Confirm,
+            &keyed_table(),
+            Dialect::Postgres,
+        );
+        assert!(access.can_mutate());
+        assert_eq!(access.restriction, None);
+        assert!(WriteProtection::Confirm.confirms());
+        assert!(!WriteProtection::ReadOnly.confirms());
+        assert!(!WriteProtection::Open.confirms());
+    }
+
+    #[test]
+    fn marking_a_connection_read_only_refuses_writes_and_says_who_refused() {
+        let access = TableAccess::resolve_protected(
+            Capabilities::FULL,
+            WriteProtection::ReadOnly,
+            &keyed_table(),
+            Dialect::Postgres,
+        );
+        assert!(!access.can_mutate());
+        assert!(!access.caps.ddl);
+        assert_eq!(access.restriction, Some(USER_READ_ONLY));
+        // Blames the marking, not the engine — the user can change one of them.
+        assert_eq!(access.read_only_notice(), Some(MARKED_READ_ONLY));
+        // Reading is untouched, and the row stays addressable for cell fetch.
+        assert!(access.caps.read_query);
+        assert!(access.identity.is_some());
+    }
+
+    #[test]
+    fn a_read_only_backend_is_still_blamed_for_itself_whatever_the_marking() {
+        // The backend already refused, so the marking didn't change anything
+        // and must not claim the credit.
+        for protection in [
+            WriteProtection::Open,
+            WriteProtection::Confirm,
+            WriteProtection::ReadOnly,
+        ] {
+            let access = TableAccess::resolve_protected(
+                Capabilities::FULL.read_only(),
+                protection,
+                &keyed_table(),
+                Dialect::Postgres,
+            );
+            assert_eq!(
+                access.restriction,
+                Some(CONNECTION_READ_ONLY),
+                "{protection:?} must not reattribute the backend's own refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn protection_defaults_to_open_and_serializes_as_kebab_case() {
+        assert_eq!(WriteProtection::default(), WriteProtection::Open);
+        assert!(WriteProtection::Open.is_open());
+        assert!(!WriteProtection::Confirm.is_open());
+        // The on-disk spelling is part of the config format (FRE-111).
+        let round_trip = |p: WriteProtection| {
+            let text = toml::to_string(&Wrapper { protection: p }).unwrap();
+            let back: Wrapper = toml::from_str(&text).unwrap();
+            (text, back.protection)
+        };
+        #[derive(Serialize, Deserialize)]
+        struct Wrapper {
+            protection: WriteProtection,
+        }
+        for (p, spelling) in [
+            (WriteProtection::Open, "open"),
+            (WriteProtection::Confirm, "confirm"),
+            (WriteProtection::ReadOnly, "read-only"),
+        ] {
+            let (text, back) = round_trip(p);
+            assert!(
+                text.contains(spelling),
+                "{p:?} should write {spelling:?}: {text}"
+            );
+            assert_eq!(back, p);
+        }
     }
 
     #[test]

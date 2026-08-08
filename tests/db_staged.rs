@@ -85,7 +85,7 @@ async fn sqlite_multi_change_batch_applies_atomically() {
             locator: locator(vec![Value::Integer(2), Value::Integer(1)]),
         },
     ];
-    let counts = apply_staged(&pool, &albums, &identity, &changes)
+    let counts = apply_staged(&pool, &pool.access(&albums), &albums, &identity, &changes)
         .await
         .unwrap();
     assert_eq!(counts.updated_rows, 2);
@@ -127,7 +127,7 @@ async fn sqlite_multi_column_edits_on_one_row_apply_as_one_row_update() {
             Value::Text("edited".into()),
         ),
     ];
-    let counts = apply_staged(&pool, &artists, &identity, &changes)
+    let counts = apply_staged(&pool, &pool.access(&artists), &artists, &identity, &changes)
         .await
         .unwrap();
     assert_eq!(counts.updated_rows, 1, "grouped into one row update");
@@ -173,7 +173,7 @@ async fn sqlite_failure_mid_batch_rolls_everything_back_and_names_the_change() {
             ],
         },
     ];
-    let err = apply_staged(&pool, &albums, &identity, &changes)
+    let err = apply_staged(&pool, &pool.access(&albums), &albums, &identity, &changes)
         .await
         .unwrap_err();
     assert_eq!(err.change_index, Some(1), "the second change failed");
@@ -225,7 +225,7 @@ async fn sqlite_sql_error_mid_batch_rolls_back_and_names_the_change() {
             ],
         },
     ];
-    let err = apply_staged(&pool, &albums, &identity, &changes)
+    let err = apply_staged(&pool, &pool.access(&albums), &albums, &identity, &changes)
         .await
         .unwrap_err();
     assert_eq!(err.change_index, Some(1));
@@ -286,7 +286,7 @@ async fn sqlite_rowid_identity_table_edits_end_to_end() {
         "body",
         Value::Text("edited".into()),
     )];
-    let counts = apply_staged(&pool, &notes, &identity, &changes)
+    let counts = apply_staged(&pool, &pool.access(&notes), &notes, &identity, &changes)
         .await
         .unwrap();
     assert_eq!(counts.updated_rows, 1);
@@ -350,7 +350,7 @@ async fn postgres_multi_change_batch_applies_atomically() {
             locator: locator(vec![Value::Integer(3)]),
         },
     ];
-    let counts = apply_staged(&pool, &items, &identity, &changes)
+    let counts = apply_staged(&pool, &pool.access(&items), &items, &identity, &changes)
         .await
         .unwrap();
     assert_eq!(counts.updated_rows, 2);
@@ -392,7 +392,7 @@ async fn postgres_failure_mid_batch_rolls_everything_back_and_names_the_change()
             locator: locator(vec![Value::Integer(99)]),
         },
     ];
-    let err = apply_staged(&pool, &items, &identity, &changes)
+    let err = apply_staged(&pool, &pool.access(&items), &items, &identity, &changes)
         .await
         .unwrap_err();
     assert_eq!(err.change_index, Some(1));
@@ -438,7 +438,7 @@ async fn sqlite_bool_checkbox_stages_integers_end_to_end() {
             bool_value(Dialect::Sqlite, false),
         ),
     ];
-    apply_staged(&pool, &flags, &identity, &changes)
+    apply_staged(&pool, &pool.access(&flags), &flags, &identity, &changes)
         .await
         .unwrap();
 
@@ -500,7 +500,7 @@ async fn postgres_staged_text_values_coerce_to_column_types() {
         // stages Integer, but text must also survive the cast).
         update(key.clone(), "quantity", Value::Text("42".into())),
     ];
-    let counts = apply_staged(&pool, &typed, &identity, &changes)
+    let counts = apply_staged(&pool, &pool.access(&typed), &typed, &identity, &changes)
         .await
         .unwrap();
     assert_eq!(counts.updated_rows, 1);
@@ -525,7 +525,7 @@ async fn postgres_staged_text_values_coerce_to_column_types() {
     // Bad text for a typed column fails at save time (the cast reports it)
     // and rolls back.
     let bad = vec![update(key, "at", Value::Text("not a date".into()))];
-    let err = apply_staged(&pool, &typed, &identity, &bad)
+    let err = apply_staged(&pool, &pool.access(&typed), &typed, &identity, &bad)
         .await
         .unwrap_err();
     assert_eq!(err.change_index, Some(0));
@@ -579,7 +579,7 @@ async fn postgres_char_n_columns_round_trip_uncast() {
         update(key.clone(), "tag", Value::Text("xyz".into())),
         update(key, "label", Value::Text("two".into())),
     ];
-    let counts = apply_staged(&pool, &items, &identity, &changes)
+    let counts = apply_staged(&pool, &pool.access(&items), &items, &identity, &changes)
         .await
         .unwrap();
     assert_eq!(counts.updated_rows, 1);
@@ -626,7 +626,7 @@ async fn postgres_bit_n_edit_fails_loudly_and_rolls_back() {
         "mask",
         Value::Text("110".into()),
     )];
-    let err = apply_staged(&pool, &items, &identity, &changes)
+    let err = apply_staged(&pool, &pool.access(&items), &items, &identity, &changes)
         .await
         .unwrap_err();
     assert_eq!(err.change_index, Some(0), "the edit itself is named");
@@ -673,7 +673,7 @@ async fn postgres_staged_text_insert_coerces_to_column_types() {
             Value::Text("[1, 2]".into()),
         ],
     }];
-    let counts = apply_staged(&pool, &typed, &identity, &changes)
+    let counts = apply_staged(&pool, &pool.access(&typed), &typed, &identity, &changes)
         .await
         .unwrap();
     assert_eq!(counts.inserted_rows, 1);
@@ -710,7 +710,7 @@ async fn postgres_set_null_on_integer_column_works_via_literal_null() {
             Value::Text("emptied".into()),
         ),
     ];
-    let counts = apply_staged(&pool, &items, &identity, &changes)
+    let counts = apply_staged(&pool, &pool.access(&items), &items, &identity, &changes)
         .await
         .unwrap();
     assert_eq!(counts.updated_rows, 1);
@@ -761,9 +761,15 @@ async fn sqlite_staged_insert_leaves_defaults_to_the_database() {
         "label filled → saveable"
     );
 
-    let counts = apply_staged(&pool, &items, &identity, &stage.changes())
-        .await
-        .unwrap();
+    let counts = apply_staged(
+        &pool,
+        &pool.access(&items),
+        &items,
+        &identity,
+        &stage.changes(),
+    )
+    .await
+    .unwrap();
     assert_eq!(counts.inserted_rows, 1);
 
     // The database assigned id (rowid alias) and the qty default.
@@ -795,9 +801,15 @@ async fn sqlite_staged_insert_leaves_defaults_to_the_database() {
             values: vec![],
         }]
     );
-    apply_staged(&pool, &logs, &logs_identity, &stage.changes())
-        .await
-        .unwrap();
+    apply_staged(
+        &pool,
+        &pool.access(&logs),
+        &logs,
+        &logs_identity,
+        &stage.changes(),
+    )
+    .await
+    .unwrap();
     let check = pool.query("SELECT id, note FROM logs").await.unwrap();
     assert_eq!(check.rows[0][0], Value::Integer(1));
     assert_eq!(check.rows[0][1], Value::Text("x".into()));
@@ -871,9 +883,15 @@ async fn postgres_staged_insert_gets_serial_and_identity_values() {
         }]
     );
 
-    let counts = apply_staged(&pool, &items, &identity, &stage.changes())
-        .await
-        .unwrap();
+    let counts = apply_staged(
+        &pool,
+        &pool.access(&items),
+        &items,
+        &identity,
+        &stage.changes(),
+    )
+    .await
+    .unwrap();
     assert_eq!(counts.inserted_rows, 1);
 
     let check = pool
@@ -924,9 +942,15 @@ async fn sqlite_staged_multi_delete_with_edit_applies_exact_counts() {
     assert_eq!(stage.delete_count(), 2);
     assert_eq!(stage.pending_count(), 3);
 
-    let counts = apply_staged(&pool, &contacts, &identity, &stage.changes())
-        .await
-        .unwrap();
+    let counts = apply_staged(
+        &pool,
+        &pool.access(&contacts),
+        &contacts,
+        &identity,
+        &stage.changes(),
+    )
+    .await
+    .unwrap();
     assert_eq!(counts.deleted_rows, 2, "exactly the confirmed count");
     assert_eq!(counts.updated_rows, 1);
     assert_eq!(counts.inserted_rows, 0);

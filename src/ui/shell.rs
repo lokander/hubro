@@ -5,13 +5,13 @@ use dioxus::desktop::tao::dpi::{LogicalSize, PhysicalPosition};
 use dioxus::desktop::tao::event::{Event, WindowEvent};
 use dioxus::desktop::{use_window, use_wry_event_handler, DesktopService, WindowCloseBehaviour};
 use dioxus::prelude::*;
-use dioxus_icons::lucide::{Moon, Pencil, Plug, Sun, SunMoon, Trash2, X};
+use dioxus_icons::lucide::{Moon, Pencil, Plug, ShieldAlert, Sun, SunMoon, Trash2, X};
 
 use crate::config::{
-    default_settings_path, load_settings, save_window_geometry, BackendKind, SavedConnection,
-    Theme, WindowGeometry,
+    default_settings_path, load_settings, save_window_geometry, BackendKind, ConnectionColor,
+    SavedConnection, Theme, WindowGeometry,
 };
-use crate::db::{ConnectionId, Dialect};
+use crate::db::{ConnectionId, Dialect, WriteProtection};
 
 use super::editor::SqlEditor;
 use super::grid::DataGrid;
@@ -439,18 +439,38 @@ fn Cheatsheet() -> Element {
     }
 }
 
+/// One tab's render data, snapshotted out of the registry so the loop can
+/// hand owned values to event handlers.
+struct TabEntry {
+    id: ConnectionId,
+    name: String,
+    dialect: Dialect,
+    /// Accent colour and write protection (FRE-111).
+    color: Option<ConnectionColor>,
+    protection: WriteProtection,
+}
+
 /// One tab per open connection, plus a fixed tab for the connections screen.
 #[component]
 fn TabBar() -> Element {
     let mut state = use_context::<AppState>();
     let active = *state.active.read();
     // Owned copies so the loop can hand ids/names to event handlers.
-    let tabs: Vec<(ConnectionId, String, Dialect)> = state
-        .registry
-        .read()
-        .iter()
-        .map(|c| (c.id, c.name.clone(), c.pool.dialect()))
-        .collect();
+    let tabs: Vec<TabEntry> = {
+        let colors = state.connection_colors.read();
+        state
+            .registry
+            .read()
+            .iter()
+            .map(|c| TabEntry {
+                id: c.id,
+                name: c.name.clone(),
+                dialect: c.pool.dialect(),
+                color: colors.get(&c.id).copied(),
+                protection: c.protection,
+            })
+            .collect()
+    };
     rsx! {
         header { class: "flex items-center gap-1 border-b border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 pt-1",
             button {
@@ -462,23 +482,44 @@ fn TabBar() -> Element {
                 onclick: move |_| state.active.set(ActiveView::Connections),
                 "Connections"
             }
-            for (id, name, dialect) in tabs {
+            for tab in tabs {
                 div {
-                    class: if active == ActiveView::Connection(id) {
+                    key: "{tab.id:?}",
+                    class: if active == ActiveView::Connection(tab.id) {
                         "flex items-center gap-1 rounded-t bg-white dark:bg-slate-900 px-3 py-1.5 text-sm text-slate-900 dark:text-slate-100"
                     } else {
                         "flex items-center gap-1 rounded-t px-3 py-1.5 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100"
                     },
+                    // The accent rides the tab's top edge (FRE-111) so it
+                    // stays visible on the inactive tabs too, where a
+                    // background tint would be lost against the bar.
+                    border_top: if let Some(color) = tab.color { "2px solid {color.css()}" },
+                    padding_top: if tab.color.is_some() { "4px" },
                     button {
                         class: "flex items-center gap-1.5",
-                        onclick: move |_| state.active.set(ActiveView::Connection(id)),
-                        BackendIcon { dialect }
-                        "{name}"
+                        onclick: {
+                            let id = tab.id;
+                            move |_| state.active.set(ActiveView::Connection(id))
+                        },
+                        BackendIcon { dialect: tab.dialect }
+                        "{tab.name}"
+                        // A protected tab says so wherever it is seen, not
+                        // only in the connections list.
+                        if let Some(badge) = tab.protection.badge() {
+                            span {
+                                class: "rounded bg-amber-100 dark:bg-amber-900/50 px-1 py-0.5 text-[10px] leading-none text-amber-700 dark:text-amber-300",
+                                title: "{badge}",
+                                if tab.protection == WriteProtection::ReadOnly { "RO" } else { "!" }
+                            }
+                        }
                     }
                     button {
                         class: "rounded px-1 py-1 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
                         aria_label: "Close connection",
-                        onclick: move |_| state.close_connection(id),
+                        onclick: {
+                            let id = tab.id;
+                            move |_| state.close_connection(id)
+                        },
                         X { size: 12 }
                     }
                 }
@@ -599,6 +640,112 @@ fn PaneButton(
     }
 }
 
+/// One saved connection's write protection and accent colour (FRE-111),
+/// edited inline under its row in the connections list.
+///
+/// Every change writes straight through to the saved list — there is no OK
+/// button. Marking is a two-field setting with an immediately visible effect
+/// (the badge and the stripe update in place), so a confirm step would only
+/// add a way to lose the change.
+#[component]
+fn MarkingEditor(
+    locator: String,
+    protection: WriteProtection,
+    color: Option<ConnectionColor>,
+) -> Element {
+    let state = use_context::<AppState>();
+    rsx! {
+        div { class: "w-full border-t border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-900/60 px-4 py-3",
+            div { class: "flex flex-wrap items-center gap-x-6 gap-y-3",
+                div { class: "flex items-center gap-2",
+                    span { class: "text-xs font-medium text-slate-600 dark:text-slate-400", "Writes" }
+                    for option in [WriteProtection::Open, WriteProtection::Confirm, WriteProtection::ReadOnly] {
+                        button {
+                            key: "{option:?}",
+                            class: if option == protection {
+                                "cursor-pointer rounded bg-slate-700 dark:bg-slate-600 px-2 py-0.5 text-xs font-medium text-white"
+                            } else {
+                                "cursor-pointer rounded border border-slate-300 dark:border-slate-700 px-2 py-0.5 text-xs text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800"
+                            },
+                            aria_pressed: if option == protection { "true" } else { "false" },
+                            onclick: {
+                                let locator = locator.clone();
+                                move |_| state.set_saved_marking(&locator, option, color)
+                            },
+                            "{protection_label(option)}"
+                        }
+                    }
+                }
+                div { class: "flex items-center gap-2",
+                    span { class: "text-xs font-medium text-slate-600 dark:text-slate-400", "Colour" }
+                    button {
+                        class: if color.is_none() {
+                            "cursor-pointer rounded border-2 border-slate-700 dark:border-slate-300 px-2 py-0.5 text-xs text-slate-700 dark:text-slate-300"
+                        } else {
+                            "cursor-pointer rounded border border-slate-300 dark:border-slate-700 px-2 py-0.5 text-xs text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-800"
+                        },
+                        title: "No colour",
+                        aria_label: "No colour",
+                        aria_pressed: if color.is_none() { "true" } else { "false" },
+                        onclick: {
+                            let locator = locator.clone();
+                            move |_| state.set_saved_marking(&locator, protection, None)
+                        },
+                        "None"
+                    }
+                    for swatch in ConnectionColor::ALL {
+                        button {
+                            key: "{swatch:?}",
+                            // The selected swatch is ringed rather than
+                            // ticked: a tick would have to be legible on six
+                            // different backgrounds.
+                            class: if color == Some(swatch) {
+                                "size-5 cursor-pointer rounded-full ring-2 ring-slate-900 dark:ring-slate-100 ring-offset-2 ring-offset-slate-100 dark:ring-offset-slate-900"
+                            } else {
+                                "size-5 cursor-pointer rounded-full hover:ring-2 hover:ring-slate-400 hover:ring-offset-2 hover:ring-offset-slate-100 dark:hover:ring-offset-slate-900"
+                            },
+                            background_color: "{swatch.css()}",
+                            title: "{swatch.label()}",
+                            aria_label: "{swatch.label()}",
+                            aria_pressed: if color == Some(swatch) { "true" } else { "false" },
+                            onclick: {
+                                let locator = locator.clone();
+                                move |_| state.set_saved_marking(&locator, protection, Some(swatch))
+                            },
+                        }
+                    }
+                }
+            }
+            p { class: "mt-2 text-xs text-slate-500",
+                "{protection_hint(protection)}"
+            }
+        }
+    }
+}
+
+/// The button label for one protection state.
+fn protection_label(protection: WriteProtection) -> &'static str {
+    match protection {
+        WriteProtection::Open => "Allow",
+        WriteProtection::Confirm => "Confirm",
+        WriteProtection::ReadOnly => "Refuse",
+    }
+}
+
+/// One sentence saying what the chosen state actually does, so the three
+/// buttons don't have to carry the whole explanation.
+fn protection_hint(protection: WriteProtection) -> &'static str {
+    match protection {
+        WriteProtection::Open => "Writes run without extra confirmation.",
+        WriteProtection::Confirm => {
+            "Every write asks first, naming this connection. Colour only warns — it changes nothing."
+        }
+        WriteProtection::ReadOnly => {
+            "Writes are refused outright, including from the SQL editor."
+        }
+    }
+}
+
 /// One row of the saved list, precomputed for rendering.
 #[derive(Clone, PartialEq)]
 struct SavedRow {
@@ -617,6 +764,9 @@ struct SavedRow {
     /// Whether that connect can be cancelled — true when it was started from
     /// this list rather than by submitting a form.
     cancellable: bool,
+    /// The row's write protection and accent colour (FRE-111).
+    protection: WriteProtection,
+    color: Option<ConnectionColor>,
     tunnel: Option<crate::tunnel::TunnelConfig>,
     auth: crate::config::PgAuth,
 }
@@ -721,6 +871,8 @@ fn ConnectionsScreen() -> Element {
     // so the trash icon only arms the confirmation — one row at a time, since
     // arming another replaces this.
     let mut confirm_remove = use_signal(|| Option::<String>::None);
+    // Which row's write-protection/colour editor is expanded (FRE-111).
+    let mut marking_open = use_signal(|| Option::<String>::None);
     let error = state.connect_error.read().clone();
     let prompt = state.password_prompt.read().clone();
     let host_key_prompt = state.host_key_prompt.read().clone();
@@ -770,6 +922,8 @@ fn ConnectionsScreen() -> Element {
                         .find(|c| c.visible && c.locator == canonical_locator)
                         .map(|c| c.step),
                     cancellable: requests.contains_key(&canonical_locator),
+                    protection: s.protection(),
+                    color: s.color(),
                     tunnel,
                     auth,
                 }
@@ -820,7 +974,16 @@ fn ConnectionsScreen() -> Element {
                         // The row's padding lives on the connect button, not on
                         // the li: as li padding it was dead space that lit up on
                         // hover but swallowed the click.
-                        li { class: "flex items-stretch first:rounded-t last:rounded-b hover:bg-slate-200 dark:hover:bg-slate-800/60",
+                        li { class: "flex flex-wrap items-stretch first:rounded-t last:rounded-b hover:bg-slate-200 dark:hover:bg-slate-800/60",
+                            // Accent stripe (FRE-111): the colour warns, and
+                            // it reads before any text does.
+                            if let Some(color) = row.color {
+                                div {
+                                    class: "w-1 shrink-0 first:rounded-tl last:rounded-bl",
+                                    background_color: "{color.css()}",
+                                    aria_hidden: "true",
+                                }
+                            }
                             button {
                                 // Dimmed and inert while its connect runs, so
                                 // the row reads as busy rather than ignored.
@@ -881,6 +1044,14 @@ fn ConnectionsScreen() -> Element {
                                     if row.is_open {
                                         span { class: "rounded bg-sky-100 dark:bg-sky-900/60 px-1.5 py-0.5 text-xs text-sky-700 dark:text-sky-300",
                                             "open"
+                                        }
+                                    }
+                                    // Protection is never silent (FRE-111):
+                                    // the user should never wonder why a save
+                                    // button is disabled or a prompt appeared.
+                                    if let Some(badge) = row.protection.badge() {
+                                        span { class: "rounded bg-amber-100 dark:bg-amber-900/50 px-1.5 py-0.5 text-xs text-amber-700 dark:text-amber-300",
+                                            "{badge}"
                                         }
                                     }
                                 }
@@ -953,6 +1124,28 @@ fn ConnectionsScreen() -> Element {
                                         }
                                     }
                                 } else {
+                                    // Marking is offered for every backend,
+                                    // including SQLite — which has no edit
+                                    // form, so this is the only place it can
+                                    // be protected from.
+                                    button {
+                                        class: if marking_open() == Some(row.locator.clone()) {
+                                            "cursor-pointer rounded bg-slate-300 dark:bg-slate-700 p-1.5 text-slate-900 dark:text-slate-200"
+                                        } else {
+                                            "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200"
+                                        },
+                                        title: "Write protection and colour",
+                                        aria_label: "Write protection and colour",
+                                        aria_expanded: if marking_open() == Some(row.locator.clone()) { "true" } else { "false" },
+                                        onclick: {
+                                            let locator = row.locator.clone();
+                                            move |_| {
+                                                let open = marking_open() == Some(locator.clone());
+                                                marking_open.set((!open).then(|| locator.clone()));
+                                            }
+                                        },
+                                        ShieldAlert { size: 14 }
+                                    }
                                     if row.backend != BackendKind::Sqlite {
                                         button {
                                             class: "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
@@ -986,6 +1179,17 @@ fn ConnectionsScreen() -> Element {
                                         },
                                         Trash2 { size: 14 }
                                     }
+                                }
+                            }
+                            // The marking editor (FRE-111), expanded inline
+                            // below its row — the row is already a full-width
+                            // click target, so a floating popover would have
+                            // to be dismissed before the row could be used.
+                            if marking_open() == Some(row.locator.clone()) {
+                                MarkingEditor {
+                                    locator: row.locator.clone(),
+                                    protection: row.protection,
+                                    color: row.color,
                                 }
                             }
                         }
@@ -1406,12 +1610,14 @@ impl EditPrefill {
                 url,
                 tunnel,
                 auth,
+                ..
             } => (name, url, tunnel, auth, "sslmode"),
             SavedConnection::SqlServer {
                 name,
                 url,
                 tunnel,
                 auth,
+                ..
             } => (name, url, tunnel, auth, "encrypt"),
             // SQLite entries carry only a path; they have no edit form.
             SavedConnection::Sqlite { name, .. } => {

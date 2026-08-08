@@ -820,6 +820,7 @@ async fn postgres_quoted_camelcase_enum_saves_through_the_staged_cast() {
     let identity = detect_row_identity(table, Dialect::Postgres).unwrap();
     let applied = hubro::db::apply_staged(
         &pool,
+        &pool.access(table),
         table,
         &identity,
         &[hubro::db::StagedChange::Update {

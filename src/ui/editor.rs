@@ -5,7 +5,8 @@ use serde::Deserialize;
 
 use crate::db::{
     needs_confirmation, ConnectionId, Dialect, ExportFormat, QueryResult, StatementOutcome,
-    StatementResult, TableMeta, Value, MAX_QUERY_ROWS, NO_DDL, NO_MUTATE, NO_QUERY,
+    StatementResult, TableMeta, Value, MARKED_READ_ONLY, MAX_QUERY_ROWS, NO_DDL, NO_MUTATE,
+    NO_QUERY,
 };
 use crate::history::{HistoryEntry, HISTORY_CAP};
 
@@ -112,14 +113,16 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
     // What this connection won't run, stated before the user writes it
     // (FRE-87). `run_sql` refuses the same cases, so the note explains a
     // refusal that would otherwise arrive only after pressing Ctrl+Enter.
-    let capability_note: Option<&'static str> = match state
-        .registry
-        .read()
-        .get(id)
-        .map(|connection| connection.pool.capabilities())
-    {
+    //
+    // Effective capabilities, so a connection the user marked read-only
+    // (FRE-111) says so here rather than only when the run is refused.
+    let capability_note: Option<&'static str> = match state.connection_caps(id) {
         Some(caps) if !caps.read_query => Some(NO_QUERY),
-        Some(caps) if !caps.mutate => Some(NO_MUTATE),
+        Some(caps) if !caps.mutate => Some(if state.marked_read_only(id) {
+            MARKED_READ_ONLY
+        } else {
+            NO_MUTATE
+        }),
         Some(caps) if !caps.ddl => Some(NO_DDL),
         _ => None,
     };
@@ -130,6 +133,13 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
             .filter(|s| needs_confirmation(s, dialect))
             .count()
     });
+    // Under Confirm (FRE-111) the banner names the connection: the whole
+    // point of the state is to make you read *which* database you are about
+    // to change, which "Run anyway?" alone never made you do.
+    let confirm_target: Option<String> = state
+        .confirms_writes(id)
+        .then(|| state.registry.read().get(id).map(|c| c.name.clone()))
+        .flatten();
     let mut show_history = use_signal(|| false);
 
     rsx! {
@@ -178,7 +188,13 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
                 if let Some(write_count) = pending_writes {
                     div { class: "flex items-center gap-3 border-b border-amber-300 dark:border-amber-900/50 bg-amber-100 dark:bg-amber-950/30 px-4 py-2",
                         span { class: "text-sm text-amber-700 dark:text-amber-300",
-                            if write_count == 1 {
+                            if let Some(target) = confirm_target.clone() {
+                                if write_count == 1 {
+                                    "Run 1 write statement against \"{target}\"?"
+                                } else {
+                                    "Run {write_count} write statements against \"{target}\"?"
+                                }
+                            } else if write_count == 1 {
                                 "This script contains 1 write statement. Run anyway?"
                             } else {
                                 "This script contains {write_count} write statements. Run anyway?"
