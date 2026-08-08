@@ -23,6 +23,24 @@ fn focus_filter_input() {
     );
 }
 
+/// What the sidebar's body should show. Derived from [`SchemaLoad`] so the
+/// render body never has to clone the table list just to find out which
+/// branch it is in — on a 300-table schema that clone alone cost ~1 ms per
+/// render (FRE-107). The list itself comes from the memo below.
+#[derive(Clone, PartialEq)]
+enum ListState {
+    Loading,
+    Failed(String),
+    /// Introspected fine, but the database has no tables at all.
+    Empty,
+    Ready,
+}
+
+/// One schema group of filter results, ready to render: the schema name and
+/// its surviving tables, each with the positions of its matching columns
+/// (empty outside column mode).
+type FilteredGroups = Vec<(Option<String>, Vec<(TableMeta, Vec<usize>)>)>;
+
 /// Sidebar for one connection: a flat list of the introspected tables and
 /// views, grouped by schema. Clicking a name selects it for the data grid
 /// and the Schema pane, which is where its columns and indexes live
@@ -36,19 +54,49 @@ fn focus_filter_input() {
 pub fn SchemaSidebar(id: ConnectionId) -> Element {
     let state = use_context::<AppState>();
     let mut filter = use_signal(String::new);
-    let schema = state
-        .schemas
-        .read()
-        .get(&id)
-        .cloned()
-        .unwrap_or(SchemaLoad::Loading);
+    let list_state = match state.schemas.read().get(&id) {
+        Some(SchemaLoad::Failed(err)) => ListState::Failed(err.clone()),
+        Some(SchemaLoad::Ready(tables)) if tables.is_empty() => ListState::Empty,
+        Some(SchemaLoad::Ready(_)) => ListState::Ready,
+        Some(SchemaLoad::Loading) | None => ListState::Loading,
+    };
 
     let raw = filter();
     let query = parse_query(&raw);
     let columns_mode = query.mode == FilterMode::Columns;
     // The box only helps once there is a list to narrow, and it would be a
     // confusing thing to offer next to a load error.
-    let show_filter = matches!(&schema, SchemaLoad::Ready(tables) if !tables.is_empty());
+    let show_filter = list_state == ListState::Ready;
+
+    // Memoized, not computed in the render body: matching runs over every
+    // table (and in column mode every column) of the schema, so re-running it
+    // on unrelated re-renders — selecting a table, staging an edit — would
+    // re-pay the whole cost for nothing. Reads `schemas` and `filter`, so it
+    // recomputes exactly when one of those changes.
+    let groups = use_memo(move || {
+        let query = parse_query(&filter());
+        let schemas = state.schemas.read();
+        let Some(SchemaLoad::Ready(tables)) = schemas.get(&id) else {
+            return FilteredGroups::new();
+        };
+        let hits = filter_tables(tables, &query);
+        group_by_schema(tables, &hits)
+            .into_iter()
+            .map(|(schema, group)| {
+                let group = group
+                    .into_iter()
+                    .map(|hit| (tables[hit.index].clone(), hit.columns))
+                    .collect();
+                (schema, group)
+            })
+            .collect()
+    });
+    let groups = groups();
+    // A schema that contributed no hit contributes no header either, which is
+    // what keeps the result reading as a narrowed tree rather than a flat list
+    // of names.
+    let show_headers =
+        groups.len() > 1 || groups.first().is_some_and(|(schema, _)| schema.is_some());
 
     rsx! {
         div { class: "flex min-h-0 flex-1 flex-col",
@@ -125,60 +173,51 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
                 }
             }
             div { class: "min-h-0 flex-1 overflow-y-auto py-1",
-                match schema {
-                    SchemaLoad::Loading => rsx! {
+                match list_state {
+                    ListState::Loading => rsx! {
                         DelayedLoading { label: "Loading schema…" }
                     },
-                    SchemaLoad::Failed(err) => rsx! {
+                    ListState::Failed(err) => rsx! {
                         div { class: "p-2",
                             Banner { kind: BannerKind::Error, message: err }
                         }
                     },
-                    SchemaLoad::Ready(tables) if tables.is_empty() => rsx! {
+                    ListState::Empty => rsx! {
                         EmptyState {
                             icon: rsx! { Database { size: 40 } },
                             title: "No tables",
                             hint: "This database has no tables yet.",
                         }
                     },
-                    SchemaLoad::Ready(tables) => {
-                        // An empty needle matches everything in introspection
-                        // order, so the unfiltered tree renders through this
-                        // same path — there is no separate "no filter" branch
-                        // to keep in sync.
-                        let hits = filter_tables(&tables, &query);
-                        let groups = group_by_schema(&tables, &hits);
-                        // Schemas that contributed no hit contribute no header
-                        // either, which is what keeps the result reading as a
-                        // narrowed tree rather than a flat list of names.
-                        let show_headers = groups.len() > 1
-                            || groups.first().is_some_and(|(s, _)| s.is_some());
-                        rsx! {
-                            if hits.is_empty() {
-                                p { class: "px-3 py-4 text-center text-xs text-slate-500 dark:text-slate-400",
-                                    if columns_mode { "No columns match " } else { "No tables match " }
-                                    span { class: "font-mono text-slate-700 dark:text-slate-300", "{query.needle}" }
+                    // An empty needle matches everything in introspection
+                    // order, so the unfiltered tree renders through this same
+                    // path — there is no separate "no filter" branch to keep
+                    // in sync.
+                    ListState::Ready => rsx! {
+                        if groups.is_empty() {
+                            p { class: "px-3 py-4 text-center text-xs text-slate-500 dark:text-slate-400",
+                                if columns_mode { "No columns match " } else { "No tables match " }
+                                span { class: "font-mono text-slate-700 dark:text-slate-300", "{query.needle}" }
+                            }
+                        }
+                        for (schema , group) in groups {
+                            if show_headers {
+                                p { class: "px-2 pt-2 pb-0.5 text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-600",
+                                    {schema.clone().unwrap_or_else(|| "(no schema)".to_string())}
                                 }
                             }
-                            for (schema, group) in groups {
-                                if show_headers {
-                                    p { class: "px-2 pt-2 pb-0.5 text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-600",
-                                        {schema.clone().unwrap_or_else(|| "(no schema)".to_string())}
-                                    }
-                                }
-                                ul {
-                                    for hit in group {
-                                        TableNode {
-                                            key: "{tables[hit.index].schema:?}.{tables[hit.index].name}",
-                                            id,
-                                            table: tables[hit.index].clone(),
-                                            columns: hit.columns.clone(),
-                                        }
+                            ul {
+                                for (table , columns) in group {
+                                    TableNode {
+                                        key: "{table.schema:?}.{table.name}",
+                                        id,
+                                        table,
+                                        columns,
                                     }
                                 }
                             }
                         }
-                    }
+                    },
                 }
             }
         }

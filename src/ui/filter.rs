@@ -10,8 +10,8 @@
 //! a scroll-hunt is replaced by a filtered tree only if the user can predict
 //! what typing three characters will do. Exact beats prefix beats
 //! word-boundary beats plain substring beats subsequence, and only then do
-//! position and length break ties — so `us` puts `users` above `census` above
-//! `unit_specs`, every time.
+//! span, position and length break ties — so `ord` puts `orders` above
+//! `records` above `overdraft`, every time.
 
 use crate::db::TableMeta;
 
@@ -22,11 +22,20 @@ const COLUMN_PREFIXES: [&str; 4] = [":col", ":cols", ":column", ":columns"];
 
 /// The canonical column-mode prefix, with its trailing space — what the
 /// sidebar's toggle button writes into the box.
-pub const COLUMN_PREFIX: &str = ":col ";
+const COLUMN_PREFIX: &str = ":col ";
 
-/// What the one filter input is searching. Both modes share
-/// [`score`]; the mode only changes what gets scored and how the hits are
-/// grouped for rendering (FRE-107).
+/// Shortest needle the subsequence fallback is offered for.
+///
+/// Below this it is all noise and no signal: on a realistic 50-table schema
+/// `us` keeps 22 tables with subsequences on and 6 with them off, and the 16
+/// extra are `refunds`, `coupons`, `job_runs` — names no one was reaching for.
+/// The motivating example (`usrol` → `user_roles`) is five characters, so
+/// nothing the feature is for is lost.
+const MIN_SUBSEQUENCE_LEN: usize = 3;
+
+/// What the one filter input is searching. Both modes share the same matcher;
+/// the mode only changes what gets scored and how the hits are grouped for
+/// rendering (FRE-107).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterMode {
     /// The default: table and view names only.
@@ -102,14 +111,21 @@ enum Tier {
 
 /// A ranking key: smaller is better, and the derived `Ord` compares the
 /// fields in declaration order, which *is* the ranking rule.
+///
+/// `span` sits ahead of `start` deliberately, and it only ever decides
+/// anything in the subsequence tier: every contiguous tier sets `span` to the
+/// needle's length, so it is constant across those candidates and the
+/// comparison falls straight through to `start`. In the subsequence tier the
+/// span *is* the quality of the match, and ordering by `start` first put
+/// `audit_events` (`a-U-dit_event-S`, span 11) above `job_runs` (span 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct MatchScore {
+struct MatchScore {
     tier: Tier,
+    /// Characters the match spans — a tight run reads more like the name than
+    /// a scattered one.
+    span: usize,
     /// Character offset the match starts at — earlier wins.
     start: usize,
-    /// Characters the match spans. Only interesting for subsequences, where
-    /// a tight run reads more like the name than a scattered one.
-    span: usize,
     /// Length of the whole name — with everything else equal, the shorter
     /// name is the more likely target.
     len: usize,
@@ -122,36 +138,46 @@ fn is_boundary(c: char) -> bool {
     !c.is_alphanumeric()
 }
 
-/// Scores `needle` against `haystack`, case-insensitively. `None` means no
-/// match at all — not even as a subsequence.
+/// Lowercases a name into the `char` vector the matcher works on.
+///
+/// `char`s rather than bytes because `str` indices would desync the moment a
+/// name contains a multi-byte character (Postgres identifiers are not
+/// ASCII-only) and the offsets here feed the ranking. `to_lowercase` rather
+/// than `to_ascii_lowercase` because the non-ASCII case is exactly the one
+/// that needs folding: `ÅRSRAPPORT` has to match `årsrapport`.
+fn lowercased(name: &str) -> Vec<char> {
+    name.chars().flat_map(char::to_lowercase).collect()
+}
+
+/// Writes the lowercased `prefix.name` form into `buf`.
+///
+/// Takes both halves already lowercased and reuses the caller's buffer: column
+/// mode scores every column of every table on each keystroke (~10k on the
+/// 300-table databases this feature exists for), and a `format!` per candidate
+/// was three quarters of the cost.
+fn qualify_into(buf: &mut Vec<char>, prefix: &[char], name: &[char]) {
+    buf.clear();
+    buf.reserve(prefix.len() + name.len() + 1);
+    buf.extend_from_slice(prefix);
+    buf.push('.');
+    buf.extend_from_slice(name);
+}
+
+/// Scores an already-lowercased needle against an already-lowercased
+/// haystack. `None` means no match at all.
 ///
 /// An empty needle matches everything perfectly, so callers that treat "no
 /// text typed" as "no filter" get the same answer either way.
-pub fn score(haystack: &str, needle: &str) -> Option<MatchScore> {
-    score_with(haystack, needle, true)
-}
-
-/// Same, but with the subsequence fallback optional.
 ///
-/// Qualified names (`public.users`) are scored with it *off* — see
-/// [`score_table`]. Left on, the schema half donates its characters to every
-/// table under it: on a `public` schema, `us` would match every single table
-/// as a subsequence (`p-u-blic.…-s`), which is exactly the flat wall of names
-/// the filter exists to avoid.
-fn score_with(haystack: &str, needle: &str, subsequences: bool) -> Option<MatchScore> {
-    // Compared as lowercased `char` vectors rather than byte slices: `str`
-    // indices would desync the moment a name contains a multi-byte character
-    // (Postgres identifiers are not ASCII-only), and the offsets here feed
-    // the ranking. The allocation is fine at sidebar scale — a few hundred
-    // tables, re-scored per keystroke.
-    let hay: Vec<char> = haystack.chars().flat_map(char::to_lowercase).collect();
-    let ned: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
+/// `subsequences` turns the fuzzy fallback off. Qualified names
+/// (`public.users`) are scored with it off — see [`score_table_prepared`].
+fn score_prepared(hay: &[char], ned: &[char], subsequences: bool) -> Option<MatchScore> {
     let len = hay.len();
     if ned.is_empty() {
         return Some(MatchScore {
             tier: Tier::Exact,
-            start: 0,
             span: 0,
+            start: 0,
             len,
         });
     }
@@ -161,8 +187,8 @@ fn score_with(haystack: &str, needle: &str, subsequences: bool) -> Option<MatchS
     if hay == ned {
         return Some(MatchScore {
             tier: Tier::Exact,
-            start: 0,
             span: ned.len(),
+            start: 0,
             len,
         });
     }
@@ -182,19 +208,19 @@ fn score_with(haystack: &str, needle: &str, subsequences: bool) -> Option<MatchS
         };
         let candidate = MatchScore {
             tier,
-            start,
             span: ned.len(),
+            start,
             len,
         };
         best = Some(best.map_or(candidate, |b| b.min(candidate)));
     }
-    if best.is_some() || !subsequences {
+    if best.is_some() || !subsequences || ned.len() < MIN_SUBSEQUENCE_LEN {
         return best;
     }
-    subsequence(&hay, &ned).map(|(start, end)| MatchScore {
+    subsequence(hay, ned).map(|(start, end)| MatchScore {
         tier: Tier::Subsequence,
-        start,
         span: end - start,
+        start,
         len,
     })
 }
@@ -229,8 +255,24 @@ fn best_of(a: Option<MatchScore>, b: Option<MatchScore>) -> Option<MatchScore> {
     }
 }
 
-/// Scores a table against the needle on both its bare name and its
-/// schema-qualified `schema.name` form, keeping the better of the two.
+/// The strongest tier a *qualified* name may claim.
+///
+/// A qualifier — the schema in front of a table, the table in front of a
+/// column — is a **scope**, and narrowing to a scope is something you do by
+/// naming it, not by sharing letters with it. Anything weaker than a word
+/// boundary means the needle landed mid-word inside the qualifier, which is
+/// not a scope narrow: on Postgres, `ub`, `bl`, `ic`, `ubli`… are each a
+/// substring of `public` and would otherwise hand back that entire schema —
+/// the full unfiltered table list, at a tier *above* subsequence, with no cue
+/// as to why.
+///
+/// It cannot be tightened to `Prefix`: a schema's second word must still
+/// narrow, and `payroll` against `hr_payroll.runs` is a [`Tier::WordPrefix`].
+const MAX_QUALIFIED_TIER: Tier = Tier::WordPrefix;
+
+/// Scores an already-lowercased table name against the needle on both its
+/// bare form and its schema-qualified `schema.name` form, keeping the better
+/// of the two. `buf` is scratch, reused across calls.
 ///
 /// Both forms matter and neither subsumes the other: typing `public` has to
 /// narrow to that schema (only the qualified form matches), while typing
@@ -238,31 +280,49 @@ fn best_of(a: Option<MatchScore>, b: Option<MatchScore>) -> Option<MatchScore> {
 /// because the schema padded the name. The qualified form is longer, so the
 /// bare name wins any tie by [`MatchScore::len`].
 ///
-/// The qualified form is matched contiguously only: a schema is a *scope*, and
-/// narrowing to one is a prefix operation, not a fuzzy one (see
-/// [`score_with`]).
-pub fn score_table(schema: Option<&str>, name: &str, needle: &str) -> Option<MatchScore> {
-    let bare = score(name, needle);
-    let qualified =
-        schema.and_then(|schema| score_with(&format!("{schema}.{name}"), needle, false));
+/// The qualified form is matched contiguously *and* no weaker than
+/// [`MAX_QUALIFIED_TIER`].
+fn score_table_prepared(
+    schema: Option<&[char]>,
+    name: &[char],
+    needle: &[char],
+    buf: &mut Vec<char>,
+) -> Option<MatchScore> {
+    let bare = score_prepared(name, needle, true);
+    let qualified = match schema {
+        Some(schema) => {
+            qualify_into(buf, schema, name);
+            score_prepared(buf, needle, false).filter(|hit| hit.tier <= MAX_QUALIFIED_TIER)
+        }
+        None => None,
+    };
     best_of(bare, qualified)
 }
 
-/// Scores a column, qualified by its owning table rather than by its schema —
-/// `:col users.id` is the natural way to say "the id on users".
+/// Scores an already-lowercased column name, qualified by its owning table
+/// rather than by its schema — `:col users.id` is the natural way to say "the
+/// id on users". `buf` is scratch, reused across calls.
 ///
-/// Unlike [`score_table`], the qualified form is only tried when the needle
-/// actually contains a `.`. The asymmetry is deliberate: a schema is part of a
-/// table's identity and narrowing to one is a stated goal, but in column mode
-/// the table name is a *scope*, and an implicit one would make `:col stripe`
-/// dump every column of a table called `stripe_events` — turning a column
-/// search into table search with extra steps.
-fn score_column(table: &str, column: &str, needle: &str) -> Option<MatchScore> {
-    let bare = score(column, needle);
-    let qualified = needle
-        .contains('.')
-        .then(|| score_with(&format!("{table}.{column}"), needle, false))
-        .flatten();
+/// Unlike [`score_table_prepared`], the qualified form is only tried when the
+/// needle actually contains a `.`. The asymmetry is deliberate: a schema is
+/// part of a table's identity and narrowing to one is a stated goal, but in
+/// column mode the table name is a *scope* and nothing else, so it has to be
+/// asked for. Left implicit, `:col stripe` would dump every column of a table
+/// called `stripe_events` — a column search with extra steps.
+fn score_column_prepared(
+    table: &[char],
+    column: &[char],
+    needle: &[char],
+    dotted: bool,
+    buf: &mut Vec<char>,
+) -> Option<MatchScore> {
+    let bare = score_prepared(column, needle, true);
+    let qualified = if dotted {
+        qualify_into(buf, table, column);
+        score_prepared(buf, needle, false).filter(|hit| hit.tier <= MAX_QUALIFIED_TIER)
+    } else {
+        None
+    };
     best_of(bare, qualified)
 }
 
@@ -290,12 +350,22 @@ pub fn filter_tables(tables: &[TableMeta], query: &Query) -> Vec<TableHit> {
             })
             .collect();
     }
+    // Lowercased once, then reused for every candidate. Rebuilding it per
+    // haystack (~10k times per keystroke in column mode on a 300-table
+    // database) was the single biggest cost in the matcher.
+    let needle = lowercased(&query.needle);
+    let dotted = query.needle.contains('.');
+    // Scratch for the qualified forms, likewise reused rather than reallocated
+    // per candidate.
+    let mut buf: Vec<char> = Vec::new();
     let mut hits: Vec<(MatchScore, TableHit)> = Vec::new();
     for (index, table) in tables.iter().enumerate() {
+        let name = lowercased(&table.name);
         match query.mode {
             FilterMode::Tables => {
+                let schema = table.schema.as_deref().map(lowercased);
                 if let Some(score) =
-                    score_table(table.schema.as_deref(), &table.name, &query.needle)
+                    score_table_prepared(schema.as_deref(), &name, &needle, &mut buf)
                 {
                     hits.push((
                         score,
@@ -315,7 +385,10 @@ pub fn filter_tables(tables: &[TableMeta], query: &Query) -> Vec<TableHit> {
                 let mut columns = Vec::new();
                 let mut best = None;
                 for (position, column) in table.columns.iter().enumerate() {
-                    if let Some(score) = score_column(&table.name, &column.name, &query.needle) {
+                    let column_name = lowercased(&column.name);
+                    if let Some(score) =
+                        score_column_prepared(&name, &column_name, &needle, dotted, &mut buf)
+                    {
                         columns.push(position);
                         best = best_of(best, Some(score));
                     }
@@ -401,8 +474,9 @@ mod tests {
             .collect()
     }
 
+    /// The tier a bare (unqualified) name matches at, subsequences allowed.
     fn tier(haystack: &str, needle: &str) -> Option<Tier> {
-        score(haystack, needle).map(|s| s.tier)
+        score_prepared(&lowercased(haystack), &lowercased(needle), true).map(|s| s.tier)
     }
 
     #[test]
@@ -435,13 +509,37 @@ mod tests {
     #[test]
     fn prefix_matches_rank_before_later_ones() {
         let tables = [
-            table(None, "census", &["id"]),
-            table(None, "unit_specs", &["id"]),
-            table(None, "users", &["id"]),
+            table(None, "records", &["id"]),
+            table(None, "overdraft", &["id"]),
+            table(None, "orders", &["id"]),
         ];
-        // Prefix, then the mid-word substring, then the scattered
-        // subsequence last.
-        assert_eq!(ranked(&tables, "us"), ["users", "census", "unit_specs"]);
+        // Prefix, then the mid-word substring (rec-ORD-s), then the scattered
+        // subsequence last (O-ve-R-D-raft).
+        assert_eq!(ranked(&tables, "ord"), ["orders", "records", "overdraft"]);
+    }
+
+    #[test]
+    fn short_needles_never_fall_back_to_a_subsequence() {
+        // Two characters is all noise: on a real schema it roughly quadruples
+        // the result set with names nobody was reaching for. Three is where
+        // the fallback starts earning its place, and `usrol` — the case the
+        // feature exists for — is five.
+        assert_eq!(tier("unit_specs", "us"), None);
+        assert_eq!(tier("unit_specs", "uns"), Some(Tier::Subsequence));
+        // Contiguous matches are unaffected at any length.
+        assert_eq!(tier("census", "us"), Some(Tier::Substring));
+    }
+
+    #[test]
+    fn the_tightest_subsequence_wins_regardless_of_where_it_starts() {
+        // Within the subsequence tier the span *is* the quality of the match,
+        // so it has to outrank the start offset — otherwise a loose scatter
+        // that happens to begin early beats a tight run that begins late.
+        let tables = [
+            table(None, "alpha_beta_charlie", &["id"]),
+            table(None, "zz_a_b_c", &["id"]),
+        ];
+        assert_eq!(ranked(&tables, "abc"), ["zz_a_b_c", "alpha_beta_charlie"]);
     }
 
     #[test]
@@ -500,6 +598,40 @@ mod tests {
         assert_eq!(ranked(&tables, "us"), ["census"]);
         // The bare name still matches fuzzily.
         assert_eq!(ranked(&tables, "enrlm"), ["enrolments"]);
+    }
+
+    #[test]
+    fn a_schema_never_lends_its_letters_to_a_substring_match_either() {
+        // The other half of the same hole, found in review: closing the fuzzy
+        // route left the Substring tier live on the qualified name, so every
+        // fragment of "public" still handed back the whole schema — and at a
+        // tier *above* subsequence, so it wasn't even buried.
+        let tables = [
+            table(Some("public"), "tags", &["id"]),
+            table(Some("public"), "orders", &["id"]),
+            table(Some("public"), "line_items", &["id"]),
+        ];
+        for needle in ["ub", "bl", "ubli", "blic"] {
+            assert!(
+                ranked(&tables, needle).is_empty(),
+                "{needle:?} matched {:?}",
+                ranked(&tables, needle)
+            );
+        }
+        // A needle that really is in a table name still finds it.
+        assert_eq!(ranked(&tables, "li"), ["line_items"]);
+    }
+
+    #[test]
+    fn a_schemas_second_word_still_narrows() {
+        // Why the qualified cap is WordPrefix and not Prefix: "payroll" names
+        // the scope just as plainly as "hr_payroll" does.
+        let tables = [
+            table(Some("hr_payroll"), "runs", &["id"]),
+            table(Some("public"), "widgets", &["id"]),
+        ];
+        assert_eq!(ranked(&tables, "payroll"), ["runs"]);
+        assert_eq!(ranked(&tables, "hr_payroll"), ["runs"]);
     }
 
     #[test]
