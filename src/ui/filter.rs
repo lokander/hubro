@@ -764,4 +764,89 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn a_table_never_lends_its_letters_to_a_column_scope() {
+        // The same hole one level down: the table in front of a column is a
+        // scope too, so a mid-word hit inside it must not scope the search.
+        let tables = [
+            table(None, "invoices", &["id", "total"]),
+            table(None, "customers", &["id", "email"]),
+        ];
+        let scoped = |raw: &str| -> Vec<String> {
+            filter_tables(&tables, &parse_query(raw))
+                .iter()
+                .map(|hit| tables[hit.index].name.clone())
+                .collect()
+        };
+        // "voices" is a substring of "invoices" and names nothing.
+        assert!(
+            scoped(":col voices.id").is_empty(),
+            "{:?}",
+            scoped(":col voices.id")
+        );
+        assert!(
+            scoped(":col stomers.em").is_empty(),
+            "{:?}",
+            scoped(":col stomers.em")
+        );
+        // Naming the table, or one of its words, still scopes.
+        assert_eq!(scoped(":col invoices.id"), ["invoices"]);
+        assert_eq!(scoped(":col customers.em"), ["customers"]);
+    }
+
+    #[test]
+    fn only_the_subsequence_tier_has_a_span_of_its_own() {
+        // `MatchScore` orders `span` before `start`, which is only correct
+        // because every contiguous tier sets `span` to the needle length —
+        // making it constant within a tier, so it can't outrank `start`
+        // there. A future tier that computed its own span would silently
+        // change the ranking of every tier above it, and nothing else in the
+        // suite would notice.
+        let names = [
+            "users",
+            "user_roles",
+            "public.users",
+            "AuditLog",
+            "unit_specs",
+            "\u{e5}rsrapport",
+            "a.b.c",
+            "x",
+            "enrolments",
+            "zz_a_b_c",
+        ];
+        let needles = [
+            "u",
+            "us",
+            "user",
+            "abc",
+            "rol",
+            "\u{e5}",
+            "b",
+            "x",
+            "unit_specs",
+            "zzz",
+        ];
+        for name in names {
+            for needle in needles {
+                let ned = lowercased(needle);
+                for subsequences in [true, false] {
+                    let Some(hit) = score_prepared(&lowercased(name), &ned, subsequences) else {
+                        continue;
+                    };
+                    if hit.tier == Tier::Subsequence {
+                        continue;
+                    }
+                    assert_eq!(
+                        hit.span,
+                        ned.len(),
+                        "{name:?} / {needle:?} matched at {:?} with span {} != needle length {}",
+                        hit.tier,
+                        hit.span,
+                        ned.len()
+                    );
+                }
+            }
+        }
+    }
 }
