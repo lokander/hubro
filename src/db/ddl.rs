@@ -119,10 +119,23 @@ pub struct ColumnExtra {
     /// A clause that *replaces* the type and everything after it, for a
     /// column defined by an expression: SQL Server's `AS (expr) PERSISTED`.
     pub computed: Option<String>,
+    /// Whether a [`Self::computed`] column is persisted. T-SQL only accepts an
+    /// explicit `NOT NULL` on a *persisted* computed column — a virtual one
+    /// derives its nullability from the expression — so the renderer needs to
+    /// know which it is before it may write the nullability out.
+    pub computed_persisted: bool,
     /// A clause inserted after the type: an identity specification
     /// (`GENERATED ALWAYS AS IDENTITY`, `IDENTITY(1,1)`) or Postgres'
     /// `GENERATED ALWAYS AS (expr) STORED`.
     pub identity: Option<String>,
+    /// The default expression as the *catalog* renders it, overriding
+    /// `ColumnMeta::default`.
+    pub default: Option<String>,
+    /// The name of the default constraint, where the backend names them (SQL
+    /// Server does, and dropping a default is done by that name — including
+    /// the auto-generated `DF__tbl__col__…` form, which is only stable if it
+    /// is written out).
+    pub default_constraint: Option<String>,
 }
 
 /// Table facts beyond [`TableMeta`], gathered per object by the backend.
@@ -138,11 +151,16 @@ pub struct TableExtras {
     /// Complete table-level constraint clauses in catalog order, each a full
     /// body ready to place inside the parentheses (e.g.
     /// `CONSTRAINT "t_pkey" PRIMARY KEY ("id")`). Server-rendered where the
-    /// backend can (`pg_get_constraintdef`). When empty, the renderer falls
-    /// back to the primary key and foreign keys `TableMeta` carries — which
-    /// know nothing of check constraints or referential actions, hence the
-    /// caveats.
-    pub constraints: Vec<String>,
+    /// backend can (`pg_get_constraintdef`).
+    ///
+    /// `None` means the backend could **not read them**, which is emphatically
+    /// not the same as `Some(vec![])` — a table with no constraints at all is
+    /// the most common shape in any database. Only `None` falls back to the
+    /// primary key and foreign keys `TableMeta` carries, and only `None` adds
+    /// the "check constraints / referential actions are missing" caveats. A
+    /// caveat that fires when nothing is wrong teaches people to skim past the
+    /// ones that matter.
+    pub constraints: Option<Vec<String>>,
     /// Complete `CREATE INDEX` statements for the indexes that do not back a
     /// constraint (those are already in `constraints`), appended after the
     /// table.
@@ -178,6 +196,57 @@ fn qualified(schema: Option<&str>, name: &str) -> String {
     }
 }
 
+/// Adds the statement terminator that stored/generated definitions leave off.
+///
+/// The semicolon goes on its own line when the statement ends *inside* a `--`
+/// line comment — `sqlite_master` happily stores `CREATE INDEX … -- note`, and
+/// appending `;` to that line comments the terminator out. One unterminated
+/// statement then swallows the next one, and the whole output stops being
+/// runnable (FRE-108).
+pub fn terminate(sql: &str) -> String {
+    let trimmed = sql.trim_end();
+    if trimmed.ends_with(';') {
+        return trimmed.to_string();
+    }
+    if ends_inside_line_comment(trimmed) {
+        format!("{trimmed}\n;")
+    } else {
+        format!("{trimmed};")
+    }
+}
+
+/// Whether `sql` ends while a `--` line comment is still open. Scans string
+/// literals, quoted identifiers, and block comments so a `--` inside any of
+/// them doesn't count.
+fn ends_inside_line_comment(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                // A line comment runs to the newline; reaching the end without
+                // one means the statement ends inside it.
+                return !sql[i..].contains('\n');
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => match sql[i + 2..].find("*/") {
+                Some(end) => i += 2 + end + 2,
+                // Unterminated block comment: nothing can close it, so the
+                // terminator has to go on its own line either way.
+                None => return true,
+            },
+            quote @ (b'\'' | b'"' | b'`') => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += 1;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
 /// Wraps a native view body (`pg_get_viewdef`) in the `CREATE VIEW` header
 /// the server does not return. Only Postgres needs this: SQLite and SQL
 /// Server both store the complete original statement.
@@ -189,9 +258,7 @@ pub fn create_view_sql(table: &TableMeta, body: &str) -> String {
     let name = qualified(table.schema.as_deref(), &table.name);
     // pg_get_viewdef(…, true) pretty-prints and terminates with a semicolon
     // already; anything else gets one so the statement is runnable.
-    let body = body.trim_end();
-    let terminator = if body.ends_with(';') { "" } else { ";" };
-    format!("{keyword} {name} AS\n{body}{terminator}")
+    format!("{keyword} {name} AS\n{}", terminate(body))
 }
 
 /// Renders `CREATE TABLE` from `table` plus whatever `extras` the backend
@@ -203,10 +270,9 @@ pub fn create_table_sql(dialect: Dialect, table: &TableMeta, extras: &TableExtra
         let extra = extras.columns.get(&column.name);
         items.push(column_clause(dialect, column, extra));
     }
-    if extras.constraints.is_empty() {
-        items.extend(fallback_constraints(table));
-    } else {
-        items.extend(extras.constraints.iter().cloned());
+    match &extras.constraints {
+        Some(constraints) => items.extend(constraints.iter().cloned()),
+        None => items.extend(fallback_constraints(table)),
     }
 
     let mut sql = format!(
@@ -216,16 +282,14 @@ pub fn create_table_sql(dialect: Dialect, table: &TableMeta, extras: &TableExtra
     );
     for index in &extras.indexes {
         sql.push_str("\n\n");
-        sql.push_str(index.trim_end());
-        if !index.trim_end().ends_with(';') {
-            sql.push(';');
-        }
+        sql.push_str(&terminate(index));
     }
 
     let mut caveats = extras.caveats.clone();
-    if extras.constraints.is_empty() {
-        // The metadata fallback: TableMeta carries a primary key and the
-        // foreign-key column pairs, and nothing else about constraints.
+    if extras.constraints.is_none() {
+        // The metadata fallback — reached only when the catalog read failed.
+        // TableMeta carries a primary key and the foreign-key column pairs,
+        // and nothing else about constraints.
         caveats.push("check constraints".into());
         caveats.push("unique constraints".into());
         caveats.push("foreign-key ON DELETE / ON UPDATE actions".into());
@@ -237,10 +301,10 @@ pub fn create_table_sql(dialect: Dialect, table: &TableMeta, extras: &TableExtra
 /// One column's line inside `CREATE TABLE`.
 ///
 /// A computed/generated column defined by an expression replaces the type and
-/// everything after it (that is the SQL Server grammar, and Postgres' stored
-/// generated columns arrive through `identity` instead). Otherwise the order
-/// is type, collation, identity, default, nullability — accepted by both
-/// dialects that reach this function.
+/// everything after it (that is the SQL Server grammar; Postgres' generated
+/// columns arrive through `identity` instead). Otherwise the order is type,
+/// collation, identity, default, nullability — accepted by both dialects that
+/// reach this function.
 ///
 /// Primary keys are deliberately *not* rendered inline, even for a
 /// single-column key: they arrive as a table-level clause from the catalog
@@ -253,7 +317,15 @@ fn column_clause(
 ) -> String {
     let name = quote_ident(&column.name);
     if let Some(computed) = extra.and_then(|e| e.computed.as_deref()) {
-        return format!("{name} {computed}");
+        let mut clause = format!("{name} {computed}");
+        // A persisted computed column carries its own nullability and T-SQL
+        // accepts it here; dropping it would turn `NOT NULL` into nullable.
+        // A non-persisted one derives nullability from the expression and
+        // rejects an explicit `NOT NULL`.
+        if extra.is_some_and(|e| e.computed_persisted) && !column.nullable {
+            clause.push_str(" NOT NULL");
+        }
+        return clause;
     }
     let type_name = extra
         .and_then(|e| e.type_name.clone())
@@ -269,13 +341,23 @@ fn column_clause(
         };
         clause.push_str(&format!(" COLLATE {rendered}"));
     }
+    // The catalog's own default expression wins over the browsable metadata's
+    // (it may carry the constraint name); either way an identity column has no
+    // literal default, so the two are mutually exclusive on both dialects.
+    let default = extra
+        .and_then(|e| e.default.as_ref())
+        .or(column.default.as_ref());
     if let Some(identity) = extra.and_then(|e| e.identity.as_deref()) {
         clause.push(' ');
         clause.push_str(identity);
-    } else if let Some(default) = &column.default {
-        // An identity column has no literal default; the two are mutually
-        // exclusive on both dialects.
-        clause.push_str(&format!(" DEFAULT {default}"));
+    } else if let Some(default) = default {
+        match extra.and_then(|e| e.default_constraint.as_deref()) {
+            Some(name) => clause.push_str(&format!(
+                " CONSTRAINT {} DEFAULT {default}",
+                quote_ident(name)
+            )),
+            None => clause.push_str(&format!(" DEFAULT {default}")),
+        }
     }
     if !column.nullable {
         clause.push_str(" NOT NULL");
@@ -428,7 +510,7 @@ mod tests {
         name.default = Some("'anon'::text".into());
         let meta = table(Some("public"), "person", vec![id, name]);
         let mut extras = TableExtras {
-            constraints: vec![r#"CONSTRAINT "person_pkey" PRIMARY KEY ("id")"#.into()],
+            constraints: Some(vec![r#"CONSTRAINT "person_pkey" PRIMARY KEY ("id")"#.into()]),
             indexes: vec![
                 "CREATE INDEX person_name_idx ON public.person USING btree (name)".into(),
             ],
@@ -473,12 +555,16 @@ mod tests {
     fn sqlserver_table_renders_identity_computed_and_unquoted_collations() {
         let mut id = column("id", "int", false);
         id.primary_key_position = Some(1);
-        let mut note = column("note", "nvarchar(50)", true);
-        note.default = Some("N'hi'".into());
-        let total = column("total", "int", true);
-        let meta = table(Some("dbo"), "orders", vec![id, note, total]);
+        let note = column("note", "nvarchar(50)", true);
+        // Persisted and NOT NULL: T-SQL accepts the nullability here and the
+        // column is a different column without it (FRE-108 review).
+        let total = column("total", "int", false);
+        let loose = column("loose", "int", false);
+        let meta = table(Some("dbo"), "orders", vec![id, note, total, loose]);
         let mut extras = TableExtras {
-            constraints: vec![r#"CONSTRAINT "PK_orders" PRIMARY KEY CLUSTERED ("id" ASC)"#.into()],
+            constraints: Some(vec![
+                r#"CONSTRAINT "PK_orders" PRIMARY KEY CLUSTERED ("id" ASC)"#.into(),
+            ]),
             ..TableExtras::default()
         };
         extras.columns.insert(
@@ -492,6 +578,8 @@ mod tests {
             "note".into(),
             ColumnExtra {
                 collation: Some("Latin1_General_CI_AS".into()),
+                default: Some("N'hi'".into()),
+                default_constraint: Some("DF_orders_note".into()),
                 ..ColumnExtra::default()
             },
         );
@@ -499,6 +587,16 @@ mod tests {
             "total".into(),
             ColumnExtra {
                 computed: Some("AS ([id]*(2)) PERSISTED".into()),
+                computed_persisted: true,
+                ..ColumnExtra::default()
+            },
+        );
+        // A non-persisted computed column derives its nullability from the
+        // expression and rejects an explicit NOT NULL, so none is written.
+        extras.columns.insert(
+            "loose".into(),
+            ColumnExtra {
+                computed: Some("AS ([id]*(3))".into()),
                 ..ColumnExtra::default()
             },
         );
@@ -508,13 +606,82 @@ mod tests {
             concat!(
                 "CREATE TABLE \"dbo\".\"orders\" (\n",
                 "    \"id\" int IDENTITY(1,1) NOT NULL,\n",
-                // T-SQL collation names are keywords, never quoted.
-                "    \"note\" nvarchar(50) COLLATE Latin1_General_CI_AS DEFAULT N'hi',\n",
+                // T-SQL collation names are keywords, never quoted; the
+                // default keeps the name you would need to drop it by.
+                "    \"note\" nvarchar(50) COLLATE Latin1_General_CI_AS \
+                 CONSTRAINT \"DF_orders_note\" DEFAULT N'hi',\n",
                 // A computed column replaces the type entirely.
-                "    \"total\" AS ([id]*(2)) PERSISTED,\n",
+                "    \"total\" AS ([id]*(2)) PERSISTED NOT NULL,\n",
+                "    \"loose\" AS ([id]*(3)),\n",
                 "    CONSTRAINT \"PK_orders\" PRIMARY KEY CLUSTERED (\"id\" ASC)\n",
                 ");"
             )
+        );
+    }
+
+    #[test]
+    fn a_table_with_no_constraints_gets_no_constraint_caveats() {
+        // A successful read that found nothing must not look like a failed
+        // read: false "not reproduced" entries on the commonest table shape in
+        // a database train people to skim past the ones that matter.
+        let meta = table(
+            Some("public"),
+            "plain",
+            vec![column("a", "integer", true), column("b", "text", true)],
+        );
+        let extras = TableExtras {
+            constraints: Some(Vec::new()),
+            caveats: vec!["triggers".into()],
+            ..TableExtras::default()
+        };
+        let ddl = create_table_sql(Dialect::Postgres, &meta, &extras);
+        assert_eq!(
+            ddl.sql,
+            "CREATE TABLE \"public\".\"plain\" (\n    \"a\" integer,\n    \"b\" text\n);"
+        );
+        assert_eq!(ddl.caveats, ["triggers"]);
+        assert!(!ddl.text().contains("check constraints"));
+    }
+
+    #[test]
+    fn terminate_keeps_a_trailing_line_comment_from_eating_the_semicolon() {
+        assert_eq!(
+            terminate("CREATE INDEX i ON t(a)"),
+            "CREATE INDEX i ON t(a);"
+        );
+        assert_eq!(
+            terminate("CREATE INDEX i ON t(a);\n"),
+            "CREATE INDEX i ON t(a);"
+        );
+        // `sqlite_master` stores the statement as written, comment and all;
+        // appending `;` to that last line would comment the terminator out and
+        // silently swallow whatever statement follows.
+        assert_eq!(
+            terminate("CREATE INDEX i ON t(a) -- note"),
+            "CREATE INDEX i ON t(a) -- note\n;"
+        );
+        // A closed comment, or one inside a literal/identifier, is not open at
+        // the end and needs no special treatment.
+        assert_eq!(
+            terminate("CREATE INDEX i -- note\n ON t(a)"),
+            "CREATE INDEX i -- note\n ON t(a);"
+        );
+        assert_eq!(
+            terminate("CREATE TABLE t (a TEXT DEFAULT '-- not a comment')"),
+            "CREATE TABLE t (a TEXT DEFAULT '-- not a comment');"
+        );
+        assert_eq!(
+            terminate("CREATE TABLE t (\"a -- b\" TEXT)"),
+            "CREATE TABLE t (\"a -- b\" TEXT);"
+        );
+        // Doubled quotes inside a literal keep the scanner in step.
+        assert_eq!(
+            terminate("CREATE TABLE t (a TEXT DEFAULT 'O''Brien') /* tail */"),
+            "CREATE TABLE t (a TEXT DEFAULT 'O''Brien') /* tail */;"
+        );
+        assert_eq!(
+            terminate("CREATE TABLE t (a) /* unclosed"),
+            "CREATE TABLE t (a) /* unclosed\n;"
         );
     }
 
@@ -530,7 +697,10 @@ mod tests {
             referenced_table: "person".into(),
             referenced_columns: vec![Some("id".into())],
         });
+        // `constraints: None` — the catalog read failed, which is what makes
+        // the fallback (and its caveats) correct here.
         let ddl = create_table_sql(Dialect::Postgres, &meta, &TableExtras::default());
+        assert!(TableExtras::default().constraints.is_none());
         assert_eq!(
             ddl.sql,
             concat!(
