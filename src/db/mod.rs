@@ -7,6 +7,7 @@
 //! resulting values in signals — never hold a signal borrow across an await.
 
 mod caps;
+mod ddl;
 mod error;
 mod export;
 mod fk;
@@ -25,6 +26,7 @@ pub use caps::{
     Capabilities, Restriction, TableAccess, CONNECTION_READ_ONLY, NO_DDL, NO_MUTATE,
     NO_OFFSET_PAGING, NO_QUERY,
 };
+pub use ddl::{Ddl, DdlObject, DdlSource};
 pub use error::DbError;
 pub use export::{write_result, ExportFormat};
 pub use fk::{build_fk_filter, resolve_referenced_column};

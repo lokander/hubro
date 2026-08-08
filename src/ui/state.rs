@@ -15,8 +15,8 @@ use crate::db::{
     apply_staged, build_fk_filter, mssql_url_target, mssql_url_via_local_port,
     mssql_url_with_password, needs_confirmation, run_script, script_refusal, split_statements,
     statement_preview, url_target, url_via_local_port, url_with_password, write_result, CellFetch,
-    ConnectionId, ConnectionRegistry, DbError, DbPool, ExportFormat, Filter, ForeignKeyMeta,
-    MssqlAuth, QueryResult, RowLocator, StatementResult, TableMeta, Value,
+    ConnectionId, ConnectionRegistry, DbError, DbPool, Ddl, DdlObject, ExportFormat, Filter,
+    ForeignKeyMeta, MssqlAuth, QueryResult, RowLocator, StatementResult, TableMeta, Value,
 };
 use crate::history::HistoryStore;
 use crate::tunnel::{HostKeyInfo, Tunnel, TunnelAuth, TunnelConfig, TunnelError};
@@ -2436,6 +2436,33 @@ impl AppState {
             return Err("this table has no usable row identity".into());
         };
         pool.fetch_cell(&meta, &identity, &locator, &column)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// DDL for one of a table's objects (FRE-108): the table/view itself, or
+    /// one of its indexes. Same shape as [`Self::load_cell`] — the pool and
+    /// metadata are cloned out of the signals before the await. No capability
+    /// gate: reading a definition is a pure read, so a read-only connection
+    /// shows DDL like any other.
+    pub async fn load_ddl(
+        self,
+        id: ConnectionId,
+        table: TableRef,
+        object: DdlObject,
+    ) -> Result<Ddl, String> {
+        let pool = self.registry.read().get(id).map(|c| c.pool.clone());
+        let meta = self.schemas.read().get(&id).and_then(|load| match load {
+            SchemaLoad::Ready(tables) => tables
+                .iter()
+                .find(|t| t.name == table.name && t.schema == table.schema)
+                .cloned(),
+            _ => None,
+        });
+        let (Some(pool), Some(meta)) = (pool, meta) else {
+            return Err("connection or schema no longer available".into());
+        };
+        pool.fetch_ddl(&meta, &object)
             .await
             .map_err(|e| e.to_string())
     }
