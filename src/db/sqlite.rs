@@ -44,9 +44,12 @@ pub async fn open_sqlite(path: &Path) -> Result<SqlitePool, DbError> {
 }
 
 /// Runs an arbitrary query, decoding every cell into the backend-neutral
-/// [`Value`] model.
+/// [`Value`] model. Free-form SQL whose result is shown to the user, so a
+/// zero-row result recovers its headers (FRE-138).
 pub async fn query(pool: &SqlitePool, sql: &str) -> Result<QueryResult, DbError> {
-    query_with(pool, sql, &[]).await
+    let mut result = query_with(pool, sql, &[]).await?;
+    sqlx_common::fill_headers(&mut result, pool, sql).await;
+    Ok(result)
 }
 
 /// Maps a driver error onto [`DbError::Query`]. sqlx 0.8 does not expose
@@ -126,15 +129,22 @@ fn bind_params<'q>(mut query: SqliteQuery<'q>, params: &[Value]) -> SqliteQuery<
 
 /// Like [`query`], with bound parameters (used by the paged table reader so
 /// filter values never touch the SQL text).
+///
+/// No header recovery on a zero-row result here, unlike [`query`] and
+/// [`query_capped`]: every caller of this builds its own projection (a page
+/// fetch, a cell fetch, a catalog read for DDL) and so already knows the
+/// columns, and nothing downstream reads them off the result. Describing the
+/// statement to fill in headers no one looks at would put an extra round trip
+/// on each of those — two on Postgres, whose `describe` also issues a
+/// `pg_attribute` query — and empty catalog reads are ordinary (a table with
+/// no table-level constraints, no non-constraint indexes).
 pub async fn query_with(
     pool: &SqlitePool,
     sql: &str,
     params: &[Value],
 ) -> Result<QueryResult, DbError> {
     let stream = bind_params(sqlx::query(sql), params).fetch(pool);
-    let mut result = sqlx_common::collect_all(stream, decode_value, query_error).await?;
-    sqlx_common::fill_headers(&mut result, pool, sql).await;
-    Ok(result)
+    sqlx_common::collect_all(stream, decode_value, query_error).await
 }
 
 /// Streams `sql` one row at a time (`fetch`, not `fetch_all`), decoding and

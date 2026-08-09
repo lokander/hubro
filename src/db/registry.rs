@@ -222,10 +222,15 @@ impl DbPool {
         TableAccess::resolve(self.backend_capabilities(), table, self.dialect())
     }
 
+    /// Runs a free-form read query, buffered. A zero-row result still carries
+    /// its column headers (FRE-138) — this is a user-facing result set, unlike
+    /// the projection-built reads behind [`Self::query_with`].
     pub async fn query(&self, sql: &str) -> Result<QueryResult, DbError> {
         match self {
             DbPool::Sqlite(pool) => sqlite::query(pool, sql).await,
-            DbPool::Postgres(pool) => postgres::query_with(pool, sql, &[]).await,
+            DbPool::Postgres(pool) => postgres::query(pool, sql).await,
+            // TDS reports result-set metadata for zero rows, so this backend
+            // needs no separate entry point to hold the same contract.
             DbPool::SqlServer(pool) => sqlserver::query_with(pool, sql, &[]).await,
         }
     }
