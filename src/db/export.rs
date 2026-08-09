@@ -405,6 +405,33 @@ mod tests {
     }
 
     #[test]
+    fn csv_puts_the_hardening_apostrophe_inside_the_quotes() {
+        // A cell that is both formula-hardened and RFC-4180-quoted: the
+        // apostrophe goes inside the quotes, before the formula character —
+        // exactly where quoting the hardened copy used to put it.
+        let r = result(
+            &["a", "b"],
+            vec![vec![
+                Value::Text("=a,b".into()),
+                Value::Text("+say \"hi\"".into()),
+            ]],
+        );
+        assert_eq!(
+            to_string(&r, ExportFormat::Csv),
+            "a,b\n\"'=a,b\",\"'+say \"\"hi\"\"\"\n"
+        );
+    }
+
+    #[test]
+    fn csv_doubles_quotes_inside_multi_byte_text() {
+        // A quote flanked by multi-byte UTF-8: the quote-doubling walk slices
+        // the string around the quote, so its split points must land on char
+        // boundaries and keep the CJK bytes verbatim.
+        let r = result(&["s"], vec![vec![Value::Text("世\"界".into())]]);
+        assert_eq!(to_string(&r, ExportFormat::Csv), "s\n\"世\"\"界\"\n");
+    }
+
+    #[test]
     fn json_keeps_formula_prefixes_verbatim() {
         let r = result(&["x"], vec![vec![Value::Text("=1+1".into())]]);
         assert_eq!(
