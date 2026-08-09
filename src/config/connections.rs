@@ -1,10 +1,15 @@
-//! Persistence for the saved-connections list (XDG config dir, TOML).
+//! The saved-connections list: `$XDG_CONFIG_HOME/hubro/connections.toml`.
+//!
+//! Error policy: **strict**. A malformed file is an error, never silently
+//! dropped — this file is user data (the list of their databases), and
+//! [`SavedList`] refuses to persist over a file that failed to load so a
+//! parse error can't turn into data loss on the next save.
 
-use std::fmt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::{write_toml_atomic, ConfigError};
 use crate::azure::EntraAuth;
 use crate::db::{Dialect, WriteProtection};
 use crate::tunnel::TunnelConfig;
@@ -70,21 +75,28 @@ impl ConnectionColor {
 /// How a server connection (Postgres, FRE-43; SQL Server, FRE-58)
 /// authenticates. `Password` (the default) resolves a password from session
 /// memory / the keyring / a prompt; `Entra` acquires a Microsoft Entra ID
-/// access token and uses it in place of the password. (Named for the backend
-/// it landed on first; the shape is backend-neutral.)
+/// access token and uses it in place of the password.
+///
+/// Serialized by contents (the `kind = "entra"` tag), so the type's Rust
+/// name never reaches the TOML — renaming it from `PgAuth` (the backend it
+/// landed on first) was on-disk-safe.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
-pub enum PgAuth {
+pub enum ServerAuth {
     #[default]
     Password,
     Entra(EntraAuth),
 }
 
-impl PgAuth {
+/// Deprecated alias for [`ServerAuth`], kept so existing callers compile
+/// unchanged while they migrate; new code should say `ServerAuth`.
+pub use self::ServerAuth as PgAuth;
+
+impl ServerAuth {
     /// Whether this is the default password mode — lets the config skip writing
     /// an `[…auth]` key for ordinary connections (back-compat).
     pub fn is_password(&self) -> bool {
-        matches!(self, PgAuth::Password)
+        matches!(self, ServerAuth::Password)
     }
 }
 
@@ -126,8 +138,8 @@ pub enum SavedConnection {
         /// Authentication mode (FRE-43). `default` + `skip_serializing_if` keep
         /// ordinary password connections' TOML unchanged, and pre-Entra config
         /// files (no `auth` key) deserialize as `Password`.
-        #[serde(default, skip_serializing_if = "PgAuth::is_password")]
-        auth: PgAuth,
+        #[serde(default, skip_serializing_if = "ServerAuth::is_password")]
+        auth: ServerAuth,
         /// Write protection (FRE-111); see the `Sqlite` variant.
         #[serde(default, skip_serializing_if = "WriteProtection::is_open")]
         protection: WriteProtection,
@@ -149,8 +161,8 @@ pub enum SavedConnection {
         tunnel: Option<TunnelConfig>,
         /// Authentication mode (FRE-58), stored exactly like the Postgres
         /// one; a missing `auth` key deserializes as `Password`.
-        #[serde(default, skip_serializing_if = "PgAuth::is_password")]
-        auth: PgAuth,
+        #[serde(default, skip_serializing_if = "ServerAuth::is_password")]
+        auth: ServerAuth,
         /// Write protection (FRE-111); see the `Sqlite` variant.
         #[serde(default, skip_serializing_if = "WriteProtection::is_open")]
         protection: WriteProtection,
@@ -273,17 +285,6 @@ impl SavedConnection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigError(pub String);
-
-impl fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "config error: {}", self.0)
-    }
-}
-
-impl std::error::Error for ConfigError {}
-
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ConnectionsFile {
     #[serde(default)]
@@ -314,337 +315,7 @@ pub fn save_connections(path: &Path, connections: &[SavedConnection]) -> Result<
     let file = ConnectionsFile {
         connections: connections.to_vec(),
     };
-    let text = toml::to_string_pretty(&file).map_err(|err| ConfigError(err.to_string()))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| ConfigError(format!("creating {}: {err}", parent.display())))?;
-    }
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, text)
-        .map_err(|err| ConfigError(format!("writing {}: {err}", tmp.display())))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|err| ConfigError(format!("replacing {}: {err}", path.display())))
-}
-
-/// Which theme the app uses. `System` follows the OS preference; `Light`
-/// and `Dark` are manual overrides. Serialized lowercase in settings.toml.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Theme {
-    #[default]
-    System,
-    Light,
-    Dark,
-}
-
-impl Theme {
-    /// Resolves to a concrete dark/light choice: `System` defers to the OS
-    /// preference, explicit choices ignore it.
-    pub fn resolve_dark(self, system_prefers_dark: bool) -> bool {
-        match self {
-            Theme::System => system_prefers_dark,
-            Theme::Light => false,
-            Theme::Dark => true,
-        }
-    }
-
-    /// Cycles System → Light → Dark → System for the toggle control.
-    pub fn next(self) -> Theme {
-        match self {
-            Theme::System => Theme::Light,
-            Theme::Light => Theme::Dark,
-            Theme::Dark => Theme::System,
-        }
-    }
-
-    /// Short label for the toggle control.
-    pub fn label(self) -> &'static str {
-        match self {
-            Theme::System => "System",
-            Theme::Light => "Light",
-            Theme::Dark => "Dark",
-        }
-    }
-}
-
-/// Sensible bounds so a corrupt (or hand-edited) geometry can never produce
-/// an unusable window: a sub-minimum or non-finite size falls back to the
-/// launch default, and a wildly out-of-range position is dropped.
-pub const MIN_WINDOW_WIDTH: f64 = 480.0;
-pub const MIN_WINDOW_HEIGHT: f64 = 360.0;
-pub const MAX_WINDOW_DIM: f64 = 16_384.0;
-/// Launch size used when no geometry is saved (the historical hard-coded
-/// WindowBuilder size).
-pub const DEFAULT_WINDOW_WIDTH: f64 = 1200.0;
-pub const DEFAULT_WINDOW_HEIGHT: f64 = 800.0;
-
-/// Persisted window size/position, in logical (scale-factor-independent)
-/// pixels so a display move between monitors of different DPI restores sanely.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct WindowGeometry {
-    pub width: f64,
-    pub height: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub x: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub y: Option<f64>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub maximized: bool,
-}
-
-impl Default for WindowGeometry {
-    fn default() -> Self {
-        WindowGeometry {
-            width: DEFAULT_WINDOW_WIDTH,
-            height: DEFAULT_WINDOW_HEIGHT,
-            x: None,
-            y: None,
-            maximized: false,
-        }
-    }
-}
-
-impl WindowGeometry {
-    /// Clamps to sane bounds, always yielding a usable geometry: a
-    /// sub-minimum, huge, or non-finite size falls back into
-    /// `[MIN, MAX]` (a corrupt tiny/negative size can't make an unusable
-    /// window), and a non-finite or wildly out-of-range position is dropped
-    /// so the OS/WM places the window instead.
-    pub fn sanitized(self) -> Self {
-        let width = if self.width.is_finite() {
-            self.width.clamp(MIN_WINDOW_WIDTH, MAX_WINDOW_DIM)
-        } else {
-            DEFAULT_WINDOW_WIDTH
-        };
-        let height = if self.height.is_finite() {
-            self.height.clamp(MIN_WINDOW_HEIGHT, MAX_WINDOW_DIM)
-        } else {
-            DEFAULT_WINDOW_HEIGHT
-        };
-        let clean = |v: Option<f64>| v.filter(|p| p.is_finite() && p.abs() <= MAX_WINDOW_DIM);
-        WindowGeometry {
-            width,
-            height,
-            x: clean(self.x),
-            y: clean(self.y),
-            maximized: self.maximized,
-        }
-    }
-}
-
-/// User preferences, persisted separately from the connections list so a
-/// corrupt settings file never blocks connecting to databases.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct Settings {
-    #[serde(default)]
-    pub theme: Theme,
-    /// Last window size/position (FRE-30). `None` until the window is first
-    /// resized/moved; on launch a missing value means "use the default size".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub window: Option<WindowGeometry>,
-    /// Whether the schema sidebar lists the objects a backend declared
-    /// internal — extension schemas and tables, child partitions (FRE-88).
-    /// Off by default: on a Timescale database they outnumber the user's
-    /// tables roughly twenty to one. `default` + `skip_serializing_if` keep
-    /// pre-FRE-88 settings files deserializing and unchanged on rewrite.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub show_internal_objects: bool,
-}
-
-/// `skip_serializing_if` predicate for `bool` fields defaulting to `false`.
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
-/// Default location: `$XDG_CONFIG_HOME/hubro/settings.toml`.
-pub fn default_settings_path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("hubro").join("settings.toml"))
-}
-
-/// Loads settings. A missing *or* malformed file yields defaults — these are
-/// non-critical UI preferences, so (unlike the connections list) a bad file
-/// never surfaces an error or blocks the app; the user just gets defaults.
-pub fn load_settings(path: &Path) -> Settings {
-    match std::fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text).unwrap_or_default(),
-        Err(_) => Settings::default(),
-    }
-}
-
-/// Persists settings, creating parent dirs and writing via a temp file +
-/// rename so a crash mid-write can't corrupt the file.
-pub fn save_settings(path: &Path, settings: &Settings) -> Result<(), ConfigError> {
-    let text = toml::to_string_pretty(settings).map_err(|err| ConfigError(err.to_string()))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| ConfigError(format!("creating {}: {err}", parent.display())))?;
-    }
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, text)
-        .map_err(|err| ConfigError(format!("writing {}: {err}", tmp.display())))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|err| ConfigError(format!("replacing {}: {err}", path.display())))
-}
-
-/// Persists just the theme, preserving the rest of the settings file (window
-/// geometry). Loads the current file first so a concurrent field isn't lost —
-/// theme and window geometry are written from different code paths.
-pub fn save_theme(path: &Path, theme: Theme) -> Result<(), ConfigError> {
-    let mut settings = load_settings(path);
-    settings.theme = theme;
-    save_settings(path, &settings)
-}
-
-/// Persists just the internal-object visibility (FRE-88), preserving the
-/// rest (see [`save_theme`] for why the file is re-read first).
-pub fn save_show_internal_objects(path: &Path, show: bool) -> Result<(), ConfigError> {
-    let mut settings = load_settings(path);
-    settings.show_internal_objects = show;
-    save_settings(path, &settings)
-}
-
-/// Persists just the window geometry, preserving the theme (see
-/// [`save_theme`] for why the file is re-read first).
-pub fn save_window_geometry(path: &Path, geometry: WindowGeometry) -> Result<(), ConfigError> {
-    let mut settings = load_settings(path);
-    settings.window = Some(geometry);
-    save_settings(path, &settings)
-}
-
-/// Which pane a restored tab shows. Mirrors `ui::state::Pane`, but kept here
-/// so the config layer never depends on the UI; serialized lowercase.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SessionPane {
-    #[default]
-    Browser,
-    Sql,
-    /// The schema pane (FRE-69).
-    Schema,
-}
-
-/// Deserializes a [`SessionPane`], treating anything this build doesn't
-/// recognize as the default rather than failing the whole session.
-///
-/// Deliberately re-uses the derived impl rather than matching the variant
-/// names by hand: a hand-written map would compile happily after a new
-/// variant is added and silently read it back as the default, which is the
-/// exact failure this helper exists to prevent.
-fn pane_or_default<'de, D>(deserializer: D) -> Result<SessionPane, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::IntoDeserializer;
-    let raw = String::deserialize(deserializer)?;
-    let by_name: serde::de::value::StringDeserializer<serde::de::value::Error> =
-        raw.into_deserializer();
-    Ok(SessionPane::deserialize(by_name).unwrap_or_default())
-}
-
-/// One open connection tab, remembered for the next launch.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct SessionTab {
-    /// Open-locator (canonical SQLite path or Postgres URL) — matched against
-    /// the saved-connections list at restore time.
-    pub locator: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selected_schema: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selected_table: Option<String>,
-    /// Tolerant of values this build doesn't know: serde treats an unknown
-    /// enum variant as a hard error, and [`load_session`] discards the whole
-    /// session on any parse failure — so a build that predates a new pane
-    /// would silently drop every restored tab, not just the pane. Unknown
-    /// values fall back to the default instead (FRE-69).
-    #[serde(default, deserialize_with = "pane_or_default")]
-    pub pane: SessionPane,
-    /// Whether the row detail panel was docked open beside the grid
-    /// (FRE-109). `default` + `skip_serializing_if` keep sessions written
-    /// before it existed loading, and leave a tab that never opened it
-    /// serializing exactly as before.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub row_detail: bool,
-}
-
-/// The last session (FRE-30): open tabs in order, plus which one was active.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct Session {
-    #[serde(default)]
-    pub tabs: Vec<SessionTab>,
-    /// Locator of the active tab, or `None` for the connections screen.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active: Option<String>,
-}
-
-/// Default location: `$XDG_CONFIG_HOME/hubro/session.toml`. Kept separate
-/// from `settings.toml` because it is transient, churns often, and is fine to
-/// lose — whereas a corrupt settings file must not take user preferences with
-/// it.
-pub fn default_session_path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("hubro").join("session.toml"))
-}
-
-/// Loads the last session. A missing *or* malformed file yields an empty
-/// session (never an error): restore is best-effort and must never block or
-/// crash startup.
-pub fn load_session(path: &Path) -> Session {
-    match std::fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text).unwrap_or_default(),
-        Err(_) => Session::default(),
-    }
-}
-
-/// Persists the session, creating parent dirs and writing via a temp file +
-/// rename so a crash mid-write can't corrupt it.
-pub fn save_session(path: &Path, session: &Session) -> Result<(), ConfigError> {
-    let text = toml::to_string_pretty(session).map_err(|err| ConfigError(err.to_string()))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| ConfigError(format!("creating {}: {err}", parent.display())))?;
-    }
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, text)
-        .map_err(|err| ConfigError(format!("writing {}: {err}", tmp.display())))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|err| ConfigError(format!("replacing {}: {err}", path.display())))
-}
-
-/// A saved connection reduced to what session-restore planning needs: its
-/// open-locator (canonical) form and which backend it targets.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RestoreCandidate {
-    pub locator: String,
-    pub backend: BackendKind,
-}
-
-/// Decides which remembered tabs to auto-reopen (pure, so it is unit-testable
-/// without a database or keyring).
-///
-/// A tab is reopened only when its locator still matches a saved connection —
-/// ad-hoc connections the user never saved are not resurrected. SQLite
-/// reconnects unconditionally; server backends (Postgres, SQL Server)
-/// reconnect only when a password is available (`password_available`: session
-/// memory or keyring), so startup never pops a wall of password prompts.
-/// Session order (and any duplicates) is preserved.
-pub fn plan_session_restore(
-    tabs: &[SessionTab],
-    candidates: &[RestoreCandidate],
-    password_available: impl Fn(&str) -> bool,
-) -> Vec<SessionTab> {
-    tabs.iter()
-        .filter(
-            |tab| match candidates.iter().find(|c| c.locator == tab.locator) {
-                None => false,
-                Some(c) => match c.backend {
-                    BackendKind::Postgres | BackendKind::SqlServer => {
-                        password_available(&tab.locator)
-                    }
-                    BackendKind::Sqlite => true,
-                },
-            },
-        )
-        .cloned()
-        .collect()
+    write_toml_atomic(path, &file)
 }
 
 /// The saved-connections list plus the load outcome. Mutations go through
@@ -875,7 +546,7 @@ mod tests {
             name: name.into(),
             url: url.into(),
             tunnel: None,
-            auth: PgAuth::Password,
+            auth: ServerAuth::Password,
             protection: WriteProtection::Open,
             color: None,
         }
@@ -886,7 +557,7 @@ mod tests {
             name: name.into(),
             url: url.into(),
             tunnel: None,
-            auth: PgAuth::Password,
+            auth: ServerAuth::Password,
             protection: WriteProtection::Open,
             color: None,
         }
@@ -1156,7 +827,7 @@ mod tests {
             name: "prod".into(),
             url: "postgres://u@h:5432/d".into(),
             tunnel: Some(tunnel(crate::tunnel::TunnelAuth::Agent)),
-            auth: PgAuth::Entra(EntraAuth::interactive_default()),
+            auth: ServerAuth::Entra(EntraAuth::interactive_default()),
             protection: WriteProtection::Open,
             color: None,
         };
@@ -1222,7 +893,7 @@ mod tests {
             name: "azure sql".into(),
             url: "mssql://you@myserver.database.windows.net:1433/app?encrypt=on".into(),
             tunnel: Some(tunnel(crate::tunnel::TunnelAuth::Agent)),
-            auth: PgAuth::Entra(EntraAuth::Interactive {
+            auth: ServerAuth::Entra(EntraAuth::Interactive {
                 tenant: "contoso.onmicrosoft.com".into(),
                 client_id: None,
             }),
@@ -1247,7 +918,7 @@ mod tests {
             name: "ignored".into(),
             url: "mssql://sa@h:1433/db".into(),
             tunnel: Some(tunnel(crate::tunnel::TunnelAuth::Agent)),
-            auth: PgAuth::Entra(EntraAuth::interactive_default()),
+            auth: ServerAuth::Entra(EntraAuth::interactive_default()),
             protection: WriteProtection::Open,
             color: None,
         };
@@ -1259,39 +930,12 @@ mod tests {
             } => {
                 assert_eq!(name, "prod");
                 assert!(tunnel.is_some());
-                assert!(matches!(auth, PgAuth::Entra(_)));
+                assert!(matches!(auth, ServerAuth::Entra(_)));
             }
             other => panic!("expected sqlserver, got {other:?}"),
         }
         // Identical settings again: no change.
         assert!(!list.add(updated));
-    }
-
-    #[test]
-    fn plan_restore_treats_sqlserver_like_postgres() {
-        let tabs = vec![
-            SessionTab {
-                locator: "mssql://sa@h:1433/withpw".into(),
-                ..Default::default()
-            },
-            SessionTab {
-                locator: "mssql://sa@h:1433/nopw".into(),
-                ..Default::default()
-            },
-        ];
-        let candidates = vec![
-            RestoreCandidate {
-                locator: "mssql://sa@h:1433/withpw".into(),
-                backend: BackendKind::SqlServer,
-            },
-            RestoreCandidate {
-                locator: "mssql://sa@h:1433/nopw".into(),
-                backend: BackendKind::SqlServer,
-            },
-        ];
-        let plan = plan_session_restore(&tabs, &candidates, |loc| loc.ends_with("withpw"));
-        let locators: Vec<&str> = plan.iter().map(|t| t.locator.as_str()).collect();
-        assert_eq!(locators, vec!["mssql://sa@h:1433/withpw"]);
     }
 
     #[test]
@@ -1333,7 +977,7 @@ mod tests {
                 name: "via agent".into(),
                 url: "postgres://u@db.internal:5432/app".into(),
                 tunnel: Some(tunnel(crate::tunnel::TunnelAuth::Agent)),
-                auth: PgAuth::Password,
+                auth: ServerAuth::Password,
                 protection: WriteProtection::Open,
                 color: None,
             },
@@ -1343,7 +987,7 @@ mod tests {
                 tunnel: Some(tunnel(crate::tunnel::TunnelAuth::KeyFile {
                     path: PathBuf::from("/home/u/.ssh/id_ed25519"),
                 })),
-                auth: PgAuth::Password,
+                auth: ServerAuth::Password,
                 protection: WriteProtection::Open,
                 color: None,
             },
@@ -1396,6 +1040,29 @@ mod tests {
     }
 
     #[test]
+    fn server_auth_serialized_form_is_pinned_across_the_rename() {
+        // `ServerAuth` was `PgAuth` until FRE-144. It serializes by contents
+        // (the `kind` tag), so the Rust name never reaches the TOML — this
+        // pins that shape so a future rename or attribute change can't move
+        // the on-disk format.
+        let password = toml::to_string(&ServerAuth::Password).unwrap();
+        assert_eq!(password, "kind = \"password\"\n");
+        let entra = toml::to_string(&ServerAuth::Entra(EntraAuth::Interactive {
+            tenant: "contoso.onmicrosoft.com".into(),
+            client_id: None,
+        }))
+        .unwrap();
+        assert!(entra.contains("kind = \"entra\""), "{entra}");
+        assert_eq!(
+            toml::from_str::<ServerAuth>(&entra).unwrap(),
+            ServerAuth::Entra(EntraAuth::Interactive {
+                tenant: "contoso.onmicrosoft.com".into(),
+                client_id: None,
+            })
+        );
+    }
+
+    #[test]
     fn entra_auth_modes_round_trip_through_the_config() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connections.toml");
@@ -1404,7 +1071,7 @@ mod tests {
                 name: "azure-interactive".into(),
                 url: "postgres://you@myserver.postgres.database.azure.com:5432/db".into(),
                 tunnel: None,
-                auth: PgAuth::Entra(EntraAuth::Interactive {
+                auth: ServerAuth::Entra(EntraAuth::Interactive {
                     tenant: "contoso.onmicrosoft.com".into(),
                     client_id: None,
                 }),
@@ -1415,7 +1082,7 @@ mod tests {
                 name: "azure-mi".into(),
                 url: "postgres://mi@other.postgres.database.azure.com:5432/db".into(),
                 tunnel: None,
-                auth: PgAuth::Entra(EntraAuth::ManagedIdentity {
+                auth: ServerAuth::Entra(EntraAuth::ManagedIdentity {
                     client_id: Some("11111111-2222-3333-4444-555555555555".into()),
                 }),
                 protection: WriteProtection::Open,
@@ -1441,7 +1108,7 @@ mod tests {
             name: "ignored".into(),
             url: "postgres://u@h:5432/db".into(),
             tunnel: None,
-            auth: PgAuth::Entra(EntraAuth::interactive_default()),
+            auth: ServerAuth::Entra(EntraAuth::interactive_default()),
             protection: WriteProtection::Open,
             color: None,
         };
@@ -1450,7 +1117,7 @@ mod tests {
         match &list.entries()[0] {
             SavedConnection::Postgres { name, auth, .. } => {
                 assert_eq!(name, "prod");
-                assert!(matches!(auth, PgAuth::Entra(_)));
+                assert!(matches!(auth, ServerAuth::Entra(_)));
             }
             other => panic!("expected postgres, got {other:?}"),
         }
@@ -1459,7 +1126,7 @@ mod tests {
             name: "prod".into(),
             url: "postgres://u@h:5432/db".into(),
             tunnel: None,
-            auth: PgAuth::Entra(EntraAuth::interactive_default()),
+            auth: ServerAuth::Entra(EntraAuth::interactive_default()),
             protection: WriteProtection::Open,
             color: None,
         };
@@ -1476,7 +1143,7 @@ mod tests {
             name: "ignored".into(),
             url: "postgres://u@h:5432/db".into(),
             tunnel: Some(tunnel(crate::tunnel::TunnelAuth::Agent)),
-            auth: PgAuth::Password,
+            auth: ServerAuth::Password,
             protection: WriteProtection::Open,
             color: None,
         };
@@ -1604,66 +1271,6 @@ mod tests {
     }
 
     #[test]
-    fn theme_serde_round_trips_lowercase() {
-        for (theme, token) in [
-            (Theme::System, "\"system\""),
-            (Theme::Light, "\"light\""),
-            (Theme::Dark, "\"dark\""),
-        ] {
-            assert_eq!(toml::Value::try_from(theme).unwrap().to_string(), token);
-            let settings = Settings {
-                theme,
-                ..Default::default()
-            };
-            let text = toml::to_string(&settings).unwrap();
-            assert_eq!(toml::from_str::<Settings>(&text).unwrap(), settings);
-        }
-    }
-
-    #[test]
-    fn theme_resolves_dark_from_system_preference() {
-        assert!(Theme::System.resolve_dark(true));
-        assert!(!Theme::System.resolve_dark(false));
-        // Explicit choices ignore the system preference.
-        assert!(!Theme::Light.resolve_dark(true));
-        assert!(Theme::Dark.resolve_dark(false));
-    }
-
-    #[test]
-    fn theme_next_cycles_system_light_dark() {
-        assert_eq!(Theme::System.next(), Theme::Light);
-        assert_eq!(Theme::Light.next(), Theme::Dark);
-        assert_eq!(Theme::Dark.next(), Theme::System);
-    }
-
-    #[test]
-    fn missing_settings_file_loads_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nope").join("settings.toml");
-        assert_eq!(load_settings(&path).theme, Theme::System);
-    }
-
-    #[test]
-    fn malformed_settings_file_falls_back_to_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("settings.toml");
-        std::fs::write(&path, "theme = 42").unwrap();
-        assert_eq!(load_settings(&path).theme, Theme::System);
-    }
-
-    #[test]
-    fn settings_save_and_load_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("deep").join("settings.toml");
-        let settings = Settings {
-            theme: Theme::Dark,
-            ..Default::default()
-        };
-        save_settings(&path, &settings).unwrap();
-        assert_eq!(load_settings(&path), settings);
-    }
-
-    #[test]
     fn add_dedupes_by_path_and_remove_reports_changes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connections.toml");
@@ -1681,324 +1288,5 @@ mod tests {
         assert!(list.remove("/tmp/missing.db").is_none());
         assert!(list.remove("/tmp/a.db").is_some());
         assert!(list.entries().is_empty());
-    }
-
-    #[test]
-    fn window_geometry_round_trips_in_settings() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("settings.toml");
-        let settings = Settings {
-            theme: Theme::Dark,
-            window: Some(WindowGeometry {
-                width: 1024.5,
-                height: 768.0,
-                x: Some(-40.0),
-                y: Some(12.0),
-                maximized: true,
-            }),
-            // Set, so the round trip pins a scalar declared after a table —
-            // TOML would otherwise emit it inside `[window]`.
-            show_internal_objects: true,
-        };
-        save_settings(&path, &settings).unwrap();
-        assert_eq!(load_settings(&path), settings);
-    }
-
-    #[test]
-    fn missing_window_geometry_loads_as_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("settings.toml");
-        // A theme-only file (as written before FRE-30).
-        std::fs::write(&path, "theme = \"light\"\n").unwrap();
-        let loaded = load_settings(&path);
-        assert_eq!(loaded.theme, Theme::Light);
-        assert_eq!(loaded.window, None);
-    }
-
-    #[test]
-    fn system_schema_visibility_round_trips_and_stays_out_of_older_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("settings.toml");
-
-        // A pre-FRE-88 file loads with the flag off and, rewritten, gains no
-        // key for it — an unaffected setting serializes unchanged.
-        std::fs::write(&path, "theme = \"light\"\n").unwrap();
-        assert!(!load_settings(&path).show_internal_objects);
-        save_theme(&path, Theme::Dark).unwrap();
-        assert!(!std::fs::read_to_string(&path)
-            .unwrap()
-            .contains("show_internal_objects"));
-
-        save_show_internal_objects(&path, true).unwrap();
-        let loaded = load_settings(&path);
-        assert!(loaded.show_internal_objects);
-        // Written alongside the theme rather than over it.
-        assert_eq!(loaded.theme, Theme::Dark);
-    }
-
-    #[test]
-    fn saving_geometry_preserves_theme_and_vice_versa() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("settings.toml");
-        save_theme(&path, Theme::Dark).unwrap();
-        let geo = WindowGeometry {
-            width: 900.0,
-            height: 600.0,
-            x: Some(10.0),
-            y: Some(20.0),
-            maximized: false,
-        };
-        save_window_geometry(&path, geo).unwrap();
-        // The geometry write must not clobber the theme…
-        assert_eq!(load_settings(&path).theme, Theme::Dark);
-        // …and a later theme write must not clobber the geometry.
-        save_theme(&path, Theme::Light).unwrap();
-        let loaded = load_settings(&path);
-        assert_eq!(loaded.theme, Theme::Light);
-        assert_eq!(loaded.window, Some(geo));
-    }
-
-    #[test]
-    fn geometry_sanitized_clamps_tiny_huge_and_negative_sizes() {
-        // Tiny/negative sizes clamp up to the minimums.
-        let tiny = WindowGeometry {
-            width: 1.0,
-            height: -50.0,
-            x: Some(5.0),
-            y: Some(5.0),
-            maximized: false,
-        }
-        .sanitized();
-        assert_eq!(tiny.width, MIN_WINDOW_WIDTH);
-        assert_eq!(tiny.height, MIN_WINDOW_HEIGHT);
-        assert_eq!(tiny.x, Some(5.0));
-
-        // Huge sizes clamp down to the maximum.
-        let huge = WindowGeometry {
-            width: 1.0e9,
-            height: 1.0e9,
-            x: None,
-            y: None,
-            maximized: false,
-        }
-        .sanitized();
-        assert_eq!(huge.width, MAX_WINDOW_DIM);
-        assert_eq!(huge.height, MAX_WINDOW_DIM);
-
-        // Non-finite sizes fall back to the launch defaults; a non-finite or
-        // wildly out-of-range position is dropped.
-        let broken = WindowGeometry {
-            width: f64::NAN,
-            height: f64::INFINITY,
-            x: Some(f64::NAN),
-            y: Some(1.0e9),
-            maximized: true,
-        }
-        .sanitized();
-        assert_eq!(broken.width, DEFAULT_WINDOW_WIDTH);
-        assert_eq!(broken.height, DEFAULT_WINDOW_HEIGHT);
-        assert_eq!(broken.x, None);
-        assert_eq!(broken.y, None);
-        assert!(broken.maximized);
-
-        // A reasonable geometry (including a negative multi-monitor x) is
-        // left untouched.
-        let ok = WindowGeometry {
-            width: 1000.0,
-            height: 700.0,
-            x: Some(-100.0),
-            y: Some(50.0),
-            maximized: false,
-        };
-        assert_eq!(ok.sanitized(), ok);
-    }
-
-    #[test]
-    fn missing_session_file_loads_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nope").join("session.toml");
-        assert_eq!(load_session(&path), Session::default());
-        assert!(load_session(&path).tabs.is_empty());
-    }
-
-    #[test]
-    fn malformed_session_file_loads_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("session.toml");
-        std::fs::write(&path, "tabs = \"not a list\"").unwrap();
-        assert_eq!(load_session(&path), Session::default());
-    }
-
-    #[test]
-    fn session_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("deep").join("session.toml");
-        let session = Session {
-            tabs: vec![
-                SessionTab {
-                    locator: "/data/music.db".into(),
-                    selected_schema: None,
-                    selected_table: Some("artists".into()),
-                    pane: SessionPane::Browser,
-                    row_detail: true,
-                },
-                SessionTab {
-                    locator: "postgres://u@h:5432/app".into(),
-                    selected_schema: Some("public".into()),
-                    selected_table: Some("orders".into()),
-                    pane: SessionPane::Sql,
-                    row_detail: false,
-                },
-                SessionTab {
-                    locator: "postgres://u@h:5432/other".into(),
-                    selected_schema: None,
-                    selected_table: Some("stock".into()),
-                    pane: SessionPane::Schema,
-                    row_detail: false,
-                },
-            ],
-            active: Some("postgres://u@h:5432/app".into()),
-        };
-        save_session(&path, &session).unwrap();
-        assert_eq!(load_session(&path), session);
-    }
-
-    #[test]
-    fn session_without_a_pane_key_loads_as_the_default() {
-        // Files written before panes were persisted at all.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("session.toml");
-        std::fs::write(
-            &path,
-            "active = \"/data/music.db\"\n\n[[tabs]]\nlocator = \"/data/music.db\"\n",
-        )
-        .unwrap();
-        let session = load_session(&path);
-        assert_eq!(session.tabs.len(), 1);
-        assert_eq!(session.tabs[0].pane, SessionPane::Browser);
-    }
-
-    #[test]
-    fn a_session_without_the_row_detail_key_loads_with_the_panel_closed() {
-        // Files written before the row detail panel existed (FRE-109): the
-        // tab must still load, with the panel simply closed.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("session.toml");
-        std::fs::write(
-            &path,
-            "active = \"/data/music.db\"\n\n[[tabs]]\nlocator = \"/data/music.db\"\n\
-             selected_table = \"artists\"\npane = \"browser\"\n",
-        )
-        .unwrap();
-        let session = load_session(&path);
-        assert_eq!(session.tabs.len(), 1);
-        assert!(!session.tabs[0].row_detail);
-        assert_eq!(session.tabs[0].selected_table.as_deref(), Some("artists"));
-    }
-
-    #[test]
-    fn a_closed_row_detail_panel_writes_no_key_at_all() {
-        // The unaffected-entries-serialize-unchanged half of the convention:
-        // a tab that never opened the panel round-trips byte-identically to
-        // what a pre-FRE-109 build wrote.
-        let closed = Session {
-            tabs: vec![SessionTab {
-                locator: "/data/music.db".into(),
-                selected_table: Some("artists".into()),
-                ..Default::default()
-            }],
-            active: None,
-        };
-        let text = toml::to_string_pretty(&closed).unwrap();
-        assert!(!text.contains("row_detail"), "{text}");
-        // …and an open one is written, so it survives the next launch.
-        let mut open = closed.clone();
-        open.tabs[0].row_detail = true;
-        let text = toml::to_string_pretty(&open).unwrap();
-        assert!(text.contains("row_detail = true"), "{text}");
-        assert_eq!(toml::from_str::<Session>(&text).unwrap(), open);
-    }
-
-    #[test]
-    fn every_pane_variant_survives_the_tolerant_deserializer() {
-        // Guards the reason `pane_or_default` delegates to the derive: each
-        // variant must read back as itself, not quietly as the default.
-        for pane in [SessionPane::Browser, SessionPane::Sql, SessionPane::Schema] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("session.toml");
-            let session = Session {
-                tabs: vec![SessionTab {
-                    locator: "/db".into(),
-                    pane,
-                    ..Default::default()
-                }],
-                active: None,
-            };
-            save_session(&path, &session).unwrap();
-            assert_eq!(load_session(&path).tabs[0].pane, pane, "{pane:?}");
-        }
-    }
-
-    #[test]
-    fn an_unknown_pane_keeps_the_rest_of_the_session() {
-        // A pane added by a newer build must not cost this one every tab:
-        // serde treats an unknown enum variant as a hard error, and
-        // `load_session` discards the whole file on any parse failure.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("session.toml");
-        std::fs::write(
-            &path,
-            "active = \"/data/music.db\"\n\n[[tabs]]\nlocator = \"/data/music.db\"\n\
-             selected_table = \"artists\"\npane = \"telemetry\"\n",
-        )
-        .unwrap();
-        let session = load_session(&path);
-        assert_eq!(session.tabs.len(), 1, "the tab must survive");
-        assert_eq!(session.tabs[0].selected_table.as_deref(), Some("artists"));
-        assert_eq!(session.tabs[0].pane, SessionPane::Browser);
-        assert_eq!(session.active.as_deref(), Some("/data/music.db"));
-    }
-
-    #[test]
-    fn plan_restore_keeps_sqlite_and_password_backed_postgres() {
-        let tabs = vec![
-            SessionTab {
-                locator: "/data/a.db".into(),
-                selected_table: Some("t".into()),
-                ..Default::default()
-            },
-            SessionTab {
-                locator: "postgres://u@h:5432/withpw".into(),
-                ..Default::default()
-            },
-            SessionTab {
-                locator: "postgres://u@h:5432/nopw".into(),
-                ..Default::default()
-            },
-            SessionTab {
-                locator: "/data/gone.db".into(),
-                ..Default::default()
-            },
-        ];
-        let candidates = vec![
-            RestoreCandidate {
-                locator: "/data/a.db".into(),
-                backend: BackendKind::Sqlite,
-            },
-            RestoreCandidate {
-                locator: "postgres://u@h:5432/withpw".into(),
-                backend: BackendKind::Postgres,
-            },
-            RestoreCandidate {
-                locator: "postgres://u@h:5432/nopw".into(),
-                backend: BackendKind::Postgres,
-            },
-            // "/data/gone.db" is in the session but NOT saved anymore.
-        ];
-        let plan = plan_session_restore(&tabs, &candidates, |loc| loc.ends_with("withpw"));
-        let locators: Vec<&str> = plan.iter().map(|t| t.locator.as_str()).collect();
-        // SQLite kept, pg-with-password kept, pg-without-password skipped, and
-        // the no-longer-saved sqlite dropped. Order preserved.
-        assert_eq!(locators, vec!["/data/a.db", "postgres://u@h:5432/withpw"]);
     }
 }
