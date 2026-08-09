@@ -17,47 +17,53 @@ use crate::db::{
 use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState};
 use super::state::{AppState, SchemaLoad, TableRef};
 
+/// What the pane should show, derived from [`SchemaLoad`] inside one `read()`
+/// scope. Cloning the whole `Ready(Vec<TableMeta>)` per render just to render
+/// *one* table was the schema-pane half of FRE-134 — this carries only the
+/// selected table's metadata out of the borrow (same shape as the sidebar's
+/// `ListState`).
+enum PaneState {
+    Loading,
+    Failed(String),
+    /// The selected table vanished from a reloaded schema (dropped or
+    /// renamed underneath us).
+    Missing,
+    Ready(TableMeta),
+}
+
 /// Structure of one table or view: its columns, and (tables only) indexes.
 #[component]
 pub fn SchemaPane(id: ConnectionId, table: TableRef) -> Element {
     let state = use_context::<AppState>();
-    let schema = state
-        .schemas
-        .read()
-        .get(&id)
-        .cloned()
-        .unwrap_or(SchemaLoad::Loading);
-    let meta: Option<TableMeta> = match &schema {
-        SchemaLoad::Ready(tables) => tables
+    let pane = match state.schemas.read().get(&id) {
+        Some(SchemaLoad::Failed(err)) => PaneState::Failed(err.clone()),
+        Some(SchemaLoad::Ready(tables)) => tables
             .iter()
             .find(|t| t.name == table.name && t.schema == table.schema)
-            .cloned(),
-        _ => None,
+            .map(|meta| PaneState::Ready(meta.clone()))
+            .unwrap_or(PaneState::Missing),
+        Some(SchemaLoad::Loading) | None => PaneState::Loading,
     };
     rsx! {
         div { class: "min-h-0 flex-1 overflow-auto",
-            match schema {
-                SchemaLoad::Loading => rsx! {
+            match pane {
+                PaneState::Loading => rsx! {
                     DelayedLoading { label: "Loading schema…" }
                 },
-                SchemaLoad::Failed(err) => rsx! {
+                PaneState::Failed(err) => rsx! {
                     div { class: "p-3",
                         Banner { kind: BannerKind::Error, message: err }
                     }
                 },
-                SchemaLoad::Ready(_) => match meta {
-                    // The selected table vanished from a reloaded schema
-                    // (dropped or renamed underneath us).
-                    None => rsx! {
-                        EmptyState {
-                            icon: rsx! { TableIcon {} },
-                            title: "This table is no longer in the schema",
-                            hint: "It may have been dropped or renamed; reload the schema.",
-                        }
-                    },
-                    Some(meta) => rsx! {
-                        SchemaBody { id, meta }
-                    },
+                PaneState::Missing => rsx! {
+                    EmptyState {
+                        icon: rsx! { TableIcon {} },
+                        title: "This table is no longer in the schema",
+                        hint: "It may have been dropped or renamed; reload the schema.",
+                    }
+                },
+                PaneState::Ready(meta) => rsx! {
+                    SchemaBody { id, meta }
                 },
             }
         }

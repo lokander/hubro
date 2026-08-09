@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dioxus::core::{spawn_forever, Task};
@@ -220,11 +221,45 @@ pub enum RunStatus {
     Cancelled,
 }
 
+/// One finished statement's result, shared rather than owned: a result can
+/// hold thousands of rows, and the editor re-reads the run on every render,
+/// so cloning it must cost an `Arc` bump, not a row-by-row copy (FRE-134).
+///
+/// `PartialEq` is pointer identity, not a deep compare. That is sound because
+/// results are write-once — pushed into [`SqlRun::statements`] and never
+/// mutated — so two equal pointers are the same result and two different
+/// pointers belong to different runs. It is also the point: pointer equality
+/// is what lets prop diffing on the result components short-circuit without
+/// walking every row (a derived `PartialEq` on `Arc` deep-compares, since
+/// row values hold floats and so are only `PartialEq`, not `Eq`).
+#[derive(Debug, Clone)]
+pub struct SharedStatement(Arc<StatementResult>);
+
+impl SharedStatement {
+    pub fn new(result: StatementResult) -> Self {
+        Self(Arc::new(result))
+    }
+}
+
+impl PartialEq for SharedStatement {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::ops::Deref for SharedStatement {
+    type Target = StatementResult;
+
+    fn deref(&self) -> &StatementResult {
+        &self.0
+    }
+}
+
 /// State of the most recent SQL script run per connection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SqlRun {
     /// Outcomes of the statements that finished, in script order.
-    pub statements: Vec<StatementResult>,
+    pub statements: Vec<SharedStatement>,
     pub status: RunStatus,
 }
 
@@ -2345,7 +2380,7 @@ impl AppState {
             let result = run_script(&pool, caps, &statements, |statement| {
                 if self.sql_generation(id) == generation {
                     if let Some(run) = self.sql_runs.write().get_mut(&id) {
-                        run.statements.push(statement);
+                        run.statements.push(SharedStatement::new(statement));
                     }
                 }
             })
