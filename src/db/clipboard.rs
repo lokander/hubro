@@ -66,7 +66,7 @@
 use std::fmt::Write as _;
 
 use super::export::{harden_csv_text, hex_literal, ExportFormat, ExportSink};
-use super::page::{quote_ident, Dialect};
+use super::sql::{qualified, quote_ident, Dialect};
 use super::value::Value;
 
 /// The clipboard encodings offered by the grid's copy-as menu.
@@ -276,10 +276,7 @@ fn render_json(block: &CopyBlock) -> String {
 
 /// One `INSERT … VALUES (…);` per row, over the selected columns.
 fn render_insert(block: &CopyBlock, dialect: Dialect) -> String {
-    let target = match &block.schema {
-        Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(&block.table)),
-        None => quote_ident(&block.table),
-    };
+    let target = qualified(block.schema.as_deref(), &block.table);
     let names: Vec<String> = block.columns.iter().map(|c| quote_ident(c)).collect();
     let names = names.join(", ");
     let mut out = String::new();

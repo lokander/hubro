@@ -1,6 +1,11 @@
 //! End-to-end tests for row-identity detection and guarded writes
-//! (FRE-26): detection runs on real introspection output, and
-//! `execute_checked` commits only when the affected-row count matches.
+//! (FRE-26): detection runs on real introspection output, and the write path
+//! commits only when the affected-row count matches.
+//!
+//! The write cases drive `apply_staged` — the real production path, which
+//! builds its statements from the detected [`RowIdentity`] and runs them
+//! through `execute_all_checked` — rather than a test-only SQL builder, so
+//! what is verified here is what the app actually sends.
 //!
 //! Postgres cases need a running server (Docker only, per CLAUDE.md) and are
 //! skipped unless `HUBRO_PG_TEST_URL` is set — see tests/db_postgres.rs
@@ -10,9 +15,15 @@ mod common;
 
 use common::FixtureDb;
 use hubro::db::{
-    delete_sql, detect_row_identity, update_sql, DbError, DbPool, Dialect, RowIdentity, TableKind,
-    TableMeta, Value,
+    apply_staged, detect_row_identity, DbError, DbPool, Dialect, RowIdentity, RowLocator,
+    StagedChange, TableKind, TableMeta, Value,
 };
+
+fn locator(values: Vec<Value>) -> RowLocator {
+    RowLocator {
+        identity_values: values,
+    }
+}
 
 fn test_url() -> Option<String> {
     match std::env::var("HUBRO_PG_TEST_URL") {
@@ -128,41 +139,54 @@ async fn sqlite_fallbacks_on_real_introspection_output() {
 }
 
 #[tokio::test]
-async fn sqlite_execute_checked_commits_matching_updates_and_deletes() {
+async fn sqlite_staged_writes_commit_through_the_full_key() {
     let fixture = FixtureDb::full().await;
     let pool = fixture.open().await;
     let tables = pool.introspect().await.unwrap();
     let albums = find(&tables, None, "albums").clone();
     let identity = detect_row_identity(&albums, Dialect::Sqlite).unwrap();
+    let access = pool.backend_access(&albums);
 
     // UPDATE targeting one row through the full composite key.
-    let (sql, _params) = update_sql(&albums, &identity, &["title".into()], Dialect::Sqlite);
-    let affected = pool
-        .execute_checked(
-            &sql,
-            &[
-                Value::Text("Renamed".into()), // SET title
-                Value::Integer(1),             // WHERE artist_id
-                Value::Integer(2),             // WHERE seq
-            ],
-            1,
-        )
-        .await
-        .unwrap();
-    assert_eq!(affected, 1);
+    let counts = apply_staged(
+        &pool,
+        &access,
+        &albums,
+        &identity,
+        &[StagedChange::Update {
+            locator: locator(vec![Value::Integer(1), Value::Integer(2)]),
+            column: "title".into(),
+            value: Value::Text("Renamed".into()),
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(counts.updated_rows, 1);
     let check = pool
         .query("SELECT title FROM albums WHERE artist_id = 1 AND seq = 2")
         .await
         .unwrap();
     assert_eq!(check.rows[0][0], Value::Text("Renamed".into()));
-
-    // DELETE with expected == actual commits.
-    let (sql, _params) = delete_sql(&albums, &identity, Dialect::Sqlite);
-    let affected = pool
-        .execute_checked(&sql, &[Value::Integer(2), Value::Integer(1)], 1)
+    // The sibling row of the same artist was not touched.
+    let sibling = pool
+        .query("SELECT title FROM albums WHERE artist_id = 1 AND seq = 1")
         .await
         .unwrap();
-    assert_eq!(affected, 1);
+    assert_eq!(sibling.rows[0][0], Value::Text("First".into()));
+
+    // DELETE through the full key commits exactly one row.
+    let counts = apply_staged(
+        &pool,
+        &access,
+        &albums,
+        &identity,
+        &[StagedChange::Delete {
+            locator: locator(vec![Value::Integer(2), Value::Integer(1)]),
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(counts.deleted_rows, 1);
     let count = pool.query("SELECT COUNT(*) FROM albums").await.unwrap();
     assert_eq!(count.rows[0][0], Value::Integer(2));
 
@@ -227,10 +251,20 @@ async fn sqlite_rowid_identity_edits_a_keyless_table() {
 
     // Two rows have identical column values; the rowid still addresses
     // exactly one of them.
-    let (sql, _params) = update_sql(&notes, &identity, &["body".into()], Dialect::Sqlite);
-    pool.execute_checked(&sql, &[Value::Text("edited".into()), Value::Integer(1)], 1)
-        .await
-        .unwrap();
+    let counts = apply_staged(
+        &pool,
+        &pool.backend_access(&notes),
+        &notes,
+        &identity,
+        &[StagedChange::Update {
+            locator: locator(vec![Value::Integer(1)]),
+            column: "body".into(),
+            value: Value::Text("edited".into()),
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(counts.updated_rows, 1);
     let check = pool
         .query("SELECT rowid, body FROM notes ORDER BY rowid")
         .await
@@ -375,7 +409,7 @@ async fn postgres_invalid_index_is_not_introspected() {
 }
 
 #[tokio::test]
-async fn postgres_execute_checked_guards_and_commits() {
+async fn postgres_staged_writes_guard_and_commit() {
     let Some(url) = test_url() else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     for sql in [
@@ -397,20 +431,21 @@ async fn postgres_execute_checked_guards_and_commits() {
     let identity = detect_row_identity(&albums, Dialect::Postgres).unwrap();
 
     // Successful single-row UPDATE via the full key.
-    let (sql, _params) = update_sql(&albums, &identity, &["title".into()], Dialect::Postgres);
-    let affected = pool
-        .execute_checked(
-            &sql,
-            &[
-                Value::Text("Renamed".into()),
-                Value::Integer(1),
-                Value::Integer(2),
-            ],
-            1,
-        )
-        .await
-        .unwrap();
-    assert_eq!(affected, 1);
+    let access = pool.backend_access(&albums);
+    let counts = apply_staged(
+        &pool,
+        &access,
+        &albums,
+        &identity,
+        &[StagedChange::Update {
+            locator: locator(vec![Value::Integer(1), Value::Integer(2)]),
+            column: "title".into(),
+            value: Value::Text("Renamed".into()),
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(counts.updated_rows, 1);
     let check = pool
         .query("SELECT title FROM rowkey_exec.albums WHERE artist_id = 1 AND seq = 2")
         .await
@@ -439,12 +474,18 @@ async fn postgres_execute_checked_guards_and_commits() {
     assert_eq!(check.rows[0][0], Value::Integer(0));
 
     // Expected == actual DELETE commits.
-    let (sql, _params) = delete_sql(&albums, &identity, Dialect::Postgres);
-    let affected = pool
-        .execute_checked(&sql, &[Value::Integer(2), Value::Integer(1)], 1)
-        .await
-        .unwrap();
-    assert_eq!(affected, 1);
+    let counts = apply_staged(
+        &pool,
+        &access,
+        &albums,
+        &identity,
+        &[StagedChange::Delete {
+            locator: locator(vec![Value::Integer(2), Value::Integer(1)]),
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(counts.deleted_rows, 1);
     let count = pool
         .query("SELECT COUNT(*) FROM rowkey_exec.albums")
         .await

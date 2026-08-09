@@ -12,6 +12,9 @@
 //!   addressing and navigation stay exact.
 
 use super::schema::ColumnMeta;
+use super::sql::{
+    equalities_where, preview_exprs, qualified, quote_ident, text_compare_expr, Dialect,
+};
 use super::value::Value;
 
 /// Max characters (text/json) or bytes (blob) of a large-cell preview fetched
@@ -35,12 +38,13 @@ pub enum ColumnClass {
     Binary,
 }
 
-/// Classifies a declared column type into a [`ColumnClass`] by
-/// case-insensitive substring, mirroring the editor-kind rules so both
-/// backends map without a per-type table. Anything not clearly text or
-/// binary — and every recognized scalar — stays [`ColumnClass::Scalar`] so it
-/// is fetched whole (previewing a scalar would corrupt its decoded type and,
-/// worse, any locator built from it).
+/// Classifies a declared column type into a [`ColumnClass`]. The binary and
+/// scalar vocabularies match on the **exact stripped base name** (case
+/// ignored, any `(n)`/`(max)` parameter suffix dropped); only the text
+/// fallback matches by substring, because misclassifying something as Text
+/// is the safe direction — it previews. Every recognized scalar is fetched
+/// whole (previewing a scalar would corrupt its decoded type and, worse, any
+/// locator built from it); anything unrecognized previews as Text.
 pub fn classify_column(type_name: &str) -> ColumnClass {
     let t = type_name.trim().to_ascii_lowercase();
     if t.contains("blob") || t.contains("bytea") {
@@ -57,13 +61,34 @@ pub fn classify_column(type_name: &str) -> ColumnClass {
     if matches!(base, "binary" | "varbinary" | "image") {
         return ColumnClass::Binary;
     }
-    // A declared scalar keeps its native decoded type. Checked before the
-    // text fallback so an empty/unknown type still previews.
-    const SCALAR_HINTS: [&str; 16] = [
-        "int", "serial", "real", "float", "double", "numeric", "decimal", "money", "bool", "date",
-        "time", "uuid", "bit", "oid", "point", "interval",
-    ];
-    if SCALAR_HINTS.iter().any(|hint| t.contains(hint)) && !t.contains("json") {
+    // A declared scalar keeps its native decoded type. Matched by exact
+    // stripped base name like the binary arm above, NOT by substring: a
+    // Postgres user-defined type merely *containing* a scalar word (a
+    // `fingerprint_data` domain contains "int", a `timeline` enum contains
+    // "time") must stay Text — a Scalar classification would fetch it whole
+    // and let an arbitrarily large value escape the preview memory bound.
+    // Checked before the text fallback so an empty/unknown type still
+    // previews.
+    if matches!(
+        base,
+        // int/serial variants (Postgres, SQL Server, SQLite).
+        "int" | "integer" | "bigint" | "smallint" | "tinyint" | "mediumint" | "int2" | "int4"
+            | "int8" | "unsigned big int" | "serial" | "smallserial" | "bigserial" | "serial2"
+            | "serial4" | "serial8"
+            // float/double/real.
+            | "real" | "float" | "float4" | "float8" | "double" | "double precision"
+            // numeric/decimal/money.
+            | "numeric" | "decimal" | "money" | "smallmoney"
+            // bool.
+            | "bool" | "boolean"
+            // date/time/timestamp variants.
+            | "date" | "datetime" | "datetime2" | "smalldatetime" | "datetimeoffset" | "time"
+            | "timetz" | "timestamp" | "timestamptz" | "time with time zone"
+            | "time without time zone" | "timestamp with time zone"
+            | "timestamp without time zone"
+            // The rest of the fixed-size zoo.
+            | "uuid" | "bit" | "bit varying" | "varbit" | "oid" | "point" | "interval"
+    ) {
         return ColumnClass::Scalar;
     }
     if t.contains("char")
@@ -281,53 +306,6 @@ pub struct PageRequest {
     pub extra_key_column: Option<String>,
 }
 
-/// SQL flavor differences the page builder must care about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Dialect {
-    Sqlite,
-    Postgres,
-    SqlServer,
-}
-
-impl Dialect {
-    /// The `n`th bound-parameter placeholder (1-based): SQLite placeholders
-    /// are positional so every one renders as `?`; Postgres numbers them
-    /// `$n`; SQL Server numbers them `@Pn` (the tiberius convention). Every
-    /// SQL builder routes its placeholders through here.
-    pub(crate) fn placeholder(self, n: usize) -> String {
-        match self {
-            Dialect::Sqlite => "?".to_string(),
-            Dialect::Postgres => format!("${n}"),
-            Dialect::SqlServer => format!("@P{n}"),
-        }
-    }
-
-    /// Renders a cast of `expr` (already-safe SQL, e.g. a quoted identifier
-    /// or a placeholder) to `target` (an introspected/static type name).
-    /// Postgres uses the postfix `expr::type` shape; SQLite shares the arm
-    /// but no builder ever casts there (its type affinity coerces on its
-    /// own). SQL Server uses the prefix `CAST(expr AS type)` shape.
-    ///
-    /// Callers pass a **dialect-neutral** target for the generic cases and
-    /// this method translates it: the stringify target `"text"` becomes
-    /// `nvarchar(max)` on SQL Server (T-SQL has no `text`-as-cast-target
-    /// worth using — the legacy `text` type is deprecated and not
-    /// comparable). Any other target renders verbatim.
-    pub(crate) fn cast_expr(self, expr: &str, target: &str) -> String {
-        match self {
-            Dialect::Sqlite | Dialect::Postgres => format!("{expr}::{target}"),
-            Dialect::SqlServer => {
-                let target = if target == "text" {
-                    "nvarchar(max)"
-                } else {
-                    target
-                };
-                format!("CAST({expr} AS {target})")
-            }
-        }
-    }
-}
-
 impl PageRequest {
     /// SELECT for this page: SQL plus bound parameters.
     pub fn select_sql(&self, dialect: Dialect) -> (String, Vec<Value>) {
@@ -440,37 +418,13 @@ impl PageRequest {
                 value_exprs.push(q);
                 continue;
             }
-            match (dialect, spec.class) {
-                (Dialect::Sqlite, ColumnClass::Text | ColumnClass::Binary) => {
-                    value_exprs.push(format!("substr({q}, 1, {n}) AS {q}"));
-                    // SQLite length() is characters for text, bytes for blobs.
-                    length_exprs.push(format!("length({q})"));
-                }
-                (Dialect::Postgres, ColumnClass::Text) => {
-                    let cast = dialect.cast_expr(&q, "text");
-                    value_exprs.push(format!("left({cast}, {n}) AS {q}"));
-                    length_exprs.push(format!("length({cast})"));
-                }
-                (Dialect::Postgres, ColumnClass::Binary) => {
-                    value_exprs.push(format!("substring({q} from 1 for {n}) AS {q}"));
-                    length_exprs.push(format!("octet_length({q})"));
-                }
-                (Dialect::SqlServer, ColumnClass::Text) => {
-                    // Cast to nvarchar(max) so xml/legacy types preview too.
-                    // The length probe counts UTF-16 code units, matching what
-                    // SUBSTRING slices — see `mssql_text_len` for why `LEN`
-                    // would silently truncate.
-                    let cast = dialect.cast_expr(&q, "text");
-                    value_exprs.push(format!("SUBSTRING({cast}, 1, {n}) AS {q}"));
-                    length_exprs.push(mssql_text_len(&cast));
-                }
-                (Dialect::SqlServer, ColumnClass::Binary) => {
-                    // SUBSTRING works on varbinary; DATALENGTH is bytes.
-                    value_exprs.push(format!("SUBSTRING({q}, 1, {n}) AS {q}"));
-                    length_exprs.push(format!("DATALENGTH({q})"));
-                }
-                (_, ColumnClass::Scalar) => value_exprs.push(q),
-            }
+            // Previewed columns are Text or Binary by construction (scalars
+            // are never previewed), so the pair always carries a real length
+            // probe. The expression shapes are shared with the on-demand
+            // cell fetch — see [`preview_exprs`].
+            let (value_expr, length_expr) = preview_exprs(dialect, spec.class, &q, n);
+            value_exprs.push(format!("{value_expr} AS {q}"));
+            length_exprs.push(length_expr);
         }
         let length_columns = length_exprs.len();
         let mut select_list = value_exprs.join(", ");
@@ -520,28 +474,19 @@ impl PageRequest {
         (sql, params)
     }
 
+    /// Thin wrapper over [`super::sql::qualified`] for this request's table.
     fn qualified_table(&self) -> String {
-        match &self.schema {
-            Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(&self.table)),
-            None => quote_ident(&self.table),
-        }
+        qualified(self.schema.as_deref(), &self.table)
     }
 
     fn where_clause(&self, dialect: Dialect) -> (String, Vec<Value>) {
         match &self.filter {
             None => (String::new(), Vec::new()),
             Some(Filter::Column { column, op, value }) => {
-                // Postgres compares strictly by type, so the column is cast to
-                // text to match the text filter value (SQLite's affinity
-                // handles this implicitly; SQL Server casts to nvarchar(max)
-                // the same way). Fine for a viewer; indexes aren't a concern
-                // yet.
-                let quoted = match dialect {
-                    Dialect::Sqlite => quote_ident(column),
-                    Dialect::Postgres | Dialect::SqlServer => {
-                        dialect.cast_expr(&quote_ident(column), "text")
-                    }
-                };
+                // Filters compare as text — see [`text_compare_expr`] for the
+                // strategy (Postgres/SQL Server cast the column to text;
+                // SQLite affinity coerces on its own).
+                let quoted = text_compare_expr(dialect, column);
                 let placeholder = dialect.placeholder(1);
                 match op {
                     FilterOp::Equals => (
@@ -559,95 +504,12 @@ impl PageRequest {
     }
 }
 
-/// A ` WHERE k1 = ? AND k2 = ?` clause pinning one row by its identity
-/// columns, with each value bound as text (Postgres/SQL Server cast the
-/// column to text; SQLite affinity coerces) — the same strategy the equals filter and
-/// foreign-key navigation use, so exotic key types (uuid, enums, timestamps)
-/// still compare. An empty list matches every row (no clause). Shared by the
-/// [`Filter::Equalities`] page filter and [`super::DbPool::fetch_cell`].
-pub(crate) fn equalities_where(
-    pairs: &[(String, Value)],
-    dialect: Dialect,
-) -> (String, Vec<Value>) {
-    if pairs.is_empty() {
-        return (String::new(), Vec::new());
-    }
-    let mut clauses = Vec::with_capacity(pairs.len());
-    let mut params = Vec::with_capacity(pairs.len());
-    for (column, value) in pairs {
-        let quoted = match dialect {
-            Dialect::Sqlite => quote_ident(column),
-            Dialect::Postgres | Dialect::SqlServer => {
-                dialect.cast_expr(&quote_ident(column), "text")
-            }
-        };
-        let placeholder = dialect.placeholder(params.len() + 1);
-        clauses.push(format!("{quoted} = {placeholder}"));
-        params.push(Value::Text(equality_text(value)));
-    }
-    (format!(" WHERE {}", clauses.join(" AND ")), params)
-}
-
-/// The text form bound for an equality comparison. Mirrors how the equals
-/// filter binds text and lets SQLite affinity / the Postgres `::text` cast do
-/// the matching. FK values are realistically integers or text; NULL is
-/// guarded out before a jump is built, and blobs never key a foreign key.
-fn equality_text(value: &Value) -> String {
-    match value {
-        Value::Integer(i) => i.to_string(),
-        Value::Real(r) => r.to_string(),
-        Value::Text(t) => t.clone(),
-        Value::Null => String::new(),
-        Value::Blob(_) => value.display(),
-    }
-}
-
 /// Escapes LIKE wildcards in user input so "50%" matches literally.
 fn escape_like(needle: &str) -> String {
     needle
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
-}
-
-/// Double-quotes an identifier, doubling embedded quotes. Deliberately takes
-/// no [`Dialect`]: ANSI `"…"` quoting works on SQLite, Postgres, and SQL
-/// Server (with QUOTED_IDENTIFIER ON, which tiberius defaults to), so one
-/// dialect-independent form covers every backend we would add.
-pub(crate) fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-/// Length of a SQL Server text value in the units `SUBSTRING` slices by
-/// (FRE-110). `cast` must already be an `nvarchar(max)` expression.
-///
-/// **Not `LEN()`.** A bounded read is only safe while the length probe and
-/// the slice count the same thing, because "was this truncated?" is decided
-/// by comparing one against the other. `LEN` breaks that invariant: it
-/// ignores trailing spaces, `SUBSTRING` does not. So an `nvarchar` of 3000
-/// characters ending in 1000 spaces reports `LEN = 2000`, the reader sees
-/// 2000 ≤ 2048 and records no [`PreviewInfo`] — and the 2048-character prefix
-/// it actually fetched is then treated as the whole value. That silently
-/// truncates a clipboard copy, and worse, an inline edit of that cell saves
-/// the prefix back over the real data.
-///
-/// `DATALENGTH` is bytes and `nvarchar` is UTF-16, so `/ 2` gives code units
-/// — exactly what `SUBSTRING` counts, and always an exact division.
-///
-/// Two consequences, both correct, both confined to SQL Server text columns:
-///
-/// - A fixed-width `nchar(n)`/`char(n)` column wider than the cap now always
-///   reads as truncated, because the engine really does store — and slice —
-///   the full padded width. Verified: `nchar(20)` holding `N'ab'` reports
-///   `LEN = 2`, while `SUBSTRING(…, 1, 20)` returns all 20 units. Such a cell
-///   used to render as complete while silently missing its padding.
-/// - Under a supplementary-character (`_SC`) collation `SUBSTRING` counts an
-///   astral character as one while this counts its two code units, so the
-///   probe can *over*-report. That direction is harmless: it marks a complete
-///   value as a preview, costing one redundant fetch that then returns the
-///   full value. Only under-reporting loses data.
-pub(crate) fn mssql_text_len(cast: &str) -> String {
-    format!("DATALENGTH({cast}) / 2")
 }
 
 #[cfg(test)]
@@ -1032,6 +894,49 @@ mod tests {
         // accepts for all of them (CLR UDTs stringify via their ToString).
         for t in ["sql_variant", "hierarchyid", "geography", "geometry"] {
             assert_eq!(classify_column(t), Text, "{t}");
+        }
+    }
+
+    #[test]
+    fn classify_column_matches_scalars_by_exact_base_name_not_substring() {
+        use ColumnClass::*;
+        // A user-defined type merely CONTAINING a scalar word must stay Text
+        // (previewed): a Scalar classification would fetch it whole and let
+        // an arbitrarily large value escape the preview memory bound.
+        for t in [
+            "fingerprint_data", // contains "int"
+            "timeline",         // contains "time"
+            "validated",        // contains "date"
+            "checkpoint",       // contains "point"
+            "serialized",       // contains "serial"
+            "orbit",            // contains "bit"
+            "unreal",           // contains "real"
+            "interval_stats",   // contains "interval"
+            "booleanish",       // contains "boolean"
+        ] {
+            assert_eq!(classify_column(t), Text, "{t}");
+        }
+        // Genuine scalar names still match: exact base name, any parameter
+        // suffix stripped, case ignored, multi-word Postgres names included.
+        for t in [
+            "int",
+            "tinyint",
+            "int8",
+            "UNSIGNED BIG INT",
+            "smallserial",
+            "float4",
+            "decimal(18,2)",
+            "NUMERIC(10, 2)",
+            "smallmoney",
+            "datetime2(7)",
+            "datetimeoffset",
+            "timestamp(3) with time zone",
+            "time without time zone",
+            "bit",
+            "bit varying(8)",
+            "interval",
+        ] {
+            assert_eq!(classify_column(t), Scalar, "{t}");
         }
     }
 

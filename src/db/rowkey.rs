@@ -2,13 +2,14 @@
 //!
 //! Editing must never target the wrong rows, so every UPDATE/DELETE needs a
 //! set of columns that uniquely identifies one row. [`detect_row_identity`]
-//! derives that from introspection metadata; [`update_sql`] / [`delete_sql`]
-//! build parameterized statements targeting the *full* key. The final
-//! safety net is [`DbPool::execute_checked`](super::DbPool::execute_checked),
-//! which rolls back unless the affected-row count matches expectations.
+//! derives that from introspection metadata; the value-aware statement
+//! builders in [`super::staged`] then target the *full* key it reports. The
+//! final safety net is
+//! [`DbPool::execute_checked`](super::DbPool::execute_checked), which rolls
+//! back unless the affected-row count matches expectations.
 
-use super::page::{quote_ident, Dialect};
 use super::schema::{TableKind, TableMeta};
+use super::sql::Dialect;
 
 /// How rows of one table are uniquely addressed by UPDATE/DELETE, in
 /// preference order: primary key, then a usable unique index, then (SQLite
@@ -111,87 +112,6 @@ fn rowid_accessor(table: &TableMeta) -> Option<String> {
                 .any(|c| c.name.eq_ignore_ascii_case(alias))
         })
         .map(str::to_string)
-}
-
-/// Parameterized UPDATE targeting exactly one row through the full key.
-///
-/// Returns the SQL plus the parameter sources in bind order: one entry per
-/// placeholder, naming the column whose value must be bound — the new
-/// values for `set_columns` first, then the key values for the WHERE
-/// clause (`rowid` for [`RowIdentity::Rowid`]).
-///
-/// `set_columns` must not be empty (there is nothing to update otherwise).
-pub fn update_sql(
-    table: &TableMeta,
-    identity: &RowIdentity,
-    set_columns: &[String],
-    dialect: Dialect,
-) -> (String, Vec<String>) {
-    debug_assert!(!set_columns.is_empty(), "UPDATE needs at least one SET");
-    let mut params = Vec::new();
-    let assignments: Vec<String> = set_columns
-        .iter()
-        .map(|column| {
-            format!(
-                "{} = {}",
-                quote_ident(column),
-                placeholder(dialect, &mut params, column)
-            )
-        })
-        .collect();
-    let sql = format!(
-        "UPDATE {} SET {} WHERE {}",
-        qualified_table(table),
-        assignments.join(", "),
-        key_clause(identity, dialect, &mut params),
-    );
-    (sql, params)
-}
-
-/// Parameterized DELETE targeting exactly one row through the full key.
-/// Parameter sources follow the same convention as [`update_sql`] (key
-/// values only, in key order).
-pub fn delete_sql(
-    table: &TableMeta,
-    identity: &RowIdentity,
-    dialect: Dialect,
-) -> (String, Vec<String>) {
-    let mut params = Vec::new();
-    let sql = format!(
-        "DELETE FROM {} WHERE {}",
-        qualified_table(table),
-        key_clause(identity, dialect, &mut params),
-    );
-    (sql, params)
-}
-
-/// `"k1" = ? AND "k2" = ?` over the full key, appending parameter sources.
-fn key_clause(identity: &RowIdentity, dialect: Dialect, params: &mut Vec<String>) -> String {
-    identity
-        .key_columns()
-        .iter()
-        .map(|column| {
-            format!(
-                "{} = {}",
-                quote_ident(column),
-                placeholder(dialect, params, column)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" AND ")
-}
-
-/// Next placeholder (`?` / `$n`), recording which column it binds.
-fn placeholder(dialect: Dialect, params: &mut Vec<String>, column: &str) -> String {
-    params.push(column.to_string());
-    dialect.placeholder(params.len())
-}
-
-fn qualified_table(table: &TableMeta) -> String {
-    match &table.schema {
-        Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(&table.name)),
-        None => quote_ident(&table.name),
-    }
 }
 
 #[cfg(test)]
@@ -498,105 +418,5 @@ mod tests {
             None,
             "no safe accessor left — read-only beats writing the wrong column"
         );
-    }
-
-    #[test]
-    fn update_sql_targets_the_full_composite_key_sqlite() {
-        let t = table(
-            TableKind::Table,
-            vec![
-                col("artist_id", false, Some(1)),
-                col("seq", false, Some(2)),
-                col("title", false, None),
-            ],
-            vec![],
-        );
-        let identity = detect_row_identity(&t, Dialect::Sqlite).unwrap();
-        let (sql, params) = update_sql(&t, &identity, &["title".into()], Dialect::Sqlite);
-        assert_eq!(
-            sql,
-            "UPDATE \"t\" SET \"title\" = ? WHERE \"artist_id\" = ? AND \"seq\" = ?"
-        );
-        assert_eq!(params, ["title", "artist_id", "seq"]);
-    }
-
-    #[test]
-    fn update_sql_uses_dollar_placeholders_and_schema_on_postgres() {
-        let mut t = table(
-            TableKind::Table,
-            vec![col("id", false, Some(1)), col("na\"me", true, None)],
-            vec![],
-        );
-        t.schema = Some("app data".into());
-        let identity = detect_row_identity(&t, Dialect::Postgres).unwrap();
-        let (sql, params) = update_sql(&t, &identity, &["na\"me".into()], Dialect::Postgres);
-        assert_eq!(
-            sql,
-            "UPDATE \"app data\".\"t\" SET \"na\"\"me\" = $1 WHERE \"id\" = $2"
-        );
-        assert_eq!(params, ["na\"me", "id"]);
-    }
-
-    #[test]
-    fn update_and_delete_sql_use_the_rowid_form() {
-        let t = table(TableKind::Table, vec![col("data", true, None)], vec![]);
-        let identity = detect_row_identity(&t, Dialect::Sqlite).unwrap();
-        let (sql, params) = update_sql(&t, &identity, &["data".into()], Dialect::Sqlite);
-        assert_eq!(sql, "UPDATE \"t\" SET \"data\" = ? WHERE \"rowid\" = ?");
-        assert_eq!(params, ["data", "rowid"]);
-        let (sql, params) = delete_sql(&t, &identity, Dialect::Sqlite);
-        assert_eq!(sql, "DELETE FROM \"t\" WHERE \"rowid\" = ?");
-        assert_eq!(params, ["rowid"]);
-    }
-
-    #[test]
-    fn update_and_delete_sql_use_at_p_placeholders_on_sqlserver() {
-        let mut t = table(
-            TableKind::Table,
-            vec![col("id", false, Some(1)), col("title", true, None)],
-            vec![],
-        );
-        t.schema = Some("dbo".into());
-        let identity = detect_row_identity(&t, Dialect::SqlServer).unwrap();
-        let (sql, params) = update_sql(&t, &identity, &["title".into()], Dialect::SqlServer);
-        assert_eq!(
-            sql,
-            "UPDATE \"dbo\".\"t\" SET \"title\" = @P1 WHERE \"id\" = @P2"
-        );
-        assert_eq!(params, ["title", "id"]);
-        let (sql, params) = delete_sql(&t, &identity, Dialect::SqlServer);
-        assert_eq!(sql, "DELETE FROM \"dbo\".\"t\" WHERE \"id\" = @P1");
-        assert_eq!(params, ["id"]);
-    }
-
-    #[test]
-    fn delete_sql_targets_the_full_key_on_postgres() {
-        let mut t = table(
-            TableKind::Table,
-            vec![col("region", false, Some(1)), col("slot", false, Some(2))],
-            vec![],
-        );
-        t.schema = Some("warehouse".into());
-        t.name = "locations".into();
-        let identity = detect_row_identity(&t, Dialect::Postgres).unwrap();
-        let (sql, params) = delete_sql(&t, &identity, Dialect::Postgres);
-        assert_eq!(
-            sql,
-            "DELETE FROM \"warehouse\".\"locations\" WHERE \"region\" = $1 AND \"slot\" = $2"
-        );
-        assert_eq!(params, ["region", "slot"]);
-    }
-
-    #[test]
-    fn unique_index_identity_targets_its_columns() {
-        let t = table(
-            TableKind::Table,
-            vec![col("email", false, None), col("bio", true, None)],
-            vec![index("uniq_email", true, &["email"])],
-        );
-        let identity = detect_row_identity(&t, Dialect::Postgres).unwrap();
-        let (sql, params) = update_sql(&t, &identity, &["bio".into()], Dialect::Postgres);
-        assert_eq!(sql, "UPDATE \"t\" SET \"bio\" = $1 WHERE \"email\" = $2");
-        assert_eq!(params, ["bio", "email"]);
     }
 }

@@ -18,6 +18,7 @@ mod registry;
 mod rowkey;
 mod schema;
 mod script;
+mod sql;
 mod sqlite;
 mod sqlserver;
 mod staged;
@@ -33,8 +34,8 @@ pub use error::DbError;
 pub use export::{write_result, ExportFormat};
 pub use fk::{build_fk_filter, resolve_referenced_column};
 pub use page::{
-    classify_column, ColumnClass, Dialect, Filter, FilterOp, Page, PageRequest, PreviewInfo,
-    SortDir, PREVIEW_BYTES,
+    classify_column, ColumnClass, Filter, FilterOp, Page, PageRequest, PreviewInfo, SortDir,
+    PREVIEW_BYTES,
 };
 pub use postgres::{
     build_url, normalize_pg_url, url_target, url_via_local_port, url_with_password,
@@ -43,7 +44,7 @@ pub use registry::{
     CellFetch, Connection, ConnectionId, ConnectionRegistry, DbPool, FETCH_CELL_MAX_BYTES,
     MAX_QUERY_ROWS, QUERY_CELL_CAP,
 };
-pub use rowkey::{delete_sql, detect_row_identity, update_sql, RowIdentity};
+pub use rowkey::{detect_row_identity, RowIdentity};
 pub use schema::{
     ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, Internal, TableKind, TableMeta, TypeDetail,
     TypeRef,
@@ -53,6 +54,7 @@ pub use script::{
     statement_needs, statement_preview, ScriptError, StatementKind, StatementNeeds,
     StatementOutcome, StatementResult,
 };
+pub use sql::Dialect;
 pub use sqlite::open_sqlite;
 pub use sqlserver::{
     build_mssql_url, mssql_url_target, mssql_url_via_local_port, mssql_url_with_password,

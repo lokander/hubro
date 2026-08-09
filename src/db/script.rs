@@ -14,8 +14,8 @@ use std::ops::Range;
 
 use super::caps::{self, Capabilities};
 use super::error::DbError;
-use super::page::Dialect;
 use super::registry::{DbPool, MAX_QUERY_ROWS};
+use super::sql::Dialect;
 use super::value::QueryResult;
 
 /// One lexed region of a SQL script. [`lex_regions`] is the single place
