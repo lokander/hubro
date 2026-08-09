@@ -337,12 +337,57 @@ async fn query_decodes_all_storage_classes() {
 }
 
 #[tokio::test]
-async fn query_with_no_rows_yields_empty_result() {
+async fn query_with_no_rows_yields_empty_result_with_its_headers() {
     let fixture = FixtureDb::full().await;
     let pool = fixture.open().await;
 
-    let empty = pool.query("SELECT * FROM albums WHERE 0").await.unwrap();
+    // A zero-row result still names its columns (FRE-138): the grid shows the
+    // shape of what was asked for rather than a blank pane, which is also what
+    // the SQL Server backend has always done (TDS sends result-set metadata
+    // even for zero rows). The sqlx backends have no row to read the names
+    // off, so they fall back to describing the statement.
+    let empty = pool
+        .query("SELECT artist_id, title FROM albums WHERE 0")
+        .await
+        .unwrap();
     assert!(empty.rows.is_empty());
+    let names: Vec<&str> = empty.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["artist_id", "title"]);
+
+    // Same contract on the capped/streaming path the SQL editor uses.
+    let (empty, truncated) = pool
+        .query_capped("SELECT artist_id, title FROM albums WHERE 0", &[], 100)
+        .await
+        .unwrap();
+    assert!(empty.rows.is_empty());
+    assert!(!truncated);
+    let names: Vec<&str> = empty.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["artist_id", "title"]);
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn statements_without_a_result_set_report_no_columns() {
+    let fixture = FixtureDb::full().await;
+    let pool = fixture.open().await;
+
+    // The header fallback describes the statement, and a statement with no
+    // result set has no columns to describe — that must stay an ordinary empty
+    // result rather than an error. `DROP TABLE` is the sharp case: re-preparing
+    // it after it ran fails outright ("no such table"), and a statement that
+    // already succeeded must not be turned into a failure just to explain a
+    // missing header.
+    pool.execute("CREATE TABLE headerless (x INTEGER)")
+        .await
+        .unwrap();
+    let (result, truncated) = pool
+        .query_capped("DROP TABLE headerless", &[], 100)
+        .await
+        .unwrap();
+    assert!(result.rows.is_empty());
+    assert!(result.columns.is_empty());
+    assert!(!truncated);
 
     pool.close().await;
 }

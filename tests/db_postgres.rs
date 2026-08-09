@@ -713,6 +713,44 @@ async fn postgres_query_capped_stops_and_bounds_cells() {
     pool.close().await;
 }
 
+/// A zero-row result still carries its column headers (FRE-138) — the same
+/// contract the SQLite and SQL Server backends hold to.
+#[tokio::test]
+async fn postgres_empty_results_keep_their_column_headers() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    fresh_fixture(&pool, "fruits_empty").await;
+
+    let sql = "SELECT id, name FROM fruits_empty WHERE false";
+    let empty = pool.query(sql).await.unwrap();
+    assert!(empty.rows.is_empty());
+    let names: Vec<&str> = empty.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["id", "name"]);
+
+    let (empty, truncated) = pool.query_capped(sql, &[], 100).await.unwrap();
+    assert!(empty.rows.is_empty());
+    assert!(!truncated);
+    let names: Vec<&str> = empty.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["id", "name"]);
+
+    // A statement with no result set has no header to recover, and must not
+    // become an error because of it.
+    pool.execute("DROP TABLE IF EXISTS pg_headerless")
+        .await
+        .unwrap();
+    pool.execute("CREATE TABLE pg_headerless (x integer)")
+        .await
+        .unwrap();
+    let (result, _) = pool
+        .query_capped("DROP TABLE pg_headerless", &[], 100)
+        .await
+        .unwrap();
+    assert!(result.rows.is_empty());
+    assert!(result.columns.is_empty());
+
+    pool.close().await;
+}
+
 /// Enum and array columns are reported by information_schema as the opaque
 /// `USER-DEFINED` / `ARRAY`, so introspection resolves the real structure
 /// from pg_catalog for the type-aware editors (FRE-71).

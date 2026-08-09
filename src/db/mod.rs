@@ -5,6 +5,14 @@
 //! about sqlx and concrete drivers. Async flow in components: run the
 //! `DbPool` futures inside `use_resource`/spawned tasks and store the
 //! resulting values in signals — never hold a signal borrow across an await.
+//!
+//! Result contract, identical on every backend (FRE-138): a query that
+//! returns no rows still returns its columns, so an empty `SELECT` shows its
+//! headers instead of a blank pane. SQL Server gets them from TDS metadata;
+//! the sqlx backends have no row to read them off and describe the statement
+//! instead (see [`sqlx_common::fill_headers`]). A statement with no result set
+//! at all — a `DROP TABLE` routed through the query path — legitimately
+//! reports no columns; that is the only empty-column case left.
 
 mod caps;
 mod clipboard;
@@ -21,6 +29,7 @@ mod script;
 mod sql;
 mod sqlite;
 mod sqlserver;
+mod sqlx_common;
 mod staged;
 mod url;
 mod value;

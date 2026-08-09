@@ -15,6 +15,7 @@ use super::schema::{ColumnMeta, TableMeta};
 use super::sql::{cell_fetch_sql, equalities_where, value_len, Dialect};
 use super::sqlite;
 use super::sqlserver::{self, MssqlPool, MssqlTx};
+use super::sqlx_common;
 use super::staged::{CheckedStatement, RowLocator};
 use super::value::{QueryResult, Value};
 
@@ -116,8 +117,10 @@ impl ScriptTx<'_> {
     /// Commits the transaction — the script's statements all take effect.
     pub async fn commit(self) -> Result<(), DbError> {
         match self {
-            ScriptTx::Sqlite(tx) => sqlite::commit_tx(tx).await,
-            ScriptTx::Postgres(tx) => postgres::commit_tx(tx).await,
+            // The two sqlx variants resolve identically, so they share one
+            // generic helper rather than one wrapper each.
+            ScriptTx::Sqlite(tx) => sqlx_common::commit_tx(tx).await,
+            ScriptTx::Postgres(tx) => sqlx_common::commit_tx(tx).await,
             ScriptTx::SqlServer(tx) => sqlserver::commit_tx(*tx).await,
         }
     }
@@ -128,8 +131,8 @@ impl ScriptTx<'_> {
     /// caller reports.
     pub async fn rollback(self) {
         match self {
-            ScriptTx::Sqlite(tx) => sqlite::rollback_tx(tx).await,
-            ScriptTx::Postgres(tx) => postgres::rollback_tx(tx).await,
+            ScriptTx::Sqlite(tx) => sqlx_common::rollback_tx(tx).await,
+            ScriptTx::Postgres(tx) => sqlx_common::rollback_tx(tx).await,
             ScriptTx::SqlServer(tx) => sqlserver::rollback_tx(*tx).await,
         }
     }

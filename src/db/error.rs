@@ -22,6 +22,16 @@ pub enum DbError {
 }
 
 impl DbError {
+    /// The guarded-write failure every backend raises when a statement in a
+    /// checked batch matched an unexpected number of rows. One constructor so
+    /// the three `execute_all_checked` implementations cannot drift in a
+    /// message the UI shows verbatim (and the tests match on).
+    pub(super) fn row_count_mismatch(affected: u64, expected: u64) -> DbError {
+        DbError::RowCountMismatch(format!(
+            "statement affected {affected} rows, expected {expected} — rolled back"
+        ))
+    }
+
     pub fn message(&self) -> &str {
         match self {
             DbError::Connect(m)
