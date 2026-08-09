@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use dioxus::prelude::*;
 use dioxus_icons::lucide::{
@@ -64,6 +65,65 @@ const GRID_SCROLL_JS: &str = r#"
   requestAnimationFrame(report);
 })();
 "#;
+
+/// Render data shared by many components, cloned by refcount rather than
+/// deep-copied into every one of them (FRE-130).
+///
+/// The grid hands the same per-table metadata to ~30 windowed rows (and the
+/// same row values to every cell of a row) on every render. As plain
+/// `HashMap`/`Vec` props that is a deep copy per row per render, plus a deep
+/// comparison per row when Dioxus decides whether the row changed. Behind this
+/// wrapper the clone is an `Arc` bump and the comparison is a pointer check.
+///
+/// The pointer check is a fast path, not the whole answer: the memos that
+/// build these values re-run whenever *any* key of a whole-map signal changes,
+/// so a rebuild that produced an identical value must still gate its
+/// dependents. Falling back to the structural comparison keeps that gating —
+/// the deep compare then costs once per rebuild instead of once per row per
+/// render. (Contrast [`SharedStatement`](super::state::SharedStatement), which
+/// is pointer-eq only: its payload is an immutable query result that is never
+/// rebuilt from equal inputs.)
+struct Shared<T>(Arc<T>);
+
+impl<T> Shared<T> {
+    fn new(value: T) -> Self {
+        Shared(Arc::new(value))
+    }
+}
+
+// Hand-written rather than derived: `#[derive(Clone)]` on a generic struct
+// would demand `T: Clone`, which is exactly what this wrapper exists to avoid.
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Shared(Arc::clone(&self.0))
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for Shared<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl<T> std::ops::Deref for Shared<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T: PartialEq> PartialEq for Shared<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
+    }
+}
+
+impl<T: Default> Default for Shared<T> {
+    fn default() -> Self {
+        Shared::new(T::default())
+    }
+}
 
 /// The cell whose in-place editor is open, addressed by row key
 /// ([`RowLocator::key`]) + column name. At most one editor is open per
@@ -455,35 +515,58 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         }
     });
 
-    // Keyboard-navigation model of the visible page (FRE-15): recomputed with
-    // the fetched page and the stage, read by the grid container's key handler
-    // for focus movement and Enter. Mirrors the render's row prep (view_rows)
-    // but owns its data so the `'static` key closure can read it off-render.
-    let nav_table = table.clone();
-    let grid_nav = use_memo(move || {
+    // The introspected metadata every row of this table renders against
+    // (FRE-130), built once here and handed to the row components as a single
+    // pointer-compared prop instead of a `HashMap`/`Vec` deep-cloned into each
+    // of the ~30 windowed rows on every render.
+    //
+    // A memo because `schemas` and `registry` are whole-map signals: a raw
+    // read would rebuild — and re-render every row — on any other connection's
+    // schema load. The memo re-runs then too, but its PartialEq gate stops the
+    // propagation there (FRE-129's pattern).
+    let render_table = table.clone();
+    let render_meta = use_memo(move || {
+        let schemas = state.schemas.read();
+        let dialect = state.registry.read().get(id).map(|c| c.pool.dialect());
+        Shared::new(TableRenderMeta::build(
+            find_table(schemas.get(&id), &render_table),
+            dialect,
+        ))
+    });
+
+    // The fetched page reduced to what the grid renders (FRE-130): headers,
+    // the rows with the stage applied, and the rows "select all on this page"
+    // ticks.
+    //
+    // This is the grid's expensive derivation — it clones every cell `Value`
+    // of the 100-row page. Deriving it in the render body re-ran it on every
+    // arrow key, shift-click, copy and checkbox tick, because the render also
+    // reads `focused_cell`, `selection`, `copy_status` and `selected`. Behind
+    // a memo it re-runs only when the page, the stage or the table's resolved
+    // access actually change; a focus move then costs the two `GridRow` diffs
+    // it should.
+    let page_table = table.clone();
+    let page_view = use_memo(move || {
+        let meta = render_meta();
         let current = rows_resource.read();
         let Some(Ok((page, extra_key))) = current.as_ref() else {
-            return GridNav::default();
+            return PageView::default();
         };
         let result = &page.result;
-        let table_meta = find_table(state.schemas.read().get(&id), &nav_table).cloned();
         // Same resolution the render uses, so keyboard navigation offers
         // exactly the editors the grid shows — the user's marking (FRE-111)
         // included. Resolving the *backend's* answer here instead would let
         // Enter open an editor on a cell the mouse correctly refuses.
-        let access = table_meta
-            .as_ref()
+        let access = find_table(state.schemas.read().get(&id), &page_table)
             .and_then(|meta| state.table_access(id, meta));
         let identity = access.as_ref().and_then(|a| a.identity.clone());
         let can_mutate = access.as_ref().is_some_and(TableAccess::can_mutate);
-        let column_kinds = column_kinds_of(table_meta.as_ref());
-        let stage = state.table_stage(id, &nav_table);
+        let stage = state.table_stage(id, &page_table);
+        // The fetch prepended the row-identity key column (rowid) when one was
+        // requested; keep it for locators, hide it from display.
         let hidden = usize::from(extra_key.is_some());
         let headers: Vec<String> = if result.columns.is_empty() {
-            table_meta
-                .as_ref()
-                .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
-                .unwrap_or_default()
+            meta.schema_columns.clone()
         } else {
             result
                 .columns
@@ -500,7 +583,21 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             stage.as_ref(),
             can_mutate,
         );
-        GridNav::build(headers, &rows, &column_kinds)
+        PageView {
+            headers: Shared::new(headers),
+            selectable: Shared::new(selectable_rows(&rows)),
+            rows,
+        }
+    });
+
+    // Keyboard-navigation model of the visible page (FRE-15): read by the grid
+    // container's key handler for focus movement and Enter. Built from the
+    // same `page_view` the render consumes — one row derivation, two readers —
+    // but owning its data so the `'static` key closure can read it off-render.
+    let grid_nav = use_memo(move || {
+        let view = page_view.read();
+        let meta = render_meta();
+        GridNav::build((*view.headers).clone(), &view.rows, &meta.column_kinds)
     });
 
     // Keep the focus ring inside the current page and seed it once data
@@ -633,31 +730,33 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         }
     });
 
-    // Introspected metadata for this table: column names feed the filter
-    // dropdown and header fallback (so headers exist even for zero-row
-    // results), and row-identity detection decides the read-only notice and
-    // how staged rows are addressed.
-    let table_meta: Option<TableMeta> = find_table(state.schemas.read().get(&id), &table).cloned();
-    let schema_columns: Vec<String> = table_meta
-        .as_ref()
-        .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
-        .unwrap_or_default();
-    // Foreign keys of this table drive the clickable FK cells (FRE-29).
-    // `col_to_fk` maps a referencing column to the index of the FK it belongs
-    // to; a column in several FKs takes the first (documented v1 limit).
-    let foreign_keys: Vec<ForeignKeyMeta> = table_meta
-        .as_ref()
-        .map(|t| t.foreign_keys.clone())
-        .unwrap_or_default();
-    let col_to_fk: HashMap<String, usize> = {
-        let mut map = HashMap::new();
-        for (index, fk) in foreign_keys.iter().enumerate() {
-            for column in &fk.columns {
-                map.entry(column.clone()).or_insert(index);
-            }
+    // The row detail panel's model (FRE-109). The panel's row is derived from
+    // the selection's focus, never stored: it cannot drift from the cell the
+    // grid has focused.
+    //
+    // Memoized (FRE-130): it clones the focused row's every value, and the
+    // render body below re-runs on every copy, tick and selection change.
+    // Reading `focused_cell` here is
+    // deliberate — the panel follows the grid's focus — but the memo's
+    // PartialEq gate means a move *within* one row (a left/right arrow)
+    // rebuilds an equal detail and re-renders nothing. Shared so the panel's
+    // prop stays pointer-comparable across the grid's own re-renders.
+    let detail = use_memo(move || {
+        // Nothing to derive while the panel is closed.
+        if !state.row_detail_open(id) {
+            return None;
         }
-        map
-    };
+        row_detail(&grid_nav.read(), *focused_cell.read(), &render_meta()).map(Shared::new)
+    });
+
+    // Introspected metadata for this table (see [`TableRenderMeta`]): column
+    // names feed the filter dropdown and the header fallback (so headers exist
+    // even for zero-row results), foreign keys drive the clickable FK cells
+    // (FRE-29), and the editor kinds decide what each cell may open.
+    let meta = render_meta();
+    // Row-identity detection decides the read-only notice and how staged rows
+    // are addressed.
+    let table_meta: Option<TableMeta> = find_table(state.schemas.read().get(&id), &table).cloned();
     // Whether the FK Back stack has anywhere to return to (reactive).
     let can_back = state.can_go_back(id);
 
@@ -670,12 +769,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let access: Option<TableAccess> = table_meta
         .as_ref()
         .and_then(|meta| state.table_access(id, meta));
-    let identity: Option<RowIdentity> = access.as_ref().and_then(|a| a.identity.clone());
     let can_mutate = access.as_ref().is_some_and(TableAccess::can_mutate);
-    // Per-column editor kind + nullability, from introspection. Cells whose
-    // column is missing here (transient schema/result mismatch) fall back
-    // to a plain text editor on a nullable column.
-    let column_kinds: HashMap<String, (EditorKind, bool)> = column_kinds_of(table_meta.as_ref());
     // Stated up front, so the absent editors are explained rather than just
     // missing.
     let read_only_notice: Option<&'static str> =
@@ -698,16 +792,9 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let save_error = stage.as_ref().and_then(|s| s.last_error.clone());
     // Insert/delete affordances only exist where editing works at all.
     let select_enabled = can_mutate;
-    // Required-column flagging for pending inserts: NOT NULL + no default +
-    // not auto-assigned (see required_insert_columns for the per-backend
-    // rules). Unfilled required cells red-flag and block Save.
-    let required: HashSet<String> = match (&table_meta, dialect) {
-        (Some(meta), Some(dialect)) => required_insert_columns(meta, dialect),
-        _ => HashSet::new(),
-    };
     let missing_required = stage
         .as_ref()
-        .map(|s| s.missing_required(&required))
+        .map(|s| s.missing_required(&meta.required))
         .unwrap_or(0);
     let delete_count = stage.as_ref().map(TableStage::delete_count).unwrap_or(0);
     // The confirmation stays armed only while its snapshot still matches
@@ -745,20 +832,6 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // and the open flag rides the persisted session.
     let detail_open = state.row_detail_open(id);
     let detail_width = clamp_detail_width(state.row_detail_width(id).unwrap_or(DETAIL_WIDTH));
-    // The panel's row is derived from the selection's focus, never stored:
-    // it cannot drift from the cell the grid has focused.
-    let detail: Option<RowDetail> = detail_open
-        .then(|| {
-            row_detail(
-                &grid_nav.read(),
-                *focused_cell.read(),
-                table_meta.as_ref().map_or(&[][..], |meta| &meta.columns),
-                &column_kinds,
-                &foreign_keys,
-                &col_to_fk,
-            )
-        })
-        .flatten();
     // Prev/Next in the panel move the GRID's focus, through the same
     // resolution an arrow key takes — the panel steers the one selection
     // rather than keeping a second row of its own.
@@ -945,10 +1018,10 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     class: "rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 text-xs text-slate-900 dark:text-slate-300",
                     onchange: move |evt| filter_column.set(evt.value()),
                     option { value: "", selected: filter_column.read().is_empty(), "column…" }
-                    for column in schema_columns.clone() {
+                    for column in meta.schema_columns.iter() {
                         option {
                             value: "{column}",
-                            selected: *filter_column.read() == column,
+                            selected: *filter_column.read() == *column,
                             "{column}"
                         }
                     }
@@ -1252,38 +1325,26 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                 Banner { kind: BannerKind::Error, message: err.to_string() }
                             }
                         },
-                        Some(Ok((page_data, extra_key))) => {
-                            let result = &page_data.result;
-                            // The fetch prepended the row-identity key column
-                            // (rowid) when one was requested; keep it for
-                            // locators, hide it from display.
-                            let hidden = usize::from(extra_key.is_some());
-                            let headers: Vec<String> = if result.columns.is_empty() {
-                                schema_columns.clone()
-                            } else {
-                                result.columns.iter().skip(hidden).map(|c| c.name.clone()).collect()
-                            };
-                            let rows = view_rows(result, &page_data.previews, hidden, identity.as_ref(), stage.as_ref(), can_mutate);
+                        Some(Ok(_)) => {
+                            // Rows, headers and the selectable set all come from
+                            // the `page_view` memo (FRE-130) — this arm no longer
+                            // re-derives them from the resource, so a focus move
+                            // or a copy costs nothing here.
+                            let view = page_view.read();
+                            let headers = view.headers.clone();
+                            let selectable = view.selectable.clone();
                             let pending_inserts: Vec<PendingInsert> = stage
                                 .as_ref()
                                 .map(|s| s.inserts().to_vec())
                                 .unwrap_or_default();
-                            // This page's selectable rows (addressable and not
-                            // already pending delete), for select-all-on-page.
-                            let selectable: Vec<(String, RowLocator)> = rows
-                                .iter()
-                                .filter(|r| !r.deleted)
-                                .filter_map(|r| Some((r.key.clone()?, r.locator.clone()?)))
-                                .collect();
                             let all_selected = !selectable.is_empty() && {
                                 let sel = selected.read();
                                 selectable.iter().all(|(key, _)| sel.contains_key(key))
                             };
-                            let insert_headers = headers.clone();
                             let insert_parent_table = row_table.clone();
                             let new_row_table = row_table.clone();
                             let empty = empty_state(
-                                rows.is_empty() && pending_inserts.is_empty(),
+                                view.rows.is_empty() && pending_inserts.is_empty(),
                                 applied_filter.read().is_some(),
                             );
                             // Windowed rendering (FRE-32): only rows in the visible
@@ -1291,17 +1352,16 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                             // the elided rows' total height keeps the scrollbar and
                             // offsets correct. `total_cols` sizes the spacers'
                             // single colspan cell across every column.
-                            let total_rows = rows.len();
+                            let total_rows = view.rows.len();
                             let total_cols = headers.len() + usize::from(select_enabled);
                             let (win_start, win_end) = *visible_range.read();
                             let (win_start, win_end) = (win_start.min(total_rows), win_end.min(total_rows));
                             let top_spacer = win_start as f64 * ROW_HEIGHT;
                             let bottom_spacer = (total_rows - win_end) as f64 * ROW_HEIGHT;
-                            let windowed_rows: Vec<(usize, RowView)> = rows
-                                .into_iter()
-                                .enumerate()
-                                .filter(|(index, _)| *index >= win_start && *index < win_end)
-                                .collect();
+                            // Only the window's rows are cloned out of the memo;
+                            // the rest of the page stays in it (FRE-130).
+                            let windowed_rows = window_rows(&view.rows, win_start, win_end);
+                            drop(view);
                             rsx! {
                                 match empty {
                                     // No-filter-match: distinct from an empty
@@ -1351,7 +1411,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                                                     selected.set(HashMap::new());
                                                                 } else {
                                                                     let mut map = selected.peek().clone();
-                                                                    for (key, locator) in &selectable {
+                                                                    for (key, locator) in selectable.iter() {
                                                                         map.insert(key.clone(), locator.clone());
                                                                     }
                                                                     selected.set(map);
@@ -1360,7 +1420,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                                         }
                                                     }
                                                 }
-                                                for (col_index , header) in headers.into_iter().enumerate() {
+                                                for (col_index , header) in headers.iter().cloned().enumerate() {
                                                     GridHeader {
                                                         name: header,
                                                         sort: sort_value.clone(),
@@ -1400,9 +1460,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                                     id,
                                                     table: row_table.clone(),
                                                     row,
-                                                    column_kinds: column_kinds.clone(),
-                                                    foreign_keys: foreign_keys.clone(),
-                                                    col_to_fk: col_to_fk.clone(),
+                                                    meta: meta.clone(),
                                                     dialect: dialect.unwrap_or(Dialect::Sqlite),
                                                     editing,
                                                     // The focused column in this row (FRE-15), else None; only the
@@ -1445,9 +1503,8 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                                     id,
                                                     table: insert_parent_table.clone(),
                                                     insert,
-                                                    headers: insert_headers.clone(),
-                                                    column_kinds: column_kinds.clone(),
-                                                    required: required.clone(),
+                                                    headers: headers.clone(),
+                                                    meta: meta.clone(),
                                                     dialect: dialect.unwrap_or(Dialect::Sqlite),
                                                     lead_cell: select_enabled,
                                                     editing,
@@ -1475,7 +1532,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     RowDetailPanel {
                         id,
                         table: detail_table,
-                        detail,
+                        detail: detail(),
                         width: detail_width,
                         dialect: dialect.unwrap_or(Dialect::Sqlite),
                         read_only_notice: read_only_notice.map(str::to_string),
@@ -1669,6 +1726,125 @@ struct RowView {
     cells: Vec<CellView>,
 }
 
+/// The fetched page reduced to exactly what the grid renders (FRE-130).
+///
+/// Built once per page/stage change by a memo and read by both the render and
+/// the keyboard-navigation model, so the page is never re-derived by a focus
+/// move, a copy or a checkbox tick. Structurally `PartialEq` (rather than
+/// pointer-compared) because that comparison is what gates those readers: a
+/// rebuild from unchanged inputs must re-render nothing.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct PageView {
+    /// Visible column names: the fetched result's, or the schema's when a
+    /// zero-row page carries none. [`Shared`] because the header list is also
+    /// handed to every pending-insert row.
+    headers: Shared<Vec<String>>,
+    /// The page's rows with the stage applied (see [`view_rows`]).
+    rows: Vec<RowView>,
+    /// The rows "select all on this page" ticks (see [`selectable_rows`]).
+    /// [`Shared`] because the checkbox handler has to own a copy.
+    selectable: Shared<Vec<(String, RowLocator)>>,
+}
+
+/// This page's selectable rows, in page order: those that are addressable and
+/// not already pending delete. Backs both the header checkbox's ticked state
+/// and what clicking it selects.
+fn selectable_rows(rows: &[RowView]) -> Vec<(String, RowLocator)> {
+    rows.iter()
+        .filter(|row| !row.deleted)
+        .filter_map(|row| Some((row.key.clone()?, row.locator.clone()?)))
+        .collect()
+}
+
+/// The `[start, end)` slice of the page to put in the DOM (FRE-32), each row
+/// paired with its index on the **whole page** — not its position in the
+/// window. Those indices are what the focus ring, the selection rectangle and
+/// the click handler address rows by, so they must survive the slicing.
+///
+/// Only these rows are cloned out of the [`PageView`] memo (FRE-130); the rest
+/// of the page is never copied per render. `start`/`end` are clamped by the
+/// caller against the page length.
+fn window_rows(rows: &[RowView], start: usize, end: usize) -> Vec<(usize, RowView)> {
+    rows[start..end]
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(offset, row)| (start + offset, row))
+        .collect()
+}
+
+/// Everything the grid's rows render against that comes from introspection
+/// rather than from the fetched page (FRE-130).
+///
+/// Bundled into one value so it can be shared by pointer: as separate props
+/// each of the ~30 windowed rows deep-cloned a `HashMap` and a `Vec` per
+/// render, and Dioxus then deep-compared them to decide the row hadn't
+/// changed. It changes only with the schema, so a memo rebuilds it far less
+/// often than the grid re-renders.
+#[derive(Debug, Default, PartialEq)]
+struct TableRenderMeta {
+    /// The table's column names in schema order: the filter dropdown's options
+    /// and the header fallback for a page with no rows to name them.
+    schema_columns: Vec<String>,
+    /// Full column metadata, for the detail panel's declared types.
+    columns: Vec<ColumnMeta>,
+    /// Per-column editor kind + nullability (see [`column_kinds_of`]).
+    column_kinds: HashMap<String, (EditorKind, bool)>,
+    /// Foreign keys of this table, indexed by `col_to_fk` (FRE-29).
+    foreign_keys: Vec<ForeignKeyMeta>,
+    /// Referencing column → index into `foreign_keys`; a column in several FKs
+    /// takes the first (documented v1 limit).
+    col_to_fk: HashMap<String, usize>,
+    /// Required-column flagging for pending inserts: NOT NULL + no default +
+    /// not auto-assigned (see [`required_insert_columns`] for the per-backend
+    /// rules). Unfilled required cells red-flag and block Save.
+    required: HashSet<String>,
+}
+
+impl TableRenderMeta {
+    /// Reduces one table's introspected metadata to what rendering needs.
+    /// `dialect` only feeds the required-column rules, which are per-backend;
+    /// without a live connection nothing is flagged (there is nothing to save
+    /// through either). Empty when the schema isn't loaded yet.
+    fn build(meta: Option<&TableMeta>, dialect: Option<Dialect>) -> Self {
+        let Some(meta) = meta else {
+            return TableRenderMeta::default();
+        };
+        let mut col_to_fk = HashMap::new();
+        for (index, fk) in meta.foreign_keys.iter().enumerate() {
+            for column in &fk.columns {
+                col_to_fk.entry(column.clone()).or_insert(index);
+            }
+        }
+        TableRenderMeta {
+            schema_columns: meta.columns.iter().map(|c| c.name.clone()).collect(),
+            columns: meta.columns.clone(),
+            column_kinds: column_kinds_of(Some(meta)),
+            foreign_keys: meta.foreign_keys.clone(),
+            col_to_fk,
+            required: dialect
+                .map(|dialect| required_insert_columns(meta, dialect))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Editor kind + nullability for one column; see [`column_kind`].
+    fn kind_of(&self, column: &str) -> (EditorKind, bool) {
+        column_kind(column, &self.column_kinds)
+    }
+
+    /// The foreign key this column belongs to, when following it leads
+    /// somewhere: a NULL key references nothing (FRE-29).
+    fn fk_of(&self, column: &str, value: &Value) -> Option<&ForeignKeyMeta> {
+        if value.is_null() {
+            return None;
+        }
+        self.col_to_fk
+            .get(column)
+            .and_then(|&index| self.foreign_keys.get(index))
+    }
+}
+
 /// Applies the stage to the fetched page: computes each row's locator from
 /// the identity's key columns (matched by name against the result), then
 /// substitutes staged cell values (dirty) and flags pending deletes. Rows
@@ -1844,7 +2020,14 @@ fn column_kinds_of(meta: Option<&TableMeta>) -> HashMap<String, (EditorKind, boo
 /// not deleted, value not a blob) and the column's type is editable
 /// (blob and database-generated columns are read-only).
 fn cell_editable(cell: &CellView, column_kinds: &HashMap<String, (EditorKind, bool)>) -> bool {
-    cell.editable && !cell_kind(cell, column_kinds).0.is_read_only()
+    editable_for_kind(cell, &cell_kind(cell, column_kinds).0)
+}
+
+/// [`cell_editable`] for a cell whose column kind has already been resolved —
+/// the row renderer looks each column up once and asks this (FRE-130), rather
+/// than repeating the lookup per question.
+fn editable_for_kind(cell: &CellView, kind: &EditorKind) -> bool {
+    cell.editable && !kind.is_read_only()
 }
 
 /// Editor kind + nullability for one column; columns missing from the
@@ -2148,7 +2331,8 @@ struct RowDetail {
     locator: Option<RowLocator>,
     fields: Vec<DetailField>,
     /// The whole row by column — the source of an FK jump's equality filter.
-    row_values: HashMap<String, Value>,
+    /// [`Shared`] because every field of the panel carries it (FRE-130).
+    row_values: Shared<HashMap<String, Value>>,
     position: DetailPosition,
 }
 
@@ -2162,30 +2346,24 @@ struct RowDetail {
 fn row_detail(
     nav: &GridNav,
     focused: Option<(usize, usize)>,
-    columns: &[ColumnMeta],
-    column_kinds: &HashMap<String, (EditorKind, bool)>,
-    foreign_keys: &[ForeignKeyMeta],
-    col_to_fk: &HashMap<String, usize>,
+    meta: &TableRenderMeta,
 ) -> Option<RowDetail> {
     // No focus yet means the page just arrived and the clamp effect is about
     // to seed one at (0, 0) — show that row now rather than flashing empty.
     let index = focused.map_or(0, |(row, _)| row);
     let row = nav.rows.get(index)?;
-    let types: HashMap<&str, String> = columns
+    let types: HashMap<&str, String> = meta
+        .columns
         .iter()
         .map(|column| (column.name.as_str(), display_type(column)))
         .collect();
     let mut fields = Vec::with_capacity(row.cells.len());
     let mut row_values = HashMap::with_capacity(row.cells.len());
     for cell in &row.cells {
-        let (kind, nullable) = column_kind(&cell.column, column_kinds);
+        let (kind, nullable) = meta.kind_of(&cell.column);
         fields.push(DetailField {
             type_name: types.get(cell.column.as_str()).cloned().unwrap_or_default(),
-            fk: col_to_fk
-                .get(&cell.column)
-                .filter(|_| !cell.value.is_null())
-                .and_then(|&index| foreign_keys.get(index))
-                .cloned(),
+            fk: meta.fk_of(&cell.column, &cell.value).cloned(),
             column: cell.column.clone(),
             value: cell.value.clone(),
             preview: cell.preview,
@@ -2202,7 +2380,7 @@ fn row_detail(
         row_key: row.key.clone().unwrap_or_else(|| format!("#{index}")),
         locator: row.locator.clone(),
         fields,
-        row_values,
+        row_values: Shared::new(row_values),
         position: DetailPosition {
             number: index + 1,
             total: nav.rows.len(),
@@ -2675,11 +2853,9 @@ fn GridRow(
     id: ConnectionId,
     table: TableRef,
     row: RowView,
-    column_kinds: HashMap<String, (EditorKind, bool)>,
-    /// Foreign keys of this table, indexed by `col_to_fk` (FRE-29).
-    foreign_keys: Vec<ForeignKeyMeta>,
-    /// Referencing column → index into `foreign_keys` (first FK wins).
-    col_to_fk: HashMap<String, usize>,
+    /// The table's introspected render metadata, shared by pointer with every
+    /// other row rather than deep-cloned into each of them (FRE-130).
+    meta: Shared<TableRenderMeta>,
     dialect: Dialect,
     editing: Signal<Option<ActiveEdit>>,
     /// The keyboard-focused column in this row (FRE-15), or `None` when the
@@ -2698,19 +2874,40 @@ fn GridRow(
     /// row's column → value map (the source of the jump's equality filter).
     on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>)>,
 ) -> Element {
+    // Every cell resolved against the table metadata exactly once (FRE-130):
+    // the editor kind and nullability, whether the cell may open an editor,
+    // and the foreign key it can jump through. The slot below used to redo
+    // three hash lookups per cell for the same three answers.
+    let cells: Vec<RowCell> = row
+        .cells
+        .iter()
+        .map(|cell| {
+            let (kind, nullable) = meta.kind_of(&cell.column);
+            RowCell {
+                editable: editable_for_kind(cell, &kind),
+                fk: meta.fk_of(&cell.column, &cell.value).cloned(),
+                cell: cell.clone(),
+                kind,
+                nullable,
+            }
+        })
+        .collect();
     // This row's Tab order: its editable columns, left to right.
-    let editable_columns: Vec<String> = row
-        .cells
-        .iter()
-        .filter(|cell| cell_editable(cell, &column_kinds))
-        .map(|cell| cell.column.clone())
-        .collect();
+    let editable_columns = Shared::new(
+        cells
+            .iter()
+            .filter(|resolved| resolved.editable)
+            .map(|resolved| resolved.cell.column.clone())
+            .collect::<Vec<String>>(),
+    );
     // The row's values by column, the source for any FK jump from this row.
-    let row_values: HashMap<String, Value> = row
-        .cells
-        .iter()
-        .map(|cell| (cell.column.clone(), cell.value.clone()))
-        .collect();
+    // Shared, so the cells carry a pointer to it rather than a copy each.
+    let row_values = Shared::new(
+        row.cells
+            .iter()
+            .map(|cell| (cell.column.clone(), cell.value.clone()))
+            .collect::<HashMap<String, Value>>(),
+    );
     // Rows pending delete (or unaddressable) can't be (re)selected; their
     // leading cell stays empty.
     let checkbox: Option<(String, RowLocator)> = match (&row.key, &row.locator) {
@@ -2747,38 +2944,49 @@ fn GridRow(
                     }
                 }
             }
-            for (col_index , cell) in row.cells.clone().into_iter().enumerate() {
+            for (col_index , resolved) in cells.into_iter().enumerate() {
                 GridCellSlot {
-                    key: "{cell.column}",
+                    key: "{resolved.cell.column}",
                     id,
                     table: table.clone(),
                     row_key: row.key.clone(),
                     locator: row.locator.clone(),
-                    kind: cell_kind(&cell, &column_kinds).0,
-                    nullable: cell_kind(&cell, &column_kinds).1,
-                    editable: cell_editable(&cell, &column_kinds),
+                    kind: resolved.kind,
+                    nullable: resolved.nullable,
+                    editable: resolved.editable,
                     focused: focused_col == Some(col_index),
                     selected: selected_cols
                         .is_some_and(|(left, right)| (left..=right).contains(&col_index)),
                     row_index,
                     col_index,
                     on_select_cell,
-                    cell: cell.clone(),
                     dialect,
                     editable_columns: editable_columns.clone(),
                     editing,
                     // FK cells (non-NULL value belonging to an FK) carry the
                     // jump payload: the FK plus this row's values. A NULL FK
                     // references nothing, so it renders as a plain cell.
-                    fk_jump: col_to_fk
-                        .get(&cell.column)
-                        .filter(|_| !cell.value.is_null())
-                        .map(|&index| (foreign_keys[index].clone(), row_values.clone())),
+                    fk_jump: resolved.fk.map(|fk| (fk, row_values.clone())),
+                    cell: resolved.cell,
                     on_fk_jump,
                 }
             }
         }
     }
+}
+
+/// One cell of a rendered row, resolved against [`TableRenderMeta`] once
+/// (FRE-130) instead of looked up again for each of the three answers a
+/// [`GridCellSlot`] needs.
+struct RowCell {
+    cell: CellView,
+    kind: EditorKind,
+    nullable: bool,
+    /// Row-level editability narrowed by the column's type — the same answer
+    /// [`cell_editable`] gives.
+    editable: bool,
+    /// The foreign key this cell can be followed through, if any.
+    fk: Option<ForeignKeyMeta>,
 }
 
 /// One cell of an editable-capable row: the display cell normally, or the
@@ -2804,13 +3012,13 @@ fn GridCellSlot(
     col_index: usize,
     on_select_cell: EventHandler<(usize, usize, bool)>,
     dialect: Dialect,
-    editable_columns: Vec<String>,
+    editable_columns: Shared<Vec<String>>,
     mut editing: Signal<Option<ActiveEdit>>,
     /// `Some((fk, row_values))` when this cell belongs to a foreign key and
     /// has a non-NULL value — renders a ↗ jump link (FRE-29). Editing the
     /// cell value stays on double-click/Enter, so navigation and editing never
     /// contend for the same gesture.
-    fk_jump: Option<(ForeignKeyMeta, HashMap<String, Value>)>,
+    fk_jump: Option<(ForeignKeyMeta, Shared<HashMap<String, Value>>)>,
     on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>)>,
 ) -> Element {
     let state = use_context::<AppState>();
@@ -2967,7 +3175,7 @@ fn GridCellSlot(
                             title: "Go to {fk.referenced_table}",
                             onclick: move |evt| {
                                 evt.stop_propagation();
-                                on_fk_jump.call((fk.clone(), row_values.clone()));
+                                on_fk_jump.call((fk.clone(), (*row_values).clone()));
                             },
                             "↗"
                         }
@@ -2987,9 +3195,11 @@ fn InsertRow(
     id: ConnectionId,
     table: TableRef,
     insert: PendingInsert,
-    headers: Vec<String>,
-    column_kinds: HashMap<String, (EditorKind, bool)>,
-    required: HashSet<String>,
+    /// The visible columns, shared with the grid's header row (FRE-130).
+    headers: Shared<Vec<String>>,
+    /// The table's introspected render metadata — the editor kinds and the
+    /// required-column set, shared by pointer with every other row.
+    meta: Shared<TableRenderMeta>,
     dialect: Dialect,
     /// Whether the grid renders the leading checkbox column (it does
     /// whenever inserts are possible; this keeps the phantom row aligned).
@@ -2999,20 +3209,26 @@ fn InsertRow(
     let state = use_context::<AppState>();
     let insert_id = insert.id();
     let row_key = insert.row_key();
+    // Each column resolved against the metadata once, like a fetched row's
+    // cells (FRE-130).
+    let columns: Vec<(String, EditorKind, bool)> = headers
+        .iter()
+        .map(|column| {
+            let (kind, nullable) = meta.kind_of(column);
+            (column.clone(), kind, nullable)
+        })
+        .collect();
     // Tab order: every editable column (blob and generated cells stay
     // "default" — there is no blob editor, and generated columns are
     // database-assigned). Columns missing from the metadata edit as text,
     // same fallback as existing rows.
-    let editable_columns: Vec<String> = headers
-        .iter()
-        .filter(|header| {
-            column_kinds
-                .get(*header)
-                .map(|(kind, _)| !kind.is_read_only())
-                .unwrap_or(true)
-        })
-        .cloned()
-        .collect();
+    let editable_columns = Shared::new(
+        columns
+            .iter()
+            .filter(|(_, kind, _)| !kind.is_read_only())
+            .map(|(column, _, _)| column.clone())
+            .collect::<Vec<String>>(),
+    );
     let remove_table = table.clone();
     rsx! {
         tr { class: "border-t border-dashed border-emerald-300 dark:border-emerald-700/60 bg-emerald-100 dark:bg-emerald-950/40",
@@ -3026,21 +3242,21 @@ fn InsertRow(
                     }
                 }
             }
-            for column in headers.clone() {
+            for (column , kind , nullable) in columns {
                 InsertCellSlot {
                     key: "{column}",
                     id,
                     table: table.clone(),
                     insert_id,
                     row_key: row_key.clone(),
-                    column: column.clone(),
                     override_value: insert.value(&column).cloned(),
-                    kind: column_kinds.get(&column).map(|(kind, _)| kind.clone()).unwrap_or(EditorKind::Text),
-                    nullable: column_kinds.get(&column).map(|(_, nullable)| *nullable).unwrap_or(true),
-                    missing: required.contains(&column) && insert.lacks_value(&column),
+                    missing: meta.required.contains(&column) && insert.lacks_value(&column),
+                    kind,
+                    nullable,
                     dialect,
                     editable_columns: editable_columns.clone(),
                     editing,
+                    column,
                 }
             }
         }
@@ -3071,7 +3287,7 @@ fn InsertCellSlot(
     nullable: bool,
     missing: bool,
     dialect: Dialect,
-    editable_columns: Vec<String>,
+    editable_columns: Shared<Vec<String>>,
     mut editing: Signal<Option<ActiveEdit>>,
 ) -> Element {
     let state = use_context::<AppState>();
@@ -3219,7 +3435,7 @@ fn TruncatedCellEditor(
     kind: EditorKind,
     dialect: Dialect,
     nullable: bool,
-    editable_columns: Vec<String>,
+    editable_columns: Shared<Vec<String>>,
     mut editing: Signal<Option<ActiveEdit>>,
 ) -> Element {
     let state = use_context::<AppState>();
@@ -3489,8 +3705,10 @@ fn detail_resize_js() -> String {
 fn RowDetailPanel(
     id: ConnectionId,
     table: TableRef,
-    /// The focused row, or `None` when the page has no rows.
-    detail: Option<RowDetail>,
+    /// The focused row, or `None` when the page has no rows. [`Shared`] so
+    /// this prop stays pointer-comparable while the grid re-renders around it
+    /// (FRE-130) — the panel only rebuilds when the focused row changes.
+    detail: Option<Shared<RowDetail>>,
     width: f64,
     dialect: Dialect,
     /// Why editing is unavailable (FRE-87/FRE-111) — the grid's sentence,
@@ -3580,10 +3798,10 @@ fn RowDetailPanel(
                             id,
                             table,
                             dialect,
-                            fields: detail.fields,
-                            locator: detail.locator,
-                            row_values: detail.row_values,
-                            row_key: detail.row_key,
+                            fields: detail.fields.clone(),
+                            locator: detail.locator.clone(),
+                            row_values: detail.row_values.clone(),
+                            row_key: detail.row_key.clone(),
                             grid_editing,
                             editing,
                             on_fk_jump,
@@ -3608,7 +3826,7 @@ fn RowDetailFields(
     table: TableRef,
     fields: Vec<DetailField>,
     locator: Option<RowLocator>,
-    row_values: HashMap<String, Value>,
+    row_values: Shared<HashMap<String, Value>>,
     dialect: Dialect,
     grid_editing: Signal<Option<ActiveEdit>>,
     /// The open editor, owned by `DataGrid` rather than created here. This
@@ -3626,11 +3844,16 @@ fn RowDetailFields(
     // an editor, so including it would dead-end the Tab walk on something that
     // can never take focus. `PreviewInfo::full_len` predicts that before the
     // fetch resolves, which is the same answer `CellFetch::capped` gives after.
-    let editable_columns: Vec<String> = fields
-        .iter()
-        .filter(|field| field.editable && !field.over_fetch_cap())
-        .map(|field| field.column.clone())
-        .collect();
+    //
+    // Shared, so each field carries a pointer to the list rather than its own
+    // copy of it (FRE-130).
+    let editable_columns = Shared::new(
+        fields
+            .iter()
+            .filter(|field| field.editable && !field.over_fetch_cap())
+            .map(|field| field.column.clone())
+            .collect::<Vec<String>>(),
+    );
     rsx! {
         dl { class: "divide-y divide-slate-200 dark:divide-slate-800",
             for field in fields {
@@ -3661,9 +3884,9 @@ fn RowDetailRow(
     table: TableRef,
     field: DetailField,
     locator: Option<RowLocator>,
-    row_values: HashMap<String, Value>,
+    row_values: Shared<HashMap<String, Value>>,
     dialect: Dialect,
-    editable_columns: Vec<String>,
+    editable_columns: Shared<Vec<String>>,
     /// The focused row's identity, so an open editor is matched on row as well
     /// as column and cannot reappear on a same-named field of another row.
     row_key: String,
@@ -3696,7 +3919,7 @@ fn RowDetailRow(
                     a {
                         class: "shrink-0 cursor-pointer select-none text-cyan-600 dark:text-cyan-400 hover:underline",
                         title: "Go to {fk.referenced_table}",
-                        onclick: move |_| on_fk_jump.call((fk.clone(), row_values.clone())),
+                        onclick: move |_| on_fk_jump.call((fk.clone(), (*row_values).clone())),
                         "↗"
                     }
                 }
@@ -3776,7 +3999,7 @@ fn RowDetailFullValue(
     field: DetailField,
     locator: RowLocator,
     dialect: Dialect,
-    editable_columns: Vec<String>,
+    editable_columns: Shared<Vec<String>>,
     /// The focused row's identity, so an open editor is matched on row as well
     /// as column and cannot reappear on a same-named field of another row.
     row_key: String,
@@ -3846,7 +4069,7 @@ fn RowDetailValue(
     value: Value,
     locator: Option<RowLocator>,
     dialect: Dialect,
-    editable_columns: Vec<String>,
+    editable_columns: Shared<Vec<String>>,
     /// The focused row's identity, so an open editor is matched on row as well
     /// as column and cannot reappear on a same-named field of another row.
     row_key: String,
@@ -4282,6 +4505,124 @@ mod tests {
     }
 
     #[test]
+    fn only_addressable_undeleted_rows_can_be_ticked() {
+        let result = two_column_result();
+        // Nothing staged: both rows are addressable, so both are selectable.
+        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), None, true);
+        let keys: Vec<String> = selectable_rows(&rows)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(
+            selectable_rows(&rows)[0].1.identity_values,
+            vec![Value::Integer(1)],
+            "the locator travels with the key",
+        );
+        // A row already pending delete drops out — ticking it again would
+        // stage a second delete for a row the user can no longer see.
+        let mut stage = TableStage::default();
+        stage.mark_delete(RowLocator {
+            identity_values: vec![Value::Integer(1)],
+        });
+        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), Some(&stage), true);
+        assert_eq!(selectable_rows(&rows).len(), 1);
+        assert_eq!(selectable_rows(&rows)[0].0, keys[1]);
+        // A table with no identity has nothing to address, so nothing to tick.
+        let rows = view_rows(&result, &[], 0, None, None, true);
+        assert!(selectable_rows(&rows).is_empty());
+    }
+
+    #[test]
+    fn a_windowed_row_keeps_its_index_on_the_whole_page() {
+        // The focus ring, the selection rectangle and the click handler all
+        // address rows by page index, so slicing the window must not renumber
+        // them from zero.
+        let result = QueryResult {
+            rows: (1..=5)
+                .map(|n| vec![Value::Integer(n), Value::Text(format!("row {n}"))])
+                .collect(),
+            ..two_column_result()
+        };
+        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), None, true);
+        let window = window_rows(&rows, 2, 4);
+        assert_eq!(
+            window.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            [2, 3]
+        );
+        assert_eq!(window[0].1.cells[1].value, Value::Text("row 3".into()));
+        // The whole page and an empty window are both fine.
+        assert_eq!(window_rows(&rows, 0, 5).len(), 5);
+        assert!(window_rows(&rows, 5, 5).is_empty());
+    }
+
+    #[test]
+    fn shared_render_data_compares_by_pointer_then_by_value() {
+        // The pointer check is a fast path: two clones of one value are equal
+        // without touching the contents…
+        let first = Shared::new(vec!["a".to_string(), "b".to_string()]);
+        let same = first.clone();
+        assert_eq!(first, same);
+        // …but a rebuild that produced an identical value must still compare
+        // equal, or every memo rebuild would re-render every row that holds it.
+        let rebuilt = Shared::new(vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(first, rebuilt);
+        assert!(
+            !Arc::ptr_eq(&first.0, &rebuilt.0),
+            "…and that is genuinely a different allocation"
+        );
+        // Different contents still differ, so real changes propagate.
+        assert_ne!(first, Shared::new(vec!["a".to_string()]));
+    }
+
+    #[test]
+    fn render_metadata_resolves_kinds_and_foreign_keys_once_per_table() {
+        let meta = TableRenderMeta::build(Some(&detail_table_meta()), Some(Dialect::Sqlite));
+        assert_eq!(meta.schema_columns, ["id", "title"]);
+        // Editor kinds come from the same helper the grid has always used.
+        assert_eq!(meta.kind_of("title"), (EditorKind::Text, true));
+        // A column missing from the metadata edits as nullable text.
+        assert_eq!(meta.kind_of("nope"), (EditorKind::Text, true));
+        // A non-NULL FK column offers the jump; the same column NULL doesn't
+        // (a NULL foreign key references nothing), nor does a plain column.
+        assert_eq!(
+            meta.fk_of("title", &Value::Text("x".into()))
+                .map(|fk| fk.referenced_table.as_str()),
+            Some("titles")
+        );
+        assert!(meta.fk_of("title", &Value::Null).is_none());
+        assert!(meta.fk_of("id", &Value::Integer(1)).is_none());
+        // Without a schema (or without a connection to name the dialect)
+        // nothing is resolved rather than half-resolved.
+        assert_eq!(
+            TableRenderMeta::build(None, None),
+            TableRenderMeta::default()
+        );
+        assert!(TableRenderMeta::build(Some(&detail_table_meta()), None)
+            .required
+            .is_empty());
+    }
+
+    #[test]
+    fn a_column_in_several_foreign_keys_takes_the_first() {
+        // Documented v1 limit: the jump affordance follows one FK per column.
+        let mut table = detail_table_meta();
+        table.foreign_keys.push(ForeignKeyMeta {
+            columns: vec!["title".into()],
+            referenced_schema: None,
+            referenced_table: "other".into(),
+            referenced_columns: vec![Some("name".into())],
+        });
+        let meta = TableRenderMeta::build(Some(&table), Some(Dialect::Sqlite));
+        assert_eq!(meta.col_to_fk["title"], 0);
+        assert_eq!(
+            meta.fk_of("title", &Value::Text("x".into()))
+                .map(|fk| fk.referenced_table.as_str()),
+            Some("titles")
+        );
+    }
+
+    #[test]
     fn tab_order_steps_within_the_row_and_stops_at_the_edges() {
         let columns = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         assert_eq!(step_column(&columns, "a", 1), Some("b".into()));
@@ -4703,27 +5044,24 @@ mod tests {
     /// `title`.
     struct DetailFixture {
         nav: GridNav,
-        columns: Vec<ColumnMeta>,
-        kinds: HashMap<String, (EditorKind, bool)>,
-        fks: Vec<ForeignKeyMeta>,
-        col_to_fk: HashMap<String, usize>,
+        meta: TableRenderMeta,
     }
 
     impl DetailFixture {
         /// [`row_detail`] over this fixture's metadata.
         fn detail(&self, nav: &GridNav, focused: Option<(usize, usize)>) -> Option<RowDetail> {
-            row_detail(
-                nav,
-                focused,
-                &self.columns,
-                &self.kinds,
-                &self.fks,
-                &self.col_to_fk,
-            )
+            row_detail(nav, focused, &self.meta)
+        }
+
+        /// Shorthand for the column kinds a [`GridNav`] is built against.
+        fn kinds(&self) -> &HashMap<String, (EditorKind, bool)> {
+            &self.meta.column_kinds
         }
     }
 
-    fn detail_fixture() -> DetailFixture {
+    /// A two-column table (`id` int PK, `title` text) with a foreign key on
+    /// `title`.
+    fn detail_table_meta() -> TableMeta {
         let column = |name: &str, type_name: &str, pk: Option<u32>| ColumnMeta {
             name: name.into(),
             type_name: type_name.into(),
@@ -4733,38 +5071,33 @@ mod tests {
             generated: Generated::Never,
             type_detail: crate::db::TypeDetail::Plain,
         };
-        let columns = vec![
-            column("id", "INTEGER", Some(1)),
-            column("title", "TEXT", None),
-        ];
-        let column_kinds = column_kinds_of(Some(&TableMeta {
+        TableMeta {
             schema: None,
             name: "t".into(),
             kind: crate::db::TableKind::Table,
-            columns: columns.clone(),
+            columns: vec![
+                column("id", "INTEGER", Some(1)),
+                column("title", "TEXT", None),
+            ],
             indexes: vec![],
-            foreign_keys: vec![],
+            foreign_keys: vec![ForeignKeyMeta {
+                columns: vec!["title".into()],
+                referenced_schema: None,
+                referenced_table: "titles".into(),
+                referenced_columns: vec![Some("name".into())],
+            }],
             restriction: None,
             internal: None,
             kind_label: None,
-        }));
-        let foreign_keys = vec![ForeignKeyMeta {
-            columns: vec!["title".into()],
-            referenced_schema: None,
-            referenced_table: "titles".into(),
-            referenced_columns: vec![Some("name".into())],
-        }];
-        let col_to_fk = [("title".to_string(), 0)].into_iter().collect();
+        }
+    }
+
+    fn detail_fixture() -> DetailFixture {
+        let meta = TableRenderMeta::build(Some(&detail_table_meta()), Some(Dialect::Sqlite));
         let result = two_column_result();
         let rows = view_rows(&result, &[], 0, Some(&pk_identity()), None, true);
-        let nav = GridNav::build(vec!["id".into(), "title".into()], &rows, &column_kinds);
-        DetailFixture {
-            nav,
-            columns,
-            kinds: column_kinds,
-            fks: foreign_keys,
-            col_to_fk,
-        }
+        let nav = GridNav::build(vec!["id".into(), "title".into()], &rows, &meta.column_kinds);
+        DetailFixture { nav, meta }
     }
 
     #[test]
@@ -4834,7 +5167,7 @@ mod tests {
         let fixture = detail_fixture();
         let result = two_column_result();
         let rows = view_rows(&result, &[], 0, Some(&pk_identity()), None, false);
-        let nav = GridNav::build(vec!["id".into(), "title".into()], &rows, &fixture.kinds);
+        let nav = GridNav::build(vec!["id".into(), "title".into()], &rows, fixture.kinds());
         let detail = fixture.detail(&nav, Some((0, 0))).unwrap();
         assert!(detail.fields.iter().all(|field| !field.editable));
         // Reading still works: the row stays addressable so previews load.
@@ -4854,7 +5187,7 @@ mod tests {
         );
         let result = two_column_result();
         let rows = view_rows(&result, &[], 0, Some(&pk_identity()), Some(&stage), true);
-        let nav = GridNav::build(vec!["id".into(), "title".into()], &rows, &fixture.kinds);
+        let nav = GridNav::build(vec!["id".into(), "title".into()], &rows, fixture.kinds());
         let detail = fixture.detail(&nav, Some((0, 0))).unwrap();
         assert!(detail.fields[1].dirty);
         assert_eq!(detail.fields[1].value, Value::Text("edited".into()));
