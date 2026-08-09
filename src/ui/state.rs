@@ -417,6 +417,220 @@ pub(crate) fn entra_secret_key(url: &str) -> String {
     format!("{url}#entra")
 }
 
+/// A secret to hand a server backend at connect time. Which variant a connect
+/// carries decides how the backend uses it: Postgres takes a password and an
+/// Entra token the same way — spliced into the URL — while SQL Server splices
+/// the password but hands the token to the driver as an AAD login, since a
+/// token sent as a password is just a rejected password.
+enum ServerCredential<'a> {
+    /// Nothing known: connect with the URL as-is. Trust auth succeeds; a
+    /// server that wants a password answers with the failure that raises the
+    /// password prompt.
+    None,
+    /// The database password — from session memory, the OS keyring, or the
+    /// prompt.
+    Password(&'a str),
+    /// A Microsoft Entra access token (never a refresh token).
+    EntraToken(&'a str),
+}
+
+/// The per-engine data the server connect flows are parameterized over.
+///
+/// Postgres and SQL Server connect through the same sequence — reserve, open
+/// the tunnel, find a credential, open the pool, prompt or save — and used to
+/// carry two line-for-line copies of it (FRE-139). They differ only in engine
+/// *data*: which URL helpers apply, which OAuth resource Entra tokens are
+/// minted for, whether a tunneled connect needs a TLS host override, and which
+/// [`SavedConnection`] variant a success persists. That data lives here and the
+/// flow is written once, the same split [`crate::db`]'s `UrlScheme` descriptor
+/// makes one layer down.
+///
+/// `Copy`, and passed by value: every connect flow is an `async fn` on
+/// [`AppState`] that may be spawned onto a root task, and a plain value avoids
+/// borrowing a descriptor across those awaits.
+#[derive(Clone, Copy)]
+pub struct ServerBackend {
+    /// Which backend this is. Carried into the prompts, which park a connect
+    /// across a UI round-trip and must resume it on the same engine.
+    pub kind: BackendKind,
+    /// Splices a secret into a URL as its password.
+    with_password: fn(&str, &str) -> Result<String, DbError>,
+    /// The host and port an SSH tunnel must forward to.
+    url_target: fn(&str) -> Result<(String, u16), DbError>,
+    /// Rewrites a URL onto the tunnel's forwarded local port.
+    via_local_port: fn(&str, u16) -> Result<String, DbError>,
+    /// The OAuth resource this engine's Entra tokens are minted for.
+    entra_resource: &'static str,
+}
+
+impl ServerBackend {
+    pub const POSTGRES: ServerBackend = ServerBackend {
+        kind: BackendKind::Postgres,
+        with_password: url_with_password,
+        url_target,
+        via_local_port: url_via_local_port,
+        entra_resource: azure::OSSRDBMS_RESOURCE,
+    };
+
+    pub const SQL_SERVER: ServerBackend = ServerBackend {
+        kind: BackendKind::SqlServer,
+        with_password: mssql_url_with_password,
+        url_target: mssql_url_target,
+        via_local_port: mssql_url_via_local_port,
+        entra_resource: azure::SQLDB_RESOURCE,
+    };
+
+    /// The descriptor for a saved entry's or a prompt's backend. SQLite maps
+    /// to Postgres because it never reaches these flows at all — it has no
+    /// URL, no auth mode and no prompts — which is exactly what the
+    /// `if backend == SqlServer { … } else { … }` dispatch these flows
+    /// replaced did with it.
+    pub fn of(kind: BackendKind) -> ServerBackend {
+        match kind {
+            BackendKind::SqlServer => ServerBackend::SQL_SERVER,
+            _ => ServerBackend::POSTGRES,
+        }
+    }
+
+    /// The TLS host override a connect needs, or `None` when the engine has no
+    /// such notion.
+    ///
+    /// Only SQL Server does, and only through a tunnel: the connect URL then
+    /// points at `127.0.0.1:<forwarded>`, but `encrypt=on` must keep
+    /// validating the server's real certificate (see
+    /// [`crate::db::open_mssql_with`]). The URL is parsed again here, which
+    /// the tunnel open already did, so the fallible parse cannot practically
+    /// fail. Postgres returns `None` unconditionally — sqlx validates against
+    /// the URL's own host, and there is no parameter to leak this into.
+    fn tls_host(&self, url: &str, tunneled: bool) -> Option<String> {
+        match self.kind {
+            BackendKind::SqlServer if tunneled => (self.url_target)(url).ok().map(|(host, _)| host),
+            _ => None,
+        }
+    }
+
+    /// Opens the pool with `credential`, splicing it into the URL or handing
+    /// it to the driver as this engine requires.
+    ///
+    /// A `match` on the kind rather than another function pointer in the
+    /// descriptor: the two openers differ in *shape*, not just identity (SQL
+    /// Server takes an auth mode and a TLS host beside the URL), and an async
+    /// function pointer would have to be boxed per call while still needing
+    /// this argument juggling somewhere.
+    async fn open(
+        &self,
+        connect_url: &str,
+        credential: ServerCredential<'_>,
+        tls_host: Option<&str>,
+    ) -> Result<DbPool, DbError> {
+        match self.kind {
+            BackendKind::SqlServer => {
+                let (url, auth) = match credential {
+                    ServerCredential::None => (connect_url.to_string(), MssqlAuth::Password),
+                    ServerCredential::Password(password) => (
+                        (self.with_password)(connect_url, password)?,
+                        MssqlAuth::Password,
+                    ),
+                    // tiberius logs in with the token itself; the URL's
+                    // user/password are ignored, so nothing is spliced in.
+                    ServerCredential::EntraToken(token) => (
+                        connect_url.to_string(),
+                        MssqlAuth::AadToken(token.to_string()),
+                    ),
+                };
+                DbPool::open_mssql_with(&url, &auth, tls_host).await
+            }
+            // Postgres takes both secrets the same way, and has no TLS host
+            // override to pass.
+            _ => {
+                let url = match credential {
+                    ServerCredential::None => connect_url.to_string(),
+                    ServerCredential::Password(secret) | ServerCredential::EntraToken(secret) => {
+                        (self.with_password)(connect_url, secret)?
+                    }
+                };
+                DbPool::open_postgres(&url).await
+            }
+        }
+    }
+
+    /// The saved-list entry a successful connect persists.
+    fn saved(
+        &self,
+        name: &str,
+        url: &str,
+        tunnel: Option<TunnelConfig>,
+        auth: PgAuth,
+    ) -> SavedConnection {
+        let name = name.to_string();
+        let url = url.to_string();
+        match self.kind {
+            BackendKind::SqlServer => SavedConnection::SqlServer {
+                name,
+                url,
+                tunnel,
+                auth,
+                protection: WriteProtection::Open,
+                color: None,
+            },
+            _ => SavedConnection::Postgres {
+                name,
+                url,
+                tunnel,
+                auth,
+                protection: WriteProtection::Open,
+                color: None,
+            },
+        }
+    }
+}
+
+/// Acquires one Entra token for `url`'s connection: redeem the cached refresh
+/// token when there is one, otherwise fall through to `open_browser`.
+///
+/// The four token acquisitions in the connect flows (two engines × silent and
+/// interactive) differ only in the resource and that opener, so this is the one
+/// place the keyring's cached refresh token is read. A keyring error means "no
+/// cached token" and falls through, exactly as an absent one does; only a
+/// refresh token is ever stored under [`entra_secret_key`], never an access
+/// token.
+async fn acquire_entra(
+    entra: &EntraAuth,
+    resource: &str,
+    url: &str,
+    open_browser: impl FnOnce(&str) -> Result<(), azure::AzureError>,
+) -> Result<azure::AccessToken, azure::AzureError> {
+    let cached = crate::secrets::get_password_async(entra_secret_key(url))
+        .await
+        .ok()
+        .flatten();
+    azure::acquire_token(
+        entra,
+        resource,
+        cached.as_deref(),
+        &azure::Endpoints::default(),
+        azure::INTERACTIVE_TIMEOUT,
+        open_browser,
+    )
+    .await
+}
+
+/// The opener a *silent* acquisition passes: it refuses to open a browser, so
+/// an interactive sign-in with no usable refresh token errors here and the
+/// flow can park the sign-in card instead of popping a window unasked.
+fn refuse_browser(_url: &str) -> Result<(), azure::AzureError> {
+    Err(azure::AzureError::Browser(
+        "interactive sign-in required".to_string(),
+    ))
+}
+
+/// The opener the sign-in card passes: the user asked for the browser.
+fn open_browser(auth_url: &str) -> Result<(), azure::AzureError> {
+    webbrowser::open(auth_url)
+        .map(|_| ())
+        .map_err(|e| azure::AzureError::Browser(e.to_string()))
+}
+
 /// Whether any table stage anywhere in the staged map has pending edits. Pure
 /// so the window-close guard's predicate can be unit-tested without a running
 /// reactive context.
@@ -870,31 +1084,8 @@ impl AppState {
         }
     }
 
-    /// Adds a Postgres connection to the saved list (URL stored without a
-    /// password; tunnel settings, sans passphrase, stored alongside) and
-    /// persists.
-    pub fn add_saved_postgres(
-        mut self,
-        name: String,
-        url: String,
-        tunnel: Option<TunnelConfig>,
-        auth: PgAuth,
-    ) {
-        let added = self.saved.write().add(SavedConnection::Postgres {
-            name,
-            url,
-            tunnel,
-            auth,
-            protection: WriteProtection::Open,
-            color: None,
-        });
-        if added {
-            self.persist_saved();
-        }
-    }
-
     /// Applies an edit to a saved connection (FRE-75): overwrites the entry
-    /// at `old_locator` — name included, which [`Self::add_saved_postgres`]
+    /// at `old_locator` — name included, which [`Self::save_server_if_open`]
     /// deliberately never does — and persists.
     ///
     /// When the edit changes host/port/database the normalized locator moves
@@ -971,14 +1162,19 @@ impl AppState {
         self.finish_connect(locator, tab_title(&path), result, None);
     }
 
-    /// Opens a saved Postgres connection. With a tunnel configured, the
-    /// tunnel opens first (its failures surface as "SSH tunnel: …", distinct
-    /// from database errors) and Postgres connects through the forwarded
-    /// port. Uses the session password when one is known; otherwise tries
-    /// without and falls back to a password prompt on authentication failure
-    /// (so trust-auth servers connect silently).
-    pub async fn connect_postgres(
+    /// Opens a saved server connection — Postgres or SQL Server, per
+    /// `backend` (FRE-139). With a tunnel configured, the tunnel opens first
+    /// (its failures surface as "SSH tunnel: …", distinct from database
+    /// errors) and the database connects through the forwarded port; for SQL
+    /// Server, TLS keeps validating the server's real hostname (see
+    /// [`crate::db::open_mssql_with`]). Entra auth acquires a token silently
+    /// or parks the sign-in card. Password auth uses the session password when
+    /// one is known, then the OS keyring; otherwise it tries without and falls
+    /// back to a password prompt on authentication failure (so trust-auth
+    /// servers connect silently).
+    pub async fn connect_server(
         mut self,
+        backend: ServerBackend,
         url: String,
         name: String,
         tunnel: Option<TunnelConfig>,
@@ -987,17 +1183,17 @@ impl AppState {
         self.connect_error.set(None);
         if self.focus_or_reserve(&url) {
             // Already open (or reserved): no connect runs, so the save below
-            // never fires. An edit still has to land — save_*_if_open no-ops
-            // unless the locator is genuinely open (FRE-75).
-            self.save_postgres_if_open(&url, &name, tunnel.clone(), auth.clone());
+            // never fires. An edit still has to land — save_server_if_open
+            // no-ops unless the locator is genuinely open (FRE-75).
+            self.save_server_if_open(backend, &url, &name, tunnel.clone(), auth.clone());
             return;
         }
-        let Some((connect_url, live_tunnel)) = self
-            .open_tunnel(&url, &name, &tunnel, &auth, BackendKind::Postgres)
-            .await
+        let Some((connect_url, live_tunnel)) =
+            self.open_tunnel(&url, &name, &tunnel, &auth, backend).await
         else {
             return; // failure already surfaced (error or passphrase/host-key prompt)
         };
+        let tls_host = backend.tls_host(&url, tunnel.is_some());
         match auth {
             PgAuth::Entra(entra) => {
                 let pending = EntraPrompt {
@@ -1005,9 +1201,9 @@ impl AppState {
                     name,
                     tunnel,
                     entra,
-                    backend: BackendKind::Postgres,
+                    backend: backend.kind,
                 };
-                self.connect_postgres_entra(pending, connect_url, live_tunnel)
+                self.connect_server_entra(backend, pending, connect_url, tls_host, live_tunnel)
                     .await;
                 return;
             }
@@ -1027,36 +1223,33 @@ impl AppState {
         }
         let had_password = session_password.is_some();
         self.set_step(&url, ConnectStep::Opening);
-        let result = match &session_password {
-            Some(password) => match url_with_password(&connect_url, password) {
-                Ok(full) => DbPool::open_postgres(&full).await,
-                Err(err) => Err(err),
-            },
-            None => DbPool::open_postgres(&connect_url).await,
+        let credential = match &session_password {
+            Some(password) => ServerCredential::Password(password),
+            None => ServerCredential::None,
         };
+        let result = backend
+            .open(&connect_url, credential, tls_host.as_deref())
+            .await;
         match result {
             Err(DbError::Connect(msg)) if msg.contains("authentication failed") => {
                 self.release_connect(&url);
                 if had_password {
-                    // Stored password is stale; drop it everywhere and re-ask.
-                    self.session_passwords.write().remove(&url);
-                    let _ = crate::secrets::delete_password_async(url.clone()).await;
-                    self.connect_error
-                        .set(Some(format!("connection failed: {msg}")));
+                    self.forget_stale_secret(url.clone(), format!("connection failed: {msg}"))
+                        .await;
                 }
                 // live_tunnel drops here; the retry re-opens it.
                 self.password_prompt.set(Some(PasswordPrompt {
                     url,
                     name,
                     kind: PromptKind::DbPassword,
-                    backend: BackendKind::Postgres,
+                    backend: backend.kind,
                     tunnel,
                     auth: PgAuth::Password,
                 }));
             }
             result => {
                 self.finish_connect(url.clone(), name.clone(), result, live_tunnel);
-                self.save_postgres_if_open(&url, &name, tunnel, PgAuth::Password);
+                self.save_server_if_open(backend, &url, &name, tunnel, PgAuth::Password);
             }
         }
     }
@@ -1066,348 +1259,26 @@ impl AppState {
     /// (the browser opener errors, so a missing/expired refresh falls through to
     /// the sign-in card rather than opening a window here). The tunnel is
     /// already open; on a silent success we connect, otherwise park the sign-in.
-    async fn connect_postgres_entra(
+    async fn connect_server_entra(
         mut self,
-        pending: EntraPrompt,
-        connect_url: String,
-        live_tunnel: Option<Tunnel>,
-    ) {
-        self.set_step(&pending.url, ConnectStep::SigningIn);
-        let cached = crate::secrets::get_password_async(entra_secret_key(&pending.url))
-            .await
-            .ok()
-            .flatten();
-        // Silent-only opener: a missing/expired refresh token errors here rather
-        // than opening a browser, so interactive falls through to the card.
-        let token = azure::acquire_token(
-            &pending.entra,
-            azure::OSSRDBMS_RESOURCE,
-            cached.as_deref(),
-            &azure::Endpoints::default(),
-            azure::INTERACTIVE_TIMEOUT,
-            |_url| {
-                Err(azure::AzureError::Browser(
-                    "interactive sign-in required".to_string(),
-                ))
-            },
-        )
-        .await;
-        match token {
-            Ok(token) => {
-                self.finish_entra_connect(pending, &connect_url, token, live_tunnel)
-                    .await;
-            }
-            // Interactive with no usable refresh token: park behind the sign-in
-            // card. Drop the tunnel; the sign-in retry re-opens it.
-            Err(_) if matches!(pending.entra, EntraAuth::Interactive { .. }) => {
-                self.release_connect(&pending.url);
-                drop(live_tunnel);
-                self.entra_prompt.set(Some(pending));
-            }
-            Err(err) => {
-                drop(live_tunnel);
-                self.fail_connect(&pending.url, err.to_string());
-            }
-        }
-    }
-
-    /// Splices an acquired Entra token in as the password, opens the pool, and
-    /// on success caches the refresh token (never the access token) and saves
-    /// the connection with its Entra auth mode.
-    async fn finish_entra_connect(
-        mut self,
-        pending: EntraPrompt,
-        connect_url: &str,
-        token: azure::AccessToken,
-        live_tunnel: Option<Tunnel>,
-    ) {
-        let EntraPrompt {
-            url,
-            name,
-            tunnel,
-            entra,
-            ..
-        } = pending;
-        let result = match url_with_password(connect_url, &token.secret) {
-            Ok(full) => DbPool::open_postgres(&full).await,
-            Err(err) => Err(err),
-        };
-        let connected = result.is_ok();
-        self.finish_connect(url.clone(), name.clone(), result, live_tunnel);
-        if connected {
-            self.entra_prompt.set(None);
-            // Cache the refresh token for silent renewals; best-effort.
-            if let Some(refresh) = token.refresh_token {
-                let _ = crate::secrets::store_password_async(entra_secret_key(&url), refresh).await;
-            }
-            self.save_postgres_if_open(&url, &name, tunnel, PgAuth::Entra(entra));
-        }
-    }
-
-    /// Resumes an interactive Entra connect from the sign-in card: opens the
-    /// browser, waits for the redirect, and connects with the acquired token.
-    pub async fn connect_postgres_with_entra_signin(mut self, prompt: EntraPrompt) {
-        self.connect_error.set(None);
-        self.entra_prompt.set(None);
-        if self.focus_or_reserve(&prompt.url) {
-            return;
-        }
-        let Some((connect_url, live_tunnel)) = self
-            .open_tunnel(
-                &prompt.url,
-                &prompt.name,
-                &prompt.tunnel,
-                &PgAuth::Entra(prompt.entra.clone()),
-                BackendKind::Postgres,
-            )
-            .await
-        else {
-            return;
-        };
-        let cached = crate::secrets::get_password_async(entra_secret_key(&prompt.url))
-            .await
-            .ok()
-            .flatten();
-        let token = azure::acquire_token(
-            &prompt.entra,
-            azure::OSSRDBMS_RESOURCE,
-            cached.as_deref(),
-            &azure::Endpoints::default(),
-            azure::INTERACTIVE_TIMEOUT,
-            |auth_url| {
-                webbrowser::open(auth_url)
-                    .map(|_| ())
-                    .map_err(|e| azure::AzureError::Browser(e.to_string()))
-            },
-        )
-        .await;
-        match token {
-            Ok(token) => {
-                self.finish_entra_connect(prompt, &connect_url, token, live_tunnel)
-                    .await;
-            }
-            Err(err) => {
-                drop(live_tunnel);
-                self.fail_connect(&prompt.url, err.to_string());
-                // Re-raise the card so the user can retry the sign-in in place.
-                self.entra_prompt.set(Some(prompt));
-            }
-        }
-    }
-
-    /// Completes the password prompt: connects with the entered password
-    /// (through the tunnel when one is configured). On success the password
-    /// always lives in session memory; with `remember` it is also stored in
-    /// the OS keyring (silently staying session-only when no keyring is
-    /// available).
-    pub async fn connect_postgres_with_password(
-        mut self,
-        url: String,
-        name: String,
-        password: String,
-        remember: bool,
-        tunnel: Option<TunnelConfig>,
-    ) {
-        self.connect_error.set(None);
-        // The prompt replaces the reservation made by connect_postgres, so
-        // re-reserve here.
-        if self.focus_or_reserve(&url) {
-            // Already open (or reserved): no connect runs, so the save
-            // below never fires. An edit still has to land —
-            // save_*_if_open no-ops unless the locator is genuinely open
-            // (FRE-75).
-            self.save_postgres_if_open(&url, &name, tunnel.clone(), PgAuth::Password);
-            return;
-        }
-        let Some((connect_url, live_tunnel)) = self
-            .open_tunnel(
-                &url,
-                &name,
-                &tunnel,
-                &PgAuth::Password,
-                BackendKind::Postgres,
-            )
-            .await
-        else {
-            return;
-        };
-        let result = match url_with_password(&connect_url, &password) {
-            Ok(full) => DbPool::open_postgres(&full).await,
-            Err(err) => Err(err),
-        };
-        if result.is_ok() {
-            if remember {
-                // Off-thread; surface a non-fatal notice when the user asked
-                // to remember but the keyring store failed.
-                let store =
-                    crate::secrets::store_password_async(url.clone(), password.clone()).await;
-                if store.is_err() {
-                    self.connect_error.set(Some(
-                        "connected, but the password could not be stored in the system \
-                         keyring — it is remembered for this session only"
-                            .to_string(),
-                    ));
-                }
-            }
-            self.session_passwords.write().insert(url.clone(), password);
-            self.password_prompt.set(None);
-        }
-        self.finish_connect(url.clone(), name.clone(), result, live_tunnel);
-        self.save_postgres_if_open(&url, &name, tunnel, PgAuth::Password);
-    }
-
-    /// Completes the SSH-passphrase prompt: remembers the passphrase for the
-    /// session and re-runs the connect flow (which now finds it), preserving the
-    /// original auth mode. Keyring persistence happens only after the connect
-    /// succeeded, so a mistyped passphrase is never stored.
-    pub async fn connect_postgres_with_ssh_passphrase(
-        mut self,
-        url: String,
-        name: String,
-        tunnel: TunnelConfig,
-        passphrase: String,
-        remember: bool,
-        auth: PgAuth,
-    ) {
-        self.stash_ssh_passphrase(&url, passphrase);
-        self.password_prompt.set(None);
-        self.connect_postgres(url.clone(), name, Some(tunnel), auth)
-            .await;
-        let connected = self.open_locators.read().iter().any(|(_, l)| *l == url);
-        if remember && connected {
-            self.persist_ssh_passphrase(&url).await;
-        }
-    }
-
-    /// Opens a saved SQL Server connection (FRE-57; tunnels and Entra FRE-58).
-    /// Mirrors [`Self::connect_postgres`]: with a tunnel configured it opens
-    /// first and the driver connects through the forwarded port (TLS keeps
-    /// validating the server's real hostname — see
-    /// [`crate::db::open_mssql_with`]); Entra auth acquires a token silently or
-    /// parks the sign-in card; password auth uses the session password when one
-    /// is known, then the OS keyring, otherwise tries without and falls back to
-    /// a password prompt on authentication failure.
-    pub async fn connect_sqlserver(
-        mut self,
-        url: String,
-        name: String,
-        tunnel: Option<TunnelConfig>,
-        auth: PgAuth,
-    ) {
-        self.connect_error.set(None);
-        if self.focus_or_reserve(&url) {
-            // Already open (or reserved): no connect runs, so the save below
-            // never fires. An edit still has to land — save_*_if_open no-ops
-            // unless the locator is genuinely open (FRE-75).
-            self.save_sqlserver_if_open(&url, &name, tunnel.clone(), auth.clone());
-            return;
-        }
-        let Some((connect_url, live_tunnel)) = self
-            .open_tunnel(&url, &name, &tunnel, &auth, BackendKind::SqlServer)
-            .await
-        else {
-            return; // failure already surfaced (error or passphrase/host-key prompt)
-        };
-        let tls_host = mssql_tls_host(&url, tunnel.is_some());
-        match auth {
-            PgAuth::Entra(entra) => {
-                let pending = EntraPrompt {
-                    url,
-                    name,
-                    tunnel,
-                    entra,
-                    backend: BackendKind::SqlServer,
-                };
-                self.connect_sqlserver_entra(pending, connect_url, tls_host, live_tunnel)
-                    .await;
-                return;
-            }
-            PgAuth::Password => {}
-        }
-        // Session memory first, then the OS keyring (off-thread, and only
-        // after the session read guard is dropped); errors mean "no keyring"
-        // and fall through to the prompt flow.
-        self.set_step(&url, ConnectStep::Credentials);
-        let mut session_password = self.session_passwords.read().get(&url).cloned();
-        if session_password.is_none() {
-            session_password = crate::secrets::get_password_async(url.clone())
-                .await
-                .ok()
-                .flatten();
-        }
-        let had_password = session_password.is_some();
-        self.set_step(&url, ConnectStep::Opening);
-        let result = match &session_password {
-            Some(password) => match mssql_url_with_password(&connect_url, password) {
-                Ok(full) => {
-                    DbPool::open_mssql_with(&full, &MssqlAuth::Password, tls_host.as_deref()).await
-                }
-                Err(err) => Err(err),
-            },
-            None => {
-                DbPool::open_mssql_with(&connect_url, &MssqlAuth::Password, tls_host.as_deref())
-                    .await
-            }
-        };
-        match result {
-            Err(DbError::Connect(msg)) if msg.contains("authentication failed") => {
-                self.release_connect(&url);
-                if had_password {
-                    // Stored password is stale; drop it everywhere and re-ask.
-                    self.session_passwords.write().remove(&url);
-                    let _ = crate::secrets::delete_password_async(url.clone()).await;
-                    self.connect_error
-                        .set(Some(format!("connection failed: {msg}")));
-                }
-                // live_tunnel drops here; the retry re-opens it.
-                self.password_prompt.set(Some(PasswordPrompt {
-                    url,
-                    name,
-                    kind: PromptKind::DbPassword,
-                    backend: BackendKind::SqlServer,
-                    tunnel,
-                    auth: PgAuth::Password,
-                }));
-            }
-            result => {
-                self.finish_connect(url.clone(), name.clone(), result, live_tunnel);
-                self.save_sqlserver_if_open(&url, &name, tunnel, PgAuth::Password);
-            }
-        }
-    }
-
-    /// The Entra branch of the SQL Server connect — the mirror of
-    /// [`Self::connect_postgres_entra`] with the Azure SQL token resource:
-    /// silent acquisition only (managed identity, or a cached refresh token);
-    /// interactive with nothing cached parks the sign-in card.
-    async fn connect_sqlserver_entra(
-        mut self,
+        backend: ServerBackend,
         pending: EntraPrompt,
         connect_url: String,
         tls_host: Option<String>,
         live_tunnel: Option<Tunnel>,
     ) {
         self.set_step(&pending.url, ConnectStep::SigningIn);
-        let cached = crate::secrets::get_password_async(entra_secret_key(&pending.url))
-            .await
-            .ok()
-            .flatten();
-        let token = azure::acquire_token(
+        let token = acquire_entra(
             &pending.entra,
-            azure::SQLDB_RESOURCE,
-            cached.as_deref(),
-            &azure::Endpoints::default(),
-            azure::INTERACTIVE_TIMEOUT,
-            |_url| {
-                Err(azure::AzureError::Browser(
-                    "interactive sign-in required".to_string(),
-                ))
-            },
+            backend.entra_resource,
+            &pending.url,
+            refuse_browser,
         )
         .await;
         match token {
             Ok(token) => {
-                self.finish_sqlserver_entra_connect(
+                self.finish_entra_connect(
+                    backend,
                     pending,
                     &connect_url,
                     tls_host,
@@ -1430,11 +1301,13 @@ impl AppState {
         }
     }
 
-    /// Feeds an acquired Entra token to tiberius as its AAD auth method, opens
-    /// the pool, and on success caches the refresh token (never the access
-    /// token) and saves the connection with its Entra auth mode.
-    async fn finish_sqlserver_entra_connect(
+    /// Logs in with an acquired Entra token — spliced in as the password for
+    /// Postgres, handed to tiberius as its AAD auth method for SQL Server —
+    /// and on success caches the refresh token (never the access token) and
+    /// saves the connection with its Entra auth mode.
+    async fn finish_entra_connect(
         mut self,
+        backend: ServerBackend,
         pending: EntraPrompt,
         connect_url: &str,
         tls_host: Option<String>,
@@ -1448,12 +1321,13 @@ impl AppState {
             entra,
             ..
         } = pending;
-        let result = DbPool::open_mssql_with(
-            connect_url,
-            &MssqlAuth::AadToken(token.secret),
-            tls_host.as_deref(),
-        )
-        .await;
+        let result = backend
+            .open(
+                connect_url,
+                ServerCredential::EntraToken(&token.secret),
+                tls_host.as_deref(),
+            )
+            .await;
         let connected = result.is_ok();
         self.finish_connect(url.clone(), name.clone(), result, live_tunnel);
         if connected {
@@ -1462,15 +1336,17 @@ impl AppState {
             if let Some(refresh) = token.refresh_token {
                 let _ = crate::secrets::store_password_async(entra_secret_key(&url), refresh).await;
             }
-            self.save_sqlserver_if_open(&url, &name, tunnel, PgAuth::Entra(entra));
+            self.save_server_if_open(backend, &url, &name, tunnel, PgAuth::Entra(entra));
         }
     }
 
-    /// Resumes an interactive Entra SQL Server connect from the sign-in card:
-    /// opens the browser, waits for the redirect, and connects with the
-    /// acquired token. The mirror of
-    /// [`Self::connect_postgres_with_entra_signin`].
-    pub async fn connect_sqlserver_with_entra_signin(mut self, prompt: EntraPrompt) {
+    /// Resumes an interactive Entra connect from the sign-in card: opens the
+    /// browser, waits for the redirect, and connects with the acquired token.
+    pub async fn connect_server_with_entra_signin(
+        mut self,
+        backend: ServerBackend,
+        prompt: EntraPrompt,
+    ) {
         self.connect_error.set(None);
         self.entra_prompt.set(None);
         if self.focus_or_reserve(&prompt.url) {
@@ -1482,33 +1358,24 @@ impl AppState {
                 &prompt.name,
                 &prompt.tunnel,
                 &PgAuth::Entra(prompt.entra.clone()),
-                BackendKind::SqlServer,
+                backend,
             )
             .await
         else {
             return;
         };
-        let tls_host = mssql_tls_host(&prompt.url, prompt.tunnel.is_some());
-        let cached = crate::secrets::get_password_async(entra_secret_key(&prompt.url))
-            .await
-            .ok()
-            .flatten();
-        let token = azure::acquire_token(
+        let tls_host = backend.tls_host(&prompt.url, prompt.tunnel.is_some());
+        let token = acquire_entra(
             &prompt.entra,
-            azure::SQLDB_RESOURCE,
-            cached.as_deref(),
-            &azure::Endpoints::default(),
-            azure::INTERACTIVE_TIMEOUT,
-            |auth_url| {
-                webbrowser::open(auth_url)
-                    .map(|_| ())
-                    .map_err(|e| azure::AzureError::Browser(e.to_string()))
-            },
+            backend.entra_resource,
+            &prompt.url,
+            open_browser,
         )
         .await;
         match token {
             Ok(token) => {
-                self.finish_sqlserver_entra_connect(
+                self.finish_entra_connect(
+                    backend,
                     prompt,
                     &connect_url,
                     tls_host,
@@ -1526,13 +1393,14 @@ impl AppState {
         }
     }
 
-    /// Completes the password prompt for a SQL Server connection: connects
-    /// with the entered password (through the tunnel when one is configured).
-    /// On success the password always lives in session memory; with `remember`
-    /// it is also stored in the OS keyring (silently staying session-only when
-    /// no keyring is available).
-    pub async fn connect_sqlserver_with_password(
+    /// Completes the password prompt: connects with the entered password
+    /// (through the tunnel when one is configured). On success the password
+    /// always lives in session memory; with `remember` it is also stored in
+    /// the OS keyring (silently staying session-only when no keyring is
+    /// available).
+    pub async fn connect_server_with_password(
         mut self,
+        backend: ServerBackend,
         url: String,
         name: String,
         password: String,
@@ -1540,37 +1408,34 @@ impl AppState {
         tunnel: Option<TunnelConfig>,
     ) {
         self.connect_error.set(None);
-        // The prompt replaces the reservation made by connect_sqlserver, so
+        // The prompt replaces the reservation made by connect_server, so
         // re-reserve here.
         if self.focus_or_reserve(&url) {
             // Already open (or reserved): no connect runs, so the save
             // below never fires. An edit still has to land —
-            // save_*_if_open no-ops unless the locator is genuinely open
+            // save_server_if_open no-ops unless the locator is genuinely open
             // (FRE-75).
-            self.save_sqlserver_if_open(&url, &name, tunnel.clone(), PgAuth::Password);
+            self.save_server_if_open(backend, &url, &name, tunnel.clone(), PgAuth::Password);
             return;
         }
         let Some((connect_url, live_tunnel)) = self
-            .open_tunnel(
-                &url,
-                &name,
-                &tunnel,
-                &PgAuth::Password,
-                BackendKind::SqlServer,
-            )
+            .open_tunnel(&url, &name, &tunnel, &PgAuth::Password, backend)
             .await
         else {
             return;
         };
-        let tls_host = mssql_tls_host(&url, tunnel.is_some());
-        let result = match mssql_url_with_password(&connect_url, &password) {
-            Ok(full) => {
-                DbPool::open_mssql_with(&full, &MssqlAuth::Password, tls_host.as_deref()).await
-            }
-            Err(err) => Err(err),
-        };
+        let tls_host = backend.tls_host(&url, tunnel.is_some());
+        let result = backend
+            .open(
+                &connect_url,
+                ServerCredential::Password(&password),
+                tls_host.as_deref(),
+            )
+            .await;
         if result.is_ok() {
             if remember {
+                // Off-thread; surface a non-fatal notice when the user asked
+                // to remember but the keyring store failed.
                 let store =
                     crate::secrets::store_password_async(url.clone(), password.clone()).await;
                 if store.is_err() {
@@ -1585,36 +1450,58 @@ impl AppState {
             self.password_prompt.set(None);
         }
         self.finish_connect(url.clone(), name.clone(), result, live_tunnel);
-        self.save_sqlserver_if_open(&url, &name, tunnel, PgAuth::Password);
+        self.save_server_if_open(backend, &url, &name, tunnel, PgAuth::Password);
     }
 
-    /// Completes the SSH-passphrase prompt for a SQL Server connection —
-    /// the mirror of [`Self::connect_postgres_with_ssh_passphrase`].
-    pub async fn connect_sqlserver_with_ssh_passphrase(
+    /// Completes the SSH-passphrase prompt: remembers the passphrase for the
+    /// session and re-runs the parked connect (which now finds it), on the
+    /// backend and auth mode the prompt carried. Keyring persistence happens
+    /// only after the connect succeeded, so a mistyped passphrase is never
+    /// stored.
+    ///
+    /// Takes the whole prompt rather than its parts because that is what it
+    /// completes — and an SSH-passphrase prompt always carries the tunnel
+    /// config to resume; one without is a no-op.
+    pub async fn connect_server_with_ssh_passphrase(
         mut self,
-        url: String,
-        name: String,
-        tunnel: TunnelConfig,
+        prompt: PasswordPrompt,
         passphrase: String,
         remember: bool,
-        auth: PgAuth,
     ) {
+        let PasswordPrompt {
+            url,
+            name,
+            backend,
+            tunnel,
+            auth,
+            ..
+        } = prompt;
+        let Some(tunnel) = tunnel else { return };
         self.stash_ssh_passphrase(&url, passphrase);
         self.password_prompt.set(None);
-        self.connect_sqlserver(url.clone(), name, Some(tunnel), auth)
-            .await;
+        self.connect_server(
+            ServerBackend::of(backend),
+            url.clone(),
+            name,
+            Some(tunnel),
+            auth,
+        )
+        .await;
         let connected = self.open_locators.read().iter().any(|(_, l)| *l == url);
         if remember && connected {
             self.persist_ssh_passphrase(&url).await;
         }
     }
 
-    /// A successful SQL Server connect always joins the saved list (add is a
+    /// A successful server connect always joins the saved list (add is a
     /// no-op when URL, tunnel, and auth are already saved, and updates the
-    /// tunnel/auth of an existing entry otherwise) — the same "connect first,
-    /// save on success" contract as [`Self::save_postgres_if_open`].
-    fn save_sqlserver_if_open(
+    /// tunnel/auth of an existing entry otherwise). This keeps the "connect
+    /// first, save on success" contract for every path — including the ones
+    /// that went through a prompt or the Entra sign-in card rather than the
+    /// form's direct path — which is why the forms themselves never save.
+    fn save_server_if_open(
         self,
+        backend: ServerBackend,
         url: &str,
         name: &str,
         tunnel: Option<TunnelConfig>,
@@ -1622,15 +1509,21 @@ impl AppState {
     ) {
         let is_open = self.open_locators.read().iter().any(|(_, l)| l == url);
         if is_open {
-            self.save_or_apply_edit(SavedConnection::SqlServer {
-                name: name.to_string(),
-                url: url.to_string(),
-                tunnel,
-                auth,
-                protection: WriteProtection::Open,
-                color: None,
-            });
+            self.save_or_apply_edit(backend.saved(name, url, tunnel, auth));
         }
+    }
+
+    /// Drops a secret that just failed from everywhere it is remembered — this
+    /// session and the OS keyring — and surfaces `message`, so the retry prompt
+    /// starts from a clean slate instead of silently re-offering the credential
+    /// that was rejected. `key` is the connection URL for a database password,
+    /// [`ssh_secret_key`] for an SSH key passphrase.
+    async fn forget_stale_secret(mut self, key: String, message: String) {
+        // The write guard is a statement temporary: nothing is held across the
+        // keyring await below.
+        self.session_passwords.write().remove(&key);
+        let _ = crate::secrets::delete_password_async(key).await;
+        self.connect_error.set(Some(message));
     }
 
     /// Completes the host-key trust prompt: records the offered key in
@@ -1653,16 +1546,14 @@ impl AppState {
             self.connect_error.set(Some(err.to_string()));
             return;
         }
-        match prompt.backend {
-            BackendKind::SqlServer => {
-                self.connect_sqlserver(prompt.url, prompt.name, Some(prompt.tunnel), prompt.auth)
-                    .await;
-            }
-            _ => {
-                self.connect_postgres(prompt.url, prompt.name, Some(prompt.tunnel), prompt.auth)
-                    .await;
-            }
-        }
+        self.connect_server(
+            ServerBackend::of(prompt.backend),
+            prompt.url,
+            prompt.name,
+            Some(prompt.tunnel),
+            prompt.auth,
+        )
+        .await;
     }
 
     /// Puts an SSH key passphrase into session memory so the next tunnel
@@ -1708,7 +1599,7 @@ impl AppState {
         name: &str,
         tunnel: &Option<TunnelConfig>,
         auth: &PgAuth,
-        backend: BackendKind,
+        backend: ServerBackend,
     ) -> Option<(String, Option<Tunnel>)> {
         let Some(config) = tunnel else {
             return Some((url.to_string(), None));
@@ -1729,11 +1620,7 @@ impl AppState {
             }
         }
         let had_passphrase = passphrase.is_some();
-        let target = match backend {
-            BackendKind::SqlServer => mssql_url_target(url),
-            _ => url_target(url),
-        };
-        let target = match target {
+        let target = match (backend.url_target)(url) {
             Ok(target) => target,
             Err(err) => {
                 self.fail_connect(url, err.to_string());
@@ -1742,33 +1629,25 @@ impl AppState {
         };
         let known_hosts = crate::tunnel::default_known_hosts_read();
         match Tunnel::open(config.clone(), passphrase, target.0, target.1, &known_hosts).await {
-            Ok(live) => {
-                let rewritten = match backend {
-                    BackendKind::SqlServer => mssql_url_via_local_port(url, live.local_port()),
-                    _ => url_via_local_port(url, live.local_port()),
-                };
-                match rewritten {
-                    Ok(rewritten) => Some((rewritten, Some(live))),
-                    Err(err) => {
-                        self.fail_connect(url, err.to_string());
-                        None
-                    }
+            Ok(live) => match (backend.via_local_port)(url, live.local_port()) {
+                Ok(rewritten) => Some((rewritten, Some(live))),
+                Err(err) => {
+                    self.fail_connect(url, err.to_string());
+                    None
                 }
-            }
+            },
             Err(err @ TunnelError::NeedsPassphrase(_)) => {
                 self.release_connect(url);
                 if had_passphrase {
                     // Stored passphrase is stale; drop it everywhere and
                     // re-ask.
-                    self.session_passwords.write().remove(&secret_key);
-                    let _ = crate::secrets::delete_password_async(secret_key).await;
-                    self.connect_error.set(Some(err.to_string()));
+                    self.forget_stale_secret(secret_key, err.to_string()).await;
                 }
                 self.password_prompt.set(Some(PasswordPrompt {
                     url: url.to_string(),
                     name: name.to_string(),
                     kind: PromptKind::SshPassphrase,
-                    backend,
+                    backend: backend.kind,
                     tunnel: Some(config.clone()),
                     auth: auth.clone(),
                 }));
@@ -1784,7 +1663,7 @@ impl AppState {
                     tunnel: config.clone(),
                     info,
                     auth: auth.clone(),
-                    backend,
+                    backend: backend.kind,
                 }));
                 None
             }
@@ -1806,31 +1685,6 @@ impl AppState {
     fn fail_connect(mut self, locator: &str, message: String) {
         self.release_connect(locator);
         self.connect_error.set(Some(message));
-    }
-
-    /// A successful Postgres connect always joins the saved list (add is a
-    /// no-op when URL and tunnel are already saved, and updates the tunnel
-    /// of an existing entry otherwise). This keeps the "connect first, save
-    /// on success" contract even when the connect went through a prompt
-    /// instead of the form's direct path.
-    fn save_postgres_if_open(
-        self,
-        url: &str,
-        name: &str,
-        tunnel: Option<TunnelConfig>,
-        auth: PgAuth,
-    ) {
-        let is_open = self.open_locators.read().iter().any(|(_, l)| l == url);
-        if is_open {
-            self.save_or_apply_edit(SavedConnection::Postgres {
-                name: name.to_string(),
-                url: url.to_string(),
-                tunnel,
-                auth,
-                protection: WriteProtection::Open,
-                color: None,
-            });
-        }
     }
 
     /// Starts a connect for a row in the connections list. `focus` is false
@@ -1860,11 +1714,9 @@ impl AppState {
         }
         let task = spawn_forever(async move {
             match backend {
-                BackendKind::Postgres => {
-                    self.connect_postgres(locator, name, tunnel, auth).await;
-                }
-                BackendKind::SqlServer => {
-                    self.connect_sqlserver(locator, name, tunnel, auth).await;
+                BackendKind::Postgres | BackendKind::SqlServer => {
+                    self.connect_server(ServerBackend::of(backend), locator, name, tunnel, auth)
+                        .await;
                 }
                 BackendKind::Sqlite => self.connect(PathBuf::from(locator)).await,
             }
@@ -3457,6 +3309,7 @@ impl AppState {
             let Some(saved_conn) = saved_conn else {
                 continue;
             };
+            let backend = ServerBackend::of(saved_conn.backend());
             match saved_conn {
                 SavedConnection::Sqlite { path, .. } => self.connect(path).await,
                 SavedConnection::Postgres {
@@ -3465,14 +3318,14 @@ impl AppState {
                     tunnel,
                     auth,
                     ..
-                } => self.connect_postgres(url, name, tunnel, auth).await,
-                SavedConnection::SqlServer {
+                }
+                | SavedConnection::SqlServer {
                     url,
                     name,
                     tunnel,
                     auth,
                     ..
-                } => self.connect_sqlserver(url, name, tunnel, auth).await,
+                } => self.connect_server(backend, url, name, tunnel, auth).await,
             }
             // Apply the remembered table, pane, and row detail panel (FRE-109)
             // to the freshly opened tab.
@@ -3525,19 +3378,6 @@ async fn system_prefers_dark() -> bool {
     let mut eval =
         document::eval("dioxus.send(window.matchMedia('(prefers-color-scheme: dark)').matches);");
     eval.recv::<bool>().await.unwrap_or(false)
-}
-
-/// The TLS host override for a SQL Server connect: the saved URL's hostname
-/// when the connect goes through an SSH tunnel (the connect URL then points at
-/// `127.0.0.1:<forwarded>`, but `encrypt=on` must keep validating the server's
-/// real certificate — see [`crate::db::open_mssql_with`]), `None` for a direct
-/// connect. The URL was already parsed by the tunnel open, so the fallible
-/// parse here cannot practically fail.
-fn mssql_tls_host(url: &str, tunneled: bool) -> Option<String> {
-    if !tunneled {
-        return None;
-    }
-    mssql_url_target(url).ok().map(|(host, _)| host)
 }
 
 /// Canonicalizes for dedupe purposes; falls back to the given path when the
@@ -3728,6 +3568,123 @@ mod tests {
             save_action(WriteProtection::ReadOnly, None, &changes),
             SaveAction::Apply
         );
+    }
+
+    #[test]
+    fn a_backend_descriptor_carries_its_engine_s_data() {
+        // The whole point of the descriptor (FRE-139): every per-engine
+        // difference the connect flows used to branch on is one lookup here,
+        // so a wrong pairing is visible in one place.
+        let pg = ServerBackend::POSTGRES;
+        let ms = ServerBackend::SQL_SERVER;
+        assert_eq!(pg.kind, BackendKind::Postgres);
+        assert_eq!(ms.kind, BackendKind::SqlServer);
+        // The OAuth resources are not interchangeable: a token minted for one
+        // service is rejected by the other.
+        assert_eq!(pg.entra_resource, azure::OSSRDBMS_RESOURCE);
+        assert_eq!(ms.entra_resource, azure::SQLDB_RESOURCE);
+        assert_ne!(pg.entra_resource, ms.entra_resource);
+        // URL helpers are the engine's own — note the default ports, which is
+        // where a mixed-up pairing would show first.
+        assert_eq!(
+            (pg.url_target)("postgres://u@db.internal/app").unwrap(),
+            ("db.internal".to_string(), 5432)
+        );
+        assert_eq!(
+            (ms.url_target)("mssql://u@db.internal/app").unwrap(),
+            ("db.internal".to_string(), 1433)
+        );
+        assert_eq!(
+            (pg.with_password)("postgres://u@h:5432/db", "p@ss").unwrap(),
+            "postgres://u:p%40ss@h:5432/db"
+        );
+        assert_eq!(
+            (ms.with_password)("mssql://sa@h:1433/db", "p@ss").unwrap(),
+            "mssql://sa:p%40ss@h:1433/db"
+        );
+        assert_eq!(
+            (ms.via_local_port)("mssql://sa@db.internal:1433/db", 40123).unwrap(),
+            "mssql://sa@127.0.0.1:40123/db"
+        );
+    }
+
+    #[test]
+    fn every_backend_kind_resolves_to_a_server_descriptor() {
+        assert_eq!(
+            ServerBackend::of(BackendKind::SqlServer).kind,
+            BackendKind::SqlServer
+        );
+        assert_eq!(
+            ServerBackend::of(BackendKind::Postgres).kind,
+            BackendKind::Postgres
+        );
+        // SQLite never reaches a server connect flow (no URL, no auth, no
+        // prompts); it resolves to Postgres exactly as the `if SqlServer {…}
+        // else {…}` dispatch this replaced did.
+        assert_eq!(
+            ServerBackend::of(BackendKind::Sqlite).kind,
+            BackendKind::Postgres
+        );
+    }
+
+    #[test]
+    fn only_a_tunneled_sql_server_connect_overrides_the_tls_host() {
+        let pg = ServerBackend::POSTGRES;
+        let ms = ServerBackend::SQL_SERVER;
+        // Through a tunnel the connect URL points at 127.0.0.1, so TLS has to
+        // be told the server's real hostname (FRE-58).
+        assert_eq!(
+            ms.tls_host("mssql://sa@db.example.com:1433/app", true),
+            Some("db.example.com".to_string())
+        );
+        assert_eq!(
+            ms.tls_host("mssql://sa@db.example.com:1433/app", false),
+            None
+        );
+        // Postgres has no such parameter — the MSSQL-only override must never
+        // leak into its path, tunneled or not.
+        assert_eq!(
+            pg.tls_host("postgres://u@db.example.com:5432/app", true),
+            None
+        );
+        assert_eq!(
+            pg.tls_host("postgres://u@db.example.com:5432/app", false),
+            None
+        );
+    }
+
+    #[test]
+    fn a_saved_entry_takes_the_backend_s_variant() {
+        let tunnel = None;
+        let pg = ServerBackend::POSTGRES.saved(
+            "prod",
+            "postgres://u@h:5432/db",
+            tunnel.clone(),
+            PgAuth::Password,
+        );
+        assert!(matches!(pg, SavedConnection::Postgres { .. }));
+        assert_eq!(pg.backend(), BackendKind::Postgres);
+        assert_eq!(pg.name(), "prod");
+        assert_eq!(pg.locator(), "postgres://u@h:5432/db");
+        // A fresh entry is unmarked; markings are set from the connections
+        // list, never inferred by a connect (FRE-111).
+        assert_eq!(pg.protection(), WriteProtection::Open);
+        assert_eq!(pg.color(), None);
+
+        let ms = ServerBackend::SQL_SERVER.saved(
+            "reporting",
+            "mssql://sa@h:1433/db",
+            tunnel,
+            PgAuth::Entra(EntraAuth::interactive_default()),
+        );
+        assert!(matches!(ms, SavedConnection::SqlServer { .. }));
+        assert_eq!(ms.backend(), BackendKind::SqlServer);
+        match ms {
+            SavedConnection::SqlServer { auth, .. } => {
+                assert!(matches!(auth, PgAuth::Entra(_)), "auth mode is preserved")
+            }
+            _ => unreachable!(),
+        }
     }
 
     fn delete(id: i64) -> StagedChange {
