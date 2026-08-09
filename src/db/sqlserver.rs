@@ -68,97 +68,32 @@ const SESSION_SETUP: &str = "SET QUOTED_IDENTIFIER ON; \
 
 type TdsClient = Client<Compat<TcpStream>>;
 
-/// Splices a password into an mssql URL (percent-encoding handled by the url
-/// crate). Saved config stores URLs without passwords; this rebuilds the full
-/// URL at connect time.
+/// Splices a password into an mssql URL — see [`super::url::with_password`].
 pub fn mssql_url_with_password(url: &str, password: &str) -> Result<String, DbError> {
-    let mut parsed =
-        url::Url::parse(url).map_err(|e| DbError::Connect(format!("invalid URL: {e}")))?;
-    // set_password encodes most special characters but passes '%' through,
-    // which would be mis-decoded on parse; encode it up front.
-    let password = password.replace('%', "%25");
-    parsed
-        .set_password(Some(&password))
-        .map_err(|_| DbError::Connect("this URL cannot carry a password".into()))?;
-    Ok(parsed.into())
+    super::url::with_password(url, password)
 }
 
-/// Canonicalizes an mssql URL into the stable form used as a saved-connection
-/// locator and keyring account key, so the same server written different ways
-/// maps to one entry and one stored secret. Validates the scheme, then:
-///
-/// - strips any password (never persisted),
-/// - rewrites `sqlserver://` to `mssql://`,
-/// - lowercases the host (DNS is case-insensitive; IP literals are unaffected),
-/// - fills the default port `1433` when omitted, so `host` and `host:1433`
-///   coincide.
-///
-/// Query params (e.g. `encrypt`) and the database path are left as-is.
+/// Canonicalizes an mssql URL into the stable saved-connection locator — see
+/// [`super::url::UrlScheme::normalize`] (`sqlserver://` → `mssql://`, default
+/// port 1433).
 pub fn normalize_mssql_url(url: &str) -> Result<String, DbError> {
-    let mut parsed =
-        url::Url::parse(url.trim()).map_err(|e| DbError::Connect(format!("invalid URL: {e}")))?;
-    if parsed.scheme() != "mssql" && parsed.scheme() != "sqlserver" {
-        return Err(DbError::Connect(format!(
-            "expected an mssql:// URL, got {}://",
-            parsed.scheme()
-        )));
-    }
-    if parsed.scheme() == "sqlserver" {
-        // Both are non-special schemes, so this never fails; ignore defensively.
-        let _ = parsed.set_scheme("mssql");
-    }
-    let _ = parsed.set_password(None);
-    if let Some(host) = parsed.host_str() {
-        let lowered = host.to_ascii_lowercase();
-        if lowered != host {
-            parsed
-                .set_host(Some(&lowered))
-                .map_err(|e| DbError::Connect(format!("invalid host: {e}")))?;
-        }
-    }
-    match parsed.port() {
-        // 0 is not a usable port; same rule as the Postgres locator (FRE-42).
-        Some(0) => return Err(DbError::Connect("port must be between 1 and 65535".into())),
-        // mssql is a non-special scheme, so the url crate always serializes an
-        // explicit port — the bare and `:1433` forms now serialize equal.
-        None => {
-            let _ = parsed.set_port(Some(1433));
-        }
-        Some(_) => {}
-    }
-    Ok(parsed.into())
+    super::url::MSSQL.normalize(url)
 }
 
-/// The host and port an mssql URL points at (default port 1433) — with an SSH
-/// tunnel this is the address the SSH server must reach.
+/// The host and port an mssql URL points at (default port 1433) — see
+/// [`super::url::UrlScheme::target`].
 pub fn mssql_url_target(url: &str) -> Result<(String, u16), DbError> {
-    let parsed = url::Url::parse(url).map_err(|e| DbError::Connect(format!("invalid URL: {e}")))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| DbError::Connect("URL has no host".into()))?
-        // IPv6 hosts come back bracketed; the forward target wants the bare
-        // address.
-        .trim_matches(['[', ']'])
-        .to_string();
-    Ok((host, parsed.port().unwrap_or(1433)))
+    super::url::MSSQL.target(url)
 }
 
-/// Rewrites a URL to connect through a forwarded local port; everything else
-/// (user, database, query params) is kept. The saved URL stays the logical
-/// one — this form is only ever used for the actual connect.
+/// Rewrites a URL to connect through a forwarded local port — see
+/// [`super::url::via_local_port`].
 pub fn mssql_url_via_local_port(url: &str, port: u16) -> Result<String, DbError> {
-    let mut parsed =
-        url::Url::parse(url).map_err(|e| DbError::Connect(format!("invalid URL: {e}")))?;
-    parsed
-        .set_host(Some("127.0.0.1"))
-        .map_err(|e| DbError::Connect(format!("rewriting URL host: {e}")))?;
-    parsed
-        .set_port(Some(port))
-        .map_err(|_| DbError::Connect("rewriting URL port failed".into()))?;
-    Ok(parsed.into())
+    super::url::via_local_port(url, port)
 }
 
-/// Builds a password-free URL from the individual connection-form fields.
+/// Builds a password-free URL from the individual connection-form fields —
+/// see [`super::url::UrlScheme::build`] (TLS param `encrypt`).
 pub fn build_mssql_url(
     host: &str,
     port: &str,
@@ -166,42 +101,7 @@ pub fn build_mssql_url(
     user: &str,
     encrypt: &str,
 ) -> Result<String, DbError> {
-    let port = if port.trim().is_empty() {
-        "1433".to_string()
-    } else {
-        port.trim().to_string()
-    };
-    if host.trim().is_empty() {
-        return Err(DbError::Connect("host must not be empty".into()));
-    }
-    let mut parsed = url::Url::parse("mssql://localhost").expect("static base URL parses");
-    parsed
-        .set_host(Some(host.trim()))
-        .map_err(|e| DbError::Connect(format!("invalid host: {e}")))?;
-    let port_num: u16 = port
-        .parse()
-        .map_err(|_| DbError::Connect(format!("invalid port: {port}")))?;
-    if port_num == 0 {
-        return Err(DbError::Connect("port must be between 1 and 65535".into()));
-    }
-    parsed
-        .set_port(Some(port_num))
-        .map_err(|_| DbError::Connect("invalid port".into()))?;
-    parsed
-        .set_username(user.trim())
-        .map_err(|_| DbError::Connect("invalid user".into()))?;
-    // Only set a path for a non-empty database, so an empty db field converges
-    // with a pasted URL that has no path (both → no trailing `/`).
-    let database = database.trim();
-    if !database.is_empty() {
-        parsed.set_path(&format!("/{database}"));
-    }
-    if !encrypt.is_empty() {
-        parsed.set_query(Some(&format!("encrypt={encrypt}")));
-    }
-    // Route through the normalizer so a form host typed as `MyHost` and a
-    // pasted `myhost` URL land on the same canonical locator.
-    normalize_mssql_url(parsed.as_str())
+    super::url::MSSQL.build(host, port, database, user, encrypt)
 }
 
 /// How a SQL Server connect authenticates (FRE-58). [`open_mssql`] always uses
@@ -2115,102 +2015,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn url_with_password_splices_and_encodes() {
-        let url =
-            mssql_url_with_password("mssql://sa@db.example.com:1433/app", "p@ss w%rd").unwrap();
-        assert_eq!(url, "mssql://sa:p%40ss%20w%25rd@db.example.com:1433/app");
-    }
-
-    #[test]
-    fn normalize_strips_password_and_checks_scheme() {
+    fn url_wrappers_bind_the_mssql_scheme() {
+        // One probe per wrapper; the shared behavior is covered in db::url.
         assert_eq!(
-            normalize_mssql_url(" mssql://u:secret@h:1433/db?encrypt=off ").unwrap(),
-            "mssql://u@h:1433/db?encrypt=off"
+            mssql_url_with_password("mssql://sa@db.example.com:1433/app", "p%rd").unwrap(),
+            "mssql://sa:p%25rd@db.example.com:1433/app"
         );
-        assert!(normalize_mssql_url("postgres://u@h/db").is_err());
-        assert!(normalize_mssql_url("not a url").is_err());
-    }
-
-    #[test]
-    fn normalize_canonicalizes_scheme_host_and_port() {
-        // sqlserver → mssql, default port filled, host lowercased.
         assert_eq!(
             normalize_mssql_url("sqlserver://user@Db.Example.COM/app").unwrap(),
             "mssql://user@db.example.com:1433/app"
         );
-        // Already canonical: idempotent.
-        let canonical = "mssql://user@db.example.com:1433/app";
-        assert_eq!(normalize_mssql_url(canonical).unwrap(), canonical);
-    }
-
-    #[test]
-    fn normalize_rejects_a_zero_port() {
-        assert!(normalize_mssql_url("mssql://user@host:0/db").is_err());
-        assert!(normalize_mssql_url("mssql://user@host:1433/db").is_ok());
-    }
-
-    #[test]
-    fn equivalent_urls_normalize_to_the_same_locator() {
-        // The same server written different ways must collapse to one
-        // locator, so a saved list dedups and the keyring key matches.
-        let forms = [
-            "mssql://user@host:1433/db",
-            "sqlserver://user@host:1433/db",
-            "mssql://user@host/db",
-            "sqlserver://user@HOST/db",
-            "mssql://user:pw@host/db",
-        ];
-        let canonical = normalize_mssql_url(forms[0]).unwrap();
-        for form in forms {
-            assert_eq!(normalize_mssql_url(form).unwrap(), canonical, "{form}");
-        }
-    }
-
-    #[test]
-    fn build_url_assembles_fields_and_defaults_port() {
-        assert_eq!(
-            build_mssql_url("db.example.com", "", "app", "sa", "on").unwrap(),
-            "mssql://sa@db.example.com:1433/app?encrypt=on"
-        );
-        assert_eq!(
-            build_mssql_url(" h ", "14330", "d", "u", "off").unwrap(),
-            "mssql://u@h:14330/d?encrypt=off"
-        );
-        assert!(build_mssql_url("h", "not-a-port", "d", "u", "on").is_err());
-    }
-
-    #[test]
-    fn build_url_rejects_a_zero_port_and_empty_host() {
-        assert!(build_mssql_url("host", "0", "db", "user", "").is_err());
-        assert!(build_mssql_url("host", "70000", "db", "user", "").is_err());
-        assert!(build_mssql_url("  ", "1433", "db", "u", "").is_err());
-    }
-
-    #[test]
-    fn form_and_paste_converge_for_an_empty_database() {
-        let from_form = build_mssql_url("host", "", "", "user", "").unwrap();
-        assert_eq!(from_form, "mssql://user@host:1433");
-        assert_eq!(from_form, normalize_mssql_url("mssql://user@host").unwrap());
-    }
-
-    #[test]
-    fn url_target_extracts_host_and_defaults_port() {
         assert_eq!(
             mssql_url_target("mssql://u@db.internal/app").unwrap(),
             ("db.internal".to_string(), 1433)
         );
         assert_eq!(
-            mssql_url_target("mssql://u@[::1]:14330/app").unwrap(),
-            ("::1".to_string(), 14330)
-        );
-        assert!(mssql_url_target("not a url").is_err());
-    }
-
-    #[test]
-    fn url_via_local_port_rewrites_only_host_and_port() {
-        assert_eq!(
             mssql_url_via_local_port("mssql://u@db.internal:1433/app?encrypt=off", 40123).unwrap(),
             "mssql://u@127.0.0.1:40123/app?encrypt=off"
+        );
+        assert_eq!(
+            build_mssql_url("db.example.com", "", "app", "sa", "on").unwrap(),
+            "mssql://sa@db.example.com:1433/app?encrypt=on"
         );
     }
 

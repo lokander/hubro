@@ -1,6 +1,8 @@
-//! Postgres backend: connecting and query execution. Introspection parity
-//! (multi-schema, indexes, FKs) lands with FRE-11; until then only tables
-//! and columns of the `public` schema are listed.
+//! Postgres backend: connecting, query execution (buffered, capped/streaming,
+//! and export paths), script transactions, DDL retrieval, and full
+//! multi-schema introspection — every user schema's tables and views with
+//! columns, primary keys, indexes, and foreign keys, with extension
+//! bookkeeping and child partitions marked internal (FRE-88).
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -28,98 +30,32 @@ use super::schema::{
 use super::staged::CheckedStatement;
 use super::value::{cap_value, ColumnInfo, QueryResult, Value};
 
-/// Splices a password into a Postgres URL (percent-encoding handled by the
-/// url crate). Saved config stores URLs without passwords; this rebuilds the
-/// full URL at connect time.
+/// Splices a password into a Postgres URL — see [`super::url::with_password`].
 pub fn url_with_password(url: &str, password: &str) -> Result<String, DbError> {
-    let mut parsed =
-        url::Url::parse(url).map_err(|e| DbError::Connect(format!("invalid URL: {e}")))?;
-    // set_password encodes most special characters but passes '%' through,
-    // which would be mis-decoded on parse; encode it up front.
-    let password = password.replace('%', "%25");
-    parsed
-        .set_password(Some(&password))
-        .map_err(|_| DbError::Connect("this URL cannot carry a password".into()))?;
-    Ok(parsed.into())
+    super::url::with_password(url, password)
 }
 
-/// Canonicalizes a Postgres URL into the stable form used as a saved-connection
-/// locator and keyring account key, so the same server written different ways
-/// maps to one entry and one stored secret. Validates the scheme, then:
-///
-/// - strips any password (never persisted),
-/// - rewrites `postgresql://` to `postgres://`,
-/// - lowercases the host (DNS is case-insensitive; IP literals are unaffected),
-/// - fills the default port `5432` when omitted, so `host` and `host:5432`
-///   coincide.
-///
-/// Query params (e.g. `sslmode`) and the database path are left as-is.
+/// Canonicalizes a Postgres URL into the stable saved-connection locator —
+/// see [`super::url::UrlScheme::normalize`] (`postgresql://` → `postgres://`,
+/// default port 5432).
 pub fn normalize_pg_url(url: &str) -> Result<String, DbError> {
-    let mut parsed =
-        url::Url::parse(url.trim()).map_err(|e| DbError::Connect(format!("invalid URL: {e}")))?;
-    if parsed.scheme() != "postgres" && parsed.scheme() != "postgresql" {
-        return Err(DbError::Connect(format!(
-            "expected a postgres:// URL, got {}://",
-            parsed.scheme()
-        )));
-    }
-    if parsed.scheme() == "postgresql" {
-        // Both are non-special schemes, so this never fails; ignore defensively.
-        let _ = parsed.set_scheme("postgres");
-    }
-    let _ = parsed.set_password(None);
-    if let Some(host) = parsed.host_str() {
-        let lowered = host.to_ascii_lowercase();
-        if lowered != host {
-            parsed
-                .set_host(Some(&lowered))
-                .map_err(|e| DbError::Connect(format!("invalid host: {e}")))?;
-        }
-    }
-    match parsed.port() {
-        // 0 is not a usable port; reject it here so a pasted URL is held to the
-        // same rule as the connection form (FRE-42).
-        Some(0) => return Err(DbError::Connect("port must be between 1 and 65535".into())),
-        // postgres is a non-special scheme, so the url crate always serializes
-        // an explicit port — the bare and `:5432` forms now serialize equal.
-        None => {
-            let _ = parsed.set_port(Some(5432));
-        }
-        Some(_) => {}
-    }
-    Ok(parsed.into())
+    super::url::POSTGRES.normalize(url)
 }
 
-/// The host and port a Postgres URL points at (default port 5432) — with an
-/// SSH tunnel this is the address the SSH server must reach.
+/// The host and port a Postgres URL points at (default port 5432) — see
+/// [`super::url::UrlScheme::target`].
 pub fn url_target(url: &str) -> Result<(String, u16), DbError> {
-    let parsed = url::Url::parse(url).map_err(|e| DbError::Connect(format!("invalid URL: {e}")))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| DbError::Connect("URL has no host".into()))?
-        // IPv6 hosts come back bracketed; the forward target wants the bare
-        // address.
-        .trim_matches(['[', ']'])
-        .to_string();
-    Ok((host, parsed.port().unwrap_or(5432)))
+    super::url::POSTGRES.target(url)
 }
 
-/// Rewrites a URL to connect through a forwarded local port; everything else
-/// (user, database, query params) is kept. The saved URL stays the logical
-/// one — this form is only ever used for the actual connect.
+/// Rewrites a URL to connect through a forwarded local port — see
+/// [`super::url::via_local_port`].
 pub fn url_via_local_port(url: &str, port: u16) -> Result<String, DbError> {
-    let mut parsed =
-        url::Url::parse(url).map_err(|e| DbError::Connect(format!("invalid URL: {e}")))?;
-    parsed
-        .set_host(Some("127.0.0.1"))
-        .map_err(|e| DbError::Connect(format!("rewriting URL host: {e}")))?;
-    parsed
-        .set_port(Some(port))
-        .map_err(|_| DbError::Connect("rewriting URL port failed".into()))?;
-    Ok(parsed.into())
+    super::url::via_local_port(url, port)
 }
 
-/// Builds a password-free URL from the individual connection-form fields.
+/// Builds a password-free URL from the individual connection-form fields —
+/// see [`super::url::UrlScheme::build`] (TLS param `sslmode`).
 pub fn build_url(
     host: &str,
     port: &str,
@@ -127,42 +63,7 @@ pub fn build_url(
     user: &str,
     sslmode: &str,
 ) -> Result<String, DbError> {
-    let port = if port.trim().is_empty() {
-        "5432".to_string()
-    } else {
-        port.trim().to_string()
-    };
-    if host.trim().is_empty() {
-        return Err(DbError::Connect("host must not be empty".into()));
-    }
-    let mut parsed = url::Url::parse("postgres://localhost").expect("static base URL parses");
-    parsed
-        .set_host(Some(host.trim()))
-        .map_err(|e| DbError::Connect(format!("invalid host: {e}")))?;
-    let port_num: u16 = port
-        .parse()
-        .map_err(|_| DbError::Connect(format!("invalid port: {port}")))?;
-    if port_num == 0 {
-        return Err(DbError::Connect("port must be between 1 and 65535".into()));
-    }
-    parsed
-        .set_port(Some(port_num))
-        .map_err(|_| DbError::Connect("invalid port".into()))?;
-    parsed
-        .set_username(user.trim())
-        .map_err(|_| DbError::Connect("invalid user".into()))?;
-    // Only set a path for a non-empty database, so an empty db field converges
-    // with a pasted URL that has no path (both → no trailing `/`).
-    let database = database.trim();
-    if !database.is_empty() {
-        parsed.set_path(&format!("/{database}"));
-    }
-    if !sslmode.is_empty() {
-        parsed.set_query(Some(&format!("sslmode={sslmode}")));
-    }
-    // Route through the normalizer so a form host typed as `MyHost` and a
-    // pasted `myhost` URL land on the same canonical locator.
-    normalize_pg_url(parsed.as_str())
+    super::url::POSTGRES.build(host, port, database, user, sslmode)
 }
 
 /// Connects to Postgres from a URL (`postgres://user@host:port/db?sslmode=…`).
@@ -1541,88 +1442,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn url_with_password_splices_and_encodes() {
-        let url =
-            url_with_password("postgres://user@db.example.com:5432/app", "p@ss w%rd").unwrap();
+    fn url_wrappers_bind_the_postgres_scheme() {
+        // One probe per wrapper; the shared behavior is covered in db::url.
         assert_eq!(
-            url,
-            "postgres://user:p%40ss%20w%25rd@db.example.com:5432/app"
+            url_with_password("postgres://user@db.example.com:5432/app", "p%rd").unwrap(),
+            "postgres://user:p%25rd@db.example.com:5432/app"
         );
-    }
-
-    #[test]
-    fn normalize_strips_password_and_checks_scheme() {
-        assert_eq!(
-            normalize_pg_url(" postgres://u:secret@h:5432/db?sslmode=require ").unwrap(),
-            "postgres://u@h:5432/db?sslmode=require"
-        );
-        assert!(normalize_pg_url("mysql://u@h/db").is_err());
-        assert!(normalize_pg_url("not a url").is_err());
-    }
-
-    #[test]
-    fn normalize_canonicalizes_scheme_host_and_port() {
-        // postgresql → postgres, default port filled, host lowercased.
         assert_eq!(
             normalize_pg_url("postgresql://user@Db.Example.COM/app").unwrap(),
             "postgres://user@db.example.com:5432/app"
         );
-        // Already canonical: idempotent.
-        let canonical = "postgres://user@db.example.com:5432/app";
-        assert_eq!(normalize_pg_url(canonical).unwrap(), canonical);
-    }
-
-    #[test]
-    fn build_url_rejects_a_zero_port() {
-        // 0 parses as a valid u16 but is not a usable port (FRE-42).
-        assert!(build_url("host", "0", "db", "user", "").is_err());
-        assert!(build_url("host", "70000", "db", "user", "").is_err());
-    }
-
-    #[test]
-    fn normalize_rejects_a_zero_port() {
-        // The pasted-URL path is held to the same rule as the form fields.
-        assert!(normalize_pg_url("postgres://user@host:0/db").is_err());
-        assert!(normalize_pg_url("postgres://user@host:5432/db").is_ok());
-    }
-
-    #[test]
-    fn form_and_paste_converge_for_an_empty_database() {
-        // An empty database field must produce the same locator as a pasted URL
-        // with no path — no phantom trailing-slash entry.
-        let from_form = build_url("host", "", "", "user", "").unwrap();
-        assert_eq!(from_form, "postgres://user@host:5432");
-        assert_eq!(from_form, normalize_pg_url("postgres://user@host").unwrap());
-    }
-
-    #[test]
-    fn equivalent_urls_normalize_to_the_same_locator() {
-        // The same server written five ways must collapse to one locator, so a
-        // saved list dedups and the keyring key matches.
-        let forms = [
-            "postgres://user@host:5432/db",
-            "postgresql://user@host:5432/db",
-            "postgres://user@host/db",
-            "postgresql://user@HOST/db",
-            "postgres://user:pw@host/db",
-        ];
-        let canonical = normalize_pg_url(forms[0]).unwrap();
-        for form in forms {
-            assert_eq!(normalize_pg_url(form).unwrap(), canonical, "{form}");
-        }
-    }
-
-    #[test]
-    fn build_url_assembles_fields_and_defaults_port() {
+        assert_eq!(
+            url_target("postgres://u@db.internal/app").unwrap(),
+            ("db.internal".to_string(), 5432)
+        );
+        assert_eq!(
+            url_via_local_port("postgres://u@db.internal:5432/app?sslmode=disable", 40123).unwrap(),
+            "postgres://u@127.0.0.1:40123/app?sslmode=disable"
+        );
         assert_eq!(
             build_url("db.example.com", "", "app", "user", "prefer").unwrap(),
             "postgres://user@db.example.com:5432/app?sslmode=prefer"
         );
-        assert_eq!(
-            build_url(" h ", "6543", "d", "u", "require").unwrap(),
-            "postgres://u@h:6543/d?sslmode=require"
-        );
-        assert!(build_url("h", "not-a-port", "d", "u", "prefer").is_err());
     }
 
     #[test]
@@ -1689,31 +1530,6 @@ mod tests {
     }
 
     #[test]
-    fn url_target_extracts_host_and_defaults_port() {
-        assert_eq!(
-            url_target("postgres://u@db.internal/app").unwrap(),
-            ("db.internal".to_string(), 5432)
-        );
-        assert_eq!(
-            url_target("postgres://u@db.internal:6543/app").unwrap(),
-            ("db.internal".to_string(), 6543)
-        );
-        assert_eq!(
-            url_target("postgres://u@[::1]:6543/app").unwrap(),
-            ("::1".to_string(), 6543)
-        );
-        assert!(url_target("not a url").is_err());
-    }
-
-    #[test]
-    fn url_via_local_port_rewrites_only_host_and_port() {
-        assert_eq!(
-            url_via_local_port("postgres://u@db.internal:5432/app?sslmode=disable", 40123).unwrap(),
-            "postgres://u@127.0.0.1:40123/app?sslmode=disable"
-        );
-    }
-
-    #[test]
     fn line_col_maps_character_positions() {
         let sql = "SELECT 1 +\n  bad_col\nFROM t";
         assert_eq!(line_col(sql, 1), Some((1, 1)));
@@ -1733,11 +1549,5 @@ mod tests {
     fn line_col_counts_characters_not_bytes() {
         // "ыыы" is 6 bytes but 3 chars; position 5 is the 'X'.
         assert_eq!(line_col("ыыыаX", 5), Some((1, 5)));
-    }
-
-    #[test]
-    fn build_url_rejects_an_empty_host() {
-        let err = build_url("  ", "5432", "db", "u", "prefer").unwrap_err();
-        assert!(err.to_string().contains("host"));
     }
 }
