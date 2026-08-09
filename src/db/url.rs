@@ -12,10 +12,10 @@
 //!
 //! Deliberately *not* here, because it is engine logic rather than engine
 //! data: SQL Server's parsing of the `encrypt`/`trustServerCertificate`
-//! query params into a tiberius `Config` (`sqlserver::parse_mssql_url`), and
-//! each backend's `friendly_connect_error` categorization. This module treats
-//! query params as opaque — [`UrlScheme::build`] only writes the TLS param,
-//! and [`UrlScheme::normalize`] passes params through untouched.
+//! query params into a tiberius `Config` (`sqlserver::pool::parse_mssql_url`),
+//! and each backend's `friendly_connect_error` categorization. This module
+//! treats query params as opaque — [`UrlScheme::build`] only writes the TLS
+//! param, and [`UrlScheme::normalize`] passes params through untouched.
 //!
 //! The backends re-export thin wrappers with their historical names
 //! (`normalize_pg_url`, `build_mssql_url`, …) so call sites are unaffected.

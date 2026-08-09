@@ -13,7 +13,7 @@
 //!
 //! Everything here is a pure function over data structures; the async catalog
 //! reads that fill [`TableExtras`] / [`IndexExtras`] live in the per-backend
-//! modules (`sqlite.rs`, `postgres.rs`, `sqlserver.rs`).
+//! modules (`sqlite.rs`, `postgres.rs`, `sqlserver/ddl.rs`).
 
 use std::collections::BTreeMap;
 
