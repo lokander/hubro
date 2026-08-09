@@ -774,6 +774,39 @@ async fn sqlserver_query_capped_stops_and_bounds_cells() {
     pool.close().await;
 }
 
+/// A zero-row result still carries its column headers (FRE-138). This backend
+/// has always done so — TDS sends result-set metadata even for zero rows — and
+/// is the reference the sqlx backends were brought in line with, so pinning it
+/// here keeps the contract from drifting back apart.
+#[tokio::test]
+async fn sqlserver_empty_results_keep_their_column_headers() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.empty_headers",
+            "CREATE TABLE dbo.empty_headers (id int NOT NULL, name nvarchar(50) NULL)",
+        ],
+    )
+    .await;
+
+    let sql = "SELECT id, name FROM dbo.empty_headers WHERE 1 = 0";
+    let empty = pool.query(sql).await.unwrap();
+    assert!(empty.rows.is_empty());
+    let names: Vec<&str> = empty.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["id", "name"]);
+
+    let (empty, truncated) = pool.query_capped(sql, &[], 100).await.unwrap();
+    assert!(empty.rows.is_empty());
+    assert!(!truncated);
+    let names: Vec<&str> = empty.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["id", "name"]);
+
+    run_all(&pool, &["DROP TABLE IF EXISTS dbo.empty_headers"]).await;
+    pool.close().await;
+}
+
 #[tokio::test]
 async fn sqlserver_export_streams_csv_and_json() {
     let Some(url) = test_url() else { return };

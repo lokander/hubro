@@ -49,6 +49,63 @@ pub(crate) fn cap_value(value: Value, cap: usize) -> Value {
     }
 }
 
+/// One decoded cell as text, `None` for SQL NULL (and for a column index the
+/// row doesn't have).
+///
+/// These four accessors read a decoded row positionally, which is how every
+/// backend consumes the catalog queries it runs through its own query path:
+/// the SQL fixes the column order, so an index is the natural key and a
+/// missing/NULL cell must degrade rather than error — a catalog column that
+/// unexpectedly reads NULL should cost one caveat, not the whole DDL. They
+/// live here because they operate on [`Value`], not on any driver's row type.
+pub(crate) fn row_opt_text(row: &[Value], idx: usize) -> Option<String> {
+    match row.get(idx) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(t)) => Some(t.clone()),
+        Some(other) => Some(other.display()),
+    }
+}
+
+/// [`row_opt_text`] with NULL flattened to the empty string.
+pub(crate) fn row_text(row: &[Value], idx: usize) -> String {
+    row_opt_text(row, idx).unwrap_or_default()
+}
+
+/// One decoded cell as an integer, `None` when it is NULL or not an integer.
+pub(crate) fn row_opt_int(row: &[Value], idx: usize) -> Option<i64> {
+    match row.get(idx) {
+        Some(Value::Integer(n)) => Some(*n),
+        _ => None,
+    }
+}
+
+/// [`row_opt_int`] with NULL flattened to zero.
+pub(crate) fn row_int(row: &[Value], idx: usize) -> i64 {
+    row_opt_int(row, idx).unwrap_or(0)
+}
+
+/// One decoded cell as a boolean. Boolean catalog columns (SQL Server's `bit`)
+/// decode as Integer 0/1.
+pub(crate) fn row_flag(row: &[Value], idx: usize) -> bool {
+    row_int(row, idx) != 0
+}
+
+/// Trims trailing zeros from a chrono-formatted fractional second: `%.f`
+/// pads to 3/6/9 digits ("09.500"), both Postgres and the SQL Server display
+/// print minimal ("09.5"). The input must end with the seconds field; the
+/// fraction dot is the only dot.
+pub(crate) fn trim_fraction(mut s: String) -> String {
+    if s.contains('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+    }
+    s
+}
+
 /// A result column as reported by the driver.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnInfo {
@@ -115,5 +172,38 @@ mod tests {
         // "héllo": cutting at byte 2 would split 'é' (2 bytes); back off to 1.
         let capped = cap_value(Value::Text("héllo".into()), 2);
         assert_eq!(capped, Value::Text("h".into()));
+    }
+
+    #[test]
+    fn row_accessors_degrade_on_null_and_missing_cells() {
+        let row = [
+            Value::Text("hi".into()),
+            Value::Null,
+            Value::Integer(0),
+            Value::Integer(7),
+        ];
+        assert_eq!(row_opt_text(&row, 0), Some("hi".to_string()));
+        assert_eq!(row_text(&row, 0), "hi");
+        // Non-text cells render through `display`, so a numeric catalog column
+        // read as text still says something useful.
+        assert_eq!(row_text(&row, 3), "7");
+        // NULL and past-the-end are the same "nothing there" for every arm.
+        for idx in [1, 99] {
+            assert_eq!(row_opt_text(&row, idx), None);
+            assert_eq!(row_text(&row, idx), "");
+            assert_eq!(row_opt_int(&row, idx), None);
+            assert_eq!(row_int(&row, idx), 0);
+            assert!(!row_flag(&row, idx));
+        }
+        assert_eq!(row_opt_int(&row, 2), Some(0));
+        assert!(!row_flag(&row, 2));
+        assert!(row_flag(&row, 3));
+    }
+
+    #[test]
+    fn trim_fraction_strips_padding_zeros() {
+        assert_eq!(trim_fraction("12:34:56.500".into()), "12:34:56.5");
+        assert_eq!(trim_fraction("12:34:56.000".into()), "12:34:56");
+        assert_eq!(trim_fraction("12:34:56".into()), "12:34:56");
     }
 }

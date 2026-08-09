@@ -15,20 +15,21 @@ use sqlx::postgres::{
 };
 use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{Decimal, JsonValue, Uuid};
-use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
+use sqlx::{Row as _, TypeInfo as _, ValueRef as _};
 
 use super::ddl::{
     create_table_sql, create_view_sql, terminate, ColumnExtra, Ddl, DdlObject, TableExtras,
 };
 use super::error::DbError;
-use super::export::{export_io_err, ExportFormat, ExportSink};
+use super::export::ExportFormat;
 use super::schema::{
     ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, Internal, TableKind, TableMeta, TypeDetail,
     TypeRef,
 };
 use super::sql::Dialect;
+use super::sqlx_common::{self, get};
 use super::staged::CheckedStatement;
-use super::value::{cap_value, ColumnInfo, QueryResult, Value};
+use super::value::{row_opt_text, row_text, trim_fraction, QueryResult, Value};
 
 /// Splices a password into a Postgres URL — see [`super::url::with_password`].
 pub fn url_with_password(url: &str, password: &str) -> Result<String, DbError> {
@@ -153,35 +154,18 @@ pub async fn query_with(
     sql: &str,
     params: &[Value],
 ) -> Result<QueryResult, DbError> {
-    let rows = bind_params(sqlx::query(sql), params)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| query_error(e, sql))?;
-    let columns = match rows.first() {
-        Some(row) => row
-            .columns()
-            .iter()
-            .map(|c| ColumnInfo {
-                name: c.name().to_string(),
-            })
-            .collect(),
-        None => Vec::new(),
-    };
-    let mut out_rows = Vec::with_capacity(rows.len());
-    for row in &rows {
-        out_rows.push(decode_row(row)?);
-    }
-    Ok(QueryResult {
-        columns,
-        rows: out_rows,
-    })
+    let stream = bind_params(sqlx::query(sql), params).fetch(pool);
+    let mut result =
+        sqlx_common::collect_all(stream, decode_value, |e| query_error(e, sql)).await?;
+    sqlx_common::fill_headers(&mut result, pool, sql).await;
+    Ok(result)
 }
 
 /// Streams `sql` one row at a time (`fetch`, not `fetch_all`), decoding and
 /// retaining at most `max_rows` rows and capping each cell to `cell_cap`
 /// bytes, so the free-form query path never scales with table or value size
 /// (FRE-33). Returns the (bounded) result and whether more rows existed
-/// beyond the cap. Shares the streaming primitive with [`export`].
+/// beyond the cap.
 pub async fn query_capped(
     pool: &PgPool,
     sql: &str,
@@ -190,7 +174,13 @@ pub async fn query_capped(
     cell_cap: usize,
 ) -> Result<(QueryResult, bool), DbError> {
     let stream = bind_params(sqlx::query(sql), params).fetch(pool);
-    collect_capped(stream, sql, max_rows, cell_cap).await
+    let (mut result, truncated) =
+        sqlx_common::collect_capped(stream, max_rows, cell_cap, decode_value, |e| {
+            query_error(e, sql)
+        })
+        .await?;
+    sqlx_common::fill_headers(&mut result, pool, sql).await;
+    Ok((result, truncated))
 }
 
 /// [`query_capped`] against a single connection (e.g. one borrowed from a
@@ -203,7 +193,13 @@ pub async fn query_capped_conn(
     cell_cap: usize,
 ) -> Result<(QueryResult, bool), DbError> {
     let stream = sqlx::query(sql).fetch(&mut *conn);
-    collect_capped(stream, sql, max_rows, cell_cap).await
+    let (mut result, truncated) =
+        sqlx_common::collect_capped(stream, max_rows, cell_cap, decode_value, |e| {
+            query_error(e, sql)
+        })
+        .await?;
+    sqlx_common::fill_headers(&mut result, &mut *conn, sql).await;
+    Ok((result, truncated))
 }
 
 /// Runs a non-row statement on a single connection (e.g. one borrowed from a
@@ -213,82 +209,7 @@ pub async fn execute_conn(
     conn: &mut sqlx::postgres::PgConnection,
     sql: &str,
 ) -> Result<u64, DbError> {
-    sqlx::query(sql)
-        .execute(conn)
-        .await
-        .map(|done| done.rows_affected())
-        .map_err(|e| DbError::Query(e.to_string()))
-}
-
-/// Commits a script transaction — its statements all take effect.
-pub async fn commit_tx(tx: sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(), DbError> {
-    tx.commit().await.map_err(|e| DbError::Query(e.to_string()))
-}
-
-/// Rolls a script transaction back. Best-effort: a rollback failure leaves
-/// nothing committed anyway (the transaction also rolls back on drop).
-pub async fn rollback_tx(tx: sqlx::Transaction<'_, sqlx::Postgres>) {
-    let _ = tx.rollback().await;
-}
-
-/// Drains a row stream into a bounded [`QueryResult`], keeping at most
-/// `max_rows` rows and capping each cell to `cell_cap` bytes; the bool is
-/// whether rows existed past the cap. Shared by the pool and single-connection
-/// capped readers.
-async fn collect_capped<S>(
-    mut stream: S,
-    sql: &str,
-    max_rows: u64,
-    cell_cap: usize,
-) -> Result<(QueryResult, bool), DbError>
-where
-    S: futures_util::Stream<Item = Result<PgRow, sqlx::Error>> + Unpin,
-{
-    use futures_util::TryStreamExt as _;
-
-    let mut columns: Vec<ColumnInfo> = Vec::new();
-    let mut out_rows: Vec<Vec<Value>> = Vec::new();
-    let mut truncated = false;
-    while let Some(row) = stream.try_next().await.map_err(|e| query_error(e, sql))? {
-        // The cap+1'th row that reaches us proves there is more; stop before
-        // decoding it so exactly `max_rows` rows are retained.
-        if out_rows.len() as u64 >= max_rows {
-            truncated = true;
-            break;
-        }
-        if columns.is_empty() {
-            columns = row
-                .columns()
-                .iter()
-                .map(|c| ColumnInfo {
-                    name: c.name().to_string(),
-                })
-                .collect();
-        }
-        let values = decode_row(&row)?
-            .into_iter()
-            .map(|v| cap_value(v, cell_cap))
-            .collect();
-        out_rows.push(values);
-    }
-    Ok((
-        QueryResult {
-            columns,
-            rows: out_rows,
-        },
-        truncated,
-    ))
-}
-
-/// Decodes every cell of one fetched row into the backend-neutral [`Value`]
-/// model. Shared by the buffered ([`query_with`]) and streaming
-/// ([`query_capped`], [`export`]) paths.
-fn decode_row(row: &PgRow) -> Result<Vec<Value>, DbError> {
-    let mut values = Vec::with_capacity(row.columns().len());
-    for idx in 0..row.columns().len() {
-        values.push(decode_value(row, idx)?);
-    }
-    Ok(values)
+    sqlx_common::execute(conn, sql, |e| query_error(e, sql)).await
 }
 
 /// Streams a query to `out` in the given format, pulling rows one at a time
@@ -303,56 +224,27 @@ pub async fn export(
     format: ExportFormat,
     out: &mut impl Write,
 ) -> Result<u64, DbError> {
-    use futures_util::TryStreamExt as _;
-
-    let mut stream = bind_params(sqlx::query(sql), params).fetch(pool);
-    let mut sink: Option<ExportSink> = None;
-    let mut rows = 0u64;
-    while let Some(row) = stream.try_next().await.map_err(|e| query_error(e, sql))? {
-        let sink = match sink.as_mut() {
-            Some(sink) => sink,
-            None => {
-                let columns = row.columns().iter().map(|c| c.name().to_string()).collect();
-                let mut new_sink = ExportSink::new(format, columns);
-                new_sink.begin(out).map_err(export_io_err)?;
-                sink.insert(new_sink)
-            }
-        };
-        let values = decode_row(&row)?;
-        sink.write_row(&values, out).map_err(export_io_err)?;
-        rows += 1;
+    let stream = bind_params(sqlx::query(sql), params).fetch(pool);
+    if let Some(rows) =
+        sqlx_common::export_stream(stream, format, out, decode_value, |e| query_error(e, sql))
+            .await?
+    {
+        return Ok(rows);
     }
-    match sink.as_mut() {
-        Some(sink) => sink.end(out).map_err(export_io_err)?,
-        None => {
-            let columns = describe_columns(pool, sql).await?;
-            let mut sink = ExportSink::new(format, columns);
-            sink.begin(out).map_err(export_io_err)?;
-            sink.end(out).map_err(export_io_err)?;
-        }
-    }
-    Ok(rows)
-}
-
-/// Column names of a prepared statement, for the header of a zero-row export.
-async fn describe_columns(pool: &PgPool, sql: &str) -> Result<Vec<String>, DbError> {
-    use sqlx::Executor as _;
-    let described = pool.describe(sql).await.map_err(|e| query_error(e, sql))?;
-    Ok(described
-        .columns()
-        .iter()
-        .map(|c| c.name().to_string())
-        .collect())
+    // No rows streamed, so no row carried the column names: describe the
+    // statement instead. This one propagates its failure — an export whose
+    // header cannot be determined is an empty file that says nothing.
+    let columns = sqlx_common::describe_columns(pool, sql)
+        .await
+        .map_err(|e| query_error(e, sql))?;
+    sqlx_common::export_empty(format, columns, out)?;
+    Ok(0)
 }
 
 /// Executes a statement without decoding rows, returning the driver's
 /// affected-row count.
 pub async fn execute(pool: &PgPool, sql: &str) -> Result<u64, DbError> {
-    sqlx::query(sql)
-        .execute(pool)
-        .await
-        .map(|done| done.rows_affected())
-        .map_err(|e| query_error(e, sql))
+    sqlx_common::execute(pool, sql, |e| query_error(e, sql)).await
 }
 
 /// Executes parameterized writes inside ONE transaction, committing only
@@ -390,10 +282,7 @@ pub async fn execute_all_checked(
             let _ = tx.rollback().await;
             return Err((
                 Some(index),
-                DbError::RowCountMismatch(format!(
-                    "statement affected {affected} rows, expected {} — rolled back",
-                    statement.expected_rows
-                )),
+                DbError::row_count_mismatch(affected, statement.expected_rows),
             ));
         }
     }
@@ -886,7 +775,7 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
             type_name: get(row, "data_type")?,
             nullable: nullable == "YES",
             primary_key_position: pk_position.map(|p| p as u32),
-            default: get::<Option<String>>(row, "column_default")?,
+            default: get::<Option<String>, _>(row, "column_default")?,
             generated,
             type_detail,
         });
@@ -970,7 +859,7 @@ pub async fn fetch_ddl(
             &[params[0].clone(), Value::Text(name.clone())],
         )
         .await?;
-        let Some(def) = rows.rows.first().and_then(|r| ddl_opt_text(r, 0)) else {
+        let Some(def) = rows.rows.first().and_then(|r| row_opt_text(r, 0)) else {
             return Err(DbError::Introspect(format!(
                 "no index named {name} in {schema}"
             )));
@@ -988,7 +877,7 @@ pub async fn fetch_ddl(
             &params,
         )
         .await?;
-        let Some(body) = rows.rows.first().and_then(|r| ddl_opt_text(r, 0)) else {
+        let Some(body) = rows.rows.first().and_then(|r| row_opt_text(r, 0)) else {
             return Err(DbError::Introspect(format!(
                 "no view definition for {schema}.{}",
                 table.name
@@ -1104,14 +993,14 @@ async fn table_ddl_extras(pool: &PgPool, params: &[Value]) -> Result<TableExtras
         ..TableExtras::default()
     };
     for row in &column_rows.rows {
-        let name = ddl_text(row, 0);
-        let default_expr = ddl_opt_text(row, 2);
+        let name = row_text(row, 0);
+        let default_expr = row_opt_text(row, 2);
         // A generated column keeps its generation expression in pg_attrdef
         // too, so it must render as a generation clause and NOT as a DEFAULT.
-        let (identity, generation_used) = match ddl_text(row, 3).as_str() {
+        let (identity, generation_used) = match row_text(row, 3).as_str() {
             "a" => (Some("GENERATED ALWAYS AS IDENTITY".to_string()), false),
             "d" => (Some("GENERATED BY DEFAULT AS IDENTITY".to_string()), false),
-            _ => match (ddl_text(row, 4).as_str(), &default_expr) {
+            _ => match (row_text(row, 4).as_str(), &default_expr) {
                 ("", _) => (None, false),
                 (kind, Some(expr)) => {
                     // attgenerated: 's' = STORED, 'v' = VIRTUAL (PG 18, and
@@ -1138,8 +1027,8 @@ async fn table_ddl_extras(pool: &PgPool, params: &[Value]) -> Result<TableExtras
         extras.columns.insert(
             name,
             ColumnExtra {
-                type_name: ddl_opt_text(row, 1),
-                collation: ddl_opt_text(row, 5),
+                type_name: row_opt_text(row, 1),
+                collation: row_opt_text(row, 5),
                 // Postgres has no column form that replaces the type.
                 computed: None,
                 computed_persisted: false,
@@ -1154,35 +1043,14 @@ async fn table_ddl_extras(pool: &PgPool, params: &[Value]) -> Result<TableExtras
     for row in &constraint_rows.rows {
         constraints.push(format!(
             "CONSTRAINT {} {}",
-            super::sql::quote_ident(&ddl_text(row, 0)),
-            ddl_text(row, 1)
+            super::sql::quote_ident(&row_text(row, 0)),
+            row_text(row, 1)
         ));
     }
     for row in &index_rows.rows {
-        extras.indexes.push(ddl_text(row, 0));
+        extras.indexes.push(row_text(row, 0));
     }
     Ok(extras)
-}
-
-/// One decoded cell as text, `None` for SQL NULL.
-fn ddl_opt_text(row: &[Value], idx: usize) -> Option<String> {
-    match row.get(idx) {
-        Some(Value::Null) | None => None,
-        Some(Value::Text(t)) => Some(t.clone()),
-        Some(other) => Some(other.display()),
-    }
-}
-
-fn ddl_text(row: &[Value], idx: usize) -> String {
-    ddl_opt_text(row, idx).unwrap_or_default()
-}
-
-fn get<'r, T: sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>>(
-    row: &'r PgRow,
-    column: &str,
-) -> Result<T, DbError> {
-    row.try_get(column)
-        .map_err(|e| DbError::Introspect(format!("column {column}: {e}")))
 }
 
 /// Decodes scalar and rich Postgres types into the backend-neutral [`Value`]
@@ -1391,21 +1259,6 @@ where
         });
     }
     Some(Value::Text(format!("{{{}}}", parts.join(","))))
-}
-
-/// Trims trailing zeros from a chrono-formatted fractional second: `%.f`
-/// pads to 3/6/9 digits ("09.500"), Postgres prints minimal ("09.5"). The
-/// input must end with the seconds field; the fraction dot is the only dot.
-fn trim_fraction(mut s: String) -> String {
-    if s.contains('.') {
-        while s.ends_with('0') {
-            s.pop();
-        }
-        if s.ends_with('.') {
-            s.pop();
-        }
-    }
-    s
 }
 
 /// Compact human form for an interval, e.g. "1 mon 2 days 03:04:05.5".

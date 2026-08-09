@@ -45,7 +45,10 @@ use super::schema::{
 };
 use super::sql::{quote_ident, Dialect};
 use super::staged::CheckedStatement;
-use super::value::{cap_value, ColumnInfo, QueryResult, Value};
+use super::value::{
+    cap_value, row_flag, row_int, row_opt_int, row_opt_text, row_text, trim_fraction, ColumnInfo,
+    QueryResult, Value,
+};
 
 /// Matches PgPool's `max_connections(4)`: enough for the grid, introspection,
 /// and a script transaction to run concurrently without deadlocking.
@@ -729,10 +732,7 @@ pub async fn execute_all_checked(
             rollback_on(&mut conn, false).await;
             return Err((
                 Some(index),
-                DbError::RowCountMismatch(format!(
-                    "statement affected {affected} rows, expected {} — rolled back",
-                    statement.expected_rows
-                )),
+                DbError::row_count_mismatch(affected, statement.expected_rows),
             ));
         }
     }
@@ -1031,28 +1031,16 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
     .await
     .map_err(map_err)?;
 
-    let text = |row: &[Value], idx: usize| -> String {
-        match row.get(idx) {
-            Some(Value::Text(t)) => t.clone(),
-            other => other.map(|v| v.display()).unwrap_or_default(),
-        }
-    };
-    let int = |row: &[Value], idx: usize| -> i64 {
-        match row.get(idx) {
-            Some(Value::Integer(n)) => *n,
-            _ => 0,
-        }
-    };
-    // bit columns decode as Integer 0/1.
-    let flag = |row: &[Value], idx: usize| -> bool { int(row, idx) != 0 };
-
+    // The catalog columns below are read positionally with the shared row
+    // accessors (`row_text`/`row_int`/`row_flag`) — sys.columns' `bit` flags
+    // decode as Integer 0/1, which `row_flag` is exactly for.
     let mut tables: Vec<TableMeta> = Vec::with_capacity(table_rows.rows.len());
     for row in &table_rows.rows {
         tables.push(TableMeta {
-            schema: Some(text(row, 0)),
-            name: text(row, 1),
+            schema: Some(row_text(row, 0)),
+            name: row_text(row, 1),
             // sys.objects.type is char(2), so the tag arrives padded.
-            kind: match text(row, 2).trim() {
+            kind: match row_text(row, 2).trim() {
                 "V" => TableKind::View,
                 _ => TableKind::Table,
             },
@@ -1082,25 +1070,25 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
     }
 
     for row in &column_rows.rows {
-        let schema = text(row, 0);
-        let table = text(row, 1);
+        let schema = row_text(row, 0);
+        let table = row_text(row, 1);
         let Some(&idx) = table_index.get(&(schema, table)) else {
             continue;
         };
-        let type_base = text(row, 3);
-        let default = match row.get(10) {
-            Some(Value::Text(t)) => Some(strip_default_parens(t).to_string()),
-            _ => None,
-        };
-        let pk_position = match row.get(11) {
-            Some(Value::Integer(n)) if *n > 0 => Some(*n as u32),
-            _ => None,
-        };
-        let generated = mssql_generated(flag(row, 8), flag(row, 9), &type_base);
+        let type_base = row_text(row, 3);
+        let default = row_opt_text(row, 10).map(|d| strip_default_parens(&d).to_string());
+        // 0 is "not part of the primary key", not the first position.
+        let pk_position = row_opt_int(row, 11).filter(|n| *n > 0).map(|n| n as u32);
+        let generated = mssql_generated(row_flag(row, 8), row_flag(row, 9), &type_base);
         tables[idx].columns.push(ColumnMeta {
-            name: text(row, 2),
-            type_name: format_mssql_type(&type_base, int(row, 4), int(row, 5), int(row, 6)),
-            nullable: flag(row, 7),
+            name: row_text(row, 2),
+            type_name: format_mssql_type(
+                &type_base,
+                row_int(row, 4),
+                row_int(row, 5),
+                row_int(row, 6),
+            ),
+            nullable: row_flag(row, 7),
             primary_key_position: pk_position,
             default,
             generated,
@@ -1110,15 +1098,15 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
     }
 
     for row in &index_rows.rows {
-        let schema = text(row, 0);
-        let table = text(row, 1);
+        let schema = row_text(row, 0);
+        let table = row_text(row, 1);
         let Some(&idx) = table_index.get(&(schema, table)) else {
             continue;
         };
-        let index_name = text(row, 2);
-        let column = text(row, 5);
-        let unique = flag(row, 3);
-        let partial = flag(row, 4);
+        let index_name = row_text(row, 2);
+        let column = row_text(row, 5);
+        let unique = row_flag(row, 3);
+        let partial = row_flag(row, 4);
         let indexes = &mut tables[idx].indexes;
         match indexes.last_mut() {
             Some(last) if last.name == index_name => last.columns.push(column),
@@ -1136,14 +1124,14 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
     // append follow-up key columns to the entry that opened the constraint.
     let mut last_fk: Option<(usize, String)> = None;
     for row in &fk_rows.rows {
-        let schema = text(row, 0);
-        let table = text(row, 1);
+        let schema = row_text(row, 0);
+        let table = row_text(row, 1);
         let Some(&idx) = table_index.get(&(schema, table)) else {
             continue;
         };
-        let fk_name = text(row, 2);
-        let column = text(row, 5);
-        let ref_column = text(row, 6);
+        let fk_name = row_text(row, 2);
+        let column = row_text(row, 5);
+        let ref_column = row_text(row, 6);
         let same = last_fk
             .as_ref()
             .is_some_and(|(i, name)| *i == idx && *name == fk_name);
@@ -1157,8 +1145,8 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
         } else {
             tables[idx].foreign_keys.push(ForeignKeyMeta {
                 columns: vec![column],
-                referenced_schema: Some(text(row, 3)),
-                referenced_table: text(row, 4),
+                referenced_schema: Some(row_text(row, 3)),
+                referenced_table: row_text(row, 4),
                 referenced_columns: vec![Some(ref_column)],
             });
             last_fk = Some((idx, fk_name));
@@ -1201,7 +1189,7 @@ pub async fn fetch_ddl(
             &params,
         )
         .await?;
-        let Some(definition) = rows.rows.first().and_then(|r| ddl_opt_text(r, 0)) else {
+        let Some(definition) = rows.rows.first().and_then(|r| row_opt_text(r, 0)) else {
             // A module created WITH ENCRYPTION has a NULL definition.
             return Err(DbError::Introspect(format!(
                 "no readable definition for {schema}.{} — the module may be encrypted",
@@ -1353,28 +1341,28 @@ async fn table_ddl_extras(pool: &MssqlPool, params: &[Value]) -> Result<TableExt
     };
 
     for row in &column_rows.rows {
-        let persisted = ddl_flag(row, 9);
-        let computed = ddl_opt_text(row, 8).map(|definition| {
+        let persisted = row_flag(row, 9);
+        let computed = row_opt_text(row, 8).map(|definition| {
             // The catalog already parenthesizes the expression.
             format!(
                 "AS {definition}{}",
                 if persisted { " PERSISTED" } else { "" }
             )
         });
-        let identity = ddl_opt_int(row, 6).map(|seed| {
-            let increment = ddl_opt_int(row, 7).unwrap_or(1);
+        let identity = row_opt_int(row, 6).map(|seed| {
+            let increment = row_opt_int(row, 7).unwrap_or(1);
             format!("IDENTITY({seed},{increment})")
         });
         extras.columns.insert(
-            ddl_text(row, 0),
+            row_text(row, 0),
             ColumnExtra {
                 type_name: Some(format_mssql_type(
-                    &ddl_text(row, 1),
-                    ddl_opt_int(row, 2).unwrap_or_default(),
-                    ddl_opt_int(row, 3).unwrap_or_default(),
-                    ddl_opt_int(row, 4).unwrap_or_default(),
+                    &row_text(row, 1),
+                    row_opt_int(row, 2).unwrap_or_default(),
+                    row_opt_int(row, 3).unwrap_or_default(),
+                    row_opt_int(row, 4).unwrap_or_default(),
                 )),
-                collation: ddl_opt_text(row, 5),
+                collation: row_opt_text(row, 5),
                 computed,
                 computed_persisted: persisted,
                 identity,
@@ -1382,8 +1370,8 @@ async fn table_ddl_extras(pool: &MssqlPool, params: &[Value]) -> Result<TableExt
                 // introspection does, then re-emitted under its own name:
                 // dropping a default on SQL Server needs that name, and an
                 // unnamed one gets a random `DF__tbl__col__…`.
-                default: ddl_opt_text(row, 11).map(|d| strip_default_parens(&d).to_string()),
-                default_constraint: ddl_opt_text(row, 10),
+                default: row_opt_text(row, 11).map(|d| strip_default_parens(&d).to_string()),
+                default_constraint: row_opt_text(row, 10),
             },
         );
     }
@@ -1394,8 +1382,8 @@ async fn table_ddl_extras(pool: &MssqlPool, params: &[Value]) -> Result<TableExt
     for row in &check_rows.rows {
         constraints.push(format!(
             "CONSTRAINT {} CHECK {}",
-            quote_ident(&ddl_text(row, 0)),
-            ddl_text(row, 1)
+            quote_ident(&row_text(row, 0)),
+            row_text(row, 1)
         ));
     }
 
@@ -1416,8 +1404,8 @@ async fn table_ddl_extras(pool: &MssqlPool, params: &[Value]) -> Result<TableExt
     let mut unenforced: Vec<String> = Vec::new();
     for (rows, disabled, untrusted) in [(&check_rows.rows, 2, 3), (&fk_rows.rows, 7, 8)] {
         for row in rows {
-            let name = ddl_text(row, 0);
-            if (ddl_flag(row, disabled) || ddl_flag(row, untrusted)) && !unenforced.contains(&name)
+            let name = row_text(row, 0);
+            if (row_flag(row, disabled) || row_flag(row, untrusted)) && !unenforced.contains(&name)
             {
                 unenforced.push(name);
             }
@@ -1455,22 +1443,22 @@ async fn table_ddl_extras(pool: &MssqlPool, params: &[Value]) -> Result<TableExt
 fn key_constraints(rows: &[Vec<Value>]) -> Vec<String> {
     let mut keys: Vec<(String, String, Vec<String>)> = Vec::new();
     for row in rows {
-        let name = ddl_text(row, 0);
+        let name = row_text(row, 0);
         // kc.type is char(2), so 'PK'/'UQ' arrive padded.
-        let kind = if ddl_text(row, 1).trim() == "PK" {
+        let kind = if row_text(row, 1).trim() == "PK" {
             "PRIMARY KEY"
         } else {
             "UNIQUE"
         };
-        let clustering = if ddl_text(row, 2).trim() == "CLUSTERED" {
+        let clustering = if row_text(row, 2).trim() == "CLUSTERED" {
             "CLUSTERED"
         } else {
             "NONCLUSTERED"
         };
         let column = format!(
             "{} {}",
-            quote_ident(&ddl_text(row, 3)),
-            if ddl_flag(row, 4) { "DESC" } else { "ASC" }
+            quote_ident(&row_text(row, 3)),
+            if row_flag(row, 4) { "DESC" } else { "ASC" }
         );
         match keys.last_mut() {
             Some((last, _, columns)) if *last == name => columns.push(column),
@@ -1500,9 +1488,9 @@ fn fk_constraints(rows: &[Vec<Value>]) -> Vec<String> {
     }
     let mut fks: Vec<Fk> = Vec::new();
     for row in rows {
-        let name = ddl_text(row, 0);
-        let column = quote_ident(&ddl_text(row, 3));
-        let referenced = quote_ident(&ddl_text(row, 4));
+        let name = row_text(row, 0);
+        let column = quote_ident(&row_text(row, 3));
+        let referenced = quote_ident(&row_text(row, 4));
         if let Some(last) = fks.last_mut() {
             if last.name == name {
                 last.columns.push(column);
@@ -1514,7 +1502,7 @@ fn fk_constraints(rows: &[Vec<Value>]) -> Vec<String> {
         // scripts these does; anything else has to be written out.
         let mut actions = String::new();
         for (idx, keyword) in [(5, "DELETE"), (6, "UPDATE")] {
-            let action = ddl_text(row, idx);
+            let action = row_text(row, idx);
             if !action.is_empty() && action != "NO_ACTION" {
                 actions.push_str(&format!(" ON {keyword} {}", action.replace('_', " ")));
             }
@@ -1524,8 +1512,8 @@ fn fk_constraints(rows: &[Vec<Value>]) -> Vec<String> {
             columns: vec![column],
             target: format!(
                 "{}.{}",
-                quote_ident(&ddl_text(row, 1)),
-                quote_ident(&ddl_text(row, 2))
+                quote_ident(&row_text(row, 1)),
+                quote_ident(&row_text(row, 2))
             ),
             referenced: vec![referenced],
             actions,
@@ -1615,14 +1603,14 @@ impl IndexDdl {
 fn collect_index_ddl(rows: &[Vec<Value>]) -> Vec<IndexDdl> {
     let mut out: Vec<IndexDdl> = Vec::new();
     for row in rows {
-        let name = ddl_text(row, 0);
+        let name = row_text(row, 0);
         if out.last().map(|i| i.meta.name.as_str()) != Some(name.as_str()) {
-            let filter = ddl_opt_text(row, 3);
-            let type_desc = ddl_text(row, 2).trim().to_string();
+            let filter = row_opt_text(row, 3);
+            let type_desc = row_text(row, 2).trim().to_string();
             out.push(IndexDdl {
                 meta: IndexMeta {
                     name: name.clone(),
-                    unique: ddl_flag(row, 1),
+                    unique: row_flag(row, 1),
                     // Same contract as introspection: a filtered index only
                     // guarantees uniqueness among the matching rows.
                     partial: filter.is_some(),
@@ -1634,18 +1622,18 @@ fn collect_index_ddl(rows: &[Vec<Value>]) -> Vec<IndexDdl> {
                     ..IndexExtras::default()
                 },
                 type_desc,
-                constraint_backed: ddl_flag(row, 4) || ddl_flag(row, 5),
+                constraint_backed: row_flag(row, 4) || row_flag(row, 5),
             });
         }
         let entry = out.last_mut().expect("pushed above when absent");
-        let column = ddl_text(row, 6);
-        if ddl_flag(row, 8) {
+        let column = row_text(row, 6);
+        if row_flag(row, 8) {
             entry.extras.included_columns.push(quote_ident(&column));
         } else {
             entry.extras.key_columns.push(format!(
                 "{} {}",
                 quote_ident(&column),
-                if ddl_flag(row, 7) { "DESC" } else { "ASC" }
+                if row_flag(row, 7) { "DESC" } else { "ASC" }
             ));
             entry.meta.columns.push(column);
         }
@@ -1701,31 +1689,6 @@ async fn index_ddl(
     ddl.caveats
         .push("index options (FILLFACTOR, compression) and filegroup placement".into());
     Ok(ddl)
-}
-
-/// One decoded cell as text, `None` for SQL NULL.
-fn ddl_opt_text(row: &[Value], idx: usize) -> Option<String> {
-    match row.get(idx) {
-        Some(Value::Null) | None => None,
-        Some(Value::Text(t)) => Some(t.clone()),
-        Some(other) => Some(other.display()),
-    }
-}
-
-fn ddl_text(row: &[Value], idx: usize) -> String {
-    ddl_opt_text(row, idx).unwrap_or_default()
-}
-
-fn ddl_opt_int(row: &[Value], idx: usize) -> Option<i64> {
-    match row.get(idx) {
-        Some(Value::Integer(n)) => Some(*n),
-        _ => None,
-    }
-}
-
-/// bit columns decode as Integer 0/1.
-fn ddl_flag(row: &[Value], idx: usize) -> bool {
-    ddl_opt_int(row, idx).unwrap_or(0) != 0
 }
 
 /// Renders a column's readable declared type the way SQL Server convention
@@ -1993,21 +1956,6 @@ fn format_numeric(n: &tiberius::numeric::Numeric) -> String {
     let padded = format!("{digits:0>width$}", width = scale + 1);
     let (int_part, frac_part) = padded.split_at(padded.len() - scale);
     format!("{sign}{int_part}.{frac_part}")
-}
-
-/// Trims trailing zeros from a chrono-formatted fractional second: `%.f`
-/// pads to 3/6/9 digits ("09.500"), the display wants minimal ("09.5"). The
-/// input must end with the seconds field; the fraction dot is the only dot.
-fn trim_fraction(mut s: String) -> String {
-    if s.contains('.') {
-        while s.ends_with('0') {
-            s.pop();
-        }
-        if s.ends_with('.') {
-            s.pop();
-        }
-    }
-    s
 }
 
 #[cfg(test)]
@@ -2324,12 +2272,5 @@ mod tests {
         // the match is on the exact catalog type name, which is fine because
         // sys.types never reports `timestamp` for anything else.
         assert_eq!(mssql_generated(false, false, "datetime2"), Generated::Never);
-    }
-
-    #[test]
-    fn trim_fraction_strips_padding_zeros() {
-        assert_eq!(trim_fraction("12:34:56.500".into()), "12:34:56.5");
-        assert_eq!(trim_fraction("12:34:56.000".into()), "12:34:56");
-        assert_eq!(trim_fraction("12:34:56".into()), "12:34:56");
     }
 }
