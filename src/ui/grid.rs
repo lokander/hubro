@@ -276,20 +276,33 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         }
     });
 
+    // This grid's own refresh nonce, pulled out of the whole-map signal
+    // through a memo: signal subscription is per-signal, not per-key, so a
+    // raw `grid_refresh.read()` re-runs its readers on ANY write to the map —
+    // a save bumping another table's nonce, or `close_connection` pruning a
+    // closed tab's entries. The memo re-runs on those writes too, but its
+    // PartialEq gate stops the propagation there: the reset effect and the
+    // resources below only re-run when THIS grid's nonce actually changed
+    // (FRE-129).
+    let nonce_table_key = table.key();
+    let refresh_nonce = use_memo(move || {
+        state
+            .grid_refresh
+            .read()
+            .get(&(id, nonce_table_key.clone()))
+            .copied()
+    });
+
     // Close any open editor and drop the row selection when the rows change
     // under them: a page flip, sort/filter change, or refetch replaces the
     // grid's contents — a stale ActiveEdit would spontaneously re-open the
     // editor if its row key scrolled back into view, and a stale selection
     // could stage deletes for rows the user no longer sees.
-    let table_key_for_reset = table.key();
     use_effect(move || {
         let _ = page();
         let _ = sort.read();
         let _ = applied_filter.read();
-        let _ = state
-            .grid_refresh
-            .read()
-            .get(&(id, table_key_for_reset.clone()));
+        let _ = refresh_nonce();
         editing.set(None);
         selected.set(HashMap::new());
         // Re-seed the focus ring at the first cell and drop any expand popup;
@@ -312,49 +325,57 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         );
     });
 
+    // Rowid-identity tables (SQLite, keyless) need the rowid in every
+    // fetched row to build row locators, but `SELECT *` doesn't include
+    // it — ask the page reader for it explicitly. The fetch's extra
+    // column is returned alongside the result so rendering hides
+    // exactly what this fetch prepended (never a stale render-time
+    // guess).
+    //
+    // The bounded fetch also needs the table's columns (to preview large
+    // ones) and the columns that must NOT be previewed: identity keys and
+    // foreign-key columns, whose truncation would misaddress rows or
+    // misdirect a jump (FRE-33).
+    //
+    // Derived through a memo because `registry` and `schemas` are whole-map
+    // signals: a raw read in the resource would re-issue this grid's SQL
+    // fetch on any other connection's open/close or schema load. The memo's
+    // PartialEq gate lets the fetch re-run only when this table's own inputs
+    // change (FRE-129).
+    let meta_table = table.clone();
+    let fetch_meta = use_memo(move || {
+        let registry = state.registry.read();
+        let schemas = state.schemas.read();
+        let meta = find_table(schemas.get(&id), &meta_table);
+        match (meta, registry.get(id)) {
+            (Some(meta), Some(connection)) => {
+                // Row identity is a read concern here — it decides which
+                // columns must be fetched whole — so it comes from the
+                // resolved access, not from whether editing is allowed.
+                let identity = connection.pool.backend_row_identity(meta);
+                let extra = match &identity {
+                    Some(RowIdentity::Rowid { column }) => Some(column.clone()),
+                    _ => None,
+                };
+                let mut no_preview: Vec<String> = identity
+                    .as_ref()
+                    .map(|i| i.key_columns().iter().map(|s| s.to_string()).collect())
+                    .unwrap_or_default();
+                for fk in &meta.foreign_keys {
+                    no_preview.extend(fk.columns.iter().cloned());
+                }
+                (meta.columns.clone(), no_preview, extra)
+            }
+            _ => (Vec::new(), Vec::new(), None),
+        }
+    });
+
     let table_for_resource = table.clone();
     let rows_resource = use_resource(move || {
         let table = table_for_resource.clone();
         // Read reactive deps before any await so the resource re-runs when
         // they change and no borrow spans the await.
-        //
-        // Rowid-identity tables (SQLite, keyless) need the rowid in every
-        // fetched row to build row locators, but `SELECT *` doesn't include
-        // it — ask the page reader for it explicitly. The fetch's extra
-        // column is returned alongside the result so rendering hides
-        // exactly what this fetch prepended (never a stale render-time
-        // guess).
-        //
-        // The bounded fetch also needs the table's columns (to preview large
-        // ones) and the columns that must NOT be previewed: identity keys and
-        // foreign-key columns, whose truncation would misaddress rows or
-        // misdirect a jump (FRE-33).
-        let (columns, no_preview, extra_key_column) = {
-            let registry = state.registry.read();
-            let schemas = state.schemas.read();
-            let meta = find_table(schemas.get(&id), &table);
-            match (meta, registry.get(id)) {
-                (Some(meta), Some(connection)) => {
-                    // Row identity is a read concern here — it decides which
-                    // columns must be fetched whole — so it comes from the
-                    // resolved access, not from whether editing is allowed.
-                    let identity = connection.pool.backend_row_identity(meta);
-                    let extra = match &identity {
-                        Some(RowIdentity::Rowid { column }) => Some(column.clone()),
-                        _ => None,
-                    };
-                    let mut no_preview: Vec<String> = identity
-                        .as_ref()
-                        .map(|i| i.key_columns().iter().map(|s| s.to_string()).collect())
-                        .unwrap_or_default();
-                    for fk in &meta.foreign_keys {
-                        no_preview.extend(fk.columns.iter().cloned());
-                    }
-                    (meta.columns.clone(), no_preview, extra)
-                }
-                _ => (Vec::new(), Vec::new(), None),
-            }
-        };
+        let (columns, no_preview, extra_key_column) = fetch_meta();
         let request = PageRequest {
             schema: table.schema.clone(),
             table: table.name.clone(),
@@ -364,8 +385,14 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             filter: applied_filter(),
             extra_key_column,
         };
-        let _ = state.grid_refresh.read().get(&(id, table.key())).copied();
-        let pool = state.registry.read().get(id).map(|c| c.pool.clone());
+        let _ = refresh_nonce();
+        // Peeked, not read: subscribing to `registry` here would re-fetch on
+        // any connection open/close. The pool for a ConnectionId never
+        // changes while this grid is mounted — the registry's only writes
+        // are `insert` (mints a fresh id), `set_protection` (pool untouched)
+        // and `remove` (which unmounts this tab) — so there is no pool
+        // change to react to; a reconnect is a new id and a new grid.
+        let pool = state.registry.peek().get(id).map(|c| c.pool.clone());
         async move {
             let Some(pool) = pool else {
                 return Err(crate::db::DbError::Query("connection closed".into()));
@@ -395,8 +422,11 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             filter: applied_filter(),
             extra_key_column: None,
         };
-        let _ = state.grid_refresh.read().get(&(id, table.key())).copied();
-        let pool = state.registry.read().get(id).map(|c| c.pool.clone());
+        let _ = refresh_nonce();
+        // Peeked for the same reason as in `rows_resource`: the pool for a
+        // ConnectionId is fixed for the connection's lifetime, and reading
+        // `registry` would re-count on unrelated connection opens/closes.
+        let pool = state.registry.peek().get(id).map(|c| c.pool.clone());
         async move {
             let Some(pool) = pool else {
                 return Err(crate::db::DbError::Query("connection closed".into()));
