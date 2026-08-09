@@ -15,6 +15,7 @@ use crate::config::{BackendKind, ConnectionColor, EditPrefill, SavedConnection, 
 use crate::db::{Dialect, WriteProtection};
 
 use super::icons::BackendIcon;
+use super::js::focus_on_mount;
 use super::notice::{Banner, BannerKind, EmptyState, Spinner};
 use super::state::{ActiveView, AppState, ConnectStep, ServerBackend};
 
@@ -203,11 +204,7 @@ fn ConnectFormModal(
             // Focused on mount so Escape works before the user clicks into a
             // field; keydowns from the fields bubble here either way.
             tabindex: "-1",
-            onmounted: move |evt: MountedEvent| {
-                spawn(async move {
-                    let _ = evt.set_focus(true).await;
-                });
-            },
+            onmounted: focus_on_mount,
             onkeydown: move |evt: KeyboardEvent| {
                 if evt.code() == Code::Escape {
                     // Intent only — see the note above on why this does not

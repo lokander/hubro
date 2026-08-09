@@ -1,29 +1,21 @@
 use dioxus::prelude::*;
 use dioxus_icons::lucide::{Database, RefreshCw, Search, X};
 
-use crate::db::{ConnectionId, TableKind};
+use crate::db::ConnectionId;
 
 use super::filter::{
     count_internal_tables, filter_tables, group_by_schema, parse_query, toggle_column_mode,
     FilterMode,
 };
-use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState};
+use super::js::focus_input_end_next_frame;
+use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState, KindBadge};
 use super::state::{AppState, SchemaLoad, TableRef};
 
 /// Puts the caret back in the filter box after one of the buttons inside it
 /// was clicked. Without this the button keeps focus and the next keystroke
 /// goes nowhere, which is exactly what you type after flipping to `:col`.
-///
-/// Deferred to the next frame so it runs after the re-render that applies the
-/// new text — otherwise the caret is placed against the old value. Same trick
-/// as the cell editor's focus fallback in `editing.rs`.
 fn focus_filter_input() {
-    document::eval(
-        "requestAnimationFrame(() => { \
-            const el = document.getElementById('dv-schema-filter'); \
-            if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); } \
-        });",
-    );
+    focus_input_end_next_frame("dv-schema-filter");
 }
 
 /// What the sidebar's body should show. Derived from [`SchemaLoad`] so the
@@ -385,16 +377,7 @@ fn TableNode(
                     "data-selected": selected,
                     onclick: move |_| state.select_table(id, &select_ref),
                     span { class: "truncate font-mono", "{name}" }
-                    if kind == TableKind::View {
-                        span { class: "rounded bg-violet-100 dark:bg-violet-900/50 px-1 text-xs text-violet-700 dark:text-violet-300",
-                            "view"
-                        }
-                    }
-                    if kind == TableKind::MaterializedView {
-                        span { class: "rounded bg-fuchsia-100 dark:bg-fuchsia-900/50 px-1 text-xs text-fuchsia-700 dark:text-fuchsia-300",
-                            "matview"
-                        }
-                    }
+                    KindBadge { kind }
                     // Sits after the kind badge, since it refines it rather
                     // than replacing it: a continuous aggregate really is a
                     // view, and saying so stays true.

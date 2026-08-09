@@ -14,7 +14,8 @@ use crate::db::{
     ColumnMeta, ConnectionId, DdlObject, DdlSource, Generated, TableKind, TableMeta, TypeDetail,
 };
 
-use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState};
+use super::js::{copy_to_clipboard, focus_on_mount};
+use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState, KindBadge};
 use super::state::{AppState, SchemaLoad, TableRef};
 
 /// What the pane should show, derived from [`SchemaLoad`] inside one `read()`
@@ -101,19 +102,7 @@ fn SchemaBody(id: ConnectionId, meta: TableMeta) -> Element {
         div { class: "p-4",
             div { class: "mb-3 flex items-baseline gap-2",
                 h2 { class: "font-mono text-sm text-slate-900 dark:text-slate-200", "{qualified}" }
-                match meta.kind {
-                    TableKind::View => rsx! {
-                        span { class: "rounded bg-violet-100 dark:bg-violet-900/50 px-1 text-xs text-violet-700 dark:text-violet-300",
-                            "view"
-                        }
-                    },
-                    TableKind::MaterializedView => rsx! {
-                        span { class: "rounded bg-fuchsia-100 dark:bg-fuchsia-900/50 px-1 text-xs text-fuchsia-700 dark:text-fuchsia-300",
-                            "matview"
-                        }
-                    },
-                    TableKind::Table => rsx! {},
-                }
+                KindBadge { kind: meta.kind }
                 // The object's own definition (FRE-108). Sits with the name
                 // it describes rather than in a toolbar, so it is obvious
                 // *what* the DDL will be for.
@@ -214,11 +203,7 @@ fn DdlOverlay(
         div {
             class: "fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-4 outline-none",
             tabindex: "-1",
-            onmounted: move |evt: MountedEvent| {
-                spawn(async move {
-                    let _ = evt.set_focus(true).await;
-                });
-            },
+            onmounted: focus_on_mount,
             onkeydown: move |evt: KeyboardEvent| {
                 if evt.code() == Code::Escape {
                     on_close.call(());
@@ -286,13 +271,10 @@ fn DdlOverlay(
 /// copied from.
 #[component]
 fn CopyDdlButton(text: String) -> Element {
-    let json = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".into());
     rsx! {
         button {
             class: "shrink-0 rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
-            onclick: move |_| {
-                document::eval(&format!("navigator.clipboard.writeText({json});"));
-            },
+            onclick: move |_| copy_to_clipboard(&text),
             "Copy"
         }
     }

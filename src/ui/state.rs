@@ -910,6 +910,25 @@ pub struct AppState {
     pub show_cheatsheet: Signal<bool>,
 }
 
+/// Finds one table's metadata in a loaded schema — the single
+/// `(schema, name)` match behind every "which table is this?" lookup in the
+/// app.
+///
+/// Borrows out of the caller's signal guard, so a render path can read a
+/// field without cloning the whole [`TableMeta`]; the async paths use
+/// [`AppState::table_meta`], which clones.
+pub fn find_table_meta<'a>(
+    load: Option<&'a SchemaLoad>,
+    table: &TableRef,
+) -> Option<&'a TableMeta> {
+    match load? {
+        SchemaLoad::Ready(tables) => tables
+            .iter()
+            .find(|t| t.name == table.name && t.schema == table.schema),
+        _ => None,
+    }
+}
+
 impl AppState {
     /// Must be called from a component (signals need the runtime).
     pub fn new() -> Self {
@@ -2593,13 +2612,7 @@ impl AppState {
         column: String,
     ) -> Result<CellFetch, String> {
         let pool = self.registry.read().get(id).map(|c| c.pool.clone());
-        let meta = self.schemas.read().get(&id).and_then(|load| match load {
-            SchemaLoad::Ready(tables) => tables
-                .iter()
-                .find(|t| t.name == table.name && t.schema == table.schema)
-                .cloned(),
-            _ => None,
-        });
+        let meta = self.table_meta(id, &table);
         let (Some(pool), Some(meta)) = (pool, meta) else {
             return Err("connection or schema no longer available".into());
         };
@@ -2627,13 +2640,7 @@ impl AppState {
         object: DdlObject,
     ) -> Result<Ddl, String> {
         let pool = self.registry.read().get(id).map(|c| c.pool.clone());
-        let meta = self.schemas.read().get(&id).and_then(|load| match load {
-            SchemaLoad::Ready(tables) => tables
-                .iter()
-                .find(|t| t.name == table.name && t.schema == table.schema)
-                .cloned(),
-            _ => None,
-        });
+        let meta = self.table_meta(id, &table);
         let (Some(pool), Some(meta)) = (pool, meta) else {
             return Err("connection or schema no longer available".into());
         };
@@ -2645,14 +2652,24 @@ impl AppState {
     /// The primary-key column names of `table` in key order, from the loaded
     /// schema (empty when the schema isn't ready or the table has no PK).
     fn table_primary_key(&self, id: ConnectionId, table: &TableRef) -> Vec<String> {
-        match self.schemas.read().get(&id) {
-            Some(SchemaLoad::Ready(tables)) => tables
-                .iter()
-                .find(|t| t.name == table.name && t.schema == table.schema)
-                .map(|t| t.primary_key().iter().map(|c| c.name.clone()).collect())
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        }
+        let schemas = self.schemas.read();
+        find_table_meta(schemas.get(&id), table)
+            .map(|t| t.primary_key().iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// One table's metadata from the loaded schema, cloned out of the signal.
+    ///
+    /// `None` while the schema is still loading, when the load failed, or
+    /// when the table is gone — a refresh can drop one out from under an open
+    /// tab, and every caller has to survive that.
+    ///
+    /// Cloning is deliberate: the async paths (cell fetch, DDL, save) must
+    /// not hold a signal borrow across their await, so they take the metadata
+    /// with them. Render paths that only read it want [`find_table_meta`],
+    /// which borrows.
+    pub fn table_meta(&self, id: ConnectionId, table: &TableRef) -> Option<TableMeta> {
+        find_table_meta(self.schemas.read().get(&id), table).cloned()
     }
 
     /// Stages a cell edit (FRE-24 pushes edits in through this). Edits
@@ -2949,13 +2966,7 @@ impl AppState {
         };
         self.nav_guard.set(None);
         let pool = self.registry.read().get(id).map(|c| c.pool.clone());
-        let meta = self.schemas.read().get(&id).and_then(|load| match load {
-            SchemaLoad::Ready(tables) => tables
-                .iter()
-                .find(|t| t.name == table.name && t.schema == table.schema)
-                .cloned(),
-            _ => None,
-        });
+        let meta = self.table_meta(id, table);
         let (Some(pool), Some(meta)) = (pool, meta) else {
             self.fail_save(
                 id,
