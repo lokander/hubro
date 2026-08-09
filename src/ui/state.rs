@@ -430,8 +430,33 @@ enum ServerCredential<'a> {
     /// The database password — from session memory, the OS keyring, or the
     /// prompt.
     Password(&'a str),
-    /// A Microsoft Entra access token (never a refresh token).
-    EntraToken(&'a str),
+    /// A Microsoft Entra access token (never a refresh token). Owned, unlike
+    /// its siblings: the token moves out of the acquisition and into the
+    /// login, so a live access token is never copied into a second place.
+    EntraToken(String),
+}
+
+/// How a credential logs in on one backend — everything [`ServerBackend::open`]
+/// must decide before it touches the network, and nothing else.
+///
+/// Split out of the open because this decision is the crux of the backend
+/// strategy and getting it wrong fails quietly in the worst way: a SQL Server
+/// Entra token spliced into the URL would be sent as a *password* and rejected
+/// as bad credentials, so the bug would read as an auth problem rather than a
+/// routing one. Being pure, it is pinned by unit tests instead of by a live
+/// server.
+///
+/// Deliberately no `Debug`: both fields carry a secret.
+struct ServerLogin {
+    /// The URL to dial, with the secret spliced in as its password when the
+    /// engine takes it that way — which Postgres does for a password and an
+    /// Entra token alike.
+    url: String,
+    /// The Entra access token to hand the driver *instead of* putting it in
+    /// the URL: SQL Server's AAD login. `None` in every other case, Postgres
+    /// tokens included — those live in `url`, and there is no driver parameter
+    /// they could go to instead.
+    aad_token: Option<String>,
 }
 
 /// The per-engine data the server connect flows are parameterized over.
@@ -509,8 +534,41 @@ impl ServerBackend {
         }
     }
 
-    /// Opens the pool with `credential`, splicing it into the URL or handing
-    /// it to the driver as this engine requires.
+    /// Where `credential` goes for this engine: into the URL as its password,
+    /// or to the driver as an AAD login. Pure — see [`ServerLogin`] for why
+    /// this is a step of its own.
+    fn login(
+        &self,
+        connect_url: &str,
+        credential: ServerCredential<'_>,
+    ) -> Result<ServerLogin, DbError> {
+        let spliced = |secret: &str| (self.with_password)(connect_url, secret);
+        Ok(match (self.kind, credential) {
+            // Nothing to place: the URL is dialed as it stands.
+            (_, ServerCredential::None) => ServerLogin {
+                url: connect_url.to_string(),
+                aad_token: None,
+            },
+            // A password is a password on both engines.
+            (_, ServerCredential::Password(password)) => ServerLogin {
+                url: spliced(password)?,
+                aad_token: None,
+            },
+            // SQL Server logs in with the token itself and ignores the URL's
+            // user/password, so the token must stay out of the URL.
+            (BackendKind::SqlServer, ServerCredential::EntraToken(token)) => ServerLogin {
+                url: connect_url.to_string(),
+                aad_token: Some(token),
+            },
+            // Postgres has no such login method: the token *is* the password.
+            (_, ServerCredential::EntraToken(token)) => ServerLogin {
+                url: spliced(&token)?,
+                aad_token: None,
+            },
+        })
+    }
+
+    /// Opens the pool with `credential`, placed by [`Self::login`].
     ///
     /// A `match` on the kind rather than another function pointer in the
     /// descriptor: the two openers differ in *shape*, not just identity (SQL
@@ -523,32 +581,20 @@ impl ServerBackend {
         credential: ServerCredential<'_>,
         tls_host: Option<&str>,
     ) -> Result<DbPool, DbError> {
+        let ServerLogin { url, aad_token } = self.login(connect_url, credential)?;
         match self.kind {
             BackendKind::SqlServer => {
-                let (url, auth) = match credential {
-                    ServerCredential::None => (connect_url.to_string(), MssqlAuth::Password),
-                    ServerCredential::Password(password) => (
-                        (self.with_password)(connect_url, password)?,
-                        MssqlAuth::Password,
-                    ),
-                    // tiberius logs in with the token itself; the URL's
-                    // user/password are ignored, so nothing is spliced in.
-                    ServerCredential::EntraToken(token) => (
-                        connect_url.to_string(),
-                        MssqlAuth::AadToken(token.to_string()),
-                    ),
+                let auth = match aad_token {
+                    Some(token) => MssqlAuth::AadToken(token),
+                    None => MssqlAuth::Password,
                 };
                 DbPool::open_mssql_with(&url, &auth, tls_host).await
             }
-            // Postgres takes both secrets the same way, and has no TLS host
-            // override to pass.
+            // No AAD login and no TLS host override exist here: `login` never
+            // produces a token for Postgres (it goes into the URL), and sqlx
+            // validates TLS against the URL's own host.
             _ => {
-                let url = match credential {
-                    ServerCredential::None => connect_url.to_string(),
-                    ServerCredential::Password(secret) | ServerCredential::EntraToken(secret) => {
-                        (self.with_password)(connect_url, secret)?
-                    }
-                };
+                debug_assert!(aad_token.is_none(), "a Postgres token belongs in the URL");
                 DbPool::open_postgres(&url).await
             }
         }
@@ -975,7 +1021,7 @@ impl AppState {
             }
         });
         // Session restore is triggered once from the Shell component (see
-        // `Shell`), not here: it drives the normal `connect`/`connect_postgres`
+        // `Shell`), not here: it drives the normal `connect`/`connect_server`
         // flow, which writes the core connection signals (registry,
         // open_locators, active, tab_ui, …). Those are owned by the root App
         // scope, so running restore from a component-scoped task keeps the
@@ -1043,9 +1089,9 @@ impl AppState {
 
     /// Records that the next successful connect to `new_locator` is an edit
     /// of `old_locator` rather than a new connection (FRE-75). Consumed by
-    /// [`Self::save_postgres_if_open`] / [`Self::save_sqlserver_if_open`],
-    /// the one place every connect path saves through — including the Entra
-    /// sign-in card, which completes long after the form has closed.
+    /// [`Self::save_server_if_open`], the one place every connect path saves
+    /// through — including the Entra sign-in card, which completes long after
+    /// the form has closed.
     pub fn set_pending_edit(mut self, old_locator: String, new_locator: String) {
         self.pending_edit.set(Some(PendingEdit {
             old_locator,
@@ -1321,10 +1367,12 @@ impl AppState {
             entra,
             ..
         } = pending;
+        // The access token moves into the login (and no further): only the
+        // refresh token below is ever written anywhere.
         let result = backend
             .open(
                 connect_url,
-                ServerCredential::EntraToken(&token.secret),
+                ServerCredential::EntraToken(token.secret),
                 tls_host.as_deref(),
             )
             .await;
@@ -3651,6 +3699,81 @@ mod tests {
             pg.tls_host("postgres://u@db.example.com:5432/app", false),
             None
         );
+    }
+
+    #[test]
+    fn a_credential_is_placed_where_its_engine_expects_it() {
+        // The crux of the backend strategy, pinned for all three credentials
+        // on both engines. A misplaced Entra token is the dangerous case: sent
+        // as a password it comes back as "authentication failed", which reads
+        // like a user error rather than a routing bug.
+        const PG: &str = "postgres://u@h:5432/db";
+        const MS: &str = "mssql://sa@h:1433/db";
+        const TOKEN: &str = "eyJhbGciOi.ACCESS.TOKEN";
+        let pg = ServerBackend::POSTGRES;
+        let ms = ServerBackend::SQL_SERVER;
+
+        // No credential: the URL is dialed exactly as it stands, and SQL
+        // Server logs in with the URL's own user (MssqlAuth::Password).
+        for (backend, url) in [(pg, PG), (ms, MS)] {
+            let login = backend.login(url, ServerCredential::None).unwrap();
+            assert_eq!(login.url, url);
+            assert!(login.aad_token.is_none());
+        }
+
+        // A password is spliced into the URL on both engines.
+        let login = pg.login(PG, ServerCredential::Password("p@ss")).unwrap();
+        assert_eq!(login.url, "postgres://u:p%40ss@h:5432/db");
+        assert!(login.aad_token.is_none());
+        let login = ms.login(MS, ServerCredential::Password("p@ss")).unwrap();
+        assert_eq!(login.url, "mssql://sa:p%40ss@h:1433/db");
+        assert!(login.aad_token.is_none());
+
+        // Postgres has no token login: the token goes in as the password.
+        let login = pg
+            .login(PG, ServerCredential::EntraToken(TOKEN.to_string()))
+            .unwrap();
+        assert_eq!(login.url, format!("postgres://u:{TOKEN}@h:5432/db"));
+        assert!(
+            login.aad_token.is_none(),
+            "Postgres has no driver-side token login to route to"
+        );
+
+        // SQL Server does: the token goes to the driver and the URL is left
+        // untouched — a token in the URL would be sent as a password.
+        let login = ms
+            .login(MS, ServerCredential::EntraToken(TOKEN.to_string()))
+            .unwrap();
+        assert_eq!(login.url, MS, "the URL must be unchanged");
+        assert!(
+            !login.url.contains(TOKEN),
+            "the access token must never reach the URL on SQL Server"
+        );
+        assert_eq!(login.aad_token.as_deref(), Some(TOKEN));
+    }
+
+    #[test]
+    fn a_login_reports_a_url_that_cannot_carry_the_secret() {
+        // The splice is fallible, and its error is the one the connect
+        // surfaces — it must not be swallowed into a connect attempt with a
+        // secret-less URL.
+        for backend in [ServerBackend::POSTGRES, ServerBackend::SQL_SERVER] {
+            assert!(backend
+                .login("not a url", ServerCredential::Password("p"))
+                .is_err());
+            // Nothing is spliced, so there is nothing to fail on: an unusable
+            // URL stays the driver's error to report, exactly as before.
+            assert!(backend.login("not a url", ServerCredential::None).is_ok());
+        }
+        // A Postgres token is spliced, so it fails here…
+        assert!(ServerBackend::POSTGRES
+            .login("not a url", ServerCredential::EntraToken("t".to_string()))
+            .is_err());
+        // …while a SQL Server token never touches the URL, which is the whole
+        // point: nothing can fail at this step.
+        assert!(ServerBackend::SQL_SERVER
+            .login("not a url", ServerCredential::EntraToken("t".to_string()))
+            .is_ok());
     }
 
     #[test]
