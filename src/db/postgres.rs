@@ -921,16 +921,22 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
             kind_label,
         });
     }
-    let index_of = |schema: &str, name: &str, tables: &[TableMeta]| {
-        tables
-            .iter()
-            .position(|t| t.schema.as_deref() == Some(schema) && t.name == name)
-    };
+    // (schema, table) → index into `tables`, built once so grouping the
+    // column/index/FK rows below is a hash lookup per row instead of a linear
+    // scan over every table (FRE-133).
+    let mut table_index: HashMap<(String, String), usize> = HashMap::with_capacity(tables.len());
+    for (idx, table) in tables.iter().enumerate() {
+        if let Some(schema) = &table.schema {
+            table_index
+                .entry((schema.clone(), table.name.clone()))
+                .or_insert(idx);
+        }
+    }
 
     for row in &column_rows {
         let schema: String = get(row, "table_schema")?;
         let table: String = get(row, "table_name")?;
-        let Some(idx) = index_of(&schema, &table, &tables) else {
+        let Some(&idx) = table_index.get(&(schema, table)) else {
             continue;
         };
         let nullable: String = get(row, "is_nullable")?;
@@ -988,7 +994,7 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
     for row in &index_rows {
         let schema: String = get(row, "table_schema")?;
         let table: String = get(row, "table_name")?;
-        let Some(idx) = index_of(&schema, &table, &tables) else {
+        let Some(&idx) = table_index.get(&(schema, table)) else {
             continue;
         };
         let index_name: String = get(row, "index_name")?;
@@ -1011,7 +1017,7 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
     for row in &fk_rows {
         let schema: String = get(row, "table_schema")?;
         let table: String = get(row, "table_name")?;
-        let Some(idx) = index_of(&schema, &table, &tables) else {
+        let Some(&idx) = table_index.get(&(schema, table)) else {
             continue;
         };
         let ref_columns: Vec<String> = get(row, "ref_columns")?;
