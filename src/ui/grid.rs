@@ -15,7 +15,7 @@ use crate::db::{
 use crate::util::human_bytes;
 
 use super::editing::{editor_kind, CellEditor, EditNav, EditorKind};
-use super::js::focus_by_id_next_frame;
+use super::js::{focus_by_id_next_frame, js_string};
 use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState};
 use super::schema::display_type;
 use super::selection::Selection;
@@ -2772,7 +2772,7 @@ fn copy_summary(raw: bool, format: CopyFormat, rows: usize, cols: usize) -> Stri
 /// nothing is indistinguishable from a broken app. The fallback restores the
 /// previously focused element so the grid keeps its keyboard focus.
 fn write_clipboard(text: &str) {
-    let json = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into());
+    let json = js_string(text);
     document::eval(&format!(
         r#"(() => {{
   const text = {json};

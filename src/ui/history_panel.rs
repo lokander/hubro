@@ -184,11 +184,10 @@ fn HistoryRow(id: ConnectionId, editor_element: String, entry: HistoryEntry) -> 
     let state = use_context::<AppState>();
     let time = format_history_time(entry.executed_at);
     let preview: String = entry.sql.split_whitespace().collect::<Vec<_>>().join(" ");
-    let sql_json = js_string(&entry.sql);
+    let json_for_load = js_string(&entry.sql);
+    let json_for_run = json_for_load.clone();
     let sql_for_load = entry.sql.clone();
-    let json_for_load = sql_json.clone();
     let sql_for_run = entry.sql.clone();
-    let json_for_run = sql_json.clone();
     let sql_for_copy = entry.sql.clone();
     let element_for_run = editor_element.clone();
     let title = match &entry.error {

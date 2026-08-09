@@ -13,10 +13,12 @@ use dioxus::prelude::*;
 /// Renders `text` as a JavaScript string literal, quotes included, for
 /// interpolation into an eval.
 ///
-/// JSON string syntax is a subset of JavaScript's, so `serde_json` is the
-/// escaper. Serializing a `&str` cannot fail; the fallback is an empty
-/// literal rather than a panic, so a hypothetical failure yields a no-op eval
-/// instead of taking the window down.
+/// JSON string syntax is a subset of JavaScript's (since ES2019, which made
+/// the unescaped line separators U+2028/U+2029 legal in string literals — the
+/// one thing `serde_json` passes through), so `serde_json` is the escaper.
+/// Serializing a `&str` cannot fail; the fallback is an empty literal rather
+/// than a panic, so a hypothetical failure yields a no-op eval instead of
+/// taking the window down.
 pub fn js_string(text: &str) -> String {
     serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into())
 }
@@ -25,7 +27,8 @@ pub fn js_string(text: &str) -> String {
 ///
 /// Used by the small copy buttons (query history, DDL viewer). The grid's
 /// copy path has its own eval with a `document.execCommand` fallback and a
-/// completion signal, which this deliberately doesn't try to cover.
+/// completion signal, which this deliberately doesn't try to cover — it still
+/// escapes its text with [`js_string`].
 pub fn copy_to_clipboard(text: &str) {
     document::eval(&format!(
         "navigator.clipboard.writeText({});",
