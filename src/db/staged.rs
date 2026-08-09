@@ -18,6 +18,7 @@
 //! type (`SET "col" = $1::integer`) so text-staged values coerce — see
 //! [`cast_target`] for why and when the cast is skipped.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write as _;
 
@@ -26,7 +27,7 @@ use super::error::DbError;
 use super::page::{quote_ident, Dialect};
 use super::registry::DbPool;
 use super::rowkey::RowIdentity;
-use super::schema::TableMeta;
+use super::schema::{ColumnMeta, TableMeta};
 use super::value::Value;
 
 /// The identity-column values addressing one row. Value order matches
@@ -226,18 +227,21 @@ pub async fn apply_staged(
             .to_string(),
         });
     }
-    let plan = build_statements(table, identity, pool.dialect(), changes)?;
-    let statements: Vec<CheckedStatement> = plan.iter().map(|s| s.statement.clone()).collect();
+    // Statements and their metadata come back as parallel-by-index vecs so
+    // the statements — which carry every staged cell value — go to
+    // `execute_all_checked` as-is instead of being cloned out of a combined
+    // struct (FRE-131); the metadata is only consulted on failure.
+    let (statements, metas) = build_statements(table, identity, pool.dialect(), changes)?;
     pool.execute_all_checked(&statements)
         .await
         .map_err(|(statement_index, error)| StagedError {
-            change_index: statement_index.map(|i| plan[i].change_index),
-            change_summary: statement_index.map(|i| plan[i].summary.clone()),
+            change_index: statement_index.map(|i| metas[i].change_index),
+            change_summary: statement_index.map(|i| metas[i].summary.clone()),
             message: error.to_string(),
         })?;
     let mut counts = AppliedCounts::default();
-    for built in &plan {
-        match built.kind {
+    for meta in &metas {
+        match meta.kind {
             StatementKind::Update => counts.updated_rows += 1,
             StatementKind::Insert => counts.inserted_rows += 1,
             StatementKind::Delete => counts.deleted_rows += 1,
@@ -253,13 +257,15 @@ enum StatementKind {
     Delete,
 }
 
-/// One statement of the plan, remembering which change it came from (for
-/// grouped updates: the first of the row's changes) and how to describe it
-/// in a failure message (for grouped updates: the row and ALL its columns,
-/// not just the first).
+/// What one planned statement means, parallel by index to the statements
+/// vec [`build_statements`] returns: which change it came from (for grouped
+/// updates: the first of the row's changes) and how to describe it in a
+/// failure message (for grouped updates: the row and ALL its columns, not
+/// just the first). Kept apart from [`CheckedStatement`] so the statements
+/// — which carry every staged value — need never be cloned out of a
+/// combined struct just to reach the executor (FRE-131).
 #[derive(Debug)]
-struct BuiltStatement {
-    statement: CheckedStatement,
+struct StatementMeta {
     change_index: usize,
     kind: StatementKind,
     summary: String,
@@ -268,26 +274,27 @@ struct BuiltStatement {
 /// Pre-grouping slot: updates accumulate SET entries until rendered.
 enum Slot {
     UpdateGroup {
-        /// [`RowLocator::key`] of `locator` — grouping matches rows by the
-        /// stage's bit-exact row identity, never by value `PartialEq`.
-        key: String,
         locator: RowLocator,
         first_index: usize,
         sets: Vec<(String, Value)>,
     },
-    Ready(BuiltStatement),
+    Ready {
+        statement: CheckedStatement,
+        meta: StatementMeta,
+    },
 }
 
-/// Turns the change list into concrete statements, in first-occurrence
-/// order (per-row updates collapse into the position of the row's first
-/// update). Validation errors (locator arity, insert arity) are reported
-/// with the offending change's index before anything touches the database.
+/// Turns the change list into concrete statements plus their
+/// parallel-by-index metadata, in first-occurrence order (per-row updates
+/// collapse into the position of the row's first update). Validation errors
+/// (locator arity, insert arity) are reported with the offending change's
+/// index before anything touches the database.
 fn build_statements(
     table: &TableMeta,
     identity: &RowIdentity,
     dialect: Dialect,
     changes: &[StagedChange],
-) -> Result<Vec<BuiltStatement>, StagedError> {
+) -> Result<(Vec<CheckedStatement>, Vec<StatementMeta>), StagedError> {
     let key_len = identity.key_columns().len();
     let check_locator = |locator: &RowLocator, index: usize, change: &StagedChange| {
         if locator.identity_values.len() == key_len {
@@ -303,7 +310,17 @@ fn build_statements(
             })
         }
     };
+    let casts = cast_targets(table, dialect);
     let mut slots: Vec<Slot> = Vec::new();
+    // Row key → index into `slots` of the row's UpdateGroup. The Vec keeps
+    // first-occurrence order; the map makes the group lookup O(1) instead
+    // of a linear scan over every prior slot, which made large staged
+    // batches quadratic in string compares (FRE-131). Grouping is by the
+    // row KEY ([`RowLocator::key`] — bit-exact, the identity the UI stage
+    // coalesced under), unchanged: PartialEq would merge 0.0/-0.0 locators
+    // (a duplicate-SET error at best, the wrong row at worst) and never
+    // group NaN with itself.
+    let mut update_groups: HashMap<String, usize> = HashMap::new();
     for (index, change) in changes.iter().enumerate() {
         match change {
             StagedChange::Update {
@@ -312,23 +329,21 @@ fn build_statements(
                 value,
             } => {
                 check_locator(locator, index, change)?;
-                // Group by the row KEY (bit-exact, the identity the UI
-                // stage coalesced under) — PartialEq would merge 0.0/-0.0
-                // locators (a duplicate-SET error at best, the wrong row at
-                // worst) and never group NaN with itself.
-                let row_key = locator.key();
-                let existing = slots.iter_mut().find_map(|slot| match slot {
-                    Slot::UpdateGroup { key, sets, .. } if *key == row_key => Some(sets),
-                    _ => None,
-                });
-                match existing {
-                    Some(sets) => sets.push((column.clone(), value.clone())),
-                    None => slots.push(Slot::UpdateGroup {
-                        key: row_key,
-                        locator: locator.clone(),
-                        first_index: index,
-                        sets: vec![(column.clone(), value.clone())],
-                    }),
+                match update_groups.entry(locator.key()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        let Slot::UpdateGroup { sets, .. } = &mut slots[*entry.get()] else {
+                            unreachable!("update_groups only indexes UpdateGroup slots");
+                        };
+                        sets.push((column.clone(), value.clone()));
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(slots.len());
+                        slots.push(Slot::UpdateGroup {
+                            locator: locator.clone(),
+                            first_index: index,
+                            sets: vec![(column.clone(), value.clone())],
+                        });
+                    }
                 }
             }
             StagedChange::Insert { columns, values } => {
@@ -343,41 +358,50 @@ fn build_statements(
                         ),
                     });
                 }
-                slots.push(Slot::Ready(BuiltStatement {
-                    statement: insert_statement(table, dialect, columns, values),
-                    change_index: index,
-                    kind: StatementKind::Insert,
-                    summary: change.describe(),
-                }));
+                slots.push(Slot::Ready {
+                    statement: insert_statement(table, dialect, &casts, columns, values),
+                    meta: StatementMeta {
+                        change_index: index,
+                        kind: StatementKind::Insert,
+                        summary: change.describe(),
+                    },
+                });
             }
             StagedChange::Delete { locator } => {
                 check_locator(locator, index, change)?;
-                slots.push(Slot::Ready(BuiltStatement {
-                    statement: delete_statement(table, identity, dialect, locator),
-                    change_index: index,
-                    kind: StatementKind::Delete,
-                    summary: change.describe(),
-                }));
+                slots.push(Slot::Ready {
+                    statement: delete_statement(table, identity, dialect, &casts, locator),
+                    meta: StatementMeta {
+                        change_index: index,
+                        kind: StatementKind::Delete,
+                        summary: change.describe(),
+                    },
+                });
             }
         }
     }
-    Ok(slots
-        .into_iter()
-        .map(|slot| match slot {
+    let mut statements = Vec::with_capacity(slots.len());
+    let mut metas = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let (statement, meta) = match slot {
             Slot::UpdateGroup {
                 locator,
                 first_index,
                 sets,
-                ..
-            } => BuiltStatement {
-                statement: update_statement(table, identity, dialect, &locator, &sets),
-                change_index: first_index,
-                kind: StatementKind::Update,
-                summary: update_summary(&locator, &sets),
-            },
-            Slot::Ready(built) => built,
-        })
-        .collect())
+            } => (
+                update_statement(table, identity, dialect, &casts, &locator, &sets),
+                StatementMeta {
+                    change_index: first_index,
+                    kind: StatementKind::Update,
+                    summary: update_summary(&locator, &sets),
+                },
+            ),
+            Slot::Ready { statement, meta } => (statement, meta),
+        };
+        statements.push(statement);
+        metas.push(meta);
+    }
+    Ok((statements, metas))
 }
 
 /// Failure summary for a (possibly multi-column) row update: names the row
@@ -429,12 +453,30 @@ impl ParamSql {
         self.values.push(value.clone());
         let placeholder = self.dialect.placeholder(self.values.len());
         match cast {
-            // `cast` is only ever `Some` when [`cast_target`] decided this
+            // `cast` is only ever `Some` when [`cast_targets`] decided this
             // dialect needs one (never on SQLite).
             Some(cast) => self.dialect.cast_expr(&placeholder, cast),
             None => placeholder,
         }
     }
+}
+
+/// Cast targets for every castable column of `table`, keyed by column
+/// name — computed ONCE per [`build_statements`] call so rendering a value
+/// looks its column up in O(1) instead of re-scanning `table.columns` per
+/// SET/key value (FRE-131). A column absent from the map (not castable, not
+/// introspected at all, or any non-Postgres dialect — SQLite's type
+/// affinity coerces on its own) binds its placeholder uncast, exactly as
+/// before.
+fn cast_targets(table: &TableMeta, dialect: Dialect) -> HashMap<&str, String> {
+    if dialect != Dialect::Postgres {
+        return HashMap::new();
+    }
+    table
+        .columns
+        .iter()
+        .filter_map(|column| cast_target(column).map(|cast| (column.name.as_str(), cast)))
+        .collect()
 }
 
 /// The Postgres cast target for one column's bound parameters, derived from
@@ -460,9 +502,10 @@ impl ParamSql {
 /// built-in array types live in `pg_catalog`, so neither is guaranteed to
 /// resolve through `search_path` (FRE-71).
 ///
-/// Skipped (`None`) — the placeholder then binds as before:
-/// - on SQLite (its type affinity coerces on its own);
-/// - when the column is unknown or its type name is empty;
+/// Skipped (`None`) — the placeholder then binds as before (unknown columns
+/// and non-Postgres dialects never reach here; [`cast_targets`] leaves them
+/// out of the map):
+/// - when the column's type name is empty;
 /// - for `data_type` strings that are not usable/plain type names:
 ///   `ARRAY` and `USER-DEFINED` whose real name didn't resolve, or anything
 ///   outside `[a-z0-9 _.]` after lowercasing — `.` is allowed because the
@@ -480,11 +523,7 @@ impl ParamSql {
 ///   unbounded/unconstrained. For the skipped types the uncast text
 ///   parameter is correct: Postgres's assignment/comparison coercion
 ///   handles text → char(n)/bit(n) with the column's true modifier.
-fn cast_target(table: &TableMeta, dialect: Dialect, column: &str) -> Option<String> {
-    if dialect != Dialect::Postgres {
-        return None;
-    }
-    let column = table.columns.iter().find(|c| c.name == column)?;
+fn cast_target(column: &ColumnMeta) -> Option<String> {
     // An enum/array column casts to its real type name, which `data_type`
     // doesn't carry (FRE-71). Both halves are arbitrary identifiers — a
     // `CREATE TYPE "Mood"` is case-sensitive and would not resolve
@@ -514,6 +553,7 @@ fn update_statement(
     table: &TableMeta,
     identity: &RowIdentity,
     dialect: Dialect,
+    casts: &HashMap<&str, String>,
     locator: &RowLocator,
     sets: &[(String, Value)],
 ) -> CheckedStatement {
@@ -522,11 +562,11 @@ fn update_statement(
     let assignments: Vec<String> = sets
         .iter()
         .map(|(column, value)| {
-            let cast = cast_target(table, dialect, column);
+            let cast = casts.get(column.as_str()).map(String::as_str);
             format!(
                 "{} = {}",
                 quote_ident(column),
-                params.value_sql(value, cast.as_deref())
+                params.value_sql(value, cast)
             )
         })
         .collect();
@@ -534,7 +574,7 @@ fn update_statement(
         "UPDATE {} SET {} WHERE {}",
         qualified_table(table),
         assignments.join(", "),
-        key_clause(table, identity, dialect, locator, &mut params),
+        key_clause(identity, casts, locator, &mut params),
     );
     CheckedStatement {
         sql,
@@ -548,6 +588,7 @@ fn update_statement(
 fn insert_statement(
     table: &TableMeta,
     dialect: Dialect,
+    casts: &HashMap<&str, String>,
     columns: &[String],
     values: &[Value],
 ) -> CheckedStatement {
@@ -560,8 +601,8 @@ fn insert_statement(
             .iter()
             .zip(values)
             .map(|(column, value)| {
-                let cast = cast_target(table, dialect, column);
-                params.value_sql(value, cast.as_deref())
+                let cast = casts.get(column.as_str()).map(String::as_str);
+                params.value_sql(value, cast)
             })
             .collect();
         format!(
@@ -583,13 +624,14 @@ fn delete_statement(
     table: &TableMeta,
     identity: &RowIdentity,
     dialect: Dialect,
+    casts: &HashMap<&str, String>,
     locator: &RowLocator,
 ) -> CheckedStatement {
     let mut params = ParamSql::new(dialect);
     let sql = format!(
         "DELETE FROM {} WHERE {}",
         qualified_table(table),
-        key_clause(table, identity, dialect, locator, &mut params),
+        key_clause(identity, casts, locator, &mut params),
     );
     CheckedStatement {
         sql,
@@ -600,13 +642,12 @@ fn delete_statement(
 
 /// `"k1" = ? AND "k2" = NULL` over the full key, pairing the identity's key
 /// columns with the locator's values (arity is validated by the caller).
-/// Key placeholders carry column casts too ([`cast_target`]) — identity
+/// Key placeholders carry column casts too ([`cast_targets`]) — identity
 /// values of rich Postgres types (uuid, timestamp, numeric keys) arrive
 /// from the grid as text and must coerce in the WHERE clause as well.
 fn key_clause(
-    table: &TableMeta,
     identity: &RowIdentity,
-    dialect: Dialect,
+    casts: &HashMap<&str, String>,
     locator: &RowLocator,
     params: &mut ParamSql,
 ) -> String {
@@ -615,11 +656,11 @@ fn key_clause(
         .iter()
         .zip(&locator.identity_values)
         .map(|(column, value)| {
-            let cast = cast_target(table, dialect, column);
+            let cast = casts.get(*column).map(String::as_str);
             format!(
                 "{} = {}",
                 quote_ident(column),
-                params.value_sql(value, cast.as_deref())
+                params.value_sql(value, cast)
             )
         })
         .collect::<Vec<_>>()
@@ -735,7 +776,7 @@ mod tests {
 
     #[test]
     fn updates_on_one_row_group_into_a_single_multi_column_statement() {
-        let plan = build_statements(
+        let (statements, metas) = build_statements(
             &table(),
             &identity(),
             Dialect::Sqlite,
@@ -745,28 +786,29 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(plan.len(), 1);
+        assert_eq!(statements.len(), 1);
+        assert_eq!(metas.len(), 1);
         assert_eq!(
-            plan[0].statement.sql,
+            statements[0].sql,
             "UPDATE \"t\" SET \"a\" = ?, \"b\" = ? WHERE \"id\" = ?"
         );
         assert_eq!(
-            plan[0].statement.params,
+            statements[0].params,
             vec![
                 Value::Text("x".into()),
                 Value::Integer(2),
                 Value::Integer(1)
             ]
         );
-        assert_eq!(plan[0].statement.expected_rows, 1);
-        assert_eq!(plan[0].change_index, 0);
+        assert_eq!(statements[0].expected_rows, 1);
+        assert_eq!(metas[0].change_index, 0);
         // The failure summary names the row and BOTH columns.
-        assert_eq!(plan[0].summary, "update of row (1) [columns a, b]");
+        assert_eq!(metas[0].summary, "update of row (1) [columns a, b]");
     }
 
     #[test]
     fn grouping_is_by_locator_not_adjacency_and_attributes_the_first_change() {
-        let plan = build_statements(
+        let (statements, metas) = build_statements(
             &table(),
             &identity(),
             Dialect::Sqlite,
@@ -779,11 +821,11 @@ mod tests {
         .unwrap();
         // Two statements: row 1 (changes 0 and 2, grouped, attributed to 0)
         // and row 2 (change 1).
-        assert_eq!(plan.len(), 2);
-        assert_eq!(plan[0].change_index, 0);
-        assert!(plan[0].statement.sql.contains("\"a\" = ?, \"b\" = ?"));
-        assert_eq!(plan[1].change_index, 1);
-        assert_eq!(plan[1].summary, "update of row (2) [columns a]");
+        assert_eq!(statements.len(), 2);
+        assert_eq!(metas[0].change_index, 0);
+        assert!(statements[0].sql.contains("\"a\" = ?, \"b\" = ?"));
+        assert_eq!(metas[1].change_index, 1);
+        assert_eq!(metas[1].summary, "update of row (2) [columns a]");
     }
 
     #[test]
@@ -798,26 +840,26 @@ mod tests {
         // 0.0 == -0.0 by PartialEq, but they are two different stage rows
         // (bit-distinct keys) — merging them would build one UPDATE with a
         // duplicate SET column (a Postgres error) against the wrong row.
-        let plan = build_statements(
+        let (statements, _) = build_statements(
             &table(),
             &identity(),
             Dialect::Sqlite,
             &[real_update(0.0, "a"), real_update(-0.0, "a")],
         )
         .unwrap();
-        assert_eq!(plan.len(), 2, "0.0 and -0.0 must stay separate rows");
+        assert_eq!(statements.len(), 2, "0.0 and -0.0 must stay separate rows");
 
         // NaN != NaN by PartialEq, but it is one stage row — its column
         // edits must group into one statement, not repeat the UPDATE.
-        let plan = build_statements(
+        let (statements, _) = build_statements(
             &table(),
             &identity(),
             Dialect::Sqlite,
             &[real_update(f64::NAN, "a"), real_update(f64::NAN, "b")],
         )
         .unwrap();
-        assert_eq!(plan.len(), 1, "NaN groups with itself");
-        assert!(plan[0].statement.sql.contains("\"a\" = ?, \"b\" = ?"));
+        assert_eq!(statements.len(), 1, "NaN groups with itself");
+        assert!(statements[0].sql.contains("\"a\" = ?, \"b\" = ?"));
     }
 
     #[test]
@@ -826,7 +868,7 @@ mod tests {
         // are bound (with their column casts — the fixture columns are
         // TEXT). This is what makes `SET int_col = NULL` work on Postgres,
         // where a bound Value::Null is typed as text.
-        let plan = build_statements(
+        let (statements, _) = build_statements(
             &pg_table(),
             &identity(),
             Dialect::Postgres,
@@ -837,16 +879,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            plan[0].statement.sql,
+            statements[0].sql,
             "UPDATE \"app\".\"t\" SET \"a\" = NULL, \"b\" = $1::text WHERE \"id\" = $2::text"
         );
         assert_eq!(
-            plan[0].statement.params,
+            statements[0].params,
             vec![Value::Text("x".into()), Value::Integer(1)]
         );
 
         // INSERT: NULL inline in VALUES.
-        let plan = build_statements(
+        let (statements, _) = build_statements(
             &pg_table(),
             &identity(),
             Dialect::Postgres,
@@ -857,18 +899,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            plan[0].statement.sql,
+            statements[0].sql,
             "INSERT INTO \"app\".\"t\" (\"id\", \"a\", \"b\") VALUES ($1::text, NULL, $2::text)"
         );
         assert_eq!(
-            plan[0].statement.params,
+            statements[0].params,
             vec![Value::Integer(5), Value::Text("y".into())]
         );
 
         // WHERE: a NULL key value renders inline too; `col = NULL` matches
         // nothing, so the row-count guard aborts instead of erroring on a
         // typed-NULL bind.
-        let plan = build_statements(
+        let (statements, _) = build_statements(
             &pg_table(),
             &identity(),
             Dialect::Postgres,
@@ -880,10 +922,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            plan[0].statement.sql,
+            statements[0].sql,
             "DELETE FROM \"app\".\"t\" WHERE \"id\" = NULL"
         );
-        assert!(plan[0].statement.params.is_empty());
+        assert!(statements[0].params.is_empty());
     }
 
     fn typed_pg_table() -> TableMeta {
@@ -923,7 +965,7 @@ mod tests {
 
     #[test]
     fn postgres_params_carry_column_casts_from_introspected_types() {
-        let plan = build_statements(
+        let (statements, _) = build_statements(
             &typed_pg_table(),
             &identity(),
             Dialect::Postgres,
@@ -936,7 +978,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            plan[0].statement.sql,
+            statements[0].sql,
             "UPDATE \"app\".\"typed\" SET \
              \"flag\" = $1::boolean, \
              \"at\" = $2::timestamp without time zone, \
@@ -946,7 +988,7 @@ mod tests {
         );
 
         // Casts apply to INSERT values and DELETE keys too.
-        let plan = build_statements(
+        let (statements, _) = build_statements(
             &typed_pg_table(),
             &identity(),
             Dialect::Postgres,
@@ -962,11 +1004,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            plan[0].statement.sql,
+            statements[0].sql,
             "INSERT INTO \"app\".\"typed\" (\"id\", \"flag\") VALUES ($1::integer, $2::boolean)"
         );
         assert_eq!(
-            plan[1].statement.sql,
+            statements[1].sql,
             "DELETE FROM \"app\".\"typed\" WHERE \"id\" = $1::integer"
         );
     }
@@ -999,7 +1041,7 @@ mod tests {
                 _ => {}
             }
         }
-        let plan = build_statements(
+        let (statements, _) = build_statements(
             &table,
             &identity(),
             Dialect::Postgres,
@@ -1010,7 +1052,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            plan[0].statement.sql,
+            statements[0].sql,
             "UPDATE \"app\".\"typed\" SET \
              \"mood\" = $1::\"app\".\"mood\", \
              \"tags\" = $2::\"pg_catalog\".\"_text\" \
@@ -1024,7 +1066,7 @@ mod tests {
         // (see the test above for when the detail does resolve); an empty
         // type name and a column missing from the metadata have nothing to
         // cast to.
-        let plan = build_statements(
+        let (statements, _) = build_statements(
             &typed_pg_table(),
             &identity(),
             Dialect::Postgres,
@@ -1037,7 +1079,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            plan[0].statement.sql,
+            statements[0].sql,
             "UPDATE \"app\".\"typed\" SET \
              \"tags\" = $1, \"mood\" = $2, \"legacy\" = $3, \"ghost\" = $4 \
              WHERE \"id\" = $5::integer"
@@ -1047,7 +1089,7 @@ mod tests {
         // (`::character` = char(1) would TRUNCATE a character(3) value) —
         // no cast; assignment coercion handles the uncast text correctly.
         // "character varying" is unbounded when bare and keeps its cast.
-        let plan = build_statements(
+        let (statements, _) = build_statements(
             &typed_pg_table(),
             &identity(),
             Dialect::Postgres,
@@ -1059,7 +1101,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            plan[0].statement.sql,
+            statements[0].sql,
             "UPDATE \"app\".\"typed\" SET \
              \"code\" = $1, \"mask\" = $2, \"nick\" = $3::character varying \
              WHERE \"id\" = $4::integer"
@@ -1068,7 +1110,7 @@ mod tests {
         // SQLite never casts — its type affinity coerces on its own.
         let mut sqlite_table = typed_pg_table();
         sqlite_table.schema = None;
-        let plan = build_statements(
+        let (statements, _) = build_statements(
             &sqlite_table,
             &identity(),
             Dialect::Sqlite,
@@ -1076,7 +1118,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            plan[0].statement.sql,
+            statements[0].sql,
             "UPDATE \"typed\" SET \"flag\" = ? WHERE \"id\" = ?"
         );
     }
@@ -1088,7 +1130,7 @@ mod tests {
         // are a driver concern for the connection issue).
         let mut t = typed_pg_table();
         t.schema = Some("dbo".into());
-        let plan = build_statements(
+        let (statements, _) = build_statements(
             &t,
             &identity(),
             Dialect::SqlServer,
@@ -1106,22 +1148,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            plan[0].statement.sql,
+            statements[0].sql,
             "UPDATE \"dbo\".\"typed\" SET \"flag\" = @P1, \"amount\" = @P2 WHERE \"id\" = @P3"
         );
         assert_eq!(
-            plan[1].statement.sql,
+            statements[1].sql,
             "INSERT INTO \"dbo\".\"typed\" (\"id\", \"flag\") VALUES (@P1, NULL)"
         );
         assert_eq!(
-            plan[2].statement.sql,
+            statements[2].sql,
             "DELETE FROM \"dbo\".\"typed\" WHERE \"id\" = @P1"
         );
     }
 
     #[test]
     fn plan_preserves_first_occurrence_order_across_kinds() {
-        let plan = build_statements(
+        let (statements, metas) = build_statements(
             &table(),
             &identity(),
             Dialect::Sqlite,
@@ -1137,8 +1179,9 @@ mod tests {
             ],
         )
         .unwrap();
+        assert_eq!(statements.len(), metas.len());
         assert_eq!(
-            plan.iter().map(|s| s.kind).collect::<Vec<_>>(),
+            metas.iter().map(|m| m.kind).collect::<Vec<_>>(),
             [
                 StatementKind::Update,
                 StatementKind::Insert,
@@ -1146,14 +1189,14 @@ mod tests {
             ]
         );
         assert_eq!(
-            plan.iter().map(|s| s.change_index).collect::<Vec<_>>(),
+            metas.iter().map(|m| m.change_index).collect::<Vec<_>>(),
             [0, 1, 2]
         );
     }
 
     #[test]
     fn empty_column_insert_uses_default_values() {
-        let plan = build_statements(
+        let (statements, _) = build_statements(
             &table(),
             &identity(),
             Dialect::Sqlite,
@@ -1163,7 +1206,7 @@ mod tests {
             }],
         )
         .unwrap();
-        assert_eq!(plan[0].statement.sql, "INSERT INTO \"t\" DEFAULT VALUES");
+        assert_eq!(statements[0].sql, "INSERT INTO \"t\" DEFAULT VALUES");
     }
 
     #[test]
@@ -1171,7 +1214,7 @@ mod tests {
         let composite = RowIdentity::PrimaryKey {
             columns: vec!["k1".into(), "k2".into()],
         };
-        let plan = build_statements(
+        let (statements, _) = build_statements(
             &table(),
             &composite,
             Dialect::Postgres,
@@ -1183,7 +1226,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            plan[0].statement.sql,
+            statements[0].sql,
             "DELETE FROM \"t\" WHERE \"k1\" = $1 AND \"k2\" = $2"
         );
     }
