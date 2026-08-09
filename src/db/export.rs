@@ -13,14 +13,16 @@
 //!
 //! CSV follows RFC-4180 quoting with LF (`\n`) line terminators: a field is
 //! wrapped in double quotes only when it contains a comma, a double quote, or
-//! a CR/LF, and embedded quotes are doubled. Each value is rendered to a
-//! string first (`NULL` → empty field, integers/reals → their plain decimal
-//! form, text verbatim, blobs → a `\x`-prefixed hex string), then quoted if
-//! needed. Because `NULL` and the empty string both render to an empty field,
-//! CSV cannot distinguish them — a documented, standard CSV limitation.
-//! Text values starting with `=` `+` `-` `@` are prefixed with an apostrophe
-//! so spreadsheet apps don't execute them as formulas (see
-//! [`harden_csv_text`]).
+//! a CR/LF, and embedded quotes are doubled. Values render as `NULL` → empty
+//! field, integers/reals → their plain decimal form, text verbatim, blobs →
+//! a `\x`-prefixed hex string — each streamed straight from the borrowed
+//! value, never materialized as a per-cell `String` (FRE-132; on a 1M×10
+//! export the old pipeline made ~10M transient allocations). Because `NULL`
+//! and the empty string both render to an empty field, CSV cannot
+//! distinguish them — a documented, standard CSV limitation. Text values
+//! starting with `=` `+` `-` `@` are prefixed with an apostrophe so
+//! spreadsheet apps don't execute them as formulas (see
+//! [`needs_formula_hardening`]).
 //!
 //! JSON is a top-level array of objects keyed by column name, streamed
 //! element by element. `NULL` → `null`, integers/reals → JSON numbers (a
@@ -86,7 +88,15 @@ impl ExportSink {
     /// Writes one data row.
     pub fn write_row(&mut self, row: &[Value], out: &mut impl Write) -> io::Result<()> {
         match self.format {
-            ExportFormat::Csv => write_csv_record(row.iter().map(csv_cell), &mut *out),
+            ExportFormat::Csv => {
+                for (idx, value) in row.iter().enumerate() {
+                    if idx > 0 {
+                        out.write_all(b",")?;
+                    }
+                    write_csv_value(value, &mut *out)?;
+                }
+                out.write_all(b"\n")
+            }
             ExportFormat::Json => {
                 out.write_all(if self.wrote_row { b",\n  " } else { b"\n  " })?;
                 write_json_object(&self.columns, row, out)?;
@@ -131,12 +141,12 @@ pub fn write_result(
     Ok(rows)
 }
 
-/// Writes one CSV record (a sequence of fields) followed by an LF, quoting
-/// each field per RFC-4180.
-fn write_csv_record<I, S>(fields: I, out: &mut impl Write) -> io::Result<()>
+/// Writes one CSV record (a sequence of string fields) followed by an LF,
+/// quoting each field per RFC-4180. Used for the header row; data rows stream
+/// each cell through [`write_csv_value`] instead.
+fn write_csv_record<'a, I>(fields: I, out: &mut impl Write) -> io::Result<()>
 where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
+    I: IntoIterator<Item = &'a str>,
 {
     let mut first = true;
     for field in fields {
@@ -144,7 +154,7 @@ where
             out.write_all(b",")?;
         }
         first = false;
-        write_csv_field(field.as_ref(), out)?;
+        write_csv_field(field, out)?;
     }
     out.write_all(b"\n")
 }
@@ -154,46 +164,95 @@ where
 fn write_csv_field(field: &str, out: &mut impl Write) -> io::Result<()> {
     if field.contains([',', '"', '\n', '\r']) {
         out.write_all(b"\"")?;
-        let mut rest = field;
-        while let Some(pos) = rest.find('"') {
-            let (before, after) = rest.split_at(pos);
-            out.write_all(before.as_bytes())?;
-            out.write_all(b"\"\"")?;
-            rest = &after[1..];
-        }
-        out.write_all(rest.as_bytes())?;
+        write_quote_doubled(field, out)?;
         out.write_all(b"\"")
     } else {
         out.write_all(field.as_bytes())
     }
 }
 
-/// The bare string form of a cell for CSV (before quoting).
+/// Streams `field` with every embedded `"` doubled, writing the borrowed
+/// slices between quotes directly — the one place the CSV path re-walks a
+/// string, and it still never copies it.
+fn write_quote_doubled(field: &str, out: &mut impl Write) -> io::Result<()> {
+    let mut rest = field;
+    while let Some(pos) = rest.find('"') {
+        let (before, after) = rest.split_at(pos);
+        out.write_all(before.as_bytes())?;
+        out.write_all(b"\"\"")?;
+        rest = &after[1..];
+    }
+    out.write_all(rest.as_bytes())
+}
+
+/// Streams one cell as a CSV field, allocation-free (FRE-132): numbers and
+/// blob hex go straight through the formatter — neither can contain a
+/// character on the RFC-4180 quoting list, so they never need quoting — and
+/// text is written borrowed by [`write_csv_text`].
 ///
 /// The clipboard's delimited formats (FRE-110) mirror this arm for arm except
 /// for NULL, which they must keep distinct from the empty string — see
 /// [`super::clipboard`].
-fn csv_cell(value: &Value) -> String {
+fn write_csv_value(value: &Value, out: &mut impl Write) -> io::Result<()> {
     match value {
-        Value::Null => String::new(),
-        Value::Integer(i) => i.to_string(),
-        Value::Real(r) => r.to_string(),
-        Value::Text(t) => harden_csv_text(t),
-        Value::Blob(b) => hex_literal(b),
+        Value::Null => Ok(()),
+        Value::Integer(i) => write!(out, "{i}"),
+        Value::Real(r) => write!(out, "{r}"),
+        Value::Text(t) => write_csv_text(t, out),
+        // Byte-by-byte hex, same bytes as [`hex_literal`] without the String.
+        Value::Blob(b) => {
+            out.write_all(b"\\x")?;
+            for byte in b {
+                write!(out, "{byte:02x}")?;
+            }
+            Ok(())
+        }
     }
 }
 
-/// Neutralizes CSV formula injection (FRE-73): Excel and LibreOffice execute
-/// cells starting with `=` `+` `-` `@` (or a tab, per OWASP's list) as live
-/// formulas on open, so a text value starting with one gets the standard
+/// Writes one text cell: decides quoting by scanning the borrowed `&str`,
+/// then writes the formula-hardening apostrophe and the text directly. The
+/// apostrophe is not on the RFC-4180 quoting list, so scanning the original
+/// text answers the quoting question for the hardened form too — and when
+/// quoting does apply, the apostrophe lands inside the quotes, exactly where
+/// quoting the hardened copy used to put it.
+fn write_csv_text(text: &str, out: &mut impl Write) -> io::Result<()> {
+    let quote = text.contains([',', '"', '\n', '\r']);
+    if quote {
+        out.write_all(b"\"")?;
+    }
+    if needs_formula_hardening(text) {
+        out.write_all(b"'")?;
+    }
+    if quote {
+        write_quote_doubled(text, out)?;
+        out.write_all(b"\"")
+    } else {
+        out.write_all(text.as_bytes())
+    }
+}
+
+/// Whether a text value triggers CSV formula injection (FRE-73): Excel and
+/// LibreOffice execute cells starting with `=` `+` `-` `@` (or a tab, per
+/// OWASP's list) as live formulas on open, so such a value gets the standard
 /// leading-apostrophe prefix. Text only — numbers render bare (`-7` must
 /// stay a number) and blobs are `\x`-prefixed; JSON is not an executable
 /// format and stays verbatim.
 ///
-/// Shared with the clipboard formats (FRE-110): pasting text into a
-/// spreadsheet runs the same formulas that opening a file does.
+/// The character list lives here alone so the streaming export
+/// ([`write_csv_text`]) and the clipboard's owned-string path
+/// ([`harden_csv_text`]) cannot drift apart.
+fn needs_formula_hardening(text: &str) -> bool {
+    text.starts_with(['=', '+', '-', '@', '\t'])
+}
+
+/// Owned-string form of the formula hardening, for the clipboard formats
+/// (FRE-110), which build each cell as a `String` anyway: pasting text into a
+/// spreadsheet runs the same formulas that opening a file does. The streaming
+/// CSV export applies the identical rule without allocating — see
+/// [`write_csv_text`].
 pub(crate) fn harden_csv_text(text: &str) -> String {
-    if text.starts_with(['=', '+', '-', '@', '\t']) {
+    if needs_formula_hardening(text) {
         format!("'{text}")
     } else {
         text.to_string()

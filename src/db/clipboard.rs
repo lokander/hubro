@@ -65,9 +65,9 @@
 
 use std::fmt::Write as _;
 
-use super::export::{harden_csv_text, hex_literal, write_result, ExportFormat};
+use super::export::{harden_csv_text, hex_literal, ExportFormat, ExportSink};
 use super::page::{quote_ident, Dialect};
-use super::value::{ColumnInfo, QueryResult, Value};
+use super::value::Value;
 
 /// The clipboard encodings offered by the grid's copy-as menu.
 ///
@@ -254,23 +254,23 @@ fn push_delimited_field(out: &mut String, field: Option<&str>, delimiter: char) 
     out.push('"');
 }
 
-/// JSON: an array of objects keyed by column name. Delegates to the export
-/// writer — its encoding (NULL → `null`, non-finite reals → their string
-/// form, blobs → `\x…` hex, column order preserved) is exactly what is wanted
-/// here, so there is one JSON renderer in the codebase, not two.
+/// JSON: an array of objects keyed by column name. Drives the export
+/// writer's [`ExportSink`] — its encoding (NULL → `null`, non-finite reals →
+/// their string form, blobs → `\x…` hex, column order preserved) is exactly
+/// what is wanted here, so there is one JSON renderer in the codebase, not
+/// two. The sink takes each row by reference, so only the column names are
+/// cloned — the old `QueryResult` detour cloned every row in the selection
+/// just to wrap them (FRE-132).
 fn render_json(block: &CopyBlock) -> String {
-    let result = QueryResult {
-        columns: block
-            .columns
-            .iter()
-            .map(|name| ColumnInfo { name: name.clone() })
-            .collect(),
-        rows: block.rows.clone(),
-    };
+    let mut sink = ExportSink::new(ExportFormat::Json, block.columns.clone());
     let mut buf = Vec::new();
     // Writing to a `Vec` cannot fail, and every byte serde_json emits is
     // valid UTF-8.
-    let _ = write_result(&result, ExportFormat::Json, &mut buf);
+    let _ = sink.begin(&mut buf);
+    for row in &block.rows {
+        let _ = sink.write_row(row, &mut buf);
+    }
+    let _ = sink.end(&mut buf);
     String::from_utf8(buf).unwrap_or_default()
 }
 
@@ -424,6 +424,8 @@ fn markdown_cell_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::export::write_result;
+    use crate::db::value::{ColumnInfo, QueryResult};
 
     fn block(columns: &[&str], rows: Vec<Vec<Value>>) -> CopyBlock {
         CopyBlock {
