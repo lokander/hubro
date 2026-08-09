@@ -17,8 +17,8 @@
 
 use std::collections::BTreeMap;
 
-use super::page::{quote_ident, Dialect};
 use super::schema::{IndexMeta, TableKind, TableMeta};
+use super::sql::{qualified, quote_ident, Dialect};
 
 /// Which of a table's objects to render DDL for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,14 +186,6 @@ pub struct IndexExtras {
     pub clustered: bool,
     /// Attributes this backend's fetch knowingly does not reproduce.
     pub caveats: Vec<String>,
-}
-
-/// Schema-qualified, quoted object name.
-fn qualified(schema: Option<&str>, name: &str) -> String {
-    match schema {
-        Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(name)),
-        None => quote_ident(name),
-    }
 }
 
 /// Adds the statement terminator that stored/generated definitions leave off.

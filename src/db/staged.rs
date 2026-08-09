@@ -10,9 +10,10 @@
 //!
 //! Row addressing builds on the FRE-26 row-identity model
 //! ([`RowIdentity`](super::rowkey::RowIdentity)); the SQL builders here are
-//! value-aware siblings of `rowkey::update_sql`/`delete_sql` — they must
-//! know the values (not just the columns) so NULLs can be rendered inline
-//! (see [`ParamSql::value_sql`]).
+//! value-aware — they must know the values (not just the columns) so NULLs
+//! can be rendered inline (see [`ParamSql::value_sql`]). They are the only
+//! UPDATE/DELETE builders in the crate: `rowkey` reports how a row is
+//! addressed, this module writes it.
 //!
 //! On Postgres every bound parameter is cast to its column's introspected
 //! type (`SET "col" = $1::integer`) so text-staged values coerce — see
@@ -24,10 +25,10 @@ use std::fmt::Write as _;
 
 use super::caps::{self, TableAccess};
 use super::error::DbError;
-use super::page::{quote_ident, Dialect};
 use super::registry::DbPool;
 use super::rowkey::RowIdentity;
 use super::schema::{ColumnMeta, TableMeta};
+use super::sql::{qualified, quote_ident, Dialect};
 use super::value::Value;
 
 /// The identity-column values addressing one row. Value order matches
@@ -667,11 +668,9 @@ fn key_clause(
         .join(" AND ")
 }
 
+/// Thin wrapper over [`super::sql::qualified`] for a table's own name.
 fn qualified_table(table: &TableMeta) -> String {
-    match &table.schema {
-        Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(&table.name)),
-        None => quote_ident(&table.name),
-    }
+    qualified(table.schema.as_deref(), &table.name)
 }
 
 #[cfg(test)]

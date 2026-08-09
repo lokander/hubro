@@ -22,11 +22,11 @@ use super::ddl::{
 };
 use super::error::DbError;
 use super::export::{export_io_err, ExportFormat, ExportSink};
-use super::page::Dialect;
 use super::schema::{
     ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, Internal, TableKind, TableMeta, TypeDetail,
     TypeRef,
 };
+use super::sql::Dialect;
 use super::staged::CheckedStatement;
 use super::value::{cap_value, ColumnInfo, QueryResult, Value};
 
@@ -1154,7 +1154,7 @@ async fn table_ddl_extras(pool: &PgPool, params: &[Value]) -> Result<TableExtras
     for row in &constraint_rows.rows {
         constraints.push(format!(
             "CONSTRAINT {} {}",
-            super::page::quote_ident(&ddl_text(row, 0)),
+            super::sql::quote_ident(&ddl_text(row, 0)),
             ddl_text(row, 1)
         ));
     }

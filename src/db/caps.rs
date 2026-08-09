@@ -17,9 +17,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::page::Dialect;
 use super::rowkey::{detect_row_identity, RowIdentity};
 use super::schema::{TableKind, TableMeta};
+use super::sql::Dialect;
 
 /// What a connection supports. Backends declare these at connect time; one
 /// object's effective set is this, narrowed by [`TableAccess::resolve`].

@@ -17,10 +17,10 @@ use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
 use super::ddl::{create_index_sql, terminate, Ddl, DdlObject, IndexExtras};
 use super::error::DbError;
 use super::export::{export_io_err, ExportFormat, ExportSink};
-use super::page::Dialect;
 use super::schema::{
     ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta, TypeDetail,
 };
+use super::sql::Dialect;
 use super::staged::CheckedStatement;
 use super::value::{cap_value, ColumnInfo, QueryResult, Value};
 
@@ -688,7 +688,7 @@ fn decode_value(row: &SqliteRow, idx: usize) -> Result<Value, DbError> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::page::quote_ident;
+    use super::super::sql::quote_ident;
 
     #[test]
     fn quote_ident_escapes_embedded_quotes() {

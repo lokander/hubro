@@ -40,10 +40,10 @@ use super::ddl::{
 };
 use super::error::DbError;
 use super::export::{export_io_err, ExportFormat, ExportSink};
-use super::page::{quote_ident, Dialect};
 use super::schema::{
     ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta, TypeDetail,
 };
+use super::sql::{quote_ident, Dialect};
 use super::staged::CheckedStatement;
 use super::value::{cap_value, ColumnInfo, QueryResult, Value};
 

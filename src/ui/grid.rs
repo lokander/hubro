@@ -2350,7 +2350,7 @@ impl CopyRefusal {
 /// (`substr`/`length` on SQLite, `left`/`length` on Postgres,
 /// `SUBSTRING`/`DATALENGTH … / 2` on SQL Server), so `full_len > cap` means
 /// exactly "the fetch would truncate this". Keeping those two in step is the
-/// whole invariant — see [`page::mssql_text_len`](crate::db) for the one place
+/// whole invariant — see [`sql::mssql_text_len`](crate::db) for the one place
 /// it was broken.
 fn plan_copy(nav: &GridNav, selection: Selection) -> Result<CopyPlan, CopyRefusal> {
     let rect = selection.bounds();
