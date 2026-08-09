@@ -14,11 +14,12 @@
 //! result set at all — a `DROP TABLE` routed through the query path —
 //! legitimately reports no columns.
 //!
-//! "User-facing" is the whole scope of that describe: [`DbPool::query`] and
-//! [`DbPool::query_capped`], the two entry points that hand a result straight
-//! to the grid. The internal reads (page fetch, cell fetch, DDL catalog
-//! queries) build their own projection and so already know their columns, so
-//! paying a round trip to recover headers nobody reads would be pure cost —
+//! "User-facing" is the whole scope of that describe: [`DbPool::query`],
+//! [`DbPool::query_capped`] and [`ScriptTx::query_capped`] — the entry points
+//! that hand a result straight to the grid. The internal reads (page fetch,
+//! cell fetch, DDL catalog queries) build their own projection and so already
+//! know their columns, so paying a round trip to recover headers nobody reads
+//! would be pure cost —
 //! double on Postgres, whose `describe` also issues a `pg_attribute` query.
 
 mod caps;
