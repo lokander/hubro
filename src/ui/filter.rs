@@ -367,15 +367,30 @@ pub fn filter_tables(tables: &[TableMeta], query: &Query, show_internal: bool) -
     // Scratch for the qualified forms, likewise reused rather than reallocated
     // per candidate.
     let mut buf: Vec<char> = Vec::new();
+    // One-entry cache of the last schema's lowered form: introspection hands
+    // the tables over grouped by schema, so each schema is lowered once
+    // instead of once per table it holds. Interleaved schemas would only cost
+    // extra lowering, never a wrong match — the cache is keyed on the schema
+    // string itself.
+    let mut last_schema: Option<(&str, Vec<char>)> = None;
     let mut hits: Vec<(MatchScore, TableHit)> = Vec::new();
     for (index, table) in tables.iter().enumerate().filter(|(_, t)| visible(t)) {
         let name = lowercased(&table.name);
         match query.mode {
             FilterMode::Tables => {
-                let schema = table.schema.as_deref().map(lowercased);
-                if let Some(score) =
-                    score_table_prepared(schema.as_deref(), &name, &needle, &mut buf)
-                {
+                let schema: Option<&[char]> = match table.schema.as_deref() {
+                    Some(schema) => {
+                        if last_schema
+                            .as_ref()
+                            .is_none_or(|(cached, _)| *cached != schema)
+                        {
+                            last_schema = Some((schema, lowercased(schema)));
+                        }
+                        last_schema.as_ref().map(|(_, lowered)| lowered.as_slice())
+                    }
+                    None => None,
+                };
+                if let Some(score) = score_table_prepared(schema, &name, &needle, &mut buf) {
                     hits.push((
                         score,
                         TableHit {
@@ -618,6 +633,28 @@ mod tests {
         // …as does the qualified form, and a dot alone doesn't match either.
         assert_eq!(ranked(&tables, "public.us"), ["users"]);
         assert!(ranked(&tables, "public.zzz").is_empty());
+    }
+
+    #[test]
+    fn schema_matching_survives_interleaved_schemas() {
+        // The one-entry schema-lowering cache in `filter_tables` assumes
+        // tables arrive grouped by schema. Interleaving must only cost extra
+        // lowering, never a wrong match: every table has to be scored against
+        // its *own* schema, not the cached neighbour's.
+        let tables = [
+            table(Some("audit"), "events", &["id"]),
+            table(Some("public"), "users", &["id"]),
+            table(Some("audit"), "trails", &["id"]),
+            table(None, "loners", &["id"]),
+            table(Some("audit"), "logs", &["id"]),
+        ];
+        // All three audit tables match their qualifier equally; the shortest
+        // qualified name wins, then the name tie-break.
+        assert_eq!(ranked(&tables, "audit"), ["logs", "events", "trails"]);
+        assert_eq!(ranked(&tables, "public.users"), ["users"]);
+        // A schemaless table between two same-named schemas must not reuse
+        // the cache either way.
+        assert!(ranked(&tables, "audit").iter().all(|name| name != "loners"));
     }
 
     #[test]

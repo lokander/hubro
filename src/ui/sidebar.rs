@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 use dioxus_icons::lucide::{Database, RefreshCw, Search, X};
 
-use crate::db::{ConnectionId, TableKind, TableMeta};
+use crate::db::{ConnectionId, TableKind};
 
 use super::filter::{
     count_internal_tables, filter_tables, group_by_schema, parse_query, toggle_column_mode,
@@ -39,10 +39,26 @@ enum ListState {
     Ready,
 }
 
-/// One schema group of filter results, ready to render: the schema name and
-/// its surviving tables, each with the positions of its matching columns
-/// (empty outside column mode).
-type FilteredGroups = Vec<(Option<String>, Vec<(TableMeta, Vec<usize>)>)>;
+/// One table that survived the filter, ready to render cheaply: the table
+/// itself stays in `state.schemas` and is looked up by `index` inside
+/// [`TableNode`], so neither the memo nor a render ever clones a `TableMeta`
+/// — on a 300-table schema that clone-per-keystroke was most of the filter's
+/// cost (FRE-134).
+#[derive(Clone, PartialEq)]
+struct RowHit {
+    /// Index into the connection's `SchemaLoad::Ready` table list.
+    index: usize,
+    /// Stable diffing key: the debug-formatted qualified name, which can't
+    /// collide across schema/name splits (same reasoning as `TableRef::key`).
+    key: String,
+    /// Positions of the table's columns that matched a column-mode filter
+    /// (empty outside column mode).
+    columns: Vec<usize>,
+}
+
+/// One schema group of filter results: the schema name and its surviving
+/// tables.
+type FilteredGroups = Vec<(Option<String>, Vec<RowHit>)>;
 
 /// Sidebar for one connection: a flat list of the introspected tables and
 /// views, grouped by schema. Clicking a name selects it for the data grid
@@ -94,13 +110,19 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
             .map(|(schema, group)| {
                 let group = group
                     .into_iter()
-                    .map(|hit| (tables[hit.index].clone(), hit.columns))
+                    .map(|hit| {
+                        let table = &tables[hit.index];
+                        RowHit {
+                            index: hit.index,
+                            key: format!("{:?}.{}", table.schema, table.name),
+                            columns: hit.columns,
+                        }
+                    })
                     .collect();
                 (schema, group)
             })
             .collect()
     });
-    let groups = groups();
     // Its own memo: depends on the schema alone, so typing in the filter box
     // doesn't recount the whole list.
     let internal_count = use_memo(move || match state.schemas.read().get(&id) {
@@ -110,9 +132,13 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
     let internal_count = internal_count();
     // A schema that contributed no hit contributes no header either, which is
     // what keeps the result reading as a narrowed tree rather than a flat list
-    // of names.
-    let show_headers =
-        groups.len() > 1 || groups.first().is_some_and(|(schema, _)| schema.is_some());
+    // of names. Read, not cloned — the render below only ever borrows the
+    // memo's value, and each borrow ends before the next signal write can
+    // happen (nothing awaits while one is held).
+    let show_headers = {
+        let groups = groups.read();
+        groups.len() > 1 || groups.first().is_some_and(|(schema, _)| schema.is_some())
+    };
 
     rsx! {
         div { class: "flex min-h-0 flex-1 flex-col",
@@ -210,7 +236,7 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
                     // path — there is no separate "no filter" branch to keep
                     // in sync.
                     ListState::Ready => rsx! {
-                        if groups.is_empty() {
+                        if groups.read().is_empty() {
                             p { class: "px-3 py-4 text-center text-xs text-slate-500 dark:text-slate-400",
                                 // With nothing typed the list can still come
                                 // up empty, when every object the database has
@@ -225,19 +251,22 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
                                 }
                             }
                         }
-                        for (schema , group) in groups {
+                        // Iterating the borrow, not `groups()`: cloning the
+                        // memo's value here would re-copy every group and key
+                        // on each unrelated re-render (FRE-134).
+                        for (schema , group) in groups.read().iter() {
                             if show_headers {
                                 p { class: "px-2 pt-2 pb-0.5 text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-600",
                                     {schema.clone().unwrap_or_else(|| "(no schema)".to_string())}
                                 }
                             }
                             ul {
-                                for (table , columns) in group {
+                                for hit in group.iter() {
                                     TableNode {
-                                        key: "{table.schema:?}.{table.name}",
+                                        key: "{hit.key}",
                                         id,
-                                        table,
-                                        columns,
+                                        index: hit.index,
+                                        columns: hit.columns.clone(),
                                     }
                                 }
                             }
@@ -275,35 +304,58 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
 /// in the Schema pane now (FRE-69), so there is nothing to expand — except in
 /// the filter's column mode, where `columns` carries the matching columns to
 /// list underneath (FRE-107).
+///
+/// Receives the table as an index into the connection's schema rather than an
+/// owned `TableMeta`, so the list the memo hands the render never carries a
+/// copy of every table's columns, indexes and foreign keys (FRE-134). Reading
+/// `state.schemas` here subscribes each row to schema reloads, but a reload
+/// recomputes the memo (and thus remounts the rows) anyway.
 #[component]
 fn TableNode(
     id: ConnectionId,
-    table: ReadSignal<TableMeta>,
-    /// Positions in `table.columns` that matched a column-mode filter, in
-    /// declaration order. Empty in the default mode.
+    /// Index into the connection's `SchemaLoad::Ready` table list.
+    index: usize,
+    /// Positions in the table's `columns` that matched a column-mode filter,
+    /// in declaration order. Empty in the default mode.
     #[props(default)]
     columns: Vec<usize>,
 ) -> Element {
     let state = use_context::<AppState>();
-    let name = table.read().name.clone();
-    let kind = table.read().kind;
-    // The engine's own word for what this is, when it has one — "hypertable"
-    // rather than a table that inexplicably has chunks (FRE-88).
-    let kind_label = table.read().kind_label.clone();
-    // Resolved here so the loop below doesn't hold a read borrow of the
-    // signal while rendering.
-    let matched: Vec<(String, String)> = columns
-        .iter()
-        .filter_map(|position| {
-            table
-                .read()
-                .columns
-                .get(*position)
-                .map(|column| (column.name.clone(), column.type_name.clone()))
-        })
-        .collect();
+    // One scoped read: only the small rendered fields are cloned out, and the
+    // borrow ends before the rsx below. A missing entry means the schema
+    // reloaded under a not-yet-recomputed memo — render nothing for that
+    // frame rather than a stale neighbour's row.
+    let (schema, name, kind, kind_label, matched) = {
+        let schemas = state.schemas.read();
+        let Some(SchemaLoad::Ready(tables)) = schemas.get(&id) else {
+            return rsx! {};
+        };
+        let Some(table) = tables.get(index) else {
+            return rsx! {};
+        };
+        // Column-mode hits resolved to (name, type) pairs for the sublist.
+        let matched: Vec<(String, String)> = columns
+            .iter()
+            .filter_map(|position| {
+                table
+                    .columns
+                    .get(*position)
+                    .map(|column| (column.name.clone(), column.type_name.clone()))
+            })
+            .collect();
+        (
+            table.schema.clone(),
+            table.name.clone(),
+            table.kind,
+            // The engine's own word for what this is, when it has one —
+            // "hypertable" rather than a table that inexplicably has chunks
+            // (FRE-88).
+            table.kind_label.clone(),
+            matched,
+        )
+    };
     let table_ref = TableRef {
-        schema: table.read().schema.clone(),
+        schema,
         name: name.clone(),
     };
     let selected = state

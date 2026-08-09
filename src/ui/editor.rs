@@ -6,13 +6,12 @@ use serde_json::json;
 
 use crate::db::{
     needs_confirmation, ConnectionId, Dialect, ExportFormat, QueryResult, StatementOutcome,
-    StatementResult, TableMeta, Value, MARKED_READ_ONLY, MAX_QUERY_ROWS, NO_DDL, NO_MUTATE,
-    NO_QUERY,
+    TableMeta, Value, MARKED_READ_ONLY, MAX_QUERY_ROWS, NO_DDL, NO_MUTATE, NO_QUERY,
 };
 use crate::history::{HistoryEntry, HISTORY_CAP};
 
 use super::notice::{Banner, BannerKind, EmptyState, LoadingLine};
-use super::state::{AppState, ExportPane, ExportStatus, RunStatus, SchemaLoad};
+use super::state::{AppState, ExportPane, ExportStatus, RunStatus, SchemaLoad, SharedStatement};
 
 /// Cap on rendered result rows (per statement). The full result still sits
 /// in memory until FRE-33 introduces streaming/limits at the query layer,
@@ -109,6 +108,9 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
         document::eval(&format!(r#"DVEditor.destroy("{element_for_drop}");"#));
     });
 
+    // Cheap despite running every render: the statements are Arc-shared
+    // [`SharedStatement`]s, so this clones pointers and the small status —
+    // never the result rows (FRE-134).
     let run = state.sql_runs.read().get(&id).cloned();
     let running = matches!(run.as_ref().map(|r| &r.status), Some(RunStatus::Running));
     // What this connection won't run, stated before the user writes it
@@ -284,8 +286,6 @@ fn HistoryPanel(id: ConnectionId, editor_element: String) -> Element {
                 .await
         }
     });
-    let entries = entries.read().clone();
-
     rsx! {
         aside { class: "flex w-80 shrink-0 flex-col border-l border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/50",
             div { class: "border-b border-slate-200 dark:border-slate-800 p-2",
@@ -327,7 +327,11 @@ fn HistoryPanel(id: ConnectionId, editor_element: String) -> Element {
                 } else if !store_ready {
                     LoadingLine { label: "Opening history…" }
                 } else {
-                    match entries {
+                    // Matched on the borrow, not a clone: up to HISTORY_CAP
+                    // entries would otherwise be deep-copied on every render
+                    // (each search keystroke). Only the rendered rows clone,
+                    // because HistoryRow needs owned props (FRE-134).
+                    match &*entries.read() {
                         None => rsx! {
                             LoadingLine { label: "Loading…" }
                         },
@@ -347,12 +351,12 @@ fn HistoryPanel(id: ConnectionId, editor_element: String) -> Element {
                         },
                         Some(Ok(entries)) => rsx! {
                             ul { class: "divide-y divide-slate-200 dark:divide-slate-800/60",
-                                for entry in entries {
+                                for entry in entries.iter() {
                                     HistoryRow {
                                         key: "{entry.id}",
                                         id,
                                         editor_element: editor_element.clone(),
-                                        entry,
+                                        entry: entry.clone(),
                                     }
                                 }
                             }
@@ -649,8 +653,12 @@ fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
 /// row count or affected count, and the result table for reads. Read results
 /// carry an Export CSV/JSON control that serializes the full held
 /// [`QueryResult`] (not just the rendered rows) through a native save dialog.
+///
+/// Takes the Arc-shared [`SharedStatement`], whose pointer-identity
+/// `PartialEq` lets prop diffing skip this whole subtree while the statement
+/// is unchanged — which is always, since results are write-once (FRE-134).
 #[component]
-fn StatementSection(id: ConnectionId, index: usize, result: StatementResult) -> Element {
+fn StatementSection(id: ConnectionId, index: usize, result: SharedStatement) -> Element {
     let state = use_context::<AppState>();
     let summary = match &result.outcome {
         StatementOutcome::Affected(1) => "1 row affected".to_string(),
@@ -658,12 +666,11 @@ fn StatementSection(id: ConnectionId, index: usize, result: StatementResult) -> 
         StatementOutcome::Rows(r) if r.rows.len() == 1 => "1 row".to_string(),
         StatementOutcome::Rows(r) => format!("{} rows", r.rows.len()),
     };
-    // The held result to export (reads only). Cloned once here so the export
-    // buttons can hand a snapshot to the background task.
-    let exportable: Option<QueryResult> = match &result.outcome {
-        StatementOutcome::Rows(rows) if !rows.rows.is_empty() => Some(rows.clone()),
-        _ => None,
-    };
+    // Whether there is a held result to export (reads only). The rows
+    // themselves are cloned per export click, not per render — the buttons
+    // capture the shared statement and snapshot it when pressed.
+    let exportable =
+        matches!(&result.outcome, StatementOutcome::Rows(rows) if !rows.rows.is_empty());
     let export_status: Option<ExportStatus> = state
         .export_status
         .read()
@@ -675,7 +682,7 @@ fn StatementSection(id: ConnectionId, index: usize, result: StatementResult) -> 
                 span { class: "font-mono text-slate-500", "{index}" }
                 span { class: "min-w-0 truncate font-mono text-slate-900 dark:text-slate-300", "{result.preview}" }
                 span { class: "shrink-0 text-cyan-700 dark:text-cyan-400", "— {summary}" }
-                if let Some(result) = exportable {
+                if exportable {
                     div { class: "flex-1" }
                     if let Some(status) = export_status.as_ref() {
                         {
@@ -687,8 +694,12 @@ fn StatementSection(id: ConnectionId, index: usize, result: StatementResult) -> 
                         class: "shrink-0 rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
                         title: "Export this result to CSV",
                         onclick: {
-                            let result = result.clone();
-                            move |_| spawn_result_export(state, id, result.clone(), ExportFormat::Csv)
+                            let statement = result.clone();
+                            move |_| {
+                                if let StatementOutcome::Rows(rows) = &statement.outcome {
+                                    spawn_result_export(state, id, rows.clone(), ExportFormat::Csv);
+                                }
+                            }
                         },
                         "Export CSV"
                     }
@@ -696,8 +707,12 @@ fn StatementSection(id: ConnectionId, index: usize, result: StatementResult) -> 
                         class: "shrink-0 rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
                         title: "Export this result to JSON",
                         onclick: {
-                            let result = result.clone();
-                            move |_| spawn_result_export(state, id, result.clone(), ExportFormat::Json)
+                            let statement = result.clone();
+                            move |_| {
+                                if let StatementOutcome::Rows(rows) = &statement.outcome {
+                                    spawn_result_export(state, id, rows.clone(), ExportFormat::Json);
+                                }
+                            }
                         },
                         "Export JSON"
                     }
@@ -721,8 +736,11 @@ fn StatementSection(id: ConnectionId, index: usize, result: StatementResult) -> 
                 StatementOutcome::Rows(rows) if rows.rows.is_empty() => rsx! {
                     p { class: "px-4 py-2 text-sm text-slate-500", "The statement returned no rows." }
                 },
-                StatementOutcome::Rows(rows) => rsx! {
-                    ResultTable { result: rows.clone() }
+                StatementOutcome::Rows(_) => rsx! {
+                    // Handed the whole shared statement, not the QueryResult
+                    // inside it: the Arc bump keeps the prop pointer-diffed
+                    // where a `rows.clone()` would deep-copy every row.
+                    ResultTable { statement: result.clone() }
                 },
             }
         }
@@ -757,8 +775,17 @@ fn spawn_result_export(
 }
 
 /// A result grid, capped at [`MAX_RENDERED_ROWS`] rendered rows.
+///
+/// Takes the shared statement rather than the [`QueryResult`] inside it: an
+/// `Arc` cannot lend out a piece of itself, so passing the rows alone would
+/// mean cloning them, and the pointer-eq `PartialEq` gating re-renders would
+/// be lost with them (FRE-134).
 #[component]
-fn ResultTable(result: QueryResult) -> Element {
+fn ResultTable(statement: SharedStatement) -> Element {
+    let StatementOutcome::Rows(result) = &statement.outcome else {
+        // Unreachable: StatementSection only mounts this for row outcomes.
+        return rsx! {};
+    };
     rsx! {
         if result.rows.len() > MAX_RENDERED_ROWS {
             p { class: "border-b border-amber-300 dark:border-amber-900/50 bg-amber-100 dark:bg-amber-950/30 px-4 py-1.5 text-xs text-amber-700 dark:text-amber-300",
@@ -778,8 +805,12 @@ fn ResultTable(result: QueryResult) -> Element {
             tbody {
                 for row in result.rows.iter().take(MAX_RENDERED_ROWS) {
                     tr { class: "border-t border-slate-200 dark:border-slate-800/60 hover:bg-slate-100 dark:hover:bg-slate-800/30",
+                        // Cells are a plain function, not a `#[component]`:
+                        // a component instance per cell — each cloning its
+                        // Value into an owned prop — was most of the render
+                        // cost of a wide result (FRE-134).
                         for value in row.iter() {
-                            ResultCell { value: value.clone() }
+                            {result_cell(value)}
                         }
                     }
                 }
@@ -788,10 +819,11 @@ fn ResultTable(result: QueryResult) -> Element {
     }
 }
 
-#[component]
-fn ResultCell(value: Value) -> Element {
+/// One result cell. NULL renders as an italic marker — distinct from an empty
+/// string — and blobs as their size tag, both via [`Value::display`].
+fn result_cell(value: &Value) -> Element {
     let display = value.display();
-    let class = match &value {
+    let class = match value {
         Value::Null => "px-3 py-1 font-mono text-xs italic text-slate-400 dark:text-slate-600",
         Value::Blob(_) => "px-3 py-1 font-mono text-xs text-violet-700 dark:text-violet-400",
         _ => "px-3 py-1 font-mono text-xs text-slate-900 dark:text-slate-200",
