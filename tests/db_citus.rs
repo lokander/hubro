@@ -486,9 +486,11 @@ async fn v1_certificate_failure_says_what_to_do() {
                 .query("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
                 .await
                 .unwrap();
+            // Postgres booleans decode as text here on purpose, so that a
+            // viewer shows "true" rather than 1 (see `decode_typed`).
             assert_eq!(
                 ssl.rows[0][0],
-                Value::Integer(1),
+                Value::Text("true".into()),
                 "sslmode=require connected without TLS"
             );
             eprintln!("skipping: this server has a certificate rustls accepts");
