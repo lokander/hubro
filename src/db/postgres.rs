@@ -2,6 +2,7 @@
 //! (multi-schema, indexes, FKs) lands with FRE-11; until then only tables
 //! and columns of the `public` schema are listed.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -552,10 +553,16 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
     //  3. Child partitions of declaratively partitioned tables. Not an
     //     extension matter at all, but a table partitioned by day floods the
     //     tree exactly as Timescale's chunks do.
+    //
+    // `deptype = 'e'` on the first two: that is the code for "member of the
+    // extension". The neighbouring `'x'` means the opposite — the object is
+    // *not* a member, it merely gets dropped with the extension — so counting
+    // it would attribute the user's own object to an extension.
     let internal_rows = sqlx::query(
         "SELECT n.nspname AS schema_name, NULL::name AS object_name, e.extname \
          FROM pg_namespace n \
          JOIN pg_depend d ON d.classid = 'pg_namespace'::regclass AND d.objid = n.oid \
+          AND d.deptype = 'e' \
          JOIN pg_extension e ON e.oid = d.refobjid \
           AND d.refclassid = 'pg_extension'::regclass \
          UNION ALL \
@@ -563,6 +570,7 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
          FROM pg_class c \
          JOIN pg_namespace n ON n.oid = c.relnamespace \
          JOIN pg_depend d ON d.classid = 'pg_class'::regclass AND d.objid = c.oid \
+          AND d.deptype = 'e' \
          JOIN pg_extension e ON e.oid = d.refobjid \
           AND d.refclassid = 'pg_extension'::regclass \
          UNION ALL \
@@ -587,9 +595,21 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
             None => Internal::Partition,
         };
         match object {
-            Some(object) => {
-                internal_objects.insert((schema, object), reason);
-            }
+            // An object can qualify twice — a partition an extension owns
+            // hits branches 2 and 3 — and the UNION has no defined row order,
+            // so name the winner rather than letting it be whichever row
+            // arrived last. Naming the extension is the more useful of the
+            // two, since "which extension" is the part the user can act on.
+            Some(object) => match internal_objects.entry((schema, object)) {
+                Entry::Occupied(mut slot) => {
+                    if matches!(reason, Internal::Extension(_)) {
+                        slot.insert(reason);
+                    }
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(reason);
+                }
+            },
             None => {
                 internal_schemas.insert(schema, reason);
             }

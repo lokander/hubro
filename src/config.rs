@@ -442,10 +442,10 @@ pub struct Settings {
     /// resized/moved; on launch a missing value means "use the default size".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<WindowGeometry>,
-    /// Whether the schema sidebar lists objects in extension-owned schemas —
-    /// TimescaleDB chunks, PostGIS's `tiger`, Citus's catalogs (FRE-88). Off
-    /// by default: on a Timescale database they outnumber the user's tables
-    /// roughly twenty to one. `default` + `skip_serializing_if` keep
+    /// Whether the schema sidebar lists the objects a backend declared
+    /// internal — extension schemas and tables, child partitions (FRE-88).
+    /// Off by default: on a Timescale database they outnumber the user's
+    /// tables roughly twenty to one. `default` + `skip_serializing_if` keep
     /// pre-FRE-88 settings files deserializing and unchanged on rewrite.
     #[serde(default, skip_serializing_if = "is_false")]
     pub show_internal_objects: bool,
@@ -495,8 +495,8 @@ pub fn save_theme(path: &Path, theme: Theme) -> Result<(), ConfigError> {
     save_settings(path, &settings)
 }
 
-/// Persists just the system-schema visibility (FRE-88), preserving the rest
-/// (see [`save_theme`] for why the file is re-read first).
+/// Persists just the internal-object visibility (FRE-88), preserving the
+/// rest (see [`save_theme`] for why the file is re-read first).
 pub fn save_show_internal_objects(path: &Path, show: bool) -> Result<(), ConfigError> {
     let mut settings = load_settings(path);
     settings.show_internal_objects = show;

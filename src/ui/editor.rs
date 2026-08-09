@@ -493,8 +493,15 @@ fn completion_schema(tables: &[TableMeta], dialect: Dialect) -> serde_json::Valu
             .collect();
         // Internal objects stay completable — the SQL tab is exactly where you
         // go to poke at a chunk — but demoted, so a database with a thousand
-        // Timescale chunks or daily partitions doesn't bury the user's own
-        // tables in the ranking (FRE-88).
+        // of them doesn't bury the user's own tables in the ranking (FRE-88).
+        //
+        // This bites hardest for internal objects in the *default* schema —
+        // partition children, PostGIS's `spatial_ref_sys` — because lang-sql
+        // hoists only that schema's list to the root namespace, which is
+        // where an unqualified name completes from. Timescale's chunks live
+        // in a schema of their own and so were never in that root list;
+        // demoting them orders the list you get after typing the schema
+        // name, which is worth having but is the smaller of the two wins.
         let entry = match table.internal {
             Some(_) => json!({
                 "self": demoted_completion(&table.name, dialect),
@@ -521,11 +528,18 @@ const INTERNAL_BOOST: i64 = -99;
 ///
 /// That namespace form hands the completion to CodeMirror **verbatim**,
 /// unlike the plain-string entries the rest of the namespace uses, which
-/// lang-sql quote-applies on our behalf. So this has to mirror lang-sql's own
-/// rule: a bare lowercase identifier inserts as-is, anything else needs an
-/// explicit quoted `apply`. Deliberately stricter than lang-sql, whose
-/// case-insensitive dialects also leave `FOO` unquoted — quoting a name that
-/// didn't need it is still correct SQL, where the reverse would not be.
+/// lang-sql quote-applies on our behalf. So this reproduces what lang-sql
+/// would have produced for the same name, adding only the boost: a bare
+/// lowercase identifier (its `^[a-z_][a-z_\d]*$`) inserts as-is, anything
+/// else gets an explicit quoted `apply`.
+///
+/// Reproducing rather than improving on it is the point — these completions
+/// sit in the same list as lang-sql's own, and one entry quoting differently
+/// from its neighbours would be a worse bug than either convention alone.
+/// So the quote character is lang-sql's: the **first** character of the
+/// dialect's `identifierQuotes` spec, which is what its `Ym` reads. That is
+/// `"` for PostgreSQL, `"` for MSSQL (whose spec is `"[`, and the `[` never
+/// wins), and a backtick for SQLite (whose spec is `` `" ``).
 fn demoted_completion(name: &str, dialect: Dialect) -> serde_json::Value {
     let mut chars = name.chars();
     let bare = matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c == '_')
@@ -533,16 +547,15 @@ fn demoted_completion(name: &str, dialect: Dialect) -> serde_json::Value {
     if bare {
         return json!({ "label": name, "type": "type", "boost": INTERNAL_BOOST });
     }
-    // SQL Server brackets its identifiers; the other two double-quote.
-    let (open, close) = match dialect {
-        Dialect::SqlServer => ('[', ']'),
-        Dialect::Postgres | Dialect::Sqlite => ('"', '"'),
+    let quote = match dialect {
+        Dialect::Postgres | Dialect::SqlServer => '"',
+        Dialect::Sqlite => '`',
     };
     json!({
         "label": name,
         "type": "type",
         "boost": INTERNAL_BOOST,
-        "apply": format!("{open}{name}{close}"),
+        "apply": format!("{quote}{name}{quote}"),
     })
 }
 
@@ -940,18 +953,18 @@ mod tests {
                 "apply": "\"weird table\"",
             })
         );
-        // SQL Server brackets instead.
+        // MSSQL's spec is `"[`, and lang-sql reads only the first character
+        // — so it double-quotes too, brackets notwithstanding.
         assert_eq!(
-            demoted_completion("weird table", Dialect::SqlServer),
-            json!({
-                "label": "weird table",
-                "type": "type",
-                "boost": -99,
-                "apply": "[weird table]",
-            })
+            demoted_completion("weird table", Dialect::SqlServer)["apply"],
+            json!("\"weird table\"")
         );
-        // Upper case is quoted too: lang-sql would leave it alone on a
-        // case-insensitive dialect, and quoting it anyway is still correct.
+        // SQLite's spec is backtick-then-quote, so its first character wins.
+        assert_eq!(
+            demoted_completion("weird table", Dialect::Sqlite)["apply"],
+            json!("`weird table`")
+        );
+        // Upper case is not a bare identifier under lang-sql's rule either.
         assert_eq!(
             demoted_completion("Chunk", Dialect::Postgres)["apply"],
             json!("\"Chunk\"")
