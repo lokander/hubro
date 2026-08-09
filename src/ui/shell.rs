@@ -19,7 +19,7 @@ use super::icons::BackendIcon;
 use super::notice::{Banner, BannerKind, EmptyState, Spinner};
 use super::schema::SchemaPane;
 use super::sidebar::SchemaSidebar;
-use super::state::{ActiveView, AppState, ConnectStep};
+use super::state::{ActiveView, AppState, ConnectStep, ServerBackend};
 
 /// The window-level keyboard listener (FRE-15). Installed once as a plain
 /// `keydown` handler on `window` — a webview-robust way to capture app-global
@@ -1294,6 +1294,15 @@ fn ConnectionsScreen() -> Element {
     }
 }
 
+/// Cancel for the three connect prompt cards (password/passphrase, host-key
+/// trust, Entra sign-in): clears the card, and with it any saved-connection
+/// edit still waiting for the parked connect to confirm it (FRE-75) — an
+/// abandoned connect must never rewrite the entry it started from.
+fn cancel_prompt<T: 'static>(state: AppState, mut prompt: Signal<Option<T>>) {
+    state.clear_pending_edit();
+    prompt.set(None);
+}
+
 /// Inline secret prompt for a saved Postgres or SQL Server connection: the
 /// database password, or the SSH key passphrase when the tunnel's key is
 /// encrypted (Postgres only). "Remember" stores the secret in the OS keyring;
@@ -1314,56 +1323,25 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
         // unmounts this card — a scope-tied `spawn` would be cancelled at
         // its next await, silently abandoning the connect.
         dioxus::core::spawn_forever(async move {
+            // The prompt carries the backend the parked connect was for, so
+            // the retry resumes on the same engine (FRE-139).
             match prompt.kind {
                 PromptKind::DbPassword => {
-                    if prompt.backend == BackendKind::SqlServer {
-                        state
-                            .connect_sqlserver_with_password(
-                                prompt.url,
-                                prompt.name,
-                                entered,
-                                remember_choice,
-                                prompt.tunnel,
-                            )
-                            .await;
-                    } else {
-                        state
-                            .connect_postgres_with_password(
-                                prompt.url,
-                                prompt.name,
-                                entered,
-                                remember_choice,
-                                prompt.tunnel,
-                            )
-                            .await;
-                    }
+                    state
+                        .connect_server_with_password(
+                            ServerBackend::of(prompt.backend),
+                            prompt.url,
+                            prompt.name,
+                            entered,
+                            remember_choice,
+                            prompt.tunnel,
+                        )
+                        .await;
                 }
                 PromptKind::SshPassphrase => {
-                    // An SSH prompt always carries its tunnel config.
-                    let Some(tunnel) = prompt.tunnel else { return };
-                    if prompt.backend == BackendKind::SqlServer {
-                        state
-                            .connect_sqlserver_with_ssh_passphrase(
-                                prompt.url,
-                                prompt.name,
-                                tunnel,
-                                entered,
-                                remember_choice,
-                                prompt.auth,
-                            )
-                            .await;
-                    } else {
-                        state
-                            .connect_postgres_with_ssh_passphrase(
-                                prompt.url,
-                                prompt.name,
-                                tunnel,
-                                entered,
-                                remember_choice,
-                                prompt.auth,
-                            )
-                            .await;
-                    }
+                    state
+                        .connect_server_with_ssh_passphrase(prompt, entered, remember_choice)
+                        .await;
                 }
             }
         });
@@ -1400,10 +1378,7 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
                 }
                 button {
                     class: "rounded px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
-                    onclick: move |_| {
-                        state.clear_pending_edit();
-                        state.password_prompt.clone().set(None);
-                    },
+                    onclick: move |_| cancel_prompt(state, state.password_prompt),
                     "Cancel"
                 }
             }
@@ -1458,10 +1433,7 @@ fn HostKeyPromptCard(prompt: super::state::HostKeyPrompt) -> Element {
                 }
                 button {
                     class: "rounded px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
-                    onclick: move |_| {
-                        state.clear_pending_edit();
-                        state.host_key_prompt.clone().set(None);
-                    },
+                    onclick: move |_| cancel_prompt(state, state.host_key_prompt),
                     "Cancel"
                 }
             }
@@ -1481,11 +1453,10 @@ fn EntraSignInCard(prompt: super::state::EntraPrompt) -> Element {
         // spawn_forever: signing in clears `entra_prompt`, unmounting this card;
         // a scope-tied spawn would be cancelled mid sign-in.
         dioxus::core::spawn_forever(async move {
-            if prompt.backend == BackendKind::SqlServer {
-                state.connect_sqlserver_with_entra_signin(prompt).await;
-            } else {
-                state.connect_postgres_with_entra_signin(prompt).await;
-            }
+            let backend = ServerBackend::of(prompt.backend);
+            state
+                .connect_server_with_entra_signin(backend, prompt)
+                .await;
         });
     };
     rsx! {
@@ -1506,10 +1477,7 @@ fn EntraSignInCard(prompt: super::state::EntraPrompt) -> Element {
                 }
                 button {
                     class: "rounded px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
-                    onclick: move |_| {
-                        state.clear_pending_edit();
-                        state.entra_prompt.clone().set(None);
-                    },
+                    onclick: move |_| cancel_prompt(state, state.entra_prompt),
                     "Cancel"
                 }
             }
@@ -1689,6 +1657,251 @@ impl EditPrefill {
     }
 }
 
+/// The signals every connection form holds, handed to [`submit_server_form`]
+/// so one pipeline can read the fields at submit time (signals are `Copy`).
+///
+/// Deliberately only the *shared* fields: each form keeps its own option
+/// signals (`sslmode` vs `encrypt` + trust-server-certificate) and folds them
+/// into the URL it passes in, which is the one genuinely per-backend step of
+/// the submit.
+#[derive(Clone, Copy)]
+struct ServerFormState {
+    name: Signal<String>,
+    /// Never prefilled; empty means "keep whatever the keyring holds"
+    /// (FRE-75).
+    password: Signal<String>,
+    remember: Signal<bool>,
+    use_url: Signal<bool>,
+    pasted_url: Signal<String>,
+    auth_mode: Signal<String>,
+    entra_tenant: Signal<String>,
+    entra_client_id: Signal<String>,
+    use_tunnel: Signal<bool>,
+    ssh_host: Signal<String>,
+    ssh_port: Signal<String>,
+    ssh_user: Signal<String>,
+    ssh_use_key: Signal<bool>,
+    ssh_key_path: Signal<String>,
+    ssh_passphrase: Signal<String>,
+    form_error: Signal<Option<String>>,
+}
+
+/// The submit pipeline both connection forms run (FRE-139): validate the
+/// tunnel fields, take the SSH passphrase and any password embedded in a
+/// pasted URL, settle the display name and auth mode, register the pending
+/// edit, carry a moved secret across, then dispatch the connect and close (and
+/// persist) only if it worked.
+///
+/// `built` is the URL the calling form's own fields produced — `Ok` or the
+/// error to show. It is computed by the caller because that is the step the
+/// two forms genuinely differ in (which `build_*`/`normalize_*` applies, and
+/// SQL Server's trust-server-certificate flag); building it is side-effect
+/// free, so a tunnel-field error still surfaces first, as before.
+///
+/// `old_locator` is set when editing a saved entry: the locator to replace,
+/// which the edit may move.
+fn submit_server_form(
+    state: AppState,
+    on_done: EventHandler<()>,
+    backend: ServerBackend,
+    form: ServerFormState,
+    old_locator: Option<String>,
+    built: Result<String, crate::db::DbError>,
+) {
+    use crate::config::PgAuth;
+    use crate::tunnel::{TunnelAuth, TunnelConfig};
+    let mut form_error = form.form_error;
+    // Tunnel settings are validated first so a bad SSH field fails before any
+    // connect attempt.
+    let tunnel: Option<TunnelConfig> = match tunnel_from_form(
+        *form.use_tunnel.peek(),
+        &form.ssh_host.peek(),
+        &form.ssh_port.peek(),
+        &form.ssh_user.peek(),
+        *form.ssh_use_key.peek(),
+        &form.ssh_key_path.peek(),
+    ) {
+        Ok(tunnel) => tunnel,
+        Err(err) => {
+            form_error.set(Some(err));
+            return;
+        }
+    };
+    let entered_passphrase = if matches!(
+        tunnel,
+        Some(TunnelConfig {
+            auth: TunnelAuth::KeyFile { .. },
+            ..
+        })
+    ) {
+        Some(form.ssh_passphrase.peek().clone()).filter(|p| !p.is_empty())
+    } else {
+        None
+    };
+    // A password pasted inside the URL is used for this connect (and
+    // remembered for the session on success) but never persisted.
+    let embedded_password = embedded_url_password(*form.use_url.peek(), &form.pasted_url.peek());
+    let url = match built {
+        Ok(url) => url,
+        Err(err) => {
+            form_error.set(Some(err.to_string()));
+            return;
+        }
+    };
+    let display_name = display_name_for(&form.name.peek(), &url);
+    // Authentication mode from the selector (FRE-44/FRE-58). Entra takes the
+    // `user` field as the Entra principal; a token replaces the password.
+    let auth: PgAuth = match auth_from_form(
+        &form.auth_mode.peek(),
+        &form.entra_tenant.peek(),
+        &form.entra_client_id.peek(),
+    ) {
+        Ok(auth) => auth,
+        Err(err) => {
+            form_error.set(Some(err));
+            return;
+        }
+    };
+    if matches!(auth, PgAuth::Entra(_)) && entra_principal_missing(&url) {
+        form_error.set(Some(
+            "Entra needs a principal — fill the user field (e.g. you@contoso.com)".to_string(),
+        ));
+        return;
+    }
+    let mut entered_password = form.password.peek().clone();
+    if entered_password.is_empty() {
+        if let Some(embedded) = embedded_password {
+            entered_password = embedded;
+        }
+    }
+    let remember_choice = *form.remember.peek();
+    form_error.set(None);
+    // spawn_forever: closing the modal (X or Escape) unmounts the form, and a
+    // scope-tied `spawn` would be cancelled at its next await — abandoning the
+    // connect with its reservation still held, which leaves the row stuck
+    // showing progress it can no longer cancel.
+    dioxus::core::spawn_forever(async move {
+        // An edit is saved by whichever path confirms the connect — including
+        // the Entra sign-in card, which resolves after this form has closed —
+        // so the intent is registered up front rather than applied here
+        // (FRE-75).
+        if let Some(old) = &old_locator {
+            state.set_pending_edit(old.clone(), url.clone());
+        }
+        // "Leave the password empty to keep the existing one" has to keep
+        // working when the edit moves the locator: the stored secret is still
+        // filed under the OLD one, and the connect below looks up the new.
+        // Carry it over first (FRE-75).
+        if entered_password.is_empty() {
+            if let Some(old) = old_locator.as_ref().filter(|old| **old != url) {
+                if let Ok(Some(stored)) = crate::secrets::get_password_async(old.clone()).await {
+                    entered_password = stored;
+                }
+            }
+        }
+        // An entered passphrase seeds session memory so the tunnel open finds
+        // it, exactly as if it came from the prompt.
+        if let Some(passphrase) = &entered_passphrase {
+            state.stash_ssh_passphrase(&url, passphrase.clone());
+        }
+        if matches!(auth, PgAuth::Entra(_)) {
+            // Entra: the connect either succeeds silently (and the flow saves
+            // it) or raises the sign-in card (which saves on completion).
+            // Either way, close the form — the card takes over.
+            //
+            // Closed *before* the await, not after: `on_done` is owned by the
+            // connections screen, and a successful connect switches to the new
+            // tab and unmounts it. This task outlives that (it is root-spawned),
+            // so calling the handler afterwards would touch a dropped scope's
+            // storage and panic. The Entra path yields after opening the tab
+            // (it caches the refresh token), so the unmount really does land
+            // first.
+            //
+            // Guarded because ordering alone is not a guarantee: a *second*
+            // focus-taking connect finishing mid-submit can unmount the screen
+            // at any await here. The screen is mounted exactly when this view
+            // is active, and when it is not, closing the form is a no-op anyway
+            // — it went with the screen.
+            close_form(&state, &on_done);
+            state
+                .connect_server(
+                    backend,
+                    url.clone(),
+                    display_name.clone(),
+                    tunnel.clone(),
+                    auth,
+                )
+                .await;
+            return;
+        }
+        if entered_password.is_empty() {
+            // No password entered: try as-is (the keyring may hold one); an
+            // auth failure raises the password prompt.
+            state
+                .connect_server(
+                    backend,
+                    url.clone(),
+                    display_name.clone(),
+                    tunnel.clone(),
+                    PgAuth::Password,
+                )
+                .await;
+        } else {
+            state
+                .connect_server_with_password(
+                    backend,
+                    url.clone(),
+                    display_name.clone(),
+                    entered_password,
+                    remember_choice,
+                    tunnel.clone(),
+                )
+                .await;
+        }
+        // The connect flow saves on success (`save_server_if_open`), which is
+        // why nothing is saved here; only close the form when the connection
+        // worked. Closing comes first for the reason above:
+        // `persist_ssh_passphrase` awaits, and by the time it returns the
+        // connections screen that owns `on_done` is gone.
+        if state.open_locators.peek().iter().any(|(_, l)| *l == url) {
+            close_form(&state, &on_done);
+            if remember_choice && entered_passphrase.is_some() {
+                state.persist_ssh_passphrase(&url).await;
+            }
+        }
+    });
+}
+
+/// The password pasted inside a URL, when the form is in paste mode. Used for
+/// that connect (and remembered for the session on success) but never
+/// persisted — the saved locator is the password-free normalization.
+fn embedded_url_password(use_url: bool, pasted: &str) -> Option<String> {
+    if !use_url {
+        return None;
+    }
+    url::Url::parse(pasted.trim()).ok().and_then(|parsed| {
+        // Url::password() returns the still-encoded form. Decoded lossily,
+        // unlike the field prefills: a password is used as typed, and refusing
+        // to decode it would silently connect with the percent-escapes.
+        parsed.password().map(|p| {
+            percent_encoding::percent_decode_str(p)
+                .decode_utf8_lossy()
+                .into_owned()
+        })
+    })
+}
+
+/// The name a submitted connection is saved and tabbed under: what the user
+/// typed, or the URL-derived fallback when they left the field empty.
+fn display_name_for(entered: &str, url: &str) -> String {
+    let entered = entered.trim();
+    if entered.is_empty() {
+        default_server_name(url)
+    } else {
+        entered.to_string()
+    }
+}
+
 /// Add-Postgres panel: individual fields or a pasted URL, plus an optional
 /// SSH tunnel.
 #[component]
@@ -1698,86 +1911,61 @@ fn PostgresForm(
     edit: Option<SavedConnection>,
     on_done: EventHandler<()>,
 ) -> Element {
-    use crate::config::PgAuth;
-    use crate::tunnel::{TunnelAuth, TunnelConfig};
     let state = use_context::<AppState>();
     let prefill = edit.clone().map(EditPrefill::from_saved);
     let seed = prefill.clone().unwrap_or_default();
     let old_locator = edit.as_ref().map(|e| e.locator().to_string());
     let editing = edit.is_some();
-    let mut use_url = use_signal(|| false);
-    let mut name = use_signal(|| seed.name.clone());
     let mut host = use_signal(|| seed.host.clone());
     let mut port = use_signal(|| seed.port.clone());
     let mut database = use_signal(|| seed.database.clone());
     let mut user = use_signal(|| seed.user.clone());
-    // Never prefilled: the stored secret isn't shown, and an empty field on
-    // save means "keep the existing keyring entry" (FRE-75).
-    let mut password = use_signal(String::new);
-    let mut remember = use_signal(|| true);
     let mut sslmode = use_signal(|| seed.option.clone().unwrap_or_else(|| "prefer".to_string()));
-    // Authentication: "password" (default), "entra-interactive", or "entra-mi".
-    let auth_mode = use_signal(|| seed.auth_mode.clone());
-    let entra_tenant = use_signal(|| seed.entra_tenant.clone());
-    let entra_client_id = use_signal(|| seed.entra_client_id.clone());
-    let mut pasted_url = use_signal(String::new);
-    let use_tunnel = use_signal(|| seed.tunnel.is_some());
-    let ssh_host = use_signal(|| seed.ssh_host.clone());
-    let ssh_port = use_signal(|| seed.ssh_port.clone());
-    let ssh_user = use_signal(|| seed.ssh_user.clone());
-    // false = ssh-agent (the default), true = key file.
-    let ssh_use_key = use_signal(|| seed.ssh_use_key);
-    let ssh_key_path = use_signal(|| seed.ssh_key_path.clone());
-    let ssh_passphrase = use_signal(String::new);
-    let mut form_error = use_signal(|| Option::<String>::None);
+    let form = ServerFormState {
+        name: use_signal(|| seed.name.clone()),
+        // Never prefilled: the stored secret isn't shown, and an empty field
+        // on save means "keep the existing keyring entry" (FRE-75).
+        password: use_signal(String::new),
+        remember: use_signal(|| true),
+        use_url: use_signal(|| false),
+        pasted_url: use_signal(String::new),
+        // Authentication: "password" (default), "entra-interactive", or
+        // "entra-mi".
+        auth_mode: use_signal(|| seed.auth_mode.clone()),
+        entra_tenant: use_signal(|| seed.entra_tenant.clone()),
+        entra_client_id: use_signal(|| seed.entra_client_id.clone()),
+        use_tunnel: use_signal(|| seed.tunnel.is_some()),
+        ssh_host: use_signal(|| seed.ssh_host.clone()),
+        ssh_port: use_signal(|| seed.ssh_port.clone()),
+        ssh_user: use_signal(|| seed.ssh_user.clone()),
+        // false = ssh-agent (the default), true = key file.
+        ssh_use_key: use_signal(|| seed.ssh_use_key),
+        ssh_key_path: use_signal(|| seed.ssh_key_path.clone()),
+        ssh_passphrase: use_signal(String::new),
+        form_error: use_signal(|| Option::<String>::None),
+    };
+    let ServerFormState {
+        mut name,
+        mut password,
+        mut remember,
+        mut use_url,
+        mut pasted_url,
+        auth_mode,
+        entra_tenant,
+        entra_client_id,
+        use_tunnel,
+        ssh_host,
+        ssh_port,
+        ssh_user,
+        ssh_use_key,
+        ssh_key_path,
+        ssh_passphrase,
+        form_error,
+    } = form;
 
-    let mut submit = move || {
-        // Cloned per attempt: the async block below takes ownership, and
-        // `submit` has to stay FnMut.
-        let old_locator = old_locator.clone();
-        // Tunnel settings are validated first so a bad SSH field fails
-        // before any connect attempt.
-        let tunnel: Option<TunnelConfig> = match tunnel_from_form(
-            *use_tunnel.peek(),
-            &ssh_host.peek(),
-            &ssh_port.peek(),
-            &ssh_user.peek(),
-            *ssh_use_key.peek(),
-            &ssh_key_path.peek(),
-        ) {
-            Ok(tunnel) => tunnel,
-            Err(err) => {
-                form_error.set(Some(err));
-                return;
-            }
-        };
-        let entered_passphrase = if matches!(
-            tunnel,
-            Some(TunnelConfig {
-                auth: TunnelAuth::KeyFile { .. },
-                ..
-            })
-        ) {
-            Some(ssh_passphrase.peek().clone()).filter(|p| !p.is_empty())
-        } else {
-            None
-        };
-        // A password pasted inside the URL is used for this connect (and
-        // remembered for the session on success) but never persisted.
-        let embedded_password = if *use_url.peek() {
-            url::Url::parse(pasted_url.peek().trim())
-                .ok()
-                .and_then(|u| {
-                    // Url::password() returns the still-encoded form.
-                    u.password().map(|p| {
-                        percent_encoding::percent_decode_str(p)
-                            .decode_utf8_lossy()
-                            .into_owned()
-                    })
-                })
-        } else {
-            None
-        };
+    let submit = move || {
+        // The URL is this form's own step; everything else is the shared
+        // pipeline (FRE-139).
         let built = if *use_url.peek() {
             crate::db::normalize_pg_url(&pasted_url.peek())
         } else {
@@ -1789,134 +1977,16 @@ fn PostgresForm(
                 &sslmode.peek(),
             )
         };
-        let url = match built {
-            Ok(url) => url,
-            Err(err) => {
-                form_error.set(Some(err.to_string()));
-                return;
-            }
-        };
-        let display_name = {
-            let entered = name.peek().trim().to_string();
-            if entered.is_empty() {
-                default_server_name(&url)
-            } else {
-                entered
-            }
-        };
-        // Authentication mode from the selector (FRE-44). Entra takes the
-        // `user` field as the Entra principal; a token replaces the password.
-        let auth: PgAuth = match auth_from_form(
-            &auth_mode.peek(),
-            &entra_tenant.peek(),
-            &entra_client_id.peek(),
-        ) {
-            Ok(auth) => auth,
-            Err(err) => {
-                form_error.set(Some(err));
-                return;
-            }
-        };
-        if matches!(auth, PgAuth::Entra(_)) && entra_principal_missing(&url) {
-            form_error.set(Some(
-                "Entra needs a principal — fill the user field (e.g. you@contoso.com)".to_string(),
-            ));
-            return;
-        }
-        let mut entered_password = password.peek().clone();
-        if entered_password.is_empty() {
-            if let Some(embedded) = embedded_password {
-                entered_password = embedded;
-            }
-        }
-        let remember_choice = *remember.peek();
-        form_error.set(None);
-        // spawn_forever: closing the modal (X or Escape) unmounts this form,
-        // and a scope-tied `spawn` would be cancelled at its next await —
-        // abandoning the connect with its reservation still held, which
-        // leaves the row stuck showing progress it can no longer cancel.
-        dioxus::core::spawn_forever(async move {
-            // An edit is saved by whichever path confirms the connect —
-            // including the Entra sign-in card, which resolves after this
-            // form has closed — so the intent is registered up front rather
-            // than applied here (FRE-75).
-            if let Some(old) = &old_locator {
-                state.set_pending_edit(old.clone(), url.clone());
-            }
-            // "Leave the password empty to keep the existing one" has to keep
-            // working when the edit moves the locator: the stored secret is
-            // still filed under the OLD one, and the connect below looks up
-            // the new. Carry it over first (FRE-75).
-            if entered_password.is_empty() {
-                if let Some(old) = old_locator.as_ref().filter(|old| **old != url) {
-                    if let Ok(Some(stored)) = crate::secrets::get_password_async(old.clone()).await
-                    {
-                        entered_password = stored;
-                    }
-                }
-            }
-            // An entered passphrase seeds session memory so the tunnel open
-            // finds it, exactly as if it came from the prompt.
-            if let Some(passphrase) = &entered_passphrase {
-                state.stash_ssh_passphrase(&url, passphrase.clone());
-            }
-            if matches!(auth, PgAuth::Entra(_)) {
-                // Entra: the connect either succeeds silently (and the flow
-                // saves it) or raises the sign-in card (which saves on
-                // completion). Either way, close the form — the card takes over.
-                //
-                // Closed *before* the await, not after: `on_done` is owned by
-                // the connections screen, and a successful connect switches to
-                // the new tab and unmounts it. This task outlives that (it is
-                // root-spawned), so calling the handler afterwards would touch
-                // a dropped scope's storage and panic. The Entra path yields
-                // after opening the tab (it caches the refresh token), so the
-                // unmount really does land first.
-                //
-                // Guarded because ordering alone is not a guarantee: a *second*
-                // focus-taking connect finishing mid-submit can unmount the
-                // screen at any await here. The screen is mounted exactly when
-                // this view is active, and when it is not, closing the form is
-                // a no-op anyway — it went with the screen.
-                close_form(&state, &on_done);
-                state
-                    .connect_postgres(url.clone(), display_name.clone(), tunnel.clone(), auth)
-                    .await;
-                return;
-            }
-            if entered_password.is_empty() {
-                state
-                    .connect_postgres(
-                        url.clone(),
-                        display_name.clone(),
-                        tunnel.clone(),
-                        PgAuth::Password,
-                    )
-                    .await;
-            } else {
-                state
-                    .connect_postgres_with_password(
-                        url.clone(),
-                        display_name.clone(),
-                        entered_password,
-                        remember_choice,
-                        tunnel.clone(),
-                    )
-                    .await;
-            }
-            // Only save and close the form when the connection worked. Closing
-            // comes first for the reason above: `persist_ssh_passphrase` awaits,
-            // and by the time it returns the connections screen that owns
-            // `on_done` is gone. Everything after it is on `AppState`, whose
-            // signals are root-owned and outlive this task.
-            if state.open_locators.peek().iter().any(|(_, l)| *l == url) {
-                close_form(&state, &on_done);
-                if remember_choice && entered_passphrase.is_some() {
-                    state.persist_ssh_passphrase(&url).await;
-                }
-                state.add_saved_postgres(display_name, url, tunnel, PgAuth::Password);
-            }
-        });
+        // Cloned per attempt: the submit takes ownership, and `submit` has to
+        // stay FnMut.
+        submit_server_form(
+            state,
+            on_done,
+            ServerBackend::POSTGRES,
+            form,
+            old_locator.clone(),
+            built,
+        );
     };
 
     let field_class = FORM_FIELD_CLASS;
@@ -2057,8 +2127,6 @@ fn SqlServerForm(
     edit: Option<SavedConnection>,
     on_done: EventHandler<()>,
 ) -> Element {
-    use crate::config::PgAuth;
-    use crate::tunnel::{TunnelAuth, TunnelConfig};
     let state = use_context::<AppState>();
     let seed = edit
         .clone()
@@ -2066,82 +2134,60 @@ fn SqlServerForm(
         .unwrap_or_default();
     let old_locator = edit.as_ref().map(|e| e.locator().to_string());
     let editing = edit.is_some();
-    let mut use_url = use_signal(|| false);
-    let mut name = use_signal(|| seed.name.clone());
     let mut host = use_signal(|| seed.host.clone());
     let mut port = use_signal(|| seed.port.clone());
     let mut database = use_signal(|| seed.database.clone());
     let mut user = use_signal(|| seed.user.clone());
-    // Never prefilled: an empty field on save keeps the keyring entry.
-    let mut password = use_signal(String::new);
-    let mut remember = use_signal(|| true);
     // Matches the URL params the backend accepts: encrypt=on|off|plaintext.
     let mut encrypt = use_signal(|| seed.option.clone().unwrap_or_else(|| "on".to_string()));
     // Accept the server's TLS certificate without CA validation — needed for
     // dev servers with self-signed certs (e.g. the stock Docker image).
     let mut trust_cert = use_signal(|| seed.trust_cert);
-    // Authentication: "password" (default), "entra-interactive", or "entra-mi".
-    let auth_mode = use_signal(|| seed.auth_mode.clone());
-    let entra_tenant = use_signal(|| seed.entra_tenant.clone());
-    let entra_client_id = use_signal(|| seed.entra_client_id.clone());
-    let mut pasted_url = use_signal(String::new);
-    let use_tunnel = use_signal(|| seed.tunnel.is_some());
-    let ssh_host = use_signal(|| seed.ssh_host.clone());
-    let ssh_port = use_signal(|| seed.ssh_port.clone());
-    let ssh_user = use_signal(|| seed.ssh_user.clone());
-    // false = ssh-agent (the default), true = key file.
-    let ssh_use_key = use_signal(|| seed.ssh_use_key);
-    let ssh_key_path = use_signal(|| seed.ssh_key_path.clone());
-    let ssh_passphrase = use_signal(String::new);
-    let mut form_error = use_signal(|| Option::<String>::None);
+    let form = ServerFormState {
+        name: use_signal(|| seed.name.clone()),
+        // Never prefilled: an empty field on save keeps the keyring entry.
+        password: use_signal(String::new),
+        remember: use_signal(|| true),
+        use_url: use_signal(|| false),
+        pasted_url: use_signal(String::new),
+        // Authentication: "password" (default), "entra-interactive", or
+        // "entra-mi".
+        auth_mode: use_signal(|| seed.auth_mode.clone()),
+        entra_tenant: use_signal(|| seed.entra_tenant.clone()),
+        entra_client_id: use_signal(|| seed.entra_client_id.clone()),
+        use_tunnel: use_signal(|| seed.tunnel.is_some()),
+        ssh_host: use_signal(|| seed.ssh_host.clone()),
+        ssh_port: use_signal(|| seed.ssh_port.clone()),
+        ssh_user: use_signal(|| seed.ssh_user.clone()),
+        // false = ssh-agent (the default), true = key file.
+        ssh_use_key: use_signal(|| seed.ssh_use_key),
+        ssh_key_path: use_signal(|| seed.ssh_key_path.clone()),
+        ssh_passphrase: use_signal(String::new),
+        form_error: use_signal(|| Option::<String>::None),
+    };
+    let ServerFormState {
+        mut name,
+        mut password,
+        mut remember,
+        mut use_url,
+        mut pasted_url,
+        auth_mode,
+        entra_tenant,
+        entra_client_id,
+        use_tunnel,
+        ssh_host,
+        ssh_port,
+        ssh_user,
+        ssh_use_key,
+        ssh_key_path,
+        ssh_passphrase,
+        form_error,
+    } = form;
 
-    let mut submit = move || {
-        // Cloned per attempt: the async block below takes ownership, and
-        // `submit` has to stay FnMut.
-        let old_locator = old_locator.clone();
-        // Tunnel settings are validated first so a bad SSH field fails
-        // before any connect attempt.
-        let tunnel: Option<TunnelConfig> = match tunnel_from_form(
-            *use_tunnel.peek(),
-            &ssh_host.peek(),
-            &ssh_port.peek(),
-            &ssh_user.peek(),
-            *ssh_use_key.peek(),
-            &ssh_key_path.peek(),
-        ) {
-            Ok(tunnel) => tunnel,
-            Err(err) => {
-                form_error.set(Some(err));
-                return;
-            }
-        };
-        let entered_passphrase = if matches!(
-            tunnel,
-            Some(TunnelConfig {
-                auth: TunnelAuth::KeyFile { .. },
-                ..
-            })
-        ) {
-            Some(ssh_passphrase.peek().clone()).filter(|p| !p.is_empty())
-        } else {
-            None
-        };
-        // A password pasted inside the URL is used for this connect (and
-        // remembered for the session on success) but never persisted.
-        let embedded_password = if *use_url.peek() {
-            url::Url::parse(pasted_url.peek().trim())
-                .ok()
-                .and_then(|u| {
-                    // Url::password() returns the still-encoded form.
-                    u.password().map(|p| {
-                        percent_encoding::percent_decode_str(p)
-                            .decode_utf8_lossy()
-                            .into_owned()
-                    })
-                })
-        } else {
-            None
-        };
+    let submit = move || {
+        // The URL is this form's own step — the encrypt option and the
+        // trust-server-certificate flag are SQL Server's alone; everything
+        // else is the shared pipeline (FRE-139).
         let built = if *use_url.peek() {
             crate::db::normalize_mssql_url(&pasted_url.peek())
         } else {
@@ -2170,123 +2216,16 @@ fn SqlServerForm(
                 }
             })
         };
-        let url = match built {
-            Ok(url) => url,
-            Err(err) => {
-                form_error.set(Some(err.to_string()));
-                return;
-            }
-        };
-        let display_name = {
-            let entered = name.peek().trim().to_string();
-            if entered.is_empty() {
-                default_server_name(&url)
-            } else {
-                entered
-            }
-        };
-        // Authentication mode from the selector (FRE-58, mirroring FRE-44).
-        // Entra takes the user field as the principal; a token replaces the
-        // password.
-        let auth: PgAuth = match auth_from_form(
-            &auth_mode.peek(),
-            &entra_tenant.peek(),
-            &entra_client_id.peek(),
-        ) {
-            Ok(auth) => auth,
-            Err(err) => {
-                form_error.set(Some(err));
-                return;
-            }
-        };
-        if matches!(auth, PgAuth::Entra(_)) && entra_principal_missing(&url) {
-            form_error.set(Some(
-                "Entra needs a principal — fill the user field (e.g. you@contoso.com)".to_string(),
-            ));
-            return;
-        }
-        let mut entered_password = password.peek().clone();
-        if entered_password.is_empty() {
-            if let Some(embedded) = embedded_password {
-                entered_password = embedded;
-            }
-        }
-        let remember_choice = *remember.peek();
-        form_error.set(None);
-        // spawn_forever: closing the modal (X or Escape) unmounts this form,
-        // and a scope-tied `spawn` would be cancelled at its next await —
-        // abandoning the connect with its reservation still held, which
-        // leaves the row stuck showing progress it can no longer cancel.
-        dioxus::core::spawn_forever(async move {
-            // An edit is saved by whichever path confirms the connect —
-            // including the Entra sign-in card, which resolves after this
-            // form has closed — so the intent is registered up front rather
-            // than applied here (FRE-75).
-            if let Some(old) = &old_locator {
-                state.set_pending_edit(old.clone(), url.clone());
-            }
-            // "Leave the password empty to keep the existing one" has to keep
-            // working when the edit moves the locator: the stored secret is
-            // still filed under the OLD one, and the connect below looks up
-            // the new. Carry it over first (FRE-75).
-            if entered_password.is_empty() {
-                if let Some(old) = old_locator.as_ref().filter(|old| **old != url) {
-                    if let Ok(Some(stored)) = crate::secrets::get_password_async(old.clone()).await
-                    {
-                        entered_password = stored;
-                    }
-                }
-            }
-            // An entered passphrase seeds session memory so the tunnel open
-            // finds it, exactly as if it came from the prompt.
-            if let Some(passphrase) = &entered_passphrase {
-                state.stash_ssh_passphrase(&url, passphrase.clone());
-            }
-            if matches!(auth, PgAuth::Entra(_)) {
-                // Entra: the connect either succeeds silently (and the flow
-                // saves it) or raises the sign-in card (which saves on
-                // completion). Either way, close the form — the card takes over.
-                // Closed before the await, for the same reason as the Postgres
-                // form: a successful connect unmounts the screen that owns
-                // `on_done`, and this task outlives it.
-                close_form(&state, &on_done);
-                state
-                    .connect_sqlserver(url.clone(), display_name.clone(), tunnel.clone(), auth)
-                    .await;
-                return;
-            }
-            if entered_password.is_empty() {
-                // No password entered: try as-is (the keyring may hold one);
-                // an auth failure raises the password prompt.
-                state
-                    .connect_sqlserver(
-                        url.clone(),
-                        display_name.clone(),
-                        tunnel.clone(),
-                        PgAuth::Password,
-                    )
-                    .await;
-            } else {
-                state
-                    .connect_sqlserver_with_password(
-                        url.clone(),
-                        display_name.clone(),
-                        entered_password,
-                        remember_choice,
-                        tunnel.clone(),
-                    )
-                    .await;
-            }
-            // The connect flow saves on success; only close the form then —
-            // and close before `persist_ssh_passphrase` awaits, since the
-            // screen owning `on_done` is gone once the new tab is up.
-            if state.open_locators.peek().iter().any(|(_, l)| *l == url) {
-                close_form(&state, &on_done);
-                if remember_choice && entered_passphrase.is_some() {
-                    state.persist_ssh_passphrase(&url).await;
-                }
-            }
-        });
+        // Cloned per attempt: the submit takes ownership, and `submit` has to
+        // stay FnMut.
+        submit_server_form(
+            state,
+            on_done,
+            ServerBackend::SQL_SERVER,
+            form,
+            old_locator.clone(),
+            built,
+        );
     };
 
     let field_class = FORM_FIELD_CLASS;
@@ -2444,6 +2383,57 @@ const FORM_FIELD_CLASS: &str ="w-full rounded border border-slate-300 dark:borde
 
 /// Select class shared by the connection forms' dropdowns.
 const FORM_SELECT_CLASS: &str = "rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-2 text-sm text-slate-900 dark:text-slate-200";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_embedded_password_is_only_taken_from_a_pasted_url() {
+        // Field mode: the password field is the only source, even if the
+        // (hidden) paste field still holds an old value.
+        assert_eq!(
+            embedded_url_password(false, "postgres://u:secret@h:5432/db"),
+            None
+        );
+        assert_eq!(
+            embedded_url_password(true, "postgres://u:secret@h:5432/db"),
+            Some("secret".to_string())
+        );
+        // Percent escapes are what the user typed, so they are decoded before
+        // the password is used.
+        assert_eq!(
+            embedded_url_password(true, "mssql://sa:p%40ss%20w%25rd@h:1433/db"),
+            Some("p@ss w%rd".to_string())
+        );
+        // Surrounding whitespace is trimmed like the URL builders do.
+        assert_eq!(
+            embedded_url_password(true, "  postgres://u:secret@h/db  "),
+            Some("secret".to_string())
+        );
+        // Nothing to take: no password in the URL, or nothing parseable.
+        assert_eq!(embedded_url_password(true, "postgres://u@h:5432/db"), None);
+        assert_eq!(embedded_url_password(true, "not a url"), None);
+        assert_eq!(embedded_url_password(true, ""), None);
+    }
+
+    #[test]
+    fn an_empty_name_field_falls_back_to_the_url() {
+        assert_eq!(
+            display_name_for("  ", "postgres://u@db.example.com:5432/app"),
+            "app @ db.example.com"
+        );
+        assert_eq!(
+            display_name_for("", "mssql://sa@db.example.com:1433/app"),
+            "app @ db.example.com"
+        );
+        // A typed name wins, trimmed.
+        assert_eq!(
+            display_name_for("  prod  ", "postgres://u@db.example.com:5432/app"),
+            "prod"
+        );
+    }
+}
 
 /// Builds the tunnel config from the SSH form fields — `Ok(None)` when the
 /// toggle is off. Shared by the Postgres and SQL Server forms; errors are
