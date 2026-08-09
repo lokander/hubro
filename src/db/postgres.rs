@@ -657,25 +657,42 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
     // 63-character table shards into `..._01ae35b2_102008`.
     //
     // Its answer is then resolved back to a real `pg_class` row rather than
-    // used as a name, because `shard_name()` qualifies anything outside the
-    // search path — a shard in a `sales` schema comes back as
+    // used as a name, because `shard_name()` qualifies anything outside
+    // `public` — a shard in a `sales` schema comes back as
     // `sales.orders_102008`, which matches no `relname` anywhere. Resolving
-    // it yields the schema and the bare name the caller actually needs, and
-    // means no string is ever parsed.
+    // it yields the schema and the bare name the caller needs, and means no
+    // string is ever parsed.
     //
-    // `to_regclass` rather than a `::regclass` cast: the cast *raises* on a
-    // name it cannot resolve, and a multi-node coordinator's `pg_dist_shard`
-    // lists shards that live on workers with no local relation. The cast
-    // would error, the `if let Ok` below would swallow it, and nothing at all
-    // would be marked; `to_regclass` returns NULL and the join drops the row.
+    // Two things that resolution has to be pinned against:
+    //
+    // `to_regclass` rather than a `::regclass` cast, because the cast *raises*
+    // on a name it cannot resolve, and a multi-node coordinator's
+    // `pg_dist_shard` lists shards living on workers with no local relation.
+    // The cast would error, the `if let Ok` below would swallow it, and
+    // nothing at all would be marked.
+    //
+    // `sc.relnamespace = c.relnamespace`, because `to_regclass` resolves
+    // through the search path: a user table named `decoy.pub_102008` with
+    // `decoy` ahead of `public` otherwise resolves *instead of* the real
+    // shard, and the user's own table is what gets hidden while the shard
+    // stays visible — backwards on both counts, and not gated behind the
+    // visibility setting, since name resolution goes through the catalog
+    // cache rather than the `pg_class` scan Citus filters. Shards always live
+    // in their table's schema, so pinning the namespace costs nothing.
+    //
+    // Residual, and benign: a `search_path` that excludes `public` leaves
+    // `public` shards unresolvable, so they go unmarked — the same place they
+    // would be if Citus were hiding them, which by default it is.
     // Best-effort for the same reason as the Timescale labels below.
     if has_citus {
         let shards = sqlx::query(
             "SELECT sn.nspname AS schema_name, sc.relname AS object_name \
              FROM pg_dist_shard s \
+             JOIN pg_class c ON c.oid = s.logicalrelid \
              JOIN pg_class sc \
                ON sc.oid = pg_catalog.to_regclass( \
                     pg_catalog.shard_name(s.logicalrelid, s.shardid)) \
+              AND sc.relnamespace = c.relnamespace \
              JOIN pg_namespace sn ON sn.oid = sc.relnamespace",
         )
         .fetch_all(pool)

@@ -648,15 +648,31 @@ async fn shards_are_marked_internal_when_citus_stops_hiding_them() {
 
     let tables = shard_pool.introspect().await.unwrap();
     let parents = ["visible_shards", "orders", long_name.as_str()];
+    // Every table in these schemas that isn't one of the three parents is a
+    // shard. Views are excluded because Citus's own `citus_tables`/
+    // `citus_schemas` live in `public` and are internal for a different
+    // reason — they'd inflate the count without being shards.
     let shards: Vec<&TableMeta> = tables
         .iter()
+        .filter(|t| t.kind == TableKind::Table)
         .filter(|t| !parents.contains(&t.name.as_str()))
         .filter(|t| t.schema.as_deref() == Some("public") || t.schema.as_deref() == Some("sales"))
         .collect();
-    assert!(
-        shards.len() >= 24,
-        "expected the shards to be visible for this test to mean anything, got {}",
-        shards.len()
+    // Against `pg_dist_shard` rather than a loose lower bound: with three
+    // shard families in play, a bound wide enough to be safe is also wide
+    // enough for a whole family to vanish unnoticed.
+    let expected = shard_pool
+        .query("SELECT count(*) FROM pg_dist_shard")
+        .await
+        .unwrap();
+    let expected = match &expected.rows[0][0] {
+        Value::Integer(n) => *n as usize,
+        other => panic!("expected a count, got {other:?}"),
+    };
+    assert_eq!(
+        shards.len(),
+        expected,
+        "every shard should be visible for this test to mean anything"
     );
     for shard in &shards {
         assert_eq!(
@@ -700,4 +716,74 @@ fn swap_database(url: &str, database: &str) -> String {
         Some(query) => format!("{root}/{database}?{query}"),
         None => format!("{root}/{database}"),
     }
+}
+
+#[tokio::test]
+async fn a_user_table_cannot_be_hidden_by_impersonating_a_shard_name() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+
+    // Shard names are resolved through `to_regclass`, which honours the
+    // search path — so a user table named like a shard, in a schema ahead of
+    // the shard's own, can resolve *instead of* it. Left unpinned that hides
+    // the user's data and reveals the shard, which is backwards twice over,
+    // and it happens under Citus's default visibility settings rather than
+    // only behind the knob the sibling test widens.
+    let _guard = FIXTURE_DDL.lock().await;
+    let db = "hubro_citus_shadow";
+    pool.query(&format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"))
+        .await
+        .unwrap();
+    pool.query(&format!("CREATE DATABASE {db}")).await.unwrap();
+    pool.query(&format!(
+        "ALTER DATABASE {db} SET search_path TO decoy, public"
+    ))
+    .await
+    .unwrap();
+
+    let shadow_pool = DbPool::open_postgres(&swap_database(&url, db))
+        .await
+        .unwrap();
+    for sql in [
+        "CREATE EXTENSION citus",
+        "SELECT citus_set_coordinator_host('localhost', 5432)",
+        "SELECT citus_set_node_property('localhost', 5432, 'shouldhaveshards', true)",
+        "CREATE TABLE public.pub (id bigint PRIMARY KEY)",
+        "SELECT create_distributed_table('public.pub', 'id')",
+        "CREATE SCHEMA decoy",
+    ] {
+        shadow_pool.query(sql).await.unwrap();
+    }
+
+    // Name a decoy table after one of the real shards.
+    let victim = shadow_pool
+        .query(
+            "SELECT pg_catalog.shard_name(logicalrelid, shardid) \
+             FROM pg_dist_shard ORDER BY shardid LIMIT 1",
+        )
+        .await
+        .unwrap();
+    let victim = match &victim.rows[0][0] {
+        Value::Text(name) => name.clone(),
+        other => panic!("expected a shard name, got {other:?}"),
+    };
+    shadow_pool
+        .query(&format!("CREATE TABLE decoy.{victim} (id bigint)"))
+        .await
+        .unwrap();
+
+    let tables = shadow_pool.introspect().await.unwrap();
+    let decoy = tables
+        .iter()
+        .find(|t| t.schema.as_deref() == Some("decoy") && t.name == victim)
+        .expect("the decoy table should be introspected");
+    assert_eq!(
+        decoy.internal, None,
+        "a user table must not be hidden for being named like a shard"
+    );
+
+    shadow_pool.close().await;
+    pool.query(&format!("DROP DATABASE {db} WITH (FORCE)"))
+        .await
+        .unwrap();
 }
