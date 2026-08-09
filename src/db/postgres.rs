@@ -194,6 +194,23 @@ fn friendly_connect_error(err: &sqlx::Error) -> String {
         // Something answered the Postgres handshake with garbage — usually a
         // different database server (e.g. SQL Server) on that host/port.
         format!("the server doesn't appear to be Postgres — check the host and port — {msg}")
+    } else if lower.contains("unsupportedcertversion") {
+        // rustls refuses to parse an X.509 v1 certificate, so the connection
+        // dies before any `sslmode` policy gets a say — including `prefer`,
+        // which reads as "encrypt if you can" but cannot fall back once the
+        // TLS handshake has begun. libpq connects to such servers happily, so
+        // without this the failure looks like hubro being broken rather than
+        // the certificate being two decades out of date (FRE-89).
+        //
+        // Not exotic: the official `citusdata/citus` image generates exactly
+        // such a certificate on first boot. Verified that a *valid* v3
+        // self-signed certificate connects fine at both `prefer` and
+        // `require`, so this is specifically about the version, not about
+        // hubro verifying more strictly than libpq does.
+        format!(
+            "the server's TLS certificate is X.509 v1, which modern TLS libraries reject — \
+             reissue it as v3, or use sslmode=disable if the network is trusted — {msg}"
+        )
     } else if lower.contains("tls") || lower.contains("ssl") {
         format!("TLS error — {msg}")
     } else if lower.contains("connection refused")
