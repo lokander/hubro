@@ -334,7 +334,7 @@ fn percent_decode(raw: &str) -> String {
 /// passphrase fields always start empty, and an empty field on save means
 /// "keep whatever is in the keyring".
 #[derive(Debug, Clone, PartialEq)]
-pub struct EditPrefill {
+pub(crate) struct EditPrefill {
     pub name: String,
     pub host: String,
     pub port: String,
@@ -1456,6 +1456,7 @@ mod tests {
         assert!(list.remove("/tmp/a.db").is_some());
         assert!(list.entries().is_empty());
     }
+
     #[test]
     fn edit_prefill_splits_the_url_into_the_forms_fields() {
         // Postgres reads back its own option key; the user is percent-decoded
