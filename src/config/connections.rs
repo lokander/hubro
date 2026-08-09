@@ -88,10 +88,6 @@ pub enum ServerAuth {
     Entra(EntraAuth),
 }
 
-/// Deprecated alias for [`ServerAuth`], kept so existing callers compile
-/// unchanged while they migrate; new code should say `ServerAuth`.
-pub use self::ServerAuth as PgAuth;
-
 impl ServerAuth {
     /// Whether this is the default password mode — lets the config skip writing
     /// an `[…auth]` key for ordinary connections (back-compat).
@@ -281,6 +277,177 @@ impl SavedConnection {
             SavedConnection::Postgres { url, .. } | SavedConnection::SqlServer { url, .. } => {
                 url.clone()
             }
+        }
+    }
+}
+
+/// A saved connection's URL split back into the form's individual fields
+/// (FRE-75). Both backends share the `scheme://user@host:port/db?opt=…`
+/// shape, so one splitter serves both; `option_key` names the query
+/// parameter the form's own dropdown owns (`sslmode` / `encrypt`).
+struct UrlFields {
+    host: String,
+    port: String,
+    database: String,
+    user: String,
+    option: Option<String>,
+    trust_cert: bool,
+}
+
+fn split_url(url: &str, option_key: &str) -> Option<UrlFields> {
+    let parsed = url::Url::parse(url).ok()?;
+    let mut option = None;
+    let mut trust_cert = false;
+    // Query keys are compared case-insensitively: the app writes
+    // `trustServerCertificate`, and a hand-pasted URL may use any casing.
+    let option_key = option_key.to_ascii_lowercase();
+    for (key, value) in parsed.query_pairs() {
+        let key = key.to_ascii_lowercase();
+        if key == option_key {
+            option = Some(value.into_owned());
+        } else if key == "trustservercertificate" {
+            // Same spellings the SQL Server driver accepts.
+            trust_cert = matches!(value.to_ascii_lowercase().as_str(), "true" | "yes" | "1");
+        }
+    }
+    Some(UrlFields {
+        host: parsed.host_str().unwrap_or_default().to_string(),
+        port: parsed.port().map(|p| p.to_string()).unwrap_or_default(),
+        database: parsed.path().trim_start_matches('/').to_string(),
+        user: percent_decode(parsed.username()),
+        option,
+        trust_cert,
+    })
+}
+
+/// Percent-decodes a URL component back to what the user typed into the
+/// field (the url crate encodes on the way in).
+fn percent_decode(raw: &str) -> String {
+    percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| raw.to_string())
+}
+
+/// A saved entry decomposed into the connection forms' field values
+/// (FRE-75). Secrets are deliberately absent: the password and SSH
+/// passphrase fields always start empty, and an empty field on save means
+/// "keep whatever is in the keyring".
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditPrefill {
+    pub name: String,
+    pub host: String,
+    pub port: String,
+    pub database: String,
+    pub user: String,
+    /// `sslmode` for Postgres, `encrypt` for SQL Server.
+    pub option: Option<String>,
+    pub trust_cert: bool,
+    pub auth_mode: String,
+    pub entra_tenant: String,
+    pub entra_client_id: String,
+    pub tunnel: Option<TunnelConfig>,
+    pub ssh_host: String,
+    pub ssh_port: String,
+    pub ssh_user: String,
+    pub ssh_use_key: bool,
+    pub ssh_key_path: String,
+}
+
+impl Default for EditPrefill {
+    /// The add flow's starting point. Note `auth_mode`/`entra_tenant` are
+    /// the forms' real defaults rather than empty strings — the password
+    /// field only renders while `auth_mode` is "password".
+    fn default() -> Self {
+        EditPrefill {
+            name: String::new(),
+            host: String::new(),
+            port: String::new(),
+            database: String::new(),
+            user: String::new(),
+            option: None,
+            trust_cert: false,
+            auth_mode: "password".to_string(),
+            entra_tenant: "organizations".to_string(),
+            entra_client_id: String::new(),
+            tunnel: None,
+            ssh_host: String::new(),
+            ssh_port: String::new(),
+            ssh_user: String::new(),
+            ssh_use_key: false,
+            ssh_key_path: String::new(),
+        }
+    }
+}
+
+impl EditPrefill {
+    /// Decomposes a saved entry into the form's field values.
+    pub fn from_saved(saved: SavedConnection) -> Self {
+        use crate::tunnel::TunnelAuth;
+        let (name, url, tunnel, auth, option_key) = match saved {
+            SavedConnection::Postgres {
+                name,
+                url,
+                tunnel,
+                auth,
+                ..
+            } => (name, url, tunnel, auth, "sslmode"),
+            SavedConnection::SqlServer {
+                name,
+                url,
+                tunnel,
+                auth,
+                ..
+            } => (name, url, tunnel, auth, "encrypt"),
+            // SQLite entries carry only a path; they have no edit form.
+            SavedConnection::Sqlite { name, .. } => {
+                return EditPrefill {
+                    name,
+                    ..EditPrefill::default()
+                }
+            }
+        };
+        let fields = split_url(&url, option_key);
+        let (auth_mode, entra_tenant, entra_client_id) = match auth {
+            ServerAuth::Password => ("password".into(), "organizations".into(), String::new()),
+            ServerAuth::Entra(EntraAuth::Interactive { tenant, client_id }) => (
+                "entra-interactive".to_string(),
+                tenant,
+                client_id.unwrap_or_default(),
+            ),
+            ServerAuth::Entra(EntraAuth::ManagedIdentity { client_id }) => (
+                "entra-mi".to_string(),
+                "organizations".to_string(),
+                client_id.unwrap_or_default(),
+            ),
+        };
+        let (ssh_use_key, ssh_key_path) = match tunnel.as_ref().map(|t| &t.auth) {
+            Some(TunnelAuth::KeyFile { path }) => (true, path.display().to_string()),
+            _ => (false, String::new()),
+        };
+        EditPrefill {
+            name,
+            host: fields.as_ref().map(|f| f.host.clone()).unwrap_or_default(),
+            port: fields.as_ref().map(|f| f.port.clone()).unwrap_or_default(),
+            database: fields
+                .as_ref()
+                .map(|f| f.database.clone())
+                .unwrap_or_default(),
+            user: fields.as_ref().map(|f| f.user.clone()).unwrap_or_default(),
+            option: fields.as_ref().and_then(|f| f.option.clone()),
+            trust_cert: fields.as_ref().is_some_and(|f| f.trust_cert),
+            auth_mode,
+            entra_tenant,
+            entra_client_id,
+            ssh_host: tunnel.as_ref().map(|t| t.host.clone()).unwrap_or_default(),
+            ssh_port: tunnel
+                .as_ref()
+                .map(|t| t.port.to_string())
+                .unwrap_or_default(),
+            ssh_user: tunnel.as_ref().map(|t| t.user.clone()).unwrap_or_default(),
+            ssh_use_key,
+            ssh_key_path,
+            tunnel,
         }
     }
 }
@@ -1288,5 +1455,106 @@ mod tests {
         assert!(list.remove("/tmp/missing.db").is_none());
         assert!(list.remove("/tmp/a.db").is_some());
         assert!(list.entries().is_empty());
+    }
+    #[test]
+    fn edit_prefill_splits_the_url_into_the_forms_fields() {
+        // Postgres reads back its own option key; the user is percent-decoded
+        // to what was typed into the field.
+        let prefill = EditPrefill::from_saved(saved_pg(
+            "prod",
+            "postgres://a%40b.com@db.example.com:5432/app?sslmode=require",
+        ));
+        assert_eq!(prefill.name, "prod");
+        assert_eq!(prefill.host, "db.example.com");
+        assert_eq!(prefill.port, "5432");
+        assert_eq!(prefill.database, "app");
+        assert_eq!(prefill.user, "a@b.com");
+        assert_eq!(prefill.option.as_deref(), Some("require"));
+        // sslmode is not trustServerCertificate; the flag stays off.
+        assert!(!prefill.trust_cert);
+        assert_eq!(prefill.auth_mode, "password");
+
+        // SQL Server owns `encrypt`, and reads the trust flag whatever its
+        // casing — a hand-pasted URL may spell it any way.
+        let prefill = EditPrefill::from_saved(saved_ms(
+            "ms",
+            "mssql://sa@db.example.com:1433/app?encrypt=off&TRUSTSERVERCERTIFICATE=yes",
+        ));
+        assert_eq!(prefill.option.as_deref(), Some("off"));
+        assert!(prefill.trust_cert);
+
+        // An unparseable URL leaves the fields empty rather than failing: the
+        // form still opens, showing the name it does know.
+        let prefill = EditPrefill::from_saved(saved_pg("broken", "not a url"));
+        assert_eq!(prefill.name, "broken");
+        assert_eq!(prefill.host, "");
+        assert_eq!(prefill.port, "");
+    }
+
+    #[test]
+    fn edit_prefill_carries_auth_and_tunnel_settings() {
+        let entra = SavedConnection::Postgres {
+            name: "az".into(),
+            url: "postgres://you@srv.postgres.database.azure.com:5432/app".into(),
+            tunnel: Some(TunnelConfig {
+                host: "bastion".into(),
+                port: 2222,
+                user: "ops".into(),
+                auth: crate::tunnel::TunnelAuth::KeyFile {
+                    path: PathBuf::from("/home/me/.ssh/id_ed25519"),
+                },
+            }),
+            auth: ServerAuth::Entra(EntraAuth::Interactive {
+                tenant: "contoso.com".into(),
+                client_id: Some("abc-123".into()),
+            }),
+            protection: WriteProtection::Open,
+            color: None,
+        };
+        let prefill = EditPrefill::from_saved(entra);
+        assert_eq!(prefill.auth_mode, "entra-interactive");
+        assert_eq!(prefill.entra_tenant, "contoso.com");
+        assert_eq!(prefill.entra_client_id, "abc-123");
+        assert_eq!(prefill.ssh_host, "bastion");
+        assert_eq!(prefill.ssh_port, "2222");
+        assert_eq!(prefill.ssh_user, "ops");
+        assert!(prefill.ssh_use_key);
+        assert_eq!(prefill.ssh_key_path, "/home/me/.ssh/id_ed25519");
+
+        // Managed identity has no tenant of its own, so the form's default
+        // stands; an agent tunnel leaves the key-file fields empty.
+        let mi = SavedConnection::SqlServer {
+            name: "mi".into(),
+            url: "mssql://you@srv.database.windows.net:1433/app".into(),
+            tunnel: Some(TunnelConfig {
+                host: "bastion".into(),
+                port: 22,
+                user: "ops".into(),
+                auth: crate::tunnel::TunnelAuth::Agent,
+            }),
+            auth: ServerAuth::Entra(EntraAuth::ManagedIdentity { client_id: None }),
+            protection: WriteProtection::Open,
+            color: None,
+        };
+        let prefill = EditPrefill::from_saved(mi);
+        assert_eq!(prefill.auth_mode, "entra-mi");
+        assert_eq!(prefill.entra_tenant, "organizations");
+        assert_eq!(prefill.entra_client_id, "");
+        assert!(!prefill.ssh_use_key);
+        assert_eq!(prefill.ssh_key_path, "");
+    }
+
+    #[test]
+    fn a_sqlite_entry_prefills_only_its_name() {
+        // SQLite has no edit form; the conversion still has to be total.
+        let prefill = EditPrefill::from_saved(saved("local", "/tmp/a.db"));
+        assert_eq!(prefill.name, "local");
+        assert_eq!(
+            prefill,
+            EditPrefill {
+                name: "local".into(),
+                ..EditPrefill::default()
+            }
+        );
     }
 }
