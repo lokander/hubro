@@ -633,6 +633,48 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
         }
     }
 
+    // Resolved before anything below mutates the maps these read.
+    let has_extension = |name: &str| {
+        internal_schemas
+            .values()
+            .chain(internal_objects.values())
+            .any(|reason| matches!(reason, Internal::Extension(ext) if ext == name))
+    };
+    let (has_citus, has_timescale) = (has_extension("citus"), has_extension("timescaledb"));
+
+    // Citus shard tables (FRE-89). Citus normally keeps these out of
+    // `pg_class` for client queries itself, so introspection never sees them
+    // and this finds nothing — but that hiding is a *setting*
+    // (`citus.show_shards_for_app_name_prefixes`), and with it widened a
+    // 26-table database reports 290, of which 264 are shards. They are not
+    // extension members and not partitions, so nothing else here catches
+    // them.
+    //
+    // `pg_dist_shard` is the catalog Citus itself uses, and the
+    // `<table>_<shardid>` name it records is the documented shard naming —
+    // derived here rather than pattern-matched, so a user table that merely
+    // looks like a shard is untouched. Best-effort for the same reason as
+    // the Timescale labels below.
+    if has_citus {
+        let shards = sqlx::query(
+            "SELECT n.nspname AS schema_name, c.relname || '_' || s.shardid AS object_name \
+             FROM pg_dist_shard s \
+             JOIN pg_class c ON c.oid = s.logicalrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace",
+        )
+        .fetch_all(pool)
+        .await;
+        if let Ok(rows) = shards {
+            for row in &rows {
+                let schema: String = get(row, "schema_name")?;
+                let object: String = get(row, "object_name")?;
+                internal_objects
+                    .entry((schema, object))
+                    .or_insert_with(|| Internal::Extension("citus".to_string()));
+            }
+        }
+    }
+
     // Timescale's own vocabulary for objects that are otherwise ordinary
     // tables and views (FRE-88), so a hypertable reads as one instead of
     // looking like a table that mysteriously has chunks. Best-effort: these
@@ -640,10 +682,7 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
     // worth failing a whole introspection over if a future version moves
     // them, and the extension is absent on nearly every Postgres database.
     let mut kind_labels: HashMap<(String, String), String> = HashMap::new();
-    if internal_schemas
-        .values()
-        .any(|reason| matches!(reason, Internal::Extension(name) if name == "timescaledb"))
-    {
+    if has_timescale {
         let labelled = [
             (
                 "SELECT hypertable_schema AS s, hypertable_name AS n \
@@ -1569,6 +1608,18 @@ mod tests {
         let friendly = friendly_connect_error(&not_pg);
         assert!(friendly.starts_with("the server doesn't appear to be Postgres"));
         assert!(!friendly.starts_with("TLS error"));
+        // An X.509 v1 server certificate (FRE-89). rustls's own wording names
+        // neither "tls" nor "ssl", so without its own arm this would fall
+        // through to the uncategorized branch and reach the user as
+        // `UnsupportedCertVersion` — true, and useless.
+        let v1 = sqlx::Error::Protocol(
+            "error communicating with database: invalid peer certificate: \
+             Other(OtherError(UnsupportedCertVersion))"
+                .into(),
+        );
+        let friendly = friendly_connect_error(&v1);
+        assert!(friendly.contains("X.509 v1"), "{friendly}");
+        assert!(friendly.contains("sslmode=disable"), "{friendly}");
     }
 
     #[test]

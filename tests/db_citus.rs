@@ -35,9 +35,11 @@
 
 use std::collections::HashMap;
 
+use tokio::sync::Mutex;
+
 use hubro::db::{
-    apply_staged, build_fk_filter, detect_row_identity, DbPool, Filter, Internal, PageRequest,
-    RowIdentity, RowLocator, SortDir, StagedChange, TableKind, TableMeta, Value,
+    apply_staged, build_fk_filter, detect_row_identity, DbPool, ExportFormat, Filter, Internal,
+    PageRequest, RowIdentity, RowLocator, SortDir, StagedChange, TableKind, TableMeta, Value,
 };
 
 fn test_url() -> Option<String> {
@@ -50,10 +52,23 @@ fn test_url() -> Option<String> {
     }
 }
 
+/// Serializes fixture DDL across the tests in this binary.
+///
+/// Distinct table names are *not* isolation under Citus: `create_distributed_table`
+/// and `DROP TABLE` take cluster-wide locks on the `pg_dist_*` catalogs, and
+/// every reference table shares one colocation group. Run in parallel, the
+/// fixtures deadlock each other — "canceling the transaction since it was
+/// involved in a distributed deadlock" — on most runs but not all, which is
+/// the worst kind of flake. Ordinary Postgres has no equivalent, which is why
+/// no other test file in this repo needs this.
+static FIXTURE_DDL: Mutex<()> = Mutex::const_new(());
+
 /// A distributed table sharded on `id`, a reference table it points at, and a
 /// plain local table — the three shapes Citus distinguishes. Suffixed per
-/// test so the tests in this binary can run concurrently.
+/// test so each test reads and writes its own rows; the DDL that creates them
+/// is serialized by [`FIXTURE_DDL`].
 async fn fresh_cluster(pool: &DbPool, suffix: &str) -> (String, String, String) {
+    let _guard = FIXTURE_DDL.lock().await;
     let orders = format!("orders_{suffix}");
     let countries = format!("countries_{suffix}");
     let notes = format!("notes_{suffix}");
@@ -459,9 +474,27 @@ async fn v1_certificate_failure_says_what_to_do() {
     let Some(base) = url.split('?').next() else {
         return;
     };
-    let Err(err) = DbPool::open_postgres(&format!("{base}?sslmode=require")).await else {
-        eprintln!("skipping: this server has a certificate rustls accepts");
-        return;
+    let connected = DbPool::open_postgres(&format!("{base}?sslmode=require")).await;
+    let err = match connected {
+        Ok(pool) => {
+            // Someone re-certified the server, so there is no v1 failure to
+            // check. Prove the success is the benign kind before accepting
+            // it: a regression that downgraded to plaintext, or one that
+            // started accepting certificates it should reject, would also
+            // land here and would otherwise skip silently.
+            let ssl = pool
+                .query("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
+                .await
+                .unwrap();
+            assert_eq!(
+                ssl.rows[0][0],
+                Value::Integer(1),
+                "sslmode=require connected without TLS"
+            );
+            eprintln!("skipping: this server has a certificate rustls accepts");
+            return;
+        }
+        Err(err) => err,
     };
 
     let message = format!("{err}");
@@ -473,4 +506,170 @@ async fn v1_certificate_failure_says_what_to_do() {
         message.contains("sslmode=disable"),
         "the error should offer a way forward, got: {message}"
     );
+}
+
+#[tokio::test]
+async fn scripts_and_exports_span_distributed_and_reference_tables() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let (orders, countries, _) = fresh_cluster(&pool, "script").await;
+
+    // The shared Postgres suite covers scripts and exports, but only over
+    // plain local tables — pointing it at this container proves nothing about
+    // distributed ones. Citus 14 has dropped the classic restrictions on
+    // mixing reference and distributed writes in one transaction, so this is
+    // a tripwire for them coming back rather than a known-broken case.
+    //
+    // Through `begin_script_tx`, which is the script tab's real path: it
+    // pins one connection for the whole transaction. Issuing BEGIN and COMMIT
+    // as separate `pool.query` calls would scatter them across the pool and
+    // strand an open transaction holding cluster-wide Citus locks.
+    let mut tx = pool.begin_script_tx().await.unwrap();
+    tx.execute(&format!("INSERT INTO {countries} VALUES ('is', 'Iceland')"))
+        .await
+        .unwrap();
+    tx.execute(&format!(
+        "INSERT INTO {orders} (id, country, total) VALUES (90001, 'is', 1.00)"
+    ))
+    .await
+    .unwrap();
+    let updated = tx
+        .execute(&format!(
+            "UPDATE {orders} SET total = 2.00 WHERE id = 90001"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(updated, 1);
+    tx.commit().await.unwrap();
+
+    // A second transaction rolls back, and takes both tables' changes with it
+    // — the distributed write and the reference write are one unit.
+    let mut tx = pool.begin_script_tx().await.unwrap();
+    tx.execute(&format!("DELETE FROM {orders} WHERE id = 90001"))
+        .await
+        .unwrap();
+    tx.execute(&format!(
+        "INSERT INTO {countries} VALUES ('gl', 'Greenland')"
+    ))
+    .await
+    .unwrap();
+    tx.rollback().await;
+
+    let survived = pool
+        .query(&format!("SELECT count(*) FROM {orders} WHERE id = 90001"))
+        .await
+        .unwrap();
+    assert_eq!(
+        survived.rows[0][0],
+        Value::Integer(1),
+        "the rolled-back delete should not have stuck"
+    );
+    let greenland = pool
+        .query(&format!(
+            "SELECT count(*) FROM {countries} WHERE code = 'gl'"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(greenland.rows[0][0], Value::Integer(0));
+
+    // Export reads a distributed table through the same shard fan-out.
+    let mut csv = Vec::new();
+    let exported = pool
+        .export(
+            &format!("SELECT id, country, total FROM {orders} WHERE country = $1 ORDER BY id"),
+            &[Value::Text("no".into())],
+            ExportFormat::Csv,
+            &mut csv,
+        )
+        .await
+        .unwrap();
+    assert!(exported > 50, "expected the filtered rows, got {exported}");
+    let text = String::from_utf8(csv).unwrap();
+    assert!(text.starts_with("id,country,total"), "{text:.40}");
+
+    pool.query(&format!("DELETE FROM {orders} WHERE id = 90001"))
+        .await
+        .unwrap();
+    pool.query(&format!("DELETE FROM {countries} WHERE code = 'is'"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn shards_are_marked_internal_when_citus_stops_hiding_them() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+
+    // `citus.show_shards_for_app_name_prefixes` is a documented knob, and
+    // widening it puts every shard table in front of the client: a 26-table
+    // database reports 290. Shards are not extension members and not
+    // partitions, so none of FRE-88's three rules catch them — hence the
+    // `pg_dist_shard` pass this pins.
+    //
+    // The setting is per-database, so this test needs one of its own rather
+    // than changing what the sibling tests see. `DROP ... WITH (FORCE)`
+    // clears a leftover from a crashed run.
+    let _guard = FIXTURE_DDL.lock().await;
+    let db = "hubro_citus_shardvis";
+    pool.query(&format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"))
+        .await
+        .unwrap();
+    pool.query(&format!("CREATE DATABASE {db}")).await.unwrap();
+    pool.query(&format!(
+        "ALTER DATABASE {db} SET citus.show_shards_for_app_name_prefixes TO '*'"
+    ))
+    .await
+    .unwrap();
+
+    let shard_url = swap_database(&url, db);
+    let shard_pool = DbPool::open_postgres(&shard_url).await.unwrap();
+    for sql in [
+        "CREATE EXTENSION citus",
+        "SELECT citus_set_coordinator_host('localhost', 5432)",
+        "SELECT citus_set_node_property('localhost', 5432, 'shouldhaveshards', true)",
+        "CREATE TABLE visible_shards (id bigint PRIMARY KEY, v text)",
+        "SELECT create_distributed_table('visible_shards', 'id')",
+    ] {
+        shard_pool.query(sql).await.unwrap();
+    }
+
+    let tables = shard_pool.introspect().await.unwrap();
+    let shards: Vec<&TableMeta> = tables
+        .iter()
+        .filter(|t| t.name.starts_with("visible_shards_"))
+        .collect();
+    assert!(
+        shards.len() >= 8,
+        "expected the shards to be visible for this test to mean anything, got {}",
+        shards.len()
+    );
+    for shard in &shards {
+        assert_eq!(
+            shard.internal,
+            Some(Internal::Extension("citus".into())),
+            "shard {} should be hidden by default",
+            shard.name
+        );
+    }
+    // The table they shard is the user's, and stays visible.
+    assert_eq!(find(&tables, "visible_shards").internal, None);
+
+    shard_pool.close().await;
+    pool.query(&format!("DROP DATABASE {db} WITH (FORCE)"))
+        .await
+        .unwrap();
+}
+
+/// Rewrites a Postgres URL to point at a different database, preserving the
+/// query string (this suite's URLs carry `sslmode=disable`).
+fn swap_database(url: &str, database: &str) -> String {
+    let (base, query) = match url.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (url, None),
+    };
+    let root = base.rsplit_once('/').expect("a url with a database path").0;
+    match query {
+        Some(query) => format!("{root}/{database}?{query}"),
+        None => format!("{root}/{database}"),
+    }
 }
