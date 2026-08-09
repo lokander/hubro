@@ -10,41 +10,159 @@
 //! Postgres `CREATE INDEX CONCURRENTLY`), in which case it falls back to
 //! sequential autocommit and earlier statements' effects persist.
 
+use std::ops::Range;
+
 use super::caps::{self, Capabilities};
 use super::error::DbError;
 use super::page::Dialect;
 use super::registry::{DbPool, MAX_QUERY_ROWS};
 use super::value::QueryResult;
 
-/// Splits a script into individual statements on `;`, respecting:
+/// One lexed region of a SQL script. [`lex_regions`] is the single place
+/// that understands quote/comment/bracket/dollar-quote state — the statement
+/// splitter, the string/comment stripper, and the first-keyword scanner are
+/// all thin consumers of it, so a lexing edge case fixed here is fixed in
+/// all three at once (FRE-136).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegionKind {
+    /// Plain SQL: keywords, identifiers, operators, whitespace.
+    Code,
+    /// A single- or double-quoted string (`'…'`, `"…"`), quotes included.
+    /// Doubled quotes need no special casing: `'it''s'` lexes as two
+    /// adjacent String regions, which every consumer treats the same as
+    /// one.
+    String,
+    /// A line comment (`-- …`, excluding the terminating newline — the
+    /// splitter's GO line tracking must see that newline as code) or a
+    /// block comment (`/* … */`, nesting like Postgres; SQLite never nests
+    /// but treating `/*` inside a comment as nested is harmless there).
+    Comment,
+    /// A `[bracketed identifier]`, brackets included (`]]` is an escaped
+    /// `]`), so `[a;b]` or `[a--b]` never split or start comments. Only
+    /// produced for [`Dialect::SqlServer`]: SQLite also accepts
+    /// `[brackets]` as a compat quirk, but this lexer has never bracketed
+    /// them there and identifiers with `;`/`--` inside are vanishingly
+    /// rare outside T-SQL scripts — bracket lexing is deliberately SQL
+    /// Server-only, keeping SQLite/Postgres behavior unchanged.
+    Bracket,
+    /// A dollar-quoted string (`$$…$$`, `$tag$…$tag$` — Postgres),
+    /// delimiters included. A bare `$` (e.g. a `$1` parameter placeholder)
+    /// is code, not a delimiter.
+    DollarQuote,
+}
+
+/// Lexes `sql` into contiguous regions covering every byte, in order.
 ///
-/// - single- and double-quoted strings (`'…'`, `"…"`; doubled quotes stay
-///   inside naturally, since each quote char toggles the string state)
-/// - dollar-quoted strings (`$$…$$`, `$tag$…$tag$` — Postgres)
-/// - line comments (`-- …`) and block comments (`/* … */`, nesting like
-///   Postgres; SQLite never nests but treating `/*` inside a comment as
-///   nested is harmless there)
-/// - a trailing statement without a semicolon
-///
-/// On SQL Server, `[bracketed identifiers]` are lexed too: everything up to
-/// the closing `]` is identifier text (`]]` is an escaped `]`), so `[a;b]`
-/// or `[a--b]` never split or start comments. SQLite also accepts
-/// `[brackets]` as a compat quirk, but this splitter has never lexed them
-/// there and identifiers with `;`/`--` inside are vanishingly rare outside
-/// T-SQL scripts — bracket lexing is deliberately SQL Server-only, keeping
-/// SQLite/Postgres splitting unchanged.
+/// Unterminated strings, comments, brackets, and dollar quotes swallow the
+/// rest of the input as their region — the graceful degradation every
+/// consumer wants. Known limitation: Postgres `E'…'` escape-string
+/// backslash quoting is not understood (`E'\''` misparses); standard SQL
+/// doubling (`''`) is fine.
+fn lex_regions(
+    sql: &str,
+    dialect: Dialect,
+) -> impl Iterator<Item = (Range<usize>, RegionKind)> + '_ {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    std::iter::from_fn(move || {
+        if i >= bytes.len() {
+            return None;
+        }
+        let start = i;
+        if let Some((end, kind)) = region_at(sql, i, dialect) {
+            i = end;
+            return Some((start..end, kind));
+        }
+        // A code byte: extend until the next non-code region opens (or the
+        // input ends), so code comes out as maximal runs.
+        i += 1;
+        while i < bytes.len() && region_at(sql, i, dialect).is_none() {
+            i += 1;
+        }
+        Some((start..i, RegionKind::Code))
+    })
+}
+
+/// If a non-code region opens at byte `i` of `sql`, returns its end offset
+/// (one past the closing delimiter, or end of input when unterminated) and
+/// its kind.
+fn region_at(sql: &str, i: usize, dialect: Dialect) -> Option<(usize, RegionKind)> {
+    let bytes = sql.as_bytes();
+    match bytes[i] {
+        quote @ (b'\'' | b'"') => {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != quote {
+                j += 1;
+            }
+            // Past the closing quote; unterminated, the rest is the string.
+            Some(((j + 1).min(bytes.len()), RegionKind::String))
+        }
+        b'[' if dialect == Dialect::SqlServer => {
+            let mut j = i + 1;
+            while j < bytes.len() {
+                if bytes[j] == b']' {
+                    if bytes.get(j + 1) == Some(&b']') {
+                        j += 2; // escaped ]] stays inside
+                    } else {
+                        j += 1; // past the closing bracket
+                        break;
+                    }
+                } else {
+                    j += 1;
+                }
+            }
+            Some((j, RegionKind::Bracket))
+        }
+        b'-' if bytes.get(i + 1) == Some(&b'-') => {
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j] != b'\n' {
+                j += 1;
+            }
+            Some((j, RegionKind::Comment))
+        }
+        b'/' if bytes.get(i + 1) == Some(&b'*') => {
+            let mut depth = 1usize;
+            let mut j = i + 2;
+            while j < bytes.len() && depth > 0 {
+                if bytes[j] == b'/' && bytes.get(j + 1) == Some(&b'*') {
+                    depth += 1;
+                    j += 2;
+                } else if bytes[j] == b'*' && bytes.get(j + 1) == Some(&b'/') {
+                    depth -= 1;
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            Some((j, RegionKind::Comment))
+        }
+        b'$' => {
+            let open_end = dollar_tag_end(bytes, i)?;
+            let delimiter = &sql[i..open_end];
+            let end = match sql[open_end..].find(delimiter) {
+                Some(close) => open_end + close + delimiter.len(),
+                None => sql.len(), // unterminated: rest is the string
+            };
+            Some((end, RegionKind::DollarQuote))
+        }
+        _ => None, // a code byte
+    }
+}
+
+/// Splits a script into individual statements on `;`, respecting quoted
+/// strings, comments, dollar quotes, and (on SQL Server) `[bracketed
+/// identifiers]` — see [`lex_regions`] for the exact lexing rules and the
+/// known `E'…'` limitation. A trailing statement without a semicolon is
+/// kept; statements that are empty (only whitespace and/or comments) are
+/// skipped.
 ///
 /// On SQL Server, `GO` also separates statements. `GO` is a client-side
 /// batch separator (SSMS/sqlcmd), not T-SQL: it only counts when it stands
 /// alone on its own line (leading whitespace allowed), optionally followed
 /// by a repeat count — `GO 5` is treated as a plain separator with the
 /// count ignored (repeating a batch is a scripting-tool feature, not
-/// something a viewer should replay). `GO` inside strings or comments, or
-/// sharing a line with other code, never splits.
-///
-/// Statements that are empty (only whitespace and/or comments) are skipped.
-/// Known limitation: Postgres `E'…'` escape-string backslash quoting is not
-/// understood (`E'\''` misparses); standard SQL doubling (`''`) is fine.
+/// something a viewer should replay). `GO` inside strings, comments, or
+/// bracketed identifiers, or sharing a line with other code, never splits.
 pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<String> {
     let bytes = sql.as_bytes();
     let mut statements = Vec::new();
@@ -53,106 +171,54 @@ pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<String> {
     // content — comment-only statements are skipped.
     let mut significant = false;
     // Where the current line starts, for GO detection: a separator line has
-    // nothing but whitespace before the `GO`. Newlines consumed inside
-    // strings/comments deliberately do not advance this — the stale prefix
-    // then contains non-whitespace, so a `GO` on such a line never splits.
+    // nothing but whitespace before the `GO`. Newlines inside strings,
+    // comments, and brackets deliberately do not advance this — the stale
+    // prefix then contains non-whitespace (at least the region's opening
+    // delimiter), so a `GO` on such a line never splits.
     let mut line_start = 0usize;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if dialect == Dialect::SqlServer
-            && matches!(bytes[i], b'g' | b'G')
-            && bytes[line_start..i].iter().all(u8::is_ascii_whitespace)
-        {
-            if let Some(line_end) = go_line_end(bytes, i) {
-                if significant {
-                    statements.push(sql[start..i].trim().to_string());
-                }
-                start = line_end;
-                line_start = line_end;
-                significant = false;
-                i = line_end;
-                continue;
-            }
-        }
-        match bytes[i] {
-            quote @ (b'\'' | b'"') => {
+    for (range, kind) in lex_regions(sql, dialect) {
+        match kind {
+            RegionKind::String | RegionKind::Bracket | RegionKind::DollarQuote => {
                 significant = true;
-                i += 1;
-                while i < bytes.len() && bytes[i] != quote {
-                    i += 1;
-                }
-                i += 1; // past the closing quote (or end of input)
             }
-            b'[' if dialect == Dialect::SqlServer => {
-                // T-SQL bracketed identifier: `;`, `--`, `/*`, quotes, and
-                // GO-like lines inside are plain identifier text. `]]` is an
-                // escaped `]`; a single `]` closes. Unterminated at EOF, the
-                // rest is the identifier (like an unterminated string).
-                // Newlines consumed here don't advance `line_start`, so a GO
-                // on a line inside an open bracket never splits (same as
-                // strings/comments).
-                significant = true;
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b']' {
-                        if bytes.get(i + 1) == Some(&b']') {
-                            i += 2; // escaped ]] stays inside
-                        } else {
-                            i += 1; // past the closing bracket
-                            break;
+            RegionKind::Comment => {}
+            RegionKind::Code => {
+                let mut i = range.start;
+                while i < range.end {
+                    if dialect == Dialect::SqlServer
+                        && matches!(bytes[i], b'g' | b'G')
+                        && bytes[line_start..i].iter().all(u8::is_ascii_whitespace)
+                    {
+                        // A GO line is all code (nothing on it can open a
+                        // region), so `line_end` never overruns this region.
+                        if let Some(line_end) = go_line_end(bytes, i) {
+                            if significant {
+                                statements.push(sql[start..i].trim().to_string());
+                            }
+                            start = line_end;
+                            line_start = line_end;
+                            significant = false;
+                            i = line_end;
+                            continue;
                         }
-                    } else {
-                        i += 1;
                     }
-                }
-            }
-            b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
+                    match bytes[i] {
+                        b';' => {
+                            if significant {
+                                statements.push(sql[start..i].trim().to_string());
+                            }
+                            start = i + 1;
+                            significant = false;
+                        }
+                        b'\n' => line_start = i + 1,
+                        other => {
+                            if !other.is_ascii_whitespace() {
+                                significant = true;
+                            }
+                        }
+                    }
                     i += 1;
                 }
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                let mut depth = 1usize;
-                i += 2;
-                while i < bytes.len() && depth > 0 {
-                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
-                        depth += 1;
-                        i += 2;
-                    } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
-                        depth -= 1;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            b'$' => {
-                significant = true;
-                if let Some(open_end) = dollar_tag_end(bytes, i) {
-                    let delimiter = &sql[i..open_end];
-                    match sql[open_end..].find(delimiter) {
-                        Some(close) => i = open_end + close + delimiter.len(),
-                        None => i = bytes.len(), // unterminated: rest is the string
-                    }
-                } else {
-                    i += 1; // a bare '$' (e.g. a $1 parameter placeholder)
-                }
-            }
-            b';' => {
-                if significant {
-                    statements.push(sql[start..i].trim().to_string());
-                }
-                start = i + 1;
-                significant = false;
-                i += 1;
-            }
-            other => {
-                if other == b'\n' {
-                    line_start = i + 1;
-                } else if !other.is_ascii_whitespace() {
-                    significant = true;
-                }
-                i += 1;
             }
         }
     }
@@ -308,11 +374,15 @@ pub struct StatementNeeds {
 /// first keywords too: [`classify_statement`] calls them writes for
 /// dispatch, but nothing here knows they are *only* writes.
 pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
-    if !needs_confirmation(sql, dialect) {
+    // Stripped once here; every scan below works on the stripped form.
+    // Before FRE-136 each helper re-stripped the same statement, up to ~6
+    // times per capability check.
+    let stripped = strip_strings_and_comments(sql, dialect);
+    if !confirmation_needed(sql, &stripped) {
         return StatementNeeds::default();
     }
     let has = |set: &[&str]| {
-        has_top_level_word(sql, dialect, |word| {
+        has_word(&stripped, |word| {
             set.contains(&word.to_ascii_lowercase().as_str())
         })
     };
@@ -330,7 +400,7 @@ pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
         // a reason that doesn't describe it. This is only reached when no
         // write token appears anywhere in the statement, so a T-SQL
         // `BEGIN … DELETE … END` block is still charged for its DELETE.
-        if manages_own_transaction(sql, dialect) {
+        if manages_own_transaction(&stripped) {
             return StatementNeeds::default();
         }
         return StatementNeeds {
@@ -366,151 +436,94 @@ pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
 /// (`SELECT [o'brien] * INTO t2 FROM t`) must not invert string tracking
 /// and hide the `INTO`, and `SELECT [into]` must not over-prompt.
 pub fn needs_confirmation(sql: &str, dialect: Dialect) -> bool {
+    confirmation_needed(sql, &strip_strings_and_comments(sql, dialect))
+}
+
+/// [`needs_confirmation`] against an already-stripped statement, so
+/// [`statement_needs`] can strip once and share the result with its own
+/// keyword scans.
+fn confirmation_needed(sql: &str, stripped: &str) -> bool {
     if classify_statement(sql) != StatementKind::Read {
         return true;
     }
     match first_keyword(sql).to_ascii_lowercase().as_str() {
-        "with" | "explain" => has_top_level_word(sql, dialect, |word| {
+        "with" | "explain" => has_word(stripped, |word| {
             let word = word.to_ascii_lowercase();
             EMBEDDED_DML_KEYWORDS.contains(&word.as_str())
                 || EMBEDDED_DDL_KEYWORDS.contains(&word.as_str())
                 || word == "into"
         }),
-        "select" => has_top_level_word(sql, dialect, |word| word.eq_ignore_ascii_case("into")),
-        "pragma" => {
-            let code = strip_strings_and_comments(sql, dialect);
-            code.contains('=') || code.contains('(')
-        }
+        "select" => has_word(stripped, |word| word.eq_ignore_ascii_case("into")),
+        "pragma" => stripped.contains('=') || stripped.contains('('),
         _ => false,
     }
 }
 
-/// Whether any word-ish token (identifier characters) of the statement —
-/// with strings, comments, and (on SQL Server) bracketed identifiers
-/// removed — matches the predicate.
-fn has_top_level_word(sql: &str, dialect: Dialect, matches: impl Fn(&str) -> bool) -> bool {
-    strip_strings_and_comments(sql, dialect)
+/// Whether any word-ish token (identifier characters) of an
+/// already-stripped statement matches the predicate. Takes the
+/// [`strip_strings_and_comments`] output rather than stripping itself so
+/// callers that run several scans strip once, not once per scan.
+fn has_word(stripped: &str, matches: impl Fn(&str) -> bool) -> bool {
+    stripped
         .split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .any(|word| !word.is_empty() && matches(word))
 }
 
-/// The statement text with quoted strings (single, double, dollar) and
-/// comments blanked out to spaces, so token scans can't be fooled by
-/// literals like `'please do not DELETE me'`. Same lexer states as
-/// [`split_statements`], including its SQL Server-only bracket handling:
-/// `[bracketed identifiers]` are blanked like quoted identifiers (`]]` is
-/// an escaped `]`), so a quote inside one can't invert string tracking and
-/// a keyword inside one can't masquerade as a token. Brackets stay inert
-/// on SQLite/Postgres, matching the splitter.
+/// The statement text with everything [`lex_regions`] calls a non-code
+/// region — quoted strings (single, double, dollar), comments, and (on SQL
+/// Server) `[bracketed identifiers]` — blanked out to spaces, so token
+/// scans can't be fooled by literals like `'please do not DELETE me'`, a
+/// quote inside a bracketed identifier can't invert string tracking, and a
+/// keyword inside one can't masquerade as a token. Brackets stay inert on
+/// SQLite/Postgres, matching the splitter.
 fn strip_strings_and_comments(sql: &str, dialect: Dialect) -> String {
     let bytes = sql.as_bytes();
     let mut out = vec![b' '; bytes.len()];
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            quote @ (b'\'' | b'"') => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != quote {
-                    i += 1;
-                }
-                i += 1;
-            }
-            b'[' if dialect == Dialect::SqlServer => {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b']' {
-                        if bytes.get(i + 1) == Some(&b']') {
-                            i += 2; // escaped ]] stays inside
-                        } else {
-                            i += 1; // past the closing bracket
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                let mut depth = 1usize;
-                i += 2;
-                while i < bytes.len() && depth > 0 {
-                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
-                        depth += 1;
-                        i += 2;
-                    } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
-                        depth -= 1;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            b'$' => {
-                if let Some(open_end) = dollar_tag_end(bytes, i) {
-                    let delimiter = &sql[i..open_end];
-                    match sql[open_end..].find(delimiter) {
-                        Some(close) => i = open_end + close + delimiter.len(),
-                        None => i = bytes.len(),
-                    }
-                } else {
-                    out[i] = b'$';
-                    i += 1;
-                }
-            }
-            c => {
-                out[i] = c;
-                i += 1;
-            }
+    for (range, kind) in lex_regions(sql, dialect) {
+        if kind == RegionKind::Code {
+            out[range.clone()].copy_from_slice(&bytes[range]);
         }
     }
-    // Multibyte chars survive intact: the fallthrough arm copies them byte
-    // by byte across iterations, and blanked regions always start and end
-    // at ASCII delimiters (a UTF-8 continuation byte can never equal an
-    // ASCII quote/comment marker), so sequences are never split.
+    // Multibyte chars survive intact: regions always start and end at ASCII
+    // delimiters (a UTF-8 continuation byte can never equal an ASCII
+    // quote/comment marker), so a code region copied here is never split
+    // mid-sequence.
     String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The first keyword of a statement, skipping leading whitespace, comments,
-/// and opening parentheses (`(SELECT …)` is a read).
+/// and opening parentheses (`(SELECT …)` is a read). Anything else — a
+/// string, a dollar quote, a non-keyword code byte — ends the scan: a
+/// statement opening with one has no first keyword and classifies as a
+/// write, the safe side.
+///
+/// Lexes without a dialect (as SQLite) because [`classify_statement`] has
+/// none to pass, and the answer is dialect-independent anyway: a leading
+/// `[` ends the scan with an empty keyword whether it opens a bracket
+/// region or sits in code as a non-keyword byte.
 fn first_keyword(sql: &str) -> &str {
     let bytes = sql.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            c if c.is_ascii_whitespace() || c == b'(' => i += 1,
-            b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
+    for (range, kind) in lex_regions(sql, Dialect::Sqlite) {
+        match kind {
+            RegionKind::Comment => {}
+            RegionKind::Code => {
+                let mut i = range.start;
+                while i < range.end && (bytes[i].is_ascii_whitespace() || bytes[i] == b'(') {
                     i += 1;
                 }
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                let mut depth = 1usize;
-                i += 2;
-                while i < bytes.len() && depth > 0 {
-                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
-                        depth += 1;
-                        i += 2;
-                    } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
-                        depth -= 1;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
+                if i == range.end {
+                    continue; // nothing but whitespace/parens: keep looking
                 }
+                let start = i;
+                while i < range.end && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                return &sql[start..i];
             }
-            _ => break,
+            _ => return "",
         }
     }
-    let start = i;
-    while i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
-        i += 1;
-    }
-    &sql[start..i]
+    ""
 }
 
 /// Maximum characters in a statement preview.
@@ -771,22 +784,27 @@ async fn run_script_atomic(
 pub fn wrap_atomically(caps: Capabilities, dialect: Dialect, statements: &[String]) -> bool {
     caps.transactions
         && statements.len() > 1
-        && !statements
-            .iter()
-            .any(|s| manages_own_transaction(s, dialect) || is_non_transactional(dialect, s))
+        && !statements.iter().any(|s| {
+            // Stripped once per statement: both checks only need the
+            // stripped form (FRE-136).
+            let stripped = strip_strings_and_comments(s, dialect);
+            manages_own_transaction(&stripped) || is_non_transactional(dialect, &stripped)
+        })
 }
 
-/// Whether a statement issues its own transaction control, so the script is
-/// managing atomicity itself and must not be wrapped again.
-fn manages_own_transaction(sql: &str, dialect: Dialect) -> bool {
+/// Whether an already-stripped statement issues its own transaction
+/// control, so the script is managing atomicity itself and must not be
+/// wrapped again.
+fn manages_own_transaction(stripped: &str) -> bool {
     matches!(
-        leading_words(sql, dialect, 1).first().map(String::as_str),
+        leading_words(stripped, 1).first().map(String::as_str),
         Some("begin" | "start" | "commit" | "rollback" | "savepoint" | "release" | "end")
     )
 }
 
-/// Whether a statement can't run (or won't take effect) inside a transaction
-/// block, so the script must run sequentially instead of wrapped. `VACUUM`
+/// Whether an already-stripped statement can't run (or won't take effect)
+/// inside a transaction block, so the script must run sequentially instead
+/// of wrapped. `VACUUM`
 /// applies to SQLite and Postgres alike (and doesn't exist elsewhere, so the
 /// unconditional check is harmless); SQLite value-setting `PRAGMA`s are
 /// *silently ignored* in a transaction (worse than erroring — they'd vanish
@@ -794,8 +812,8 @@ fn manages_own_transaction(sql: &str, dialect: Dialect) -> bool {
 /// transaction block"; the SQL Server set covers server-level operations
 /// T-SQL refuses inside a user transaction (`CREATE`/`ALTER`/`DROP
 /// DATABASE`, `BACKUP`, `RESTORE`, full-text DDL).
-fn is_non_transactional(dialect: Dialect, sql: &str) -> bool {
-    let words = leading_words(sql, dialect, 2);
+fn is_non_transactional(dialect: Dialect, stripped: &str) -> bool {
+    let words = leading_words(stripped, 2);
     let first = words.first().map(String::as_str).unwrap_or("");
     let second = words.get(1).map(String::as_str).unwrap_or("");
     if first == "vacuum" {
@@ -806,8 +824,7 @@ fn is_non_transactional(dialect: Dialect, sql: &str) -> bool {
         // transaction; keep the script sequential so it actually applies. This
         // over-declines call-form read PRAGMAs (`PRAGMA table_info(t)`), but
         // running those sequentially is harmless. Mirrors `needs_confirmation`.
-        let code = strip_strings_and_comments(sql, dialect);
-        if code.contains('=') || code.contains('(') {
+        if stripped.contains('=') || stripped.contains('(') {
             return true;
         }
     }
@@ -821,9 +838,7 @@ fn is_non_transactional(dialect: Dialect, sql: &str) -> bool {
             return true;
         }
         // CREATE/DROP INDEX CONCURRENTLY, REINDEX … CONCURRENTLY.
-        if has_top_level_word(sql, dialect, |word| {
-            word.eq_ignore_ascii_case("concurrently")
-        }) {
+        if has_word(stripped, |word| word.eq_ignore_ascii_case("concurrently")) {
             return true;
         }
     }
@@ -840,11 +855,11 @@ fn is_non_transactional(dialect: Dialect, sql: &str) -> bool {
     false
 }
 
-/// The first `n` word tokens of a statement (lowercased), with strings and
-/// comments removed so a leading comment or quoted text can't masquerade as a
-/// keyword.
-fn leading_words(sql: &str, dialect: Dialect, n: usize) -> Vec<String> {
-    strip_strings_and_comments(sql, dialect)
+/// The first `n` word tokens of an already-stripped statement (lowercased).
+/// Working on [`strip_strings_and_comments`] output means a leading comment
+/// or quoted text can't masquerade as a keyword.
+fn leading_words(stripped: &str, n: usize) -> Vec<String> {
+    stripped
         .split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .filter(|word| !word.is_empty())
         .take(n)
@@ -1511,6 +1526,74 @@ mod tests {
         // On other dialects brackets are plain text and stay in place.
         let stripped = strip_strings_and_comments("SELECT [into] FROM t", Dialect::Postgres);
         assert!(stripped.contains("[into]"));
+    }
+
+    /// The lexed regions of `sql` as text slices, for asserting on directly.
+    fn regions(sql: &str, dialect: Dialect) -> Vec<(&str, RegionKind)> {
+        lex_regions(sql, dialect)
+            .map(|(range, kind)| (&sql[range], kind))
+            .collect()
+    }
+
+    #[test]
+    fn lexer_covers_every_byte_in_order() {
+        use RegionKind::*;
+        assert_eq!(
+            regions("SELECT 'a;b' -- c\n/* d */ $t$e$t$ $1", Dialect::Postgres),
+            [
+                ("SELECT ", Code),
+                ("'a;b'", String),
+                (" ", Code),
+                ("-- c", Comment), // the newline is code, for GO line tracking
+                ("\n", Code),
+                ("/* d */", Comment),
+                (" ", Code),
+                ("$t$e$t$", DollarQuote),
+                (" $1", Code), // a parameter placeholder is not a delimiter
+            ]
+        );
+    }
+
+    #[test]
+    fn lexer_brackets_are_sqlserver_only() {
+        use RegionKind::*;
+        assert_eq!(
+            regions("SELECT [a]]b] x", Dialect::SqlServer),
+            [("SELECT ", Code), ("[a]]b]", Bracket), (" x", Code)]
+        );
+        assert_eq!(
+            regions("SELECT [a]]b] x", Dialect::Postgres),
+            [("SELECT [a]]b] x", Code)]
+        );
+    }
+
+    #[test]
+    fn lexer_doubled_quotes_lex_as_adjacent_strings() {
+        use RegionKind::*;
+        assert_eq!(
+            regions("'it''s'", Dialect::Sqlite),
+            [("'it'", String), ("'s'", String)]
+        );
+    }
+
+    #[test]
+    fn lexer_unterminated_regions_swallow_the_rest() {
+        use RegionKind::*;
+        for (sql, kind) in [
+            ("SELECT 'a; b", String),
+            ("SELECT /* a /* b */ c", Comment), // unbalanced nesting
+            ("SELECT $$a; b", DollarQuote),
+        ] {
+            assert_eq!(
+                regions(sql, Dialect::Postgres),
+                [("SELECT ", Code), (&sql[7..], kind)],
+                "{sql:?}"
+            );
+        }
+        assert_eq!(
+            regions("SELECT [a; b", Dialect::SqlServer),
+            [("SELECT ", Code), ("[a; b", Bracket)]
+        );
     }
 
     #[test]
