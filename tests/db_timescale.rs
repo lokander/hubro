@@ -482,17 +482,25 @@ async fn an_extensions_table_in_an_ordinary_schema_is_still_internal() {
     pool.query("CREATE EXTENSION IF NOT EXISTS pg_buffercache")
         .await
         .unwrap();
+    // This test's own table in the same schema, so the contrast below rests
+    // on a table this test created rather than on whatever a sibling test
+    // happened to leave behind — the tests in this binary run concurrently
+    // against one database, and each must also pass run on its own.
+    pool.query("DROP TABLE IF EXISTS ext_neighbour")
+        .await
+        .unwrap();
+    pool.query("CREATE TABLE ext_neighbour (id int PRIMARY KEY)")
+        .await
+        .unwrap();
 
     let tables = pool.introspect().await.unwrap();
-    let view = find(&tables, "pg_buffercache");
     assert_eq!(
-        view.internal,
+        find(&tables, "pg_buffercache").internal,
         Some(Internal::Extension("pg_buffercache".into()))
     );
+    // ...while the user's own table in that same schema stays the user's.
+    assert_eq!(find(&tables, "ext_neighbour").internal, None);
 
-    // ...while `public` itself is untouched: the user's tables in the same
-    // schema stay the user's.
-    assert!(tables
-        .iter()
-        .any(|t| t.schema.as_deref() == Some("public") && t.internal.is_none()));
+    pool.query("DROP TABLE ext_neighbour").await.unwrap();
+    pool.query("DROP EXTENSION pg_buffercache").await.unwrap();
 }

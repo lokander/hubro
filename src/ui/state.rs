@@ -581,8 +581,9 @@ pub struct AppState {
     /// `theme` and — for `System` — a one-time startup read of the OS
     /// preference. Root-scoped: written from the startup detection task.
     pub dark: Signal<bool>,
-    /// Whether the schema sidebar lists extension-owned schemas (FRE-88).
-    /// Persisted by [`Self::set_show_internal_objects`]; global rather than
+    /// Whether the schema sidebar lists the objects a backend declared
+    /// internal (FRE-88). Persisted by
+    /// [`Self::set_show_internal_objects`]; global rather than
     /// per-connection, since it expresses what the user wants to look at
     /// rather than anything about one database.
     pub show_internal_objects: Signal<bool>,
@@ -677,9 +678,11 @@ impl AppState {
             // the startup detection task (below) corrects `System`. Root-
             // scoped: written from that spawn_forever task.
             dark: Signal::new_in_scope(theme.resolve_dark(false), ScopeId::ROOT),
-            // Component-scoped, unlike its neighbours: only the sidebar and
-            // the completion namespace read it, and its setter writes it
-            // before spawning, so no root-scoped task ever touches it.
+            // Component-scoped, unlike its neighbours: only the sidebar
+            // reads it, and its setter writes it before spawning, so no
+            // root-scoped task ever touches it. (The completion namespace
+            // demotes internal objects unconditionally, so it never reads
+            // this at all.)
             show_internal_objects: Signal::new(settings.show_internal_objects),
             // Root-scoped: resolved from the Entra sign-in task, which
             // outlives the form that registered the edit.
@@ -2465,8 +2468,9 @@ impl AppState {
         });
     }
 
-    /// Shows or hides extension-owned schemas in the sidebar (FRE-88) and
-    /// persists the choice, best-effort like [`Self::set_theme`].
+    /// Shows or hides the database's own internal objects in the sidebar
+    /// (FRE-88) and persists the choice, best-effort like
+    /// [`Self::set_theme`].
     pub fn set_show_internal_objects(mut self, show: bool) {
         self.show_internal_objects.set(show);
         let Some(path) = default_settings_path() else {
