@@ -650,14 +650,19 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
     // extension members and not partitions, so nothing else here catches
     // them.
     //
-    // `pg_dist_shard` is the catalog Citus itself uses, and the
-    // `<table>_<shardid>` name it records is the documented shard naming —
-    // derived here rather than pattern-matched, so a user table that merely
-    // looks like a shard is untouched. Best-effort for the same reason as
-    // the Timescale labels below.
+    // `pg_dist_shard` is the catalog Citus itself uses, and `shard_name()` is
+    // Citus's own function for turning a row of it into a table name — asking
+    // it beats reproducing the rule, which is not the plain
+    // `<table>_<shardid>` it looks like: Citus hashes and truncates once that
+    // would exceed NAMEDATALEN, so a 63-character table shards into
+    // `..._nam_01ae35b2_102008`. Either way the name comes from the catalog
+    // rather than a pattern, so a user table that merely looks like a shard is
+    // untouched. Best-effort for the same reason as the Timescale labels
+    // below.
     if has_citus {
         let shards = sqlx::query(
-            "SELECT n.nspname AS schema_name, c.relname || '_' || s.shardid AS object_name \
+            "SELECT n.nspname AS schema_name, \
+                    pg_catalog.shard_name(s.logicalrelid, s.shardid) AS object_name \
              FROM pg_dist_shard s \
              JOIN pg_class c ON c.oid = s.logicalrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace",
@@ -668,9 +673,10 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
             for row in &rows {
                 let schema: String = get(row, "schema_name")?;
                 let object: String = get(row, "object_name")?;
-                internal_objects
-                    .entry((schema, object))
-                    .or_insert_with(|| Internal::Extension("citus".to_string()));
+                // Same precedence as the branches above: naming the extension
+                // beats naming the shape, so a shard that is also a partition
+                // reports the extension rather than disagreeing with them.
+                internal_objects.insert((schema, object), Internal::Extension("citus".to_string()));
             }
         }
     }
