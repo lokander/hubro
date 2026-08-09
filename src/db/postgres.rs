@@ -651,21 +651,32 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
     // them.
     //
     // `pg_dist_shard` is the catalog Citus itself uses, and `shard_name()` is
-    // Citus's own function for turning a row of it into a table name — asking
-    // it beats reproducing the rule, which is not the plain
-    // `<table>_<shardid>` it looks like: Citus hashes and truncates once that
-    // would exceed NAMEDATALEN, so a 63-character table shards into
-    // `..._nam_01ae35b2_102008`. Either way the name comes from the catalog
-    // rather than a pattern, so a user table that merely looks like a shard is
-    // untouched. Best-effort for the same reason as the Timescale labels
-    // below.
+    // Citus's own function for naming a row of it — asking beats reproducing
+    // the rule, which is not the plain `<table>_<shardid>` it looks like:
+    // Citus hashes and truncates once that would exceed NAMEDATALEN, so a
+    // 63-character table shards into `..._01ae35b2_102008`.
+    //
+    // Its answer is then resolved back to a real `pg_class` row rather than
+    // used as a name, because `shard_name()` qualifies anything outside the
+    // search path — a shard in a `sales` schema comes back as
+    // `sales.orders_102008`, which matches no `relname` anywhere. Resolving
+    // it yields the schema and the bare name the caller actually needs, and
+    // means no string is ever parsed.
+    //
+    // `to_regclass` rather than a `::regclass` cast: the cast *raises* on a
+    // name it cannot resolve, and a multi-node coordinator's `pg_dist_shard`
+    // lists shards that live on workers with no local relation. The cast
+    // would error, the `if let Ok` below would swallow it, and nothing at all
+    // would be marked; `to_regclass` returns NULL and the join drops the row.
+    // Best-effort for the same reason as the Timescale labels below.
     if has_citus {
         let shards = sqlx::query(
-            "SELECT n.nspname AS schema_name, \
-                    pg_catalog.shard_name(s.logicalrelid, s.shardid) AS object_name \
+            "SELECT sn.nspname AS schema_name, sc.relname AS object_name \
              FROM pg_dist_shard s \
-             JOIN pg_class c ON c.oid = s.logicalrelid \
-             JOIN pg_namespace n ON n.oid = c.relnamespace",
+             JOIN pg_class sc \
+               ON sc.oid = pg_catalog.to_regclass( \
+                    pg_catalog.shard_name(s.logicalrelid, s.shardid)) \
+             JOIN pg_namespace sn ON sn.oid = sc.relnamespace",
         )
         .fetch_all(pool)
         .await;

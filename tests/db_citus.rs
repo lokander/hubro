@@ -625,23 +625,36 @@ async fn shards_are_marked_internal_when_citus_stops_hiding_them() {
 
     let shard_url = swap_database(&url, db);
     let shard_pool = DbPool::open_postgres(&shard_url).await.unwrap();
+    // Three shapes that each broke a different draft of the shard rule: a
+    // plain table in `public`, one in a schema outside the search path
+    // (`shard_name()` qualifies those, so its answer is not a bare relname),
+    // and one whose name is long enough that Citus hashes and truncates the
+    // shard names instead of appending to them.
+    let long_name = format!("t_{}", "x".repeat(60));
     for sql in [
-        "CREATE EXTENSION citus",
-        "SELECT citus_set_coordinator_host('localhost', 5432)",
-        "SELECT citus_set_node_property('localhost', 5432, 'shouldhaveshards', true)",
-        "CREATE TABLE visible_shards (id bigint PRIMARY KEY, v text)",
-        "SELECT create_distributed_table('visible_shards', 'id')",
+        "CREATE EXTENSION citus".to_string(),
+        "SELECT citus_set_coordinator_host('localhost', 5432)".to_string(),
+        "SELECT citus_set_node_property('localhost', 5432, 'shouldhaveshards', true)".to_string(),
+        "CREATE TABLE visible_shards (id bigint PRIMARY KEY, v text)".to_string(),
+        "SELECT create_distributed_table('visible_shards', 'id')".to_string(),
+        "CREATE SCHEMA sales".to_string(),
+        "CREATE TABLE sales.orders (id bigint PRIMARY KEY)".to_string(),
+        "SELECT create_distributed_table('sales.orders', 'id')".to_string(),
+        format!("CREATE TABLE {long_name} (id bigint PRIMARY KEY)"),
+        format!("SELECT create_distributed_table('{long_name}', 'id')"),
     ] {
-        shard_pool.query(sql).await.unwrap();
+        shard_pool.query(&sql).await.unwrap();
     }
 
     let tables = shard_pool.introspect().await.unwrap();
+    let parents = ["visible_shards", "orders", long_name.as_str()];
     let shards: Vec<&TableMeta> = tables
         .iter()
-        .filter(|t| t.name.starts_with("visible_shards_"))
+        .filter(|t| !parents.contains(&t.name.as_str()))
+        .filter(|t| t.schema.as_deref() == Some("public") || t.schema.as_deref() == Some("sales"))
         .collect();
     assert!(
-        shards.len() >= 8,
+        shards.len() >= 24,
         "expected the shards to be visible for this test to mean anything, got {}",
         shards.len()
     );
@@ -649,12 +662,25 @@ async fn shards_are_marked_internal_when_citus_stops_hiding_them() {
         assert_eq!(
             shard.internal,
             Some(Internal::Extension("citus".into())),
-            "shard {} should be hidden by default",
+            "shard {:?}.{} should be hidden by default",
+            shard.schema,
             shard.name
         );
     }
-    // The table they shard is the user's, and stays visible.
-    assert_eq!(find(&tables, "visible_shards").internal, None);
+    // Shards outside `public` are the case a bare-name rule misses entirely.
+    assert!(
+        shards.iter().any(|t| t.schema.as_deref() == Some("sales")),
+        "the sales-schema shards should be among them"
+    );
+
+    // The tables they shard are the user's, and stay visible.
+    for parent in parents {
+        let meta = tables
+            .iter()
+            .find(|t| t.name == parent)
+            .unwrap_or_else(|| panic!("{parent} missing"));
+        assert_eq!(meta.internal, None, "{parent} is the user's table");
+    }
 
     shard_pool.close().await;
     pool.query(&format!("DROP DATABASE {db} WITH (FORCE)"))
