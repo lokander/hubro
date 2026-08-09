@@ -510,9 +510,10 @@ pub struct AppState {
     /// Per-table grid refresh nonce, keyed by (connection,
     /// [`TableRef::key`]). Lifted out of the grid component so a successful
     /// save can force a refetch; the grid's Refresh button bumps it too.
-    /// (The grid's resource reads the whole map, so a bump for one table
-    /// re-runs any mounted grid's fetch — harmless, since only the selected
-    /// table's grid is mounted.)
+    /// (Signal subscription is per-signal, so any write here wakes every
+    /// mounted grid's readers — the grid therefore reads its own entry
+    /// through a PartialEq-gated memo, and only the bumped table's grid
+    /// actually resets/refetches; FRE-129.)
     pub grid_refresh: Signal<HashMap<(ConnectionId, String), u64>>,
     /// Two-step unsaved-changes guard. Navigating away from staged edits
     /// (selecting another table, switching panes, closing the tab) does not
