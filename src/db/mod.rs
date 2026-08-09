@@ -6,13 +6,20 @@
 //! `DbPool` futures inside `use_resource`/spawned tasks and store the
 //! resulting values in signals — never hold a signal borrow across an await.
 //!
-//! Result contract, identical on every backend (FRE-138): a query that
-//! returns no rows still returns its columns, so an empty `SELECT` shows its
-//! headers instead of a blank pane. SQL Server gets them from TDS metadata;
-//! the sqlx backends have no row to read them off and describe the statement
-//! instead (see [`sqlx_common::fill_headers`]). A statement with no result set
-//! at all — a `DROP TABLE` routed through the query path — legitimately
-//! reports no columns; that is the only empty-column case left.
+//! Result contract, identical on every backend (FRE-138): a *user-facing*
+//! query that returns no rows still returns its columns, so an empty `SELECT`
+//! shows its headers instead of a blank pane. SQL Server gets them from TDS
+//! metadata; the sqlx backends have no row to read them off and describe the
+//! statement instead (see [`sqlx_common::fill_headers`]). A statement with no
+//! result set at all — a `DROP TABLE` routed through the query path —
+//! legitimately reports no columns.
+//!
+//! "User-facing" is the whole scope of that describe: [`DbPool::query`] and
+//! [`DbPool::query_capped`], the two entry points that hand a result straight
+//! to the grid. The internal reads (page fetch, cell fetch, DDL catalog
+//! queries) build their own projection and so already know their columns, so
+//! paying a round trip to recover headers nobody reads would be pure cost —
+//! double on Postgres, whose `describe` also issues a `pg_attribute` query.
 
 mod caps;
 mod clipboard;

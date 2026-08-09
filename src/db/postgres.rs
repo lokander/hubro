@@ -149,16 +149,28 @@ fn bind_params<'q>(mut query: PgQuery<'q>, params: &[Value]) -> PgQuery<'q> {
     query
 }
 
+/// Runs an arbitrary query, decoding every cell into the backend-neutral
+/// [`Value`] model. Free-form SQL whose result is shown to the user, so a
+/// zero-row result recovers its headers (FRE-138).
+pub async fn query(pool: &PgPool, sql: &str) -> Result<QueryResult, DbError> {
+    let mut result = query_with(pool, sql, &[]).await?;
+    sqlx_common::fill_headers(&mut result, pool, sql).await;
+    Ok(result)
+}
+
+/// Like [`query`], with bound parameters.
+///
+/// No header recovery on a zero-row result here — see
+/// [`super::sqlite::query_with`] for why the projection-built callers skip it.
+/// It costs more on this backend: sqlx's Postgres `describe` issues a second
+/// `pg_attribute` query whose result would be discarded with the rest.
 pub async fn query_with(
     pool: &PgPool,
     sql: &str,
     params: &[Value],
 ) -> Result<QueryResult, DbError> {
     let stream = bind_params(sqlx::query(sql), params).fetch(pool);
-    let mut result =
-        sqlx_common::collect_all(stream, decode_value, |e| query_error(e, sql)).await?;
-    sqlx_common::fill_headers(&mut result, pool, sql).await;
-    Ok(result)
+    sqlx_common::collect_all(stream, decode_value, |e| query_error(e, sql)).await
 }
 
 /// Streams `sql` one row at a time (`fetch`, not `fetch_all`), decoding and
