@@ -542,9 +542,15 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // of the 100-row page. Deriving it in the render body re-ran it on every
     // arrow key, shift-click, copy and checkbox tick, because the render also
     // reads `focused_cell`, `selection`, `copy_status` and `selected`. Behind
-    // a memo it re-runs only when the page, the stage or the table's resolved
-    // access actually change; a focus move then costs the two `GridRow` diffs
-    // it should.
+    // a memo none of those reach it: a focus move now costs the two `GridRow`
+    // diffs it should.
+    //
+    // It is not fully insulated, and doesn't need to be. `schemas`, `registry`
+    // and `stages` are whole-map signals, so this still re-runs on an
+    // unrelated connection's schema load or save — as the render body always
+    // did. What changed is that the PartialEq gate below stops such a rebuild
+    // from reaching the rows, so the cost is one derivation rather than a
+    // re-render of the grid.
     let page_table = table.clone();
     let page_view = use_memo(move || {
         let meta = render_meta();
@@ -1762,9 +1768,21 @@ fn selectable_rows(rows: &[RowView]) -> Vec<(String, RowLocator)> {
 /// the click handler address rows by, so they must survive the slicing.
 ///
 /// Only these rows are cloned out of the [`PageView`] memo (FRE-130); the rest
-/// of the page is never copied per render. `start`/`end` are clamped by the
-/// caller against the page length.
+/// of the page is never copied per render.
+///
+/// `start..end` must be a valid range into `rows`. It is: it comes from
+/// [`compute_visible_range`], which clamps `end` to the row count it was given
+/// and can never return `end < start`, and the caller clamps both against the
+/// rendered page's length again. The assert names that dependency instead of
+/// leaving it to be rediscovered — the slice runs in the render path, so a
+/// later change to `compute_visible_range` that broke the invariant would take
+/// the grid down with it.
 fn window_rows(rows: &[RowView], start: usize, end: usize) -> Vec<(usize, RowView)> {
+    debug_assert!(
+        start <= end && end <= rows.len(),
+        "visible range {start}..{end} is not a window into {} rows",
+        rows.len(),
+    );
     rows[start..end]
         .iter()
         .cloned()
