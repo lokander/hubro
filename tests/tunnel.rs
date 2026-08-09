@@ -130,7 +130,7 @@ async fn postgres_connects_end_to_end_through_the_tunnel() {
         .await
         .expect("tunnel should open");
     // The saved URL points at the logical host; the connect goes through the
-    // forwarded local port, exactly like AppState::connect_postgres does it.
+    // forwarded local port, exactly like AppState::connect_server does it.
     let url = format!(
         "postgres://tester:testpass@127.0.0.1:{}/demo",
         tunnel.local_port()
@@ -144,9 +144,9 @@ async fn postgres_connects_end_to_end_through_the_tunnel() {
 }
 
 /// The SQL Server mirror of the end-to-end test above (FRE-58), exercising the
-/// exact glue `AppState::connect_sqlserver` uses: the logical URL is rewritten
-/// through the forwarded local port, and the driver gets the original hostname
-/// as its TLS server name while dialing 127.0.0.1. Needs the
+/// exact glue `AppState::connect_server` uses on SQL Server: the logical URL
+/// is rewritten through the forwarded local port, and the driver gets the
+/// original hostname as its TLS server name while dialing 127.0.0.1. Needs the
 /// `hubro-mssql-test` container (see the file header); skipped unless
 /// `HUBRO_SSH_TEST_MSSQL_PASSWORD` is set.
 #[tokio::test]
