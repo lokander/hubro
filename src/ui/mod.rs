@@ -1,6 +1,7 @@
 //! UI components. `App` is the root; `main.rs` only configures the window
 //! and launches it.
 
+mod connections;
 pub mod editing;
 mod editor;
 mod filter;

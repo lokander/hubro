@@ -10,8 +10,8 @@ use crate::azure::{self, EntraAuth};
 use crate::config::{
     default_config_path, default_session_path, default_settings_path, load_session, load_settings,
     plan_session_restore, save_session, save_show_internal_objects, save_theme, BackendKind,
-    ConnectionColor, PgAuth, RestoreCandidate, SavedConnection, SavedList, Session, SessionPane,
-    SessionTab, Theme,
+    ConnectionColor, RestoreCandidate, SavedConnection, SavedList, ServerAuth, Session,
+    SessionPane, SessionTab, Theme,
 };
 use crate::db::{
     apply_staged, build_fk_filter, mssql_url_target, mssql_url_via_local_port,
@@ -334,7 +334,7 @@ pub struct PasswordPrompt {
     pub tunnel: Option<TunnelConfig>,
     /// Auth mode of the attempt, carried through so the retry (e.g. after an
     /// SSH passphrase) resumes the same Entra/password flow.
-    pub auth: PgAuth,
+    pub auth: ServerAuth,
 }
 
 /// A pending host-key trust decision for a tunneled Postgres or SQL Server
@@ -349,7 +349,7 @@ pub struct HostKeyPrompt {
     /// The offered key: what to display and, on trust, what to persist.
     pub info: HostKeyInfo,
     /// Auth mode of the attempt, carried through so the retry resumes it.
-    pub auth: PgAuth,
+    pub auth: ServerAuth,
     /// Which backend the retry must reconnect with.
     pub backend: BackendKind,
 }
@@ -606,7 +606,7 @@ impl ServerBackend {
         name: &str,
         url: &str,
         tunnel: Option<TunnelConfig>,
-        auth: PgAuth,
+        auth: ServerAuth,
     ) -> SavedConnection {
         let name = name.to_string();
         let url = url.to_string();
@@ -1224,7 +1224,7 @@ impl AppState {
         url: String,
         name: String,
         tunnel: Option<TunnelConfig>,
-        auth: PgAuth,
+        auth: ServerAuth,
     ) {
         self.connect_error.set(None);
         if self.focus_or_reserve(&url) {
@@ -1241,7 +1241,7 @@ impl AppState {
         };
         let tls_host = backend.tls_host(&url, tunnel.is_some());
         match auth {
-            PgAuth::Entra(entra) => {
+            ServerAuth::Entra(entra) => {
                 let pending = EntraPrompt {
                     url,
                     name,
@@ -1253,7 +1253,7 @@ impl AppState {
                     .await;
                 return;
             }
-            PgAuth::Password => {}
+            ServerAuth::Password => {}
         }
         // Session memory first, then the OS keyring. The keyring call runs
         // off-thread (a locked wallet can block on a user dialog) and only
@@ -1290,12 +1290,12 @@ impl AppState {
                     kind: PromptKind::DbPassword,
                     backend: backend.kind,
                     tunnel,
-                    auth: PgAuth::Password,
+                    auth: ServerAuth::Password,
                 }));
             }
             result => {
                 self.finish_connect(url.clone(), name.clone(), result, live_tunnel);
-                self.save_server_if_open(backend, &url, &name, tunnel, PgAuth::Password);
+                self.save_server_if_open(backend, &url, &name, tunnel, ServerAuth::Password);
             }
         }
     }
@@ -1384,7 +1384,7 @@ impl AppState {
             if let Some(refresh) = token.refresh_token {
                 let _ = crate::secrets::store_password_async(entra_secret_key(&url), refresh).await;
             }
-            self.save_server_if_open(backend, &url, &name, tunnel, PgAuth::Entra(entra));
+            self.save_server_if_open(backend, &url, &name, tunnel, ServerAuth::Entra(entra));
         }
     }
 
@@ -1405,7 +1405,7 @@ impl AppState {
                 &prompt.url,
                 &prompt.name,
                 &prompt.tunnel,
-                &PgAuth::Entra(prompt.entra.clone()),
+                &ServerAuth::Entra(prompt.entra.clone()),
                 backend,
             )
             .await
@@ -1463,11 +1463,11 @@ impl AppState {
             // below never fires. An edit still has to land —
             // save_server_if_open no-ops unless the locator is genuinely open
             // (FRE-75).
-            self.save_server_if_open(backend, &url, &name, tunnel.clone(), PgAuth::Password);
+            self.save_server_if_open(backend, &url, &name, tunnel.clone(), ServerAuth::Password);
             return;
         }
         let Some((connect_url, live_tunnel)) = self
-            .open_tunnel(&url, &name, &tunnel, &PgAuth::Password, backend)
+            .open_tunnel(&url, &name, &tunnel, &ServerAuth::Password, backend)
             .await
         else {
             return;
@@ -1498,7 +1498,7 @@ impl AppState {
             self.password_prompt.set(None);
         }
         self.finish_connect(url.clone(), name.clone(), result, live_tunnel);
-        self.save_server_if_open(backend, &url, &name, tunnel, PgAuth::Password);
+        self.save_server_if_open(backend, &url, &name, tunnel, ServerAuth::Password);
     }
 
     /// Completes the SSH-passphrase prompt: remembers the passphrase for the
@@ -1553,7 +1553,7 @@ impl AppState {
         url: &str,
         name: &str,
         tunnel: Option<TunnelConfig>,
-        auth: PgAuth,
+        auth: ServerAuth,
     ) {
         let is_open = self.open_locators.read().iter().any(|(_, l)| l == url);
         if is_open {
@@ -1646,7 +1646,7 @@ impl AppState {
         url: &str,
         name: &str,
         tunnel: &Option<TunnelConfig>,
-        auth: &PgAuth,
+        auth: &ServerAuth,
         backend: ServerBackend,
     ) -> Option<(String, Option<Tunnel>)> {
         let Some(config) = tunnel else {
@@ -1749,7 +1749,7 @@ impl AppState {
         name: String,
         backend: BackendKind,
         tunnel: Option<TunnelConfig>,
-        auth: PgAuth,
+        auth: ServerAuth,
         focus: bool,
     ) {
         // SQLite reserves under the canonicalized path, so key on that or the
@@ -3320,7 +3320,7 @@ impl AppState {
                 _ => None,
             });
             let ready = match auth {
-                Some(PgAuth::Entra(entra)) => {
+                Some(ServerAuth::Entra(entra)) => {
                     let has_refresh =
                         crate::secrets::get_password_async(entra_secret_key(&candidate.locator))
                             .await
@@ -3783,7 +3783,7 @@ mod tests {
             "prod",
             "postgres://u@h:5432/db",
             tunnel.clone(),
-            PgAuth::Password,
+            ServerAuth::Password,
         );
         assert!(matches!(pg, SavedConnection::Postgres { .. }));
         assert_eq!(pg.backend(), BackendKind::Postgres);
@@ -3798,13 +3798,16 @@ mod tests {
             "reporting",
             "mssql://sa@h:1433/db",
             tunnel,
-            PgAuth::Entra(EntraAuth::interactive_default()),
+            ServerAuth::Entra(EntraAuth::interactive_default()),
         );
         assert!(matches!(ms, SavedConnection::SqlServer { .. }));
         assert_eq!(ms.backend(), BackendKind::SqlServer);
         match ms {
             SavedConnection::SqlServer { auth, .. } => {
-                assert!(matches!(auth, PgAuth::Entra(_)), "auth mode is preserved")
+                assert!(
+                    matches!(auth, ServerAuth::Entra(_)),
+                    "auth mode is preserved"
+                )
             }
             _ => unreachable!(),
         }
