@@ -1,5 +1,13 @@
 //! SQLite backend: connecting, introspection, and query execution.
+//!
+//! Introspection runs a constant number of queries regardless of table count:
+//! the object list comes from `sqlite_master`, and columns, indexes, and
+//! foreign keys come from the pragma table-valued functions
+//! (`pragma_table_xinfo`, `pragma_index_list`, `pragma_index_info`,
+//! `pragma_foreign_key_list`) joined against it — no per-table `PRAGMA`
+//! round-trips (FRE-133).
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
@@ -9,7 +17,7 @@ use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
 use super::ddl::{create_index_sql, terminate, Ddl, DdlObject, IndexExtras};
 use super::error::DbError;
 use super::export::{export_io_err, ExportFormat, ExportSink};
-use super::page::{quote_ident, Dialect};
+use super::page::Dialect;
 use super::schema::{
     ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta, TypeDetail,
 };
@@ -327,7 +335,9 @@ async fn describe_columns(pool: &SqlitePool, sql: &str) -> Result<Vec<String>, D
         .collect())
 }
 
-/// Lists tables and views with columns, indexes, and foreign keys.
+/// Lists tables and views with columns, indexes, and foreign keys. Four
+/// batched queries total — see the module header for the pragma
+/// table-valued-function strategy (FRE-133).
 pub async fn introspect(pool: &SqlitePool) -> Result<Vec<TableMeta>, DbError> {
     let entries = sqlx::query(
         "SELECT name, type FROM sqlite_master \
@@ -337,6 +347,10 @@ pub async fn introspect(pool: &SqlitePool) -> Result<Vec<TableMeta>, DbError> {
     .fetch_all(pool)
     .await
     .map_err(|e| DbError::Introspect(e.to_string()))?;
+
+    let mut columns = table_columns(pool).await?;
+    let mut indexes = table_indexes(pool).await?;
+    let mut foreign_keys = table_foreign_keys(pool).await?;
 
     let mut tables = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -349,9 +363,9 @@ pub async fn introspect(pool: &SqlitePool) -> Result<Vec<TableMeta>, DbError> {
         };
         tables.push(TableMeta {
             schema: None,
-            columns: table_columns(pool, &name).await?,
-            indexes: table_indexes(pool, &name).await?,
-            foreign_keys: table_foreign_keys(pool, &name).await?,
+            columns: columns.remove(&name).unwrap_or_default(),
+            indexes: indexes.remove(&name).unwrap_or_default(),
+            foreign_keys: foreign_keys.remove(&name).unwrap_or_default(),
             name,
             kind,
             // No per-object narrowing: kind and row identity already carry
@@ -367,7 +381,13 @@ pub async fn introspect(pool: &SqlitePool) -> Result<Vec<TableMeta>, DbError> {
     Ok(tables)
 }
 
-async fn table_columns(pool: &SqlitePool, table: &str) -> Result<Vec<ColumnMeta>, DbError> {
+/// The `sqlite_master` filter every batched pragma join below shares; must
+/// match the object list in [`introspect`].
+const MASTER_FILTER: &str = "m.type IN ('table', 'view') AND m.name NOT LIKE 'sqlite_%'";
+
+/// Columns of every table and view, keyed by object name (unique per SQLite
+/// schema).
+async fn table_columns(pool: &SqlitePool) -> Result<HashMap<String, Vec<ColumnMeta>>, DbError> {
     // `table_xinfo` (not `table_info`) so generated (`AS (…)`) columns are
     // reported: they appear in `SELECT *`, so the grid's bounded page fetch —
     // which builds an explicit projection from this metadata (FRE-33) — must
@@ -375,16 +395,28 @@ async fn table_columns(pool: &SqlitePool, table: &str) -> Result<Vec<ColumnMeta>
     // `hidden` column: 0 = ordinary, 2 = VIRTUAL generated, 3 = STORED
     // generated, 1 = a hidden column (virtual-table machinery) that `SELECT *`
     // does NOT return — skip those so the projection still matches `SELECT *`.
-    let rows = pragma(pool, "table_xinfo", table).await?;
-    let mut columns = Vec::with_capacity(rows.len());
+    let sql = format!(
+        "SELECT m.name AS table_name, x.name AS name, x.type AS type, \
+                x.\"notnull\" AS \"notnull\", x.dflt_value AS dflt_value, \
+                x.pk AS pk, x.hidden AS hidden \
+         FROM sqlite_master m JOIN pragma_table_xinfo(m.name) x \
+         WHERE {MASTER_FILTER} \
+         ORDER BY m.name, x.cid"
+    );
+    let rows = sqlx::query(&sql)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| DbError::Introspect(e.to_string()))?;
+    let mut columns: HashMap<String, Vec<ColumnMeta>> = HashMap::new();
     for row in rows {
         let hidden: i64 = get(&row, "hidden")?;
         if hidden == 1 {
             continue;
         }
+        let table: String = get(&row, "table_name")?;
         let pk: i64 = get(&row, "pk")?;
         let notnull: i64 = get(&row, "notnull")?;
-        columns.push(ColumnMeta {
+        columns.entry(table).or_default().push(ColumnMeta {
             name: get(&row, "name")?,
             type_name: get(&row, "type")?,
             nullable: notnull == 0,
@@ -404,20 +436,53 @@ async fn table_columns(pool: &SqlitePool, table: &str) -> Result<Vec<ColumnMeta>
     Ok(columns)
 }
 
-async fn table_indexes(pool: &SqlitePool, table: &str) -> Result<Vec<IndexMeta>, DbError> {
-    let rows = pragma(pool, "index_list", table).await?;
-    let mut indexes = Vec::with_capacity(rows.len());
+/// Indexes of every table, keyed by table name. Two queries: the per-table
+/// index list, and every index's key columns keyed by index name — index
+/// names are unique across a SQLite schema, so one flat map covers all
+/// tables.
+async fn table_indexes(pool: &SqlitePool) -> Result<HashMap<String, Vec<IndexMeta>>, DbError> {
+    let sql = format!(
+        "SELECT il.name AS index_name, ii.seqno AS seqno, ii.name AS column_name \
+         FROM sqlite_master m \
+         JOIN pragma_index_list(m.name) il \
+         JOIN pragma_index_info(il.name) ii \
+         WHERE {MASTER_FILTER}"
+    );
+    let column_rows = sqlx::query(&sql)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| DbError::Introspect(e.to_string()))?;
+    let mut index_columns: HashMap<String, Vec<(i64, Option<String>)>> = HashMap::new();
+    for col in column_rows {
+        let index: String = get(&col, "index_name")?;
+        index_columns
+            .entry(index)
+            .or_default()
+            .push((get(&col, "seqno")?, get(&col, "column_name")?));
+    }
+
+    // `seq` is the pragma's own output ordinal, so ordering by it keeps each
+    // table's indexes in the order the per-table pragma reported them.
+    let sql = format!(
+        "SELECT m.name AS table_name, il.name AS index_name, \
+                il.\"unique\" AS \"unique\", il.partial AS partial \
+         FROM sqlite_master m JOIN pragma_index_list(m.name) il \
+         WHERE {MASTER_FILTER} \
+         ORDER BY m.name, il.seq"
+    );
+    let rows = sqlx::query(&sql)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| DbError::Introspect(e.to_string()))?;
+    let mut indexes: HashMap<String, Vec<IndexMeta>> = HashMap::new();
     for row in rows {
-        let name: String = get(&row, "name")?;
+        let table: String = get(&row, "table_name")?;
+        let name: String = get(&row, "index_name")?;
         let unique: i64 = get(&row, "unique")?;
         let partial: i64 = get(&row, "partial")?;
-        let column_rows = pragma(pool, "index_info", &name).await?;
-        let mut columns: Vec<(i64, Option<String>)> = Vec::with_capacity(column_rows.len());
-        for col in column_rows {
-            columns.push((get(&col, "seqno")?, get(&col, "name")?));
-        }
+        let mut columns = index_columns.remove(&name).unwrap_or_default();
         columns.sort_by_key(|(seqno, _)| *seqno);
-        indexes.push(IndexMeta {
+        indexes.entry(table).or_default().push(IndexMeta {
             name,
             unique: unique != 0,
             partial: partial != 0,
@@ -431,43 +496,61 @@ async fn table_indexes(pool: &SqlitePool, table: &str) -> Result<Vec<IndexMeta>,
     Ok(indexes)
 }
 
+/// One `pragma_foreign_key_list` row: (id, seq, referenced table, from, to).
+type FkPart = (i64, i64, String, String, Option<String>);
+
+/// Foreign keys of every table, keyed by table name.
 async fn table_foreign_keys(
     pool: &SqlitePool,
-    table: &str,
-) -> Result<Vec<ForeignKeyMeta>, DbError> {
-    let rows = pragma(pool, "foreign_key_list", table).await?;
+) -> Result<HashMap<String, Vec<ForeignKeyMeta>>, DbError> {
+    let sql = format!(
+        "SELECT m.name AS table_name, fk.id AS id, fk.seq AS seq, \
+                fk.\"table\" AS ref_table, fk.\"from\" AS from_col, fk.\"to\" AS to_col \
+         FROM sqlite_master m JOIN pragma_foreign_key_list(m.name) fk \
+         WHERE {MASTER_FILTER}"
+    );
+    let rows = sqlx::query(&sql)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| DbError::Introspect(e.to_string()))?;
     // Rows arrive one per column, keyed by (id, seq); group them into FKs.
-    let mut parts: Vec<(i64, i64, String, String, Option<String>)> = Vec::new();
+    let mut parts: HashMap<String, Vec<FkPart>> = HashMap::new();
     for row in rows {
-        parts.push((
+        let table: String = get(&row, "table_name")?;
+        parts.entry(table).or_default().push((
             get(&row, "id")?,
             get(&row, "seq")?,
-            get(&row, "table")?,
-            get(&row, "from")?,
-            get(&row, "to")?,
+            get(&row, "ref_table")?,
+            get(&row, "from_col")?,
+            get(&row, "to_col")?,
         ));
     }
-    parts.sort_by_key(|(id, seq, ..)| (*id, *seq));
 
-    let mut fks: Vec<(i64, ForeignKeyMeta)> = Vec::new();
-    for (id, _, referenced_table, from, to) in parts {
-        match fks.last_mut() {
-            Some((last_id, fk)) if *last_id == id => {
-                fk.columns.push(from);
-                fk.referenced_columns.push(to);
+    let mut foreign_keys: HashMap<String, Vec<ForeignKeyMeta>> =
+        HashMap::with_capacity(parts.len());
+    for (table, mut parts) in parts {
+        parts.sort_by_key(|(id, seq, ..)| (*id, *seq));
+        let mut fks: Vec<(i64, ForeignKeyMeta)> = Vec::new();
+        for (id, _, referenced_table, from, to) in parts {
+            match fks.last_mut() {
+                Some((last_id, fk)) if *last_id == id => {
+                    fk.columns.push(from);
+                    fk.referenced_columns.push(to);
+                }
+                _ => fks.push((
+                    id,
+                    ForeignKeyMeta {
+                        columns: vec![from],
+                        referenced_schema: None,
+                        referenced_table,
+                        referenced_columns: vec![to],
+                    },
+                )),
             }
-            _ => fks.push((
-                id,
-                ForeignKeyMeta {
-                    columns: vec![from],
-                    referenced_schema: None,
-                    referenced_table,
-                    referenced_columns: vec![to],
-                },
-            )),
         }
+        foreign_keys.insert(table, fks.into_iter().map(|(_, fk)| fk).collect());
     }
-    Ok(fks.into_iter().map(|(_, fk)| fk).collect())
+    Ok(foreign_keys)
 }
 
 /// DDL for one object (FRE-108). SQLite stores the original `CREATE`
@@ -567,14 +650,6 @@ async fn index_sql(pool: &SqlitePool, table: &str) -> Result<Vec<String>, DbErro
     rows.iter().map(|row| get(row, "sql")).collect()
 }
 
-async fn pragma(pool: &SqlitePool, pragma: &str, arg: &str) -> Result<Vec<SqliteRow>, DbError> {
-    let sql = format!("PRAGMA {pragma}({})", quote_ident(arg));
-    sqlx::query(&sql)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| DbError::Introspect(e.to_string()))
-}
-
 fn get<'r, T: sqlx::Decode<'r, sqlx::Sqlite> + sqlx::Type<sqlx::Sqlite>>(
     row: &'r SqliteRow,
     column: &str,
@@ -590,8 +665,7 @@ fn decode_value(row: &SqliteRow, idx: usize) -> Result<Value, DbError> {
     if raw.is_null() {
         return Ok(Value::Null);
     }
-    let type_name = raw.type_info().name().to_string();
-    let decoded = match type_name.as_str() {
+    let decoded = match raw.type_info().name() {
         "INTEGER" | "BOOLEAN" => Value::Integer(
             row.try_get::<i64, _>(idx)
                 .map_err(|e| DbError::Query(e.to_string()))?,
@@ -614,7 +688,7 @@ fn decode_value(row: &SqliteRow, idx: usize) -> Result<Value, DbError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::page::quote_ident;
 
     #[test]
     fn quote_ident_escapes_embedded_quotes() {

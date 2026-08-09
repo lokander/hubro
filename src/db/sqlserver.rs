@@ -23,6 +23,7 @@
 //! raw batches on one checked-out connection ([`MssqlTx`]), which the server
 //! ties together via the session's transaction descriptor.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1108,7 +1109,7 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
     // the referenced columns explicitly, so `referenced_columns` entries are
     // always `Some` — no implicit-PK resolution needed (fk.rs handles both).
     // Deliberately no `is_ms_shipped` filter here: an FK whose parent table
-    // isn't in the user-table list fails the `index_of` lookup below and is
+    // isn't in the user-table list fails the `table_index` lookup below and is
     // dropped anyway.
     let fk_rows = query_with(
         pool,
@@ -1168,16 +1169,22 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
             kind_label: None,
         });
     }
-    let index_of = |schema: &str, name: &str, tables: &[TableMeta]| {
-        tables
-            .iter()
-            .position(|t| t.schema.as_deref() == Some(schema) && t.name == name)
-    };
+    // (schema, table) → index into `tables`, built once so grouping the
+    // column/index/FK rows below is a hash lookup per row instead of a linear
+    // scan over every table (FRE-133).
+    let mut table_index: HashMap<(String, String), usize> = HashMap::with_capacity(tables.len());
+    for (idx, table) in tables.iter().enumerate() {
+        if let Some(schema) = &table.schema {
+            table_index
+                .entry((schema.clone(), table.name.clone()))
+                .or_insert(idx);
+        }
+    }
 
     for row in &column_rows.rows {
         let schema = text(row, 0);
         let table = text(row, 1);
-        let Some(idx) = index_of(&schema, &table, &tables) else {
+        let Some(&idx) = table_index.get(&(schema, table)) else {
             continue;
         };
         let type_base = text(row, 3);
@@ -1205,7 +1212,7 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
     for row in &index_rows.rows {
         let schema = text(row, 0);
         let table = text(row, 1);
-        let Some(idx) = index_of(&schema, &table, &tables) else {
+        let Some(&idx) = table_index.get(&(schema, table)) else {
             continue;
         };
         let index_name = text(row, 2);
@@ -1231,7 +1238,7 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
     for row in &fk_rows.rows {
         let schema = text(row, 0);
         let table = text(row, 1);
-        let Some(idx) = index_of(&schema, &table, &tables) else {
+        let Some(&idx) = table_index.get(&(schema, table)) else {
             continue;
         };
         let fk_name = text(row, 2);
