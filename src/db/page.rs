@@ -39,12 +39,13 @@ pub enum ColumnClass {
 }
 
 /// Classifies a declared column type into a [`ColumnClass`]. The binary and
-/// scalar vocabularies match on the **exact stripped base name** (case
-/// ignored, any `(n)`/`(max)` parameter suffix dropped); only the text
-/// fallback matches by substring, because misclassifying something as Text
-/// is the safe direction — it previews. Every recognized scalar is fetched
-/// whole (previewing a scalar would corrupt its decoded type and, worse, any
-/// locator built from it); anything unrecognized previews as Text.
+/// scalar vocabularies match on the **normalized base name** — case ignored,
+/// any `(n)`/`(max)` parameter suffix dropped, `unsigned`/`signed`
+/// qualifiers dropped — never by substring; only the text fallback matches
+/// by substring, because Text is the safe direction (it previews). Every
+/// recognized scalar is fetched whole (previewing a scalar would corrupt its
+/// decoded type and, worse, any locator built from it); anything
+/// unrecognized previews as Text.
 pub fn classify_column(type_name: &str) -> ColumnClass {
     let t = type_name.trim().to_ascii_lowercase();
     if t.contains("blob") || t.contains("bytea") {
@@ -61,34 +62,9 @@ pub fn classify_column(type_name: &str) -> ColumnClass {
     if matches!(base, "binary" | "varbinary" | "image") {
         return ColumnClass::Binary;
     }
-    // A declared scalar keeps its native decoded type. Matched by exact
-    // stripped base name like the binary arm above, NOT by substring: a
-    // Postgres user-defined type merely *containing* a scalar word (a
-    // `fingerprint_data` domain contains "int", a `timeline` enum contains
-    // "time") must stay Text — a Scalar classification would fetch it whole
-    // and let an arbitrarily large value escape the preview memory bound.
-    // Checked before the text fallback so an empty/unknown type still
-    // previews.
-    if matches!(
-        base,
-        // int/serial variants (Postgres, SQL Server, SQLite).
-        "int" | "integer" | "bigint" | "smallint" | "tinyint" | "mediumint" | "int2" | "int4"
-            | "int8" | "unsigned big int" | "serial" | "smallserial" | "bigserial" | "serial2"
-            | "serial4" | "serial8"
-            // float/double/real.
-            | "real" | "float" | "float4" | "float8" | "double" | "double precision"
-            // numeric/decimal/money.
-            | "numeric" | "decimal" | "money" | "smallmoney"
-            // bool.
-            | "bool" | "boolean"
-            // date/time/timestamp variants.
-            | "date" | "datetime" | "datetime2" | "smalldatetime" | "datetimeoffset" | "time"
-            | "timetz" | "timestamp" | "timestamptz" | "time with time zone"
-            | "time without time zone" | "timestamp with time zone"
-            | "timestamp without time zone"
-            // The rest of the fixed-size zoo.
-            | "uuid" | "bit" | "bit varying" | "varbit" | "oid" | "point" | "interval"
-    ) {
+    // A declared scalar keeps its native decoded type. Checked before the
+    // text fallback so an empty/unknown type still previews.
+    if is_scalar_base(base) {
         return ColumnClass::Scalar;
     }
     if t.contains("char")
@@ -100,9 +76,80 @@ pub fn classify_column(type_name: &str) -> ColumnClass {
     {
         return ColumnClass::Text;
     }
-    // Unknown/user-defined types could hold arbitrarily large text, so
-    // preview them rather than buffer them in full.
+    // Everything else previews, and that is a decision, not an oversight:
+    //
+    // - **User-defined types.** They can hold arbitrarily large text, so
+    //   buffering one in full would escape the preview memory bound. This is
+    //   why the vocabularies above match the whole normalized name instead
+    //   of a substring — a type merely *containing* a scalar word must not
+    //   be fetched whole. The names really do reach here: a materialized
+    //   view's columns come from `format_type()`, which reports the user
+    //   type itself (`app.timeline`, `app.fingerprint_data`); SQL Server
+    //   alias types report their alias name from `sys.types`; and SQLite
+    //   declared types are free-form text. (On an ordinary Postgres table
+    //   `data_type` says `USER-DEFINED` for an enum and the *base* type for
+    //   a domain, so that path never reaches here under a user name.)
+    // - **Postgres range and multirange types** (`int4range`, `daterange`,
+    //   `numrange`, `tstzrange`, `int8multirange`, …), which arrive as
+    //   `data_type` verbatim. They preview *uniformly* — the text render is
+    //   what the grid would show either way, and one rule beats the split
+    //   this vocabulary used to fall into accidentally (`int4range` matched
+    //   the `int` substring while `numrange` matched nothing).
+    // - **Array types**, whether they arrive as `ARRAY` from a table or as
+    //   `integer[]`/`uuid[]` from a materialized view's `format_type()` —
+    //   both spellings preview, so the two introspection paths agree.
     ColumnClass::Text
+}
+
+/// Whether a normalized base name (see [`classify_column`]) names a
+/// fixed-size scalar.
+///
+/// Two normalizations happen here rather than in the vocabulary:
+///
+/// - `unsigned`/`signed` qualifier tokens are dropped. SQLite declared types
+///   are free-form, and its INTEGER-affinity family is spelled every which
+///   way — `BIGINT UNSIGNED` (what a modern `mysqldump` conversion emits,
+///   since MySQL 8 dropped display widths), `UNSIGNED INT`, and SQLite's own
+///   documented `UNSIGNED BIG INT`. There is no principled line that admits
+///   one and rejects the others.
+/// - `interval` keeps its SQL field qualifiers (`interval year to month`,
+///   `interval hour`, `interval day to second` — what `format_type()`
+///   reports for a qualified interval), which name the same scalar type.
+fn is_scalar_base(base: &str) -> bool {
+    let normalized = base
+        .split_whitespace()
+        .filter(|word| !matches!(*word, "unsigned" | "signed"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized == "interval" || normalized.starts_with("interval ") {
+        return true;
+    }
+    matches!(
+        normalized.as_str(),
+        // int/serial variants (Postgres, SQL Server, SQLite). "big int" is
+        // the qualifier-stripped form of SQLite's `UNSIGNED BIG INT`.
+        "int" | "integer" | "bigint" | "big int" | "smallint" | "tinyint" | "mediumint" | "int2"
+            | "int4" | "int8" | "serial" | "smallserial" | "bigserial" | "serial2" | "serial4"
+            | "serial8"
+            // float/double/real.
+            | "real" | "float" | "float4" | "float8" | "double" | "double precision"
+            // numeric/decimal/money.
+            | "numeric" | "decimal" | "money" | "smallmoney"
+            // bool.
+            | "bool" | "boolean"
+            // date/time/timestamp variants.
+            | "date" | "datetime" | "datetime2" | "smalldatetime" | "datetimeoffset" | "time"
+            | "timetz" | "timestamp" | "timestamptz" | "time with time zone"
+            | "time without time zone" | "timestamp with time zone"
+            | "timestamp without time zone"
+            // The rest of the fixed-size zoo. `uniqueidentifier` is SQL
+            // Server's uuid: fetched whole it decodes through tiberius's
+            // GUID path (hyphenated lowercase, like the query editor shows),
+            // where the text preview would render T-SQL's uppercase CAST —
+            // two spellings of one column, since a uuid *key* column is
+            // always fetched whole anyway.
+            | "uuid" | "uniqueidentifier" | "bit" | "bit varying" | "varbit" | "oid" | "point"
+    )
 }
 
 /// One visible column of a bounded page, and how its value was fetched. The
@@ -900,29 +947,32 @@ mod tests {
     #[test]
     fn classify_column_matches_scalars_by_exact_base_name_not_substring() {
         use ColumnClass::*;
-        // A user-defined type merely CONTAINING a scalar word must stay Text
-        // (previewed): a Scalar classification would fetch it whole and let
-        // an arbitrarily large value escape the preview memory bound.
+        // A type merely CONTAINING a scalar word must stay Text (previewed):
+        // a Scalar classification would fetch it whole and let an
+        // arbitrarily large value escape the preview memory bound. These
+        // reach `classify_column` as matview `format_type()` output, SQL
+        // Server alias types, and SQLite declared types.
         for t in [
             "fingerprint_data", // contains "int"
-            "timeline",         // contains "time"
+            "app.timeline",     // contains "time" — matview format_type
+            "app.fingerprint",  // contains "int"
             "validated",        // contains "date"
-            "checkpoint",       // contains "point"
             "serialized",       // contains "serial"
             "orbit",            // contains "bit"
             "unreal",           // contains "real"
-            "interval_stats",   // contains "interval"
+            "interval_stats",   // starts with "interval", but is one word
             "booleanish",       // contains "boolean"
+            "pointer",          // contains "point"
+            "moneybag",         // contains "money"
         ] {
             assert_eq!(classify_column(t), Text, "{t}");
         }
         // Genuine scalar names still match: exact base name, any parameter
-        // suffix stripped, case ignored, multi-word Postgres names included.
+        // suffix stripped, case ignored, multi-word names included.
         for t in [
             "int",
             "tinyint",
             "int8",
-            "UNSIGNED BIG INT",
             "smallserial",
             "float4",
             "decimal(18,2)",
@@ -934,9 +984,71 @@ mod tests {
             "time without time zone",
             "bit",
             "bit varying(8)",
-            "interval",
         ] {
             assert_eq!(classify_column(t), Scalar, "{t}");
+        }
+        // SQLite declared types are free-form, and its INTEGER-affinity
+        // family spells the unsigned qualifier every which way. All of them
+        // are the same scalar; the qualifier is normalized away.
+        for t in [
+            "UNSIGNED BIG INT", // SQLite's own documented spelling
+            "bigint unsigned",  // what a modern mysqldump conversion emits
+            "BIGINT UNSIGNED",
+            "int unsigned",
+            "integer unsigned",
+            "smallint unsigned",
+            "tinyint unsigned",
+            "unsigned int",
+            "unsigned integer",
+            "int(11) unsigned",
+            "decimal(10,2) unsigned",
+        ] {
+            assert_eq!(classify_column(t), Scalar, "{t}");
+        }
+        // An interval keeps its field qualifiers (matview `format_type()`
+        // output) and is still the same scalar type.
+        for t in [
+            "interval",
+            "interval year to month",
+            "interval hour",
+            "interval day to second(3)",
+        ] {
+            assert_eq!(classify_column(t), Scalar, "{t}");
+        }
+        // SQL Server's uuid spelling is fetched whole like `uuid`, so a
+        // GUID column reads the same whether or not it is a key column.
+        assert_eq!(classify_column("uniqueidentifier"), Scalar);
+    }
+
+    #[test]
+    fn classify_column_previews_ranges_and_arrays_uniformly() {
+        use ColumnClass::*;
+        // Postgres range/multirange types all preview — deliberately one
+        // rule, where the old substring vocabulary split them by accident
+        // (`int4range` matched "int", `numrange` matched nothing).
+        for t in [
+            "int4range",
+            "int8range",
+            "numrange",
+            "daterange",
+            "tsrange",
+            "tstzrange",
+            "int4multirange",
+            "datemultirange",
+        ] {
+            assert_eq!(classify_column(t), Text, "{t}");
+        }
+        // Arrays preview under BOTH introspection spellings: `ARRAY` from an
+        // ordinary table's `data_type`, and `format_type()`'s element form
+        // from a materialized view. The two paths agree.
+        for t in [
+            "ARRAY",
+            "integer[]",
+            "bigint[]",
+            "uuid[]",
+            "timestamp with time zone[]",
+        ] {
+            assert_eq!(classify_column(t), Text, "{t}");
         }
     }
 
