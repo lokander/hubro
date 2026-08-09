@@ -21,6 +21,7 @@ mod script;
 mod sqlite;
 mod sqlserver;
 mod staged;
+mod url;
 mod value;
 
 pub use caps::{
