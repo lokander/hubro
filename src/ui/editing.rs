@@ -46,6 +46,8 @@ use dioxus_icons::lucide::RotateCcw;
 
 use crate::db::{Dialect, TypeDetail, Value};
 
+use super::js::{focus_by_id_next_frame, focus_on_mount};
+
 /// Which editor a column gets, derived by [`editor_kind`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorKind {
@@ -472,25 +474,13 @@ pub fn CellEditor(
         }
         _ => {}
     };
-    let focus_on_mount = move |evt: MountedEvent| {
-        spawn(async move {
-            let _ = evt.set_focus(true).await;
-        });
-    };
     // Belt and braces for focus: when the editor moves cell-to-cell (Tab),
     // the OLD editor — which holds keyboard focus — unmounts in the same
     // patch that mounts this one, and WebKit's focus fallback (to the body)
     // can land AFTER onmounted's set_focus, leaving the new editor
     // unfocused. Re-focus on the next frame. Only one editor exists at a
     // time, so a fixed element id is unambiguous.
-    use_effect(|| {
-        document::eval(
-            "requestAnimationFrame(() => { \
-                const el = document.getElementById('dv-cell-editor'); \
-                if (el) el.focus(); \
-            });",
-        );
-    });
+    use_effect(|| focus_by_id_next_frame("dv-cell-editor"));
 
     let input_class =
         "w-full min-w-28 rounded border border-amber-500 bg-slate-100 dark:bg-slate-950 px-1.5 \

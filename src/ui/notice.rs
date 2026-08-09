@@ -12,6 +12,8 @@ use std::time::Duration;
 use dioxus::prelude::*;
 use dioxus_icons::lucide::{Info, TriangleAlert, X};
 
+use crate::db::TableKind;
+
 /// The severity of a [`Banner`], picking its icon and color scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BannerKind {
@@ -182,5 +184,30 @@ pub fn DelayedLoading(label: String) -> Element {
         if show() {
             LoadingLine { label }
         }
+    }
+}
+
+/// The badge naming a schema object's kind, wherever one is listed — the
+/// sidebar's table list and the schema pane's heading.
+///
+/// A plain table gets none: it is the default, and badging every row would
+/// leave nothing for the badge to distinguish. An engine-specific
+/// `kind_label` ("hypertable", "continuous aggregate") is rendered separately
+/// *after* this one, since it refines the kind rather than replacing it.
+#[component]
+pub fn KindBadge(kind: TableKind) -> Element {
+    let (class, label) = match kind {
+        TableKind::View => (
+            "rounded bg-violet-100 dark:bg-violet-900/50 px-1 text-xs text-violet-700 dark:text-violet-300",
+            "view",
+        ),
+        TableKind::MaterializedView => (
+            "rounded bg-fuchsia-100 dark:bg-fuchsia-900/50 px-1 text-xs text-fuchsia-700 dark:text-fuchsia-300",
+            "matview",
+        ),
+        TableKind::Table => return rsx! {},
+    };
+    rsx! {
+        span { class, "{label}" }
     }
 }

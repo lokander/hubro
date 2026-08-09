@@ -15,11 +15,12 @@ use crate::db::{
 use crate::util::human_bytes;
 
 use super::editing::{editor_kind, CellEditor, EditNav, EditorKind};
+use super::js::focus_by_id_next_frame;
 use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState};
 use super::schema::display_type;
 use super::selection::Selection;
 use super::stage::{required_insert_columns, PendingInsert, TableStage};
-use super::state::{AppState, ExportPane, ExportStatus, SchemaLoad, TableRef};
+use super::state::{find_table_meta, AppState, ExportPane, ExportStatus, TableRef};
 
 const PAGE_SIZE: u32 = 100;
 
@@ -406,7 +407,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let fetch_meta = use_memo(move || {
         let registry = state.registry.read();
         let schemas = state.schemas.read();
-        let meta = find_table(schemas.get(&id), &meta_table);
+        let meta = find_table_meta(schemas.get(&id), &meta_table);
         match (meta, registry.get(id)) {
             (Some(meta), Some(connection)) => {
                 // Row identity is a read concern here — it decides which
@@ -529,7 +530,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         let schemas = state.schemas.read();
         let dialect = state.registry.read().get(id).map(|c| c.pool.dialect());
         Shared::new(TableRenderMeta::build(
-            find_table(schemas.get(&id), &render_table),
+            find_table_meta(schemas.get(&id), &render_table),
             dialect,
         ))
     });
@@ -563,7 +564,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         // exactly the editors the grid shows — the user's marking (FRE-111)
         // included. Resolving the *backend's* answer here instead would let
         // Enter open an editor on a cell the mouse correctly refuses.
-        let access = find_table(state.schemas.read().get(&id), &page_table)
+        let access = find_table_meta(state.schemas.read().get(&id), &page_table)
             .and_then(|meta| state.table_access(id, meta));
         let identity = access.as_ref().and_then(|a| a.identity.clone());
         let can_mutate = access.as_ref().is_some_and(TableAccess::can_mutate);
@@ -727,12 +728,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // closed panel editor's input and nothing handed it back.
     use_effect(move || {
         if editing.read().is_none() && detail_editing.read().is_none() {
-            document::eval(
-                "requestAnimationFrame(() => { \
-                    const el = document.getElementById('dv-grid'); \
-                    if (el) el.focus(); \
-                });",
-            );
+            focus_by_id_next_frame("dv-grid");
         }
     });
 
@@ -762,7 +758,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let meta = render_meta();
     // Row-identity detection decides the read-only notice and how staged rows
     // are addressed.
-    let table_meta: Option<TableMeta> = find_table(state.schemas.read().get(&id), &table).cloned();
+    let table_meta: Option<TableMeta> = state.table_meta(id, &table);
     // Whether the FK Back stack has anywhere to return to (reactive).
     let can_back = state.can_go_back(id);
 
@@ -1070,11 +1066,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                 if applied_filter.read().is_some() {
                     button {
                         class: "rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
-                        onclick: move |_| {
-                            applied_filter.set(None);
-                            filter_text.set(String::new());
-                            page.set(0);
-                        },
+                        onclick: move |_| clear_filter(filter_text, applied_filter, page),
                         "Clear"
                     }
                 }
@@ -1379,11 +1371,11 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                             hint: "No rows in this table match the current filter.",
                                             button {
                                                 class: "rounded border border-slate-300 dark:border-slate-700 px-3 py-1 text-xs text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
-                                                onclick: move |_| {
-                                                    applied_filter.set(None);
-                                                    filter_text.set(String::new());
-                                                    page.set(0);
-                                                },
+                                                onclick: move |_| clear_filter(
+                                                    filter_text,
+                                                    applied_filter,
+                                                    page,
+                                                ),
                                                 "Clear filter"
                                             }
                                         }
@@ -1689,16 +1681,6 @@ fn empty_state(no_visible_rows: bool, has_filter: bool) -> Option<GridEmpty> {
     } else {
         GridEmpty::Table
     })
-}
-
-/// Finds one table's metadata in a loaded schema.
-fn find_table<'a>(load: Option<&'a SchemaLoad>, table: &TableRef) -> Option<&'a TableMeta> {
-    match load? {
-        SchemaLoad::Ready(tables) => tables
-            .iter()
-            .find(|t| t.name == table.name && t.schema == table.schema),
-        _ => None,
-    }
 }
 
 /// One cell prepared for rendering.
@@ -2077,6 +2059,79 @@ fn step_column(columns: &[String], current: &str, delta: i32) -> Option<String> 
         return None;
     }
     columns.get(next as usize).cloned()
+}
+
+/// The `(on_commit, on_draft)` pair [`edit_callbacks`] builds. Boxed so the
+/// four call sites name one type instead of two `impl Trait`s; the editor is
+/// one cell at a time, so the allocation is not on any hot path.
+type EditCallbacks = (
+    Box<dyn FnMut((Option<Value>, EditNav))>,
+    Box<dyn FnMut(String)>,
+);
+
+/// The `on_commit` / `on_draft` pair every open [`CellEditor`] needs.
+///
+/// Four sites open one — a grid cell, a pending-insert cell, a truncated
+/// cell's editor and a detail-panel field — and all four want the same two
+/// behaviours: commit through the caller's `stage` step then walk to the
+/// column `nav` asks for, and stash unparseable text against the row/column
+/// it belongs to. `stage` is the one thing they genuinely differ in (a cell
+/// edit vs. a pending insert's value), so it stays a caller-supplied closure.
+///
+/// The draft guard is why this is shared rather than repeated: it is
+/// load-bearing for the one-editor invariant, not just for focus. Input that
+/// doesn't parse is stashed rather than dropped (FRE-74), and `use_drop`
+/// fires *after* whatever closed this editor has already chosen the next one
+/// — so an unguarded stash resurrects the invalid editor and hijacks the
+/// switch. Double-clicking another panel field reopened the old one, and
+/// double-clicking a grid cell was swallowed entirely (the resurrected editor
+/// stole the shared element id back, blurring the grid's). Every route to the
+/// grid blurs the input first, which commits and closes it *unless* the text
+/// doesn't parse — precisely the case the reverse guard in [`DataGrid`]
+/// handles, and precisely the case an unguarded stash would undo.
+fn edit_callbacks(
+    mut editing: Signal<Option<ActiveEdit>>,
+    row_key: String,
+    column: String,
+    editable_columns: Shared<Vec<String>>,
+    mut stage: impl FnMut(Value) + 'static,
+) -> EditCallbacks {
+    let commit_row_key = row_key.clone();
+    let commit_column = column.clone();
+    let on_commit = move |(value, nav): (Option<Value>, EditNav)| {
+        if let Some(value) = value {
+            stage(value);
+        }
+        // Tab walks the editable columns — in the detail panel that is the
+        // field list, which is the same thing seen sideways.
+        let next = match nav {
+            EditNav::Stay => None,
+            EditNav::Next => step_column(&editable_columns, &commit_column, 1),
+            EditNav::Prev => step_column(&editable_columns, &commit_column, -1),
+        };
+        editing.set(next.map(|column| ActiveEdit {
+            row_key: commit_row_key.clone(),
+            column,
+            draft: None,
+        }));
+    };
+    let on_draft = move |text: String| {
+        // Stash only while this cell is still the active edit — a deliberate
+        // switch to another cell, or a sort/filter reset, must not be hijacked
+        // back to the invalid editor.
+        let still_active = editing
+            .peek()
+            .as_ref()
+            .is_some_and(|active| active.is_on(&row_key, &column));
+        if still_active {
+            editing.set(Some(ActiveEdit {
+                row_key: row_key.clone(),
+                column: column.clone(),
+                draft: Some(text),
+            }));
+        }
+    };
+    (Box::new(on_commit), Box::new(on_draft))
 }
 
 /// A move requested by a grid-navigation key (FRE-15), resolved by
@@ -2799,6 +2854,21 @@ fn equality_filter_label(filter: Option<&Filter>) -> Option<String> {
     }
 }
 
+/// Clears the filter and returns to the first page — what both "Clear"
+/// affordances do (the toolbar's button and the no-rows-match empty state).
+///
+/// Both the applied filter and the input text go: leaving the text behind
+/// would show a filter that isn't in effect.
+fn clear_filter(
+    mut filter_text: Signal<String>,
+    mut applied_filter: Signal<Option<Filter>>,
+    mut page: Signal<u64>,
+) {
+    applied_filter.set(None);
+    filter_text.set(String::new());
+    page.set(0);
+}
+
 /// Applies the staged filter inputs and resets to the first page.
 fn apply_filter(
     filter_column: Signal<String>,
@@ -3069,13 +3139,15 @@ fn GridCellSlot(
                 }
             };
         }
-        let commit_table = table.clone();
         let draft = editing
             .read()
             .as_ref()
             .and_then(|active| active.draft.clone());
-        let draft_row_key = row_key.clone();
-        let draft_column = column.clone();
+        let (on_commit, on_draft) =
+            edit_callbacks(editing, row_key, column.clone(), editable_columns, {
+                let table = table.clone();
+                move |value| state.stage_cell_edit(id, &table, locator.clone(), &column, value)
+            });
         rsx! {
             CellEditor {
                 kind,
@@ -3083,37 +3155,9 @@ fn GridCellSlot(
                 nullable,
                 initial: cell.value.clone(),
                 draft,
-                on_commit: move |(value, nav): (Option<Value>, EditNav)| {
-                    if let Some(value) = value {
-                        state.stage_cell_edit(id, &commit_table, locator.clone(), &column, value);
-                    }
-                    let next = match nav {
-                        EditNav::Stay => None,
-                        EditNav::Next => step_column(&editable_columns, &column, 1),
-                        EditNav::Prev => step_column(&editable_columns, &column, -1),
-                    };
-                    editing.set(next.map(|column| ActiveEdit {
-                        row_key: row_key.clone(),
-                        column,
-                        draft: None,
-                    }));
-                },
+                on_commit,
                 on_cancel: move |_| editing.set(None),
-                on_draft: move |text: String| {
-                    // Stash only while this cell is still the active edit —
-                    // a deliberate switch to another cell or a sort/filter
-                    // reset must not be hijacked back to the invalid editor.
-                    let still_active = editing.peek().as_ref().is_some_and(|active| {
-                        active.row_key == draft_row_key && active.column == draft_column
-                    });
-                    if still_active {
-                        editing.set(Some(ActiveEdit {
-                            row_key: draft_row_key.clone(),
-                            column: draft_column.clone(),
-                            draft: Some(text),
-                        }));
-                    }
-                },
+                on_draft,
             }
         }
     } else {
@@ -3317,17 +3361,18 @@ fn InsertCellSlot(
             .is_some_and(|active| active.row_key == row_key && active.column == column);
 
     if is_active {
-        let commit_table = table.clone();
-        let commit_column = column.clone();
-        let commit_row_key = row_key.clone();
         let default_table = table.clone();
         let default_column = column.clone();
         let draft = editing
             .read()
             .as_ref()
             .and_then(|active| active.draft.clone());
-        let draft_row_key = row_key.clone();
-        let draft_column = column.clone();
+        let (on_commit, on_draft) =
+            edit_callbacks(editing, row_key, column.clone(), editable_columns, {
+                let table = table.clone();
+                let column = column.clone();
+                move |value| state.stage_insert_value(id, &table, insert_id, &column, value)
+            });
         rsx! {
             CellEditor {
                 kind,
@@ -3335,36 +3380,8 @@ fn InsertCellSlot(
                 nullable,
                 initial: override_value.clone().unwrap_or(Value::Null),
                 draft,
-                on_draft: move |text: String| {
-                    // Stash only while this cell is still the active edit —
-                    // a deliberate switch to another cell or a sort/filter
-                    // reset must not be hijacked back to the invalid editor.
-                    let still_active = editing.peek().as_ref().is_some_and(|active| {
-                        active.row_key == draft_row_key && active.column == draft_column
-                    });
-                    if still_active {
-                        editing.set(Some(ActiveEdit {
-                            row_key: draft_row_key.clone(),
-                            column: draft_column.clone(),
-                            draft: Some(text),
-                        }));
-                    }
-                },
-                on_commit: move |(value, nav): (Option<Value>, EditNav)| {
-                    if let Some(value) = value {
-                        state.stage_insert_value(id, &commit_table, insert_id, &commit_column, value);
-                    }
-                    let next = match nav {
-                        EditNav::Stay => None,
-                        EditNav::Next => step_column(&editable_columns, &commit_column, 1),
-                        EditNav::Prev => step_column(&editable_columns, &commit_column, -1),
-                    };
-                    editing.set(next.map(|column| ActiveEdit {
-                        row_key: commit_row_key.clone(),
-                        column,
-                        draft: None,
-                    }));
-                },
+                on_draft,
+                on_commit,
                 on_cancel: move |_| editing.set(None),
                 on_default: move |_| {
                     state.clear_insert_value(id, &default_table, insert_id, &default_column);
@@ -3506,17 +3523,22 @@ fn TruncatedCellEditor(
         }
         Some(Ok(fetch)) => {
             let initial = fetch.value.clone();
-            let commit_table = table.clone();
-            let commit_column = column.clone();
-            let commit_row_key = row_key.clone();
-            let commit_columns = editable_columns.clone();
-            let commit_locator = locator.clone();
             let draft = editing
                 .read()
                 .as_ref()
                 .and_then(|active| active.draft.clone());
-            let draft_row_key = row_key.clone();
-            let draft_column = column.clone();
+            let (on_commit, on_draft) = edit_callbacks(
+                editing,
+                row_key.clone(),
+                column.clone(),
+                editable_columns.clone(),
+                {
+                    let table = table.clone();
+                    let column = column.clone();
+                    let locator = locator.clone();
+                    move |value| state.stage_cell_edit(id, &table, locator.clone(), &column, value)
+                },
+            );
             rsx! {
                 CellEditor {
                     kind,
@@ -3524,37 +3546,8 @@ fn TruncatedCellEditor(
                     nullable,
                     initial,
                     draft,
-                    on_draft: move |text: String| {
-                        // Stash only while this cell is still the active
-                        // edit — a deliberate switch to another cell or a
-                        // sort/filter reset must not be hijacked back to
-                        // the invalid editor.
-                        let still_active = editing.peek().as_ref().is_some_and(|active| {
-                            active.row_key == draft_row_key && active.column == draft_column
-                        });
-                        if still_active {
-                            editing.set(Some(ActiveEdit {
-                                row_key: draft_row_key.clone(),
-                                column: draft_column.clone(),
-                                draft: Some(text),
-                            }));
-                        }
-                    },
-                    on_commit: move |(value, nav): (Option<Value>, EditNav)| {
-                        if let Some(value) = value {
-                            state.stage_cell_edit(id, &commit_table, commit_locator.clone(), &commit_column, value);
-                        }
-                        let next = match nav {
-                            EditNav::Stay => None,
-                            EditNav::Next => step_column(&commit_columns, &commit_column, 1),
-                            EditNav::Prev => step_column(&commit_columns, &commit_column, -1),
-                        };
-                        editing.set(next.map(|column| ActiveEdit {
-                            row_key: commit_row_key.clone(),
-                            column,
-                            draft: None,
-                        }));
-                    },
+                    on_draft,
+                    on_commit,
                     on_cancel: move |_| editing.set(None),
                 }
             }
@@ -4110,11 +4103,14 @@ fn RowDetailValue(
     if active {
         let locator = locator.expect("an editable field has a locator");
         let column = field.column.clone();
-        let step_columns = editable_columns.clone();
         let draft = open.and_then(|open| open.draft);
-        let draft_row = row_key.clone();
-        let draft_column = field.column.clone();
-        let step_row = row_key.clone();
+        let (on_commit, on_draft) = edit_callbacks(
+            editing,
+            row_key,
+            field.column.clone(),
+            editable_columns,
+            move |value| state.stage_cell_edit(id, &table, locator.clone(), &column, value),
+        );
         return rsx! {
             CellEditor {
                 // A block wrapper, not a table cell: this is a form, not a row.
@@ -4124,23 +4120,7 @@ fn RowDetailValue(
                 nullable: field.nullable,
                 initial: value,
                 draft,
-                on_commit: move |(committed, nav): (Option<Value>, EditNav)| {
-                    if let Some(committed) = committed {
-                        state.stage_cell_edit(id, &table, locator.clone(), &column, committed);
-                    }
-                    // Tab walks the panel's fields the way it walks a row's
-                    // cells in the grid.
-                    let next = match nav {
-                        EditNav::Stay => None,
-                        EditNav::Next => step_column(&step_columns, &column, 1),
-                        EditNav::Prev => step_column(&step_columns, &column, -1),
-                    };
-                    editing.set(next.map(|column| ActiveEdit {
-                        row_key: step_row.clone(),
-                        column,
-                        draft: None,
-                    }));
-                },
+                on_commit,
                 on_cancel: move |_| editing.set(None),
                 // Input that doesn't parse is stashed rather than dropped
                 // (FRE-74). The grid needs this because scrolling unmounts a
@@ -4149,36 +4129,7 @@ fn RowDetailValue(
                 // key, a click, the post-save refetch — remounts every field.
                 // Without it the text vanished silently, which is worse than
                 // the grid, whose editor stays open showing the parse error.
-                on_draft: move |text: String| {
-                    // Stash only while this field is still the active edit —
-                    // the same guard the grid's editor carries, and for a
-                    // sharper reason here. `use_drop` fires *after* whatever
-                    // closed this editor has already chosen the next one, so
-                    // an unguarded stash resurrects the invalid editor and
-                    // hijacks the switch: double-clicking another panel field
-                    // reopened this one, and double-clicking a grid cell was
-                    // swallowed entirely (the resurrected editor stole the
-                    // shared element id back, blurring the grid's).
-                    //
-                    // That also makes this guard load-bearing for the
-                    // one-editor invariant, not just for focus. Every route to
-                    // the grid blurs this input first, which commits and
-                    // closes it *unless* the text doesn't parse — so
-                    // unparseable text is precisely the case the reverse guard
-                    // in `DataGrid` has to handle, and precisely the case an
-                    // unguarded `on_draft` would undo.
-                    let still_active = editing
-                        .peek()
-                        .as_ref()
-                        .is_some_and(|active| active.is_on(&draft_row, &draft_column));
-                    if still_active {
-                        editing.set(Some(ActiveEdit {
-                            row_key: draft_row.clone(),
-                            column: draft_column.clone(),
-                            draft: Some(text),
-                        }));
-                    }
-                },
+                on_draft,
             }
         };
     }
