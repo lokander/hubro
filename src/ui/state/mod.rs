@@ -53,7 +53,7 @@ use crate::db::{
     DdlObject, ExportFormat, Filter, ForeignKeyMeta, MssqlAuth, QueryResult, Rollback, RowLocator,
     StagedChange, StatementResult, TableAccess, TableMeta, Value, WriteProtection,
 };
-use crate::history::HistoryStore;
+use crate::history::{HistoryStore, SaveOutcome};
 use crate::tunnel::{HostKeyInfo, Tunnel, TunnelAuth, TunnelConfig, TunnelError};
 use crate::ui::notice::SPINNER_DELAY;
 use crate::ui::stage::TableStage;
@@ -195,6 +195,164 @@ pub enum NavAction {
     CloseConnection,
 }
 
+/// One buffer ("query tab") in a connection's SQL pane. A saved query opens
+/// into a new one (FRE-113), which is what keeps it from overwriting whatever
+/// was in the editor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SqlBuffer {
+    /// Per-tab id. Monotonic and never reused, so a run or a pending write
+    /// confirmation that names a buffer can only ever mean the buffer it was
+    /// started from — a closed buffer's id is not handed to a later one.
+    pub id: u64,
+    /// The saved query this buffer was opened from, shown on its tab.
+    /// `None` for a scratch buffer.
+    pub title: Option<String>,
+    /// The editor text, synced from the webview so it survives buffer, pane,
+    /// and tab switches.
+    pub text: String,
+}
+
+impl SqlBuffer {
+    /// An empty, untitled buffer.
+    pub fn scratch(id: u64) -> Self {
+        SqlBuffer {
+            id,
+            title: None,
+            text: String::new(),
+        }
+    }
+
+    /// Whether this buffer holds nothing worth keeping — untitled and blank.
+    /// Opening a saved query into such a buffer overwrites nothing, so it is
+    /// reused rather than leaving an empty tab behind.
+    fn is_scratch(&self) -> bool {
+        self.title.is_none() && self.text.trim().is_empty()
+    }
+}
+
+/// The id a tab's first SQL buffer gets.
+pub const FIRST_SQL_BUFFER: u64 = 1;
+
+/// One connection tab's SQL buffers, in tab order, plus which one is showing.
+///
+/// Never empty: a tab always has an editor, so closing the last buffer leaves
+/// a fresh scratch one rather than nothing. That invariant is why the fields
+/// are private — every mutation goes through a method that maintains it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SqlBuffers {
+    list: Vec<SqlBuffer>,
+    active: u64,
+    /// Highest id ever handed out in this tab. Ids are never reused: a run
+    /// and a parked write confirmation each name their buffer by id, and
+    /// handing a closed buffer's id to a later one would re-attach them to a
+    /// query they did not come from.
+    issued: u64,
+}
+
+impl Default for SqlBuffers {
+    fn default() -> Self {
+        SqlBuffers {
+            list: vec![SqlBuffer::scratch(FIRST_SQL_BUFFER)],
+            active: FIRST_SQL_BUFFER,
+            issued: FIRST_SQL_BUFFER,
+        }
+    }
+}
+
+impl SqlBuffers {
+    /// The buffers in tab order. Always at least one.
+    pub fn list(&self) -> &[SqlBuffer] {
+        &self.list
+    }
+
+    /// The buffer the SQL pane is showing.
+    pub fn active(&self) -> u64 {
+        self.active
+    }
+
+    /// One buffer's text, empty for an id that is gone.
+    pub fn text(&self, buffer: u64) -> &str {
+        self.list
+            .iter()
+            .find(|b| b.id == buffer)
+            .map_or("", |b| b.text.as_str())
+    }
+
+    /// Stores one buffer's text, reporting whether it actually changed. A
+    /// write to an id that is gone is dropped: a closed buffer's last
+    /// message from the webview must not resurrect it.
+    pub fn set_text(&mut self, buffer: u64, text: String) -> bool {
+        match self.list.iter_mut().find(|b| b.id == buffer) {
+            Some(existing) => {
+                let changed = existing.text != text;
+                existing.text = text;
+                changed
+            }
+            None => false,
+        }
+    }
+
+    /// Names a buffer after the query just saved from it.
+    pub fn set_title(&mut self, buffer: u64, title: String) {
+        if let Some(existing) = self.list.iter_mut().find(|b| b.id == buffer) {
+            existing.title = Some(title);
+        }
+    }
+
+    /// Switches to another buffer. An id that is gone is ignored, so `active`
+    /// always names a buffer that exists.
+    pub fn select(&mut self, buffer: u64) {
+        if self.list.iter().any(|b| b.id == buffer) {
+            self.active = buffer;
+        }
+    }
+
+    /// The next never-used id.
+    fn issue(&mut self) -> u64 {
+        self.issued += 1;
+        self.issued
+    }
+
+    /// Puts `text` in front of the user without losing what is already there
+    /// (FRE-113): a new buffer, unless the active one is an untitled blank,
+    /// in which case that one is reused. Makes it active and returns its id.
+    pub fn open(&mut self, title: Option<String>, text: String) -> u64 {
+        let active = self.active;
+        if let Some(buffer) = self
+            .list
+            .iter_mut()
+            .find(|b| b.id == active && b.is_scratch())
+        {
+            buffer.title = title;
+            buffer.text = text;
+            return active;
+        }
+        let id = self.issue();
+        self.list.push(SqlBuffer { id, title, text });
+        self.active = id;
+        id
+    }
+
+    /// Closes one buffer and returns the id now active. Closing the last one
+    /// leaves a fresh scratch buffer — with a new id, like every other.
+    pub fn close(&mut self, buffer: u64) -> u64 {
+        let Some(index) = self.list.iter().position(|b| b.id == buffer) else {
+            return self.active;
+        };
+        self.list.remove(index);
+        if self.list.is_empty() {
+            let id = self.issue();
+            self.list.push(SqlBuffer::scratch(id));
+            self.active = id;
+        } else if self.active == buffer {
+            // The buffer that slid into the closed one's place, or the new
+            // last one.
+            self.active = self.list[index.min(self.list.len() - 1)].id;
+        }
+        self.active
+    }
+}
+
 /// Per-tab UI state that must survive tab switches.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TabUi {
@@ -202,9 +360,8 @@ pub struct TabUi {
     pub selected_table: Option<TableRef>,
     /// Data browser, SQL editor, or schema.
     pub pane: Pane,
-    /// SQL editor buffer, synced from the webview so it survives pane and
-    /// tab switches.
-    pub sql_text: String,
+    /// The SQL pane's buffers ("query tabs", FRE-113) and which is showing.
+    pub sql: SqlBuffers,
     /// Whether the row detail panel is docked open beside the grid
     /// (FRE-109). Per tab rather than per table, so it stays open while
     /// browsing from table to table; persisted in the session.
@@ -292,6 +449,11 @@ impl std::ops::Deref for SharedStatement {
 /// State of the most recent SQL script run per connection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SqlRun {
+    /// Which of the tab's SQL buffers ran it. One connection still runs one
+    /// script at a time, but the results are shown only under the buffer that
+    /// produced them — a result panel under a query it did not come from
+    /// would be a lie the editor has no way to caveat.
+    pub buffer: u64,
     /// Outcomes of the statements that finished, in script order.
     pub statements: Vec<SharedStatement>,
     pub status: RunStatus,
@@ -341,8 +503,44 @@ impl ExportStatus {
 /// (recorded into history when the run happens) plus its split statements.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingSql {
+    /// The buffer the script came from; the banner is shown under that
+    /// buffer only, so confirming always means the text on screen.
+    pub buffer: u64,
     pub script: String,
     pub statements: Vec<String>,
+}
+
+/// The outcome of the most recent saved-query write (FRE-113), shown as one
+/// line in the saved-queries panel until the next one replaces it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SavedStatus {
+    /// Stored under this name; `replaced` when it overwrote an existing
+    /// query of the same name in the same scope.
+    Saved {
+        name: String,
+        replaced: bool,
+    },
+    Failed(String),
+}
+
+impl SavedStatus {
+    /// The panel line for this status: display text plus a Tailwind color
+    /// class, in the shape [`ExportStatus::line`] established.
+    pub fn line(&self) -> (String, &'static str) {
+        match self {
+            // "Updated" rather than "Saved" when something was overwritten:
+            // the user is entitled to know a name they reused was already
+            // taken.
+            SavedStatus::Saved { name, replaced } => (
+                format!("{} “{name}”", if *replaced { "Updated" } else { "Saved" }),
+                "text-emerald-700 dark:text-emerald-400",
+            ),
+            SavedStatus::Failed(err) => (
+                format!("Save failed: {err}"),
+                "text-red-600 dark:text-red-400",
+            ),
+        }
+    }
 }
 
 /// What a pending [`PasswordPrompt`] is asking for.
@@ -586,6 +784,13 @@ pub struct AppState {
     pub history_nonce: Signal<u64>,
     /// UI mirror of the store's persisted recording flag.
     pub history_recording: Signal<bool>,
+    /// Bumped whenever a saved query is written or deleted (FRE-113), so open
+    /// saved-query panels re-query. Separate from [`Self::history_nonce`]:
+    /// running a script must not make every open panel refetch a list that
+    /// cannot have changed.
+    pub saved_nonce: Signal<u64>,
+    /// Outcome of the most recent saved-query write, shown in the panel.
+    pub saved_status: Signal<Option<SavedStatus>>,
     /// The persisted theme choice (System / Light / Dark). The toggle cycles
     /// it; [`Self::set_theme`] persists it to settings.toml.
     pub theme: Signal<Theme>,
@@ -706,6 +911,10 @@ impl AppState {
             history_record_error: Signal::new_in_scope(None, ScopeId::ROOT),
             history_nonce: Signal::new_in_scope(0, ScopeId::ROOT),
             history_recording: Signal::new_in_scope(true, ScopeId::ROOT),
+            // Root-scoped for the same reason as their history neighbours:
+            // written from the `spawn_forever` save/delete tasks.
+            saved_nonce: Signal::new_in_scope(0, ScopeId::ROOT),
+            saved_status: Signal::new_in_scope(None, ScopeId::ROOT),
             // Root-scoped: the startup detection task below (a
             // `spawn_forever` running in the root scope) reads it, so a
             // component-scoped signal would trip `__copy_value_hoisted`.
@@ -1355,6 +1564,156 @@ mod tests {
             canonical(&db).display().to_string(),
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Buffers holding text nobody has saved, in tab order.
+    fn buffers(texts: &[&str]) -> SqlBuffers {
+        let mut buffers = SqlBuffers::default();
+        buffers.set_text(FIRST_SQL_BUFFER, texts[0].to_string());
+        for text in &texts[1..] {
+            buffers.open(None, (*text).to_string());
+        }
+        buffers
+    }
+
+    #[test]
+    fn opening_a_query_never_overwrites_unsaved_editor_text() {
+        // The property the whole "open in a new tab" rule exists for
+        // (FRE-113): whatever was being written is still there afterwards,
+        // and the opened query is what the pane switches to.
+        let mut buffers = buffers(&["SELECT half_typed"]);
+        let opened = buffers.open(Some("Daily counts".into()), "SELECT count(*)".into());
+        assert_eq!(buffers.list().len(), 2);
+        assert_eq!(buffers.active(), opened);
+        assert_eq!(buffers.text(FIRST_SQL_BUFFER), "SELECT half_typed");
+        assert_eq!(buffers.list()[1].title.as_deref(), Some("Daily counts"));
+        assert_eq!(buffers.text(opened), "SELECT count(*)");
+    }
+
+    #[test]
+    fn opening_reuses_an_untitled_blank_buffer() {
+        // Nothing to protect, so opening into it beats leaving an empty tab
+        // stranded beside the query the user asked for. Whitespace-only
+        // counts as blank; a titled buffer never does, even when emptied.
+        let mut buffers = buffers(&["  \n "]);
+        assert_eq!(
+            buffers.open(Some("Counts".into()), "SELECT 1".into()),
+            FIRST_SQL_BUFFER
+        );
+        assert_eq!(buffers.list().len(), 1);
+        assert_eq!(buffers.list()[0].title.as_deref(), Some("Counts"));
+
+        // Now that it is named, opening again must not clobber it.
+        let second = buffers.open(Some("Other".into()), "SELECT 2".into());
+        assert_ne!(second, FIRST_SQL_BUFFER);
+        assert_eq!(buffers.list().len(), 2);
+
+        // An inactive blank is left alone too — reusing it would move the
+        // user to a tab they weren't in.
+        let mut two = buffers_with_blank_first();
+        let opened = two.open(None, "SELECT new".into());
+        assert_eq!(two.list().len(), 3);
+        assert_eq!(two.active(), opened);
+    }
+
+    /// A blank, untitled *inactive* first buffer, with the second active.
+    fn buffers_with_blank_first() -> SqlBuffers {
+        let mut buffers = SqlBuffers::default();
+        buffers.set_text(FIRST_SQL_BUFFER, "typing".into());
+        let second = buffers.open(None, "SELECT keep_me".into());
+        buffers.set_text(FIRST_SQL_BUFFER, String::new());
+        assert_eq!(buffers.list().len(), 2);
+        assert_eq!(buffers.active(), second);
+        buffers
+    }
+
+    #[test]
+    fn buffer_ids_are_never_reused() {
+        // A stale run or a parked write confirmation names its buffer by id;
+        // handing a closed buffer's id to a new one would re-attach them.
+        let mut buffers = buffers(&["a", "b"]);
+        let ids: Vec<u64> = buffers.list().iter().map(|b| b.id).collect();
+        buffers.close(ids[1]);
+        let reopened = buffers.open(None, "c".into());
+        assert!(
+            !ids.contains(&reopened) || reopened == ids[0],
+            "id {reopened} was already used"
+        );
+        assert_ne!(reopened, ids[1], "a closed buffer's id must not come back");
+
+        // Closing every buffer leaves one scratch buffer, also with a new id.
+        let mut seen = vec![ids[0], ids[1], reopened];
+        for _ in 0..3 {
+            let active = buffers.active();
+            let after = buffers.close(active);
+            assert_eq!(buffers.list().len().max(1), buffers.list().len());
+            if !seen.contains(&after) {
+                seen.push(after);
+            }
+        }
+        let unique: HashSet<u64> = seen.iter().copied().collect();
+        assert_eq!(unique.len(), seen.len(), "an id was handed out twice");
+        assert_eq!(buffers.list().len(), 1, "a tab always keeps one buffer");
+    }
+
+    #[test]
+    fn closing_moves_the_selection_only_when_it_has_to() {
+        let mut buffers = buffers(&["a", "b", "c"]);
+        let ids: Vec<u64> = buffers.list().iter().map(|b| b.id).collect();
+        buffers.select(ids[2]);
+        // Closing an inactive buffer leaves the active one alone.
+        assert_eq!(buffers.close(ids[0]), ids[2]);
+        // Closing the active last one falls back to the new last.
+        assert_eq!(buffers.close(ids[2]), ids[1]);
+        // Closing a buffer that is already gone changes nothing.
+        assert_eq!(buffers.close(ids[0]), ids[1]);
+        assert_eq!(buffers.list().len(), 1);
+
+        // Closing an active middle buffer falls to the one that took its
+        // place, not to the start of the list.
+        let mut three = buffers_abc();
+        let ids: Vec<u64> = three.list().iter().map(|b| b.id).collect();
+        three.select(ids[1]);
+        assert_eq!(three.close(ids[1]), ids[2]);
+    }
+
+    fn buffers_abc() -> SqlBuffers {
+        buffers(&["a", "b", "c"])
+    }
+
+    #[test]
+    fn a_closed_buffers_last_keystroke_cannot_resurrect_it() {
+        // The webview can deliver one more doc message after a tab is closed;
+        // it must land nowhere rather than re-create the buffer.
+        let mut buffers = buffers(&["a", "b"]);
+        let ids: Vec<u64> = buffers.list().iter().map(|b| b.id).collect();
+        buffers.close(ids[1]);
+        assert!(!buffers.set_text(ids[1], "late".into()));
+        assert_eq!(buffers.list().len(), 1);
+        assert_eq!(buffers.text(ids[1]), "");
+        // A select for a buffer that is gone is ignored too, so `active`
+        // always names a buffer that exists.
+        buffers.select(ids[1]);
+        assert_eq!(buffers.active(), ids[0]);
+    }
+
+    #[test]
+    fn saved_status_names_what_it_did() {
+        let (created, _) = SavedStatus::Saved {
+            name: "Counts".into(),
+            replaced: false,
+        }
+        .line();
+        assert_eq!(created, "Saved “Counts”");
+        let (replaced, _) = SavedStatus::Saved {
+            name: "Counts".into(),
+            replaced: true,
+        }
+        .line();
+        assert_eq!(replaced, "Updated “Counts”");
+        let (failed, class) = SavedStatus::Failed("disk full".into()).line();
+        assert_eq!(failed, "Save failed: disk full");
+        assert!(class.contains("red"));
     }
 
     #[test]

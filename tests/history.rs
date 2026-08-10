@@ -154,3 +154,246 @@ async fn entries_survive_reopening_the_store() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].sql, "SELECT 42");
 }
+
+// --- Saved queries (FRE-113) -------------------------------------------
+
+use hubro::history::SaveOutcome;
+
+#[tokio::test]
+async fn saved_queries_are_scoped_per_connection_unless_global() {
+    let (_dir, store) = temp_store().await;
+    assert_eq!(
+        store
+            .save_query("Recent orders", None, "SELECT * FROM orders", Some("db-a"))
+            .await
+            .unwrap(),
+        SaveOutcome::Created
+    );
+    store
+        .save_query(
+            "Table sizes",
+            Some("Works anywhere"),
+            "SELECT 1",
+            None, // global
+        )
+        .await
+        .unwrap();
+
+    // The connection sees its own plus the global one, its own first.
+    let for_a = store.saved_queries("db-a", None).await.unwrap();
+    assert_eq!(
+        for_a.iter().map(|q| q.name.as_str()).collect::<Vec<_>>(),
+        ["Recent orders", "Table sizes"]
+    );
+    assert_eq!(for_a[0].locator.as_deref(), Some("db-a"));
+    assert_eq!(for_a[1].locator, None);
+    assert_eq!(for_a[0].description, None);
+    assert_eq!(for_a[1].description.as_deref(), Some("Works anywhere"));
+    assert!(for_a[0].updated_at > 0);
+
+    // Another connection sees only the global one — a query written for one
+    // schema is not offered against a database that lacks it.
+    let for_b = store.saved_queries("db-b", None).await.unwrap();
+    assert_eq!(
+        for_b.iter().map(|q| q.name.as_str()).collect::<Vec<_>>(),
+        ["Table sizes"]
+    );
+}
+
+#[tokio::test]
+async fn resaving_a_name_replaces_it_within_its_scope_only() {
+    let (_dir, store) = temp_store().await;
+    store
+        .save_query("Counts", None, "SELECT 1", Some("db-a"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .save_query("Counts", Some("now with a note"), "SELECT 2", Some("db-a"))
+            .await
+            .unwrap(),
+        SaveOutcome::Replaced
+    );
+    let saved = store.saved_queries("db-a", None).await.unwrap();
+    assert_eq!(saved.len(), 1, "re-saving a name must not duplicate it");
+    assert_eq!(saved[0].sql, "SELECT 2");
+    assert_eq!(saved[0].description.as_deref(), Some("now with a note"));
+
+    // The same name in another scope is a different query, not a conflict.
+    assert_eq!(
+        store
+            .save_query("Counts", None, "SELECT 3", Some("db-b"))
+            .await
+            .unwrap(),
+        SaveOutcome::Created
+    );
+    assert_eq!(
+        store
+            .save_query("Counts", None, "SELECT 4", None)
+            .await
+            .unwrap(),
+        SaveOutcome::Created
+    );
+    assert_eq!(store.saved_queries("db-a", None).await.unwrap().len(), 2);
+    assert_eq!(
+        store.saved_queries("db-a", None).await.unwrap()[0].sql,
+        "SELECT 2"
+    );
+}
+
+#[tokio::test]
+async fn saved_query_search_covers_name_description_and_sql() {
+    let (_dir, store) = temp_store().await;
+    store
+        .save_query(
+            "Orders",
+            Some("everything unshipped"),
+            "SELECT 1",
+            Some("db"),
+        )
+        .await
+        .unwrap();
+    store
+        .save_query("Artists", None, "SELECT * FROM artists", Some("db"))
+        .await
+        .unwrap();
+    store
+        .save_query("Percent", None, "SELECT '100%' AS pct", Some("db"))
+        .await
+        .unwrap();
+
+    let by_name = store.saved_queries("db", Some("orde")).await.unwrap();
+    assert_eq!(by_name.len(), 1);
+    assert_eq!(by_name[0].name, "Orders");
+    // Case-insensitive, like the history search.
+    assert_eq!(
+        store.saved_queries("db", Some("ORDE")).await.unwrap().len(),
+        1
+    );
+    // The description is searched too — it is often the only place the word
+    // you remember was ever written down.
+    let by_description = store.saved_queries("db", Some("unshipped")).await.unwrap();
+    assert_eq!(by_description.len(), 1);
+    assert_eq!(by_description[0].name, "Orders");
+    // And the SQL itself.
+    let by_sql = store
+        .saved_queries("db", Some("FROM artists"))
+        .await
+        .unwrap();
+    assert_eq!(by_sql.len(), 1);
+    assert_eq!(by_sql[0].name, "Artists");
+    // LIKE wildcards in the needle are matched literally.
+    let percent = store.saved_queries("db", Some("100%")).await.unwrap();
+    assert_eq!(percent.len(), 1);
+    assert_eq!(percent[0].name, "Percent");
+    assert!(store
+        .saved_queries("db", Some("100%x"))
+        .await
+        .unwrap()
+        .is_empty());
+    // A blank needle is no filter at all.
+    assert_eq!(store.saved_queries("db", Some(" ")).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn deleting_a_saved_query_removes_only_that_one() {
+    let (_dir, store) = temp_store().await;
+    store
+        .save_query("Keep", None, "SELECT 1", Some("db"))
+        .await
+        .unwrap();
+    store
+        .save_query("Drop", None, "SELECT 2", Some("db"))
+        .await
+        .unwrap();
+    let doomed = store
+        .saved_queries("db", Some("Drop"))
+        .await
+        .unwrap()
+        .remove(0);
+
+    store.delete_saved_query(doomed.id).await.unwrap();
+    let left = store.saved_queries("db", None).await.unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].name, "Keep");
+    // Deleting the same id twice is not an error — the row is simply gone.
+    store.delete_saved_query(doomed.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn saving_needs_a_name_and_something_to_save() {
+    let (_dir, store) = temp_store().await;
+    assert!(store
+        .save_query("   ", None, "SELECT 1", Some("db"))
+        .await
+        .is_err());
+    assert!(store
+        .save_query("Empty", None, "  \n ", Some("db"))
+        .await
+        .is_err());
+    assert!(store.saved_queries("db", None).await.unwrap().is_empty());
+
+    // Surrounding whitespace is trimmed rather than stored, so " Name " and
+    // "Name" are the same entry and not two that look identical in the list.
+    store
+        .save_query("  Name  ", Some("  "), "SELECT 1", Some("db"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .save_query("Name", None, "SELECT 2", Some("db"))
+            .await
+            .unwrap(),
+        SaveOutcome::Replaced
+    );
+    let saved = store.saved_queries("db", None).await.unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].name, "Name");
+    assert_eq!(saved[0].description, None);
+}
+
+#[tokio::test]
+async fn saved_queries_ignore_the_recording_opt_out_and_survive_a_clear() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("history.db");
+    let store = HistoryStore::open_at(&path).await.unwrap();
+
+    // Recording off is about hubro logging what you ran; saving is something
+    // the user asked for, so it still lands.
+    store.set_recording(false).await.unwrap();
+    store
+        .save_query("Kept", None, "SELECT 1", Some("db"))
+        .await
+        .unwrap();
+    assert_eq!(store.saved_queries("db", None).await.unwrap().len(), 1);
+
+    // Clearing the connection's history leaves saved queries alone.
+    store.set_recording(true).await.unwrap();
+    store.record("db", "SELECT 99", true, None).await.unwrap();
+    store.clear("db").await.unwrap();
+    assert!(store.list("db", None, 50).await.unwrap().is_empty());
+    assert_eq!(store.saved_queries("db", None).await.unwrap().len(), 1);
+    drop(store);
+
+    // And they survive a restart, like the rest of the store.
+    let reopened = HistoryStore::open_at(&path).await.unwrap();
+    let saved = reopened.saved_queries("db", None).await.unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].sql, "SELECT 1");
+}
+
+#[tokio::test]
+async fn history_pruning_never_reaches_saved_queries() {
+    let (_dir, store) = temp_store().await;
+    store
+        .save_query("Survivor", None, "SELECT 'kept'", Some("big"))
+        .await
+        .unwrap();
+    for i in 0..(HISTORY_CAP + 5) {
+        store
+            .record("big", &format!("SELECT {i}"), true, None)
+            .await
+            .unwrap();
+    }
+    assert_eq!(store.saved_queries("big", None).await.unwrap().len(), 1);
+}

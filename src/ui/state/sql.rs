@@ -1,6 +1,6 @@
-//! Running SQL and getting results out: the editor buffer, the script run
+//! Running SQL and getting results out: the editor buffers, the script run
 //! with its write-confirmation gate and cancellation, query-history
-//! recording, and the CSV/JSON exports.
+//! recording, saved queries (FRE-113), and the CSV/JSON exports.
 //!
 //! Split out of [`super`] for the same reason as [`super::connect`]: it is
 //! procedural orchestration over [`AppState`]'s signals — spawn a task, track
@@ -9,18 +9,86 @@
 use super::*;
 
 impl AppState {
-    /// Stores the editor buffer (synced from the webview on change). An
-    /// actual text change invalidates any pending write confirmation — the
-    /// banner must never run SQL that no longer matches the buffer.
-    pub fn set_sql_text(mut self, id: ConnectionId, text: String) {
-        let changed = {
-            let mut tab_ui = self.tab_ui.write();
-            let ui = tab_ui.entry(id).or_default();
-            let changed = ui.sql_text != text;
-            ui.sql_text = text;
-            changed
-        };
-        if changed {
+    /// One tab's SQL buffers in tab order (FRE-113). A tab that has never
+    /// been to its SQL pane has no entry yet; it reads as the one scratch
+    /// buffer such a pane shows, rather than as a write from a render path.
+    pub fn sql_buffers(&self, id: ConnectionId) -> Vec<SqlBuffer> {
+        match self.tab_ui.read().get(&id) {
+            Some(ui) => ui.sql.list().to_vec(),
+            None => SqlBuffers::default().list().to_vec(),
+        }
+    }
+
+    /// Which buffer one tab's SQL pane is showing.
+    pub fn active_sql_buffer(&self, id: ConnectionId) -> u64 {
+        self.tab_ui
+            .read()
+            .get(&id)
+            .map_or(FIRST_SQL_BUFFER, |ui| ui.sql.active())
+    }
+
+    /// One buffer's text, empty when it is gone.
+    pub fn sql_buffer_text(&self, id: ConnectionId, buffer: u64) -> String {
+        self.tab_ui
+            .read()
+            .get(&id)
+            .map_or(String::new(), |ui| ui.sql.text(buffer).to_string())
+    }
+
+    /// Stores one buffer's editor text (synced from the webview on change).
+    /// An actual text change invalidates that buffer's pending write
+    /// confirmation — the banner must never run SQL that no longer matches
+    /// the buffer.
+    pub fn set_sql_text(mut self, id: ConnectionId, buffer: u64, text: String) {
+        let changed = self
+            .tab_ui
+            .write()
+            .entry(id)
+            .or_default()
+            .sql
+            .set_text(buffer, text);
+        if changed && self.pending_sql.read().get(&id).map(|p| p.buffer) == Some(buffer) {
+            self.pending_sql.write().remove(&id);
+        }
+    }
+
+    /// Shows `text` in the SQL pane without losing what is already being
+    /// written (FRE-113): a new buffer, unless the active one is an untitled
+    /// blank. Returns the buffer now active.
+    pub fn open_sql_buffer(mut self, id: ConnectionId, title: Option<String>, text: String) -> u64 {
+        self.tab_ui
+            .write()
+            .entry(id)
+            .or_default()
+            .sql
+            .open(title, text)
+    }
+
+    /// Adds an empty scratch buffer and switches to it.
+    pub fn new_sql_buffer(self, id: ConnectionId) -> u64 {
+        self.open_sql_buffer(id, None, String::new())
+    }
+
+    /// Switches the SQL pane to another buffer.
+    pub fn select_sql_buffer(mut self, id: ConnectionId, buffer: u64) {
+        self.tab_ui
+            .write()
+            .entry(id)
+            .or_default()
+            .sql
+            .select(buffer);
+    }
+
+    /// Closes one buffer, dropping the run and the pending confirmation that
+    /// belonged to it — both name a buffer that no longer exists, and a
+    /// confirmation whose SQL the user can no longer read must never stay
+    /// runnable.
+    pub fn close_sql_buffer(mut self, id: ConnectionId, buffer: u64) {
+        self.tab_ui.write().entry(id).or_default().sql.close(buffer);
+        if self.sql_runs.read().get(&id).map(|r| r.buffer) == Some(buffer) {
+            self.sql_runs.write().remove(&id);
+        }
+        if self.pending_sql.read().get(&id).map(|p| p.buffer) == Some(buffer) {
             self.pending_sql.write().remove(&id);
         }
     }
@@ -33,7 +101,7 @@ impl AppState {
     /// A statement the connection's capabilities forbid (FRE-87) is refused
     /// here, *before* the confirmation banner — being asked to confirm a
     /// write that can never run is a prompt with no right answer.
-    pub fn run_sql(mut self, id: ConnectionId, sql: String) {
+    pub fn run_sql(mut self, id: ConnectionId, buffer: u64, sql: String) {
         self.pending_sql.write().remove(&id);
         // Effective capabilities: the backend's, narrowed by the user's
         // marking (FRE-111). Reading `pool.backend_capabilities()` here instead would
@@ -53,6 +121,7 @@ impl AppState {
             self.sql_runs.write().insert(
                 id,
                 SqlRun {
+                    buffer,
                     statements: Vec::new(),
                     status: RunStatus::Refused {
                         reason: reason.to_string(),
@@ -67,20 +136,21 @@ impl AppState {
             self.pending_sql.write().insert(
                 id,
                 PendingSql {
+                    buffer,
                     script: sql,
                     statements,
                 },
             );
             return;
         }
-        self.execute_script(id, sql, statements);
+        self.execute_script(id, buffer, sql, statements);
     }
 
     /// Confirms the write banner: runs the stashed script.
     pub fn confirm_pending_sql(mut self, id: ConnectionId) {
         let pending = self.pending_sql.write().remove(&id);
         if let Some(pending) = pending {
-            self.execute_script(id, pending.script, pending.statements);
+            self.execute_script(id, pending.buffer, pending.script, pending.statements);
         }
     }
 
@@ -133,7 +203,13 @@ impl AppState {
     /// Executes a split script in the background: reads fetch rows, writes
     /// report affected counts, execution stops at the first error. Each
     /// statement's outcome lands in [`Self::sql_runs`] as it finishes.
-    fn execute_script(mut self, id: ConnectionId, script: String, statements: Vec<String>) {
+    fn execute_script(
+        mut self,
+        id: ConnectionId,
+        buffer: u64,
+        script: String,
+        statements: Vec<String>,
+    ) {
         let Some((pool, caps)) = self
             .registry
             .read()
@@ -146,6 +222,7 @@ impl AppState {
         self.sql_runs.write().insert(
             id,
             SqlRun {
+                buffer,
                 statements: Vec::new(),
                 status: RunStatus::Running,
             },
@@ -211,13 +288,9 @@ impl AppState {
         success: bool,
         error: Option<String>,
     ) {
-        let locator = self
-            .open_locators
-            .read()
-            .iter()
-            .find(|(open_id, _)| *open_id == id)
-            .map(|(_, locator)| locator.clone());
-        let Some(locator) = locator else { return };
+        let Some(locator) = self.connection_locator(id) else {
+            return;
+        };
         let store = self.history.read().clone();
         let Some(store) = store else { return };
         match store
@@ -254,13 +327,9 @@ impl AppState {
 
     /// Deletes one connection's history and refreshes open panels.
     pub fn clear_history(self, id: ConnectionId) {
-        let locator = self
-            .open_locators
-            .read()
-            .iter()
-            .find(|(open_id, _)| *open_id == id)
-            .map(|(_, locator)| locator.clone());
-        let Some(locator) = locator else { return };
+        let Some(locator) = self.connection_locator(id) else {
+            return;
+        };
         let store = self.history.read().clone();
         let Some(store) = store else { return };
         let mut nonce_signal = self.history_nonce;
@@ -268,6 +337,92 @@ impl AppState {
             if store.clear(&locator).await.is_ok() {
                 let mut nonce = nonce_signal.write();
                 *nonce += 1;
+            }
+        });
+    }
+
+    /// The locator one open connection was opened from — the scope a saved
+    /// query or a history entry belongs to. `None` once the tab is gone.
+    pub fn connection_locator(&self, id: ConnectionId) -> Option<String> {
+        self.open_locators
+            .read()
+            .iter()
+            .find(|(open_id, _)| *open_id == id)
+            .map(|(_, locator)| locator.clone())
+    }
+
+    /// Saves editor text under a name (FRE-113), scoped to this connection or
+    /// global. Best-effort and off the UI path like the history writes; the
+    /// outcome — including a failure — lands in [`Self::saved_status`], and a
+    /// success bumps [`Self::saved_nonce`] so open panels re-query.
+    ///
+    /// A successful save also titles the buffer it came from, so the query
+    /// tab stops reading "Query 2" the moment it has a name.
+    pub fn save_query(
+        mut self,
+        id: ConnectionId,
+        buffer: u64,
+        name: String,
+        description: Option<String>,
+        sql: String,
+        global: bool,
+    ) {
+        let locator = self.connection_locator(id);
+        let store = self.history.read().clone();
+        let Some(store) = store else {
+            self.saved_status.set(Some(SavedStatus::Failed(
+                "the saved-query store is unavailable".to_string(),
+            )));
+            return;
+        };
+        // A connection-scoped save needs a scope; without a locator the tab
+        // is already gone, and silently writing a global would put the query
+        // somewhere the user did not ask for.
+        if !global && locator.is_none() {
+            self.saved_status.set(Some(SavedStatus::Failed(
+                "this connection is no longer open".to_string(),
+            )));
+            return;
+        }
+        let scope = (!global).then_some(locator).flatten();
+        spawn_forever(async move {
+            let outcome = store
+                .save_query(&name, description.as_deref(), &sql, scope.as_deref())
+                .await;
+            match outcome {
+                Ok(outcome) => {
+                    self.saved_status.set(Some(SavedStatus::Saved {
+                        name: name.trim().to_string(),
+                        replaced: outcome == SaveOutcome::Replaced,
+                    }));
+                    self.title_sql_buffer(id, buffer, name.trim().to_string());
+                    let mut nonce = self.saved_nonce.write();
+                    *nonce += 1;
+                }
+                Err(err) => self.saved_status.set(Some(SavedStatus::Failed(err))),
+            }
+        });
+    }
+
+    /// Names an existing buffer after the query just saved from it.
+    fn title_sql_buffer(mut self, id: ConnectionId, buffer: u64, title: String) {
+        let mut tab_ui = self.tab_ui.write();
+        if let Some(ui) = tab_ui.get_mut(&id) {
+            ui.sql.set_title(buffer, title);
+        }
+    }
+
+    /// Deletes one saved query and refreshes open panels.
+    pub fn delete_saved_query(mut self, entry: i64) {
+        let store = self.history.read().clone();
+        let Some(store) = store else { return };
+        spawn_forever(async move {
+            match store.delete_saved_query(entry).await {
+                Ok(()) => {
+                    let mut nonce = self.saved_nonce.write();
+                    *nonce += 1;
+                }
+                Err(err) => self.saved_status.set(Some(SavedStatus::Failed(err))),
             }
         });
     }

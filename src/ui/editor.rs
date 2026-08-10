@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use dioxus_icons::lucide::Play;
+use dioxus_icons::lucide::{Play, Plus, X};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -12,7 +12,10 @@ use crate::db::{
 use super::history_panel::HistoryPanel;
 use super::js::js_string;
 use super::notice::{Banner, BannerKind, EmptyState, LoadingLine};
-use super::state::{AppState, ExportPane, ExportStatus, RunStatus, SchemaLoad, SharedStatement};
+use super::saved_panel::SavedQueriesPanel;
+use super::state::{
+    AppState, ExportPane, ExportStatus, RunStatus, SchemaLoad, SharedStatement, SqlBuffer,
+};
 
 /// Cap on rendered result rows (per statement). The full result still sits
 /// in memory until FRE-33 introduces streaming/limits at the query layer,
@@ -27,9 +30,40 @@ enum EditorMessage {
     Doc { doc: String },
 }
 
-/// Free-form SQL pane: CodeMirror 6 editor (bundled locally in
-/// assets/codemirror.js — the app works offline) above, results below.
-/// Ctrl+Enter runs the buffer, or just the selection when one exists.
+/// Which side panel the SQL pane is showing. At most one at a time: they are
+/// the same width and the same shape, and both open would leave no editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorPanel {
+    None,
+    History,
+    Saved,
+}
+
+/// The DOM id of one connection tab's CodeMirror host.
+///
+/// One instance per tab, not per buffer: switching query tabs pushes the new
+/// buffer's text into it with `setDoc` (what the history panel's Load has
+/// always done) rather than mounting a second editor. A per-buffer instance
+/// looked cleaner and was wrong — Dioxus diffs the two hosts into the *same*
+/// DOM node, so the outgoing editor stayed in place and the incoming buffer
+/// was never shown.
+fn editor_element_id(id: ConnectionId) -> String {
+    format!("sql-editor-{id:?}").replace(['(', ')'], "-")
+}
+
+/// The name on a query tab: the saved query it was opened from, or its
+/// position for a scratch buffer (FRE-113). Position rather than "Untitled"
+/// so several scratch buffers stay tellable apart.
+fn buffer_label(buffer: &SqlBuffer, index: usize) -> String {
+    match &buffer.title {
+        Some(title) => title.clone(),
+        None => format!("Query {}", index + 1),
+    }
+}
+
+/// Free-form SQL pane: a strip of query tabs over a CodeMirror 6 editor
+/// (bundled locally in assets/codemirror.js — the app works offline), results
+/// below. Ctrl+Enter runs the buffer, or just the selection when one exists.
 #[component]
 pub fn SqlEditor(id: ConnectionId) -> Element {
     let state = use_context::<AppState>();
@@ -39,80 +73,51 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
         .get(id)
         .map(|c| c.pool.dialect())
         .unwrap_or(Dialect::Sqlite);
-    let editor_element = format!("sql-editor-{id:?}").replace(['(', ')'], "-");
-    let dialect_name = match dialect {
-        Dialect::Postgres => "postgres",
-        Dialect::Sqlite => "sqlite",
-        Dialect::SqlServer => "mssql",
-    };
+    let editor_element = editor_element_id(id);
+    // The query tabs and which one is showing (FRE-113). Both are memos: they
+    // read `tab_ui`, which changes on every keystroke, and a memo's PartialEq
+    // gate is what keeps the pane from re-rendering for text nobody's tab
+    // strip can see (FRE-129).
+    let tabs = use_memo(move || {
+        state
+            .sql_buffers(id)
+            .iter()
+            .enumerate()
+            .map(|(index, buffer)| (buffer.id, buffer_label(buffer, index)))
+            .collect::<Vec<(u64, String)>>()
+    });
+    let active_buffer = use_memo(move || state.active_sql_buffer(id));
+    let active = active_buffer();
 
-    // Mount CodeMirror once and pump its messages. The eval channel stays
-    // open for the component's lifetime; unmounting destroys the JS view.
-    let element_for_effect = editor_element.clone();
+    // Show the active buffer's text. Runs on a real buffer *switch* only —
+    // the memo gates it — and reads the text with `peek`, so a keystroke
+    // never pushes the document back into the editor under the caret.
+    let element_for_switch = editor_element.clone();
     use_effect(move || {
-        let element = element_for_effect.clone();
-        let initial = state
+        let buffer = active_buffer();
+        let text = state
             .tab_ui
             .peek()
             .get(&id)
-            .map(|ui| ui.sql_text.clone())
-            .unwrap_or_default();
-        // Whatever the introspection has produced so far; the refresh
-        // effect below pushes updates once (re)loads finish.
-        let schema_json = match state.schemas.peek().get(&id) {
-            Some(SchemaLoad::Ready(tables)) => completion_schema(tables, dialect).to_string(),
-            _ => "{}".to_string(),
-        };
-        let initial_json = js_string(&initial);
-        spawn(async move {
-            let js = format!(
-                r#"
-                window.__dvRun = (p) => dioxus.send(JSON.stringify({{ kind: "run", sql: p.sql }}));
-                window.__dvDoc = (p) => dioxus.send(JSON.stringify({{ kind: "doc", doc: p.doc }}));
-                DVEditor.create("{element}", "{element}", "{dialect_name}", {initial_json}, {schema_json});
-                "#
-            );
-            let mut channel = document::eval(&js);
-            // The channel closes (Err) when the component unmounts.
-            while let Ok(raw) = channel.recv::<String>().await {
-                match serde_json::from_str::<EditorMessage>(&raw) {
-                    Ok(EditorMessage::Run { sql }) => {
-                        let trimmed = sql.trim();
-                        if !trimmed.is_empty() {
-                            state.run_sql(id, trimmed.to_string());
-                        }
-                    }
-                    Ok(EditorMessage::Doc { doc }) => state.set_sql_text(id, doc),
-                    Err(_) => {}
-                }
-            }
-        });
-    });
-
-    // Keep completion data in sync with schema reloads: reading the signal
-    // (not peeking) subscribes this effect, so it re-runs whenever
-    // `load_schema` rewrites the entry. While a reload is in flight
-    // (Loading) or failed, the editor keeps its previous completions.
-    let element_for_schema = editor_element.clone();
-    use_effect(move || {
-        let schema_json = match state.schemas.read().get(&id) {
-            Some(SchemaLoad::Ready(tables)) => completion_schema(tables, dialect).to_string(),
-            _ => return,
-        };
+            .map_or(String::new(), |ui| ui.sql.text(buffer).to_string());
         document::eval(&format!(
-            r#"DVEditor.updateSchema("{element_for_schema}", "{dialect_name}", {schema_json});"#
+            r#"DVEditor.setDoc("{element_for_switch}", {});"#,
+            js_string(&text)
         ));
-    });
-
-    let element_for_drop = editor_element.clone();
-    use_drop(move || {
-        document::eval(&format!(r#"DVEditor.destroy("{element_for_drop}");"#));
     });
 
     // Cheap despite running every render: the statements are Arc-shared
     // [`SharedStatement`]s, so this clones pointers and the small status —
     // never the result rows (FRE-134).
-    let run = state.sql_runs.read().get(&id).cloned();
+    //
+    // Filtered to the active buffer: one connection still runs one script at
+    // a time, but its results belong to the buffer that ran them.
+    let run = state
+        .sql_runs
+        .read()
+        .get(&id)
+        .filter(|run| run.buffer == active)
+        .cloned();
     let running = matches!(run.as_ref().map(|r| &r.status), Some(RunStatus::Running));
     // What this connection won't run, stated before the user writes it
     // (FRE-87). `run_sql` refuses the same cases, so the note explains a
@@ -130,13 +135,18 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
         Some(caps) if !caps.ddl => Some(NO_DDL),
         _ => None,
     };
-    let pending_writes = state.pending_sql.read().get(&id).map(|pending| {
-        pending
-            .statements
-            .iter()
-            .filter(|s| needs_confirmation(s, dialect))
-            .count()
-    });
+    let pending_writes = state
+        .pending_sql
+        .read()
+        .get(&id)
+        .filter(|pending| pending.buffer == active)
+        .map(|pending| {
+            pending
+                .statements
+                .iter()
+                .filter(|s| needs_confirmation(s, dialect))
+                .count()
+        });
     // Under Confirm (FRE-111) the banner names the connection: the whole
     // point of the state is to make you read *which* database you are about
     // to change, which "Run anyway?" alone never made you do.
@@ -144,7 +154,7 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
         .confirms_writes(id)
         .then(|| state.registry.read().get(id).map(|c| c.name.clone()))
         .flatten();
-    let mut show_history = use_signal(|| false);
+    let panel = use_signal(|| EditorPanel::None);
 
     rsx! {
         div { class: "flex h-full min-h-0",
@@ -170,24 +180,48 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
                             "Cancel"
                         }
                     }
-                    button {
-                        class: if show_history() {
-                            "rounded bg-slate-300 dark:bg-slate-700 px-2 py-0.5 text-xs text-slate-900 dark:text-slate-100"
-                        } else {
-                            "rounded border border-slate-300 dark:border-slate-700 px-2 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100"
-                        },
-                        onclick: move |_| {
-                            let showing = *show_history.read();
-                            show_history.set(!showing);
-                        },
-                        "History"
-                    }
+                    PanelButton { panel, target: EditorPanel::Saved, label: "Saved" }
+                    PanelButton { panel, target: EditorPanel::History, label: "History" }
                 }
             }
-            div {
-                id: "{editor_element}",
-                class: "h-1/2 min-h-0 shrink-0 overflow-hidden border-b border-slate-300 dark:border-slate-700 text-sm",
+            // The query tabs. Opening a saved query adds one here instead of
+            // replacing what is in the editor (FRE-113).
+            div { class: "flex items-center gap-1 overflow-x-auto border-b border-slate-200 dark:border-slate-800 px-2 py-1",
+                for (buffer_id, label) in tabs().into_iter() {
+                    div {
+                        key: "{buffer_id}",
+                        class: if buffer_id == active {
+                            "flex shrink-0 items-center gap-1 rounded bg-slate-200 dark:bg-slate-700 px-2 py-0.5 text-xs text-slate-900 dark:text-slate-100"
+                        } else {
+                            "flex shrink-0 items-center gap-1 rounded px-2 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
+                        },
+                        button {
+                            class: "max-w-40 truncate",
+                            title: "{label}",
+                            onclick: move |_| state.select_sql_buffer(id, buffer_id),
+                            "{label}"
+                        }
+                        if tabs.read().len() > 1 {
+                            button {
+                                class: "rounded px-0.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-600 hover:text-slate-900 dark:hover:text-slate-100",
+                                aria_label: "Close query tab",
+                                onclick: move |_| state.close_sql_buffer(id, buffer_id),
+                                X { size: 10 }
+                            }
+                        }
+                    }
+                }
+                button {
+                    class: "shrink-0 rounded px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                    title: "New query tab",
+                    aria_label: "New query tab",
+                    onclick: move |_| {
+                        state.new_sql_buffer(id);
+                    },
+                    Plus { size: 12 }
+                }
             }
+            EditorSurface { id, dialect }
             div { class: "min-h-0 flex-1 overflow-auto",
                 if let Some(write_count) = pending_writes {
                     div { class: "flex items-center gap-3 border-b border-amber-300 dark:border-amber-900/50 bg-amber-100 dark:bg-amber-950/30 px-4 py-2",
@@ -238,9 +272,128 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
                 }
             }
         }
-        if show_history() {
-            HistoryPanel { id, editor_element: editor_element.clone() }
+        match panel() {
+            EditorPanel::None => rsx! {},
+            EditorPanel::History => rsx! {
+                HistoryPanel { id, buffer: active, editor_element: editor_element.clone() }
+            },
+            EditorPanel::Saved => rsx! {
+                SavedQueriesPanel { id, buffer: active }
+            },
         }
+        }
+    }
+}
+
+/// One of the SQL toolbar's panel toggles. Clicking the open one closes it.
+#[component]
+fn PanelButton(panel: Signal<EditorPanel>, target: EditorPanel, label: String) -> Element {
+    let mut panel = panel;
+    rsx! {
+        button {
+            class: if panel() == target {
+                "rounded bg-slate-300 dark:bg-slate-700 px-2 py-0.5 text-xs text-slate-900 dark:text-slate-100"
+            } else {
+                "rounded border border-slate-300 dark:border-slate-700 px-2 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100"
+            },
+            onclick: move |_| {
+                let showing = panel() == target;
+                panel.set(if showing { EditorPanel::None } else { target });
+            },
+            "{label}"
+        }
+    }
+}
+
+/// The CodeMirror host: mounts the editor, pumps its messages, keeps its
+/// completion namespace in sync, and destroys it on unmount.
+///
+/// Its own component so the parent can re-render (a new query tab, a finished
+/// run) without remounting the editor. Which buffer its messages belong to is
+/// resolved when each message arrives — the instance outlives every buffer
+/// switch, so a captured id would go stale on the first one.
+#[component]
+fn EditorSurface(id: ConnectionId, dialect: Dialect) -> Element {
+    let state = use_context::<AppState>();
+    let element = editor_element_id(id);
+    let dialect_name = match dialect {
+        Dialect::Postgres => "postgres",
+        Dialect::Sqlite => "sqlite",
+        Dialect::SqlServer => "mssql",
+    };
+
+    // Mount CodeMirror once and pump its messages. The eval channel stays
+    // open for the component's lifetime; unmounting destroys the JS view.
+    let element_for_effect = element.clone();
+    use_effect(move || {
+        let element = element_for_effect.clone();
+        // Peeked, not read: this effect must run on mount and never again,
+        // or every keystroke would recreate the editor.
+        let initial = state
+            .tab_ui
+            .peek()
+            .get(&id)
+            .map_or(String::new(), |ui| ui.sql.text(ui.sql.active()).to_string());
+        // Whatever the introspection has produced so far; the refresh
+        // effect below pushes updates once (re)loads finish.
+        let schema_json = match state.schemas.peek().get(&id) {
+            Some(SchemaLoad::Ready(tables)) => completion_schema(tables, dialect).to_string(),
+            _ => "{}".to_string(),
+        };
+        let initial_json = js_string(&initial);
+        spawn(async move {
+            let js = format!(
+                r#"
+                window.__dvRun = (p) => dioxus.send(JSON.stringify({{ kind: "run", sql: p.sql }}));
+                window.__dvDoc = (p) => dioxus.send(JSON.stringify({{ kind: "doc", doc: p.doc }}));
+                DVEditor.create("{element}", "{element}", "{dialect_name}", {initial_json}, {schema_json});
+                "#
+            );
+            let mut channel = document::eval(&js);
+            // The channel closes (Err) when the component unmounts.
+            while let Ok(raw) = channel.recv::<String>().await {
+                match serde_json::from_str::<EditorMessage>(&raw) {
+                    Ok(EditorMessage::Run { sql }) => {
+                        let trimmed = sql.trim();
+                        if !trimmed.is_empty() {
+                            let buffer = state.active_sql_buffer(id);
+                            state.run_sql(id, buffer, trimmed.to_string());
+                        }
+                    }
+                    Ok(EditorMessage::Doc { doc }) => {
+                        let buffer = state.active_sql_buffer(id);
+                        state.set_sql_text(id, buffer, doc);
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+    });
+
+    // Keep completion data in sync with schema reloads: reading the signal
+    // (not peeking) subscribes this effect, so it re-runs whenever
+    // `load_schema` rewrites the entry. While a reload is in flight
+    // (Loading) or failed, the editor keeps its previous completions.
+    let element_for_schema = element.clone();
+    use_effect(move || {
+        let schema_json = match state.schemas.read().get(&id) {
+            Some(SchemaLoad::Ready(tables)) => completion_schema(tables, dialect).to_string(),
+            _ => return,
+        };
+        document::eval(&format!(
+            r#"DVEditor.updateSchema("{element_for_schema}", "{dialect_name}", {schema_json});"#
+        ));
+    });
+
+    let element_for_drop = element.clone();
+    use_drop(move || {
+        document::eval(&format!(r#"DVEditor.destroy("{element_for_drop}");"#));
+    });
+
+    rsx! {
+        div {
+            id: "{element}",
+            class: "h-1/2 min-h-0 shrink-0 overflow-hidden border-b border-slate-300 dark:border-slate-700 text-sm",
         }
     }
 }
