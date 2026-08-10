@@ -155,47 +155,23 @@ impl PgConn {
 /// The URL may carry a password; saved config never does — callers splice a
 /// session password in via [`url_with_password`].
 pub async fn open_postgres(url: &str) -> Result<PgConn, DbError> {
-    // The flavor has to be known *before* the pool exists, not after: a
-    // reimplementation may need a session default applied to every connection
-    // the pool opens later, and `after_connect` is fixed when the pool is
-    // built. Hence a probe connection first — which also serves as the
-    // liveness check this function has always made, so the cost is one
-    // connect rather than a query that was already being run.
-    let flavor = probe_flavor(url).await?;
-
-    // Note on what is deliberately *not* set here (FRE-90). CockroachDB's
-    // `autocommit_before_ddl` defaults to on, committing the open transaction
-    // before each DDL statement — so a failing script's `CREATE TABLE`
-    // survives the rollback hubro reports (see `tests/db_cockroach.rs`).
-    // Turning it off does restore transactional DDL, and was tried; it also
-    // makes every `ALTER TABLE` / `CREATE INDEX` against a *schema-locked*
-    // table fail, and Cockroach creates tables schema-locked by default. That
-    // trades a gap in an uncommon operation for breaking a common one against
-    // tables hubro did not create, so the engine's default stands and the
-    // limitation is documented instead.
     let pool = PgPoolOptions::new()
         .max_connections(4)
         .connect(url)
         .await
         .map_err(|e| DbError::Connect(friendly_connect_error(&e)))?;
-    Ok(PgConn { pool, flavor })
-}
-
-/// Opens one connection solely to ask the server who it is, then drops it.
-async fn probe_flavor(url: &str) -> Result<PgFlavor, DbError> {
-    use sqlx::Connection as _;
-
-    let mut conn = sqlx::postgres::PgConnection::connect(url)
-        .await
-        .map_err(|e| DbError::Connect(friendly_connect_error(&e)))?;
+    // `SELECT version()` in place of the `SELECT 1` this used to run: it is
+    // the same liveness check — one round trip on a connection the pool has
+    // already opened — and it answers who the server is at the same time, so
+    // knowing the flavor costs nothing (FRE-90).
     let version: String = sqlx::query_scalar("SELECT version()")
-        .fetch_one(&mut conn)
+        .fetch_one(&pool)
         .await
         .map_err(|e| DbError::Connect(friendly_connect_error(&e)))?;
-    // The probe has served its purpose; a close failure says nothing about
-    // whether the real pool will connect.
-    let _ = conn.close().await;
-    Ok(detect_flavor(&version))
+    Ok(PgConn {
+        pool,
+        flavor: detect_flavor(&version),
+    })
 }
 
 /// Categorizes common failure modes so the connections screen reads well:
@@ -659,31 +635,6 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
         }
     }
 
-    // Schemas the engine reserves for its own catalog beyond the two the
-    // queries above already exclude (FRE-90).
-    //
-    // CockroachDB puts 119 objects in `crdb_internal` and `pg_extension` and
-    // lists both in `information_schema.tables` exactly as it lists the user's
-    // own tables — so without this the schema tree is mostly Cockroach's
-    // bookkeeping, and most of it does not even open (`crdb_internal` refuses
-    // to be read at all unless `allow_unsafe_internals` is set). None of it is
-    // reachable through `pg_depend`, which is how every other internal object
-    // here is found: these are not extension members, they are the engine.
-    //
-    // Matching on the name is what FRE-88 rules out — but the rule there is
-    // about *guessing* from a name, and this is not a guess on two counts.
-    // The connection has already identified itself as CockroachDB, so no
-    // stock-Postgres database can reach this; and on CockroachDB both names
-    // are reserved by the engine (`CREATE SCHEMA crdb_internal` is refused —
-    // it already exists), so no user's schema can ever be caught by it. That
-    // is the same standing the hardcoded `pg_catalog` and `information_schema`
-    // above have.
-    if conn.flavor() == PgFlavor::CockroachDB {
-        for schema in ["crdb_internal", "pg_extension"] {
-            internal_schemas.insert(schema.to_string(), Internal::System);
-        }
-    }
-
     // Tables and views across all non-system schemas. Materialized views
     // (relkind 'm') are not in information_schema, so they come from a
     // pg_catalog UNION (FRE-41).
@@ -850,17 +801,40 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
         let schema: String = get(row, "table_schema")?;
         let name: String = get(row, "table_name")?;
         let key = (schema.clone(), name.clone());
+        // `SYSTEM VIEW` is the engine's own catalog, in a schema it reserves
+        // beyond the two excluded above (FRE-90). CockroachDB reports 119 such
+        // objects — `crdb_internal` and `pg_extension` — and lists them here
+        // exactly as it lists the user's tables, so without this the schema
+        // tree is mostly Cockroach's bookkeeping, and most of it does not even
+        // open (`crdb_internal` refuses to be read at all without
+        // `allow_unsafe_internals`).
+        //
+        // Taken from `table_type` rather than from a list of schema names,
+        // which is what FRE-88 rules out: this is the server's own
+        // classification of the object, in a query already being run. Stock
+        // PostgreSQL never emits the value — it has nothing left to classify
+        // once `pg_catalog` and `information_schema` are excluded — so the
+        // rule needs no engine check and costs nothing to carry.
+        let system = table_type == "SYSTEM VIEW";
         // The object's own rule first, then its schema's — most specific wins.
+        // Naming the extension beats naming the engine for the same reason it
+        // beats naming the shape above: it is the part the user can act on.
         let internal = internal_objects
             .get(&key)
-            .or_else(|| internal_schemas.get(&schema))
-            .cloned();
+            .cloned()
+            .or_else(|| system.then_some(Internal::System))
+            .or_else(|| internal_schemas.get(&schema).cloned());
         let kind_label = kind_labels.get(&key).cloned();
         tables.push(TableMeta {
             schema: Some(schema),
             name,
             kind: match table_type.as_str() {
-                "VIEW" => TableKind::View,
+                // A `SYSTEM VIEW` is a view, and saying so keeps it read-only
+                // by the ordinary route: nothing about being the engine's own
+                // catalog makes its rows addressable, and the alternative
+                // (falling through to `Table`) would offer editing on 119
+                // objects that mostly cannot even be read.
+                "VIEW" | "SYSTEM VIEW" => TableKind::View,
                 "MATERIALIZED VIEW" => TableKind::MaterializedView,
                 _ => TableKind::Table,
             },
@@ -1464,8 +1438,8 @@ mod tests {
         // written to match the parser (FRE-90/91/92).
         for (version, expected) in [
             (
-                "PostgreSQL 17.5 (Debian 17.5-1.pgdg120+1) on x86_64-pc-linux-gnu, \
-                 compiled by gcc (Debian 12.2.0-14) 12.2.0, 64-bit",
+                "PostgreSQL 17.10 on x86_64-pc-linux-musl, compiled by gcc \
+                 (Alpine 15.2.0) 15.2.0, 64-bit",
                 PgFlavor::Postgres,
             ),
             (

@@ -26,9 +26,11 @@
 //!     so one column's width took down the whole schema tree. The query now
 //!     pins the width itself.
 //!  2. **The schema tree was mostly Cockroach's.** `crdb_internal` and
-//!     `pg_extension` hold over a hundred objects and are listed like user
-//!     tables, and most of them cannot even be opened. They are now marked
-//!     [`Internal::System`], which the sidebar already knows how to hide.
+//!     `pg_extension` hold 119 objects and are listed like user tables, and
+//!     most of them cannot even be opened. Cockroach reports them as
+//!     `table_type = 'SYSTEM VIEW'`, a value stock PostgreSQL never emits, so
+//!     introspection now reads them off that: marked [`Internal::System`] for
+//!     the sidebar to hide, and typed as views rather than tables.
 //!
 //! One is a known gap, left as it is on purpose:
 //!
@@ -135,10 +137,12 @@ async fn cockroach_identifies_itself_as_its_own_engine() {
     let Some(url) = test_url() else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
 
-    // Everything else in this file rests on the connection knowing what it is
-    // talking to: the reserved-schema rule and the DDL-atomicity setting are
-    // both gated on this answer, so a detection regression would silently
-    // restore both bugs while every other test still passed.
+    // Nothing else in this file depends on this answer, and that is
+    // deliberate: every fix FRE-90 landed reads a catalog fact instead, so the
+    // backend behaves correctly here whether or not it recognises the engine.
+    // Detection exists to *report* who answered — and because FRE-92 needs it
+    // to declare Materialize's capabilities, which no catalog fact supplies.
+    // `stock_postgres_is_detected_as_stock_postgres` pins the other direction.
     assert_eq!(pool.pg_flavor(), Some(PgFlavor::CockroachDB));
 
     pool.close().await;
@@ -203,6 +207,11 @@ async fn cockroach_reserved_catalog_schemas_are_marked_as_the_engines_own() {
     // the equivalent in the two schemas introspection already excludes, so
     // nothing else here catches these: they are not extension members (the
     // pg_depend path finds nothing on Cockroach) and not partitions.
+    //
+    // Selected by schema *here* even though the backend classifies them by
+    // `table_type`, which is the point: the test names the objects
+    // independently of the rule under test, so a rule that quietly stopped
+    // matching would fail this rather than select nothing and pass.
     let reserved: Vec<&TableMeta> = tables
         .iter()
         .filter(|t| {
@@ -219,6 +228,15 @@ async fn cockroach_reserved_catalog_schemas_are_marked_as_the_engines_own() {
     );
     for table in &reserved {
         assert_eq!(table.internal, Some(Internal::System), "{table:?}");
+        // A `SYSTEM VIEW` is a view: nothing about being the engine's own
+        // catalog makes its rows addressable, and reading it as a table would
+        // offer editing on objects that mostly cannot even be read.
+        assert_eq!(table.kind, TableKind::View, "{table:?}");
+        assert_eq!(
+            detect_row_identity(table, pool.dialect()),
+            None,
+            "{table:?}"
+        );
     }
 
     // ...and the user's own schema is untouched by the rule.
