@@ -461,6 +461,25 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         }
     });
 
+    // Whether this object has any rows to list at all (FRE-148). Resolved
+    // beside the other read-side facts, and through the same memo gate for the
+    // same reason, so that a declared-unbrowsable object never reaches the
+    // server: the query it would otherwise run is one the engine answers with
+    // an error about an object that stores nothing. A RisingWave sink is the
+    // case — it writes outward to Kafka or another database.
+    let gate_table = table.clone();
+    let unbrowsable = use_memo(move || {
+        let registry = state.registry.read();
+        let schemas = state.schemas.read();
+        match (
+            find_table_meta(schemas.get(&id), &gate_table),
+            registry.get(id),
+        ) {
+            (Some(meta), Some(connection)) => connection.access(meta).unreadable,
+            _ => None,
+        }
+    });
+
     let table_for_resource = table.clone();
     let rows_resource = use_resource(move || {
         let table = table_for_resource.clone();
@@ -477,6 +496,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             extra_key_column,
         };
         let _ = refresh_nonce();
+        let refused = unbrowsable();
         // Peeked, not read: subscribing to `registry` here would re-fetch on
         // any connection open/close. The pool for a ConnectionId never
         // changes while this grid is mounted — the registry's only writes
@@ -485,6 +505,9 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         // change to react to; a reconnect is a new id and a new grid.
         let pool = state.registry.peek().get(id).map(|c| c.pool.clone());
         async move {
+            if let Some(reason) = refused {
+                return Err(crate::db::DbError::Unsupported(reason.to_string()));
+            }
             let Some(pool) = pool else {
                 return Err(crate::db::DbError::Query("connection closed".into()));
             };
@@ -514,11 +537,17 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             extra_key_column: None,
         };
         let _ = refresh_nonce();
+        let refused = unbrowsable();
         // Peeked for the same reason as in `rows_resource`: the pool for a
         // ConnectionId is fixed for the connection's lifetime, and reading
         // `registry` would re-count on unrelated connection opens/closes.
         let pool = state.registry.peek().get(id).map(|c| c.pool.clone());
         async move {
+            // Gated as well as the page: counting rows an object does not have
+            // is the same query failing for the same reason.
+            if let Some(reason) = refused {
+                return Err(crate::db::DbError::Unsupported(reason.to_string()));
+            }
             let Some(pool) = pool else {
                 return Err(crate::db::DbError::Query("connection closed".into()));
             };
@@ -804,6 +833,9 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // missing.
     let read_only_notice: Option<&'static str> =
         access.as_ref().and_then(TableAccess::read_only_notice);
+    // Whether this object has rows to list at all (FRE-148). Absent access
+    // means the schema has not loaded yet, which is not a refusal.
+    let can_read = access.as_ref().is_none_or(TableAccess::can_read);
 
     // Staged (unsaved) changes of this table, if any.
     let stage: Option<TableStage> = state.table_stage(id, &table);
@@ -1004,6 +1036,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                 id,
                 table: table.clone(),
                 dialect,
+                can_read,
                 detail_open,
                 meta: meta.clone(),
                 filter_column,
@@ -1031,8 +1064,12 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                 confirm,
                 read_only_notice,
             }
-            // Read-only notice (views / no usable row key)
-            if let Some(notice) = read_only_notice {
+            // Read-only notice (views / no usable row key). Suppressed for an
+            // object with no rows at all: its restriction explains both why it
+            // cannot be edited and why it cannot be opened, and the grid below
+            // is already showing that same sentence — twice on one screen
+            // reads as two problems (FRE-148).
+            if let Some(notice) = read_only_notice.filter(|_| can_read) {
                 div { class: "px-3 pt-2",
                     Banner { kind: BannerKind::Info, message: notice.to_string() }
                 }
@@ -1058,6 +1095,20 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     match current.as_ref() {
                         None => rsx! {
                             DelayedLoading { label: "Loading…" }
+                        },
+                        // An object the backend declares has no rows (FRE-148)
+                        // is not a failure to report in red: nothing went
+                        // wrong, and there is simply nothing to list. A
+                        // RisingWave sink is the case — it writes outward to
+                        // Kafka or another database and stores nothing itself.
+                        // The sentence is the backend's own, so it explains the
+                        // object rather than naming the engine.
+                        Some(Err(crate::db::DbError::Unsupported(reason))) => rsx! {
+                            EmptyState {
+                                icon: rsx! { File { size: 40 } },
+                                title: "Nothing to browse here",
+                                hint: "{reason}",
+                            }
                         },
                         Some(Err(err)) => rsx! {
                             div { class: "p-3",
@@ -1364,6 +1415,10 @@ fn GridToolbar(
     /// `None` until the connection reports one; gates the INSERT copy format
     /// and the export buttons, which both need to know the dialect.
     dialect: Option<Dialect>,
+    /// Whether this object has rows to read (FRE-148). False hides the export
+    /// affordances: an export is the same query the grid is refusing, so
+    /// offering it would hand back the failure the gate just prevented.
+    can_read: bool,
     /// Whether the row detail panel is docked — the toggle's pressed state.
     /// A prop rather than a read, because [`DataGrid`] needs it for the body
     /// layout anyway.
@@ -1531,7 +1586,7 @@ fn GridToolbar(
                     }
                 }
             }
-            if let Some(export_dialect) = dialect {
+            if let Some(export_dialect) = dialect.filter(|_| can_read) {
                 button {
                     class: "rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
                     title: "Export the current view (filter + sort, all rows) to CSV",

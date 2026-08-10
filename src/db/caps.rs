@@ -100,6 +100,17 @@ pub enum Restriction {
     /// not writable (a DuckDB view over a Parquet file, a StarRocks
     /// duplicate-key table), or the user's own read-only marking (FRE-111).
     Declared(&'static str),
+    /// The object has no rows *at all*, so it is neither writable nor
+    /// browsable — a RisingWave sink, which writes outward to Kafka or another
+    /// database and stores nothing of its own (FRE-148).
+    ///
+    /// The one restriction that also narrows reading. It is a distinct variant
+    /// rather than a flag beside [`Self::Declared`] because a backend declares
+    /// it once and both consequences follow: the object stops offering
+    /// editing, *and* stops being opened. Before it existed, a sink resolved
+    /// to a view — correctly unwritable, but views are browsable, so opening
+    /// one ran a query the engine answered with `table or source not found`.
+    NoRows(&'static str),
 }
 
 impl Restriction {
@@ -111,8 +122,17 @@ impl Restriction {
             Restriction::NoRowIdentity => {
                 "This table has no primary key or usable unique index — editing will be disabled."
             }
-            Restriction::Declared(message) => message,
+            Restriction::Declared(message) | Restriction::NoRows(message) => message,
         }
+    }
+
+    /// Whether this restriction also means the object cannot be *read*.
+    ///
+    /// False for every other variant, and deliberately so: a view, a
+    /// materialized view and a key-less table are all browsable: what they
+    /// lack is a way to address one row for writing.
+    pub fn hides_rows(self) -> bool {
+        matches!(self, Restriction::NoRows(_))
     }
 }
 
@@ -251,6 +271,15 @@ pub struct TableAccess {
     /// fetch) and for writes. `None` when no such addressing exists.
     pub identity: Option<RowIdentity>,
     pub restriction: Option<Restriction>,
+    /// Why this object has no rows to show, when it has none (FRE-148) — the
+    /// read mirror of [`Self::restriction`], and `None` for everything that
+    /// can be browsed.
+    ///
+    /// Separate from `restriction` even though it is derived from it, because
+    /// the two answer different questions and a read-only connection makes
+    /// them disagree: there, `restriction` is the connection's refusal to
+    /// write, while whether the object has rows is unchanged.
+    pub unreadable: Option<&'static str>,
 }
 
 impl TableAccess {
@@ -262,6 +291,15 @@ impl TableAccess {
         // Identity is resolved even for objects that can't be written: the
         // grid's cell-fetch path pins a row by the same key.
         let identity = detect_row_identity(table, dialect);
+        // Read narrowing is taken from the object's own declaration and
+        // nothing else, *before* the write chain below — which short-circuits
+        // on a read-only connection and would otherwise never look at the
+        // object at all. Whether something has rows to show is a fact about
+        // the object; whether this connection may write is not.
+        let unreadable = table
+            .restriction
+            .filter(|r| r.hides_rows())
+            .map(Restriction::message);
         let restriction = if !defaults.mutate {
             Some(CONNECTION_READ_ONLY)
         } else if let Some(declared) = table.restriction {
@@ -289,10 +327,12 @@ impl TableAccess {
         TableAccess {
             caps: Capabilities {
                 mutate: restriction.is_none() && defaults.mutate,
+                read_query: defaults.read_query && unreadable.is_none(),
                 ..defaults
             },
             identity,
             restriction,
+            unreadable,
         }
     }
 
@@ -326,6 +366,10 @@ impl TableAccess {
         }
         access.caps = Capabilities {
             mutate: access.restriction.is_none() && effective.mutate,
+            // Carried over rather than taken from `effective`: the marking is
+            // about writing, and rebuilding from it wholesale would hand back
+            // the read capability `resolve` just took away.
+            read_query: effective.read_query && access.unreadable.is_none(),
             ..effective
         };
         access
@@ -339,6 +383,13 @@ impl TableAccess {
     /// The reason editing is unavailable, or `None` when it is available.
     pub fn read_only_notice(&self) -> Option<&'static str> {
         self.restriction.map(Restriction::message)
+    }
+
+    /// Whether this object's rows can be listed at all (FRE-148). False only
+    /// for an object that stores none — everything else is browsable, however
+    /// unwritable.
+    pub fn can_read(&self) -> bool {
+        self.caps.read_query
     }
 }
 
@@ -401,6 +452,67 @@ mod tests {
             assert!(access.caps.read_query);
             assert!(access.caps.offset_paging);
         }
+    }
+
+    #[test]
+    fn an_object_with_no_rows_is_neither_writable_nor_browsable() {
+        const REASON: &str = "A sink writes to an external system.";
+        let mut sink = table(TableKind::View, vec![col("id", Some(1))]);
+        sink.restriction = Some(Restriction::NoRows(REASON));
+
+        let access = TableAccess::resolve(Capabilities::FULL, &sink, Dialect::Postgres);
+        assert!(!access.can_mutate());
+        assert!(
+            !access.can_read(),
+            "the whole point: a sink must not be opened"
+        );
+        assert_eq!(access.unreadable, Some(REASON));
+        // The object's own sentence, not the kind's — reporting "Views are
+        // read-only" would send the reader looking for a view definition.
+        assert_eq!(access.read_only_notice(), Some(REASON));
+
+        // Every other restriction leaves reading alone. Without this the gate
+        // would silently take the whole schema tree with it.
+        for kind in [
+            TableKind::View,
+            TableKind::MaterializedView,
+            TableKind::Table,
+        ] {
+            let ordinary = table(kind, vec![col("id", Some(1))]);
+            let access = TableAccess::resolve(Capabilities::FULL, &ordinary, Dialect::Postgres);
+            assert!(access.can_read(), "{kind:?} must stay browsable");
+            assert_eq!(access.unreadable, None);
+        }
+    }
+
+    #[test]
+    fn a_read_only_connection_does_not_hide_why_an_object_has_no_rows() {
+        // The case the resolution order has to get right: the write chain
+        // short-circuits on a connection that cannot write, so a gate derived
+        // from it would never look at the object and a sink would look
+        // browsable on exactly the connections most likely to be pointed at
+        // one.
+        const REASON: &str = "A sink writes to an external system.";
+        let mut sink = table(TableKind::View, vec![col("id", Some(1))]);
+        sink.restriction = Some(Restriction::NoRows(REASON));
+
+        let access = TableAccess::resolve(Capabilities::FULL.read_only(), &sink, Dialect::Postgres);
+        assert!(!access.can_read());
+        assert_eq!(access.unreadable, Some(REASON));
+        // Writing is refused by the connection, which is the more actionable
+        // reason for *that* question, and the two answers stay independent.
+        assert_eq!(access.restriction, Some(CONNECTION_READ_ONLY));
+
+        // The user's own marking must not hand the read capability back
+        // either — `resolve_protected` rebuilds `caps` from the marked set.
+        let protected = TableAccess::resolve_protected(
+            Capabilities::FULL,
+            WriteProtection::ReadOnly,
+            &sink,
+            Dialect::Postgres,
+        );
+        assert!(!protected.can_read());
+        assert_eq!(protected.unreadable, Some(REASON));
     }
 
     #[test]

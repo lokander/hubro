@@ -513,6 +513,10 @@ const STREAMING_SOURCE: &str =
 /// Kafka or another database. Without this it fell through to an ordinary
 /// table, which offered editing on nothing and failed on open with the
 /// engine's own "table or source not found" (FRE-93).
+///
+/// Carried by [`Restriction::NoRows`] rather than `Declared`, so the sentence
+/// below is what the *grid* shows in place of that failure, not only what the
+/// editing affordance shows (FRE-148).
 const STREAMING_SINK: &str =
     "A sink writes to an external system; it has no rows of its own to show.";
 
@@ -1187,7 +1191,12 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
             restriction: if source {
                 Some(Restriction::Declared(STREAMING_SOURCE))
             } else if sink {
-                Some(Restriction::Declared(STREAMING_SINK))
+                // `NoRows`, not `Declared`: a sink stores nothing, so this one
+                // declaration has to stop it being *opened* as well as edited
+                // (FRE-148). Not gated on the flavor — `table_type = 'SINK'`
+                // is the server's own classification, so any engine reporting
+                // it inherits this.
+                Some(Restriction::NoRows(STREAMING_SINK))
             } else {
                 None
             },
