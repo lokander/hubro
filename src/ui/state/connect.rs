@@ -77,6 +77,8 @@ pub(super) enum PassphraseSource {
 /// it came from, and leaving it would shadow the keyring on the next attempt.
 /// Only a keyring-sourced rejection also deletes the stored copy — see
 /// [`PassphraseSource`].
+#[must_use = "the verdict decides whether the keyring copy is deleted; dropping it \
+              leaves a stale passphrase that every later connect re-offers"]
 pub(super) fn forget_failed_ssh_passphrase(
     session: &mut HashMap<String, String>,
     key: &str,
@@ -1230,24 +1232,25 @@ impl AppState {
         // then keyring (off-thread, guard dropped before the await), then a
         // prompt. Only key-file auth can need one.
         let secret_key = ssh_secret_key(url);
-        let mut passphrase = None;
-        // Which of the two supplied it decides what a rejection below means,
-        // so the source is tracked alongside the value (FRE-151).
-        let mut source = None;
+        // Value and source travel as one: which of the two supplied it decides
+        // what a rejection below means, and two separate `Option`s kept in step
+        // by hand would let a passphrase with no recorded source silently skip
+        // that decision (FRE-151).
+        let mut stored: Option<(String, PassphraseSource)> = None;
         if matches!(config.auth, TunnelAuth::KeyFile { .. }) {
-            passphrase = self.session_passwords.read().get(&secret_key).cloned();
-            if passphrase.is_some() {
-                source = Some(PassphraseSource::Session);
-            } else {
-                passphrase = crate::secrets::get_password_async(secret_key.clone())
+            // Read into a local first: the guard is a statement temporary, so
+            // nothing is held across the keyring await below.
+            let session = self.session_passwords.read().get(&secret_key).cloned();
+            stored = match session {
+                Some(value) => Some((value, PassphraseSource::Session)),
+                None => crate::secrets::get_password_async(secret_key.clone())
                     .await
                     .ok()
-                    .flatten();
-                if passphrase.is_some() {
-                    source = Some(PassphraseSource::Keyring);
-                }
-            }
+                    .flatten()
+                    .map(|value| (value, PassphraseSource::Keyring)),
+            };
         }
+        let (passphrase, source) = stored.unzip();
         let target = match (backend.url_target)(url) {
             Ok(target) => target,
             Err(err) => {
@@ -1787,7 +1790,7 @@ mod tests {
 
         // Unrelated entries are never collateral.
         let mut session = HashMap::from([("other#ssh".to_string(), "keep".to_string())]);
-        forget_failed_ssh_passphrase(&mut session, KEY, PassphraseSource::Keyring);
+        let _ = forget_failed_ssh_passphrase(&mut session, KEY, PassphraseSource::Keyring);
         assert_eq!(session.get("other#ssh").map(String::as_str), Some("keep"));
     }
 
@@ -1811,22 +1814,46 @@ mod tests {
             "the rejection path must go through the shared policy"
         );
         // Both arms have to be reachable, or the policy is being handed a
-        // constant and the distinction it exists for is gone.
+        // constant and the distinction it exists for is gone. Assert the
+        // *assignments*, not mere mentions: a version that labels every hit
+        // `Keyring` still contains both names.
         assert!(
-            body.contains("PassphraseSource::Session"),
+            body.contains("(value, PassphraseSource::Session)"),
             "nothing marks a session-sourced passphrase, so a typo is \
              indistinguishable from a stale stored secret again"
         );
         assert!(
-            body.contains("PassphraseSource::Keyring"),
+            body.contains("(value, PassphraseSource::Keyring)"),
             "nothing marks a keyring-sourced passphrase, so a genuinely stale \
              stored secret is never cleaned up"
         );
-        // And the delete must be gated on what the policy returned, rather than
-        // running beside it.
+        // The policy must be handed the *tracked* source. Passing a literal
+        // compiles, keeps both names above present, and restores the original
+        // bug in full — so the call's arguments are checked, not just its name.
+        let call_start = body
+            .find("forget_failed_ssh_passphrase(")
+            .expect("checked above");
+        let call = &body[call_start..];
+        let call = &call[..call.find(';').expect("the call is a statement")];
         assert!(
-            body.contains("if drop_stored {") && body.contains("delete_password_async(secret_key)"),
+            !call.contains("PassphraseSource::"),
+            "the policy is being handed a constant instead of the source that \
+             was actually tracked — with `Keyring` that is the FRE-151 bug \
+             verbatim, and with `Session` no stale passphrase is ever cleaned up"
+        );
+
+        // And the delete must be *inside* the gate, not merely somewhere near
+        // it: two independent `contains` checks pass just as well when the
+        // delete has been moved out beside an inert `if`.
+        let gate = method_body(&body, "if drop_stored {");
+        assert!(
+            gate.contains("delete_password_async(secret_key)"),
             "the keyring delete must be conditional on the policy's verdict"
+        );
+        assert_eq!(
+            body.matches("delete_password_async").count(),
+            1,
+            "a second, ungated delete would undo the gate above"
         );
     }
 
