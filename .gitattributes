@@ -1,0 +1,33 @@
+# Line endings are LF everywhere, including on Windows checkouts (FRE-160).
+#
+# Without this, git's default `core.autocrlf=true` on Windows rewrites every
+# text file to CRLF on checkout, which breaks three things at once:
+#
+#   1. Tests that compare a checked-in file byte for byte — the round-trip
+#      fixture in tests/config_back_compat.rs, and the `include_str!` mirrors
+#      in tests/file_associations.rs that match on "</key>\n\t<true/>".
+#      They fail on a difference git introduced, not one the code made.
+#   2. Any future test over the seven files read with `include_str!`
+#      (Cargo.toml, Dioxus.toml, release.yml, the three under packaging/,
+#      README.md), which is a standing invitation to the same bug.
+#
+# Not a reason, though it looks like one: the macOS bundle. `info_plist_path`
+# does copy packaging/macos/Info.plist verbatim, but release.yml builds that
+# bundle on macos-latest, where git never converts — and XML tolerates either
+# ending regardless. The byte-exact tests are the whole justification.
+#
+# The repo has no file that wants CRLF — no .bat or .cmd, and nothing checked
+# in with CRLF today — so a single rule is enough and there is no exception
+# list to keep current.
+* text=auto eol=lf
+
+# Fixtures are data, not source. Today there is exactly one — an ASCII TOML
+# compared for exact bytes — but a fixture directory attracts binary files
+# (a SQLite database is the obvious next one), and `-text` is the rule that
+# stays correct for both: "never convert" is stronger than "normalise to LF",
+# and it is what a byte-exact comparison wants either way.
+#
+# It also makes this the one place a CRLF file could legitimately live: a
+# fixture authored on Windows keeps its CRLF bytes on every platform, which
+# is the point of pinning bytes rather than endings.
+tests/fixtures/** -text
