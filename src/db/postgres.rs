@@ -69,18 +69,34 @@ pub fn build_url(
 
 /// Which engine answered the Postgres wire handshake (FRE-90).
 ///
-/// hubro speaks one protocol to a family of servers. Stock PostgreSQL and the
-/// extensions layered on it (TimescaleDB, Citus) are the same engine and share
-/// [`PgFlavor::Postgres`]; the reimplementations diverge in ways the backend
-/// has to know about, because each breaks something the Postgres path is
-/// entitled to assume — a schema the engine reserves that must not read as the
-/// user's data, a session default that quietly voids transactional DDL, an
-/// engine that cannot be written to at all.
+/// hubro speaks one protocol to a family of servers: stock PostgreSQL, the
+/// extensions layered on it (TimescaleDB, Citus) which are the same engine and
+/// share [`PgFlavor::Postgres`], and the reimplementations, which get their
+/// own variant.
 ///
-/// Deliberately *not* a general version model: it answers "who is this" and
-/// nothing else. Anything that varies by version within one engine belongs in
-/// a catalog query, which reports what the server actually has rather than
-/// what its version number implies.
+/// **Nothing in the backend branches on this today, and that is the intended
+/// state.** Both problems FRE-90 found on CockroachDB looked like they needed
+/// the engine's identity and turned out not to: a 64-bit `ordinal_position` is
+/// fixed by pinning the width in SQL for everyone, and its reserved catalog
+/// schemas are found through `table_type`, which is the server's own
+/// classification. A catalog fact beats knowing the name every time — it
+/// reports what this server actually does rather than what its name implies,
+/// it needs no update when an engine changes behaviour between versions, and
+/// it keeps the FRE-88 rule against name-matching intact. Reach for a flavor
+/// check only when no catalog fact answers the question.
+///
+/// It exists because one such question is already known: Materialize's
+/// capabilities (FRE-92) are a property of the engine, not of anything in its
+/// catalog, and [`Capabilities`](super::caps::Capabilities) must be declared
+/// at connect. It is carried from FRE-90 rather than added there because the
+/// `version()` call that answers it is the liveness check the connect path
+/// already made, so having the answer costs nothing — and because the finding
+/// that most of these engines *don't* need it is worth recording in code
+/// rather than losing.
+///
+/// Deliberately not a general version model: it answers "who is this" and
+/// nothing else. Anything varying by version *within* one engine belongs in a
+/// catalog query for the same reason as above.
 ///
 /// Detected once at connect and never re-checked — the server on the other end
 /// of an open connection does not change.
@@ -154,6 +170,14 @@ impl PgConn {
 /// Connects to Postgres from a URL (`postgres://user@host:port/db?sslmode=…`).
 /// The URL may carry a password; saved config never does — callers splice a
 /// session password in via [`url_with_password`].
+///
+/// Note for anyone reaching for `after_connect` to set a per-engine session
+/// default here: CockroachDB's `autocommit_before_ddl` is the obvious
+/// candidate, since leaving it on costs a script its atomicity (FRE-146).
+/// Turning it off was tried in FRE-90 and reverted — it makes every
+/// `ALTER TABLE`/`CREATE INDEX` fail against a schema-locked table, which is
+/// how CockroachDB creates tables by default, so it breaks a common operation
+/// to fix a rarer one. `tests/db_cockroach.rs` pins the resulting behaviour.
 pub async fn open_postgres(url: &str) -> Result<PgConn, DbError> {
     let pool = PgPoolOptions::new()
         .max_connections(4)
