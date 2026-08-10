@@ -230,6 +230,17 @@ impl Record {
 /// A pull-based stream of records. Implemented by [`CsvReader`] and
 /// [`JsonReader`]; `run_import` only ever asks for the next one, which is
 /// what keeps the import streaming.
+///
+/// Two shapes are accepted rather than refused, and both are visible in the
+/// dialog's preview before anything is imported:
+///
+/// - a record with **more** fields than the header names: the surplus is not
+///   mapped to anything, so it is dropped. (Usually the symptom of a wrong
+///   delimiter — which the preview shows as one column too many.) A record
+///   with **fewer** is equally fine: the missing fields are
+///   [`SourceValue::Missing`], i.e. NULL.
+/// - a JSON object with the same key twice: `serde_json` keeps the last, so
+///   the last wins here too.
 pub trait RecordSource {
     /// The file's own field names, when it has them (a CSV header). `None`
     /// means fields are addressed by position or by key instead.
@@ -460,7 +471,11 @@ pub fn default_mapping(table: &TableMeta, fields: &[SourceField]) -> Vec<ColumnB
     let importable: Vec<&ColumnMeta> = table.columns.iter().filter(|c| is_importable(c)).collect();
     let mut bindings = Vec::new();
     let mut taken: Vec<&str> = Vec::new();
-    for (position, source) in fields.iter().enumerate() {
+    for source in fields {
+        // A positional field takes the importable column at its own index; a
+        // named one matches by name. Either way a column is bound at most
+        // once, so two fields spelled alike do not produce an INSERT that
+        // names the same column twice.
         let matched = match source {
             SourceField::Key(key) => importable
                 .iter()
@@ -468,9 +483,6 @@ pub fn default_mapping(table: &TableMeta, fields: &[SourceField]) -> Vec<ColumnB
                 .map(|c| c.name.as_str()),
             SourceField::Index(index) => importable.get(*index).map(|c| c.name.as_str()),
         };
-        // A positional binding uses the field's own position; a named one
-        // must not bind the same column twice (two fields spelled alike).
-        let _ = position;
         if let Some(name) = matched {
             if taken.contains(&name) {
                 continue;
@@ -770,16 +782,18 @@ pub async fn run_import(
             },
         }
         if batch.len() >= per_batch {
-            if let Err(err) = flush(&mut tx, table, dialect, &planned, &batch).await {
-                return Err(abort(tx, report.inserted_rows, None, err.to_string()).await);
+            if let Err((err, applied)) = flush(&mut tx, table, dialect, &planned, &batch).await {
+                let undone = report.inserted_rows + applied;
+                return Err(abort(tx, undone, None, err.to_string()).await);
             }
             report.inserted_rows += batch.len() as u64;
             batch.clear();
         }
     }
     if !batch.is_empty() {
-        if let Err(err) = flush(&mut tx, table, dialect, &planned, &batch).await {
-            return Err(abort(tx, report.inserted_rows, None, err.to_string()).await);
+        if let Err((err, applied)) = flush(&mut tx, table, dialect, &planned, &batch).await {
+            let undone = report.inserted_rows + applied;
+            return Err(abort(tx, undone, None, err.to_string()).await);
         }
         report.inserted_rows += batch.len() as u64;
     }
@@ -802,12 +816,20 @@ async fn flush(
     dialect: Dialect,
     planned: &[PlannedColumn<'_>],
     rows: &[Vec<Value>],
-) -> Result<(), DbError> {
+) -> Result<(), (DbError, u64)> {
     let (sql, params) = insert_sql(table, dialect, planned, rows);
-    let affected = tx.execute_with(&sql, &params).await?;
+    // The error carries how many rows of THIS batch had landed, so
+    // [`ImportError::undone_rows`] counts everything the rollback undid. The
+    // row-count mismatch is the one case where that is not zero — and it was
+    // the case the count used to miss, which is precisely the case the guard
+    // exists for.
+    let affected = tx
+        .execute_with(&sql, &params)
+        .await
+        .map_err(|err| (err, 0))?;
     let expected = rows.len() as u64;
     if affected != expected {
-        return Err(DbError::row_count_mismatch(affected, expected));
+        return Err((DbError::row_count_mismatch(affected, expected), affected));
     }
     Ok(())
 }

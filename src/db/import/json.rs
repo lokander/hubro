@@ -12,6 +12,17 @@
 //! Records are objects keyed by field name; a top-level value that is not an
 //! object is reported with its line, since there is nothing to map its
 //! columns from.
+//!
+//! Two things are errors rather than a short import, on the same reasoning as
+//! the CSV reader's unterminated quote — a file that stops early must not
+//! import as though it were complete, which is the rollback guarantee one
+//! level up:
+//!
+//! - an array whose closing `]` never arrives (a half-downloaded export);
+//! - anything but whitespace after that `]`.
+//!
+//! And one JSON value is bounded by [`MAX_VALUE_BYTES`], so a malformed file
+//! cannot be accumulated whole while looking for a close that never comes.
 
 use std::io::{self, BufRead};
 
@@ -46,6 +57,12 @@ pub fn sniff_shape(sample: &[u8]) -> JsonShape {
     }
 }
 
+/// Largest single JSON value the scanner will assemble before giving up —
+/// the counterpart to [`csv::MAX_FIELD_BYTES`](super::csv::MAX_FIELD_BYTES),
+/// and what keeps peak memory bounded when a value's closing brace or quote
+/// never arrives.
+pub const MAX_VALUE_BYTES: usize = 32 * 1024 * 1024;
+
 /// Pulls JSON records one at a time out of a byte stream.
 pub struct JsonReader<R: BufRead> {
     input: R,
@@ -55,6 +72,8 @@ pub struct JsonReader<R: BufRead> {
     line: u64,
     /// Array mode: whether the opening `[` has been consumed.
     opened: bool,
+    /// Whether the byte-order mark has been looked for.
+    primed: bool,
     finished: bool,
 }
 
@@ -66,8 +85,26 @@ impl<R: BufRead> JsonReader<R> {
             encoding,
             line: 1,
             opened: false,
+            primed: false,
             finished: false,
         }
+    }
+
+    /// Consumes a UTF-8 byte-order mark. PowerShell's `Out-File` and several
+    /// Windows exporters write one, and without this the file is refused with
+    /// a message about starting with `ï` — naming the symptom and not the
+    /// cause. The CSV reader has always stripped it; this one had not.
+    fn strip_bom(&mut self) -> Result<(), ReadError> {
+        if self.primed {
+            return Ok(());
+        }
+        self.primed = true;
+        let line = self.line;
+        let buf = self.input.fill_buf().map_err(|e| io_read_error(line, e))?;
+        if buf.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            self.input.consume(3);
+        }
+        Ok(())
     }
 
     fn peek(&mut self) -> Result<Option<u8>, ReadError> {
@@ -118,6 +155,16 @@ impl<R: BufRead> JsonReader<R> {
                 }
                 break;
             };
+            if raw.len() > MAX_VALUE_BYTES {
+                return Err(ReadError {
+                    line: Some(self.line),
+                    message: format!(
+                        "this JSON value is larger than {} MiB — check that the file is really \
+                         JSON, and that a string or bracket is not left open",
+                        MAX_VALUE_BYTES / (1024 * 1024)
+                    ),
+                });
+            }
             if in_string {
                 raw.push(byte);
                 self.bump(byte);
@@ -175,6 +222,7 @@ impl<R: BufRead> JsonReader<R> {
         if self.finished {
             return Ok(None);
         }
+        self.strip_bom()?;
         if self.shape == JsonShape::Array && !self.opened {
             match self.skip_whitespace()? {
                 Some(b'[') => {
@@ -202,12 +250,36 @@ impl<R: BufRead> JsonReader<R> {
             match self.skip_whitespace()? {
                 None => {
                     self.finished = true;
+                    // End of file inside an array that never closed: the
+                    // file stops early, so the import must not report the
+                    // records it did read as the whole of it. A
+                    // half-downloaded export is exactly this shape.
+                    if self.shape == JsonShape::Array {
+                        return Err(ReadError {
+                            line: Some(self.line),
+                            message: "the file ends before the array is closed — it looks \
+                                      truncated, so importing it would import only part of it"
+                                .to_string(),
+                        });
+                    }
                     return Ok(None);
                 }
                 Some(b',') if self.shape == JsonShape::Array => self.bump(b','),
                 Some(b']') if self.shape == JsonShape::Array => {
                     self.bump(b']');
                     self.finished = true;
+                    // Anything but whitespace after the array is not part of
+                    // a file anyone meant to import — two concatenated
+                    // exports, or a truncation that landed mid-document.
+                    if let Some(trailing) = self.skip_whitespace()? {
+                        return Err(ReadError {
+                            line: Some(self.line),
+                            message: format!(
+                                "the array ends here, but the file continues with {:?}",
+                                trailing as char
+                            ),
+                        });
+                    }
                     return Ok(None);
                 }
                 Some(_) => break,
@@ -343,6 +415,67 @@ mod tests {
         let err = reader.next_record().unwrap_err();
         assert_eq!(err.line, Some(2));
         assert!(err.message.contains("a number"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_truncated_array_is_an_error_not_a_short_import() {
+        // A half-downloaded export: the records that are there are fine, so
+        // nothing errors until the end — and reporting "imported 2 rows"
+        // would be reporting a partial file as a whole one.
+        let mut reader = JsonReader::new(
+            r#"[{"id":1},{"id":2}"#.as_bytes(),
+            JsonShape::Array,
+            Encoding::Utf8,
+        );
+        assert!(reader.next_record().unwrap().is_some());
+        assert!(reader.next_record().unwrap().is_some());
+        let err = reader.next_record().unwrap_err();
+        assert!(err.message.contains("truncated"), "{}", err.message);
+
+        // Trailing junk after the array is refused for the same reason.
+        let mut trailing = JsonReader::new(
+            r#"[{"id":1}] {"id":2}"#.as_bytes(),
+            JsonShape::Array,
+            Encoding::Utf8,
+        );
+        trailing.next_record().unwrap();
+        let err = trailing.next_record().unwrap_err();
+        assert!(err.message.contains("continues with"), "{}", err.message);
+
+        // A properly closed array still ends cleanly, trailing whitespace and
+        // all — the guard must not fire on an ordinary file.
+        let mut clean = JsonReader::new(
+            "[{\"id\":1}]\n\n".as_bytes(),
+            JsonShape::Array,
+            Encoding::Utf8,
+        );
+        clean.next_record().unwrap();
+        assert_eq!(clean.next_record().unwrap(), None);
+    }
+
+    #[test]
+    fn a_utf8_bom_does_not_hide_the_array() {
+        // What PowerShell's Out-File writes. Before this the file was refused
+        // for "starting with 'ï'", which names the symptom and not the cause.
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(br#"[{"id":1}]"#);
+        let mut reader = JsonReader::new(bytes.as_slice(), JsonShape::Array, Encoding::Utf8);
+        assert!(reader.next_record().unwrap().is_some());
+        assert_eq!(reader.next_record().unwrap(), None);
+    }
+
+    #[test]
+    fn an_oversized_value_is_refused_instead_of_accumulated() {
+        // The streaming bound, for a file whose brace never closes.
+        let mut oversized = String::from("[{\"a\":\"");
+        oversized.push_str(&"x".repeat(MAX_VALUE_BYTES + 1024));
+        let mut reader = JsonReader::new(oversized.as_bytes(), JsonShape::Array, Encoding::Utf8);
+        let err = reader.next_record().unwrap_err();
+        assert!(
+            err.message.contains("larger than 32 MiB"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]

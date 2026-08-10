@@ -5,22 +5,32 @@
 //! delimiter/quote override and a non-UTF-8 [`Encoding`].
 //!
 //! [`CsvReader`] pulls **one record at a time** from any [`BufRead`], so peak
-//! memory is one record regardless of file size, mirroring how the export
-//! streams one row at a time.
+//! memory is one record — bounded by [`MAX_FIELD_BYTES`] and
+//! [`MAX_RECORD_BYTES`] even when the file is malformed — regardless of file
+//! size, mirroring how the export streams one row at a time.
 //!
 //! Parsing follows RFC-4180 with the tolerances real files need:
 //!
 //! - a field is quoted or it is not; inside quotes a doubled quote is one
 //!   literal quote, and a delimiter, CR or LF is ordinary text;
-//! - line terminators are LF or CRLF (a lone CR ending a record is not a
-//!   terminator — old Mac files are not a case worth guessing at);
+//! - line terminators are LF or CRLF, and a CRLF's CR belongs to the
+//!   terminator wherever it appears — including at the end of the last line,
+//!   with or without its LF;
 //! - a completely blank line yields no record, so the newline that ends the
-//!   last line never produces a phantom all-empty row;
+//!   last line never produces a phantom all-empty row. **CRLF included**: a CR
+//!   is not content, so `\r\n\r\n` is one blank line and not a record of one
+//!   empty field. (It used to be, which put an all-NULL row into the table for
+//!   every Excel export ending in a blank line, or aborted the import against
+//!   a NOT NULL column at a line with no data on it.);
 //! - text after a closing quote (`"a"b`) is kept verbatim rather than
 //!   rejected, because refusing the whole file over one sloppy field would be
 //!   the worse failure — the value that reaches the column is `ab`;
 //! - an unterminated quote *is* an error: everything after it would silently
 //!   collapse into one field, and reporting the line beats importing that.
+//!   The error arrives at [`MAX_FIELD_BYTES`] rather than at end of file, so
+//!   the memory bound holds for a malformed file too — reading a 2 GB file
+//!   into one field to discover the quote never closed is the same bug the
+//!   error exists to prevent, one level down.
 //!
 //! Field text is decoded per [`Encoding`], so a Latin-1 file (which is not
 //! valid UTF-8 and would otherwise fail outright) imports by choosing it.
@@ -37,6 +47,33 @@ fn io_read_error(line: u64, err: io::Error) -> ReadError {
     }
 }
 
+/// The error for a quoted field that runs past the end of the file.
+fn unclosed_quote(line: u64) -> ReadError {
+    ReadError {
+        line: Some(line),
+        message: "a quoted field is never closed before the end of the file".to_string(),
+    }
+}
+
+/// The error for a field or record past its size bound. Names the quote
+/// character when the reader was inside a quoted field, because that is
+/// overwhelmingly the cause: the wrong quote character turns the rest of the
+/// file into one value.
+fn oversized(line: u64, in_quotes: bool, what: &str, limit: usize) -> ReadError {
+    let hint = if in_quotes {
+        " — an opening quote here is never closed, so check the quote character"
+    } else {
+        " — check the delimiter, or that this is really a CSV file"
+    };
+    ReadError {
+        line: Some(line),
+        message: format!(
+            "this {what} is larger than {} MiB{hint}",
+            limit / (1024 * 1024)
+        ),
+    }
+}
+
 /// Delimiters [`sniff_dialect`] considers, in preference order — comma first
 /// so a file with no evidence either way stays plain CSV.
 pub const DELIMITERS: [u8; 4] = *b",;\t|";
@@ -47,6 +84,20 @@ const SNIFF_RECORDS: usize = 20;
 
 /// How much of a file [`super::sniff_file`] reads to detect with.
 pub const SNIFF_BYTES: usize = 64 * 1024;
+
+/// Largest single field the reader will assemble before giving up.
+///
+/// This is what keeps the streaming guarantee true for a *malformed* file: a
+/// quote that never closes, or a quote character set to something the file
+/// uses as ordinary text, otherwise swallows every remaining byte into one
+/// field. Matching
+/// [`FETCH_CELL_MAX_BYTES`](crate::db::FETCH_CELL_MAX_BYTES) is deliberate —
+/// it is already the app's answer to "how large a single value will we hold".
+pub const MAX_FIELD_BYTES: usize = 8 * 1024 * 1024;
+
+/// Largest single record, so a file with no line terminator at all (one line,
+/// many small fields) is bounded too.
+pub const MAX_RECORD_BYTES: usize = 32 * 1024 * 1024;
 
 /// The CSV shape: what separates fields, what quotes them, and whether the
 /// first record names the columns. Detected by [`sniff_dialect`] and freely
@@ -173,17 +224,23 @@ impl<R: BufRead> CsvReader<R> {
             let mut field: Vec<u8> = Vec::new();
             let mut state = State::FieldStart;
             // Whether anything made this a real record rather than a blank
-            // line: a delimiter, a quote, or any field content.
+            // line: a delimiter, a quote, or any field content. A CR is
+            // NOT content — it is half of a CRLF terminator — so it must not
+            // set this, or every blank line in a Windows file becomes a
+            // record of one empty field.
             let mut structural = false;
+            // Bytes held for this record, so a malformed file (see
+            // [`MAX_FIELD_BYTES`]) is refused rather than accumulated.
+            let mut record_bytes = 0usize;
             loop {
                 let Some(byte) = self.next_byte()? else {
                     self.finished = true;
                     if state == State::Quoted {
-                        return Err(ReadError {
-                            line: Some(start_line),
-                            message: "a quoted field is never closed before the end of the file"
-                                .to_string(),
-                        });
+                        return Err(unclosed_quote(start_line));
+                    }
+                    // A last line ending in a bare CR: still a terminator.
+                    if field.last() == Some(&b'\r') {
+                        field.pop();
                     }
                     fields.push(std::mem::take(&mut field));
                     break;
@@ -207,8 +264,13 @@ impl<R: BufRead> CsvReader<R> {
                             break;
                         } else {
                             field.push(byte);
+                            record_bytes += 1;
                             state = State::Unquoted;
-                            structural = true;
+                            // A CR is provisionally part of a terminator: it
+                            // is stripped again by the LF (or by end of file)
+                            // above, and until then it is not evidence that
+                            // this line holds anything.
+                            structural = structural || byte != b'\r';
                         }
                     }
                     State::Quoted => {
@@ -219,6 +281,7 @@ impl<R: BufRead> CsvReader<R> {
                                 self.line += 1;
                             }
                             field.push(byte);
+                            record_bytes += 1;
                         }
                     }
                     State::QuoteClosed => {
@@ -239,9 +302,30 @@ impl<R: BufRead> CsvReader<R> {
                             // Text after the closing quote: keep it rather
                             // than reject the file.
                             field.push(byte);
+                            record_bytes += 1;
                             state = State::Unquoted;
+                            structural = true;
                         }
                     }
+                }
+                // Checked after every byte, so the bound holds however the
+                // file is malformed — an unclosed quote is only the most
+                // likely way to get here.
+                if field.len() > MAX_FIELD_BYTES {
+                    return Err(oversized(
+                        start_line,
+                        state == State::Quoted,
+                        "field",
+                        MAX_FIELD_BYTES,
+                    ));
+                }
+                if record_bytes > MAX_RECORD_BYTES {
+                    return Err(oversized(
+                        start_line,
+                        state == State::Quoted,
+                        "record",
+                        MAX_RECORD_BYTES,
+                    ));
                 }
             }
             // A line with no delimiter, no quote and no content is blank.
@@ -462,6 +546,86 @@ mod tests {
                 vec!["1".to_string(), "2".into()]
             ]
         );
+    }
+
+    #[test]
+    fn crlf_blank_lines_produce_no_record_either() {
+        // The Excel case, and the one this reader got wrong: a CR is half a
+        // terminator, not content, so `\r\n\r\n` is a blank line. Treating it
+        // as content put an all-empty record into every Windows export that
+        // ends with a blank line — committed as an all-NULL row, or aborting
+        // the whole import against a NOT NULL column at a line with no data.
+        let expected = vec![
+            vec!["a".to_string(), "b".into()],
+            vec!["1".to_string(), "2".into()],
+        ];
+        assert_eq!(fields("a,b\r\n\r\n\r\n1,2\r\n\r\n"), expected);
+        // Trailing blank line with and without its final terminator.
+        assert_eq!(fields("a,b\r\n1,2\r\n\r\n"), expected);
+        assert_eq!(fields("a,b\r\n1,2\r\n\r"), expected);
+        // ...and the file that is nothing but blank lines holds no records.
+        assert!(fields("\r\n\r\n").is_empty());
+        assert!(fields("\r").is_empty());
+    }
+
+    #[test]
+    fn a_line_of_only_delimiters_is_a_record_even_in_crlf() {
+        // The other side of the same rule: a delimiter IS content, so this
+        // must not be swept up as a blank line.
+        assert_eq!(
+            fields(",\r\n"),
+            vec![vec!["".to_string(), "".into()]],
+            "a delimiter makes a real record of empty fields"
+        );
+    }
+
+    #[test]
+    fn a_final_bare_cr_is_a_terminator_not_part_of_the_last_field() {
+        assert_eq!(
+            fields("a,b\r\n1,2\r"),
+            vec![
+                vec!["a".to_string(), "b".into()],
+                vec!["1".to_string(), "2".into()]
+            ]
+        );
+    }
+
+    #[test]
+    fn an_oversized_field_is_refused_instead_of_accumulated() {
+        // The streaming guarantee has to hold for a *malformed* file too:
+        // before this, an unclosed quote read the whole file into one field
+        // and only reported the problem at EOF — 82 MB of memory to deliver
+        // an error message about the first line.
+        let mut oversized = String::from("id,name\n1,\"");
+        oversized.push_str(&"x".repeat(MAX_FIELD_BYTES + 1024));
+        let mut reader =
+            CsvReader::new(oversized.as_bytes(), CsvDialect::default(), Encoding::Utf8);
+        let err = reader.next_record().unwrap_err();
+        assert_eq!(err.line, Some(2));
+        assert!(err.message.contains("larger than 8 MiB"), "{}", err.message);
+        // The message points at the likely cause rather than just the size.
+        assert!(err.message.contains("quote character"), "{}", err.message);
+    }
+
+    #[test]
+    fn an_oversized_record_without_any_newline_is_refused_too() {
+        // No unclosed quote here: just a file with no line terminator, which
+        // the field bound alone would not catch.
+        let field_size = MAX_FIELD_BYTES / 8;
+        let one_field = "x".repeat(field_size);
+        let mut oversized = String::new();
+        for _ in 0..(MAX_RECORD_BYTES / field_size + 2) {
+            oversized.push_str(&one_field);
+            oversized.push(',');
+        }
+        let mut reader = CsvReader::new(oversized.as_bytes(), headerless(), Encoding::Utf8);
+        let err = reader.next_record().unwrap_err();
+        assert!(
+            err.message.contains("larger than 32 MiB"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("delimiter"), "{}", err.message);
     }
 
     #[test]

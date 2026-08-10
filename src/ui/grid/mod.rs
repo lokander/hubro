@@ -885,6 +885,14 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         access.as_ref().and_then(import_refusal).map(str::to_string);
     // The file the user picked, if the import dialog is open over this grid.
     let import_file = use_signal(|| Option::<std::path::PathBuf>::None);
+    // The connection's name when it is marked confirm-writes (FRE-111), so
+    // the dialog can name it in the confirmation an import has to pass.
+    let confirm_connection: Option<String> = state
+        .registry
+        .read()
+        .get(id)
+        .filter(|c| c.confirms_writes())
+        .map(|c| c.name.clone());
 
     // Staged (unsaved) changes of this table, if any.
     let stage: Option<TableStage> = state.table_stage(id, &table);
@@ -1477,6 +1485,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     table: meta,
                     path,
                     refusal: import_refused.clone(),
+                    confirm_connection: confirm_connection.clone(),
                     on_close: move |_| import_file.clone().set(None),
                 }
             }
