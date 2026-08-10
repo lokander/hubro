@@ -43,20 +43,21 @@ use dioxus_icons::lucide::{
 };
 
 use crate::db::{
-    raw_cell_text, render_copy, ColumnMeta, ConnectionId, CopyBlock, CopyFormat, Dialect,
-    ExportFormat, Filter, FilterOp, ForeignKeyMeta, Generated, Page, PageRequest, PreviewInfo,
-    QueryResult, RowIdentity, RowLocator, SortDir, StagedChange, TableAccess, TableMeta, Value,
-    FETCH_CELL_MAX_BYTES,
+    import_refusal, raw_cell_text, render_copy, ColumnMeta, ConnectionId, CopyBlock, CopyFormat,
+    Dialect, ExportFormat, Filter, FilterOp, ForeignKeyMeta, Generated, Page, PageRequest,
+    PreviewInfo, QueryResult, RowIdentity, RowLocator, SortDir, StagedChange, TableAccess,
+    TableMeta, Value, FETCH_CELL_MAX_BYTES,
 };
 use crate::util::human_bytes;
 
 use super::editing::{editor_kind, CellEditor, EditNav, EditorKind};
+use super::import::ImportDialog;
 use super::js::{focus_by_id_next_frame, js_string};
 use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState};
 use super::schema::display_type;
 use super::selection::Selection;
 use super::stage::{required_insert_columns, PendingInsert, TableStage};
-use super::state::{find_table_meta, AppState, ExportPane, ExportStatus, TableRef};
+use super::state::{find_table_meta, AppState, ExportPane, ExportStatus, ImportStatus, TableRef};
 
 const PAGE_SIZE: u32 = 100;
 
@@ -877,6 +878,13 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // Whether this object has rows to list at all (FRE-148). Absent access
     // means the schema has not loaded yet, which is not a refusal.
     let can_read = access.as_ref().is_none_or(TableAccess::can_read);
+    // Why importing a file into this object is refused, when it is (FRE-112).
+    // Resolved from the same `access` as every other write affordance, so an
+    // import is offered exactly where editing is.
+    let import_refused: Option<String> =
+        access.as_ref().and_then(import_refusal).map(str::to_string);
+    // The file the user picked, if the import dialog is open over this grid.
+    let import_file = use_signal(|| Option::<std::path::PathBuf>::None);
 
     // Staged (unsaved) changes of this table, if any.
     let stage: Option<TableStage> = state.table_stage(id, &table);
@@ -1078,6 +1086,9 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                 table: table.clone(),
                 dialect,
                 can_read,
+                can_import: table_meta.is_some(),
+                import_refused: import_refused.clone(),
+                import_file,
                 detail_open,
                 meta: meta.clone(),
                 filter_column,
@@ -1457,8 +1468,64 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     }
                 }
             }
+            // The import dialog (FRE-112), open once a file has been picked.
+            // Mounted here rather than in the toolbar because it needs the
+            // table's columns, which this scope already has.
+            if let (Some(path), Some(meta)) = (import_file(), table_meta.clone()) {
+                ImportDialog {
+                    id,
+                    table: meta,
+                    path,
+                    refusal: import_refused.clone(),
+                    on_close: move |_| import_file.clone().set(None),
+                }
+            }
         }
     }
+}
+
+/// Opens a file picker and, on a chosen file, opens the import dialog over
+/// the grid. A plain `spawn` (not `spawn_forever`) like the export's save
+/// dialog: nothing has started, so a grid that unmounts meanwhile has simply
+/// cancelled the choice.
+fn pick_import_file(mut target: Signal<Option<std::path::PathBuf>>) {
+    spawn(async move {
+        let picked = rfd::AsyncFileDialog::new()
+            .set_title("Import into this table")
+            .add_filter(
+                "CSV and JSON",
+                &["csv", "tsv", "txt", "json", "jsonl", "ndjson"],
+            )
+            .add_filter("All files", &["*"])
+            .pick_file()
+            .await;
+        if let Some(file) = picked {
+            target.set(Some(file.path().to_path_buf()));
+        }
+    });
+}
+
+/// The skipped lines a finished import reported, as one line — `None` when
+/// it skipped nothing. The status text says *how many*; this says *which*,
+/// because a count alone leaves the user with no way to find the rows that
+/// did not arrive.
+fn import_skipped(status: &ImportStatus) -> Option<String> {
+    let report = status.report()?;
+    if report.skipped.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<String> = report
+        .skipped
+        .iter()
+        .map(|skipped| format!("line {}: {}", skipped.line, skipped.reason))
+        .collect();
+    if report.skips_truncated() {
+        lines.push(format!(
+            "and {} more",
+            report.skipped_rows - report.skipped.len() as u64
+        ));
+    }
+    Some(lines.join(" · "))
 }
 
 /// The grid's toolbar: FK Back, the column/op/value filter, the copy-as menu,
@@ -1479,6 +1546,17 @@ fn GridToolbar(
     /// affordances: an export is the same query the grid is refusing, so
     /// offering it would hand back the failure the gate just prevented.
     can_read: bool,
+    /// Whether an import can be offered at all: false until the schema has
+    /// loaded, since the dialog maps fields onto the table's columns and has
+    /// none to show without it.
+    can_import: bool,
+    /// Why an import is refused, when it is (FRE-112) — the same sentence the
+    /// disabled Save button shows. `Some` leaves the button visible but
+    /// disabled and explained, rather than silently absent.
+    import_refused: Option<String>,
+    /// The file picked for import, if any: set by this toolbar's picker and
+    /// consumed by [`DataGrid`], which owns the dialog.
+    import_file: Signal<Option<std::path::PathBuf>>,
     /// Whether the row detail panel is docked — the toggle's pressed state.
     /// A prop rather than a read, because [`DataGrid`] needs it for the body
     /// layout anyway.
@@ -1503,6 +1581,7 @@ fn GridToolbar(
         .read()
         .get(&(id, ExportPane::Grid))
         .cloned();
+    let import_status: Option<ImportStatus> = state.import_status.read().get(&id).cloned();
     let export_table = table.clone();
     let refresh_table = table.clone();
     // Everything a clipboard copy needs besides the selection itself
@@ -1521,7 +1600,37 @@ fn GridToolbar(
         (rows, cols, sel.cell_count())
     });
     rsx! {
-        div { class: "flex items-center gap-2 border-b border-slate-200 dark:border-slate-800 px-3 py-2 text-sm",
+        div { class: "border-b border-slate-200 dark:border-slate-800",
+        // An import reports on a line of its own rather than in the row
+        // below. That row is routinely over its width — the export buttons
+        // already wrap — so a `truncate`d status there collapses to nothing
+        // (it is the only shrinkable item), and an import's message is a
+        // sentence naming a line and a column, not a word.
+        if let Some(status) = import_status.as_ref() {
+            {
+                let (text, class) = status.line();
+                let skipped = import_skipped(status);
+                rsx! {
+                    div { class: "flex items-start gap-2 border-b border-slate-200 dark:border-slate-800 px-3 py-1.5 text-xs",
+                        span { class: "shrink-0 font-medium {class}", "{text}" }
+                        if let Some(skipped) = skipped {
+                            span { class: "min-w-0 flex-1 truncate text-slate-500 dark:text-slate-400",
+                                title: "{skipped}",
+                                "{skipped}"
+                            }
+                        }
+                        div { class: "flex-1" }
+                        button {
+                            class: "shrink-0 rounded px-1.5 py-0.5 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800",
+                            title: "Dismiss",
+                            onclick: move |_| state.clear_import_status(id),
+                            "Dismiss"
+                        }
+                    }
+                }
+            }
+        }
+        div { class: "flex items-center gap-2 px-3 py-2 text-sm",
             // Back: return to the view a foreign-key jump came from (FRE-29).
             if can_back {
                 button {
@@ -1666,6 +1775,18 @@ fn GridToolbar(
                     "Export JSON"
                 }
             }
+            if can_import {
+                button {
+                    class: "rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100 disabled:opacity-50 disabled:hover:bg-transparent",
+                    disabled: import_refused.is_some(),
+                    title: match import_refused.as_deref() {
+                        Some(reason) => reason.to_string(),
+                        None => "Import a CSV or JSON file into this table".to_string(),
+                    },
+                    onclick: move |_| pick_import_file(import_file),
+                    "Import…"
+                }
+            }
             // Row detail (FRE-109): the same toggle as Ctrl+D, here so the
             // panel is discoverable without knowing the shortcut.
             button {
@@ -1686,6 +1807,7 @@ fn GridToolbar(
                 RefreshCw { size: 12 }
                 "Refresh"
             }
+        }
         }
     }
 }

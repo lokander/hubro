@@ -14,18 +14,20 @@
 //! `impl AppState` blocks live in all five files, so the split is invisible
 //! to callers: everything is still reached as `state::…`.
 //!
-//! The four submodules open with `use super::*`. They hold nothing but
+//! The submodules open with `use super::*`. They hold nothing but
 //! `impl AppState` and its private helpers — they are one type's
 //! implementation spread across files rather than modules with a surface of
 //! their own — so they deliberately inherit this file's imports and types
 //! instead of restating thirty `use` lines four times.
 
 mod connect;
+mod import;
 mod session;
 mod sql;
 mod staging;
 
 pub use connect::ServerBackend;
+pub use import::{ImportRequest, ImportStatus};
 // Reached from `session`'s restore path; defined beside the flow that
 // writes it.
 pub(crate) use connect::entra_secret_key;
@@ -48,11 +50,13 @@ use crate::config::{
 };
 use crate::db::{
     apply_staged, build_fk_filter, explain_statement, mssql_url_target, mssql_url_via_local_port,
-    mssql_url_with_password, needs_confirmation, run_script, script_refusal, split_statements,
-    statement_preview, url_target, url_via_local_port, url_with_password, write_result,
-    Capabilities, CellFetch, Connection, ConnectionId, ConnectionRegistry, DbError, DbPool, Ddl,
-    DdlObject, ExportFormat, Filter, ForeignKeyMeta, MssqlAuth, QueryResult, Rollback, RowLocator,
-    StagedChange, StatementResult, TableAccess, TableMeta, TableStats, Value, WriteProtection,
+    mssql_url_with_password, needs_confirmation, open_source, run_import, run_script,
+    script_refusal, split_statements, statement_preview, url_target, url_via_local_port,
+    url_with_password, write_result, Capabilities, CellFetch, Connection, ConnectionId,
+    ConnectionRegistry, DbError, DbPool, Ddl, DdlObject, Encoding, ExportFormat, Filter,
+    ForeignKeyMeta, ImportOptions, ImportReport, MssqlAuth, QueryResult, Rollback, RowLocator,
+    SourceFormat, StagedChange, StatementResult, TableAccess, TableMeta, TableStats, Value,
+    WriteProtection,
 };
 use crate::history::{HistoryStore, SaveOutcome};
 use crate::tunnel::{HostKeyInfo, Tunnel, TunnelAuth, TunnelConfig, TunnelError};
@@ -871,6 +875,15 @@ pub struct AppState {
     /// foreign-key jumps, most recent last. [`Self::navigate_back`] pops one;
     /// a manual table selection clears the stack.
     pub nav_history: Signal<HashMap<ConnectionId, Vec<FocusTarget>>>,
+    /// Latest import progress per connection (FRE-112). Root-scoped: written
+    /// from the `spawn_forever` import task. Keyed per connection only — an
+    /// import is always started from the grid, so there is no second pane to
+    /// tell apart.
+    pub import_status: Signal<HashMap<ConnectionId, ImportStatus>>,
+    /// Monotonic id per connection's import, so a slow import cannot record
+    /// its outcome over one started after it — the same guard the export
+    /// statuses carry.
+    pub import_generations: Signal<HashMap<ConnectionId, u64>>,
     /// Whether the keyboard-shortcut cheatsheet overlay is showing (FRE-15).
     /// App-global (one overlay for the whole window), toggled by `?` and
     /// dismissed by Escape / a backdrop click / `?` again.
@@ -980,6 +993,10 @@ impl AppState {
             // Root-scoped: written from the spawn_forever export task.
             export_status: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             export_generations: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            // Root-scoped for the same reason: written from the
+            // spawn_forever import task.
+            import_status: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            import_generations: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             // FK navigation state is only ever touched from UI event handlers,
             // so component scope is fine (like tab_ui / nav_guard).
             pending_focus: Signal::new(HashMap::new()),
@@ -1543,6 +1560,8 @@ impl AppState {
         self.export_generations
             .write()
             .retain(|(conn, _), _| *conn != id);
+        self.import_status.write().remove(&id);
+        self.import_generations.write().remove(&id);
         self.pending_focus.write().remove(&id);
         self.nav_history.write().remove(&id);
         // Abort every query tab's in-flight run and drop the bookkeeping;

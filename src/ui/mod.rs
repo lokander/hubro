@@ -8,6 +8,7 @@ mod filter;
 mod grid;
 mod history_panel;
 mod icons;
+mod import;
 mod js;
 mod notice;
 mod saved_panel;

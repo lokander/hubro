@@ -94,6 +94,23 @@ impl ScriptTx<'_> {
         }
     }
 
+    /// Runs a non-row statement with bound parameters in the transaction,
+    /// returning affected rows.
+    ///
+    /// The parameterized counterpart to [`Self::execute`], for writes whose
+    /// values must not be interpolated into the SQL and whose atomicity spans
+    /// several statements: a file import (FRE-112) sends one batch of rows per
+    /// call and commits (or rolls back) all of them together. Scripts
+    /// (FRE-38) are raw text and use [`Self::execute`].
+    pub async fn execute_with(&mut self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
+        // `tx` deref-coerces to the `&mut Connection` these helpers take.
+        match self {
+            ScriptTx::Sqlite(tx) => sqlite::execute_with_conn(tx, sql, params).await,
+            ScriptTx::Postgres(tx) => postgres::execute_with_conn(tx, sql, params).await,
+            ScriptTx::SqlServer(tx) => sqlserver::execute_with_conn(tx, sql, params).await,
+        }
+    }
+
     /// Runs a row-returning statement in the transaction, bounded exactly like
     /// the pool's [`DbPool::query_capped`] (row cap + per-cell byte cap).
     pub async fn query_capped(

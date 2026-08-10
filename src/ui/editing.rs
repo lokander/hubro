@@ -11,13 +11,16 @@
 //! - array → the array literal as text, checked for well-formedness
 //!   before staging (element types are left to the database)
 //!
-//! Every other column falls back to **case-insensitive substring matching**
-//! on the declared type name, so both SQLite declared types ("INTEGER",
+//! Every other column is classified by [`classify_type`], the declared-type
+//! vocabulary this shares with the file import (FRE-112) so the two cannot
+//! disagree about what a column holds. It matches the type name
+//! case-insensitively, so both SQLite declared types ("INTEGER",
 //! "VARCHAR(40)", possibly empty) and Postgres `data_type` strings
 //! ("integer", "timestamp without time zone", "jsonb") map without a
 //! per-backend table:
 //!
-//! - `blob` / `bytea` → read-only (blobs are not editable yet)
+//! - `blob` / `bytea`, and SQL Server's `binary`/`varbinary`/`image` →
+//!   read-only (binary values are not editable yet)
 //! - `bool` → checkbox
 //! - `json` → multiline text, validated with serde_json before staging
 //! - `date` / `time` / `timestamp` / `interval` → plain text staged as
@@ -44,7 +47,12 @@
 use dioxus::prelude::*;
 use dioxus_icons::lucide::RotateCcw;
 
-use crate::db::{Dialect, TypeDetail, Value};
+use crate::db::{classify_type, parse_numeric_text, Dialect, TypeClass, TypeDetail, Value};
+
+// The boolean rendering lives with the shared coercion rules (`db::coerce`)
+// so the cell editor and the file import stage a checkbox identically; it is
+// re-exported here because this is where callers have always found it.
+pub use crate::db::{bool_checked, bool_value};
 
 use super::js::{focus_by_id_next_frame, focus_on_mount};
 
@@ -111,73 +119,21 @@ pub fn editor_kind(type_name: &str, detail: &TypeDetail) -> EditorKind {
         TypeDetail::Array { .. } => return EditorKind::Array,
         _ => {}
     }
-    let t = type_name.to_ascii_lowercase();
-    if t.is_empty() {
-        return EditorKind::Text;
-    }
-    if t.contains("blob") || t.contains("bytea") {
-        return EditorKind::Blob;
-    }
-    if t.contains("bool") {
-        return EditorKind::Bool;
-    }
-    if t.contains("json") {
-        return EditorKind::Json;
-    }
-    if t.contains("date") || t.contains("time") || t.contains("interval") {
-        return EditorKind::DateTime;
-    }
-    if t.contains("point") {
-        // Postgres "point" (geometric) contains "int" but is not a number.
-        return EditorKind::Text;
-    }
-    if t.contains("numeric") || t.contains("decimal") {
-        return EditorKind::Numeric {
+    match classify_type(type_name) {
+        TypeClass::Binary => EditorKind::Blob,
+        TypeClass::Bool => EditorKind::Bool,
+        TypeClass::Json => EditorKind::Json,
+        TypeClass::DateTime => EditorKind::DateTime,
+        TypeClass::Exact => EditorKind::Numeric {
             kind: NumericKind::Exact,
-        };
-    }
-    if t.contains("int") || t.contains("serial") {
-        return EditorKind::Numeric {
+        },
+        TypeClass::Integer => EditorKind::Numeric {
             kind: NumericKind::Integer,
-        };
-    }
-    if ["real", "float", "double"].iter().any(|n| t.contains(n)) {
-        return EditorKind::Numeric {
+        },
+        TypeClass::Float => EditorKind::Numeric {
             kind: NumericKind::Float,
-        };
-    }
-    EditorKind::Text
-}
-
-/// The staged value for a boolean checkbox, per backend:
-///
-/// - SQLite has no boolean storage class — `0`/`1` integers are what its
-///   numeric affinity stores natively, so stage [`Value::Integer`].
-/// - Postgres `boolean` columns reject a bound integer; stage the text
-///   `"true"`/`"false"`, which the staged SQL's `::boolean` cast (and
-///   Postgres' own literal parsing) accepts.
-/// - SQL Server `bit` columns take `0`/`1` (T-SQL has no true/false
-///   literals), so stage [`Value::Integer`] like SQLite.
-pub fn bool_value(dialect: Dialect, checked: bool) -> Value {
-    match dialect {
-        Dialect::Sqlite | Dialect::SqlServer => Value::Integer(i64::from(checked)),
-        Dialect::Postgres => Value::Text(if checked { "true" } else { "false" }.into()),
-    }
-}
-
-/// Whether a fetched value reads as "checked" when a boolean cell opens.
-/// Covers both backends' renderings: SQLite integers and Postgres
-/// "true"/"false" text (plus common literal spellings).
-pub fn bool_checked(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Integer(i) => *i != 0,
-        Value::Real(r) => *r != 0.0,
-        Value::Text(t) => matches!(
-            t.to_ascii_lowercase().as_str(),
-            "true" | "t" | "yes" | "on" | "1"
-        ),
-        Value::Blob(_) => false,
+        },
+        TypeClass::Text => EditorKind::Text,
     }
 }
 
@@ -211,30 +167,21 @@ pub fn parse_input(kind: &EditorKind, dialect: Dialect, text: &str) -> Result<Va
     }
 }
 
-/// Numeric validation: whole numbers stage as [`Value::Integer`] on every
-/// flavor. Beyond that, per [`NumericKind`]:
-///
-/// - `Integer` rejects anything that is not an i64 — staging "1.5" for an
-///   integer column would silently round to 2 through the save-time
-///   `::integer` cast;
-/// - `Float` stages other finite numbers as [`Value::Real`];
-/// - `Exact` stages them as the typed text (no f64 round-trip).
-///
-/// Non-numbers (and inf/NaN) are rejected on every flavor.
+/// Numeric validation, per [`NumericKind`] — the same rules the file import
+/// applies to a numeric column, because it is literally the same function
+/// ([`parse_numeric_text`]): whole numbers stage as [`Value::Integer`]
+/// everywhere, `Integer` rejects a fractional value rather than rounding it
+/// through the save-time cast, `Float` stages [`Value::Real`], and `Exact`
+/// stages the typed text so precision survives.
 fn parse_numeric(text: &str, kind: NumericKind) -> Result<Value, String> {
-    let t = text.trim();
-    if t.is_empty() {
-        return Err("enter a number (or use the ∅ NULL button)".to_string());
-    }
-    if let Ok(i) = t.parse::<i64>() {
-        return Ok(Value::Integer(i));
-    }
-    match (kind, t.parse::<f64>()) {
-        (NumericKind::Integer, Ok(f)) if f.is_finite() => Err(format!("not a whole number: {t}")),
-        (NumericKind::Float, Ok(f)) if f.is_finite() => Ok(Value::Real(f)),
-        (NumericKind::Exact, Ok(f)) if f.is_finite() => Ok(Value::Text(t.to_string())),
-        _ => Err(format!("not a number: {t}")),
-    }
+    parse_numeric_text(
+        text,
+        match kind {
+            NumericKind::Integer => TypeClass::Integer,
+            NumericKind::Float => TypeClass::Float,
+            NumericKind::Exact => TypeClass::Exact,
+        },
+    )
 }
 
 /// Validates a Postgres array literal well enough to keep a malformed one

@@ -314,6 +314,21 @@ pub async fn execute_conn(
     sqlx_common::execute(conn, sql, query_error).await
 }
 
+/// [`execute_conn`] with bound parameters — the write path for a batch of
+/// imported rows (FRE-112), which must run inside the caller's transaction
+/// and must not interpolate its values into the SQL.
+pub async fn execute_with_conn(
+    conn: &mut sqlx::sqlite::SqliteConnection,
+    sql: &str,
+    params: &[Value],
+) -> Result<u64, DbError> {
+    bind_params(sqlx::query(sql), params)
+        .execute(conn)
+        .await
+        .map(|done| done.rows_affected())
+        .map_err(query_error)
+}
+
 /// Streams a query to `out` in the given format, pulling rows one at a time
 /// (`fetch`, not `fetch_all`) and writing each incrementally — peak memory is
 /// one decoded row plus the writer's buffer. Returns the number of data rows
