@@ -24,11 +24,16 @@
 //!
 //! ## What the verification found
 //!
-//! **No backend change was needed to make it work.** Pointing the whole
-//! Postgres suite at this container passes — including every DDL test, which is
-//! more than CockroachDB managed — with five exceptions. One of them is a real
-//! robustness gap in hubro, filed rather than fixed here (finding 2); the rest
-//! are the engine or the container:
+//! **No backend change was needed to make it work.** Run with
+//! `-- --test-threads=1`, the whole Postgres suite passes against this
+//! container — including every DDL test, which is more than CockroachDB
+//! managed — with three exceptions, all of them the engine or the container
+//! (findings 3-5 below).
+//!
+//! The other two findings are not shared-suite failures at all under that
+//! invocation: they appear only when schema changes run *concurrently*, which
+//! is what removing `--test-threads=1` does. One of the two is a real
+//! robustness gap in hubro, filed rather than fixed here.
 //!
 //!  1. **Concurrent DDL is refused.** Two `CREATE TABLE`s in flight at once
 //!     fail with `could not serialize access due to concurrent update`, because
@@ -50,11 +55,15 @@
 //!     `MISMATCHED_SCHEMA` — "the catalog snapshot used for this transaction
 //!     has been invalidated" — surfaces when a schema change lands between the
 //!     six queries introspection runs. It is a *read* failing, which is the
-//!     part that matters: refreshing the schema tree on a cluster someone else
-//!     is changing can error out, and the message names a Yugabyte internal
-//!     rather than anything the user can act on. Transient by construction, so
-//!     the next attempt succeeds — which is why the tests here retry once via
-//!     [`introspect_stable`], and why hubro should too. Filed as FRE-147 rather
+//!     part that matters: refreshing the schema tree while *anything* is
+//!     changing the schema can error out, and the message names a Yugabyte
+//!     internal rather than anything the user can act on. Not only a
+//!     multi-user hazard, either — the two routes in finding 1 reach it from a
+//!     single hubro window. Nor is it rare: instrumenting the retry below
+//!     showed it firing on roughly half of this binary's runs, with the second
+//!     attempt succeeding every time. Transient by construction, which is why
+//!     the tests here retry once via [`introspect_stable`], and why hubro
+//!     should too. Filed as FRE-147 rather
 //!     than fixed here: which errors are worth retrying is a cross-engine
 //!     decision, not a Yugabyte one.
 //!  3. **A failing script does not roll back its DDL** — the same gap
@@ -97,9 +106,9 @@
 use std::sync::OnceLock;
 
 use hubro::db::{
-    apply_staged, detect_row_identity, run_script, split_statements, DbPool, DdlObject, Filter,
-    Internal, PageRequest, PgFlavor, Restriction, RowIdentity, RowLocator, SortDir, StagedChange,
-    TableKind, TableMeta, Value,
+    apply_staged, detect_row_identity, run_script, split_statements, DbPool, DdlObject, DdlSource,
+    Filter, Internal, PageRequest, PgFlavor, Restriction, RowIdentity, RowLocator, SortDir,
+    StagedChange, TableKind, TableMeta, Value,
 };
 use tokio::sync::Mutex;
 
@@ -280,11 +289,15 @@ async fn yugabyte_introspects_with_full_postgres_parity() {
     let ddl = pool
         .fetch_ddl(table, &DdlObject::Index(format!("{readings}_pkey")))
         .await
-        .unwrap()
-        .text();
+        .unwrap();
+    // Asserted rather than assumed: `pg_get_indexdef` is what carries the
+    // sharding attributes, and a fall back to reconstruction would drop them
+    // while still producing plausible-looking DDL.
+    assert_eq!(ddl.source, DdlSource::Native);
+    let text = ddl.text();
     assert!(
-        ddl.contains("USING lsm") && ddl.contains("HASH"),
-        "expected Yugabyte's sharding attributes in the index DDL, got: {ddl}"
+        text.contains("USING lsm") && text.contains("HASH"),
+        "expected Yugabyte's sharding attributes in the index DDL, got: {text}"
     );
 
     pool.close().await;
