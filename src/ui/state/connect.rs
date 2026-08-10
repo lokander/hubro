@@ -52,6 +52,40 @@ pub(super) fn ssh_secret_key(url: &str) -> String {
     format!("{url}#ssh")
 }
 
+/// Where a tunnel passphrase came from. The two sources differ in what a
+/// rejection means, which is why this is an enum rather than the "did we have
+/// one" bool it replaced (FRE-151).
+///
+/// A **keyring** passphrase is one a tunnel open has already accepted, so a
+/// rejection means the stored copy went stale and should go. A **session**
+/// passphrase carries no such guarantee: [`AppState::stash_ssh_passphrase`]
+/// writes the user's typed passphrase into session memory *unvalidated* —
+/// that map is the only channel to this re-entrant call — so reading a session
+/// hit as a stale stored secret let a single typo delete the saved passphrase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PassphraseSource {
+    /// Typed at the prompt this session. Never validated on its own.
+    Session,
+    /// Read back from the OS keyring, where only accepted passphrases land.
+    Keyring,
+}
+
+/// Drops the passphrase that just failed out of session memory and reports
+/// whether the keyring copy should go too.
+///
+/// Session memory is cleared for **both** sources: the value is wrong wherever
+/// it came from, and leaving it would shadow the keyring on the next attempt.
+/// Only a keyring-sourced rejection also deletes the stored copy — see
+/// [`PassphraseSource`].
+pub(super) fn forget_failed_ssh_passphrase(
+    session: &mut HashMap<String, String>,
+    key: &str,
+    source: PassphraseSource,
+) -> bool {
+    session.remove(key);
+    source == PassphraseSource::Keyring
+}
+
 /// Keyring key for a connection's cached Entra refresh token. Disjoint from the
 /// password (bare URL) and SSH passphrase (`#ssh`) keys, so the three never
 /// collide. Only a refresh token is ever cached here — never an access token.
@@ -1197,16 +1231,23 @@ impl AppState {
         // prompt. Only key-file auth can need one.
         let secret_key = ssh_secret_key(url);
         let mut passphrase = None;
+        // Which of the two supplied it decides what a rejection below means,
+        // so the source is tracked alongside the value (FRE-151).
+        let mut source = None;
         if matches!(config.auth, TunnelAuth::KeyFile { .. }) {
             passphrase = self.session_passwords.read().get(&secret_key).cloned();
-            if passphrase.is_none() {
+            if passphrase.is_some() {
+                source = Some(PassphraseSource::Session);
+            } else {
                 passphrase = crate::secrets::get_password_async(secret_key.clone())
                     .await
                     .ok()
                     .flatten();
+                if passphrase.is_some() {
+                    source = Some(PassphraseSource::Keyring);
+                }
             }
         }
-        let had_passphrase = passphrase.is_some();
         let target = match (backend.url_target)(url) {
             Ok(target) => target,
             Err(err) => {
@@ -1225,10 +1266,20 @@ impl AppState {
             },
             Err(err @ TunnelError::NeedsPassphrase(_)) => {
                 self.release_connect(url);
-                if had_passphrase {
-                    // Stored passphrase is stale; drop it everywhere and
-                    // re-ask.
-                    self.forget_stale_secret(secret_key, err.to_string()).await;
+                if let Some(source) = source {
+                    // Something was tried and rejected. It leaves session
+                    // memory either way; only a keyring-sourced one is stale
+                    // enough to delete (FRE-151). The write guard is a
+                    // statement temporary — nothing is held across the await.
+                    let drop_stored = forget_failed_ssh_passphrase(
+                        &mut self.session_passwords.write(),
+                        &secret_key,
+                        source,
+                    );
+                    if drop_stored {
+                        let _ = crate::secrets::delete_password_async(secret_key).await;
+                    }
+                    self.connect_error.set(Some(err.to_string()));
                 }
                 self.password_prompt.set(Some(PasswordPrompt {
                     url: url.to_string(),
@@ -1544,6 +1595,14 @@ mod tests {
         )
     }
 
+    /// The source of [`AppState::open_tunnel`], read for the reason
+    /// [`open_target_body`] documents: reaching the branch it is asked about
+    /// needs an SSH server, a keyring and a Dioxus runtime, and the bug there
+    /// was a routing mistake visible right here.
+    fn open_tunnel_body() -> String {
+        method_body(include_str!("connect.rs"), "async fn open_tunnel(")
+    }
+
     /// A saved Postgres entry with an SSH tunnel and interactive Entra auth —
     /// the two fields `SavedList::add` adopts, and so the two an argv connect
     /// can destroy.
@@ -1690,6 +1749,84 @@ mod tests {
         assert!(
             body.contains("Some(password)"),
             "the password that came with the URL is no longer being connected with"
+        );
+    }
+
+    #[test]
+    fn only_a_keyring_sourced_passphrase_is_deleted_when_it_is_rejected() {
+        const KEY: &str = "postgres://u@h:5432/db#ssh";
+
+        // Typed at the prompt and rejected: the keyring copy is somebody
+        // else's — the *saved* passphrase, which this attempt says nothing
+        // about. Deleting it here is the bug (FRE-151).
+        let mut session = HashMap::from([(KEY.to_string(), "typ0".to_string())]);
+        assert!(
+            !forget_failed_ssh_passphrase(&mut session, KEY, PassphraseSource::Session),
+            "a mistyped passphrase must not delete the stored one"
+        );
+
+        // It still leaves session memory: it is wrong, and leaving it would
+        // shadow the keyring on the next attempt — the connect would then keep
+        // failing on a value the user has already replaced.
+        assert!(
+            !session.contains_key(KEY),
+            "the rejected passphrase is still in session memory, where it will \
+             be tried again ahead of the keyring"
+        );
+
+        // Read back from the keyring and rejected: only passphrases a tunnel
+        // open accepted are ever stored, so this one has gone stale and both
+        // copies go.
+        let mut session = HashMap::from([(KEY.to_string(), "stale".to_string())]);
+        assert!(
+            forget_failed_ssh_passphrase(&mut session, KEY, PassphraseSource::Keyring),
+            "a stale stored passphrase must be dropped, or every connect \
+             re-offers the credential the server just refused"
+        );
+        assert!(!session.contains_key(KEY));
+
+        // Unrelated entries are never collateral.
+        let mut session = HashMap::from([("other#ssh".to_string(), "keep".to_string())]);
+        forget_failed_ssh_passphrase(&mut session, KEY, PassphraseSource::Keyring);
+        assert_eq!(session.get("other#ssh").map(String::as_str), Some("keep"));
+    }
+
+    #[test]
+    fn open_tunnel_decides_on_the_passphrase_s_source_not_its_presence() {
+        // The test above proves the policy; this proves `open_tunnel` uses it.
+        // The two are separable — the policy would stay green against a caller
+        // that never consults it, which is exactly the shape of the original
+        // bug: `had_passphrase` was a bool, so a session hit and a keyring hit
+        // were indistinguishable and both deleted the stored secret.
+        let body = open_tunnel_body();
+        assert!(
+            !body.contains("forget_stale_secret"),
+            "open_tunnel is deleting the keyring entry unconditionally again — \
+             that is the FRE-151 bug: `stash_ssh_passphrase` puts the user's \
+             *unvalidated* typing in session memory, so one typo destroys the \
+             saved passphrase"
+        );
+        assert!(
+            body.contains("forget_failed_ssh_passphrase("),
+            "the rejection path must go through the shared policy"
+        );
+        // Both arms have to be reachable, or the policy is being handed a
+        // constant and the distinction it exists for is gone.
+        assert!(
+            body.contains("PassphraseSource::Session"),
+            "nothing marks a session-sourced passphrase, so a typo is \
+             indistinguishable from a stale stored secret again"
+        );
+        assert!(
+            body.contains("PassphraseSource::Keyring"),
+            "nothing marks a keyring-sourced passphrase, so a genuinely stale \
+             stored secret is never cleaned up"
+        );
+        // And the delete must be gated on what the policy returned, rather than
+        // running beside it.
+        assert!(
+            body.contains("if drop_stored {") && body.contains("delete_password_async(secret_key)"),
+            "the keyring delete must be conditional on the policy's verdict"
         );
     }
 
