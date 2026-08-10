@@ -17,6 +17,7 @@ use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{Decimal, JsonValue, Uuid};
 use sqlx::{Row as _, TypeInfo as _, ValueRef as _};
 
+use super::caps::Restriction;
 use super::ddl::{
     create_table_sql, create_view_sql, terminate, ColumnExtra, Ddl, DdlObject, TableExtras,
 };
@@ -462,6 +463,103 @@ fn line_col(sql: &str, position: usize) -> Option<(usize, usize)> {
     (position == seen + 1).then_some((line, column))
 }
 
+/// Which shape of the column query to run — see [`column_query`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnQuery {
+    /// Everything stock Postgres exposes, including identity/generated flags
+    /// and the `udt_*` pair that resolves enum and array structure.
+    Rich,
+    /// Only the columns every Postgres-wire `information_schema` has. The
+    /// missing ones are selected as the constants they would decode to, so the
+    /// result shape — and therefore the decoding below — is identical.
+    Portable,
+}
+
+/// Columns for every relation, with primary-key positions resolved in SQL.
+///
+/// Identity and generated columns carry a NULL `column_default` even though the
+/// database supplies their value, so `is_identity`/`identity_generation`/
+/// `is_generated` are surfaced separately and mapped into
+/// [`ColumnMeta::generated`] (FRE-25 required-column detection and read-only
+/// gating). Materialized-view columns are not in `information_schema.columns`
+/// at all, so they come from `pg_attribute` via a UNION (FRE-41) — matviews
+/// have no PK, identity or generated columns, so those are constant in that
+/// half, and `format_type` yields the type name with its modifiers (e.g.
+/// `character varying(255)`). `ord` orders columns within a relation across
+/// both halves.
+///
+/// `pk_position` is cast to `int8` rather than taken as it comes: the SQL
+/// standard leaves `information_schema` positions as an implementation-defined
+/// exact numeric, and CockroachDB makes `key_column_usage.ordinal_position`
+/// 64-bit where stock Postgres makes it 32-bit (FRE-90). Decoding is exact by
+/// wire type, so the mismatch failed the *whole* introspection. Pinning the
+/// width costs nothing on Postgres and makes the decode independent of what any
+/// engine chose.
+fn column_query(shape: ColumnQuery) -> String {
+    // The three spans that differ. The portable shape must select the same
+    // column names in the same order, so only the expressions change.
+    let (generated, type_detail, type_join) = match shape {
+        ColumnQuery::Rich => (
+            "c.is_identity, c.identity_generation, c.is_generated",
+            "ut.typtype::text AS typtype, ut.typcategory::text AS typcategory, \
+             ut.oid::int8 AS type_oid, \
+             c.udt_schema AS type_schema, c.udt_name AS type_base",
+            "LEFT JOIN pg_namespace un ON un.nspname = c.udt_schema \
+             LEFT JOIN pg_type ut ON ut.typname = c.udt_name AND ut.typnamespace = un.oid",
+        ),
+        ColumnQuery::Portable => (
+            "'NO' AS is_identity, NULL::text AS identity_generation, 'NEVER' AS is_generated",
+            "NULL::text AS typtype, NULL::text AS typcategory, \
+             NULL::int8 AS type_oid, \
+             NULL::text AS type_schema, NULL::text AS type_base",
+            "",
+        ),
+    };
+    format!(
+        "SELECT c.table_schema, c.table_name, c.column_name, c.data_type, \
+                c.is_nullable, c.column_default, \
+                {generated}, \
+                pk.ordinal_position::int8 AS pk_position, \
+                c.ordinal_position AS ord, \
+                {type_detail} \
+         FROM information_schema.columns c \
+         {type_join} \
+         LEFT JOIN ( \
+             SELECT kcu.table_schema, kcu.table_name, kcu.column_name, kcu.ordinal_position \
+             FROM information_schema.table_constraints tc \
+             JOIN information_schema.key_column_usage kcu \
+               ON kcu.constraint_name = tc.constraint_name \
+              AND kcu.constraint_schema = tc.constraint_schema \
+              AND kcu.table_schema = tc.table_schema \
+              AND kcu.table_name = tc.table_name \
+             WHERE tc.constraint_type = 'PRIMARY KEY' \
+         ) pk ON pk.table_schema = c.table_schema \
+             AND pk.table_name = c.table_name \
+             AND pk.column_name = c.column_name \
+         WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema') \
+         UNION ALL \
+         SELECT n.nspname, c.relname, a.attname, \
+                format_type(a.atttypid, a.atttypmod), \
+                CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END, \
+                NULL::text, 'NO', NULL::text, 'NEVER', \
+                NULL::int8, a.attnum::int, \
+                t.typtype::text, t.typcategory::text, t.oid::int8, \
+                tn.nspname, t.typname \
+         FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         JOIN pg_type t ON t.oid = a.atttypid \
+         JOIN pg_namespace tn ON tn.oid = t.typnamespace \
+         WHERE c.relkind = 'm' AND a.attnum > 0 AND NOT a.attisdropped \
+           AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM information_schema.columns ic \
+             WHERE ic.table_schema = n.nspname AND ic.table_name = c.relname \
+           ) \
+         ORDER BY table_schema, table_name, ord"
+    )
+}
+
 /// Full multi-schema introspection: every user schema's tables and views
 /// with columns, primary keys, indexes (incl. unique), and foreign keys —
 /// parity with the SQLite metadata model. Six batched queries regardless
@@ -659,9 +757,46 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
         }
     }
 
+    // Schemas Materialize reserves for its own catalog (FRE-92). It exposes
+    // five beyond the two excluded above — `mz_catalog`, `mz_internal`,
+    // `mz_introspection`, `mz_unsafe`, `mz_catalog_unstable` — holding 265
+    // objects between them, which would otherwise be the overwhelming majority
+    // of the schema tree.
+    //
+    // No cross-engine catalog fact reaches these: unlike CockroachDB's, they
+    // are reported as ordinary tables and views rather than `SYSTEM VIEW`, and
+    // `pg_depend` is empty. Materialize does record it, in the one place only
+    // Materialize has — `mz_schemas.id`, where a leading `s` means the system
+    // created the schema and `u` means a user did. So this is the case
+    // `PgFlavor` exists for: knowing the engine is what tells us *which*
+    // catalog to ask, and the answer still comes from the catalog rather than
+    // from a list of names.
+    //
+    // Best-effort, like the Timescale and Citus queries above: a schema tree
+    // cluttered with Materialize's internals is worse than one without the
+    // badge, but neither is worth failing the whole introspection over.
+    if conn.flavor() == PgFlavor::Materialize {
+        if let Ok(rows) = sqlx::query("SELECT name FROM mz_schemas WHERE id LIKE 's%'")
+            .fetch_all(pool)
+            .await
+        {
+            for row in &rows {
+                let schema: String = get(row, "name")?;
+                internal_schemas.insert(schema, Internal::System);
+            }
+        }
+    }
+
     // Tables and views across all non-system schemas. Materialized views
-    // (relkind 'm') are not in information_schema, so they come from a
-    // pg_catalog UNION (FRE-41).
+    // (relkind 'm') are not in stock Postgres's information_schema, so they
+    // come from a pg_catalog UNION (FRE-41).
+    //
+    // "Not in information_schema" is a PostgreSQL choice, not a rule: Materialize
+    // lists its materialized views there *and* reports `relkind = 'm'`, so both
+    // halves of the UNION claim them and every such object arrived twice —
+    // once whole, once as a duplicate that later grouping left empty (FRE-92).
+    // The second half therefore takes only what the first did not, which is a
+    // no-op on any server that behaves like stock Postgres.
     let table_rows = sqlx::query(
         "SELECT table_schema, table_name, table_type \
          FROM information_schema.tables \
@@ -672,6 +807,10 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
          JOIN pg_namespace n ON n.oid = c.relnamespace \
          WHERE c.relkind = 'm' \
            AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM information_schema.tables it \
+             WHERE it.table_schema = n.nspname AND it.table_name = c.relname \
+           ) \
          ORDER BY table_schema, table_name",
     )
     .fetch_all(pool)
@@ -700,51 +839,36 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     // taking down the entire schema tree. Pinning the width in SQL costs
     // nothing on Postgres and makes the decode independent of what any
     // Postgres-wire engine chose here.
-    let column_rows = sqlx::query(
-        "SELECT c.table_schema, c.table_name, c.column_name, c.data_type, \
-                c.is_nullable, c.column_default, \
-                c.is_identity, c.identity_generation, c.is_generated, \
-                pk.ordinal_position::int8 AS pk_position, \
-                c.ordinal_position AS ord, \
-                ut.typtype::text AS typtype, ut.typcategory::text AS typcategory, \
-                ut.oid::int8 AS type_oid, \
-                c.udt_schema AS type_schema, c.udt_name AS type_base \
-         FROM information_schema.columns c \
-         LEFT JOIN pg_namespace un ON un.nspname = c.udt_schema \
-         LEFT JOIN pg_type ut ON ut.typname = c.udt_name AND ut.typnamespace = un.oid \
-         LEFT JOIN ( \
-             SELECT kcu.table_schema, kcu.table_name, kcu.column_name, kcu.ordinal_position \
-             FROM information_schema.table_constraints tc \
-             JOIN information_schema.key_column_usage kcu \
-               ON kcu.constraint_name = tc.constraint_name \
-              AND kcu.constraint_schema = tc.constraint_schema \
-              AND kcu.table_schema = tc.table_schema \
-              AND kcu.table_name = tc.table_name \
-             WHERE tc.constraint_type = 'PRIMARY KEY' \
-         ) pk ON pk.table_schema = c.table_schema \
-             AND pk.table_name = c.table_name \
-             AND pk.column_name = c.column_name \
-         WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema') \
-         UNION ALL \
-         SELECT n.nspname, c.relname, a.attname, \
-                format_type(a.atttypid, a.atttypmod), \
-                CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END, \
-                NULL::text, 'NO', NULL::text, 'NEVER', \
-                NULL::int8, a.attnum::int, \
-                t.typtype::text, t.typcategory::text, t.oid::int8, \
-                tn.nspname, t.typname \
-         FROM pg_attribute a \
-         JOIN pg_class c ON c.oid = a.attrelid \
-         JOIN pg_namespace n ON n.oid = c.relnamespace \
-         JOIN pg_type t ON t.oid = a.atttypid \
-         JOIN pg_namespace tn ON tn.oid = t.typnamespace \
-         WHERE c.relkind = 'm' AND a.attnum > 0 AND NOT a.attisdropped \
-           AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
-         ORDER BY table_schema, table_name, ord",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(map_err)?;
+    // Stock Postgres supplies the identity/generated flags and the
+    // `udt_schema`/`udt_name` pair from `information_schema.columns`; a
+    // Postgres-wire engine with a slimmer `information_schema` supplies
+    // neither, and selecting a column the server does not have fails the
+    // statement outright — taking the whole schema tree with it, the same way
+    // the `pk_position` width did (FRE-90). Materialize's
+    // `information_schema.columns` has eleven columns to stock's forty-four
+    // (FRE-92), so it needs the portable shape.
+    //
+    // Tried first and fallen back from, rather than probed for: the fallback
+    // is one wasted round trip on the engines that need it and none at all on
+    // the ones that don't, and it degrades on *any* missing column rather than
+    // on the specific five known today. What it costs is real and worth
+    // stating — an engine in the portable shape reports no identity columns
+    // and no enum/array detail. Both are absent on such an engine anyway
+    // (Materialize has neither), so the degraded answer is also the correct
+    // one; if that stops being true for some future engine, this is where it
+    // will be wrong.
+    let column_rows = match sqlx::query(&column_query(ColumnQuery::Rich))
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(_) => sqlx::query(&column_query(ColumnQuery::Portable))
+            .fetch_all(pool)
+            .await
+            // The fallback's own failure is the one worth reporting: the rich
+            // query failing is expected on these engines and says nothing.
+            .map_err(map_err)?,
+    };
 
     // Enum variants for every enum type in the database, keyed by type OID
     // (FRE-71). One query rather than per-column: enum types are few and a
@@ -770,26 +894,44 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     // (indpred) are flagged so row-identity detection can reject them;
     // invalid indexes (e.g. from a failed CREATE INDEX CONCURRENTLY) make
     // no guarantees at all and are dropped entirely.
-    let index_rows = sqlx::query(
-        "SELECT n.nspname AS table_schema, t.relname AS table_name, \
-                i.relname AS index_name, ix.indisunique AS is_unique, \
-                ix.indpred IS NOT NULL AS is_partial, \
-                k.ord AS key_position, a.attname AS column_name \
-         FROM pg_index ix \
-         JOIN pg_class t ON t.oid = ix.indrelid \
-         JOIN pg_class i ON i.oid = ix.indexrelid \
-         JOIN pg_namespace n ON n.oid = t.relnamespace \
-         CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) \
-         LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
-         WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
-           AND n.nspname NOT LIKE 'pg\\_%' \
-           AND k.ord <= ix.indnkeyatts \
-           AND ix.indisvalid \
-         ORDER BY n.nspname, t.relname, i.relname, k.ord",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(map_err)?;
+    // `indnkeyatts` separates an index's key columns from its INCLUDE payload,
+    // and is absent on engines that have no INCLUDE to separate — Materialize
+    // among them (FRE-92). Same fallback shape as the column query above: the
+    // clause is dropped rather than the query failing. On an engine without
+    // INCLUDE that changes nothing; on one that has it but hides the count,
+    // payload columns would be read as key columns, which is why the narrower
+    // form is tried first.
+    let index_sql = |bound_keys: bool| {
+        format!(
+            "SELECT n.nspname AS table_schema, t.relname AS table_name, \
+                    i.relname AS index_name, ix.indisunique AS is_unique, \
+                    ix.indpred IS NOT NULL AS is_partial, \
+                    k.ord AS key_position, a.attname AS column_name \
+             FROM pg_index ix \
+             JOIN pg_class t ON t.oid = ix.indrelid \
+             JOIN pg_class i ON i.oid = ix.indexrelid \
+             JOIN pg_namespace n ON n.oid = t.relnamespace \
+             CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) \
+             LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
+             WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
+               AND n.nspname NOT LIKE 'pg\\_%' \
+               {} \
+               AND ix.indisvalid \
+             ORDER BY n.nspname, t.relname, i.relname, k.ord",
+            if bound_keys {
+                "AND k.ord <= ix.indnkeyatts"
+            } else {
+                ""
+            }
+        )
+    };
+    let index_rows = match sqlx::query(&index_sql(true)).fetch_all(pool).await {
+        Ok(rows) => rows,
+        Err(_) => sqlx::query(&index_sql(false))
+            .fetch_all(pool)
+            .await
+            .map_err(map_err)?,
+    };
 
     // Foreign keys from pg_constraint; conkey/confkey arrays preserve the
     // multi-column ordering that information_schema loses.
@@ -840,6 +982,11 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
         // once `pg_catalog` and `information_schema` are excluded — so the
         // rule needs no engine check and costs nothing to carry.
         let system = table_type == "SYSTEM VIEW";
+        // Materialize's streaming inputs (FRE-92). A source is continuously
+        // written by the engine from somewhere else — Kafka, Postgres
+        // replication, a load generator — so it is readable and never
+        // writable, which is a view's contract rather than a table's.
+        let source = table_type == "SOURCE";
         // The object's own rule first, then its schema's — most specific wins.
         // Naming the extension beats naming the engine for the same reason it
         // beats naming the shape above: it is the part the user can act on.
@@ -848,7 +995,14 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
             .cloned()
             .or_else(|| system.then_some(Internal::System))
             .or_else(|| internal_schemas.get(&schema).cloned());
-        let kind_label = kind_labels.get(&key).cloned();
+        let kind_label = kind_labels.get(&key).cloned().or_else(|| {
+            // Materialize's own vocabulary for the object kind that has no
+            // Postgres equivalent (FRE-92), so a source reads as one instead of
+            // as a mysteriously unwritable view. Same treatment `hypertable`
+            // and `continuous aggregate` get on Timescale (FRE-88): the label
+            // refines the kind rather than replacing it.
+            source.then(|| "source".to_string())
+        });
         tables.push(TableMeta {
             schema: Some(schema),
             name,
@@ -857,17 +1011,25 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
                 // by the ordinary route: nothing about being the engine's own
                 // catalog makes its rows addressable, and the alternative
                 // (falling through to `Table`) would offer editing on 119
-                // objects that mostly cannot even be read.
-                "VIEW" | "SYSTEM VIEW" => TableKind::View,
+                // objects that mostly cannot even be read. A Materialize
+                // `SOURCE` is a view for the same reason — derived, readable,
+                // never written by the user.
+                "VIEW" | "SYSTEM VIEW" | "SOURCE" => TableKind::View,
                 "MATERIALIZED VIEW" => TableKind::MaterializedView,
                 _ => TableKind::Table,
             },
             columns: Vec::new(),
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
-            // No per-object narrowing: kind and row identity already carry
-            // everything this backend knows about writability (FRE-87).
-            restriction: None,
+            // Per-object narrowing only where the driver knows something the
+            // resolver cannot derive (FRE-87). Kind and row identity carry the
+            // rest, so this is `None` for everything except a Materialize
+            // source — which resolves to a view, and would otherwise be
+            // refused with "Views are read-only", a sentence that sends the
+            // reader looking for a view definition that does not exist.
+            restriction: source.then_some(Restriction::Declared(
+                "Materialize sources are written by the engine, not by hand.",
+            )),
             internal,
             kind_label,
         });
