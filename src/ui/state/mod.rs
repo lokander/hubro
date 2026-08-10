@@ -247,6 +247,18 @@ pub struct SqlBuffers {
     /// handing a closed buffer's id to a later one would re-attach them to a
     /// query they did not come from.
     issued: u64,
+    /// Bumped every time text is placed into a buffer from *outside* the
+    /// editor, i.e. by [`Self::open`].
+    ///
+    /// The SQL pane pushes the document into CodeMirror when
+    /// [`Self::doc_target`] changes. The buffer id alone cannot carry that:
+    /// opening a saved query into an untitled blank buffer reuses it, so the
+    /// id stays the same and an id-gated effect never fires — the tab renames
+    /// itself and the editor stays empty, which is the state layer and the
+    /// screen disagreeing. Text arriving *from* the editor
+    /// ([`Self::set_text`]) deliberately does not bump it: pushing a
+    /// keystroke back into CodeMirror would fight the caret.
+    doc_generation: u64,
 }
 
 impl Default for SqlBuffers {
@@ -255,6 +267,7 @@ impl Default for SqlBuffers {
             list: vec![SqlBuffer::scratch(FIRST_SQL_BUFFER)],
             active: FIRST_SQL_BUFFER,
             issued: FIRST_SQL_BUFFER,
+            doc_generation: 0,
         }
     }
 }
@@ -268,6 +281,14 @@ impl SqlBuffers {
     /// The buffer the SQL pane is showing.
     pub fn active(&self) -> u64 {
         self.active
+    }
+
+    /// What the editor should currently be displaying: the active buffer and
+    /// the generation of the last text put into a buffer from outside it.
+    /// Either changing means the editor's document is stale — see
+    /// [`Self::doc_generation`].
+    pub fn doc_target(&self) -> (u64, u64) {
+        (self.active, self.doc_generation)
     }
 
     /// One buffer's text, empty for an id that is gone.
@@ -318,6 +339,10 @@ impl SqlBuffers {
     /// in which case that one is reused. Makes it active and returns its id.
     pub fn open(&mut self, title: Option<String>, text: String) -> u64 {
         let active = self.active;
+        // Both branches place text the editor has not seen, so both move the
+        // document generation — the reuse branch especially, since it is the
+        // one whose buffer id does not change.
+        self.doc_generation += 1;
         if let Some(buffer) = self
             .list
             .iter_mut()
@@ -446,14 +471,15 @@ impl std::ops::Deref for SharedStatement {
     }
 }
 
-/// State of the most recent SQL script run per connection.
+/// State of the most recent SQL script run in one query tab.
+///
+/// Keyed per `(connection, buffer)` rather than per connection: results
+/// belong to the buffer that produced them, and a run started in one query
+/// tab must not overwrite — or silently discard — what another tab is
+/// showing. That also keeps each tab's own Cancel button reachable while its
+/// script is in flight, whichever tab is in front.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SqlRun {
-    /// Which of the tab's SQL buffers ran it. One connection still runs one
-    /// script at a time, but the results are shown only under the buffer that
-    /// produced them — a result panel under a query it did not come from
-    /// would be a lie the editor has no way to caveat.
-    pub buffer: u64,
     /// Outcomes of the statements that finished, in script order.
     pub statements: Vec<SharedStatement>,
     pub status: RunStatus,
@@ -502,10 +528,10 @@ impl ExportStatus {
 /// A script held back by the write-confirmation banner: the original text
 /// (recorded into history when the run happens) plus its split statements.
 #[derive(Debug, Clone, PartialEq)]
+/// Keyed per `(connection, buffer)` like [`SqlRun`], so the banner is shown
+/// under the buffer the script came from and confirming always means the text
+/// on screen.
 pub struct PendingSql {
-    /// The buffer the script came from; the banner is shown under that
-    /// buffer only, so confirming always means the text on screen.
-    pub buffer: u64,
     pub script: String,
     pub statements: Vec<String>,
 }
@@ -739,11 +765,11 @@ pub struct AppState {
     /// [`Self::any_dirty`] + [`Self::confirm_quit`] (FRE-37), which raises a
     /// discard-and-quit confirmation rather than losing the edits silently.
     pub nav_guard: Signal<Option<PendingNav>>,
-    /// Latest free-form SQL result per connection.
-    pub sql_runs: Signal<HashMap<ConnectionId, SqlRun>>,
+    /// Latest free-form SQL result per query tab (FRE-113).
+    pub sql_runs: Signal<HashMap<(ConnectionId, u64), SqlRun>>,
     /// Scripts containing writes, held here until the user confirms (or
-    /// dismisses) the write-confirmation banner.
-    pub pending_sql: Signal<HashMap<ConnectionId, PendingSql>>,
+    /// dismisses) the write-confirmation banner, per query tab.
+    pub pending_sql: Signal<HashMap<(ConnectionId, u64), PendingSql>>,
     /// Staged saves waiting on the FRE-111 confirmation, one per table, each
     /// holding the exact change list the prompt named.
     ///
@@ -761,13 +787,15 @@ pub struct AppState {
     /// on it. Its enforcing counterpart, [`WriteProtection`], lives on
     /// [`Connection`] for the opposite reason.
     pub connection_colors: Signal<HashMap<ConnectionId, ConnectionColor>>,
-    /// Handle of the in-flight run per connection, kept so the Cancel
-    /// button can abort it. Entries are removed when a run completes.
-    pub sql_tasks: Signal<HashMap<ConnectionId, Task>>,
+    /// Handle of the in-flight run per query tab, kept so the Cancel button
+    /// can abort it. Entries are removed when a run completes — and cancelled
+    /// when the query tab or the connection closes, since a run nothing can
+    /// reach still burns a core and pins a pool connection.
+    pub sql_tasks: Signal<HashMap<(ConnectionId, u64), Task>>,
     /// Stale-run guard: each started run gets the next generation number,
     /// and a completing task only writes its result while its generation is
     /// still current.
-    pub sql_generations: Signal<HashMap<ConnectionId, u64>>,
+    pub sql_generations: Signal<HashMap<(ConnectionId, u64), u64>>,
     /// Persisted query-history store, opened in the background at startup.
     /// `None` while opening or when opening failed (see
     /// [`Self::history_error`]) — history is best-effort and the app works
@@ -789,8 +817,10 @@ pub struct AppState {
     /// running a script must not make every open panel refetch a list that
     /// cannot have changed.
     pub saved_nonce: Signal<u64>,
-    /// Outcome of the most recent saved-query write, shown in the panel.
-    pub saved_status: Signal<Option<SavedStatus>>,
+    /// Outcome of the most recent saved-query write, per connection. Keyed
+    /// like [`Self::export_status`] (FRE-73): one connection's "Saved" line
+    /// has no business appearing in another connection's panel.
+    pub saved_status: Signal<HashMap<ConnectionId, SavedStatus>>,
     /// The persisted theme choice (System / Light / Dark). The toggle cycles
     /// it; [`Self::set_theme`] persists it to settings.toml.
     pub theme: Signal<Theme>,
@@ -914,7 +944,7 @@ impl AppState {
             // Root-scoped for the same reason as their history neighbours:
             // written from the `spawn_forever` save/delete tasks.
             saved_nonce: Signal::new_in_scope(0, ScopeId::ROOT),
-            saved_status: Signal::new_in_scope(None, ScopeId::ROOT),
+            saved_status: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             // Root-scoped: the startup detection task below (a
             // `spawn_forever` running in the root scope) reads it, so a
             // component-scoped signal would trip `__copy_value_hoisted`.
@@ -1451,12 +1481,13 @@ impl AppState {
             .retain(|(open_id, _)| *open_id != id);
         self.schemas.write().remove(&id);
         self.tab_ui.write().remove(&id);
-        self.sql_runs.write().remove(&id);
-        self.pending_sql.write().remove(&id);
+        self.sql_runs.write().retain(|(conn, _), _| *conn != id);
+        self.pending_sql.write().retain(|(conn, _), _| *conn != id);
         self.pending_saves
             .write()
             .retain(|(conn, _), _| *conn != id);
         self.connection_colors.write().remove(&id);
+        self.saved_status.write().remove(&id);
         self.export_status
             .write()
             .retain(|(conn, _), _| *conn != id);
@@ -1465,14 +1496,24 @@ impl AppState {
             .retain(|(conn, _), _| *conn != id);
         self.pending_focus.write().remove(&id);
         self.nav_history.write().remove(&id);
-        // Abort any in-flight run and drop its bookkeeping; bumping nothing
-        // is fine — removing the generation entry makes any still-alive
-        // task's generation stale.
-        let task = self.sql_tasks.write().remove(&id);
-        if let Some(task) = task {
+        // Abort every query tab's in-flight run and drop the bookkeeping;
+        // bumping nothing is fine — removing the generation entries makes any
+        // still-alive task's generation stale.
+        let tasks: Vec<Task> = {
+            let mut sql_tasks = self.sql_tasks.write();
+            let ids: Vec<(ConnectionId, u64)> = sql_tasks
+                .keys()
+                .filter(|(conn, _)| *conn == id)
+                .copied()
+                .collect();
+            ids.iter().filter_map(|key| sql_tasks.remove(key)).collect()
+        };
+        for task in tasks {
             task.cancel();
         }
-        self.sql_generations.write().remove(&id);
+        self.sql_generations
+            .write()
+            .retain(|(conn, _), _| *conn != id);
         if *self.active.read() == ActiveView::Connection(id) {
             self.active.set(ActiveView::Connections);
         }
@@ -1625,6 +1666,45 @@ mod tests {
         assert_eq!(buffers.list().len(), 2);
         assert_eq!(buffers.active(), second);
         buffers
+    }
+
+    #[test]
+    fn opening_moves_the_document_target_even_when_it_reuses_the_buffer() {
+        // What the SQL pane's `setDoc` effect is gated on. The reuse branch
+        // returns the *same* buffer id, so if the id were the only dependency
+        // the editor would keep showing the old (empty) document while the
+        // tab renamed itself — the state layer and the screen disagreeing.
+        // This is the feature's first-use path: a fresh SQL pane is exactly
+        // one untitled blank buffer.
+        let mut buffers = SqlBuffers::default();
+        let before = buffers.doc_target();
+        let opened = buffers.open(Some("Artists".into()), "SELECT * FROM artists".into());
+        assert_eq!(opened, before.0, "this test must exercise the reuse branch");
+        assert_ne!(
+            buffers.doc_target(),
+            before,
+            "a reused buffer still needs the editor's document replaced"
+        );
+
+        // The non-reuse branch moves it too (its id changes as well).
+        let before = buffers.doc_target();
+        buffers.open(Some("Albums".into()), "SELECT * FROM albums".into());
+        assert_ne!(buffers.doc_target(), before);
+    }
+
+    #[test]
+    fn typing_does_not_move_the_document_target() {
+        // The opposite guard: text arriving *from* the editor must not push a
+        // document back into it, or every keystroke would fight the caret.
+        let mut buffers = SqlBuffers::default();
+        let before = buffers.doc_target();
+        assert!(buffers.set_text(FIRST_SQL_BUFFER, "SELECT 1".into()));
+        assert_eq!(buffers.doc_target(), before);
+        // Nor does naming a buffer after a save, or selecting the buffer that
+        // is already active.
+        buffers.set_title(FIRST_SQL_BUFFER, "Counts".into());
+        buffers.select(FIRST_SQL_BUFFER);
+        assert_eq!(buffers.doc_target(), before);
     }
 
     #[test]

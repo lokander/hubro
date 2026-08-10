@@ -397,3 +397,67 @@ async fn history_pruning_never_reaches_saved_queries() {
     }
     assert_eq!(store.saved_queries("big", None).await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn opening_a_pre_saved_query_database_upgrades_it_in_place() {
+    // A history.db written before FRE-113: `entries`, its index and `meta`,
+    // with real content. Opening it must add the saved-query table without
+    // disturbing what is already there — the upgrade path every existing
+    // install takes, and one no other test reaches, since every other test
+    // starts from a file this build created.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("history.db");
+    {
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let old = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        for statement in [
+            "CREATE TABLE entries (\
+                 id INTEGER PRIMARY KEY, \
+                 locator TEXT NOT NULL, \
+                 sql TEXT NOT NULL, \
+                 executed_at INTEGER NOT NULL, \
+                 success INTEGER NOT NULL, \
+                 error TEXT\
+             )",
+            "CREATE INDEX entries_by_locator ON entries(locator, id)",
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            "INSERT INTO entries (locator, sql, executed_at, success, error) \
+             VALUES ('db', 'SELECT 1', 1700000000, 1, NULL)",
+            "INSERT INTO meta (key, value) VALUES ('recording', 'off')",
+        ] {
+            sqlx::query(statement).execute(&old).await.unwrap();
+        }
+        old.close().await;
+    }
+
+    let store = HistoryStore::open_at(&path).await.unwrap();
+
+    // The old history and the old opt-out survived the upgrade.
+    let entries = store.list("db", None, 50).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].sql, "SELECT 1");
+    assert!(!store.recording_enabled().await.unwrap());
+
+    // And the new table exists and works, including its uniqueness index —
+    // a table created without it would take the second save as a new row.
+    store
+        .save_query("Kept", None, "SELECT 2", Some("db"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .save_query("Kept", None, "SELECT 3", Some("db"))
+            .await
+            .unwrap(),
+        SaveOutcome::Replaced
+    );
+    let saved = store.saved_queries("db", None).await.unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].sql, "SELECT 3");
+}

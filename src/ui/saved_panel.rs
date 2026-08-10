@@ -37,8 +37,9 @@ pub(super) fn SavedQueriesPanel(
     let mut showing_form = use_signal(|| false);
     let store_ready = state.history.read().is_some();
     let history_error = state.history_error.read().clone();
-    let mut status_signal = state.saved_status;
-    let status = status_signal.read().clone();
+    // Per connection (like the export status, FRE-73): another connection's
+    // "Saved" line has no business showing up in this panel.
+    let status = state.saved_status.read().get(&id).cloned();
     // Empty buffers are not worth naming, and the store refuses them anyway;
     // saying so on the button beats a red line after the fact.
     let buffer_empty = state.sql_buffer_text(id, buffer).trim().is_empty();
@@ -76,7 +77,7 @@ pub(super) fn SavedQueriesPanel(
                             "Save what is in the editor under a name"
                         },
                         onclick: move |_| {
-                            status_signal.set(None);
+                            state.saved_status.clone().write().remove(&id);
                             showing_form.set(true);
                         },
                         "Save current query"
@@ -287,7 +288,7 @@ fn SavedRow(id: ConnectionId, entry: SavedQuery) -> Element {
                     button {
                         class: "rounded bg-rose-600 px-1.5 py-0.5 text-xs font-semibold text-white hover:bg-rose-500",
                         onclick: move |_| {
-                            state.delete_saved_query(entry_id);
+                            state.delete_saved_query(id, entry_id);
                             confirm_delete.set(false);
                         },
                         "Delete for good"

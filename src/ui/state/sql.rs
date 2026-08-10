@@ -27,6 +27,18 @@ impl AppState {
             .map_or(FIRST_SQL_BUFFER, |ui| ui.sql.active())
     }
 
+    /// What the SQL pane should currently be displaying: the active buffer
+    /// and the generation of the last text placed into a buffer from outside
+    /// the editor (see [`SqlBuffers::doc_target`]). The pane pushes the
+    /// document into CodeMirror whenever this changes — the buffer id alone
+    /// would miss an open that reuses the buffer already on screen.
+    pub fn sql_doc_target(&self, id: ConnectionId) -> (u64, u64) {
+        self.tab_ui
+            .read()
+            .get(&id)
+            .map_or((FIRST_SQL_BUFFER, 0), |ui| ui.sql.doc_target())
+    }
+
     /// One buffer's text, empty when it is gone.
     pub fn sql_buffer_text(&self, id: ConnectionId, buffer: u64) -> String {
         self.tab_ui
@@ -47,8 +59,8 @@ impl AppState {
             .or_default()
             .sql
             .set_text(buffer, text);
-        if changed && self.pending_sql.read().get(&id).map(|p| p.buffer) == Some(buffer) {
-            self.pending_sql.write().remove(&id);
+        if changed {
+            self.pending_sql.write().remove(&(id, buffer));
         }
     }
 
@@ -79,18 +91,29 @@ impl AppState {
             .select(buffer);
     }
 
-    /// Closes one buffer, dropping the run and the pending confirmation that
-    /// belonged to it — both name a buffer that no longer exists, and a
-    /// confirmation whose SQL the user can no longer read must never stay
-    /// runnable.
+    /// Closes one buffer, **cancelling its in-flight run** and dropping the
+    /// run, the pending confirmation and the stale-run bookkeeping that
+    /// belonged to it.
+    ///
+    /// Cancelling is the whole point, not tidiness: closing the tab takes its
+    /// Cancel button with it, so a run left alive would keep burning CPU and
+    /// pinning a pool connection with nothing anywhere able to stop it, and
+    /// its results are discarded on arrival regardless. This is what
+    /// [`Self::close_connection`] does for a whole tab; a query tab is the
+    /// same situation one buffer down. (As there, cancelling only drops the
+    /// future — the statement already in flight still finishes server-side;
+    /// see [`Self::cancel_sql`].)
     pub fn close_sql_buffer(mut self, id: ConnectionId, buffer: u64) {
         self.tab_ui.write().entry(id).or_default().sql.close(buffer);
-        if self.sql_runs.read().get(&id).map(|r| r.buffer) == Some(buffer) {
-            self.sql_runs.write().remove(&id);
+        let task = self.sql_tasks.write().remove(&(id, buffer));
+        if let Some(task) = task {
+            task.cancel();
         }
-        if self.pending_sql.read().get(&id).map(|p| p.buffer) == Some(buffer) {
-            self.pending_sql.write().remove(&id);
-        }
+        self.sql_runs.write().remove(&(id, buffer));
+        self.pending_sql.write().remove(&(id, buffer));
+        // Removing the generation makes any still-alive task for this buffer
+        // stale, so a completing run can't resurrect the closed tab's entry.
+        self.sql_generations.write().remove(&(id, buffer));
     }
 
     /// Runs a free-form SQL script against one connection. Scripts where
@@ -102,7 +125,7 @@ impl AppState {
     /// here, *before* the confirmation banner — being asked to confirm a
     /// write that can never run is a prompt with no right answer.
     pub fn run_sql(mut self, id: ConnectionId, buffer: u64, sql: String) {
-        self.pending_sql.write().remove(&id);
+        self.pending_sql.write().remove(&(id, buffer));
         // Effective capabilities: the backend's, narrowed by the user's
         // marking (FRE-111). Reading `pool.backend_capabilities()` here instead would
         // let a script write to a connection marked read-only.
@@ -117,11 +140,10 @@ impl AppState {
         if let Some((statement_index, reason)) = script_refusal(caps, &statements, dialect) {
             // Claim the run slot like a real run does: an in-flight script
             // must not push its results into the refusal or overwrite it.
-            self.claim_run_slot(id);
+            self.claim_run_slot(id, buffer);
             self.sql_runs.write().insert(
-                id,
+                (id, buffer),
                 SqlRun {
-                    buffer,
                     statements: Vec::new(),
                     status: RunStatus::Refused {
                         reason: reason.to_string(),
@@ -134,9 +156,8 @@ impl AppState {
         }
         if statements.iter().any(|s| needs_confirmation(s, dialect)) {
             self.pending_sql.write().insert(
-                id,
+                (id, buffer),
                 PendingSql {
-                    buffer,
                     script: sql,
                     statements,
                 },
@@ -147,16 +168,16 @@ impl AppState {
     }
 
     /// Confirms the write banner: runs the stashed script.
-    pub fn confirm_pending_sql(mut self, id: ConnectionId) {
-        let pending = self.pending_sql.write().remove(&id);
+    pub fn confirm_pending_sql(mut self, id: ConnectionId, buffer: u64) {
+        let pending = self.pending_sql.write().remove(&(id, buffer));
         if let Some(pending) = pending {
-            self.execute_script(id, pending.buffer, pending.script, pending.statements);
+            self.execute_script(id, buffer, pending.script, pending.statements);
         }
     }
 
     /// Dismisses the write banner without running anything.
-    pub fn dismiss_pending_sql(mut self, id: ConnectionId) {
-        self.pending_sql.write().remove(&id);
+    pub fn dismiss_pending_sql(mut self, id: ConnectionId, buffer: u64) {
+        self.pending_sql.write().remove(&(id, buffer));
     }
 
     /// Aborts the in-flight run, keeping the outcomes of the statements
@@ -174,28 +195,31 @@ impl AppState {
     ///
     /// Either way each cancelled long-running query pins one pool
     /// connection until the statement finishes.
-    pub fn cancel_sql(mut self, id: ConnectionId) {
-        let task = self.sql_tasks.write().remove(&id);
+    pub fn cancel_sql(mut self, id: ConnectionId, buffer: u64) {
+        let task = self.sql_tasks.write().remove(&(id, buffer));
         let Some(task) = task else { return };
         task.cancel();
-        if let Some(run) = self.sql_runs.write().get_mut(&id) {
+        if let Some(run) = self.sql_runs.write().get_mut(&(id, buffer)) {
             if run.status == RunStatus::Running {
                 run.status = RunStatus::Cancelled;
             }
         }
     }
 
-    /// Takes ownership of this connection's SQL run slot: cancels any
-    /// still-running task and bumps the generation, so a run that completes
-    /// later can tell it has been superseded and leaves the new result
-    /// alone. Returns the new generation.
-    fn claim_run_slot(&mut self, id: ConnectionId) -> u64 {
-        let previous = self.sql_tasks.write().remove(&id);
+    /// Takes ownership of one query tab's SQL run slot: cancels any
+    /// still-running task **of that tab** and bumps its generation, so a run
+    /// that completes later can tell it has been superseded and leaves the
+    /// new result alone. Returns the new generation.
+    ///
+    /// Per buffer, so re-running in one query tab no longer cancels or
+    /// discards a run another tab has going.
+    fn claim_run_slot(&mut self, id: ConnectionId, buffer: u64) -> u64 {
+        let previous = self.sql_tasks.write().remove(&(id, buffer));
         if let Some(previous) = previous {
             previous.cancel();
         }
         let mut generations = self.sql_generations.write();
-        let entry = generations.entry(id).or_insert(0);
+        let entry = generations.entry((id, buffer)).or_insert(0);
         *entry += 1;
         *entry
     }
@@ -218,11 +242,10 @@ impl AppState {
         else {
             return;
         };
-        let generation = self.claim_run_slot(id);
+        let generation = self.claim_run_slot(id, buffer);
         self.sql_runs.write().insert(
-            id,
+            (id, buffer),
             SqlRun {
-                buffer,
                 statements: Vec::new(),
                 status: RunStatus::Running,
             },
@@ -233,8 +256,8 @@ impl AppState {
         let task = spawn_forever(async move {
             let started = std::time::Instant::now();
             let result = run_script(&pool, caps, &statements, |statement| {
-                if self.sql_generation(id) == generation {
-                    if let Some(run) = self.sql_runs.write().get_mut(&id) {
+                if self.sql_generation(id, buffer) == generation {
+                    if let Some(run) = self.sql_runs.write().get_mut(&(id, buffer)) {
                         run.statements.push(SharedStatement::new(statement));
                     }
                 }
@@ -252,11 +275,11 @@ impl AppState {
                 self.record_history(id, script, success, error_text).await;
             });
             // Stale-run guard: a newer run (or a close) owns the slot now.
-            if self.sql_generation(id) != generation {
+            if self.sql_generation(id, buffer) != generation {
                 return;
             }
-            self.sql_tasks.write().remove(&id);
-            if let Some(run) = self.sql_runs.write().get_mut(&id) {
+            self.sql_tasks.write().remove(&(id, buffer));
+            if let Some(run) = self.sql_runs.write().get_mut(&(id, buffer)) {
                 run.status = match result {
                     Ok(()) => RunStatus::Done { elapsed_ms },
                     Err(err) => RunStatus::Failed {
@@ -269,11 +292,15 @@ impl AppState {
                 };
             }
         });
-        self.sql_tasks.write().insert(id, task);
+        self.sql_tasks.write().insert((id, buffer), task);
     }
 
-    fn sql_generation(self, id: ConnectionId) -> u64 {
-        self.sql_generations.read().get(&id).copied().unwrap_or(0)
+    fn sql_generation(self, id: ConnectionId, buffer: u64) -> u64 {
+        self.sql_generations
+            .read()
+            .get(&(id, buffer))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Best-effort history write for a completed run: never blocks or fails
@@ -370,18 +397,20 @@ impl AppState {
         let locator = self.connection_locator(id);
         let store = self.history.read().clone();
         let Some(store) = store else {
-            self.saved_status.set(Some(SavedStatus::Failed(
-                "the saved-query store is unavailable".to_string(),
-            )));
+            self.set_saved_status(
+                id,
+                SavedStatus::Failed("the saved-query store is unavailable".to_string()),
+            );
             return;
         };
         // A connection-scoped save needs a scope; without a locator the tab
         // is already gone, and silently writing a global would put the query
         // somewhere the user did not ask for.
         if !global && locator.is_none() {
-            self.saved_status.set(Some(SavedStatus::Failed(
-                "this connection is no longer open".to_string(),
-            )));
+            self.set_saved_status(
+                id,
+                SavedStatus::Failed("this connection is no longer open".to_string()),
+            );
             return;
         }
         let scope = (!global).then_some(locator).flatten();
@@ -391,17 +420,25 @@ impl AppState {
                 .await;
             match outcome {
                 Ok(outcome) => {
-                    self.saved_status.set(Some(SavedStatus::Saved {
-                        name: name.trim().to_string(),
-                        replaced: outcome == SaveOutcome::Replaced,
-                    }));
+                    self.set_saved_status(
+                        id,
+                        SavedStatus::Saved {
+                            name: name.trim().to_string(),
+                            replaced: outcome == SaveOutcome::Replaced,
+                        },
+                    );
                     self.title_sql_buffer(id, buffer, name.trim().to_string());
                     let mut nonce = self.saved_nonce.write();
                     *nonce += 1;
                 }
-                Err(err) => self.saved_status.set(Some(SavedStatus::Failed(err))),
+                Err(err) => self.set_saved_status(id, SavedStatus::Failed(err)),
             }
         });
+    }
+
+    /// Records the outcome of a saved-query write for one connection's panel.
+    fn set_saved_status(mut self, id: ConnectionId, status: SavedStatus) {
+        self.saved_status.write().insert(id, status);
     }
 
     /// Names an existing buffer after the query just saved from it.
@@ -413,7 +450,7 @@ impl AppState {
     }
 
     /// Deletes one saved query and refreshes open panels.
-    pub fn delete_saved_query(mut self, entry: i64) {
+    pub fn delete_saved_query(mut self, id: ConnectionId, entry: i64) {
         let store = self.history.read().clone();
         let Some(store) = store else { return };
         spawn_forever(async move {
@@ -422,7 +459,7 @@ impl AppState {
                     let mut nonce = self.saved_nonce.write();
                     *nonce += 1;
                 }
-                Err(err) => self.saved_status.set(Some(SavedStatus::Failed(err))),
+                Err(err) => self.set_saved_status(id, SavedStatus::Failed(err)),
             }
         });
     }
