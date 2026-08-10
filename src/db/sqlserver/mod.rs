@@ -13,9 +13,9 @@ mod pool;
 
 pub use ddl::fetch_ddl;
 pub use pool::{
-    begin_tx, commit_tx, execute, execute_all_checked, execute_conn, export, open_mssql,
-    open_mssql_with, query_capped, query_capped_conn, query_with, rollback_tx, MssqlAuth,
-    MssqlPool, MssqlTx,
+    begin_tx, commit_tx, execute, execute_all_checked, execute_conn, execute_with_conn, export,
+    open_mssql, open_mssql_with, query_capped, query_capped_conn, query_with, rollback_tx,
+    MssqlAuth, MssqlPool, MssqlTx,
 };
 
 use std::collections::HashMap;

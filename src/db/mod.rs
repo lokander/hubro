@@ -24,10 +24,12 @@
 
 mod caps;
 mod clipboard;
+mod coerce;
 mod ddl;
 mod error;
 mod export;
 mod fk;
+mod import;
 mod page;
 mod plan;
 mod postgres;
@@ -50,10 +52,21 @@ pub use caps::{
     NO_QUERY, UNGUARDED_WRITES, USER_READ_ONLY,
 };
 pub use clipboard::{raw_cell_text, render_copy, CopyBlock, CopyFormat};
+pub use coerce::{bool_checked, bool_value, classify_type, TypeClass};
+// The cell editor validates numbers with the import's rules rather than its
+// own copy of them (FRE-112); nothing outside the crate needs this.
+pub(crate) use coerce::parse_numeric_text;
 pub use ddl::{Ddl, DdlObject, DdlSource};
 pub use error::DbError;
 pub use export::{write_result, ExportFormat};
 pub use fk::{build_fk_filter, resolve_referenced_column};
+pub use import::{
+    default_mapping, import_refusal, is_importable, mapping_from_header, open_source, preview,
+    run_import, sniff_dialect, sniff_encoding, sniff_file, sniff_shape, ColumnBinding, CsvDialect,
+    CsvReader, EmptyField, Encoding, ErrorMode, FileSniff, ImportError, ImportOptions,
+    ImportReport, JsonReader, JsonShape, ReadError, Record, RecordSource, SkippedRow, SourceField,
+    SourceFormat, SourcePreview, SourceValue, MAX_REPORTED_SKIPS,
+};
 pub use page::{
     classify_column, ColumnClass, Filter, FilterOp, Page, PageRequest, PreviewInfo, SortDir,
     PREVIEW_BYTES,

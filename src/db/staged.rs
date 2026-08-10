@@ -417,17 +417,27 @@ fn update_summary(locator: &RowLocator, sets: &[(String, Value)]) -> String {
 }
 
 /// Accumulates bound parameters while rendering value positions into SQL.
-struct ParamSql {
+///
+/// Visible to the rest of `db/` so the file import (FRE-112) renders its
+/// multi-row INSERTs through the identical logic — an imported value and a
+/// hand-edited one must reach the same column the same way, NULL literals and
+/// Postgres casts included.
+pub(super) struct ParamSql {
     dialect: Dialect,
     values: Vec<Value>,
 }
 
 impl ParamSql {
-    fn new(dialect: Dialect) -> Self {
+    pub(super) fn new(dialect: Dialect) -> Self {
         ParamSql {
             dialect,
             values: Vec::new(),
         }
+    }
+
+    /// The parameters accumulated so far, in bind order.
+    pub(super) fn into_values(self) -> Vec<Value> {
+        self.values
     }
 
     /// A bound placeholder for `value` — except NULL, which is rendered as
@@ -447,7 +457,7 @@ impl ParamSql {
     /// never true, so a NULL identity value matches nothing and the
     /// row-count guard aborts the batch — the safe outcome, since a NULL
     /// key cannot address a row anyway.
-    fn value_sql(&mut self, value: &Value, cast: Option<&str>) -> String {
+    pub(super) fn value_sql(&mut self, value: &Value, cast: Option<&str>) -> String {
         if value.is_null() {
             return "NULL".to_string();
         }
@@ -469,7 +479,7 @@ impl ParamSql {
 /// introspected at all, or any non-Postgres dialect — SQLite's type
 /// affinity coerces on its own) binds its placeholder uncast, exactly as
 /// before.
-fn cast_targets(table: &TableMeta, dialect: Dialect) -> HashMap<&str, String> {
+pub(super) fn cast_targets(table: &TableMeta, dialect: Dialect) -> HashMap<&str, String> {
     if dialect != Dialect::Postgres {
         return HashMap::new();
     }

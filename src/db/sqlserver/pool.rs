@@ -757,6 +757,21 @@ pub async fn execute_conn(tx: &mut MssqlTx, sql: &str) -> Result<u64, DbError> {
     settle(&mut tx.conn, result, sql)
 }
 
+/// [`execute_conn`] with bound parameters — the write path for a batch of
+/// imported rows (FRE-112), which must run inside the script transaction and
+/// must not interpolate its values into the SQL.
+pub async fn execute_with_conn(
+    tx: &mut MssqlTx,
+    sql: &str,
+    params: &[Value],
+) -> Result<u64, DbError> {
+    if tx.conn.is_discarded() {
+        return Err(lost_connection());
+    }
+    let result = run_execute(tx.conn.client(), sql, params).await;
+    settle(&mut tx.conn, result, sql)
+}
+
 /// Commits a script transaction — its statements all take effect. A failed
 /// commit discards the connection (nothing was committed; the server rolls
 /// the transaction back with the session). A transaction whose connection was
