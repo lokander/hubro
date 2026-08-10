@@ -44,8 +44,10 @@
 //!     Cockroach creates by default, which is the more common operation, so
 //!     the engine's default stands. See
 //!     `cockroach_script_dml_rolls_back_but_its_ddl_does_not`, which pins the
-//!     behaviour so the trade stays a decision rather than a surprise; warning
-//!     the user in the SQL editor is FRE-146.
+//!     behaviour so the trade stays a decision rather than a surprise.
+//!     Telling the user is FRE-146 — and since YugabyteDB turned out to do the
+//!     same thing (FRE-91), that belongs behind a `Capabilities` flag rather
+//!     than a check against this one engine.
 //!
 //! And two are engine behaviour hubro should follow rather than fight:
 //!
