@@ -2,6 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+More specific guidance lives next to the code it governs, and loads when you work there:
+
+- `src/db/CLAUDE.md` — engine flavors, introspection SQL, retrying, capabilities, object metadata.
+- `src/ui/CLAUDE.md` — the Dioxus 0.7 API rules. **Read this before writing any component**; 0.7 changed every API and pre-0.7 patterns from training data will not compile.
+- `tests/CLAUDE.md` — which engine needs which env var, the container layout, verifying a new engine, the support matrix.
+- `docs/interactive-testing.md` — how to drive the app on Linux, macOS and Windows.
+
 ## Project
 
 `hubro` is a **desktop-only database viewer** (SQLite and Postgres via sqlx, SQL Server via tiberius) built with Dioxus 0.7 (Rust), shipping on Linux, macOS, and Windows. Do not add web or mobile platform support. Work is tracked in the Linear project "hubro" (team FRE).
@@ -21,17 +28,8 @@ Licensed **GPL-3.0-only** (FRE-83), with copyright held solely by Fredrik Lokand
 - `cargo test` — run all tests: unit tests live in `#[cfg(test)]` modules next to the code, integration tests in `tests/`. Test fixture files go in `tests/fixtures/`. Run a single test with `cargo test <name>`.
 - Don't run `cargo test` and `dx build`/`cargo build` concurrently — they contend on the `target/` lock (spurious signal/exit 144); run them sequentially.
 - Don't pipe `cargo test` into `head`/`grep`: SIGPIPE can kill the run mid-fixture and leave an engine database half-set-up, so the *next* run fails on leftover state rather than on code. Redirect to a file and grep that.
-- **A green engine-test run can mean nothing ran**: every `tests/db_*.rs` skips *and passes* when its `HUBRO_*_TEST_URL` is unset, so a stopped container or a typo reads as success. Confirm the tests executed, and mutation-check load-bearing assertions (invert one — it must fail). That caught an assertion in an unreached branch, a boundary defended only by a doc comment, and a guard with an escape route.
-- Postgres integration tests skip unless `HUBRO_PG_TEST_URL` is set; SQL Server tests skip unless `HUBRO_MSSQL_TEST_URL` is set; TimescaleDB tests skip unless `HUBRO_TIMESCALE_TEST_URL` is set; Citus tests skip unless `HUBRO_CITUS_TEST_URL` is set; CockroachDB tests skip unless `HUBRO_CRDB_TEST_URL` is set; YugabyteDB tests skip unless `HUBRO_YUGABYTE_TEST_URL` is set; Materialize tests skip unless `HUBRO_MATERIALIZE_TEST_URL` is set; RisingWave tests skip unless `HUBRO_RISINGWAVE_TEST_URL` is set; SSH-tunnel tests need `HUBRO_SSH_TEST` (+ `HUBRO_SSH_TEST_KEY`/`_ENC_KEY`). **`scripts/test-db.sh` starts and addresses them** (FRE-150): `./scripts/test-db.sh up` brings up every engine, waits for it, and runs its one-time setup; `env $(./scripts/test-db.sh env) cargo test` runs the suite against them without anyone retyping a URL. The `docker run` commands stay in the test-file headers as the source of truth — the script is the convenience. Point them at the Docker `hubro-pg-test` (host port 5433) / `hubro-mssql-test` (14333) / `hubro-timescale-test` (5434) / `hubro-citus-test` (5435) / `hubro-crdb-test` (26257) / `hubro-yugabyte-test` (5436) / `hubro-materialize-test` (6875) / `hubro-risingwave-test` (4566) / `hubro-ssh-test` (2222) containers; the exact `docker run` commands live in the test-file headers (`tests/db_postgres.rs`, `tests/db_sqlserver.rs`, `tests/db_timescale.rs`, `tests/db_citus.rs`, `tests/db_cockroach.rs`, `tests/db_yugabyte.rs`, `tests/db_materialize.rs`, `tests/db_risingwave.rs`, `tests/tunnel.rs`). The Citus URL needs `?sslmode=disable` — that image ships an X.509 v1 certificate rustls won't parse (FRE-89) — and so does the CockroachDB one, which runs `--insecure` and serves no TLS at all. Pointing the shared suite at YugabyteDB needs `-- --test-threads=1`: that engine refuses concurrent DDL, so parallel tests fail on each other's fixtures rather than on anything real (FRE-91).
+- **A green engine-test run can mean nothing ran**: every `tests/db_*.rs` skips *and passes* when its `HUBRO_*_TEST_URL` is unset, so a stopped container or a typo reads as success. Confirm the tests executed, and mutation-check load-bearing assertions (invert one — it must fail). That caught an assertion in an unreached branch, a boundary defended only by a doc comment, and a guard with an escape route. Which variable each engine needs, and how to start them, is in `tests/CLAUDE.md`.
 - **Two agents cannot share one container set.** Every suite uses fixed fixture names against one database, so concurrent runs drop each other's tables — measured, not theoretical: two `db_cockroach` runs against the same set fail 3-6 tests each, and against separate sets both pass. So parallel work on several issues needs `./scripts/test-db.sh up <N>` per agent (ports are `base + N*100`, container names get a `-N` suffix, set 0 is the layout the headers document), then `env $(./scripts/test-db.sh env <N>) cargo test`, and `rm <N>` to release it. Worktrees isolate the code but **not** the build: a fresh one has no `.cargo/config.toml` (untracked, via `.git/info/exclude`), so it builds into `./target` on the QLC system drive. Write one per worktree pointing at `/mnt/data/cargo-target/hubro-<N>`, and `cp -a --reflink=always` the warm dir into it — `/mnt/data` is btrfs, so the copy is free and the first build starts warm. Process names are shared too: every worktree builds a binary called `hubro`, so `pkill -x hubro` (or `pkill -x Xephyr`) kills the siblings' — kill by recorded PID.
-- Engine-verification issues (FRE-88 onwards) have **two possible outcomes, and only one of them produces a test file.**
-  - *The engine works through an existing backend.* It gets one `tests/db_<engine>.rs` behind its own `HUBRO_<ENGINE>_TEST_URL`, covering only what that engine does differently — the shared surface is verified by pointing the existing suite at the same container. The header records that engine's findings (what needed fixing, what is absent, what is a known gap), and the engine gets a row in the support matrix.
-  - *The engine needs a backend of its own.* There is nothing to test, so there is no test file — writing one that cannot pass would be worse than none. QuestDB is the worked example (FRE-94): no `OFFSET`, so every paged read fails, and the conclusion was "that is a backend, not a verification" (FRE-149). Record it under **Tested and not supported** in the matrix with the version tried and the blocker, and file the follow-up issue. The verification still succeeded — a "no" that stops the next person re-testing it is a result.
-- **The README's "Supported databases" matrix (FRE-96) is the published record**, assembled from those headers. Adding a row is the last step of a successful verification, with the exact version run and the date it passed both taken from an actual run rather than from the image tag — `SELECT version()` and friends, since the `:latest` tags in the test headers say nothing. The Browse/Edit/Script columns restate what `backend_capabilities` and `TableAccess::resolve` already decide, so a row that disagrees with the app is a bug in the row. `tests/support_matrix.rs` enforces the parts that can be checked offline: every `PgFlavor` and `Dialect` variant has a row, and no row records an image tag in place of a version.
-- Postgres-wire engines that aren't PostgreSQL are identified once at connect by `PgFlavor` (`src/db/postgres.rs`, FRE-90), read from the `version()` call that doubles as the liveness check. Keep any flavor branching inside the backend so a new engine is handled in one place; `DbPool::pg_flavor()` exists to report the answer, not for callers to branch on. **Prefer a catalog fact over the flavor whenever one exists** — CockroachDB's reserved catalog schemas are found via `table_type = 'SYSTEM VIEW'`, not via its name, which keeps the FRE-88 rule intact and needs no engine check at all. Likewise, anything varying by *version* within one engine belongs in a catalog query, which reports what the server has rather than what its version implies. Where no catalog fact exists, the flavor picks which catalog to *ask* rather than deciding the answer itself — Materialize's reserved schemas come from `mz_schemas.id` (FRE-92), a query only Materialize can answer.
-- Introspection SQL must not lean on PostgreSQL internals it doesn't need: `NULL::text` rather than `NULL::name` (`name` is a PostgreSQL-internal type), and no explicit `LATERAL` on an `unnest` in `FROM` (Postgres implies it; RisingWave's parser rejects it). Both cost nothing on Postgres and were the difference between a working schema tree and none (FRE-93).
-- Introspection queries must survive a server that lacks a column they select — one absent column fails the whole statement and empties the schema tree. `src/db/postgres.rs` handles this by trying the rich query and falling back to a portable shape that selects the missing pieces as the constants they would decode to (FRE-92); the fallback degrades on *any* missing column rather than on a list of known ones. Equally, don't assume a UNION's two halves are disjoint because they are on PostgreSQL: Materialize reports materialized views in both `information_schema` and `relkind = 'm'`, so each half now takes only what the other did not.
-- A failure the *server* declared retryable is `DbError::Transient`, classified on SQLSTATE `40001` alone and never on message text (FRE-147) — YugabyteDB's stale catalog snapshot and CockroachDB's transaction conflicts share the code and share nothing in their wording. Only the multi-statement catalog reads act on it: `DbPool::introspect` and `fetch_ddl` run **once** more via `retry_transient`, because a schema change landing between their queries is nobody's mistake and nothing the user can act on. Never retry a write on it, and never loop — a second failure isn't a racing schema change, and a schema tree that hangs is worse than one that reports an error.
 
 The crate is split into a library (`src/lib.rs`, holds app modules) and a thin binary (`src/main.rs`) so integration tests can import app code as `hubro::...`.
 
@@ -39,63 +37,9 @@ When a live database server (e.g. Postgres) is needed for testing or development
 
 Git pushes use SSH; the key is passphrase-protected. If pushes fail with "Permission denied (publickey)", ask the user to run `ssh-add`, or temporarily switch the remote to HTTPS with the authenticated `gh` CLI (`gh auth setup-git`).
 
-## Interactive testing (screenshots + clicking)
+## Interactive testing
 
-Development happens on multiple machines; pick the recipe for the current platform.
-
-Nothing in the suite covers rendering, so a UI change wants the app driven: FRE-148's model tests all passed while the screen stated the reason twice and still offered Export on an unbrowsable object. The app writes to the *real* `$XDG_CONFIG_HOME/hubro/`, so launch it with `XDG_CONFIG_HOME`/`XDG_DATA_HOME` pointed at a scratch dir rather than cleaning up afterwards, and `stat` them before and after to confirm. Parallel agents each need their own display (`Xephyr :12`, `:13`, …).
-
-### Linux (KDE Plasma on Wayland)
-
-To drive the app (click, type, screenshot) without touching the user's real cursor, run it inside a nested Xephyr X server:
-
-```bash
-Xephyr :2 -screen 900x700 &
-DISPLAY=:2 GDK_BACKEND=x11 ./target/dx/hubro/debug/linux/app/hubro &   # binary path from `dx build`
-DISPLAY=:2 xdotool search --name "Hubro" windowmove 50 50                  # window is named "Hubro"; may spawn offscreen
-DISPLAY=:2 xdotool mousemove X Y click 1                                     # full pointer control
-import -display :2 -window root shot.png                                     # screenshot the nested display
-```
-
-Driving the app directly on the desktop half-works and isn't worth it: `spectacle -b -n -a -o shot.png` captures windows and `xdotool key` reaches XWayland windows (after a one-time KDE "Remote Control" approval), but KWin ignores XTEST pointer events, so mouse control is impossible outside Xephyr.
-
-Gotchas: native `<select>` dropdowns are driven by click → `key Down/Up` → `key Return` (options aren't clickable elements). Xephyr runs no window manager, so nothing delivers `WindowEvent::CloseRequested` — send a synthetic `WM_DELETE_WINDOW` ClientMessage (a ~30-line Xlib/`gcc -lX11` helper) to test the window-close guard.
-
-### macOS
-
-The app is a native Cocoa bundle — there is no display server to nest, so **synthetic input drives the real cursor** (no Xephyr-style isolation exists). Keep interactions short: screenshot → verify → act, and save/restore the pointer around clicks. Tools: `brew install cliclick smokris/getwindowid/getwindowid`. One-time grants for the terminal app in System Settings → Privacy & Security: **Accessibility** (cliclick/System Events) and **Screen Recording** (screencapture).
-
-```bash
-dx build    # bundle: target/dx/hubro/debug/macos/Hubro.app
-open target/dx/hubro/debug/macos/Hubro.app    # must go via LaunchServices — see the blank-webview gotcha; quit with pkill -x Hubro
-GetWindowID Hubro --list     # titles list as "(null)" — pick the id with the main window's size
-screencapture -x -l <id> shot.png                                         # crisp per-window capture, works unfocused
-osascript -e 'tell app "System Events" to tell (first process whose unix id is '$(pgrep -x Hubro)') to get {position, size} of window 1'
-POS=$(cliclick p | tr -d ' '); cliclick c:X,Y; cliclick "m:$POS"          # click, then restore the cursor
-```
-
-Gotchas: on current macOS the webview stays **blank when the binary is exec'd directly** from a terminal (the window opens but WKWebView never paints) — launch through LaunchServices instead (`open path/to/Hubro.app`, then `pkill -x hubro` to quit; note the release bundle's process name is lowercase `hubro`, the debug bundle's is `Hubro`). Click targets are **window position + logical (point) coordinates** from the osascript line — don't derive them from screenshot pixels, which are 2x Retina and include shadow margins. The first click on an unfocused window only focuses it (the webview doesn't accept click-through) — click twice or activate the app first. Keystrokes go via System Events (`keystroke`/`key code`) to the focused window. The window-close guard is testable directly: macOS has a real window manager, so the red button or Cmd+W delivers `CloseRequested` — no synthetic-event helper needed.
-
-### Windows
-
-Everything goes through **posted window messages** (`PostMessage` to the WebView2 child) — no real cursor movement, no focus stealing, and no permission grants needed. Dot-source the checked-in helper `scripts/winauto.ps1` (PowerShell 7) for all of it:
-
-```powershell
-dx build    # exe: target\dx\hubro\debug\windows\app\hubro.exe
-Start-Process .\target\dx\hubro\debug\windows\app\hubro.exe   # window title "Hubro"
-. .\scripts\winauto.ps1
-$h = Find-AppWindow                 # top-level HWND (throws if the app isn't running)
-Save-WindowShot $h shot.png         # crisp PrintWindow capture, works while occluded; 1:1 with click coords
-Send-PostedClick $h X Y             # coords relative to the window rect = the screenshot's pixel coords
-Send-PostedText  $h "localhost"     # WM_CHAR into the focused element — click a field first
-Send-PostedKey   $h 0x28            # virtual keys: 0x0D Enter, 0x1B Esc, 0x26/0x28 Up/Down, 0x09 Tab
-Send-PostedWheel $h X Y -3          # scroll down 3 notches at that point
-Send-Close       $h                 # WM_CLOSE → delivers CloseRequested (tests the close guard)
-```
-
-Build prerequisites beyond rustup + VS Build Tools: **NASM** (`aws-lc-sys` needs it; GitHub's windows-latest runners have it preinstalled, dev machines don't — drop `nasm.exe` from nasm.us into `~\.cargo\bin`) and the WebView2 runtime (preinstalled on Win11). Install dx from the prebuilt `dx-x86_64-pc-windows-msvc.zip` GitHub release asset rather than `cargo install`.
-
-Gotchas: native `<select>` dropdowns work like on Linux — posted click, then `Send-PostedKey` Down/Up + Enter (the popup is a separate OS window that won't appear in captures; drive it blind by keyboard). **Re-screenshot before deriving coordinates** — form layouts shift as content changes and a click 5px off a field silently does nothing. Screenshots include the title bar and native menu (webview content starts ~56px down). Coordinates are 1:1 only at 100% display scaling (the helper calls `SetProcessDPIAware`; both dev monitors are at 100%). Posted input is verified with the app foreground (its normal state after launch); it never disturbs other windows either way. In the helper, Win32 `FindWindowEx` needs `[NullString]::Value` — a PowerShell `$null` string marshals as `""` and matches nothing.
+Nothing in the suite covers rendering, so a UI change wants the app driven: FRE-148's model tests all passed while the screen stated the reason twice and still offered Export on an unbrowsable object. Three sessions running, driving the app has caught bugs a green suite passed. The per-platform recipes, and the rule about isolating the app's config while doing it, are in **`docs/interactive-testing.md`**.
 
 ## Issue workflow
 
@@ -103,7 +47,7 @@ Work is tracked in Linear (team FRE). Docs-only changes (CLAUDE.md, README, etc.
 
 1. Move the Linear issue to In Progress. Create a **git worktree** on the issue's branch (use Linear's suggested branch name, e.g. `lokander/fre-5-set-up-async-database-layer`), and do all work there.
 2. Commit (conventional, subject-only), push the branch, and open a **GitHub PR** with `gh pr create`. Reference the issue ID (e.g. FRE-5) in the PR so Linear links it.
-3. Spawn a **subagent to review the PR** (correctness, the Dioxus 0.7 rules above, scope vs the issue). `gh pr review --approve` is blocked as self-approval — post findings with `gh pr comment`. Fix blocking findings and re-review by resuming the *same* review subagent via SendMessage (keeps its context). Only proceed once it approves. Expect findings to be *claims* rather than broken features — a doc comment, README cell or `# validates` comment asserting a property nothing checks. Prefer making such a claim checkable over restating it (`tests/support_matrix.rs` is the pattern); a guard that cannot fire is worse than none, because it reads as handled.
+3. Spawn a **subagent to review the PR** (correctness, the Dioxus 0.7 rules in `src/ui/CLAUDE.md`, scope vs the issue). `gh pr review --approve` is blocked as self-approval — post findings with `gh pr comment`. Fix blocking findings and re-review by resuming the *same* review subagent via SendMessage (keeps its context). Only proceed once it approves. Expect findings to be *claims* rather than broken features — a doc comment, README cell or `# validates` comment asserting a property nothing checks. Prefer making such a claim checkable over restating it (`tests/support_matrix.rs` is the pattern); a guard that cannot fire is worse than none, because it reads as handled. Mutate the **fix** too, not just the code it fixes: a correct fix that no test pins is one commit from regressing, and one such fix survived reverting to the exact pre-fix code with 485 tests still green.
 4. **Wait for CI to pass** (`gh pr checks <n> --watch`) before merging — local clippy/test runs don't cover everything CI checks (e.g. rustfmt). With several PRs in flight, rebase each onto `main` locally and build before merging: GitHub's `MERGEABLE` is textual, and a conflict-free merge still failed to compile when a sibling added a field to `SavedConnection`. Then **remove the worktree first**, and rebase-merge (`gh pr merge --rebase --delete-branch`) from the main checkout — merging from inside the worktree fails trying to check out `main`. Run the merge as its own step (chaining a `gh pr comment` + merge in one command trips the self-merge classifier). Move the issue to Done with the PR linked.
 
 ### Milestones
@@ -120,60 +64,8 @@ Use [Conventional Commits](https://www.conventionalcommits.org/) with **subject 
 
 ## Architecture
 
-- All components currently live in `src/main.rs`. `main()` calls `dioxus::launch(App)`; `App` is the root component.
+- `src/main.rs` is a thin binary: it parses CLI arguments and calls `dioxus::launch`. Components live under `src/ui/`, the backends under `src/db/`, and config under `src/config/`; each of those has its own guidance file where one is warranted.
 - Static files live in `assets/` and are referenced via the `asset!("/assets/...")` macro (paths are relative to the project root). Stylesheets/favicons are injected with `document::Link` in `App`.
-- `Dioxus.toml` holds Dioxus CLI app configuration (currently just the empty `[application]` section).
+- `Dioxus.toml` holds Dioxus CLI app configuration: the bundle identifier, icons (order is load-bearing — read the comment), and the per-platform file associations from FRE-114. `packaging/README.md` explains why each platform's declaration looks different.
 - New fields on `SavedConnection`/`Settings` use `#[serde(default, skip_serializing_if = ...)]` so older config files still deserialize and unaffected entries serialize unchanged.
-- Capabilities are declared per *server*, not just per driver (FRE-87/FRE-93): `DbPool::backend_capabilities` consults `PgFlavor` because RisingWave speaks the Postgres protocol but has no read-write transactions. Declaring `transactions: false` is what makes the script tab stop wrapping batches and editing refuse with a reason — hubro's row-count write guard *is* a transaction, so a backend without one is not offered unguarded editing.
-- **Prefer narrowing a claim to clearing a capability.** CockroachDB and YugabyteDB hold real transactions that roll DML back and let DDL escape, so they declare `transactions: true` with `transactional_ddl: false` (FRE-146) — declaring them non-transactional would be the worse lie, disabling the script tab's atomicity for the case where it does hold. `transactional_ddl` is the one capability that gates nothing: it only decides whether a failed script reports `Rollback::Full` or `Rollback::ExceptSchemaChanges`. When engines disagree on the details of a gap (Cockroach also commits writes staged *before* a DDL; Yugabyte rolls those back), say only what holds on both — claiming less than is known beats claiming more.
-- Objects that are the database's own bookkeeping (extension schemas and tables, child partitions) are declared per backend as `TableMeta::internal` during introspection — never inferred from name patterns (FRE-88). The sidebar hides them behind one toggle and the SQL editor demotes them in completion ranking, so every new backend inherits both by filling in that one field. `TableMeta::kind_label` is the matching hook for engine-specific vocabulary (`hypertable`, `continuous aggregate`), rendered as a badge that refines `TableKind` rather than replacing it.
-- An object with **no rows at all** — a RisingWave sink, which writes outward and stores nothing — is declared `Restriction::NoRows` (FRE-148), the one restriction that narrows *reading* as well as writing. `TableAccess::resolve` derives the read gate from the object's own declaration and never from the write chain, which short-circuits on a read-only connection; `resolve_protected` has to carry it over explicitly, since rebuilding `caps` from the marking would hand the read capability back. Every other restriction (view, materialized view, key-less table) leaves browsing alone — they lack a way to address one row for writing, not rows to show.
 - The app was renamed from `dataview` (FRE-64) before it had any users, so there is deliberately no migration code. The name is load-bearing in `$XDG_CONFIG_HOME/hubro/` (connections, settings, session, SSH known_hosts), `$XDG_DATA_HOME/hubro/history.db`, the `hubro` keyring service, and the `no.lokander.hubro` bundle id — changing it again would strand all four.
-
-## Dioxus 0.7 — critical API notes
-
-This repo uses Dioxus 0.7, which changed every API. **`cx`, `Scope`, and `use_state` no longer exist** — do not use pre-0.7 patterns from training data. Reference docs: https://dioxuslabs.com/learn/0.7 — or query Context7 (library ID `/dioxuslabs/dioxus`, pick the latest 0.7.x version) when the MCP server is available.
-
-### Components and props
-
-Components are `#[component]` functions returning `Element` (function name must start with a capital letter or contain an underscore). A component re-renders only when its props change (by `PartialEq`) or a reactive state it reads is updated.
-
-- Props must be owned values (`String`, `Vec<T>`, not `&str`/`&[T]`) implementing `PartialEq + Clone`.
-- Wrap a prop type in `ReadOnlySignal<T>` to make it reactive and `Copy` — memos/resources reading it re-run when the prop changes.
-
-### RSX syntax
-
-```rust
-rsx! {
-    div {
-        class: "container",              // attribute
-        color: "red",                    // inline style
-        width: if condition { "100%" },  // conditional attribute
-        "Hello!"
-    }
-    for i in 0..5 {          // prefer loops over iterator chains
-        div { "{i}" }
-    }
-    if condition {
-        div { "shown conditionally" }
-    }
-    {children}               // expressions are wrapped in braces
-}
-```
-
-### State
-
-State uses signals — a signal tracks where it's read and written, and rerenders/reruns dependents on change:
-
-- `use_signal(|| initial)` — local state. Call `my_signal()` to clone the value, `.read()` for a reference, `.write()` for a mutable reference, `.with_mut(|v| ...)` to mutate in place.
-- `use_memo(move || ...)` — memoized derived value, recalculates when signals it reads change.
-- `use_resource(move || async move { ... })` — async state; re-runs when signals read in the closure change. Reading it yields `None` while loading, `Some(value)` when loaded.
-- Context: parent calls `use_context_provider(|| state)`, children read with `use_context::<T>()` (matched by type).
-- `use_memo` has a PartialEq write gate; `Signal::set` is unconditional and dirties every subscriber. Replacing a memo with `use_signal` + `use_effect` + `set` silently loses that gate — in the grid that re-ran the page fetch and `COUNT(*)` on any unrelated connection's open/close (FRE-129/FRE-148). Keep the memo, and `peek` before writing if you also need to retain a previous value across a reload.
-- A signal read/written from a root `spawn_forever` task must be `Signal::new_in_scope(.., ScopeId::ROOT)`; a component-scoped one trips a `__copy_value_hoisted` runtime warning and can fail after that scope drops.
-
-**Never hold a signal read/write borrow across an `await` point** — pending borrows make later reads/writes fail. `clippy.toml` enforces this via `await-holding-invalid-types` for `GenerationalRef(Mut)` and `dioxus_signals::WriteLock`; always run clippy from the project root so this config applies.
-
-### Routing (if added later)
-
-Routes are a single `enum` deriving `Routable`, with variants annotated `#[route("/path")]` (dynamic segments: `/blog/:id` → enum fields). Render with `Router::<Route> {}`; use `#[layout(NavBar)]` plus an `Outlet::<Route> {}` inside the layout component for shared chrome. Requires the `router` cargo feature on the `dioxus` dependency.
