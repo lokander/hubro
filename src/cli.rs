@@ -185,17 +185,25 @@ pub enum CliError {
 
 impl CliError {
     /// Builds [`CliError::UnknownOption`] from the argument as typed, keeping
-    /// only the part before any `=`.
+    /// only the option *name*: everything before the first `=` or whitespace.
     ///
     /// The value of an option hubro does not have is of no use in the message
-    /// — "unknown option `--connect`" names the mistake completely — and it is
-    /// the one place an arbitrary user string was echoed back. `--connect=<a
-    /// URL with a password>` is not a contrived shape: it is what a `psql`
-    /// habit produces. Redaction still runs on the name, but truncating here
-    /// means the error never *holds* the secret in the first place, which is
-    /// the stronger of the two guarantees.
+    /// — "unknown option `--connect`" names the mistake completely — and this
+    /// is the one place an arbitrary user string was echoed back.
+    /// `--connect=<a URL with a password>` is not a contrived shape: it is
+    /// what a `psql` habit produces.
+    ///
+    /// Whitespace ends the name as well as `=`, for a reason beyond tidiness:
+    /// it is precisely the boundary [`redact_url`] cannot see past. A single
+    /// argument like `-x <url>` — quoted, so the shell does not split it —
+    /// would otherwise carry a password containing a space into a message that
+    /// has no way to redact one. Truncating here means the error never *holds*
+    /// the secret, which is the stronger guarantee; redaction still runs on
+    /// the name as defence in depth.
     pub fn unknown_option(arg: &str) -> CliError {
-        let name = arg.split_once('=').map_or(arg, |(name, _)| name);
+        let name = arg
+            .split_once(|c: char| c == '=' || c.is_whitespace())
+            .map_or(arg, |(name, _)| name);
         CliError::UnknownOption(name.to_string())
     }
 
@@ -271,10 +279,22 @@ impl std::error::Error for CliError {}
 /// last `@` in that run. That over-reaches rather than under-reaches: it will
 /// redact `scheme://a:b@c` inside a sentence, which is the direction to err in.
 ///
-/// The one shape it does not catch is a password with an unescaped space,
-/// which splits the run before the `@`. No path reaches a message with one:
-/// such a URL fails `url::Url::parse`, and the parse errors this crate
-/// surfaces never quote their input (`tests/cli_secrets.rs` pins that).
+/// The one shape it does not catch is a password containing whitespace, which
+/// ends the run before the `@` is reached. That gap is real and cannot be
+/// closed here — bounding the search by anything a password *may* contain is
+/// what caused the previous bug, and whitespace is the last character class
+/// left. (It is not, as an earlier version of this comment claimed, ruled out
+/// by `url::Url::parse`: the url crate percent-encodes a space in the
+/// userinfo, so `postgres://user:SEK RET@host/db` parses and connects
+/// perfectly well.)
+///
+/// It is closed one level up instead, by no error variant holding raw user
+/// text that reaches past a space: [`CliError::unknown_option`] truncates at
+/// the first `=` *or* whitespace, [`CliError::UnsupportedScheme`] holds only a
+/// scheme, [`CliError::UnusableUrl`] holds only validation messages that never
+/// quote their input, and [`CliError::File`] holds a path. Anything added to
+/// [`CliError`] that echoes an argument has to keep that true — redaction
+/// alone will not.
 pub fn redact_url(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;

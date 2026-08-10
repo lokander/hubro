@@ -65,15 +65,48 @@ fn plist_string(key: &str) -> String {
     after[open + "<string>".len()..close].to_string()
 }
 
-/// Every `<key>` in the plist, in document order.
-fn plist_keys() -> Vec<String> {
-    INFO_PLIST
-        .match_indices("<key>")
-        .filter_map(|(at, _)| {
-            let after = &INFO_PLIST[at + "<key>".len()..];
-            after.find("</key>").map(|end| after[..end].to_string())
-        })
-        .collect()
+/// The keys of the plist's outermost `<dict>`, in document order — the ones
+/// dx would have generated, as opposed to those nested inside
+/// `CFBundleDocumentTypes`.
+///
+/// Depth-tracked rather than "every key up to the first nested one". That
+/// shortcut looked equivalent and was not: it stopped reading at the
+/// document-types array, so a key appended *after* the array was invisible to
+/// the very guard that exists to notice a key appearing or going missing.
+/// Comments are stripped first, so prose mentioning a tag cannot be mistaken
+/// for one.
+fn top_level_plist_keys() -> Vec<String> {
+    let mut source = String::with_capacity(INFO_PLIST.len());
+    let mut rest = INFO_PLIST;
+    while let Some(start) = rest.find("<!--") {
+        source.push_str(&rest[..start]);
+        rest = match rest[start..].find("-->") {
+            Some(end) => &rest[start + end + "-->".len()..],
+            None => "",
+        };
+    }
+    source.push_str(rest);
+
+    let mut keys = Vec::new();
+    let mut depth = 0usize;
+    let mut rest = source.as_str();
+    while let Some(open) = rest.find('<') {
+        rest = &rest[open + 1..];
+        let Some(close) = rest.find('>') else { break };
+        match &rest[..close] {
+            "dict" | "array" => depth += 1,
+            "/dict" | "/array" => depth = depth.saturating_sub(1),
+            // Depth 1 is directly inside the root <dict>.
+            "key" if depth == 1 => {
+                if let Some(end) = rest[close + 1..].find("</key>") {
+                    keys.push(rest[close + 1..close + 1 + end].to_string());
+                }
+            }
+            _ => {}
+        }
+        rest = &rest[close + 1..];
+    }
+    keys
 }
 
 /// The value of a top-level `key = "value"` line in a TOML file. Same
@@ -291,12 +324,8 @@ fn the_info_plist_declares_exactly_the_keys_dx_would_have_written() {
         // file exists. Its nested keys are checked by the test below.
         "CFBundleDocumentTypes",
     ];
-    let keys = plist_keys();
-    let top_level: Vec<&str> = keys
-        .iter()
-        .map(String::as_str)
-        .take_while(|key| *key != "CFBundleTypeName")
-        .collect();
+    let keys = top_level_plist_keys();
+    let top_level: Vec<&str> = keys.iter().map(String::as_str).collect();
     assert_eq!(
         top_level, expected,
         "the mirror no longer matches the key set dx writes — add the missing \
