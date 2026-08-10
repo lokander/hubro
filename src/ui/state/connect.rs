@@ -48,7 +48,7 @@ async fn migrate_secret(old: String, new: String) {
 /// suffix keeps it disjoint from the database password stored under the
 /// bare URL (`#` cannot appear in a valid connection URL's serialized form
 /// unescaped, so this never collides).
-fn ssh_secret_key(url: &str) -> String {
+pub(super) fn ssh_secret_key(url: &str) -> String {
     format!("{url}#ssh")
 }
 
