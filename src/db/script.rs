@@ -425,6 +425,16 @@ pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
 ///   the bare `SELECT … INTO` form does. Plain `EXPLAIN SELECT` /
 ///   `EXPLAIN ANALYZE SELECT` do not prompt: the only top-level `INTO` in a
 ///   read is the table-creating one.
+/// - `EXPLAIN` additionally **inherits whatever it explains**: the statement
+///   after the `EXPLAIN` header goes through this same check
+///   ([`explain_body`]). The keyword scan alone asks only whether a *known*
+///   write form appears, so `EXPLAIN CALL do_the_thing()` — a statement whose
+///   effect nothing here can name, and which `CALL do_the_thing()` alone is
+///   charged both capabilities for — read as a plain query the moment three
+///   characters were typed in front of it. The plan view (FRE-119) builds
+///   exactly such a prefix, so this is what stops it laundering a statement's
+///   classification; `explaining_never_loosens_the_gate` pins that as a
+///   property rather than a promise.
 /// - `SELECT`: an `INTO` token — `SELECT … INTO new_table` creates a table.
 /// - `PRAGMA`: a `=` or `(` — the value-setting forms. This deliberately
 ///   over-prompts call-form read pragmas like `PRAGMA table_info(t)`: some
@@ -446,17 +456,102 @@ fn confirmation_needed(sql: &str, stripped: &str) -> bool {
     if classify_statement(sql) != StatementKind::Read {
         return true;
     }
-    match first_keyword(sql).to_ascii_lowercase().as_str() {
-        "with" | "explain" => has_word(stripped, |word| {
+    let embedded_write = || {
+        has_word(stripped, |word| {
             let word = word.to_ascii_lowercase();
             EMBEDDED_DML_KEYWORDS.contains(&word.as_str())
                 || EMBEDDED_DDL_KEYWORDS.contains(&word.as_str())
                 || word == "into"
-        }),
+        })
+    };
+    match first_keyword(sql).to_ascii_lowercase().as_str() {
+        "with" => embedded_write(),
+        "explain" => {
+            // The body is a slice of the *stripped* text, so it is passed as
+            // both arguments: strings and comments are already blanked, which
+            // is what the `sql` argument is otherwise only used to look
+            // through. It is strictly shorter than `stripped` (the `EXPLAIN`
+            // keyword is consumed), so the recursion terminates.
+            let body = explain_body(stripped);
+            embedded_write() || confirmation_needed(body, body)
+        }
         "select" => has_word(stripped, |word| word.eq_ignore_ascii_case("into")),
         "pragma" => stripped.contains('=') || stripped.contains('('),
         _ => false,
     }
+}
+
+/// Words that may stand between `EXPLAIN` and the statement it explains,
+/// across the dialects hubro speaks: PostgreSQL's legacy un-parenthesized
+/// options (`EXPLAIN ANALYZE VERBOSE SELECT …`) and SQLite's `EXPLAIN QUERY
+/// PLAN`. None of them can change anything on its own, which is what makes
+/// skipping them safe — a word *not* in this list ends the header and is
+/// treated as the start of the explained statement.
+const EXPLAIN_OPTION_WORDS: [&str; 4] = ["analyze", "verbose", "query", "plan"];
+
+/// The statement an already-stripped `EXPLAIN …` explains: everything after
+/// the `EXPLAIN` keyword, its optional parenthesized option list, and any
+/// leading [`EXPLAIN_OPTION_WORDS`].
+///
+/// Degrades toward *more* checking, never less: an unbalanced option list or
+/// a header with nothing after it yields an empty body, which
+/// [`classify_statement`] calls a write and [`confirmation_needed`] therefore
+/// prompts for.
+fn explain_body(stripped: &str) -> &str {
+    let bytes = stripped.as_bytes();
+    let mut i = 0usize;
+    // Leading whitespace and open parens, exactly what `first_keyword` skips
+    // before reading the `EXPLAIN` it has already matched.
+    while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'(') {
+        i += 1;
+    }
+    while i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+        i += 1;
+    }
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        match bytes.get(i) {
+            None => break,
+            // A parenthesized option list — `(ANALYZE, FORMAT JSON)`. Skipped
+            // as a balanced group; an unbalanced one runs to the end and
+            // empties the body.
+            Some(b'(') => {
+                let mut depth = 0usize;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'(' => depth += 1,
+                        b')' => depth = depth.saturating_sub(1),
+                        _ => {}
+                    }
+                    i += 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+            Some(_) => {
+                let start = i;
+                while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                let word = stripped[start..i].to_ascii_lowercase();
+                if !EXPLAIN_OPTION_WORDS.contains(&word.as_str()) {
+                    i = start;
+                    break;
+                }
+            }
+        }
+    }
+    &stripped[i..]
+}
+
+/// Whether `sql` is written as an `EXPLAIN`. The plan view (FRE-119) asks so
+/// it can leave such a statement alone instead of prefixing a second
+/// `EXPLAIN` onto it.
+pub fn is_explain(sql: &str) -> bool {
+    first_keyword(sql).eq_ignore_ascii_case("explain")
 }
 
 /// Whether any word-ish token (identifier characters) of an
@@ -1418,6 +1513,217 @@ mod tests {
             statement_needs("SELECT 'please do not DELETE me'", Dialect::Postgres),
             StatementNeeds::default()
         );
+    }
+
+    /// Every statement the plan view might be pointed at, including the ones
+    /// written to look harmless.
+    const GATE_CORPUS: [&str; 22] = [
+        "SELECT 1",
+        "SELECT * FROM t WHERE a = 1",
+        "TABLE t",
+        "VALUES (1)",
+        "SELECT 'DELETE FROM t'",
+        "SELECT 1 -- DELETE FROM t",
+        "SELECT /* DROP TABLE t */ 1",
+        "UPDATE t SET a = 1",
+        "DELETE FROM t",
+        "INSERT INTO t VALUES (1)",
+        "TRUNCATE t",
+        "DROP TABLE t",
+        "CREATE TABLE t (a int)",
+        "SELECT * INTO backup FROM t",
+        "WITH gone AS (DELETE FROM t RETURNING *) SELECT * FROM gone",
+        "WITH x AS (SELECT 1) SELECT * INTO t2 FROM x",
+        "CALL do_the_thing()",
+        "EXEC sp_rename 'a', 'b'",
+        "PRAGMA journal_mode = WAL",
+        "VACUUM",
+        "COPY t FROM stdin",
+        "REFRESH MATERIALIZED VIEW mv",
+    ];
+
+    /// **The plan view cannot run a write the Run button would have prompted
+    /// for** (FRE-119), as a property rather than a list of cases.
+    ///
+    /// The Explain action's whole rewrite is prefixing `EXPLAIN …`
+    /// ([`explain_statement`](super::super::plan::explain_statement)), and it
+    /// then hands the result to the same [`script_refusal`] /
+    /// [`needs_confirmation`] gates a typed statement goes through. So the one
+    /// thing that could make it a bypass is a prefix that *lowers* what a
+    /// statement is charged for — which is exactly what this asserts cannot
+    /// happen, for every prefix on every dialect.
+    ///
+    /// It found a real hole: before [`explain_body`], `EXPLAIN CALL p()` was
+    /// charged nothing at all, because the keyword scan looks only for write
+    /// forms it can name and `CALL` names none. Three characters in front of a
+    /// statement turned "needs both capabilities" into "needs none".
+    #[test]
+    fn explaining_never_loosens_the_gate() {
+        use super::super::plan::{explain_statement, ExplainSupport};
+        for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
+            for support in [
+                ExplainSupport::PG_JSON,
+                ExplainSupport::PG_TEXT,
+                ExplainSupport::SQLITE,
+            ] {
+                for sql in GATE_CORPUS {
+                    let explained = explain_statement(sql, support);
+                    let plain_needs = statement_needs(sql, dialect);
+                    let explained_needs = statement_needs(&explained, dialect);
+                    assert!(
+                        !plain_needs.mutate || explained_needs.mutate,
+                        "{explained:?} on {dialect:?} lost the mutate gate {sql:?} had"
+                    );
+                    assert!(
+                        !plain_needs.ddl || explained_needs.ddl,
+                        "{explained:?} on {dialect:?} lost the ddl gate {sql:?} had"
+                    );
+                    assert!(
+                        !needs_confirmation(sql, dialect)
+                            || needs_confirmation(&explained, dialect),
+                        "{explained:?} on {dialect:?} stopped prompting for {sql:?}"
+                    );
+                    // The same statement through the capability gate the UI
+                    // actually calls: whatever a read-only connection refuses
+                    // to run, it refuses to explain.
+                    let read_only = Capabilities::FULL.read_only();
+                    assert!(
+                        script_refusal(read_only, &stmts(&[sql]), dialect).is_none()
+                            || script_refusal(read_only, &stmts(&[&explained]), dialect).is_some(),
+                        "a read-only connection refuses {sql:?} but would explain it as \
+                         {explained:?} on {dialect:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_explain_inherits_what_it_explains() {
+        // The specific shapes behind the property above, spelled out so a
+        // regression names itself.
+        for (sql, dialect) in [
+            // The hole `explain_body` closes: an effect nothing can name.
+            ("EXPLAIN CALL do_the_thing()", Dialect::Postgres),
+            (
+                "EXPLAIN (FORMAT JSON) CALL do_the_thing()",
+                Dialect::Postgres,
+            ),
+            ("EXPLAIN EXEC sp_rename 'a', 'b'", Dialect::SqlServer),
+            // A value-setting PRAGMA behind SQLite's EXPLAIN header.
+            (
+                "EXPLAIN QUERY PLAN PRAGMA journal_mode = WAL",
+                Dialect::Sqlite,
+            ),
+            // Named write forms, with the header spelled every way.
+            ("EXPLAIN ANALYZE UPDATE t SET a = 1", Dialect::Postgres),
+            (
+                "EXPLAIN (ANALYZE, FORMAT JSON) DELETE FROM t",
+                Dialect::Postgres,
+            ),
+            ("explain analyze verbose delete from t", Dialect::Postgres),
+            // Comments between the header words hide nothing: the scan runs
+            // on text with comments already blanked out.
+            (
+                "EXPLAIN /* just looking */ ANALYZE /* honest */ UPDATE t SET a = 1",
+                Dialect::Postgres,
+            ),
+            // A data-modifying CTE under an EXPLAIN ANALYZE.
+            (
+                "EXPLAIN ANALYZE WITH gone AS (DELETE FROM t RETURNING *) SELECT * FROM gone",
+                Dialect::Postgres,
+            ),
+            // An unterminated option list leaves no readable body, which is
+            // charged as an unknown effect rather than waved through.
+            ("EXPLAIN (FORMAT JSON SELECT 1", Dialect::Postgres),
+        ] {
+            assert!(needs_confirmation(sql, dialect), "{sql:?}");
+            assert!(
+                script_refusal(Capabilities::FULL.read_only(), &stmts(&[sql]), dialect).is_some(),
+                "a read-only connection must refuse {sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explaining_a_read_still_prompts_for_nothing() {
+        // The other half of the guard: over-prompting on the statements the
+        // Explain button actually generates would train the user to click
+        // through the banner that matters.
+        for (sql, dialect) in [
+            ("EXPLAIN SELECT 1", Dialect::Postgres),
+            (
+                "EXPLAIN (FORMAT JSON) SELECT * FROM t WHERE a = 1",
+                Dialect::Postgres,
+            ),
+            (
+                "EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS) SELECT 1",
+                Dialect::Postgres,
+            ),
+            ("EXPLAIN ANALYZE SELECT 1", Dialect::Postgres),
+            ("EXPLAIN VERBOSE SELECT count(*) FROM t", Dialect::Postgres),
+            ("EXPLAIN (FORMAT JSON) TABLE t", Dialect::Postgres),
+            ("EXPLAIN (FORMAT JSON) VALUES (1)", Dialect::Postgres),
+            (
+                "EXPLAIN (FORMAT JSON) WITH x AS (SELECT 1) SELECT * FROM x",
+                Dialect::Postgres,
+            ),
+            ("EXPLAIN QUERY PLAN SELECT * FROM t", Dialect::Sqlite),
+            // Function calls in a read are not the PRAGMA `(` rule.
+            (
+                "EXPLAIN QUERY PLAN SELECT lower(name) FROM t",
+                Dialect::Sqlite,
+            ),
+            // A write named only inside a string or a comment is not a write.
+            (
+                "EXPLAIN (FORMAT JSON) SELECT 'DELETE FROM t'",
+                Dialect::Postgres,
+            ),
+            (
+                "EXPLAIN (FORMAT JSON) SELECT 1 -- DROP TABLE t",
+                Dialect::Postgres,
+            ),
+        ] {
+            assert!(!needs_confirmation(sql, dialect), "{sql:?}");
+            assert_eq!(
+                statement_needs(sql, dialect),
+                StatementNeeds::default(),
+                "{sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_semicolon_pair_is_explained_statement_by_statement() {
+        use super::super::plan::{explain_statement, ExplainSupport};
+        // The write in the second half of the buffer keeps its gate: Explain
+        // splits first and prefixes each statement, so nothing is hidden
+        // behind the first one's EXPLAIN.
+        let script = "SELECT 1; DELETE FROM t";
+        let explained: Vec<String> = split_statements(script, Dialect::Postgres)
+            .iter()
+            .map(|statement| explain_statement(statement, ExplainSupport::PG_JSON))
+            .collect();
+        assert_eq!(
+            explained,
+            [
+                "EXPLAIN (FORMAT JSON) SELECT 1",
+                "EXPLAIN (FORMAT JSON) DELETE FROM t"
+            ]
+        );
+        assert_eq!(
+            script_refusal(
+                Capabilities::FULL.read_only(),
+                &explained,
+                Dialect::Postgres
+            ),
+            Some((1, caps::NO_MUTATE))
+        );
+        // And on a connection that can write, it is the confirmation banner
+        // that stands between the plan view and the DELETE.
+        assert!(explained
+            .iter()
+            .any(|s| needs_confirmation(s, Dialect::Postgres)));
     }
 
     #[test]

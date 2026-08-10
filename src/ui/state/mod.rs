@@ -47,7 +47,7 @@ use crate::config::{
     SessionPane, SessionTab, Theme,
 };
 use crate::db::{
-    apply_staged, build_fk_filter, mssql_url_target, mssql_url_via_local_port,
+    apply_staged, build_fk_filter, explain_statement, mssql_url_target, mssql_url_via_local_port,
     mssql_url_with_password, needs_confirmation, run_script, script_refusal, split_statements,
     statement_preview, url_target, url_via_local_port, url_with_password, write_result,
     Capabilities, CellFetch, Connection, ConnectionId, ConnectionRegistry, DbError, DbPool, Ddl,
@@ -484,6 +484,13 @@ pub struct SqlRun {
     /// Outcomes of the statements that finished, in script order.
     pub statements: Vec<SharedStatement>,
     pub status: RunStatus,
+    /// Whether Explain started this run (FRE-119), so its results render as
+    /// query plans instead of result grids.
+    ///
+    /// A property of the run rather than of the buffer: the same query tab
+    /// alternates between running a statement and explaining it, and what is
+    /// on screen belongs to whichever was asked for last.
+    pub explain: bool,
 }
 
 /// Which pane an export belongs to. Statuses are keyed per connection AND
@@ -535,6 +542,9 @@ impl ExportStatus {
 pub struct PendingSql {
     pub script: String,
     pub statements: Vec<String>,
+    /// Carried across the confirmation so the run the user confirms is still
+    /// the Explain they asked for (FRE-119).
+    pub explain: bool,
 }
 
 /// The outcome of the most recent saved-query write (FRE-113), shown as one

@@ -103,6 +103,12 @@ opening a file while hubro is already running starts a second copy.
 - **SQL editor** — run queries and multi-statement scripts (wrapped in a
   transaction where the server has one), with schema-aware autocomplete, syntax
   highlighting, query history, cancellation, and a confirmation before writes.
+- **Query plans** — Explain shows what the server would do with the buffer:
+  a cost-annotated tree with the expensive nodes highlighted on PostgreSQL,
+  and the server's own `EXPLAIN` output verbatim elsewhere. SQL Server has no
+  `EXPLAIN` statement, so the action is disabled there and says why. Explain
+  never adds `ANALYZE`; an `EXPLAIN ANALYZE` you write yourself really does run
+  the statement, and passes through the same write confirmation Run does.
 - **Edit** rows inline — cell edits, inserts, and deletes staged and saved
   atomically, with primary-key/unique-index detection and confirmation before
   destructive operations. Views and materialized views are read-only, as is

@@ -29,6 +29,7 @@ mod error;
 mod export;
 mod fk;
 mod page;
+mod plan;
 mod postgres;
 mod registry;
 mod rowkey;
@@ -56,6 +57,9 @@ pub use fk::{build_fk_filter, resolve_referenced_column};
 pub use page::{
     classify_column, ColumnClass, Filter, FilterOp, Page, PageRequest, PreviewInfo, SortDir,
     PREVIEW_BYTES,
+};
+pub use plan::{
+    explain_statement, ExplainSupport, PlanDisplay, PlanNode, PlanTree, EXPENSIVE_SHARE, NO_EXPLAIN,
 };
 pub use postgres::{
     build_url, normalize_pg_url, url_target, url_via_local_port, url_with_password, PgFlavor,
