@@ -616,6 +616,69 @@ async fn cockroach_reports_a_full_rollback_when_the_script_never_reached_its_ddl
 }
 
 #[tokio::test]
+async fn cockroach_counts_a_failing_ddl_as_having_escaped_the_rollback() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+
+    // The boundary between this test and the one above, which is a real
+    // decision rather than an off-by-one: the statements a rollback claim is
+    // resolved over *include* the failing one. A DDL that fails has still done
+    // its damage here, because `autocommit_before_ddl` commits the open
+    // transaction before the statement executes — so the write staged ahead of
+    // it survives even though the schema change never happened.
+    //
+    // Resolving over the statements strictly before the failure would report
+    // "no changes were applied" for exactly this shape, which is the FRE-146
+    // bug returning by a narrower route.
+    pool.query("DROP TABLE IF EXISTS crdb_boundary_dup CASCADE")
+        .await
+        .unwrap();
+    pool.query("DROP TABLE IF EXISTS crdb_boundary_dml CASCADE")
+        .await
+        .unwrap();
+    pool.query("CREATE TABLE crdb_boundary_dml (id int PRIMARY KEY)")
+        .await
+        .unwrap();
+    // Already present, so the script's CREATE TABLE is the statement that fails.
+    pool.query("CREATE TABLE crdb_boundary_dup (id int PRIMARY KEY)")
+        .await
+        .unwrap();
+
+    let sql = "INSERT INTO crdb_boundary_dml VALUES (1); \
+               CREATE TABLE crdb_boundary_dup (id int PRIMARY KEY)";
+    let statements = split_statements(sql, pool.dialect());
+    let error = run_script(&pool, pool.backend_capabilities(), &statements, |_| {})
+        .await
+        .expect_err("the table already exists");
+    assert_eq!(error.statement_index, 1, "the DDL is the failing statement");
+    assert_eq!(
+        error.rollback,
+        Rollback::ExceptSchemaChanges,
+        "a failing DDL still commits what was staged before it"
+    );
+
+    // The database agrees: the INSERT survived a rollback that claimed nothing
+    // about it either way.
+    let rows = pool
+        .query("SELECT count(*) FROM crdb_boundary_dml")
+        .await
+        .unwrap();
+    assert_eq!(
+        integer(&rows.rows[0][0]),
+        1,
+        "the autocommit fired before the failing DDL and took the INSERT with it"
+    );
+
+    pool.query("DROP TABLE crdb_boundary_dup CASCADE")
+        .await
+        .unwrap();
+    pool.query("DROP TABLE crdb_boundary_dml CASCADE")
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn cockroach_serial_is_unique_but_not_sequential() {
     let Some(url) = test_url() else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
