@@ -440,7 +440,34 @@ fn query_error(err: sqlx::Error, sql: &str) -> DbError {
             }
         }
     }
+    if is_transient(&err) {
+        return DbError::Transient(message);
+    }
     DbError::Query(message)
+}
+
+/// SQLSTATE `40001` — `serialization_failure`, the standard code for "this
+/// failed against a concurrent change; run it again" (FRE-147).
+///
+/// The code, never the message. Two of the engines in this family raise it for
+/// reasons whose *text* shares nothing: YugabyteDB's catalog snapshot going
+/// stale mid-query reports `MISMATCHED_SCHEMA` with a pair of internal version
+/// numbers, and CockroachDB's transaction retries report a conflict. Both
+/// arrive as `40001`, which is what makes one rule enough — and what keeps
+/// hubro from matching on an engine-internal string that its authors never
+/// promised to keep.
+///
+/// Deliberately just the one code. `40P01` (deadlock) is retryable in the same
+/// sense but means genuine contention rather than a racing schema change, and
+/// stock PostgreSQL raises neither on the paths that act on this: catalog reads
+/// run at READ COMMITTED in their own implicit transactions, where `40001`
+/// cannot occur. So this classification is inert on PostgreSQL, by
+/// construction rather than by a flavor check.
+fn is_transient(err: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(db_err) = err else {
+        return false;
+    };
+    db_err.code().as_deref() == Some("40001")
 }
 
 /// Maps a 1-based character position into 1-based line and column numbers.
@@ -665,7 +692,12 @@ fn column_query(shape: ColumnQuery) -> String {
 /// of table count.
 pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     let pool = conn.pool();
-    let map_err = |e: sqlx::Error| DbError::Introspect(e.to_string());
+    // A serialization failure keeps its own variant so the caller can retry
+    // it (FRE-147); anything else is an introspection failure like any other.
+    let map_err = |e: sqlx::Error| match is_transient(&e) {
+        true => DbError::Transient(e.to_string()),
+        false => DbError::Introspect(e.to_string()),
+    };
 
     // Objects that are the database's own bookkeeping rather than the user's
     // data (FRE-88), from the three sources Postgres has. All three are

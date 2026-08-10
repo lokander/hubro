@@ -499,19 +499,25 @@ impl DbPool {
     /// reconstructs where the backend has no generator; the returned [`Ddl`]
     /// says which, and [`Ddl::text`] labels a reconstruction.
     pub async fn fetch_ddl(&self, table: &TableMeta, object: &DdlObject) -> Result<Ddl, DbError> {
-        match self {
-            DbPool::Sqlite(pool) => sqlite::fetch_ddl(pool, table, object).await,
-            DbPool::Postgres(pg) => postgres::fetch_ddl(pg.pool(), table, object).await,
-            DbPool::SqlServer(pool) => sqlserver::fetch_ddl(pool, table, object).await,
-        }
+        retry_transient(|| async {
+            match self {
+                DbPool::Sqlite(pool) => sqlite::fetch_ddl(pool, table, object).await,
+                DbPool::Postgres(pg) => postgres::fetch_ddl(pg.pool(), table, object).await,
+                DbPool::SqlServer(pool) => sqlserver::fetch_ddl(pool, table, object).await,
+            }
+        })
+        .await
     }
 
     pub async fn introspect(&self) -> Result<Vec<TableMeta>, DbError> {
-        match self {
-            DbPool::Sqlite(pool) => sqlite::introspect(pool).await,
-            DbPool::Postgres(pg) => postgres::introspect(pg).await,
-            DbPool::SqlServer(pool) => sqlserver::introspect(pool).await,
-        }
+        retry_transient(|| async {
+            match self {
+                DbPool::Sqlite(pool) => sqlite::introspect(pool).await,
+                DbPool::Postgres(pg) => postgres::introspect(pg).await,
+                DbPool::SqlServer(pool) => sqlserver::introspect(pool).await,
+            }
+        })
+        .await
     }
 
     pub async fn close(&self) {
@@ -520,6 +526,38 @@ impl DbPool {
             DbPool::Postgres(pg) => pg.pool().close().await,
             DbPool::SqlServer(pool) => pool.close().await,
         }
+    }
+}
+
+/// Runs a catalog read, running it a second time if the server called the
+/// first failure transient ([`DbError::Transient`], FRE-147).
+///
+/// The two operations wrapped in this are the multi-statement reads:
+/// [`DbPool::introspect`] issues six catalog queries and
+/// [`DbPool::fetch_ddl`] up to three. Each runs in its own implicit
+/// transaction on a pooled connection, so a schema change landing *between*
+/// them can fail the call — on YugabyteDB the connection's catalog snapshot is
+/// invalidated outright. Nothing the user did, nothing they can act on, and
+/// the message names an engine internal.
+///
+/// **Once, never in a loop.** A second failure means something other than a
+/// racing schema change, and a schema tree that hangs is worse than one that
+/// reports an error. The retry is also confined to *reads*: `40001` on a write
+/// is a conflict the user must be told about, not one to silently paper over
+/// by running the write again.
+///
+/// Backend-agnostic on purpose. Only the Postgres backend builds
+/// [`DbError::Transient`] today, so this is a plain call-through for SQLite and
+/// SQL Server — but the policy is one function, so a fourth backend that has a
+/// retryable class inherits it by classifying its errors, not by repeating this.
+async fn retry_transient<T, F, Fut>(mut operation: F) -> Result<T, DbError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, DbError>>,
+{
+    match operation().await {
+        Err(err) if err.is_transient() => operation().await,
+        result => result,
     }
 }
 
@@ -674,6 +712,47 @@ mod tests {
         assert_eq!(
             refuse_paged_read(no_query),
             Err(DbError::Unsupported(caps::NO_QUERY.to_string()))
+        );
+    }
+
+    /// Counts calls so each case can assert how many attempts a policy made,
+    /// which is the whole content of "retry once, never in a loop".
+    async fn attempts(outcomes: &[Result<u8, DbError>]) -> (Result<u8, DbError>, usize) {
+        let calls = std::cell::Cell::new(0);
+        let result = retry_transient(|| {
+            let index = calls.get();
+            calls.set(index + 1);
+            let outcome = outcomes[index.min(outcomes.len() - 1)].clone();
+            async move { outcome }
+        })
+        .await;
+        (result, calls.get())
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_is_retried_exactly_once() {
+        let transient = || Err(DbError::Transient("catalog moved".into()));
+
+        // Succeeding first time asks the server once.
+        assert_eq!(attempts(&[Ok(1)]).await, (Ok(1), 1));
+
+        // The case this exists for: the second attempt sees the new catalog.
+        assert_eq!(attempts(&[transient(), Ok(2)]).await, (Ok(2), 2));
+
+        // Still failing transiently is reported, not looped on. A schema tree
+        // that hangs would be worse than one that says what went wrong.
+        assert_eq!(
+            attempts(&[transient()]).await,
+            (Err(DbError::Transient("catalog moved".into())), 2)
+        );
+
+        // Everything else is a real failure and is never run twice — a
+        // syntactically broken catalog query would fail identically the second
+        // time, at the cost of another round trip.
+        let permanent = Err(DbError::Introspect("no such column".into()));
+        assert_eq!(
+            attempts(std::slice::from_ref(&permanent)).await,
+            (permanent, 1)
         );
     }
 
