@@ -10,6 +10,7 @@ mod history_panel;
 mod icons;
 mod js;
 mod notice;
+mod saved_panel;
 mod schema;
 mod selection;
 mod shell;

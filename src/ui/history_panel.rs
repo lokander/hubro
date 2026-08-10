@@ -26,7 +26,7 @@ const HISTORY_PANEL_LIMIT: i64 = HISTORY_CAP;
 /// history: search, per-entry Load / Run / Copy, clear-history, and the
 /// recording opt-out.
 #[component]
-pub(super) fn HistoryPanel(id: ConnectionId, editor_element: String) -> Element {
+pub(super) fn HistoryPanel(id: ConnectionId, buffer: u64, editor_element: String) -> Element {
     let state = use_context::<AppState>();
     // The controlled input; `search` only follows it on Enter (or when the
     // input is cleared) so each keystroke doesn't hit the database.
@@ -128,6 +128,7 @@ pub(super) fn HistoryPanel(id: ConnectionId, editor_element: String) -> Element 
                                     HistoryRow {
                                         key: "{entry.id}",
                                         id,
+                                        buffer,
                                         editor_element: editor_element.clone(),
                                         entry: entry.clone(),
                                     }
@@ -180,7 +181,13 @@ pub(super) fn HistoryPanel(id: ConnectionId, editor_element: String) -> Element 
 /// One history entry: status dot, local-time stamp, one-line SQL preview
 /// (full text in the tooltip), and Load / Run / Copy actions.
 #[component]
-fn HistoryRow(id: ConnectionId, editor_element: String, entry: HistoryEntry) -> Element {
+fn HistoryRow(
+    id: ConnectionId,
+    /// The SQL buffer Load and Run target: the one on screen.
+    buffer: u64,
+    editor_element: String,
+    entry: HistoryEntry,
+) -> Element {
     let state = use_context::<AppState>();
     let time = format_history_time(entry.executed_at);
     let preview: String = entry.sql.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -216,7 +223,7 @@ fn HistoryRow(id: ConnectionId, editor_element: String, entry: HistoryEntry) -> 
                         document::eval(&format!(
                             r#"DVEditor.setDoc("{editor_element}", {json_for_load});"#
                         ));
-                        state.set_sql_text(id, sql_for_load.clone());
+                        state.set_sql_text(id, buffer, sql_for_load.clone());
                     },
                     "Load"
                 }
@@ -228,8 +235,8 @@ fn HistoryRow(id: ConnectionId, editor_element: String, entry: HistoryEntry) -> 
                         document::eval(&format!(
                             r#"DVEditor.setDoc("{element_for_run}", {json_for_run});"#
                         ));
-                        state.set_sql_text(id, sql_for_run.clone());
-                        state.run_sql(id, sql_for_run.clone());
+                        state.set_sql_text(id, buffer, sql_for_run.clone());
+                        state.run_sql(id, buffer, sql_for_run.clone());
                     },
                     "Run"
                 }
