@@ -494,15 +494,30 @@ struct CatalogShape {
 /// this code has always used, and being wrong that way surfaces an error
 /// rather than quietly wrong metadata.
 async fn catalog_shape(pool: &PgPool) -> CatalogShape {
+    // Asked of `pg_attribute` rather than of `information_schema.columns`,
+    // even though the latter reads more naturally. The probe would then depend
+    // on `information_schema` describing itself and `pg_catalog` — neither of
+    // which the standard requires — and a server that declined would answer
+    // zero, which reads as "this column is missing" rather than as "I don't
+    // know". That is the one direction with no safe default: dropping the
+    // `indnkeyatts` bound on an engine that *does* have INCLUDE columns would
+    // silently promote payload columns to key columns, and a test run could
+    // not tell, since the probe-failure default and the right answer coincide
+    // on every engine that works. `pg_attribute` is already load-bearing for
+    // introspection, so asking it costs no new assumption.
     let probe = sqlx::query_as::<_, (i64, i64)>(
         "SELECT \
-           (SELECT count(*) FROM information_schema.columns \
-            WHERE table_schema = 'information_schema' AND table_name = 'columns' \
-              AND column_name IN ('udt_schema', 'udt_name', \
-                                  'is_identity', 'identity_generation', 'is_generated')), \
-           (SELECT count(*) FROM information_schema.columns \
-            WHERE table_schema = 'pg_catalog' AND table_name = 'pg_index' \
-              AND column_name = 'indnkeyatts')",
+           (SELECT count(*) FROM pg_attribute a \
+            JOIN pg_class c ON c.oid = a.attrelid \
+            JOIN pg_namespace n ON n.oid = c.relnamespace \
+            WHERE n.nspname = 'information_schema' AND c.relname = 'columns' \
+              AND a.attname IN ('udt_schema', 'udt_name', \
+                                'is_identity', 'identity_generation', 'is_generated')), \
+           (SELECT count(*) FROM pg_attribute a \
+            JOIN pg_class c ON c.oid = a.attrelid \
+            JOIN pg_namespace n ON n.oid = c.relnamespace \
+            WHERE n.nspname = 'pg_catalog' AND c.relname = 'pg_index' \
+              AND a.attname = 'indnkeyatts')",
     )
     .fetch_one(pool)
     .await;

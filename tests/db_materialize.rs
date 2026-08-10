@@ -46,9 +46,9 @@
 //! is redundant but true and re-runnable.
 //!
 //! And 265 objects across five reserved schemas would have buried the user's
-//! own. Nothing cross-engine reaches them — unlike CockroachDB's they are
-//! ordinary tables and views, not `SYSTEM VIEW`, and `pg_depend` is empty — but
-//! `mz_schemas` marks them: `database_id` is null exactly for the schemas that
+//! own. Nothing cross-engine reaches them: unlike CockroachDB's they are
+//! ordinary tables and views rather than `SYSTEM VIEW`, and the extension path
+//! finds nothing either. But `mz_schemas` marks them: `database_id` is null exactly for the schemas that
 //! belong to no database, which is what a system schema is. That is the case
 //! [`PgFlavor`] exists for — the engine's identity says *which* catalog to ask,
 //! and the catalog still supplies the answer.
