@@ -612,13 +612,15 @@ pub fn name_matches(name: &str, query: &str) -> bool {
     name.to_lowercase().contains(&query.to_lowercase())
 }
 
-/// Whether two group names are the same name (FRE-120).
+/// Whether two group names are the same name (FRE-120): case-insensitively,
+/// so "Prod" and "prod" are one group.
 ///
-/// Identity is exact — that is what a connection's `group` field is matched
-/// against — but *creating* or *renaming* compares case-insensitively, so
-/// "Prod" and "prod" can't both be made through the UI. A hand-edited file
-/// can still hold both, and then both are shown: reconciling them by folding
-/// one into the other would move connections the user never asked to move.
+/// Applied in three places, and it has to be all three or the rule leaks:
+/// creating and renaming refuse a name already taken, and [`reconcile_groups`]
+/// folds the spellings a hand-edited file may hold. Matching a connection to
+/// its section stays *exact* — reconcile has already rewritten every entry to
+/// the declared spelling by then, so exact matching there is a consequence of
+/// this rule rather than an exception to it.
 fn same_group_name(a: &str, b: &str) -> bool {
     a.to_lowercase() == b.to_lowercase()
 }
@@ -678,31 +680,54 @@ fn normalize_and_dedup(entries: Vec<SavedConnection>) -> Vec<SavedConnection> {
 }
 
 /// Reconciles the entries' group names with the group list (FRE-120), so the
-/// one invariant the rest of this module relies on holds however the file was
-/// written: **every group an entry names is in `groups`**.
+/// two invariants the rest of this module relies on hold however the file was
+/// written:
 ///
-/// Trims each entry's name and treats an empty one as ungrouped, then appends
-/// any group named by an entry but missing from the list, in the order the
-/// entries appear. A hand-edited file that files a connection under a group
-/// it never declared would otherwise render that connection nowhere — the
-/// list is drawn from `groups`, so a section that doesn't exist can't show
-/// its members.
+/// 1. **Every group an entry names is in `groups`.** The list is drawn from
+///    `groups`, so a connection filed under a group the file never declared
+///    would render nowhere.
+/// 2. **No two groups in `groups` are the same name.** Two sections with one
+///    name each show the same connections, which is the "at most one group"
+///    property read backwards — one connection, two rows — and they collide
+///    on the render key, while rename/delete/move act on the first only.
+///
+/// Both are enforced case-insensitively, matching the rule [`Self::create_group`]
+/// and [`SavedList::rename_group`] already apply to typed names, and the
+/// **first spelling wins**: later ones fold onto it, entries included. A file
+/// with `["Prod", "prod"]` is one group however it was produced — including by
+/// this function's own trim, which turns `["Prod ", "Prod"]` into a duplicate
+/// that was not there on disk.
+///
+/// Folding a case variant is not moving a connection between groups: it is
+/// the same group under one spelling, and the alternative is showing it twice.
+///
+/// [`Self::create_group`]: SavedList::create_group
 fn reconcile_groups(groups: &mut Vec<String>, entries: &mut [SavedConnection]) {
-    for name in groups.iter_mut() {
-        *name = name.trim().to_string();
+    let mut declared: Vec<String> = Vec::with_capacity(groups.len());
+    for name in groups.iter() {
+        let trimmed = name.trim();
+        if trimmed.is_empty() || declared.iter().any(|kept| same_group_name(kept, trimmed)) {
+            continue;
+        }
+        declared.push(trimmed.to_string());
     }
-    groups.retain(|name| !name.is_empty());
     for entry in entries.iter_mut() {
         let trimmed = entry.group().map(str::trim).unwrap_or_default().to_string();
         if trimmed.is_empty() {
             entry.set_group(None);
             continue;
         }
-        entry.set_group(Some(trimmed.clone()));
-        if !groups.contains(&trimmed) {
-            groups.push(trimmed);
+        // Whichever spelling was declared first is the one the entry is filed
+        // under from here on.
+        match declared.iter().find(|kept| same_group_name(kept, &trimmed)) {
+            Some(canonical) => entry.set_group(Some(canonical.clone())),
+            None => {
+                declared.push(trimmed.clone());
+                entry.set_group(Some(trimmed));
+            }
         }
     }
+    *groups = declared;
 }
 
 impl SavedList {
@@ -1349,6 +1374,92 @@ mod tests {
         // Every entry is reachable from a section.
         let listed: usize = list.arrange("").iter().map(|s| s.entries.len()).sum();
         assert_eq!(listed, 2);
+    }
+
+    /// Asserts what [`reconcile_groups`] claims, on a list loaded from
+    /// `text`: no two groups are the same name, every entry's group is one of
+    /// them, and — the reason both matter — **every connection renders
+    /// exactly once**.
+    fn assert_group_invariants(text: &str) -> SavedList {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.toml");
+        std::fs::write(&path, text).unwrap();
+        let (list, err) = SavedList::load(&path);
+        assert!(err.is_none(), "{text}");
+        for (i, a) in list.groups().iter().enumerate() {
+            for b in &list.groups()[i + 1..] {
+                assert!(!same_group_name(a, b), "duplicate group {a}/{b} in {text}");
+            }
+        }
+        for entry in list.entries() {
+            if let Some(group) = entry.group() {
+                assert!(
+                    list.groups().iter().any(|g| g == group),
+                    "{group} is not declared, in {text}"
+                );
+            }
+        }
+        let mut rendered: Vec<String> = Vec::new();
+        for section in list.arrange("") {
+            rendered.extend(section.entries.iter().map(|e| e.locator()));
+        }
+        let mut unique = rendered.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            rendered.len(),
+            unique.len(),
+            "a row rendered twice, in {text}"
+        );
+        assert_eq!(
+            rendered.len(),
+            list.entries().len(),
+            "every connection renders exactly once, in {text}"
+        );
+        list
+    }
+
+    #[test]
+    fn a_hand_edited_group_list_cannot_render_a_connection_twice() {
+        // The invariant `reconcile_groups` claims holds "however the file was
+        // written". A duplicate declaration used to survive the load, and two
+        // sections of one name each showed the same connection: one
+        // connection, two rows, which is "at most one group" read backwards.
+        let one =
+            "[[connections]]\nkind = \"sqlite\"\nname = \"a\"\npath = \"/tmp/a.db\"\ngroup = ";
+        let list =
+            assert_group_invariants(&format!("groups = [\"Prod\", \"Prod\"]\n\n{one}\"Prod\"\n"));
+        assert_eq!(list.groups(), ["Prod"]);
+
+        // The trim can *manufacture* a duplicate from a file that had none.
+        let list = assert_group_invariants(&format!(
+            "groups = [\"Prod \", \"Prod\"]\n\n{one}\"Prod\"\n"
+        ));
+        assert_eq!(list.groups(), ["Prod"]);
+
+        // Case variants are one group, first spelling wins, and an entry
+        // filed under a variant folds onto it rather than inventing a second.
+        let list = assert_group_invariants(&format!(
+            "groups = [\"Prod\", \"PROD\", \"prod\"]\n\n{one}\"prod\"\n"
+        ));
+        assert_eq!(list.groups(), ["Prod"]);
+        assert_eq!(list.entries()[0].group(), Some("Prod"));
+
+        // An undeclared group is still adopted, and a second entry naming a
+        // case variant of it joins the same one.
+        let list = assert_group_invariants(
+            "[[connections]]\nkind = \"sqlite\"\nname = \"a\"\npath = \"/tmp/a.db\"\ngroup = \"Invented\"\n\
+             \n[[connections]]\nkind = \"sqlite\"\nname = \"b\"\npath = \"/tmp/b.db\"\ngroup = \"INVENTED\"\n",
+        );
+        assert_eq!(list.groups(), ["Invented"]);
+        assert_eq!(list.arrange("")[0].entries.len(), 2);
+
+        // Whitespace-only declarations and memberships are not groups.
+        let list = assert_group_invariants(&format!(
+            "groups = [\"  \", \"\", \"Kept\"]\n\n{one}\"  \"\n"
+        ));
+        assert_eq!(list.groups(), ["Kept"]);
+        assert_eq!(list.entries()[0].group(), None);
     }
 
     #[test]
