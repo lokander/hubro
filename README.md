@@ -21,6 +21,12 @@ that starts fast and stays responsive on big tables. Passwords go to your
 operating system's keyring rather than a config file, and remote servers can be
 reached over an SSH tunnel or with Microsoft Entra ID sign-in.
 
+Several other engines speak one of those three wire protocols, and hubro is
+tested against them too — CockroachDB, YugabyteDB, TimescaleDB, Citus,
+Materialize and RisingWave each have a row in
+[Supported databases](#supported-databases), with the version tested and
+whatever does not work.
+
 Hubro runs on Linux, macOS, and Windows. It is free software (GPL-3.0).
 
 ![Hubro browsing a SQLite database](docs/screenshot.png)
@@ -71,17 +77,93 @@ required).
 - **Data grid** with sorting, filtering, and paging that stays fast on huge
   tables and large values (windowed rendering, bounded memory).
 - **SQL editor** — run queries and multi-statement scripts (wrapped in a
-  transaction), with schema-aware autocomplete, syntax highlighting, query
-  history, cancellation, and a confirmation before writes.
+  transaction where the server has one), with schema-aware autocomplete, syntax
+  highlighting, query history, cancellation, and a confirmation before writes.
 - **Edit** rows inline — cell edits, inserts, and deletes staged and saved
   atomically, with primary-key/unique-index detection and confirmation before
-  destructive operations (views and materialized views are read-only).
+  destructive operations. Views and materialized views are read-only, as is
+  anything hubro cannot address one row of; see
+  [Supported databases](#supported-databases) for which engines this applies
+  to.
 - **Export** query and table results to CSV or JSON (streamed).
 - **Foreign-key navigation**, keyboard shortcuts (with a cheatsheet),
   dark/light theme, and window/session restore.
 - **Secure remote access** — SSH tunnels (agent or key file) with host-key
   verification for Postgres and SQL Server, and Microsoft Entra ID sign-in for
   Azure Postgres and Azure SQL (interactive browser or managed identity).
+
+## Supported databases
+
+hubro has three backends — SQLite, Postgres, and SQL Server — but a backend is
+really a *wire protocol*, and several engines speak one of them without being
+that engine. Each is listed here only if hubro is tested against it end to end,
+with the version that was actually run.
+
+| Engine | Via backend | Verified version | Browse | Edit | Script | Notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| SQLite | SQLite | 3.46.0 | Yes | Yes | Atomic | A table without a primary key stays editable through its `rowid`. |
+| PostgreSQL | Postgres | 17.10 | Yes | Yes | Atomic | The reference implementation. A table with no primary key or unique index is read-only. |
+| SQL Server | SQL Server | 2022 (16.0.4265.3) | Yes | Yes | Atomic | `GO` batches are split and run in order. |
+| TimescaleDB | Postgres | 2.29.1 (on PostgreSQL 17.10) | Yes | Keyed hypertables | Atomic | Chunks and extension schemas are hidden as internal; `hypertable` and `continuous aggregate` show as badges. A hypertable with no key is read-only — see below. |
+| Citus | Postgres | 14.1-1 (on PostgreSQL 18.4) | Yes | Yes | Atomic | Distributed and reference tables page, sort, filter, and edit through the distribution key. Shards are hidden as internal. Needs `sslmode=disable` — see below. |
+| CockroachDB | Postgres | v26.2.5 | Yes | Yes | DML only | A failing script rolls back its writes but **not** its schema changes; hubro says so rather than claiming otherwise. Every table has a key, so keyless tables are editable here. |
+| YugabyteDB | Postgres | 2026.1.0.1 (PostgreSQL 15.12) | Yes | Yes | DML only | Same rollback caveat as CockroachDB, for its own reasons. Refuses concurrent schema changes. |
+| Materialize | Postgres | 26.36.0 | Yes | No | Atomic | The SQL editor writes, but the grid never does: Materialize rejects `PRIMARY KEY` and `UNIQUE`, so no table has a row to address. Sinks, clusters and indexes are not shown. |
+| RisingWave | Postgres | 3.0.2 | Yes | No | Sequential | No read-write transactions at all, so scripts run statement by statement and editing is refused rather than offered unguarded. Sinks are listed but not browsable — they store no rows. |
+
+**Browse** is the schema tree and the paged data grid. **Edit** is editing rows
+in the grid. **Script** is the SQL editor's multi-statement behaviour: *Atomic*
+wraps the batch in a transaction, *DML only* rolls data back but not schema
+changes, *Sequential* runs each statement on its own with no rollback.
+
+Every row above was verified on **2026-08-10** by running that engine's test
+suite against the listed version. The Edit and Script columns restate the
+capabilities hubro declares for that server, which is what the app itself gates
+on — and each engine's suite checks those declarations against the running
+server, so a wrong column shows up as a failing test rather than as a
+disappointed user. A second test asserts that every engine the code can detect
+has a row here at all, so this table cannot quietly fall behind the code.
+
+Three rules keep this honest:
+
+- Only engines actually tested get a row. Nothing is listed because it "should
+  work".
+- Partial support is a row with caveats, not an omission. "No" in a column is
+  useful information.
+- The exact version tested is recorded, because "supports PostgreSQL" without a
+  number is not a claim anyone can check.
+
+### Caveats worth knowing before you start
+
+- **TimescaleDB** requires any unique constraint to include the partitioning
+  column, so many real hypertables have no key at all. Those browse and script
+  normally but refuse row editing, with the reason shown. hubro deliberately
+  does not fall back to `ctid` here: rows move between chunks under
+  compression, so a `ctid` read a moment ago can address a different row.
+- **Citus** and **CockroachDB** both need `sslmode=disable` in the test URLs,
+  for unrelated reasons — the Citus image ships an X.509 v1 certificate that
+  rustls will not parse, and the single-node CockroachDB container runs
+  `--insecure` and serves no TLS. A secure CockroachDB cluster connects with an
+  ordinary `sslmode=require` URL.
+- **YugabyteDB** refuses two schema changes at once, so its own test suite runs
+  single-threaded. hubro reaches this only by running DDL from two connections
+  at the same time, and the failure is a plain statement error.
+
+### Tested and not supported
+
+**QuestDB** speaks the Postgres wire protocol but is not a supported engine. It
+has no `OFFSET`, paging by cursor instead, and hubro's paged reads append
+`LIMIT`/`OFFSET` unconditionally — so the grid would show nothing. It also has
+no primary keys, foreign keys, or indexes, and no `DELETE`. Supporting it means
+a backend of its own rather than a variant of the Postgres one. Recorded here
+so nobody has to rediscover it.
+
+### What is not on this list
+
+Anything absent is untested, not known-broken. A managed service running a
+listed engine — Azure Database for PostgreSQL, for instance — goes through the
+same backend as the engine it runs, but hosted providers are not separately
+verified and so have no row of their own.
 
 ## Development
 
@@ -117,9 +199,14 @@ cargo test
 
 Tailwind is compiled automatically by `dx serve` from `tailwind.css` in the
 project root — no npm or Tailwind CLI needed. The generated output lands in
-`assets/tailwind.css`. Postgres, SQL Server, and SSH-tunnel integration tests
-skip unless pointed at a server (see the headers of `tests/db_postgres.rs`,
-`tests/db_sqlserver.rs`, and `tests/tunnel.rs` for the `docker run` commands).
+`assets/tailwind.css`.
+
+Integration tests that need a server skip unless pointed at one with the
+matching `HUBRO_*_TEST_URL` variable. Every engine in
+[Supported databases](#supported-databases) has a `tests/db_<engine>.rs` whose
+header carries both the `docker run` command that starts it and what that
+engine's verification found; `tests/tunnel.rs` does the same for SSH tunnels.
+Those headers are where the table above comes from.
 
 ### Project layout
 
