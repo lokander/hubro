@@ -1,8 +1,9 @@
 //! YugabyteDB verification (FRE-91). Yugabyte runs the *real* PostgreSQL query
 //! layer on top of its own distributed storage, so unlike CockroachDB
 //! (`tests/db_cockroach.rs`) it is not a reimplementation — `pg_catalog` is
-//! genuine and introspection needed no changes at all. These tests pin the
-//! places where the storage layer underneath still shows through.
+//! genuine, and introspection needed no changes to read it correctly. These
+//! tests pin the places where the storage layer underneath still shows
+//! through, and the one place it does so sharply enough to want a fix.
 //!
 //! Needs a running server (Docker only, per CLAUDE.md) and is skipped unless
 //! `HUBRO_YUGABYTE_TEST_URL` is set, e.g.:
@@ -10,20 +11,24 @@
 //! ```sh
 //! docker run -d --name hubro-yugabyte-test -p 5436:5433 -p 15433:15433 \
 //!   yugabytedb/yugabyte:latest bin/yugabyted start --background=false
-//! docker exec hubro-yugabyte-test /home/yugabyte/bin/ysqlsh -h $(hostname -i) \
-//!   -U yugabyte -c 'CREATE DATABASE demo'
+//! docker exec hubro-yugabyte-test bash -c \
+//!   '/home/yugabyte/bin/ysqlsh -h $(hostname -i) -U yugabyte -c "CREATE DATABASE demo"'
 //! HUBRO_YUGABYTE_TEST_URL='postgres://yugabyte@localhost:5436/demo' cargo test
 //! ```
 //!
 //! YSQL listens on 5433 *inside* the container, mapped to 5436 to stay clear of
 //! the Timescale container on 5434. The stock image uses trust auth, so the URL
-//! carries no password.
+//! carries no password. The `bash -c` wrapper is load-bearing: `ysqlsh` binds
+//! the container's own address rather than loopback, and an unwrapped
+//! `$(hostname -i)` would expand on the *host* instead.
 //!
 //! ## What the verification found
 //!
-//! **Nothing in the backend needed changing.** Pointing the whole Postgres
-//! suite at this container passes — including every DDL test, which is more
-//! than CockroachDB managed — with four exceptions, none of them a hubro bug:
+//! **No backend change was needed to make it work.** Pointing the whole
+//! Postgres suite at this container passes — including every DDL test, which is
+//! more than CockroachDB managed — with five exceptions. One of them is a real
+//! robustness gap in hubro, filed rather than fixed here (finding 2); the rest
+//! are the engine or the container:
 //!
 //!  1. **Concurrent DDL is refused.** Two `CREATE TABLE`s in flight at once
 //!     fail with `could not serialize access due to concurrent update`, because
@@ -31,20 +36,36 @@
 //!     replay a statement that is not first in its batch. This is the one
 //!     finding with teeth, and it is mostly a *test harness* problem: the
 //!     shared suite runs its tests concurrently against one database, so it
-//!     needs `--test-threads=1` here. hubro itself never issues concurrent DDL
-//!     — a desktop viewer runs one statement at a time — and when the conflict
-//!     does happen the engine's message comes through intact rather than
-//!     corrupting anything. This file serialises its own fixture DDL through
-//!     [`DDL_LOCK`] so it stays honest under the default threaded runner.
-//!  2. **A failing script does not roll back its DDL** — the same gap
+//!     needs `--test-threads=1` here. hubro reaches it far more rarely, but it
+//!     *can*: run slots are claimed per connection (`claim_run_slot` in
+//!     `src/ui/state/sql.rs`), so two open connections can run DDL at once, and
+//!     a cancelled Postgres statement keeps executing server-side — so
+//!     cancel-then-rerun can overlap two DDLs on one connection. What makes
+//!     this a non-issue is the *shape* of the failure, which
+//!     `yugabyte_refuses_concurrent_ddl_without_corrupting_anything` pins: a
+//!     plain statement error carrying the engine's own explanation, with the
+//!     winner fully applied. This file serialises its own fixture DDL through
+//!     [`ddl_lock`] so it stays honest under the default threaded runner.
+//!  2. **Introspection can fail transiently, and hubro does not retry it.**
+//!     `MISMATCHED_SCHEMA` — "the catalog snapshot used for this transaction
+//!     has been invalidated" — surfaces when a schema change lands between the
+//!     six queries introspection runs. It is a *read* failing, which is the
+//!     part that matters: refreshing the schema tree on a cluster someone else
+//!     is changing can error out, and the message names a Yugabyte internal
+//!     rather than anything the user can act on. Transient by construction, so
+//!     the next attempt succeeds — which is why the tests here retry once via
+//!     [`introspect_stable`], and why hubro should too. Filed as FRE-147 rather
+//!     than fixed here: which errors are worth retrying is a cross-engine
+//!     decision, not a Yugabyte one.
+//!  3. **A failing script does not roll back its DDL** — the same gap
 //!     CockroachDB has, for a different reason (Yugabyte simply commits each
 //!     schema change as it executes). DML in the same transaction rolls back
 //!     correctly, so the fix is to narrow what hubro *claims*, not to disable
 //!     transactions: FRE-146.
-//!  3. **`numeric 'NaN'` is not storable** (`DECIMAL does not support NaN
+//!  4. **`numeric 'NaN'` is not storable** (`DECIMAL does not support NaN
 //!     yet`), so the shared suite's undecodable-cell fixture cannot be built
 //!     here. The decode path it exercises is engine-independent.
-//!  4. **The stock image uses trust auth**, so the shared suite's
+//!  5. **The stock image uses trust auth**, so the shared suite's
 //!     wrong-password test cannot fail the way it expects. A container
 //!     property, not an engine one.
 //!
@@ -53,19 +74,32 @@
 //! should: it is asserting that this connection is *not* mistaken for stock
 //! PostgreSQL, which is the whole point of the detection.
 //!
+//! ## Scope of this file
+//!
+//! Only what Yugabyte does differently. Types and export are verified by
+//! pointing the shared suite here (`db_export`, `db_staged` and the type cases
+//! in `db_postgres` all pass), not by anything below — there is no divergence
+//! for them to pin.
+//!
 //! ## Where the storage layer shows through, harmlessly
 //!
-//! Indexes report `lsm` rather than `btree` as their access method (hubro does
-//! not record it), and a table declared without a primary key has no
-//! user-visible key at all — no `ctid`, and no implicit `rowid` of the kind
-//! CockroachDB adds — so it is read-only, exactly as on stock Postgres.
+//! Indexes are LSM rather than B-tree and carry sharding attributes, but
+//! `pg_index` is byte-identical to stock Postgres — the extra detail lives in
+//! `pg_get_indexdef` (`USING lsm (id HASH, sensor_id ASC)`), so it reaches Show
+//! DDL (FRE-108) and leaves the browsable metadata untouched. Neither the
+//! access method nor the distribution is anything hubro records, so nothing
+//! had to change to accommodate them.
+//!
+//! A table declared without a primary key has no user-visible key at all — no
+//! `ctid`, and no implicit `rowid` of the kind CockroachDB adds — so it is
+//! read-only, exactly as on stock Postgres.
 
 use std::sync::OnceLock;
 
 use hubro::db::{
-    apply_staged, detect_row_identity, run_script, split_statements, DbPool, Filter, Internal,
-    PageRequest, PgFlavor, Restriction, RowIdentity, RowLocator, SortDir, StagedChange, TableKind,
-    TableMeta, Value,
+    apply_staged, detect_row_identity, run_script, split_statements, DbPool, DdlObject, Filter,
+    Internal, PageRequest, PgFlavor, Restriction, RowIdentity, RowLocator, SortDir, StagedChange,
+    TableKind, TableMeta, Value,
 };
 use tokio::sync::Mutex;
 
@@ -89,7 +123,9 @@ fn test_url() -> Option<String> {
 /// prevent.
 ///
 /// Held for fixture setup only, never across the assertions, so the tests still
-/// exercise concurrent *reads and writes* — which Yugabyte handles fine.
+/// exercise concurrent reads and writes. Ordinary data reads are unaffected by
+/// a racing schema change; catalog reads are not, which is what
+/// [`introspect_stable`] exists for.
 fn ddl_lock() -> &'static Mutex<()> {
     static DDL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     DDL_LOCK.get_or_init(|| Mutex::new(()))
@@ -142,6 +178,31 @@ async fn with_ddl(pool: &DbPool, statements: &[String]) {
     }
 }
 
+/// [`DbPool::introspect`], retried once past Yugabyte's transient catalog
+/// invalidation (finding 2 in the header).
+///
+/// Introspection is a *read*, but it is a multi-statement one: six queries on
+/// pooled connections. If a schema change lands between them, Yugabyte fails
+/// the batch with `MISMATCHED_SCHEMA` rather than serving a stale snapshot.
+/// It is transient by construction — the next attempt sees the new catalog
+/// version — so a retry is the correct response rather than a way to hide a
+/// failure, and it is what hubro itself should do (FRE-147).
+///
+/// Retried once, not looped: a second failure means something other than a
+/// racing schema change, and this must not turn a real breakage into a hang.
+async fn introspect_stable(pool: &DbPool) -> Vec<TableMeta> {
+    match pool.introspect().await {
+        Ok(tables) => tables,
+        Err(error) => {
+            assert!(
+                error.message().contains("MISMATCHED_SCHEMA"),
+                "only the catalog race is retried, got: {error:?}"
+            );
+            pool.introspect().await.unwrap()
+        }
+    }
+}
+
 fn find<'a>(tables: &'a [TableMeta], name: &str) -> &'a TableMeta {
     tables
         .iter()
@@ -177,7 +238,7 @@ async fn yugabyte_introspects_with_full_postgres_parity() {
     let pool = DbPool::open_postgres(&url).await.unwrap();
     let (readings, sensors) = fresh_fixture(&pool, "intro").await;
 
-    let tables = pool.introspect().await.unwrap();
+    let tables = introspect_stable(&pool).await;
     let table = find(&tables, &readings);
 
     assert_eq!(table.kind, TableKind::Table);
@@ -198,9 +259,10 @@ async fn yugabyte_introspects_with_full_postgres_parity() {
     assert_eq!(fk.referenced_table, sensors);
     assert_eq!(fk.referenced_columns, [Some("id".to_string())]);
 
-    // Yugabyte's indexes are LSM rather than B-tree, and the primary key is the
-    // table's distribution key. Neither is anything hubro records, so both
-    // arrive as ordinary index metadata — which is the claim being pinned.
+    // Yugabyte's indexes are LSM rather than B-tree, and the primary key
+    // doubles as the table's distribution key. Neither is anything the
+    // browsable metadata records, so both arrive as ordinary index metadata —
+    // which is the claim being pinned.
     assert!(
         table
             .indexes
@@ -208,6 +270,21 @@ async fn yugabyte_introspects_with_full_postgres_parity() {
             .any(|i| i.columns == ["temperature"] && !i.unique),
         "expected the secondary index, got {:?}",
         table.indexes
+    );
+
+    // The sharding attributes FRE-91 asked about do exist — they just live in
+    // the DDL rather than in `pg_index`, which is byte-identical to stock
+    // Postgres here. `pg_get_indexdef` renders them, so Show DDL (FRE-108)
+    // reports the distribution the user actually has instead of a B-tree that
+    // was never created. Native output, so this is the server's own text.
+    let ddl = pool
+        .fetch_ddl(table, &DdlObject::Index(format!("{readings}_pkey")))
+        .await
+        .unwrap()
+        .text();
+    assert!(
+        ddl.contains("USING lsm") && ddl.contains("HASH"),
+        "expected Yugabyte's sharding attributes in the index DDL, got: {ddl}"
     );
 
     pool.close().await;
@@ -255,7 +332,7 @@ async fn yugabyte_rows_edit_through_the_composite_key() {
     let pool = DbPool::open_postgres(&url).await.unwrap();
     let (readings, _) = fresh_fixture(&pool, "edit").await;
 
-    let tables = pool.introspect().await.unwrap();
+    let tables = introspect_stable(&pool).await;
     let table = find(&tables, &readings);
     let identity = detect_row_identity(table, pool.dialect()).expect("composite pk");
     assert_eq!(
@@ -339,7 +416,7 @@ async fn yugabyte_table_without_a_key_is_read_only_like_postgres() {
         .await
         .unwrap();
 
-    let tables = pool.introspect().await.unwrap();
+    let tables = introspect_stable(&pool).await;
     let table = find(&tables, "yb_nokey");
     let columns: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(columns, ["a", "b"], "no implicit key column is exposed");
@@ -390,7 +467,7 @@ async fn yugabyte_materialized_view_browses_but_refuses_writes() {
     )
     .await;
 
-    let tables = pool.introspect().await.unwrap();
+    let tables = introspect_stable(&pool).await;
     let meta = find(&tables, &view);
     assert_eq!(meta.kind, TableKind::MaterializedView);
     assert!(
@@ -447,7 +524,7 @@ async fn yugabyte_extension_objects_are_attributed_like_any_postgres() {
     )
     .await;
 
-    let tables = pool.introspect().await.unwrap();
+    let tables = introspect_stable(&pool).await;
     let view = find(&tables, "pg_buffercache");
     assert_eq!(
         view.internal,
@@ -465,7 +542,14 @@ async fn yugabyte_extension_objects_are_attributed_like_any_postgres() {
         "Yugabyte exposes no reserved catalog schema of its own"
     );
 
-    with_ddl(&pool, &["DROP TABLE yb_ext_neighbour".to_string()]).await;
+    with_ddl(
+        &pool,
+        &[
+            "DROP TABLE yb_ext_neighbour".to_string(),
+            "DROP EXTENSION pg_buffercache".to_string(),
+        ],
+    )
+    .await;
     pool.close().await;
 }
 
@@ -549,10 +633,11 @@ async fn yugabyte_refuses_concurrent_ddl_without_corrupting_anything() {
     //
     // What matters for hubro is the shape of the failure, which is what this
     // asserts: a plain statement error carrying the engine's own explanation,
-    // with the winner fully applied. hubro never issues concurrent DDL itself
-    // (a desktop viewer runs one statement at a time), so this is reachable
-    // only by two hubro windows on one cluster — or, far more likely, by a test
-    // suite, which is why this file has a DDL lock at all.
+    // with the winner fully applied. hubro does reach this — run slots are
+    // per connection, so two open connections can issue DDL at once, and a
+    // cancelled Postgres statement keeps running server-side, so
+    // cancel-then-rerun can overlap two on one connection — but far less often
+    // than a test suite does, which is why this file has a DDL lock at all.
     with_ddl(
         &pool,
         &[
@@ -573,8 +658,11 @@ async fn yugabyte_refuses_concurrent_ddl_without_corrupting_anything() {
     );
     drop(guard);
 
-    // Not asserted as "one fails": the race is real, and on a quiet cluster
-    // both can win. What must hold either way is that a loser fails *cleanly*.
+    // Observed as a conflict every time it was tried, but not asserted as
+    // "exactly one fails": that is a timing claim about a distributed cluster,
+    // and a test that depends on losing a race is a test that goes flaky on a
+    // faster machine. What must hold either way is that a loser fails
+    // *cleanly*, which is the part hubro's behaviour actually rests on.
     for outcome in [&a, &b] {
         if let Err(error) = outcome {
             let message = error.message().to_lowercase();
@@ -587,7 +675,7 @@ async fn yugabyte_refuses_concurrent_ddl_without_corrupting_anything() {
 
     // Whichever succeeded is a complete, usable table — the conflict is a
     // refusal, not a partial apply.
-    let tables = pool.introspect().await.unwrap();
+    let tables = introspect_stable(&pool).await;
     for (name, outcome) in [("yb_race_a", &a), ("yb_race_b", &b)] {
         if outcome.is_ok() {
             let table = find(&tables, name);
