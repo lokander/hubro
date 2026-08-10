@@ -387,3 +387,12 @@ impl AppState {
         self.export_status.write().insert(slot, status);
     }
 }
+
+/// Sibling temp path for an atomic export write (`foo.csv` → `foo.csv.part`).
+/// Streaming into this and renaming on success keeps a mid-stream failure
+/// from clobbering an existing file at the destination.
+fn export_temp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".part");
+    path.with_file_name(name)
+}

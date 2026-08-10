@@ -390,6 +390,53 @@ impl AppState {
     }
 }
 
+/// Whether any table stage anywhere in the staged map has pending edits. Pure
+/// so the window-close guard's predicate can be unit-tested without a running
+/// reactive context.
+fn staged_has_dirty(staged: &HashMap<ConnectionId, HashMap<String, TableStage>>) -> bool {
+    staged
+        .values()
+        .any(|tables| tables.values().any(|stage| !stage.is_empty()))
+}
+
+/// What a Save click should do on a write-protected connection (FRE-111).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveAction {
+    /// Send the changes now.
+    Apply,
+    /// Hold them and show the connection-naming confirmation first.
+    Park,
+}
+
+/// Resolves a Save click: `protection` is the connection's marking, `parked`
+/// the change list a previous click already confirmed (if any), and `current`
+/// what the stage holds now.
+///
+/// The comparison between `parked` and `current` is the substance here.
+/// Confirming authorizes a *specific* set of changes, so editing, discarding
+/// or staging more after the prompt appears has to send the user back through
+/// it — otherwise the prompt would launder whatever the stage happened to
+/// contain by the time they clicked, which is exactly the accident FRE-111
+/// exists to prevent.
+///
+/// `ReadOnly` returns `Apply` rather than a third variant: there is nothing to
+/// confirm, and the write is refused underneath by the capability resolution
+/// (see [`TableAccess::resolve_protected`]) with a message naming the marking.
+/// Parking it instead would offer a prompt whose only outcome is a failure.
+fn save_action(
+    protection: WriteProtection,
+    parked: Option<&[StagedChange]>,
+    current: &[StagedChange],
+) -> SaveAction {
+    if !protection.confirms() {
+        return SaveAction::Apply;
+    }
+    match parked {
+        Some(confirmed) if confirmed == current => SaveAction::Apply,
+        _ => SaveAction::Park,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
