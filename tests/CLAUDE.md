@@ -23,6 +23,10 @@ Engine-verification issues (FRE-88 onwards) have **two possible outcomes, and on
 
 **The README's "Supported databases" matrix (FRE-96) is the published record**, assembled from those headers. Adding a row is the last step of a successful verification, with the exact version run and the date it passed both taken from an actual run rather than from the image tag — `SELECT version()` and friends, since the `:latest` tags in the test headers say nothing. The Browse/Edit/Script columns restate what `backend_capabilities` and `TableAccess::resolve` already decide, so a row that disagrees with the app is a bug in the row. `tests/support_matrix.rs` enforces the parts that can be checked offline: every `PgFlavor` and `Dialect` variant has a row, and no row records an image tag in place of a version.
 
+## Performance budgets
+
+`tests/perf.rs` has an `#[ignore]`d budget suite (`cargo test --test perf -- --ignored --test-threads=1 --nocapture`) timing real db-layer operations against p50 budgets; a plain `cargo test` only runs its tiny-scale generator checks. Full-scale fixtures cache under `target/perf-fixtures/` (~1 GB; `HUBRO_PERF_REBUILD=1` forces a rebuild). Budgets live in `tests/common/`, recorded baselines in `docs/PERFORMANCE.md`.
+
 ## Fixtures
 
 Fixture files go in `tests/fixtures/`, which `.gitattributes` marks `-text` so git never rewrites their bytes. `tests/line_endings.rs` names the files whose tests depend on that.

@@ -2,7 +2,7 @@
 
 How to drive the app to verify a UI change. Development happens on multiple machines; pick the recipe for the current platform.
 
-The app writes to the *real* `$XDG_CONFIG_HOME/hubro/`, so launch it with `XDG_CONFIG_HOME`/`XDG_DATA_HOME` pointed at a scratch dir rather than cleaning up afterwards, and `stat` them before and after to confirm. Parallel agents each need their own display (`Xephyr :12`, `:13`, …), and must kill the app and the display **by recorded PID** — every worktree builds a binary called `hubro`, so `pkill -x hubro` takes the siblings' down too.
+The app writes to the *real* `$XDG_CONFIG_HOME/hubro/`, so launch it with `XDG_CONFIG_HOME`/`XDG_DATA_HOME` pointed at a scratch dir rather than cleaning up afterwards, and `stat` them before and after to confirm. The scratch dirs don't cover passwords: saving a connection writes to the real `hubro` keyring service, so also set `HUBRO_DISABLE_KEYRING=1` (forces the session-only fallback, `src/secrets.rs`). Parallel agents each need their own display (`Xephyr :12`, `:13`, …), and must kill the app and the display **by recorded PID** — every worktree builds a binary called `hubro`, so `pkill -x hubro` takes the siblings' down too.
 
 ## Linux (KDE Plasma on Wayland)
 
