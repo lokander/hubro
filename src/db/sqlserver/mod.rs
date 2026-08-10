@@ -330,6 +330,15 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
 /// come back NULL — absent, as they should be, with no special case. An
 /// indexed view does have them and reports real numbers, which is why nothing
 /// here filters on object type.
+///
+/// **A row count of zero is kept, and that is deliberate.** An empty table has
+/// partitions and reports `row_count = 0`, which is a measurement rather than
+/// an absence: this counter needs no `ANALYZE` to be meaningful, so there is no
+/// "not counted yet" state for it to be confused with. Only NULL — no
+/// partitions at all — means unknown. The Postgres arm reaches the same
+/// answer from `reltuples = 0`, and the two must agree: an empty table that
+/// reported "0 rows" here and nothing there would be one backend contradicting
+/// the other about an identical situation.
 pub async fn fetch_table_stats(pool: &MssqlPool, table: &TableMeta) -> Result<TableStats, DbError> {
     // OBJECT_ID takes the name as a *string*, so it is bound rather than
     // spliced — and quoted, since it is otherwise parsed as an identifier

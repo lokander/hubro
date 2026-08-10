@@ -1111,3 +1111,43 @@ async fn an_exact_count_ignores_a_quoted_name_and_a_non_public_schema() {
     pool.query("DROP SCHEMA \"stats sch\"").await.unwrap();
     pool.close().await;
 }
+
+#[tokio::test]
+async fn an_analyzed_empty_table_reports_zero_rows_rather_than_nothing() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.query("DROP TABLE IF EXISTS stats_empty")
+        .await
+        .unwrap();
+    pool.query("CREATE TABLE stats_empty (id int, name text)")
+        .await
+        .unwrap();
+
+    // Before ANALYZE the table has never been measured: `reltuples` is -1 on
+    // every engine this suite is pointed at, and nothing is claimed.
+    let meta = meta_of(&pool, "stats_empty").await;
+    assert_eq!(pool.fetch_table_stats(&meta).await.unwrap().rows, None);
+
+    pool.query("ANALYZE stats_empty").await.unwrap();
+    let stats = pool.fetch_table_stats(&meta).await.unwrap();
+
+    // The state this exists for. ANALYZE measured the table and found no rows,
+    // so `reltuples` is 0 — a fact, not an absence. Reporting nothing here
+    // would render identically to "statistics unknown" and would contradict
+    // SQL Server, whose maintained counter reports 0 for the same table
+    // (`sqlserver_an_empty_table_reports_zero_rows_not_nothing`).
+    assert_eq!(
+        stats.rows,
+        Some(RowCount::Estimated(0)),
+        "a measured zero must be reported as zero"
+    );
+    assert!(stats.rows.is_some_and(RowCount::is_estimate));
+    // And it is emphatically not "nothing known" — the pane must not fall back
+    // to its no-statistics line for a table it can describe.
+    assert!(!stats.is_empty());
+
+    assert_eq!(pool.count_table_rows(&meta).await.unwrap(), 0);
+
+    pool.query("DROP TABLE stats_empty").await.unwrap();
+    pool.close().await;
+}

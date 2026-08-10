@@ -185,6 +185,21 @@ fn SchemaBody(id: ConnectionId, meta: TableMeta) -> Element {
     }
 }
 
+/// The exact count to show for `current`, out of whatever was last counted.
+///
+/// `None` unless the stored count belongs to the table now on screen. The whole
+/// point is the *inequality* case: a count is expensive, so it is kept after it
+/// arrives, and the moment it is shown beside a different table it is a wrong
+/// number carrying the one badge that promises it is right. Schema and name are
+/// both compared, since the same table name in two schemas is two tables.
+fn exact_for(
+    counted: Option<&(TableRef, Result<u64, String>)>,
+    current: &TableRef,
+) -> Option<Result<u64, String>> {
+    let (counted_table, result) = counted?;
+    (counted_table == current).then(|| result.clone())
+}
+
 /// How big this table is (FRE-118): an estimated row count, its size on disk,
 /// and the one action that turns the estimate into a real number.
 ///
@@ -194,9 +209,22 @@ fn SchemaBody(id: ConnectionId, meta: TableMeta) -> Element {
 /// different badges — an estimate shown as though it were counted would be
 /// worse than showing nothing.
 ///
-/// `table` is a [`ReadSignal`] so the estimate re-loads when the pane
-/// switches tables: this component is reused rather than remounted, so a
-/// plain prop would leave the first table's numbers on the screen forever.
+/// Two independent defenses keep a number from outliving the table it
+/// describes, and neither assumes the other:
+///
+///  - `table` is a [`ReadSignal`], so the estimate re-loads if this component
+///    is ever re-rendered with a new table rather than remounted;
+///  - the exact count is stored *with* the [`TableRef`] it counted, and
+///    [`exact_for`] hands it back only for the table now on screen.
+///
+/// Today neither is what actually saves it: `SchemaPane` is keyed by
+/// `table.key()` and `ConnectionView` by connection id (`src/ui/shell.rs`), so
+/// a table or connection switch remounts this and resets both signals. That
+/// keying is load-bearing and this does not rely on it — the two are written
+/// so that removing either the key or the pairing still leaves the number
+/// correct, because a stale count wearing the "exact" badge is the one failure
+/// this whole feature is arranged to prevent. [`exact_for`] is the half that
+/// can be tested without a renderer, and is.
 #[component]
 fn TableStatsLine(id: ConnectionId, table: ReadSignal<TableRef>) -> Element {
     let state = use_context::<AppState>();
@@ -204,22 +232,11 @@ fn TableStatsLine(id: ConnectionId, table: ReadSignal<TableRef>) -> Element {
         let table = table();
         async move { state.load_table_stats(id, table).await }
     });
-    // The exact count is stored *with* the table it counted. Being reused
-    // across table switches is the same thing that makes the signal outlive
-    // its subject, and a count left over from the previous table would be a
-    // wrong number wearing the "exact" badge — the one failure this whole
-    // feature is arranged to prevent.
     let mut counted = use_signal(|| Option::<(TableRef, Result<u64, String>)>::None);
     let mut counting = use_signal(|| false);
 
     let loaded = stats.read().clone();
-    let exact: Option<Result<u64, String>> = {
-        let current = table();
-        counted
-            .read()
-            .as_ref()
-            .and_then(|(t, result)| (*t == current).then(|| result.clone()))
-    };
+    let exact = exact_for(counted.read().as_ref(), &table());
     let rows = match exact.as_ref().and_then(|r| r.as_ref().ok()) {
         Some(n) => Some(RowCount::Exact(*n)),
         None => loaded
@@ -524,6 +541,52 @@ mod tests {
             )),
             "text[]"
         );
+    }
+
+    fn table_ref(schema: Option<&str>, name: &str) -> TableRef {
+        TableRef {
+            schema: schema.map(str::to_string),
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn an_exact_count_is_never_shown_beside_a_different_table() {
+        let counted = (table_ref(Some("public"), "orders"), Ok(160));
+
+        // The table it was counted for: the number is the whole reason the
+        // button exists, so it must survive.
+        assert_eq!(
+            exact_for(Some(&counted), &table_ref(Some("public"), "orders")),
+            Some(Ok(160))
+        );
+
+        // Any other table, and it is withheld — this is the guard. A count of
+        // 160 shown beside `customers` would be a wrong number wearing the
+        // "exact" badge, which is worse than no number at all.
+        assert_eq!(
+            exact_for(Some(&counted), &table_ref(Some("public"), "customers")),
+            None
+        );
+        // Same name, different schema: two different tables.
+        assert_eq!(
+            exact_for(Some(&counted), &table_ref(Some("archive"), "orders")),
+            None
+        );
+        // Same name, no schema at all (SQLite) — still not the same table.
+        assert_eq!(exact_for(Some(&counted), &table_ref(None, "orders")), None);
+
+        // Nothing counted yet.
+        assert_eq!(exact_for(None, &table_ref(Some("public"), "orders")), None);
+
+        // A *failed* count is carried the same way, so an error message cannot
+        // leak onto the next table either.
+        let failed = (table_ref(None, "t"), Err("boom".to_string()));
+        assert_eq!(
+            exact_for(Some(&failed), &table_ref(None, "t")),
+            Some(Err("boom".to_string()))
+        );
+        assert_eq!(exact_for(Some(&failed), &table_ref(None, "u")), None);
     }
 
     #[test]
