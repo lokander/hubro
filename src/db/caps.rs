@@ -105,8 +105,29 @@ pub const NO_MUTATE: &str = "This connection is read-only.";
 pub const NO_DDL: &str = "This connection doesn't allow schema changes.";
 pub const NO_OFFSET_PAGING: &str = "This connection can't page through rows with LIMIT/OFFSET.";
 
+/// Why editing is refused on a backend that cannot hold a transaction.
+///
+/// Not a nicety. Every staged write applies through
+/// [`execute_all_checked`](super::registry::DbPool::execute_all_checked),
+/// which commits only when each statement affected exactly the rows it
+/// expected and rolls back when it did not — and that check is the whole
+/// reason an edit cannot quietly hit the wrong rows. Without a transaction the
+/// mismatch is still *detected*, but only after the write has landed: the
+/// guard would report the damage instead of preventing it.
+///
+/// So a non-transactional backend is not offered unguarded editing. RisingWave
+/// is the first (FRE-93): `BEGIN` there raises a notice saying no transaction
+/// was started, and `ROLLBACK` silently does nothing.
+pub const NO_GUARDED_WRITE: &str =
+    "This connection can't run transactions, so an edit that turned out to affect the wrong \
+     rows couldn't be undone.";
+
 /// The connection-level explanation when a backend declares `mutate: false`.
 pub const CONNECTION_READ_ONLY: Restriction = Restriction::Declared(NO_MUTATE);
+
+/// The connection-level explanation when a backend can write but cannot make
+/// the write safe — see [`NO_GUARDED_WRITE`].
+pub const UNGUARDED_WRITES: Restriction = Restriction::Declared(NO_GUARDED_WRITE);
 
 /// What the user chose, as opposed to what the backend imposes — worded so the
 /// two are never confused. A backend that can't write says "is read-only"; a
@@ -220,6 +241,13 @@ impl TableAccess {
         let identity = detect_row_identity(table, dialect);
         let restriction = if !defaults.mutate {
             Some(CONNECTION_READ_ONLY)
+        } else if !defaults.transactions {
+            // Checked before the object's own reasons for the same rule the
+            // connection-level refusal above follows: a limit of the
+            // connection stands whatever the object is, and telling someone
+            // "this view is read-only" would send them to find a writable
+            // table that is equally refused. See [`NO_GUARDED_WRITE`].
+            Some(UNGUARDED_WRITES)
         } else if let Some(declared) = table.restriction {
             Some(declared)
         } else {
@@ -375,6 +403,42 @@ mod tests {
         assert!(access.caps.read_query);
         // The row is still addressable, so cell fetch keeps working.
         assert!(access.identity.is_some());
+    }
+
+    #[test]
+    fn a_backend_without_transactions_refuses_editing_and_says_why() {
+        // RisingWave's shape (FRE-93): it writes, runs DDL and pages fine, but
+        // holds no transaction — so the row-count guard behind every staged
+        // write can only report damage, never prevent it.
+        let defaults = Capabilities {
+            transactions: false,
+            ..Capabilities::FULL
+        };
+        let access = TableAccess::resolve(defaults, &keyed_table(), Dialect::Postgres);
+        assert!(!access.can_mutate());
+        assert_eq!(access.restriction, Some(UNGUARDED_WRITES));
+        assert_eq!(access.read_only_notice(), Some(NO_GUARDED_WRITE));
+        // Reading is untouched, and the row stays addressable for cell fetch —
+        // this is about writing safely, not about the table being opaque.
+        assert!(access.caps.read_query);
+        assert!(access.caps.offset_paging);
+        assert!(access.identity.is_some());
+    }
+
+    #[test]
+    fn losing_transactions_does_not_relabel_an_object_already_unwritable() {
+        // A view is a view. The connection-level reason is checked first by
+        // design, but it must not be the one *shown* for an object that would
+        // be refused anyway — same asymmetry the marking rules follow.
+        let defaults = Capabilities {
+            transactions: false,
+            ..Capabilities::FULL
+        };
+        for kind in [TableKind::View, TableKind::MaterializedView] {
+            let t = table(kind, vec![col("id", Some(1))]);
+            let access = TableAccess::resolve(defaults, &t, Dialect::Postgres);
+            assert!(!access.can_mutate(), "{kind:?}");
+        }
     }
 
     #[test]

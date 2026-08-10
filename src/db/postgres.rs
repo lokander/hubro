@@ -116,6 +116,9 @@ pub enum PgFlavor {
     /// Materialize — a streaming engine speaking the Postgres wire protocol
     /// (FRE-92).
     Materialize,
+    /// RisingWave — a streaming engine with real, editable tables, but no
+    /// read-write transactions (FRE-93).
+    RisingWave,
 }
 
 /// Identifies the engine from its `version()` string.
@@ -137,6 +140,8 @@ fn detect_flavor(version: &str) -> PgFlavor {
         PgFlavor::CockroachDB
     } else if version.contains("materialize") {
         PgFlavor::Materialize
+    } else if version.contains("risingwave") {
+        PgFlavor::RisingWave
     } else if version.contains("-yb-") || version.contains("yugabyte") {
         PgFlavor::Yugabyte
     } else {
@@ -664,12 +669,19 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     //     extension matter at all, but a table partitioned by day floods the
     //     tree exactly as Timescale's chunks do.
     //
+    // The placeholder is `NULL::text` rather than the `name` that would match
+    // its sibling columns: `name` is a PostgreSQL-internal type, and an engine
+    // reimplementing the catalog need not have it — RisingWave does not, and
+    // failed to bind the cast at all, taking the whole introspection with it
+    // (FRE-93). Text unions with `name` on every engine that has both, and the
+    // value is decoded as a string either way.
+    //
     // `deptype = 'e'` on the first two: that is the code for "member of the
     // extension". The neighbouring `'x'` means the opposite — the object is
     // *not* a member, it merely gets dropped with the extension — so counting
     // it would attribute the user's own object to an extension.
     let internal_rows = sqlx::query(
-        "SELECT n.nspname AS schema_name, NULL::name AS object_name, e.extname \
+        "SELECT n.nspname AS schema_name, NULL::text AS object_name, e.extname \
          FROM pg_namespace n \
          JOIN pg_depend d ON d.classid = 'pg_namespace'::regclass AND d.objid = n.oid \
           AND d.deptype = 'e' \
@@ -956,6 +968,12 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     // (indpred) are flagged so row-identity detection can reject them;
     // invalid indexes (e.g. from a failed CREATE INDEX CONCURRENTLY) make
     // no guarantees at all and are dropped entirely.
+    // The `unnest` join carries no explicit `LATERAL`. PostgreSQL implies it
+    // for a set-returning function in FROM, so the keyword adds nothing there,
+    // and RisingWave's parser rejects it outright — it wants a subquery after
+    // `LATERAL` and fails to prepare the statement, taking introspection with
+    // it (FRE-93). Verified equivalent on every engine in this milestone.
+    //
     // `indnkeyatts` separates an index's key columns from its INCLUDE payload,
     // and is absent on engines that have no INCLUDE to separate — Materialize
     // among them (FRE-92). Dropped from the query on those servers rather than
@@ -972,7 +990,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
              JOIN pg_namespace n ON n.oid = t.relnamespace \
-             CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) \
+             CROSS JOIN unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) \
              LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
              WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
                AND n.nspname NOT LIKE 'pg\\_%' \
@@ -1701,6 +1719,11 @@ mod tests {
                 "PostgreSQL 9.5 on x86_64-unknown-linux-gnu (Materialize 26.36.0)",
                 PgFlavor::Materialize,
             ),
+            (
+                "PostgreSQL 13.14.0-RisingWave-3.0.2 \
+                 (391c3a16ef26d0cd86d1236c9b7c122a9a27fb1e)",
+                PgFlavor::RisingWave,
+            ),
         ] {
             assert_eq!(detect_flavor(version), expected, "{version}");
         }
@@ -1714,6 +1737,7 @@ mod tests {
         for version in [
             "PostgreSQL 15.12-YB-2026.1.0.1-b0 on x86_64-pc-linux-gnu",
             "PostgreSQL 9.5 on x86_64-unknown-linux-gnu (Materialize 26.36.0)",
+            "PostgreSQL 13.14.0-RisingWave-3.0.2 (391c3a16)",
         ] {
             assert_ne!(detect_flavor(version), PgFlavor::Postgres, "{version}");
         }
