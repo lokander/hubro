@@ -1,0 +1,23 @@
+{{! Desktop entry template for dx bundle (Dioxus.toml: [bundle.deb]
+    desktop_template). dx renders this for the deb, the rpm and the AppImage,
+    so this one file carries the file association on every Linux package.
+
+    It is dx's built-in template plus two things (FRE-114): `%f` on Exec, so a
+    file manager passes the double-clicked path, and the MimeType line that
+    makes hubro appear as a handler for SQLite databases at all. Keep the rest
+    byte-for-byte identical to dx's default — anything dropped here is dropped
+    from the shipped .desktop file.
+
+    `%f` and not `%F`: hubro opens one database per window, and a `%F` launch
+    with several files would be a usage error. }}
+[Desktop Entry]
+Categories={{categories}}
+{{#if comment}}
+Comment={{comment}}
+{{/if}}
+Exec={{exec}} %f
+Icon={{icon}}
+Name={{name}}
+Terminal=false
+Type=Application
+MimeType=application/vnd.sqlite3;application/x-sqlite3;

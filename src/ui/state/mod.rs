@@ -39,6 +39,7 @@ use dioxus::core::{spawn_forever, Task};
 use dioxus::prelude::*;
 
 use crate::azure::{self, EntraAuth};
+use crate::cli::OpenTarget;
 use crate::config::{
     default_config_path, default_session_path, default_settings_path, load_session, load_settings,
     plan_session_restore, save_session, save_show_internal_objects, save_theme, BackendKind,

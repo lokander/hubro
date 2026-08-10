@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  WiX fragment adding hubro's file associations to the MSI (FRE-114).
+
+  Wired up in Dioxus.toml as [bundle.windows.wix] fragment_paths plus
+  component_group_refs = ["HubroFileAssociations"] — the fragment defines the
+  component group and that reference is what pulls it into the installed
+  feature. Without the reference the fragment compiles and installs nothing.
+
+  HKLM because dx's MSI is InstallScope="perMachine"; the registry values live
+  in components of their own, so uninstalling removes exactly what was added.
+
+  The association is registered the additive way. Each extension gets an
+  OpenWithProgids entry, which adds hubro to that file type's "Open with" list
+  and leaves the existing default alone; nothing here writes the (Default)
+  value of .db, .sqlite or .sqlite3. That is required for `.db` — a contested
+  extension owned by many unrelated formats — and Windows 8 and later refuse an
+  installer-set default anyway: the user picks one, and this makes hubro
+  something they can pick.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <ComponentGroup Id="HubroFileAssociations" Directory="INSTALLDIR">
+
+      <!-- The ProgID: what "Hubro.Database" means, and how to launch it. -->
+      <Component Id="HubroProgId" Guid="*">
+        <RegistryKey Root="HKLM" Key="Software\Classes\Hubro.Database" ForceDeleteOnUninstall="yes">
+          <RegistryValue Type="string" Value="SQLite database" KeyPath="yes" />
+          <RegistryValue Key="DefaultIcon" Type="string" Value="&quot;[INSTALLDIR]hubro.exe&quot;,0" />
+          <!-- One file per window, so a single %1 rather than %*. -->
+          <RegistryValue Key="shell\open\command" Type="string" Value="&quot;[INSTALLDIR]hubro.exe&quot; &quot;%1&quot;" />
+        </RegistryKey>
+      </Component>
+
+      <!--
+        The application entry, which is what makes hubro appear in the
+        "Choose another app" list even for a file type it has no ProgID
+        association with.
+      -->
+      <Component Id="HubroApplication" Guid="*">
+        <RegistryKey Root="HKLM" Key="Software\Classes\Applications\hubro.exe" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="FriendlyAppName" Type="string" Value="Hubro" KeyPath="yes" />
+          <RegistryValue Key="shell\open\command" Type="string" Value="&quot;[INSTALLDIR]hubro.exe&quot; &quot;%1&quot;" />
+          <RegistryValue Key="SupportedTypes" Name=".db" Type="string" Value="" />
+          <RegistryValue Key="SupportedTypes" Name=".sqlite" Type="string" Value="" />
+          <RegistryValue Key="SupportedTypes" Name=".sqlite3" Type="string" Value="" />
+        </RegistryKey>
+      </Component>
+
+      <!-- One component per extension: an additional handler, never the default. -->
+      <Component Id="HubroOpenWithDb" Guid="*">
+        <RegistryValue Root="HKLM" Key="Software\Classes\.db\OpenWithProgids"
+                       Name="Hubro.Database" Type="string" Value="" KeyPath="yes" />
+      </Component>
+
+      <Component Id="HubroOpenWithSqlite" Guid="*">
+        <RegistryValue Root="HKLM" Key="Software\Classes\.sqlite\OpenWithProgids"
+                       Name="Hubro.Database" Type="string" Value="" KeyPath="yes" />
+      </Component>
+
+      <Component Id="HubroOpenWithSqlite3" Guid="*">
+        <RegistryValue Root="HKLM" Key="Software\Classes\.sqlite3\OpenWithProgids"
+                       Name="Hubro.Database" Type="string" Value="" KeyPath="yes" />
+      </Component>
+
+    </ComponentGroup>
+  </Fragment>
+</Wix>

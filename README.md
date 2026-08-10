@@ -67,11 +67,35 @@ required).
 
 </details>
 
+## Opening a database from outside the app
+
+hubro takes one argument — a SQLite file or a connection URL:
+
+```bash
+hubro app.db                          # opens the file in a tab
+hubro postgres://user@db.internal/app # asks for the password, then connects
+hubro --help                          # usage; --version prints the version
+```
+
+A file opened this way is not added to the saved connections list; a server URL
+joins it on success, stored without its password as usual.
+
+**Leave the password out of the URL.** A password on a command line is written
+to your shell's history file and is readable by anyone who can list processes,
+and hubro cannot undo either. Given a URL without one, hubro asks — and can
+remember it in the system keyring.
+
+Double-clicking a database works too: hubro registers as *a* handler for `.db`,
+`.sqlite` and `.sqlite3`, never as the default — `.db` in particular belongs to
+a great many unrelated formats. Pick hubro from the "Open with" menu, and make
+it the default there if you want one. Until single-instance handling lands,
+opening a file while hubro is already running starts a second copy.
+
 ## Features
 
 - **Connect** to SQLite files and Postgres or SQL Server servers (connection
-  form or URL), with the OS keyring remembering passwords — Secret Service on
-  Linux, Keychain on macOS, Credential Manager on Windows.
+  form, URL, or the command line), with the OS keyring remembering passwords —
+  Secret Service on Linux, Keychain on macOS, Credential Manager on Windows.
 - **Browse** schemas — tables, views, and Postgres materialized views in the
   sidebar; columns, indexes, and foreign keys in the schema pane.
 - **Data grid** with sorting, filtering, and paging that stays fast on huge
@@ -223,9 +247,15 @@ tunnels. Those headers are where the table above comes from.
 ├─ src/lib.rs    # library root, imported by tests as hubro::
 ├─ src/db/       # backend-neutral DB layer (sqlite, postgres, schema, paging)
 ├─ src/ui/       # Dioxus components (shell, sidebar, grid, editor, state)
+├─ src/cli.rs    # argument parsing and OS "open this file" requests
 ├─ src/azure.rs  # Entra ID token acquisition; tunnel.rs, secrets.rs, config.rs
+├─ packaging/    # file-association declarations read by `dx bundle`
 ├─ tailwind.css  # Tailwind input (compiled by dx)
 ```
+
+File associations are declared per platform under
+[`packaging/`](packaging/README.md), wired up in `Dioxus.toml`, and checked by
+`tests/file_associations.rs`.
 
 Notes on the data grid's performance work live in
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).

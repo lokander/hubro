@@ -1,0 +1,14 @@
+#!/bin/sh
+# Debian post-removal hook (Dioxus.toml: [bundle.deb] post_remove_script).
+#
+# The counterpart to postinst: with the .desktop entry gone, the desktop
+# database still lists it until rebuilt, which would leave a file manager
+# offering to open databases with an application that is no longer installed.
+# Best-effort for the same reasons.
+set -e
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || true
+fi
+
+exit 0

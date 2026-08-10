@@ -75,7 +75,7 @@ pub use script::{
     StatementOutcome, StatementResult,
 };
 pub use sql::Dialect;
-pub use sqlite::open_sqlite;
+pub use sqlite::{check_sqlite_file, open_sqlite, SqliteFileError, SqliteFileErrorKind};
 pub use sqlserver::{
     build_mssql_url, mssql_url_target, mssql_url_via_local_port, mssql_url_with_password,
     normalize_mssql_url, open_mssql, open_mssql_with, MssqlAuth, MssqlPool, MssqlTx,

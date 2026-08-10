@@ -26,14 +26,32 @@ icon = [
     "assets/icons/32x32.png",
 ]
 
+# File associations (FRE-114). Each platform declares them its own way, and
+# `tests/file_associations.rs` checks every declaration against
+# `cli::DATABASE_EXTENSIONS` and against the values in this file. What each one
+# does, and why Linux's looks different from the other two, is in
+# packaging/README.md.
+
 [bundle.deb]
 depends = ["libwebkit2gtk-4.1-0", "libgtk-3-0"]
+# dx renders this template for the deb, the rpm *and* the AppImage, so this one
+# file is the whole Linux story: `Exec=… %f` plus the MimeType line.
+desktop_template = "packaging/linux/hubro.desktop.hbs"
+# Rebuild the desktop database, without which the MimeType line is not
+# consulted until something else triggers a rebuild.
+post_install_script = "packaging/linux/postinst"
+post_remove_script = "packaging/linux/postrm"
 
 # Release dmgs are built on Apple Silicon runners (arm64-only, no Intel
 # build), and every arm64 Mac runs macOS 11+. Unsigned: no Developer ID, so
 # first launch needs right-click → Open (documented in the README).
 [bundle.macos]
 minimum_system_version = "11.0"
+# CFBundleDocumentTypes lives here because a macOS file association has nowhere
+# else to go. Note this **replaces** dx's generated Info.plist rather than
+# merging into it, so that file mirrors every key dx would have written — read
+# its header before touching it.
+info_plist_path = "packaging/macos/Info.plist"
 
 # WebView2 install mode for the Windows installers: the evergreen download
 # bootstrapper keeps them small (the offline installer would embed ~130 MB).
@@ -48,3 +66,12 @@ webview_install_mode = { DownloadBootstrapper = { silent = true } }
 # in `bundle.icon` above is a `.png`. Without this it silently falls back to
 # dx's own bundled logo.
 icon_path = "assets/icons/icon.ico"
+
+# Registry entries registering hubro as *an* "Open with" handler for database
+# files. MSI only: the NSIS setup.exe installs no associations, which is a
+# deliberate limit of this issue rather than an oversight.
+[bundle.windows.wix]
+fragment_paths = ["packaging/windows/file-associations.wxs"]
+# The fragment is dead weight without this — it defines the component group,
+# and only a reference from the installed feature pulls it in.
+component_group_refs = ["HubroFileAssociations"]

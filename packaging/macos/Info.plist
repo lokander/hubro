@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist for the macOS .app bundle (Dioxus.toml: [bundle.macos]
+  info_plist_path), added for the file association in FRE-114.
+
+  READ THIS BEFORE EDITING. dx does not merge: pointing `info_plist_path` at a
+  file makes dx copy it verbatim *instead of* generating one, so every key it
+  would have generated has to be repeated here. Everything above
+  CFBundleDocumentTypes is exactly that — a copy of dx 0.7's generated plist
+  for this project — and only CFBundleDocumentTypes is ours.
+
+  A hand-maintained copy of a generated file goes stale silently: bump the
+  crate version and the About box would keep reporting 0.7.0. So
+  tests/file_associations.rs re-derives every mirrored value from Cargo.toml
+  and Dioxus.toml and fails when one drifts. If a dx upgrade adds a key to its
+  generated plist, that test cannot know — check `create_macos_info_plist` in
+  the dioxus-cli source when upgrading dx.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>English</string>
+	<key>CFBundleDisplayName</key>
+	<string>Hubro</string>
+	<key>CFBundleExecutable</key>
+	<string>hubro</string>
+	<key>CFBundleIconFile</key>
+	<string>Hubro.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>no.lokander.hubro</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Hubro</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.7.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.7.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © 2026 Fredrik Lokander</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+
+	<!--
+	  The file association itself. Two entries rather than one because the
+	  extensions are not equally ours:
+
+	  - `.sqlite` / `.sqlite3` name SQLite and nothing else, so hubro offers
+	    itself as the Default handler for them.
+	  - `.db` is used by a great many unrelated formats, so hubro is only ever
+	    an Alternate handler for it — it stays available under "Open With" and
+	    never takes the extension over from whatever the user already uses.
+
+	  Files arrive through the `open` Apple Event rather than argv; the handler
+	  for that is `Event::Opened` in src/main.rs.
+	-->
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>SQLite database</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSHandlerRank</key>
+			<string>Default</string>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>sqlite</string>
+				<string>sqlite3</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Database file</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>db</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>
