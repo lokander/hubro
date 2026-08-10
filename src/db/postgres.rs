@@ -30,6 +30,7 @@ use super::schema::{
 use super::sql::Dialect;
 use super::sqlx_common::{self, get};
 use super::staged::CheckedStatement;
+use super::stats::{size_bytes, RowCount, TableStats};
 use super::value::{row_opt_text, row_text, trim_fraction, QueryResult, Value};
 
 /// Splices a password into a Postgres URL — see [`super::url::with_password`].
@@ -1405,6 +1406,149 @@ pub async fn fetch_ddl(
     Ok(create_table_sql(Dialect::Postgres, table, &extras))
 }
 
+/// Which storage statistics this server can be asked for (FRE-118).
+///
+/// The same probe-don't-guess discipline as [`catalog_shape`], for the same
+/// reason: `pg_class` is the one catalog every Postgres-wire engine claims to
+/// have and none of them implements fully. Of the seven engines in the test
+/// matrix, three answer neither half — CockroachDB has the columns but leaves
+/// `reltuples` NULL and ships no `pg_total_relation_size` (its `crdb_internal`
+/// equivalent is refused outright); Materialize has `reltuples` but no
+/// `relpages` and no size function; RisingWave has neither column.
+///
+/// Where it differs from [`catalog_shape`] is the default when the *probe*
+/// cannot be run at all, and deliberately: an unknown catalog shape falls back
+/// to the rich query because degrading there would report quietly wrong
+/// metadata, whereas degrading here loses a number and nothing else. So a probe
+/// this cannot answer means "no statistics", never "try it and see" — and a
+/// probe that fails outright is propagated rather than read as an absence, so a
+/// broken connection is not reported to the user as a server without statistics.
+struct StatsShape {
+    /// Whether `pg_class` has both `reltuples` and `relpages`. Both, because
+    /// [`row_estimate`] needs the pair to tell an unmeasured zero from a
+    /// measured one — a server offering only one of them loses the estimate,
+    /// which is the conservative direction.
+    row_estimate: bool,
+    /// Whether `pg_total_relation_size(oid)` exists.
+    total_size: bool,
+}
+
+impl StatsShape {
+    /// Nothing to ask for, so there is no query worth sending.
+    fn is_empty(&self) -> bool {
+        !self.row_estimate && !self.total_size
+    }
+}
+
+/// Asks the catalog which statistics it keeps, once per stats fetch.
+///
+/// Asked of `pg_attribute`/`pg_proc` rather than by running the real query and
+/// catching the failure, so "this server has no such column" stays
+/// distinguishable from "that query happened to fail" (FRE-92).
+async fn stats_shape(pool: &PgPool) -> Result<StatsShape, DbError> {
+    let (columns, size_fn) = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT \
+           (SELECT count(*) FROM pg_attribute a \
+            JOIN pg_class c ON c.oid = a.attrelid \
+            JOIN pg_namespace n ON n.oid = c.relnamespace \
+            WHERE n.nspname = 'pg_catalog' AND c.relname = 'pg_class' \
+              AND a.attname IN ('reltuples', 'relpages')), \
+           (SELECT count(*) FROM pg_proc p \
+            JOIN pg_namespace n ON n.oid = p.pronamespace \
+            WHERE n.nspname = 'pg_catalog' AND p.proname = 'pg_total_relation_size')",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| match is_transient(&e) {
+        true => DbError::Transient(e.to_string()),
+        false => DbError::Introspect(e.to_string()),
+    })?;
+    Ok(StatsShape {
+        row_estimate: columns == 2,
+        total_size: size_fn > 0,
+    })
+}
+
+/// Row count and on-disk size for one table, from statistics the server already
+/// keeps (FRE-118). Never scans: the row half is the planner's estimate, and an
+/// exact number is a separate, explicit `COUNT(*)`.
+///
+/// Anything the server does not keep comes back as `None` rather than as a
+/// zero, which is why the query selects a literal NULL for the halves
+/// [`stats_shape`] says are missing instead of omitting them — the result shape,
+/// and so the decoding, is the same either way.
+pub async fn fetch_table_stats(pool: &PgPool, table: &TableMeta) -> Result<TableStats, DbError> {
+    let shape = stats_shape(pool).await?;
+    if shape.is_empty() {
+        return Ok(TableStats::default());
+    }
+    let (reltuples, relpages) = match shape.row_estimate {
+        true => ("c.reltuples::float8", "c.relpages::int8"),
+        false => ("NULL::float8", "NULL::int8"),
+    };
+    // A plain view has no storage of its own, and `pg_total_relation_size`
+    // answers 0 for one — which would render as a measured "0 B" rather than as
+    // the absence it is. Read off `relkind` rather than off [`TableKind`]: a
+    // materialized view has storage and must keep reporting it, and relkind is
+    // the catalog's own answer to which is which. SQL Server's indexed views
+    // reach the same conclusion from the other direction — see its own
+    // `fetch_table_stats`.
+    let size = match shape.total_size {
+        true => "CASE WHEN c.relkind = 'v' THEN NULL ELSE pg_total_relation_size(c.oid) END::int8",
+        false => "NULL::int8",
+    };
+    let sql = format!(
+        "SELECT {reltuples}, {relpages}, {size} \
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = COALESCE($1::text, current_schema()) AND c.relname::text = $2"
+    );
+    let row = sqlx::query_as::<_, (Option<f64>, Option<i64>, Option<i64>)>(&sql)
+        .bind(table.schema.as_deref())
+        .bind(&table.name)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| match is_transient(&e) {
+            true => DbError::Transient(e.to_string()),
+            false => DbError::Introspect(e.to_string()),
+        })?;
+    // No row at all means the relation is gone (dropped under a stale schema
+    // tree), which is an absence like any other rather than an error.
+    let Some((reltuples, relpages, bytes)) = row else {
+        return Ok(TableStats::default());
+    };
+    Ok(TableStats {
+        rows: row_estimate(reltuples, relpages).map(RowCount::Estimated),
+        bytes: size_bytes(bytes),
+    })
+}
+
+/// Turns a raw `pg_class` row estimate into a number worth showing, or `None`.
+///
+/// Two spellings of "nobody has counted this yet" have to be dropped, and both
+/// are catalog facts rather than version guesses:
+///
+/// - **`reltuples < 0`.** PostgreSQL 14 and later store `-1` for a relation
+///   that has never been vacuumed or analyzed, precisely so it is
+///   distinguishable from an empty one. A freshly created or freshly restored
+///   database reports this for every table, which is exactly when a viewer is
+///   most likely to be pointed at it.
+/// - **`reltuples = 0` with `relpages = 0`.** The pre-14 spelling of the same
+///   thing, and what the planner itself special-cases: a relation occupying no
+///   pages has no measured statistics, so its zero is an initial value rather
+///   than a measurement.
+///
+/// A relation that *does* occupy pages and estimates zero rows has been
+/// measured and really is (as far as anything cheap can tell) empty, so that
+/// zero is kept — it is a fact, and dropping it would leave the pane blank on a
+/// table whose emptiness is the very thing worth knowing.
+fn row_estimate(reltuples: Option<f64>, relpages: Option<i64>) -> Option<u64> {
+    let (reltuples, relpages) = (reltuples?, relpages?);
+    if reltuples < 0.0 || !reltuples.is_finite() || (reltuples == 0.0 && relpages == 0) {
+        return None;
+    }
+    Some(reltuples.round() as u64)
+}
+
 /// What a `pg_dump` of the same table carries and this rebuild does not,
 /// regardless of how the catalog read went. Named rather than implied, so a
 /// reader knows the boundary.
@@ -1787,6 +1931,31 @@ fn format_interval(iv: &PgInterval) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unmeasured_relation_estimates_nothing_rather_than_zero() {
+        // PostgreSQL 14+ says -1 for "never vacuumed or analyzed"; every table
+        // in a freshly restored database looks like this.
+        assert_eq!(row_estimate(Some(-1.0), Some(0)), None);
+        assert_eq!(row_estimate(Some(-1.0), Some(12)), None);
+        // Pre-14, and every engine whose pg_class is a stub: zero tuples in
+        // zero pages is an initial value, not a measurement.
+        assert_eq!(row_estimate(Some(0.0), Some(0)), None);
+        // A column this server does not have — the shape probe selected NULL.
+        assert_eq!(row_estimate(None, Some(3)), None);
+        assert_eq!(row_estimate(Some(42.0), None), None);
+    }
+
+    #[test]
+    fn a_measured_estimate_survives_rounds_and_may_be_zero() {
+        assert_eq!(row_estimate(Some(42.0), Some(1)), Some(42));
+        // reltuples is a float and routinely fractional after a sampled
+        // ANALYZE of a partially filled page.
+        assert_eq!(row_estimate(Some(9.6), Some(1)), Some(10));
+        // Measured *and* empty: the table occupies pages and ANALYZE found no
+        // rows. That zero is a fact worth showing, unlike the two above.
+        assert_eq!(row_estimate(Some(0.0), Some(4)), Some(0));
+    }
 
     #[test]
     fn each_engine_is_identified_from_the_version_string_it_really_sends() {

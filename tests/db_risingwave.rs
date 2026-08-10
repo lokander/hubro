@@ -593,3 +593,47 @@ async fn risingwave_source_and_sink_are_read_only_and_say_which_they_are() {
     }
     pool.close().await;
 }
+
+#[tokio::test]
+async fn risingwave_has_no_pg_class_statistics_so_none_are_invented() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let (readings, matview) = fresh_fixture(&pool, "stats").await;
+    let tables = pool.introspect().await.unwrap();
+
+    // RisingWave's `pg_class` has no `reltuples` column and it defines no
+    // relation-size function, so the shape probe finds nothing to ask for and
+    // no statistics query is sent at all. The point of the probe: a server
+    // missing a column must produce an empty answer, not a failed statement
+    // that would put an error where a number goes (FRE-92/FRE-118).
+    for name in [&readings, &matview] {
+        let stats = pool.fetch_table_stats(find(&tables, name)).await.unwrap();
+        assert!(
+            stats.is_empty(),
+            "{name}: RisingWave keeps no such statistics: {stats:?}"
+        );
+    }
+
+    // Counting still works on both, which is what makes the empty estimate
+    // tolerable rather than a dead end.
+    assert_eq!(
+        pool.count_table_rows(find(&tables, &readings))
+            .await
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        pool.count_table_rows(find(&tables, &matview))
+            .await
+            .unwrap(),
+        2
+    );
+
+    pool.query(&format!("DROP MATERIALIZED VIEW IF EXISTS {matview}"))
+        .await
+        .unwrap();
+    pool.query(&format!("DROP TABLE IF EXISTS {readings}"))
+        .await
+        .unwrap();
+    pool.close().await;
+}

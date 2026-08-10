@@ -111,12 +111,22 @@
 //! A table declared without a primary key has no user-visible key at all — no
 //! `ctid`, and no implicit `rowid` of the kind CockroachDB adds — so it is
 //! read-only, exactly as on stock Postgres.
+//!
+//! Storage statistics (FRE-118) are half stock and half not, which is why they
+//! get a test of their own here. `ANALYZE` writes `pg_class.reltuples` exactly
+//! as PostgreSQL does, so the row estimate needs no allowance. But
+//! `pg_total_relation_size` answers 0 for a table that has just been written —
+//! Yugabyte populates its size accounting out of band and it arrives later.
+//! Nothing in the backend is engine-specific about this: a zero size is dropped
+//! as unaccounted on every backend, because nothing occupies literally nothing,
+//! so "0 B" beside sixteen rows never reaches the screen. It is only the shared
+//! suite that has to guard its size assertions, and only those.
 
 use std::sync::OnceLock;
 
 use hubro::db::{
     apply_staged, detect_row_identity, run_script, split_statements, Capabilities, DbPool,
-    DdlObject, DdlSource, Filter, Internal, PageRequest, PgFlavor, Restriction, Rollback,
+    DdlObject, DdlSource, Filter, Internal, PageRequest, PgFlavor, Restriction, Rollback, RowCount,
     RowIdentity, RowLocator, SortDir, StagedChange, TableKind, TableMeta, Value,
 };
 use tokio::sync::Mutex;
@@ -721,5 +731,57 @@ async fn yugabyte_refuses_concurrent_ddl_without_corrupting_anything() {
         ],
     )
     .await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn yugabyte_row_estimate_arrives_but_its_size_accounting_lags() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    // The fixture seeds sixteen readings (eight per sensor).
+    let (readings, sensors) = fresh_fixture(&pool, "stats").await;
+    // ANALYZE runs under the DDL lock, not because it changes the schema but
+    // because Yugabyte serialises it against the catalog the other tests'
+    // fixtures are writing: run loose, it fails a sibling's fixture INSERT
+    // with "could not serialize access due to concurrent update", which names
+    // neither test and looks like a hubro bug (finding 1 in the header).
+    with_ddl(&pool, &[format!("ANALYZE {readings}")]).await;
+
+    let tables = pool.introspect().await.unwrap();
+    let meta = find(&tables, &readings).clone();
+
+    // The row half is ordinary: ANALYZE writes `reltuples` exactly as stock
+    // Postgres does, so the shared suite's estimate assertions hold here
+    // unguarded.
+    let stats = pool.fetch_table_stats(&meta).await.unwrap();
+    assert_eq!(stats.rows, Some(RowCount::Estimated(16)));
+
+    // The size half is not. Yugabyte's `pg_total_relation_size` answers 0 for
+    // a table it was handed rows a moment ago — its storage accounting is
+    // populated out of band and arrives later. A viewer that rendered that
+    // literally would show "0 B" beside sixteen rows, so a zero size is
+    // dropped as unaccounted rather than reported (FRE-118). That is what is
+    // pinned here: never a zero, whichever side of the lag this run lands on.
+    assert_ne!(
+        stats.bytes,
+        Some(0),
+        "a zero size must never survive as a measurement"
+    );
+    assert!(
+        stats.bytes.is_none_or(|b| b > 0),
+        "any size reported must be a real one: {:?}",
+        stats.bytes
+    );
+
+    // And the exact count is unaffected by any of it.
+    assert_eq!(pool.count_table_rows(&meta).await.unwrap(), 16);
+
+    let _guard = ddl_lock().lock().await;
+    pool.query(&format!("DROP TABLE IF EXISTS {readings} CASCADE"))
+        .await
+        .unwrap();
+    pool.query(&format!("DROP TABLE IF EXISTS {sensors} CASCADE"))
+        .await
+        .unwrap();
     pool.close().await;
 }

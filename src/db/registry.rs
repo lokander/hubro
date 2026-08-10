@@ -16,6 +16,7 @@ use super::sqlite;
 use super::sqlserver::{self, MssqlPool, MssqlTx};
 use super::sqlx_common;
 use super::staged::{CheckedStatement, RowLocator};
+use super::stats::TableStats;
 use super::value::{QueryResult, Value};
 
 /// Hard cap on rows the free-form query path fetches into memory, independent
@@ -483,13 +484,59 @@ impl DbPool {
     /// Total row count for the request's table and filter (paging ignored).
     pub async fn count_rows(&self, request: &PageRequest) -> Result<u64, DbError> {
         let (sql, params) = request.count_sql(self.dialect());
-        let result = self.query_with(&sql, &params).await?;
+        self.count_query(&sql, &params).await
+    }
+
+    /// Exactly how many rows `table` holds, by running `COUNT(*)` (FRE-118).
+    ///
+    /// **Only ever because the user asked.** This is the expensive half of the
+    /// pair — a full scan on most engines — and the reason the schema pane's
+    /// figure comes from [`Self::fetch_table_stats`] instead until an explicit
+    /// action calls this. Nothing that merely opens or expands anything may
+    /// reach it.
+    ///
+    /// Unfiltered by construction: the grid's own count runs through
+    /// [`Self::count_rows`] with the page's filter, and the two must not be
+    /// confused for each other.
+    pub async fn count_table_rows(&self, table: &TableMeta) -> Result<u64, DbError> {
+        let sql = format!(
+            "SELECT COUNT(*) FROM {}",
+            super::sql::qualified(table.schema.as_deref(), &table.name)
+        );
+        self.count_query(&sql, &[]).await
+    }
+
+    /// Runs a single-value `COUNT(*)` query and decodes it.
+    async fn count_query(&self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
+        let result = self.query_with(sql, params).await?;
         match result.rows.first().and_then(|r| r.first()) {
             Some(Value::Integer(n)) => Ok(*n as u64),
             other => Err(DbError::Query(format!(
                 "unexpected COUNT(*) result: {other:?}"
             ))),
         }
+    }
+
+    /// Cheap storage statistics for one object: an estimated row count and its
+    /// on-disk size, read from statistics the server already keeps (FRE-118).
+    ///
+    /// **Never scans.** Each backend answers from one catalog query, so this is
+    /// safe to run whenever a table is merely looked at — which is the whole
+    /// point, since the exact count is not. Anything the server does not keep
+    /// comes back as `None` on [`TableStats`] rather than as a zero.
+    ///
+    /// Retried once on a transient failure like the other multi-statement
+    /// catalog reads: the Postgres arm probes the catalog's shape before
+    /// querying it, so a schema change can land between the two.
+    pub async fn fetch_table_stats(&self, table: &TableMeta) -> Result<TableStats, DbError> {
+        retry_transient(|| async {
+            match self {
+                DbPool::Sqlite(pool) => sqlite::fetch_table_stats(pool, table).await,
+                DbPool::Postgres(pg) => postgres::fetch_table_stats(pg.pool(), table).await,
+                DbPool::SqlServer(pool) => sqlserver::fetch_table_stats(pool, table).await,
+            }
+        })
+        .await
     }
 
     /// Streams the rows of `sql` (with bound `params`) to `out` in `format`,
@@ -547,7 +594,7 @@ impl DbPool {
 /// Runs a catalog read, running it a second time if the server called the
 /// first failure transient ([`DbError::Transient`], FRE-147).
 ///
-/// The two operations wrapped in this are the multi-statement reads.
+/// The three operations wrapped in this are the multi-statement reads.
 /// [`DbPool::introspect`] is the one this exists for: its catalog queries each
 /// run in their own implicit transaction on a pooled connection, so a schema
 /// change landing *between* them can fail the whole call — on YugabyteDB the
@@ -558,7 +605,9 @@ impl DbPool {
 /// return an error at all — the single-query index and view lookups. Its
 /// table branch cannot: a failed catalog read there is folded into the output
 /// as a caveat rather than propagated, so it degrades instead of retrying, and
-/// deliberately so.
+/// deliberately so. [`DbPool::fetch_table_stats`] joins them for the same
+/// reason as introspection: its Postgres arm probes which statistics the
+/// catalog keeps and then reads them, two statements with a gap between.
 ///
 /// **Once, never in a loop.** A second failure means something other than a
 /// racing schema change, and a schema tree that hangs is worse than one that

@@ -11,8 +11,10 @@ use dioxus::prelude::*;
 use dioxus_icons::lucide::X;
 
 use crate::db::{
-    ColumnMeta, ConnectionId, DdlObject, DdlSource, Generated, TableKind, TableMeta, TypeDetail,
+    unreadable_reason, ColumnMeta, ConnectionId, DdlObject, DdlSource, Generated, RowCount,
+    TableKind, TableMeta, TypeDetail,
 };
+use crate::util::{human_bytes, human_count};
 
 use super::js::{copy_to_clipboard, focus_on_mount};
 use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState, KindBadge};
@@ -112,6 +114,14 @@ fn SchemaBody(id: ConnectionId, meta: TableMeta) -> Element {
                     "Show DDL"
                 }
             }
+            // How big the thing is (FRE-118) — under the name it describes and
+            // above the columns, since it is read far more often than any one
+            // column. Withheld from objects with no rows at all (a RisingWave
+            // sink, FRE-148): their emptiness is already stated by the grid,
+            // and offering to count them would be offering a failure.
+            if unreadable_reason(&meta).is_none() {
+                TableStatsLine { id, table: table.clone() }
+            }
             table { class: "w-full border-collapse text-left",
                 thead {
                     tr { class: "border-b border-slate-300 dark:border-slate-700",
@@ -170,6 +180,131 @@ fn SchemaBody(id: ConnectionId, meta: TableMeta) -> Element {
                 table: table.clone(),
                 object,
                 on_close: move |_| showing_ddl.set(None),
+            }
+        }
+    }
+}
+
+/// How big this table is (FRE-118): an estimated row count, its size on disk,
+/// and the one action that turns the estimate into a real number.
+///
+/// The estimate loads on its own because it costs one catalog query; the exact
+/// count never does, because it costs a scan. That asymmetry is the feature,
+/// and it is why the two numbers arrive through different calls and render with
+/// different badges — an estimate shown as though it were counted would be
+/// worse than showing nothing.
+///
+/// `table` is a [`ReadSignal`] so the estimate re-loads when the pane
+/// switches tables: this component is reused rather than remounted, so a
+/// plain prop would leave the first table's numbers on the screen forever.
+#[component]
+fn TableStatsLine(id: ConnectionId, table: ReadSignal<TableRef>) -> Element {
+    let state = use_context::<AppState>();
+    let stats = use_resource(move || {
+        let table = table();
+        async move { state.load_table_stats(id, table).await }
+    });
+    // The exact count is stored *with* the table it counted. Being reused
+    // across table switches is the same thing that makes the signal outlive
+    // its subject, and a count left over from the previous table would be a
+    // wrong number wearing the "exact" badge — the one failure this whole
+    // feature is arranged to prevent.
+    let mut counted = use_signal(|| Option::<(TableRef, Result<u64, String>)>::None);
+    let mut counting = use_signal(|| false);
+
+    let loaded = stats.read().clone();
+    let exact: Option<Result<u64, String>> = {
+        let current = table();
+        counted
+            .read()
+            .as_ref()
+            .and_then(|(t, result)| (*t == current).then(|| result.clone()))
+    };
+    let rows = match exact.as_ref().and_then(|r| r.as_ref().ok()) {
+        Some(n) => Some(RowCount::Exact(*n)),
+        None => loaded
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .and_then(|s| s.rows),
+    };
+    let bytes = loaded
+        .as_ref()
+        .and_then(|r| r.as_ref().ok())
+        .and_then(|s| s.bytes);
+    // Two independent failures, and they read differently: the estimate not
+    // arriving is a shrug, a count the user asked for failing is an answer
+    // they are owed.
+    let stats_error = loaded.as_ref().and_then(|r| r.as_ref().err().cloned());
+    let count_error = exact.as_ref().and_then(|r| r.as_ref().err().cloned());
+    // The server answered, and answered nothing. Said once, plainly, rather
+    // than rendered as the zeroes it is not.
+    let nothing_known =
+        loaded.is_some() && stats_error.is_none() && rows.is_none() && bytes.is_none();
+
+    rsx! {
+        div { class: "mb-4 flex items-baseline gap-2 text-xs text-slate-500 dark:text-slate-400",
+            if let Some(rows) = rows {
+                span { class: "shrink-0", title: rows.tooltip(),
+                    // The tilde is the label a reader sees before any badge
+                    // does its work, and it travels with the number.
+                    if rows.is_estimate() {
+                        "≈ "
+                    }
+                    "{human_count(rows.value())} rows"
+                }
+                span {
+                    class: if rows.is_estimate() {
+                        "shrink-0 rounded bg-amber-100 dark:bg-amber-900/50 px-1 text-amber-700 dark:text-amber-300"
+                    } else {
+                        "shrink-0 rounded bg-emerald-100 dark:bg-emerald-900/50 px-1 text-emerald-700 dark:text-emerald-300"
+                    },
+                    title: rows.tooltip(),
+                    "{rows.label()}"
+                }
+            }
+            if let Some(bytes) = bytes {
+                if rows.is_some() {
+                    span { class: "text-slate-400 dark:text-slate-600", "·" }
+                }
+                span { class: "shrink-0",
+                    title: "Space the object occupies on disk, indexes and out-of-line storage included",
+                    "{human_bytes(bytes)}"
+                }
+            }
+            if nothing_known {
+                span { class: "italic",
+                    title: "This server keeps no row or size statistics for this object. Counting exactly still works.",
+                    "No stored statistics"
+                }
+            }
+            if let Some(err) = stats_error {
+                span { class: "truncate italic text-amber-700 dark:text-amber-400", title: "{err}",
+                    "Statistics unavailable"
+                }
+            }
+            if let Some(err) = count_error {
+                span { class: "truncate text-rose-700 dark:text-rose-400", title: "{err}",
+                    "Count failed: {err}"
+                }
+            }
+            button {
+                class: "ml-auto shrink-0 rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100 disabled:opacity-50",
+                disabled: counting(),
+                title: "Runs SELECT COUNT(*) against this object — a full scan on a large table",
+                onclick: move |_| {
+                    let target = table();
+                    counting.set(true);
+                    spawn(async move {
+                        let result = state.count_table_rows(id, target.clone()).await;
+                        counting.set(false);
+                        counted.set(Some((target, result)));
+                    });
+                },
+                if counting() {
+                    "Counting…"
+                } else {
+                    "Count exactly"
+                }
             }
         }
     }

@@ -51,7 +51,7 @@ use crate::db::{
     statement_preview, url_target, url_via_local_port, url_with_password, write_result,
     Capabilities, CellFetch, Connection, ConnectionId, ConnectionRegistry, DbError, DbPool, Ddl,
     DdlObject, ExportFormat, Filter, ForeignKeyMeta, MssqlAuth, QueryResult, Rollback, RowLocator,
-    StagedChange, StatementResult, TableAccess, TableMeta, Value, WriteProtection,
+    StagedChange, StatementResult, TableAccess, TableMeta, TableStats, Value, WriteProtection,
 };
 use crate::history::{HistoryStore, SaveOutcome};
 use crate::tunnel::{HostKeyInfo, Tunnel, TunnelAuth, TunnelConfig, TunnelError};
@@ -1417,6 +1417,44 @@ impl AppState {
             return Err("connection or schema no longer available".into());
         };
         pool.fetch_ddl(&meta, &object)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// One table's cheap storage statistics (FRE-118), loaded when the schema
+    /// pane opens it. Same shape as [`Self::load_ddl`]: pool and metadata are
+    /// cloned out of the signals before the await, and no capability gate —
+    /// reading the catalog's own accounting is a pure read.
+    ///
+    /// Cheap is the contract, not an aspiration: this must never grow into
+    /// anything that scans, because it runs on nothing more deliberate than
+    /// looking at a table. The expensive number is [`Self::count_table_rows`].
+    pub async fn load_table_stats(
+        self,
+        id: ConnectionId,
+        table: TableRef,
+    ) -> Result<TableStats, String> {
+        let pool = self.registry.read().get(id).map(|c| c.pool.clone());
+        let meta = self.table_meta(id, &table);
+        let (Some(pool), Some(meta)) = (pool, meta) else {
+            return Err("connection or schema no longer available".into());
+        };
+        pool.fetch_table_stats(&meta)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Exactly how many rows a table holds, by running `COUNT(*)` (FRE-118).
+    ///
+    /// Only ever from an explicit "count exactly" action — see
+    /// [`DbPool::count_table_rows`], which is where the reason lives.
+    pub async fn count_table_rows(self, id: ConnectionId, table: TableRef) -> Result<u64, String> {
+        let pool = self.registry.read().get(id).map(|c| c.pool.clone());
+        let meta = self.table_meta(id, &table);
+        let (Some(pool), Some(meta)) = (pool, meta) else {
+            return Err("connection or schema no longer available".into());
+        };
+        pool.count_table_rows(&meta)
             .await
             .map_err(|e| e.to_string())
     }

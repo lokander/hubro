@@ -4,7 +4,7 @@ mod common;
 
 use common::FixtureDb;
 use hubro::db::{
-    apply_staged, Capabilities, DbError, DbPool, Restriction, RowIdentity, RowLocator,
+    apply_staged, Capabilities, DbError, DbPool, Restriction, RowCount, RowIdentity, RowLocator,
     StagedChange, TableKind, TableMeta, Value,
 };
 
@@ -413,5 +413,55 @@ async fn custom_schema_helper_builds_a_usable_database() {
     let result = pool.query("SELECT sum(x) FROM t").await.unwrap();
     assert_eq!(result.rows[0][0], Value::Integer(6));
 
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_reports_rows_only_after_analyze_and_never_reports_a_size() {
+    let fixture = FixtureDb::full().await;
+    let pool = fixture.open().await;
+    let tables = pool.introspect().await.unwrap();
+    let artists = table(&tables, "artists").clone();
+
+    // A database nobody has analyzed has no `sqlite_stat1` at all — SQLite
+    // keeps no statistics of its own. Absent, not zero, and not an error
+    // either: selecting from the missing table would be one.
+    let before = pool.fetch_table_stats(&artists).await.unwrap();
+    assert!(
+        before.is_empty(),
+        "an un-analyzed database knows nothing: {before:?}"
+    );
+
+    let exact = pool.count_table_rows(&artists).await.unwrap();
+    assert!(exact > 0, "the fixture seeds artists");
+
+    pool.query("ANALYZE").await.unwrap();
+    let after = pool.fetch_table_stats(&artists).await.unwrap();
+    assert_eq!(
+        after.rows,
+        Some(RowCount::Estimated(exact)),
+        "ANALYZE writes the row count sqlite_stat1 leads with"
+    );
+    // Deliberately absent on every SQLite database, analyzed or not: the only
+    // per-table size SQLite offers is `dbstat`, which walks every page — the
+    // cost this estimate exists to avoid.
+    assert_eq!(after.bytes, None, "SQLite reports no per-table size");
+
+    // A view has no stat1 row of its own, so it stays absent while the table
+    // it reads from does not.
+    let view = pool
+        .fetch_table_stats(table(&tables, "artist_overview"))
+        .await
+        .unwrap();
+    assert!(view.is_empty(), "a view has no stored statistics: {view:?}");
+
+    // Quoted and keyword identifiers go through the same qualifier as
+    // everything else.
+    assert_eq!(
+        pool.count_table_rows(table(&tables, "we\"ird table"))
+            .await
+            .unwrap(),
+        3
+    );
     pool.close().await;
 }

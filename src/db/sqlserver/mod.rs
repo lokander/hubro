@@ -26,6 +26,8 @@ use super::error::DbError;
 use super::schema::{
     ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta, TypeDetail,
 };
+use super::sql::qualified;
+use super::stats::{size_bytes, RowCount, TableStats};
 use super::value::{
     row_flag, row_int, row_opt_int, row_opt_text, row_text, trim_fraction, ColumnInfo, Value,
 };
@@ -306,6 +308,52 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
     }
 
     Ok(tables)
+}
+
+/// Row count and on-disk size for one object (FRE-118), from
+/// `sys.dm_db_partition_stats` — the same accounting `sp_spaceused` reports
+/// and the cheapest answer SQL Server has: it is maintained as rows are
+/// written, so nothing is scanned to read it.
+///
+/// **Rows** are summed over the base rowset only (`index_id` 0 = heap, 1 =
+/// clustered index); every other `index_id` is a nonclustered copy of the same
+/// rows and adding them would multiply the count by the number of indexes.
+/// Reported as an *estimate* regardless: the counter is maintained rather than
+/// sampled, but it is documented as approximate and can drift until the next
+/// `DBCC UPDATEUSAGE`.
+///
+/// **Size** is the reserved page count across *all* index ids — the object's
+/// full footprint, indexes and LOB allocation units included, matching what
+/// Postgres's `pg_total_relation_size` covers.
+///
+/// A non-indexed view has no partitions, so both sums are over zero rows and
+/// come back NULL — absent, as they should be, with no special case. An
+/// indexed view does have them and reports real numbers, which is why nothing
+/// here filters on object type.
+pub async fn fetch_table_stats(pool: &MssqlPool, table: &TableMeta) -> Result<TableStats, DbError> {
+    // OBJECT_ID takes the name as a *string*, so it is bound rather than
+    // spliced — and quoted, since it is otherwise parsed as an identifier
+    // path and a schema or table containing a dot would resolve elsewhere.
+    let qualified = qualified(table.schema.as_deref(), &table.name);
+    let result = query_with(
+        pool,
+        "SELECT SUM(CASE WHEN ps.index_id IN (0, 1) THEN ps.row_count ELSE 0 END), \
+                SUM(ps.reserved_page_count) * CAST(8192 AS bigint) \
+         FROM sys.dm_db_partition_stats ps \
+         WHERE ps.object_id = OBJECT_ID(@P1)",
+        &[Value::Text(qualified)],
+    )
+    .await
+    .map_err(|e| DbError::Introspect(e.message().to_string()))?;
+    let Some(row) = result.rows.first() else {
+        return Ok(TableStats::default());
+    };
+    Ok(TableStats {
+        rows: row_opt_int(row, 0)
+            .filter(|n| *n >= 0)
+            .map(|n| RowCount::Estimated(n as u64)),
+        bytes: size_bytes(row_opt_int(row, 1)),
+    })
 }
 
 /// Renders a column's readable declared type the way SQL Server convention
