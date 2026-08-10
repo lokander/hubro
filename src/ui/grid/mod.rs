@@ -1747,28 +1747,44 @@ fn GridFooter(
                     // more, so the ellipsis reads honestly.
                     let at_end = total.map(|t| last >= t).unwrap_or(true);
                     rsx! {
-                        match total {
-                            Some(total) => rsx! { span { class: "shrink-0 whitespace-nowrap", "rows {first}–{last} of {total}" } },
-                            None => rsx! { span { class: "shrink-0 whitespace-nowrap", "rows {first}–{last} of …" } },
-                        }
-                        // Aggregate readout for the selected cells (FRE-117).
-                        // It sits beside the row range deliberately: the range
-                        // says what the *page* holds, this says what the
-                        // *selection* holds, and the two must never be
-                        // confused for one another.
-                        if let Some(stats) = selection_stats() {
+                        // Everything left of the stepper lives in one bounded
+                        // group: `flex-1 min-w-0 overflow-hidden` fixes its
+                        // width at exactly the space the stepper leaves, so a
+                        // long readout truncates inside it instead of running
+                        // over the buttons. It also replaces the old spacer —
+                        // growing to fill is what pushes the stepper right.
+                        div { class: "flex min-w-0 flex-1 items-center gap-3 overflow-hidden",
+                            match total {
+                                Some(total) => rsx! { span { class: "shrink-0 whitespace-nowrap", "rows {first}–{last} of {total}" } },
+                                None => rsx! { span { class: "shrink-0 whitespace-nowrap", "rows {first}–{last} of …" } },
+                            }
+                            // Aggregate readout for the selected cells (FRE-117).
+                            // It sits beside the row range deliberately: the range
+                            // says what the *page* holds, this says what the
+                            // *selection* holds, and the two must never be
+                            // confused for one another.
+                            if let Some(stats) = selection_stats() {
                             {
                                 let line = stats.line();
-                                let clipboard = line.clone();
+                                // The clipboard gets the scope note too: a
+                                // number pasted elsewhere outlives the tooltip
+                                // that qualified it.
+                                let clipboard = stats.copy_text();
                                 let note = stats.scope_note();
+                                let prefix = stats.scope_prefix();
+                                let counts = stats.counts_text();
+                                let aggregates = stats.aggregate_text();
                                 rsx! {
                                     button {
-                                        class: "min-w-0 truncate rounded px-1.5 py-0.5 text-left text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
-                                        // The readout is the element that gives
-                                        // way when the footer is narrow, so the
-                                        // tooltip repeats it in full — a
-                                        // truncated "avg 622.482…" is the one
-                                        // number a reader came for.
+                                        // Drawn in three pieces so the footer
+                                        // sheds them in the right order: the
+                                        // scope prefix and the aggregates keep
+                                        // their width and the counts truncate.
+                                        // sum/avg/min/max are what the reader
+                                        // came for; "12 cells · 11 non-null" is
+                                        // the preamble. The tooltip still
+                                        // carries the whole line.
+                                        class: "flex min-w-0 items-center gap-1.5 rounded px-1.5 py-0.5 text-left text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
                                         title: "{line}\n\n{note} Click to copy this readout.",
                                         onclick: move |_| {
                                             write_clipboard(&clipboard);
@@ -1777,12 +1793,34 @@ fn GridFooter(
                                                     Some(CopyStatus::ok("Copied the selection stats".to_string())),
                                                 );
                                         },
-                                        "{line}"
+                                        span { class: "shrink-0 whitespace-nowrap", "{prefix}" }
+                                        span { class: "min-w-0 truncate", "· {counts}" }
+                                        if let Some(aggregates) = aggregates {
+                                            // Not `shrink-0`: a selection whose
+                                            // max is a full-width i64 runs
+                                            // wider than the footer on its own,
+                                            // and an unshrinkable span would
+                                            // overrun the group and the stepper
+                                            // with it. A shrink factor this far
+                                            // below the counts' 1 is a priority
+                                            // rather than a ratio — flexbox
+                                            // splits the overflow by
+                                            // factor × width, so the counts
+                                            // collapse to nothing before these
+                                            // numbers give up a pixel, and only
+                                            // aggregates too wide for the whole
+                                            // footer truncate at all.
+                                            span {
+                                                class: "min-w-0 truncate",
+                                                flex_shrink: "0.001",
+                                                "· {aggregates}"
+                                            }
+                                        }
                                     }
+                                }
                                 }
                             }
                         }
-                        div { class: "flex-1" }
                         // The stepper never gives way: the readout beside it
                         // truncates instead, so a long selection summary can't
                         // wrap "← Prev" onto two lines.

@@ -354,13 +354,19 @@ impl SelectionStats {
         Some(self.sum?.as_f64()? / summable as f64)
     }
 
-    /// The status-bar readout. Always opens with `Selection` and the shape of
-    /// what was counted, so the numbers can't be read as a table-wide
-    /// aggregate; when only some cells are numeric it says so before quoting
-    /// a sum.
-    pub(super) fn line(&self) -> String {
+    /// The readout's opening: what this describes and how big it is. Rendered
+    /// as its own span and never allowed to give way, because a row of numbers
+    /// with nothing saying whose they are is the failure this feature exists
+    /// to avoid.
+    pub(super) fn scope_prefix(&self) -> String {
+        format!("Selection {}×{}", self.rows, self.cols)
+    }
+
+    /// The counting half: cells, non-null, distinct. This is the part that
+    /// truncates first in a narrow footer — it is the preamble, and the
+    /// aggregates beside it are what the reader came for.
+    pub(super) fn counts_text(&self) -> String {
         let mut parts = vec![
-            format!("Selection {}×{}", self.rows, self.cols),
             format!("{} {}", self.cells, plural(self.cells, "cell", "cells")),
             format!("{} non-null", self.non_null),
         ];
@@ -372,9 +378,20 @@ impl SelectionStats {
             };
             parts.push(format!("{bound}{} distinct", self.distinct));
         }
+        parts.join(" · ")
+    }
+
+    /// The aggregate half: sum/avg/min/max, and the caveats that qualify them.
+    /// `None` when there is no numeric cell to aggregate.
+    ///
+    /// The "N numeric of M non-null" qualifier lives *in here* rather than
+    /// with the counts on purpose: it is the sentence that stops a sum over 7
+    /// of 11 values reading as a sum over 11, so it has to survive exactly
+    /// when the sum does. Splitting them would let a narrow window drop the
+    /// qualifier and keep the number.
+    pub(super) fn aggregate_text(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
         if let Some(sum) = self.sum {
-            // Name the numeric subset whenever it isn't every non-null cell:
-            // a sum over 4 of 9 values must not read as a sum over 9.
             let summable = self.numeric - self.nan;
             if summable != self.non_null {
                 parts.push(format!("{summable} numeric of {} non-null", self.non_null));
@@ -387,13 +404,32 @@ impl SelectionStats {
                 parts.push(format!("min {}", min.display()));
                 parts.push(format!("max {}", max.display()));
             }
+            if self.nan > 0 {
+                parts.push(format!("{} NaN skipped", self.nan));
+            }
         } else if self.numeric > 0 && self.numeric == self.nan {
             parts.push(format!("{} numeric, all NaN", self.numeric));
         }
-        if self.nan > 0 && self.sum.is_some() {
-            parts.push(format!("{} NaN skipped", self.nan));
-        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
+    /// The whole readout as one line — the tooltip's first line and the basis
+    /// of what a click copies. Composed from the three rendered pieces, so
+    /// what is displayed and what is copied cannot drift apart.
+    pub(super) fn line(&self) -> String {
+        let mut parts = vec![self.scope_prefix(), self.counts_text()];
+        parts.extend(self.aggregate_text());
         parts.join(" · ")
+    }
+
+    /// What a click puts on the clipboard: the readout *and* its scope, joined.
+    ///
+    /// The line alone says "Selection" but not which rows it covers, and a
+    /// number pasted into a ticket or a message outlives every tooltip — that
+    /// paste is exactly where mistaking a page's sum for the table's does its
+    /// damage. So the caveat travels with the numbers.
+    pub(super) fn copy_text(&self) -> String {
+        format!("{}\n{}", self.line(), self.scope_note())
     }
 
     /// The tooltip: what the readout covers, in as many words. The readout is
@@ -910,6 +946,69 @@ mod tests {
     }
 
     #[test]
+    fn the_rendered_pieces_reassemble_into_the_copied_line() {
+        // The footer draws the three pieces separately so the counts can
+        // truncate while the aggregates survive; the clipboard gets `line()`.
+        // If those ever disagree, the copy would say something the screen
+        // never did.
+        for s in [
+            stats(
+                vec![vec![Value::Integer(1), Value::Text("a".into())]],
+                Selection::all(1, 2).unwrap(),
+            ),
+            stats(
+                vec![vec![Value::Text("a".into()), Value::Null]],
+                Selection::all(1, 2).unwrap(),
+            ),
+            stats(
+                vec![vec![Value::Real(f64::NAN), Value::Real(2.0)]],
+                Selection::all(1, 2).unwrap(),
+            ),
+        ] {
+            let mut pieces = vec![s.scope_prefix(), s.counts_text()];
+            pieces.extend(s.aggregate_text());
+            assert_eq!(pieces.join(" · "), s.line());
+        }
+
+        // The qualifier that scopes a partial sum belongs with the aggregates,
+        // not the counts: a narrow footer must never keep "sum 12" while
+        // dropping "2 numeric of 4 non-null".
+        let mixed = stats(
+            vec![
+                vec![Value::Integer(5), Value::Text("five".into())],
+                vec![Value::Integer(7), Value::Text("seven".into())],
+            ],
+            Selection::all(2, 2).unwrap(),
+        );
+        let aggregates = mixed.aggregate_text().expect("a numeric subset");
+        assert!(
+            aggregates.starts_with("2 numeric of 4 non-null"),
+            "{aggregates}"
+        );
+        assert!(aggregates.contains("sum 12"), "{aggregates}");
+        assert!(
+            !mixed.counts_text().contains("sum"),
+            "{}",
+            mixed.counts_text()
+        );
+    }
+
+    #[test]
+    fn the_copied_text_carries_the_scope_with_the_numbers() {
+        // A pasted number outlives the tooltip that qualified it, so the
+        // clipboard gets the caveat too — FRE-117's "describes the selection,
+        // not the table" has to survive leaving the app.
+        let s = stats(
+            vec![vec![Value::Integer(1), Value::Integer(2)]],
+            Selection::all(1, 2).unwrap(),
+        );
+        let copied = s.copy_text();
+        assert!(copied.starts_with(&s.line()), "{copied}");
+        assert!(copied.contains("this page only"), "{copied}");
+        assert!(copied.contains("not the whole table"), "{copied}");
+    }
+
+    #[test]
     fn the_readout_cannot_reach_the_database() {
         // FRE-117 is explicit that the statistics come from cells already in
         // memory: no query, no full-table scan. `compute` takes only a
@@ -917,8 +1016,24 @@ mod tests {
         // module's code can await, spawn, or touch a pool — a claim in a doc
         // comment would not survive the first person who added a fetch.
         let source = include_str!("stats.rs");
+        // Splitting at the test-module attribute scans everything before it —
+        // but only while the file carries exactly one. A second, earlier one
+        // (a test-only helper dropped mid-module) would silently shorten the
+        // scanned region and leave the rest of the file unexamined, which is
+        // the one failure a guard like this must not have. So the count is
+        // asserted, not assumed.
+        //
+        // The marker is spelled with `concat!` so that writing it here doesn't
+        // make this test match itself — the first version did, six times over.
+        let marker = concat!("#[cfg", "(test)]");
+        assert_eq!(
+            source.matches(marker).count(),
+            1,
+            "more than one test-module attribute: the source scan below would \
+             stop at the first one and leave the rest of the module unchecked"
+        );
         let code = source
-            .split("#[cfg(test)]")
+            .split(marker)
             .next()
             .expect("the module has a non-test half");
         let code: String = code
@@ -942,8 +1057,15 @@ mod tests {
                 "`{forbidden}` in the statistics module: it must compute from the page in hand"
             );
         }
-        // The guard only means something if it is reading real code.
+        // The guard only means something if it is reading real code — and all
+        // of it. `compute` is the first item of the module and `format_float`
+        // the last, so requiring both pins the scanned region to the whole
+        // non-test half rather than to whatever prefix a stray marker left.
         assert!(code.contains("fn compute"), "source scan found no code");
+        assert!(
+            code.contains("fn format_float"),
+            "source scan stopped before the end of the module"
+        );
     }
 
     #[test]
