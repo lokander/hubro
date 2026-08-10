@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 use dioxus_icons::lucide::{Database, RefreshCw, Search, X};
 
-use crate::db::ConnectionId;
+use crate::db::{ConnectionId, Restriction};
 
 use super::filter::{
     count_internal_tables, filter_tables, group_by_schema, parse_query, toggle_column_mode,
@@ -317,7 +317,7 @@ fn TableNode(
     // borrow ends before the rsx below. A missing entry means the schema
     // reloaded under a not-yet-recomputed memo — render nothing for that
     // frame rather than a stale neighbour's row.
-    let (schema, name, kind, kind_label, matched) = {
+    let (schema, name, kind, kind_label, unbrowsable, matched) = {
         let schemas = state.schemas.read();
         let Some(SchemaLoad::Ready(tables)) = schemas.get(&id) else {
             return rsx! {};
@@ -343,6 +343,16 @@ fn TableNode(
             // "hypertable" rather than a table that inexplicably has chunks
             // (FRE-88).
             table.kind_label.clone(),
+            // Why this object has no rows to open, when it has none (FRE-148).
+            // Read from the object's own declaration through the same
+            // predicate `TableAccess::resolve` uses, rather than resolving the
+            // full access here: whether something stores rows is a fact about
+            // the object, so the connection is not an input and the registry
+            // does not need reading.
+            table
+                .restriction
+                .filter(|r| r.hides_rows())
+                .map(Restriction::message),
             matched,
         )
     };
@@ -375,8 +385,21 @@ fn TableNode(
                     // so it arrows through the filtered list for free.
                     class: "dv-table-btn flex min-w-0 flex-1 items-center gap-2 text-left",
                     "data-selected": selected,
+                    // An object with no rows is dimmed and carries its reason
+                    // as a tooltip, so it does not read as openable (FRE-148).
+                    // Still a button, deliberately: disabling it would drop the
+                    // row out of the Ctrl+B/↑↓ walk above, and selecting it is
+                    // how the grid gets to state the reason in full.
+                    title: unbrowsable.unwrap_or_default(),
                     onclick: move |_| state.select_table(id, &select_ref),
-                    span { class: "truncate font-mono", "{name}" }
+                    span {
+                        class: if unbrowsable.is_some() {
+                            "truncate font-mono text-slate-500 dark:text-slate-500 italic"
+                        } else {
+                            "truncate font-mono"
+                        },
+                        "{name}"
+                    }
                     KindBadge { kind }
                     // Sits after the kind badge, since it refines it rather
                     // than replacing it: a continuous aggregate really is a

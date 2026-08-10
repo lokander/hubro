@@ -97,13 +97,27 @@
 //! `SOURCE` too and was previously naming itself in a message RisingWave also
 //! showed.
 //!
-//! **A sink still cannot be opened**, and that half is not fixed. It has no
-//! rows at all, so `fetch_page` gets the engine's own `table or source not
-//! found`; being a view stops it offering editing, but views are browsable and
-//! nothing here says "this object has no rows to browse". Suppressing the open
-//! needs a per-object *read* gate, and `read_query` is connection-level — that
-//! is an extension of the capability model rather than a verification finding,
-//! so it is recorded here and filed as FRE-148 rather than bolted on.
+//! **A sink is no longer offered for opening** (FRE-148). It has no rows at
+//! all, so `fetch_page` used to return the engine's own `table or source not
+//! found`: being a view stopped it offering editing, but views are browsable
+//! and nothing said "this object has no rows to browse". Suppressing the open
+//! needed a per-object *read* gate, since `read_query` is connection-level —
+//! an extension of the capability model rather than a verification finding,
+//! which is why it was filed separately rather than bolted on here.
+//!
+//! It arrives as `Restriction::NoRows`, so one declaration in the backend
+//! both refuses editing and stops the open: the sidebar dims the object and
+//! carries its reason as a tooltip, and selecting it states that reason in
+//! place of the grid instead of running a query that cannot work.
+//!
+//! FRE-148 asked whether Materialize shares the shape. It does not arise
+//! there: `tests/db_materialize.rs` records that Materialize's sinks stay out
+//! of the schema tree entirely, and its `information_schema.tables` reported
+//! no `SINK` rows when checked — though that container has no sinks to report,
+//! since creating one needs a Kafka broker, so this is not a positive finding
+//! about the engine. It costs nothing either way: the declaration keys on
+//! `table_type = 'SINK'`, the server's own classification, so any engine that
+//! reports one inherits the gate without a flavor check.
 
 use hubro::db::{
     apply_staged, detect_row_identity, run_script, split_statements, Capabilities, DbPool, Filter,
@@ -535,12 +549,40 @@ async fn risingwave_source_and_sink_are_read_only_and_say_which_they_are() {
     let sink = find(&tables, "rw_edge_sink");
     assert_eq!(sink.kind, TableKind::View);
     assert_eq!(sink.kind_label.as_deref(), Some("sink"));
-    assert!(!pool.backend_access(sink).can_mutate());
-    assert!(pool
-        .backend_access(sink)
+    let sink_access = pool.backend_access(sink);
+    assert!(!sink_access.can_mutate());
+    assert!(sink_access
         .read_only_notice()
         .unwrap()
         .contains("no rows of its own"));
+
+    // The half FRE-148 added: it is not browsable either, and says why. A
+    // source sitting next to it stays browsable, which is what keeps the gate
+    // from being "streaming objects are hidden" — a source really does have
+    // rows to read.
+    assert!(
+        !sink_access.can_read(),
+        "a sink has no rows, so it must not be offered for opening"
+    );
+    assert_eq!(
+        sink_access.unreadable,
+        Some("A sink writes to an external system; it has no rows of its own to show.")
+    );
+    assert!(
+        pool.backend_access(source).can_read(),
+        "a source is written by the engine but still readable"
+    );
+
+    // And the claim is true of the engine, not just of hubro's model: the read
+    // the gate suppresses is one RisingWave itself refuses.
+    let attempted = pool
+        .query("SELECT * FROM rw_edge_sink LIMIT 1")
+        .await
+        .expect_err("a sink stores no rows");
+    assert!(
+        attempted.message().contains("not found"),
+        "the engine's own refusal is what the gate exists to pre-empt: {attempted}"
+    );
 
     for sql in [
         "DROP SINK rw_edge_sink",
