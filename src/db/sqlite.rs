@@ -491,10 +491,15 @@ pub async fn fetch_table_stats(
 /// The row count leading a `sqlite_stat1.stat` string ("10000 500 1" → 10000),
 /// or `None` if it does not lead with one.
 ///
-/// Parsed rather than trusted: the column is documented as opaque text whose
-/// later tokens SQLite is free to change, and a `stat` written by a future
-/// version that opened with something else would otherwise be read as a row
-/// count. Unparseable means unknown, which renders as nothing.
+/// The count always comes first: `ANALYZE` writes the table's row count, then
+/// the per-column selectivities, and the non-numeric hints (`unordered`,
+/// `sz=…`, `noskipscan`) are *appended* after that list rather than prefixed.
+///
+/// Parsed defensively anyway, because `sqlite_stat1` is an ordinary
+/// user-writable table and hand-editing it to steer the planner is a
+/// documented technique — so its contents are input, not a guarantee.
+/// Anything that does not lead with a number is unknown, which renders as
+/// nothing rather than as a guess.
 fn sqlite_stat_rows(stat: &str) -> Option<u64> {
     stat.split_whitespace().next()?.parse().ok()
 }
@@ -643,8 +648,9 @@ mod tests {
         // A table with no index gets the bare count.
         assert_eq!(sqlite_stat_rows("7"), Some(7));
         assert_eq!(sqlite_stat_rows("0 1"), Some(0));
-        // SQLite may prefix the string with a keyword (`unordered`, `sz=…`)
-        // and is free to add more; anything that does not open with a count is
+        // The hints are appended, so a real `stat` still leads with the count.
+        assert_eq!(sqlite_stat_rows("120 1 unordered"), Some(120));
+        // And anything hand-written that does not lead with a number is
         // unknown rather than guessed at.
         assert_eq!(sqlite_stat_rows("unordered 42"), None);
         assert_eq!(sqlite_stat_rows(""), None);

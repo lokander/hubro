@@ -1101,6 +1101,9 @@ async fn sqlserver_table_stats_come_from_the_partition_counters() {
     // Postgres there is nothing to ANALYZE first — but the number is still
     // documented as approximate, so it must still arrive labelled.
     let meta = introspect_table(&pool, "stats_rows").await;
+    // Summed over index_id 0/1 only: `ix_stats_rows_name` holds the same three
+    // rows at index_id 2, so an unfiltered SUM would report six and this
+    // assertion is what pins the filter.
     let stats = pool.fetch_table_stats(&meta).await.unwrap();
     assert_eq!(stats.rows, Some(RowCount::Estimated(3)));
     assert_ne!(
@@ -1108,8 +1111,6 @@ async fn sqlserver_table_stats_come_from_the_partition_counters() {
         Some(RowCount::Exact(3)),
         "a maintained counter is still not a COUNT(*)"
     );
-    // Summed over index_id 0/1 only: the nonclustered index above holds the
-    // same three rows, and adding its partition would report six.
     assert!(
         stats.bytes.is_some_and(|b| b > 0),
         "reserved pages must be reported: {:?}",
@@ -1172,5 +1173,37 @@ async fn sqlserver_table_stats_come_from_the_partition_counters() {
         ],
     )
     .await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_an_empty_table_reports_zero_rows_not_nothing() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "IF OBJECT_ID('dbo.stats_empty') IS NOT NULL DROP TABLE dbo.stats_empty",
+            "CREATE TABLE dbo.stats_empty (id int NOT NULL PRIMARY KEY, name nvarchar(50))",
+        ],
+    )
+    .await;
+
+    // The counterpart to `an_analyzed_empty_table_reports_zero_rows_rather_
+    // than_nothing` in the Postgres suite, and the reason both exist: an empty
+    // table must describe itself the same way on both backends. Here there is
+    // no ANALYZE to wait for — the partition counter is maintained — so an
+    // empty table reads 0 from the moment it is created.
+    let meta = introspect_table(&pool, "stats_empty").await;
+    let stats = pool.fetch_table_stats(&meta).await.unwrap();
+    assert_eq!(
+        stats.rows,
+        Some(RowCount::Estimated(0)),
+        "a maintained counter reading zero is a measurement, not an absence"
+    );
+    assert!(!stats.is_empty());
+    assert_eq!(pool.count_table_rows(&meta).await.unwrap(), 0);
+
+    run_all(&pool, &["DROP TABLE dbo.stats_empty"]).await;
     pool.close().await;
 }

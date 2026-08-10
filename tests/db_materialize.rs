@@ -489,11 +489,18 @@ async fn materialize_reports_no_statistics_rather_than_a_row_of_zeroes() {
     let (readings, view, matview) = fresh_fixture(&pool, "stats").await;
     let tables = pool.introspect().await.unwrap();
 
-    // Materialize's `pg_class` is a stub: it has `reltuples` (always -1) but
-    // no `relpages`, and there is no `pg_total_relation_size`. Both halves of
-    // the shape probe therefore say no, and every object — table, view and
-    // materialized view alike — reports nothing rather than the zeroes a
-    // credulous query would have produced (FRE-118).
+    // Materialize's `pg_class` is a stub. It has `reltuples`, so the shape
+    // probe's row half says yes and the query runs — but the column reads -1
+    // for every object, which is the never-measured sentinel, so nothing is
+    // claimed. There is no `pg_total_relation_size` at all, so the size half
+    // says no outright. Every object — table, view and materialized view
+    // alike — therefore reports nothing rather than the zeroes a credulous
+    // query would have produced (FRE-118).
+    //
+    // Worth pinning precisely because the sentinel is now the *only* thing
+    // suppressing these: a measured zero is reported as zero since the review
+    // of FRE-118, so if this engine ever answered 0 instead of -1 the pane
+    // would start claiming every object is empty. This test would fail first.
     for name in [&readings, &view, &matview] {
         let stats = pool.fetch_table_stats(find(&tables, name)).await.unwrap();
         assert!(

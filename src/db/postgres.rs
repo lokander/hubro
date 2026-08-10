@@ -1411,10 +1411,10 @@ pub async fn fetch_ddl(
 /// The same probe-don't-guess discipline as [`catalog_shape`], for the same
 /// reason: `pg_class` is the one catalog every Postgres-wire engine claims to
 /// have and none of them implements fully. Of the seven engines in the test
-/// matrix, three answer neither half — CockroachDB has the columns but leaves
+/// matrix, three answer nothing usable — CockroachDB has the column but leaves
 /// `reltuples` NULL and ships no `pg_total_relation_size` (its `crdb_internal`
-/// equivalent is refused outright); Materialize has `reltuples` but no
-/// `relpages` and no size function; RisingWave has neither column.
+/// equivalent is refused outright); Materialize has `reltuples` but reports -1
+/// for everything and has no size function; RisingWave has neither.
 ///
 /// Where it differs from [`catalog_shape`] is the default when the *probe*
 /// cannot be run at all, and deliberately: an unknown catalog shape falls back
@@ -1424,10 +1424,7 @@ pub async fn fetch_ddl(
 /// probe that fails outright is propagated rather than read as an absence, so a
 /// broken connection is not reported to the user as a server without statistics.
 struct StatsShape {
-    /// Whether `pg_class` has both `reltuples` and `relpages`. Both, because
-    /// [`row_estimate`] needs the pair to tell an unmeasured zero from a
-    /// measured one — a server offering only one of them loses the estimate,
-    /// which is the conservative direction.
+    /// Whether `pg_class` has `reltuples`.
     row_estimate: bool,
     /// Whether `pg_total_relation_size(oid)` exists.
     total_size: bool,
@@ -1452,7 +1449,7 @@ async fn stats_shape(pool: &PgPool) -> Result<StatsShape, DbError> {
             JOIN pg_class c ON c.oid = a.attrelid \
             JOIN pg_namespace n ON n.oid = c.relnamespace \
             WHERE n.nspname = 'pg_catalog' AND c.relname = 'pg_class' \
-              AND a.attname IN ('reltuples', 'relpages')), \
+              AND a.attname = 'reltuples'), \
            (SELECT count(*) FROM pg_proc p \
             JOIN pg_namespace n ON n.oid = p.pronamespace \
             WHERE n.nspname = 'pg_catalog' AND p.proname = 'pg_total_relation_size')",
@@ -1464,7 +1461,7 @@ async fn stats_shape(pool: &PgPool) -> Result<StatsShape, DbError> {
         false => DbError::Introspect(e.to_string()),
     })?;
     Ok(StatsShape {
-        row_estimate: columns == 2,
+        row_estimate: columns > 0,
         total_size: size_fn > 0,
     })
 }
@@ -1482,9 +1479,9 @@ pub async fn fetch_table_stats(pool: &PgPool, table: &TableMeta) -> Result<Table
     if shape.is_empty() {
         return Ok(TableStats::default());
     }
-    let (reltuples, relpages) = match shape.row_estimate {
-        true => ("c.reltuples::float8", "c.relpages::int8"),
-        false => ("NULL::float8", "NULL::int8"),
+    let reltuples = match shape.row_estimate {
+        true => "c.reltuples::float8",
+        false => "NULL::float8",
     };
     // A plain view has no storage of its own, and `pg_total_relation_size`
     // answers 0 for one — which would render as a measured "0 B" rather than as
@@ -1498,11 +1495,11 @@ pub async fn fetch_table_stats(pool: &PgPool, table: &TableMeta) -> Result<Table
         false => "NULL::int8",
     };
     let sql = format!(
-        "SELECT {reltuples}, {relpages}, {size} \
+        "SELECT {reltuples}, {size} \
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
          WHERE n.nspname = COALESCE($1::text, current_schema()) AND c.relname::text = $2"
     );
-    let row = sqlx::query_as::<_, (Option<f64>, Option<i64>, Option<i64>)>(&sql)
+    let row = sqlx::query_as::<_, (Option<f64>, Option<i64>)>(&sql)
         .bind(table.schema.as_deref())
         .bind(&table.name)
         .fetch_optional(pool)
@@ -1513,37 +1510,45 @@ pub async fn fetch_table_stats(pool: &PgPool, table: &TableMeta) -> Result<Table
         })?;
     // No row at all means the relation is gone (dropped under a stale schema
     // tree), which is an absence like any other rather than an error.
-    let Some((reltuples, relpages, bytes)) = row else {
+    let Some((reltuples, bytes)) = row else {
         return Ok(TableStats::default());
     };
     Ok(TableStats {
-        rows: row_estimate(reltuples, relpages).map(RowCount::Estimated),
+        rows: row_estimate(reltuples).map(RowCount::Estimated),
         bytes: size_bytes(bytes),
     })
 }
 
 /// Turns a raw `pg_class` row estimate into a number worth showing, or `None`.
 ///
-/// Two spellings of "nobody has counted this yet" have to be dropped, and both
-/// are catalog facts rather than version guesses:
+/// **`reltuples < 0` is the only thing dropped, and a zero is kept.**
+/// PostgreSQL 14 and later store `-1` for a relation that has never been
+/// vacuumed or analyzed, precisely so it is distinguishable from an empty one —
+/// which is exactly the distinction this needs, and every Postgres-wire engine
+/// in the matrix spells it that way. Verified rather than assumed: a populated,
+/// never-analyzed table reports `reltuples = -1` on PostgreSQL 17.10,
+/// TimescaleDB 17.10, Citus 18.4 and YugabyteDB 15.12 alike, and CockroachDB
+/// reports NULL. So the sentinel alone separates "nobody has counted this" from
+/// "counted, and the answer was none".
 ///
-/// - **`reltuples < 0`.** PostgreSQL 14 and later store `-1` for a relation
-///   that has never been vacuumed or analyzed, precisely so it is
-///   distinguishable from an empty one. A freshly created or freshly restored
-///   database reports this for every table, which is exactly when a viewer is
-///   most likely to be pointed at it.
-/// - **`reltuples = 0` with `relpages = 0`.** The pre-14 spelling of the same
-///   thing, and what the planner itself special-cases: a relation occupying no
-///   pages has no measured statistics, so its zero is an initial value rather
-///   than a measurement.
+/// A measured zero is therefore reported *as zero*. It is available, it is
+/// true, and on a table someone has just opened in an unfamiliar database it is
+/// very plausibly the most useful thing the pane can say — certainly better than
+/// a blank that reads as "unknown" and invites an exact count to discover the
+/// same thing. It is also what SQL Server's maintained counter reports for the
+/// identical table, and the two backends must not disagree about it.
 ///
-/// A relation that *does* occupy pages and estimates zero rows has been
-/// measured and really is (as far as anything cheap can tell) empty, so that
-/// zero is kept — it is a fact, and dropping it would leave the pane blank on a
-/// table whose emptiness is the very thing worth knowing.
-fn row_estimate(reltuples: Option<f64>, relpages: Option<i64>) -> Option<u64> {
-    let (reltuples, relpages) = (reltuples?, relpages?);
-    if reltuples < 0.0 || !reltuples.is_finite() || (reltuples == 0.0 && relpages == 0) {
+/// An earlier version also dropped `reltuples = 0` alongside `relpages = 0`,
+/// reasoning that PostgreSQL 13 and older have no `-1` and spell "unmeasured"
+/// that way. That clause never fired for the case it described on any server
+/// here — the `-1` covers it — and only ever suppressed genuine zeroes, so it is
+/// gone, and `relpages` with it. If a pre-14 server ever enters the support
+/// matrix, the fix is not to reinstate the guess: `pg_stat_get_last_analyze_time`
+/// answers "has this ever been analyzed" as a catalog fact, which is what
+/// CLAUDE.md's rule about version-dependent behaviour asks for.
+fn row_estimate(reltuples: Option<f64>) -> Option<u64> {
+    let reltuples = reltuples?;
+    if reltuples < 0.0 || !reltuples.is_finite() {
         return None;
     }
     Some(reltuples.round() as u64)
@@ -1933,28 +1938,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_unmeasured_relation_estimates_nothing_rather_than_zero() {
+    fn an_unmeasured_relation_estimates_nothing() {
         // PostgreSQL 14+ says -1 for "never vacuumed or analyzed"; every table
-        // in a freshly restored database looks like this.
-        assert_eq!(row_estimate(Some(-1.0), Some(0)), None);
-        assert_eq!(row_estimate(Some(-1.0), Some(12)), None);
-        // Pre-14, and every engine whose pg_class is a stub: zero tuples in
-        // zero pages is an initial value, not a measurement.
-        assert_eq!(row_estimate(Some(0.0), Some(0)), None);
-        // A column this server does not have — the shape probe selected NULL.
-        assert_eq!(row_estimate(None, Some(3)), None);
-        assert_eq!(row_estimate(Some(42.0), None), None);
+        // in a freshly created or freshly restored database looks like this,
+        // on all four Postgres-family engines in the matrix.
+        assert_eq!(row_estimate(Some(-1.0)), None);
+        // A column this server does not have (the shape probe selected NULL),
+        // or one it leaves NULL, as CockroachDB does.
+        assert_eq!(row_estimate(None), None);
+        // Nothing sane produces these, and NaN would round into a garbage u64.
+        assert_eq!(row_estimate(Some(f64::NAN)), None);
+        assert_eq!(row_estimate(Some(f64::INFINITY)), None);
     }
 
     #[test]
-    fn a_measured_estimate_survives_rounds_and_may_be_zero() {
-        assert_eq!(row_estimate(Some(42.0), Some(1)), Some(42));
+    fn a_measured_zero_is_reported_as_zero() {
+        // The regression this pins: an analyzed, genuinely empty table reports
+        // `reltuples = 0`, and that zero is a measurement. Suppressing it left
+        // the pane indistinguishable from "statistics unknown" while SQL
+        // Server reported "0 rows" for the identical table.
+        assert_eq!(row_estimate(Some(0.0)), Some(0));
+    }
+
+    #[test]
+    fn a_measured_estimate_survives_and_rounds() {
+        assert_eq!(row_estimate(Some(42.0)), Some(42));
         // reltuples is a float and routinely fractional after a sampled
         // ANALYZE of a partially filled page.
-        assert_eq!(row_estimate(Some(9.6), Some(1)), Some(10));
-        // Measured *and* empty: the table occupies pages and ANALYZE found no
-        // rows. That zero is a fact worth showing, unlike the two above.
-        assert_eq!(row_estimate(Some(0.0), Some(4)), Some(0));
+        assert_eq!(row_estimate(Some(9.6)), Some(10));
     }
 
     #[test]
