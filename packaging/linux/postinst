@@ -1,0 +1,18 @@
+#!/bin/sh
+# Debian post-install hook (Dioxus.toml: [bundle.deb] post_install_script).
+#
+# Rebuilds the desktop database, which indexes which application handles which
+# MIME type. Without it the .desktop entry is on disk but nothing consults its
+# MimeType line until some other package triggers a rebuild, so hubro would not
+# appear under "Open with" until then (FRE-114). dx's deb has no dpkg triggers,
+# so this is done explicitly.
+#
+# Best-effort: a container or minimal install may not have the tool, and a
+# package must not fail to install over a cache refresh.
+set -e
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || true
+fi
+
+exit 0

@@ -6,6 +6,7 @@ use dioxus::desktop::{use_window, use_wry_event_handler, DesktopService, WindowC
 use dioxus::prelude::*;
 use dioxus_icons::lucide::{Moon, Sun, SunMoon, X};
 
+use crate::cli::Startup;
 use crate::config::{
     default_settings_path, load_settings, save_window_geometry, ConnectionColor, Theme,
     WindowGeometry,
@@ -115,9 +116,33 @@ pub fn Shell() -> Element {
     // (not a root `spawn_forever` in AppState::new): restore drives the normal
     // connect flow, which writes the core connection signals — running it here
     // keeps those writes in a live scope, matching the manual connect path.
+    //
+    // A database named on the command line (FRE-114) opens *after* the
+    // restore, in the same task: restore ends by setting the active view to
+    // whichever tab was in front last time, so opening first would leave the
+    // database the user just asked for behind a tab they didn't.
     use_hook(|| {
+        let startup = try_consume_context::<Startup>().and_then(|Startup(target)| target);
         spawn(async move {
             state.restore_session().await;
+            if let Some(target) = startup {
+                state.open_target(target).await;
+            }
+        });
+    });
+
+    // Databases the OS hands to the *running* app: on macOS a double-clicked
+    // file arrives as an `open` Apple Event rather than in argv (FRE-114).
+    // Claimed once, and the queue is unbounded, so an event delivered before
+    // this task starts is still opened rather than dropped.
+    use_hook(|| {
+        let Some(mut opened) = crate::cli::take_opened() else {
+            return;
+        };
+        spawn(async move {
+            while let Some(target) = opened.recv().await {
+                state.open_target(target).await;
+            }
         });
     });
 

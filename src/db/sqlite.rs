@@ -26,9 +26,123 @@ use super::staged::CheckedStatement;
 use super::stats::{RowCount, TableStats};
 use super::value::{QueryResult, Value};
 
+/// The 16 bytes every SQLite database file begins with, including the
+/// terminating NUL (the SQLite file format, section 1.3).
+const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+
+/// Why a path can't be opened as a SQLite database (FRE-114).
+///
+/// Exists so "you pointed hubro at a JPEG" is answered by hubro rather than
+/// relayed from the driver: sqlx collapses a missing file, a directory and a
+/// text file into `(code: 14) unable to open database file` or
+/// `file is not a database`, which says neither which of those happened nor
+/// which file it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteFileError {
+    /// The path as the caller gave it, so the message names the file the user
+    /// typed rather than a canonicalized form they don't recognize.
+    pub path: std::path::PathBuf,
+    pub kind: SqliteFileErrorKind,
+}
+
+/// What is wrong with the file — see [`SqliteFileError`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqliteFileErrorKind {
+    /// Nothing exists at that path.
+    NotFound,
+    /// Something exists but isn't a regular file — most often a directory.
+    NotAFile,
+    /// A file that does not start with the SQLite header.
+    NotADatabase,
+    /// Existence couldn't be established (permissions, an I/O error).
+    Unreadable(String),
+}
+
+impl SqliteFileError {
+    /// The "nothing there" error for a path already known to be absent.
+    pub fn not_found(path: std::path::PathBuf) -> Self {
+        SqliteFileError {
+            path,
+            kind: SqliteFileErrorKind::NotFound,
+        }
+    }
+}
+
+impl std::fmt::Display for SqliteFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let path = self.path.display();
+        match &self.kind {
+            SqliteFileErrorKind::NotFound => write!(f, "no such file: {path}"),
+            SqliteFileErrorKind::NotAFile => write!(f, "not a file: {path}"),
+            SqliteFileErrorKind::NotADatabase => {
+                write!(f, "not a SQLite database: {path}")
+            }
+            SqliteFileErrorKind::Unreadable(reason) => {
+                write!(f, "cannot read {path}: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SqliteFileError {}
+
+/// Checks that `path` is a file hubro can open as a SQLite database, without
+/// opening a connection to it.
+///
+/// Decides on facts about the file — does it exist, is it a regular file, does
+/// it start with [`SQLITE_HEADER`] — rather than on the driver's error text,
+/// which is one message for four different problems. That is also what lets
+/// one answer serve two places: the command line reports it before a window
+/// opens (FRE-114), and [`open_sqlite`] turns it into the connect error the
+/// connections screen shows for the file picker, the saved list, and a session
+/// restore.
+///
+/// A **zero-length file passes**, because SQLite itself treats one as a valid
+/// empty database and writes the header on first use — refusing it here would
+/// reject a file the app opens perfectly well. Anything non-empty but shorter
+/// than the header cannot be a database.
+pub fn check_sqlite_file(path: &Path) -> Result<(), SqliteFileError> {
+    let fail = |kind| {
+        Err(SqliteFileError {
+            path: path.to_path_buf(),
+            kind,
+        })
+    };
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return fail(SqliteFileErrorKind::NotFound)
+        }
+        Err(err) => return fail(SqliteFileErrorKind::Unreadable(err.to_string())),
+    };
+    if !metadata.is_file() {
+        return fail(SqliteFileErrorKind::NotAFile);
+    }
+    if metadata.len() == 0 {
+        return Ok(());
+    }
+    let mut header = [0u8; SQLITE_HEADER.len()];
+    let read = match std::fs::File::open(path).and_then(|mut file| {
+        use std::io::Read as _;
+        file.read(&mut header)
+    }) {
+        Ok(read) => read,
+        Err(err) => return fail(SqliteFileErrorKind::Unreadable(err.to_string())),
+    };
+    if read < SQLITE_HEADER.len() || &header != SQLITE_HEADER {
+        return fail(SqliteFileErrorKind::NotADatabase);
+    }
+    Ok(())
+}
+
 /// Opens an existing SQLite database file and validates it is actually a
-/// SQLite database (the file header is only checked on first real access).
+/// SQLite database.
+///
+/// [`check_sqlite_file`] runs first so the ordinary failures carry hubro's own
+/// wording. The `PRAGMA` below still runs: a file with the right header can be
+/// corrupt or encrypted past it, and that is the driver's judgement to make.
 pub async fn open_sqlite(path: &Path) -> Result<SqlitePool, DbError> {
+    check_sqlite_file(path).map_err(|err| DbError::Connect(err.to_string()))?;
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(false);
@@ -632,6 +746,7 @@ fn decode_value(row: &SqliteRow, idx: usize) -> Result<Value, DbError> {
 #[cfg(test)]
 mod tests {
     use super::super::sql::quote_ident;
+    use super::*;
 
     #[test]
     fn quote_ident_escapes_embedded_quotes() {
@@ -655,5 +770,59 @@ mod tests {
         assert_eq!(sqlite_stat_rows("unordered 42"), None);
         assert_eq!(sqlite_stat_rows(""), None);
         assert_eq!(sqlite_stat_rows("-3 1"), None);
+    }
+
+    #[test]
+    fn the_file_check_names_which_problem_it_found() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let missing = dir.path().join("nope.db");
+        let err = check_sqlite_file(&missing).unwrap_err();
+        assert_eq!(err.kind, SqliteFileErrorKind::NotFound);
+        // The message names the file the user typed, so a mistyped path is
+        // obvious from the message alone.
+        assert!(err.to_string().contains("nope.db"), "{err}");
+        assert!(err.to_string().starts_with("no such file"), "{err}");
+
+        let err = check_sqlite_file(dir.path()).unwrap_err();
+        assert_eq!(err.kind, SqliteFileErrorKind::NotAFile);
+
+        let garbage = dir.path().join("holiday.jpg");
+        std::fs::write(&garbage, b"\xff\xd8\xff\xe0 not a database at all").unwrap();
+        let err = check_sqlite_file(&garbage).unwrap_err();
+        assert_eq!(err.kind, SqliteFileErrorKind::NotADatabase);
+        assert!(err.to_string().contains("not a SQLite database"), "{err}");
+        // The point of the whole check: the driver's wording never reaches the
+        // user for this case.
+        assert!(!err.to_string().contains("code: 14"), "{err}");
+
+        // Non-empty but too short to hold a header: still not a database.
+        let stub = dir.path().join("stub.db");
+        std::fs::write(&stub, b"SQLite").unwrap();
+        assert_eq!(
+            check_sqlite_file(&stub).unwrap_err().kind,
+            SqliteFileErrorKind::NotADatabase
+        );
+    }
+
+    #[test]
+    fn the_file_check_accepts_what_sqlite_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // A real header. (`open_sqlite` is exercised end-to-end against real
+        // databases in tests/db_sqlite.rs; this pins the byte-level rule.)
+        let real = dir.path().join("app.sqlite3");
+        let mut bytes = SQLITE_HEADER.to_vec();
+        bytes.extend_from_slice(&[0u8; 32]);
+        std::fs::write(&real, &bytes).unwrap();
+        assert!(check_sqlite_file(&real).is_ok());
+
+        // A zero-length file is a valid empty database to SQLite itself —
+        // `tests/db_sqlite.rs::open_empty_file_succeeds_like_sqlite_itself`
+        // holds the driver to the same answer, so this is not just an
+        // assumption about it.
+        let empty = dir.path().join("empty.db");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(check_sqlite_file(&empty).is_ok());
     }
 }

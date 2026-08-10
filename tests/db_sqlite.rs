@@ -22,6 +22,14 @@ async fn open_missing_file_is_a_connect_error() {
         .err()
         .expect("opening a missing file must fail");
     assert!(matches!(err, DbError::Connect(_)));
+    // hubro's wording, naming the path — not the driver's "(code: 14) unable
+    // to open database file", which says neither what went wrong nor where
+    // (FRE-114).
+    assert!(
+        err.to_string()
+            .contains("no such file: /nonexistent/nope.db"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
@@ -34,6 +42,37 @@ async fn open_non_database_file_is_a_connect_error() {
         .err()
         .expect("opening a non-database file must fail");
     assert!(matches!(err, DbError::Connect(_)));
+    assert!(err.to_string().contains("not a SQLite database"), "{err}");
+    assert!(err.to_string().contains("garbage.db"), "{err}");
+}
+
+#[tokio::test]
+async fn open_a_directory_is_a_connect_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = DbPool::open_sqlite(dir.path())
+        .await
+        .err()
+        .expect("opening a directory must fail");
+    assert!(err.to_string().contains("not a file"), "{err}");
+}
+
+#[tokio::test]
+async fn open_empty_file_succeeds_like_sqlite_itself() {
+    // The pre-flight header check (FRE-114) lets a zero-length file through on
+    // the claim that SQLite treats one as a valid empty database. This holds
+    // the driver to that claim: were it to stop being true, the check would be
+    // accepting a file the app then fails to open.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fresh.db");
+    std::fs::write(&path, b"").unwrap();
+    let pool = DbPool::open_sqlite(&path)
+        .await
+        .expect("SQLite opens a zero-length file as an empty database");
+    assert!(
+        pool.introspect().await.unwrap().is_empty(),
+        "an empty database has no objects"
+    );
+    pool.close().await;
 }
 
 #[tokio::test]

@@ -603,6 +603,53 @@ impl AppState {
         }
     }
 
+    /// Opens a database named on the command line or handed over by the OS
+    /// (FRE-114) — one entry point for `hubro <file>`, `hubro <url>`, and a
+    /// file association on all three platforms.
+    ///
+    /// Drives the ordinary connect flows rather than a shortcut of its own,
+    /// for the reason session restore does: an argv-opened tab should be
+    /// indistinguishable from one opened by hand, prompts and all. Which also
+    /// settles the two things the two kinds of target do differently, because
+    /// both are what the existing flows already do:
+    ///
+    /// - a **file** is opened without joining the saved list, because
+    ///   [`Self::connect`] never saves — "opened once from a shell" is not a
+    ///   connection anybody asked to keep;
+    /// - a **server** does join it on success, because every server connect
+    ///   does ([`Self::save_server_if_open`]). What is saved is the normalized
+    ///   locator, which carries no password.
+    ///
+    /// Any password from the URL goes into session memory only — never the
+    /// keyring. Storing a credential permanently is a decision the "remember
+    /// password" checkbox exists to take; a password that happened to be on a
+    /// command line has not been through it.
+    pub async fn open_target(mut self, target: OpenTarget) {
+        match target {
+            OpenTarget::File(path) => self.connect(path).await,
+            OpenTarget::Server {
+                backend,
+                url,
+                password,
+            } => {
+                if let Some(password) = password {
+                    // Statement temporary: the guard is dropped before the
+                    // await below.
+                    self.session_passwords.write().insert(url.clone(), password);
+                }
+                let name = crate::cli::display_name(&url);
+                self.connect_server(
+                    ServerBackend::of(backend),
+                    url,
+                    name,
+                    None,
+                    ServerAuth::Password,
+                )
+                .await;
+            }
+        }
+    }
+
     /// Opens a saved SQLite connection in a new tab, or focuses the existing
     /// tab when the same file is already open.
     pub async fn connect(mut self, path: PathBuf) {
