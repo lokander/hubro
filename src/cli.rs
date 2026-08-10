@@ -659,11 +659,30 @@ mod tests {
 
     #[test]
     fn a_file_url_resolves_to_its_path() {
+        // Both the URL and the path it names are platform-specific, because
+        // `Url::to_file_path` applies each platform's rules: Windows needs a
+        // drive letter and rejects a Unix-style absolute path. That rejection
+        // is the right answer rather than a gap — `file:///var/lib/app.db`
+        // names nothing a Windows process can open, so hubro's own "not a
+        // local file URL" is what the user should see (FRE-160).
+        #[cfg(windows)]
+        let (url, path) = ("file:///C:/data/app.db", PathBuf::from(r"C:\data\app.db"));
+        #[cfg(not(windows))]
+        let (url, path) = ("file:///var/lib/app.db", PathBuf::from("/var/lib/app.db"));
+
+        assert_eq!(classify(OsStr::new(url)).unwrap(), OpenTarget::File(path));
+
+        // A host in a `file://` URL divides the platforms rather than being
+        // uniformly wrong: Windows resolves one to a UNC path, which really
+        // does name a file it can open over SMB, while everywhere else it
+        // names nothing local and is refused. Both are `to_file_path`'s
+        // answer, and hubro wants the platform's answer rather than its own.
+        #[cfg(windows)]
         assert_eq!(
-            classify(OsStr::new("file:///var/lib/app.db")).unwrap(),
-            OpenTarget::File(PathBuf::from("/var/lib/app.db"))
+            classify(OsStr::new("file://elsewhere/app.db")).unwrap(),
+            OpenTarget::File(PathBuf::from(r"\\elsewhere\app.db"))
         );
-        // A `file://` URL on another host names no local path.
+        #[cfg(not(windows))]
         assert!(classify(OsStr::new("file://elsewhere/app.db")).is_err());
     }
 

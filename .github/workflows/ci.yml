@@ -52,8 +52,23 @@ jobs:
     # release.yml already builds each OS. Keeping macOS and Windows off the PR
     # path is what holds this repo inside the monthly Actions minutes — the
     # cost is that platform-specific breakage surfaces after the merge, so
-    # dispatch the full matrix on the branch when a PR touches
-    # `cfg(windows)`/`cfg(unix)` code (see the workflow_dispatch note above).
+    # dispatch the full matrix on the branch (see the workflow_dispatch note
+    # above) when a PR touches anything platform-shaped:
+    #
+    #   - `cfg(windows)`/`cfg(unix)` code;
+    #   - path *syntax* — separators, drive letters, UNC, absolute-ness,
+    #     canonicalisation, or a `file://` URL (`Url::to_file_path` applies
+    #     each platform's rules, so one assertion cannot describe all three).
+    #     Not merely handling a path: nearly every PR here does that, and a
+    #     trigger that fires on all of them is one nobody can follow;
+    #   - a test comparing a checked-in file byte for byte, or matching one
+    #     against a literal containing `\n` (see .gitattributes);
+    #   - process spawning, signals, or the keyring.
+    #
+    # The `cfg` bullet alone used to be the whole rule and was too narrow:
+    # FRE-160 was three Windows failures across two merged PRs, none of which
+    # had a `cfg` block — a path, a `file://` URL, and two byte-exact
+    # comparisons.
     # fail-fast off: when one leg fails, the others still report, so
     # platform-specific breakage is diagnosed in a single run.
     strategy:
