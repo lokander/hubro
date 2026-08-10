@@ -5,12 +5,13 @@
 //!   it;
 //! - [`nav`] — keyboard navigation and the windowed row range;
 //! - [`copy`] — copying a cell selection to the clipboard;
-//! - [`detail`] — the row detail panel.
+//! - [`detail`] — the row detail panel;
+//! - [`viewer`] — the rich cell viewers (JSON, images, binary, long text).
 //!
 //! This file keeps the orchestrator itself: the ~20 hooks that hold a table's
 //! page, sort, filter, selection and stage, the effects that keep them
 //! consistent, and the toolbar/save-bar/footer chrome around the body. The
-//! four submodules reference each other only through small shared types
+//! five submodules reference each other only through small shared types
 //! ([`GridNav`], [`Selection`], [`ActiveEdit`], [`RowDetail`]), which live
 //! here.
 //!
@@ -22,11 +23,13 @@ mod copy;
 mod detail;
 mod nav;
 mod rows;
+mod viewer;
 
 use copy::*;
 use detail::*;
 use nav::*;
 use rows::*;
+use viewer::*;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -190,12 +193,15 @@ enum ExpandView {
     /// A value already fully in the page — rendered directly, and safe to
     /// copy.
     ///
-    /// Carries the [`Value`], not its display string: the popup shows
-    /// `Value::display` (so a blob still reads as `<blob 12 B>`), but "Copy
-    /// raw" has to put the same text on the clipboard as a Ctrl+C over that
-    /// cell — [`raw_cell_text`], i.e. the blob's hex and nothing at all for
-    /// NULL. Holding only the display string copied the placeholder.
-    Text(Value),
+    /// Carries the [`Value`], not its display string: the popup renders it
+    /// through [`CellViewer`] (FRE-115), and "Copy raw" has to put the same
+    /// text on the clipboard as a Ctrl+C over that cell —
+    /// [`raw_cell_text`], i.e. the blob's hex and nothing at all for NULL.
+    /// Holding only the display string copied the placeholder.
+    ///
+    /// The column travels with it so the popup can look up the declared type
+    /// the viewer classifies on, exactly as the detail panel does.
+    Text { value: Value, column: String },
     /// A truncated cell whose row can't be addressed (a view, a keyless
     /// table), so the full value can never be loaded. The popup shows the
     /// preview for reading but refuses to copy it — the same call
@@ -221,7 +227,10 @@ fn expand_view(cell: &GridNavCell, locator: Option<RowLocator>) -> ExpandView {
             display: cell.display.clone(),
             column: cell.column.clone(),
         },
-        (false, _) => ExpandView::Text(cell.value.clone()),
+        (false, _) => ExpandView::Text {
+            value: cell.value.clone(),
+            column: cell.column.clone(),
+        },
     }
 }
 
@@ -1413,15 +1422,13 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                         }
                         match view {
                             // A short value already in hand is always the full
-                            // value, so JSON pretty-printing is safe (FRE-77).
-                            ExpandView::Text(value) => {
-                                let shown = value.display();
-                                let display = pretty_json(&shown).unwrap_or_else(|| shown.clone());
+                            // value, so the rich viewers may decode it: JSON
+                            // as a tree, an image as a picture (FRE-77/FRE-115).
+                            ExpandView::Text { value, column } => {
+                                let type_name = meta.type_of(&column);
                                 rsx! {
                                     CopyRawButton { raw: raw_cell_text(&value) }
-                                    pre { class: "whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
-                                        "{display}"
-                                    }
+                                    CellViewer { value, type_name, truncated: None }
                                 }
                             },
                             // Preview of an unloadable value: readable, but no
@@ -1437,8 +1444,11 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                     "{display}"
                                 }
                             },
-                            ExpandView::Fetch { locator, column } => rsx! {
-                                ExpandedValue { id, table: table.clone(), locator, column }
+                            ExpandView::Fetch { locator, column } => {
+                                let type_name = meta.type_of(&column);
+                                rsx! {
+                                    ExpandedValue { id, table: table.clone(), locator, column, type_name }
+                                }
                             },
                         }
                     }
@@ -2285,13 +2295,17 @@ mod tests {
         let nav = GridNav::build(vec!["id".into(), "cover".into()], &rows, &HashMap::new());
         let blob = &nav.rows[0].cells[1];
         assert_eq!(blob.display, "<blob 2 B>", "the grid shows a placeholder");
-        let ExpandView::Text(value) = expand_view(blob, nav.rows[0].locator.clone()) else {
+        let ExpandView::Text { value, column } = expand_view(blob, nav.rows[0].locator.clone())
+        else {
             panic!("a complete value expands in hand");
         };
         assert_eq!(raw_cell_text(&value), "\\xdead");
+        // The column travels with the value so the popup can classify it on
+        // the declared type, like the detail panel (FRE-115).
+        assert_eq!(column, "cover");
         // Same for NULL: the popup reads "NULL", a copy yields nothing —
         // exactly as `plan_copy` + `raw_cell_text` do for the same cell.
-        let ExpandView::Text(value) = expand_view(&nav.rows[0].cells[0], None) else {
+        let ExpandView::Text { value, .. } = expand_view(&nav.rows[0].cells[0], None) else {
             panic!("a complete value expands in hand");
         };
         assert_eq!(value.display(), "NULL");
