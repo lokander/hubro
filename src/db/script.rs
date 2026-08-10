@@ -646,31 +646,39 @@ pub async fn run_script(
         return Err(refusal);
     }
     if wrap_atomically(caps, pool.dialect(), statements) {
-        let cover = rollback_cover(caps, pool.dialect(), statements);
-        run_script_atomic(pool, statements, cover, on_result).await
+        run_script_atomic(pool, caps, statements, on_result).await
     } else {
         run_script_sequential(pool, statements, on_result).await
     }
 }
 
-/// What a rollback on this connection would cover for *these* statements
-/// (FRE-146) — resolved before the script runs, since it depends only on the
-/// script's text and the connection's declared capabilities.
+/// What a rollback covered, given the statements that actually *ran* (FRE-146).
 ///
 /// [`Rollback::ExceptSchemaChanges`] needs both halves: an engine whose
-/// rollback lets DDL escape, *and* a script that actually contains DDL. A
-/// pure-DML script on CockroachDB rolls back completely, and saying otherwise
-/// would be its own false claim — the opposite one, and no better.
+/// rollback lets DDL escape, *and* a schema change among the statements that
+/// reached the server. A pure-DML script on CockroachDB rolls back completely,
+/// and saying otherwise would be its own false claim — the opposite one, and
+/// no better.
+///
+/// **`ran` is the statements up to and including the failing one, not the whole
+/// script.** A script whose `CREATE TABLE` sits *after* the statement that
+/// failed never executed that DDL, so its rollback really did cover everything;
+/// reporting otherwise would invent a surviving table. The failing statement is
+/// *included* because a DDL that fails has still done its damage on
+/// CockroachDB: `autocommit_before_ddl` commits the open transaction before the
+/// statement runs, so the writes staged ahead of it survive even when the
+/// schema change itself does not.
 ///
 /// Uses [`statement_needs`] rather than [`classify_statement`] for the same
 /// reason the capability gate does: it catches a schema change that the first
 /// keyword doesn't advertise (`SELECT … INTO new_table`, `EXEC sp_rename`),
 /// which the conservative side here counts as DDL.
-fn rollback_cover(caps: Capabilities, dialect: Dialect, statements: &[String]) -> Rollback {
-    let changes_schema = || statements.iter().any(|s| statement_needs(s, dialect).ddl);
-    match caps.transactional_ddl || !changes_schema() {
-        true => Rollback::Full,
-        false => Rollback::ExceptSchemaChanges,
+fn rollback_cover(caps: Capabilities, dialect: Dialect, ran: &[String]) -> Rollback {
+    let changes_schema = || ran.iter().any(|s| statement_needs(s, dialect).ddl);
+    if caps.transactional_ddl || !changes_schema() {
+        Rollback::Full
+    } else {
+        Rollback::ExceptSchemaChanges
     }
 }
 
@@ -760,13 +768,14 @@ async fn run_script_sequential(
 
 /// The atomic path: all statements run in one transaction, committed only if
 /// every statement succeeds. Any failure (including a failed commit) rolls the
-/// script back, and reports that rollback as the `cover`
-/// [`rollback_cover`] resolved for this connection and script — [`Rollback::Full`]
-/// unless the engine lets schema changes escape it (FRE-146).
+/// script back, and reports what that rollback covered via [`rollback_cover`]
+/// — [`Rollback::Full`] unless the engine lets schema changes escape it
+/// (FRE-146). Resolved per failure rather than once up front, since it depends
+/// on which statements actually ran.
 async fn run_script_atomic(
     pool: &DbPool,
+    caps: Capabilities,
     statements: &[String],
-    cover: Rollback,
     mut on_result: impl FnMut(StatementResult),
 ) -> Result<(), ScriptError> {
     let mut tx = match pool.begin_script_tx().await {
@@ -806,7 +815,9 @@ async fn run_script_atomic(
                     statement_index,
                     preview: statement_preview(statement),
                     error,
-                    rollback: cover,
+                    // Only what ran can have escaped the rollback — a schema
+                    // change later in the script never reached the server.
+                    rollback: rollback_cover(caps, pool.dialect(), &statements[..=statement_index]),
                 });
             }
         }
@@ -819,7 +830,9 @@ async fn run_script_atomic(
             statement_index: statements.len().saturating_sub(1),
             preview: "COMMIT".to_string(),
             error,
-            rollback: cover,
+            // Every statement ran before the commit was attempted, so the
+            // whole script is in scope here.
+            rollback: rollback_cover(caps, pool.dialect(), statements),
         });
     }
     Ok(())
@@ -1701,6 +1714,39 @@ mod tests {
         let hidden = stmts(&["SELECT 1", "SELECT * INTO backup FROM t"]);
         assert_eq!(
             rollback_cover(escapes, Dialect::Postgres, &hidden),
+            Rollback::ExceptSchemaChanges
+        );
+    }
+
+    #[test]
+    fn a_schema_change_the_script_never_reached_did_not_escape() {
+        let escapes = Capabilities {
+            transactional_ddl: false,
+            ..Capabilities::FULL
+        };
+        // `run_script_atomic` passes the statements up to and including the
+        // failing one, which is what makes this distinction reachable: the
+        // caller cannot ask about DDL the server never saw.
+        let script = stmts(&[
+            "INSERT INTO t VALUES (1)",
+            "SELECT * FROM missing_relation",
+            "CREATE TABLE never (id int)",
+        ]);
+
+        // Failing at statement 1, the CREATE TABLE never ran — so the rollback
+        // really did cover everything, and reporting a surviving table would
+        // invent one.
+        assert_eq!(
+            rollback_cover(escapes, Dialect::Postgres, &script[..=1]),
+            Rollback::Full
+        );
+
+        // The failing statement is itself included, because a DDL that fails
+        // has still done its damage on CockroachDB: the autocommit fires
+        // before the statement runs, so writes staged ahead of it survive.
+        let failing_ddl = stmts(&["INSERT INTO t VALUES (1)", "CREATE TABLE dup (id int)"]);
+        assert_eq!(
+            rollback_cover(escapes, Dialect::Postgres, &failing_ddl[..=1]),
             Rollback::ExceptSchemaChanges
         );
     }

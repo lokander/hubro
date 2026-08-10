@@ -374,9 +374,9 @@ fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
                     // the one direction that matters.
                     Rollback::ExceptSchemaChanges => format!(
                         "Script rolled back after {elapsed_ms} ms, but this server does not undo \
-                         schema changes on rollback — the script's CREATE/ALTER/DROP statements, \
-                         and possibly data written before them, were kept. Check the schema \
-                         before running it again.",
+                         schema changes on rollback — the schema changes it ran, and possibly \
+                         data written before them, were kept. Check the schema before running \
+                         it again.",
                     ),
                 },
             }
