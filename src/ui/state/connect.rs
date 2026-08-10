@@ -1528,6 +1528,22 @@ mod tests {
         panic!("unbalanced braces after `{signature}`");
     }
 
+    /// The source of [`AppState::open_target`].
+    ///
+    /// Read rather than executed because the method needs a Dioxus runtime, a
+    /// live server and a keyring to reach its consequences, while every
+    /// regression it has actually had was a *routing* mistake — one visible
+    /// right here. The properties it is asked about are pinned beside the
+    /// behavioural tests of the values themselves, so neither stands alone: the
+    /// value tests would pass against a path that ignores them, and these would
+    /// pass against a path that routes correctly to something broken.
+    fn open_target_body() -> String {
+        method_body(
+            include_str!("connect.rs"),
+            "pub async fn open_target(self, target: OpenTarget)",
+        )
+    }
+
     /// A saved Postgres entry with an SSH tunnel and interactive Entra auth —
     /// the two fields `SavedList::add` adopts, and so the two an argv connect
     /// can destroy.
@@ -1544,6 +1560,7 @@ mod tests {
             auth: ServerAuth::Entra(EntraAuth::interactive_default()),
             protection: WriteProtection::Open,
             color: None,
+            group: None,
         }
     }
 
@@ -1569,6 +1586,7 @@ mod tests {
             path: PathBuf::from(URL),
             protection: WriteProtection::Open,
             color: None,
+            group: None,
         }];
         let (tunnel, auth) = saved_server_settings(&sqlite, URL);
         assert!(tunnel.is_none());
@@ -1610,6 +1628,34 @@ mod tests {
             }
             other => panic!("unexpected entry {other:?}"),
         }
+
+        // Everything above proves the *values* are safe once `open_target`
+        // looks them up. It does not prove `open_target` looks them up — and a
+        // test that walks the helper by hand stays green while the argv path
+        // goes back to passing `None`/`Password`, which is precisely the
+        // regression this exists to catch. So the wiring is pinned here too,
+        // by the same source-level instrument the test below uses.
+        let body = open_target_body();
+        assert!(
+            body.contains("saved_server_settings(saved.entries(), &url)"),
+            "open_target no longer looks the saved entry up, so it is back to \
+             handing the connect defaults — which erases a saved tunnel and \
+             downgrades a saved Entra sign-in on disk"
+        );
+        assert!(
+            body.contains("self.connect_server(backend, url, name, tunnel, auth)"),
+            "the looked-up tunnel and auth must be the ones handed to the connect"
+        );
+        assert!(
+            body.contains("backend, url, name, password, false, tunnel,"),
+            "the password route must carry the looked-up tunnel too"
+        );
+        assert!(
+            body.contains("matches!(auth, ServerAuth::Password)"),
+            "without this guard an argv password takes the password route for an \
+             Entra-saved connection, and that route saves ServerAuth::Password — \
+             the same downgrade by another door"
+        );
     }
 
     #[test]
@@ -1627,10 +1673,7 @@ mod tests {
         // Dioxus runtime (`AppState::new` must be called from a component), so
         // it is not reachable from a unit test — but the routing is, and the
         // routing is where the bug was.
-        let body = method_body(
-            include_str!("connect.rs"),
-            "pub async fn open_target(self, target: OpenTarget)",
-        );
+        let body = open_target_body();
         assert!(
             !body.contains("session_passwords"),
             "open_target writes session memory again — an unvalidated password \
