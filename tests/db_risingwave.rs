@@ -91,12 +91,19 @@
 //! schema name identifies them, gated on the flavor.
 //!
 //! Sources and sinks are RisingWave's other objects with no Postgres
-//! equivalent. Both are now views rather than tables: a `SOURCE` is written by
-//! the engine from outside, and a `SINK` writes *outward* and has no rows of
-//! its own — before this it read as an ordinary browsable table and failed on
-//! open with `table or source not found`. The source's reason is worded for
-//! the object rather than the engine, since Materialize reports `SOURCE` too
-//! and was previously naming itself in a message RisingWave also showed.
+//! equivalent. Both are views rather than tables now: a `SOURCE` is written by
+//! the engine from outside, and a `SINK` writes *outward*. The source's reason
+//! is worded for the object rather than the engine, since Materialize reports
+//! `SOURCE` too and was previously naming itself in a message RisingWave also
+//! showed.
+//!
+//! **A sink still cannot be opened**, and that half is not fixed. It has no
+//! rows at all, so `fetch_page` gets the engine's own `table or source not
+//! found`; being a view stops it offering editing, but views are browsable and
+//! nothing here says "this object has no rows to browse". Suppressing the open
+//! needs a per-object *read* gate, and `read_query` is connection-level — that
+//! is an extension of the capability model rather than a verification finding,
+//! so it is recorded here and filed as FRE-148 rather than bolted on.
 
 use hubro::db::{
     apply_staged, detect_row_identity, run_script, split_statements, Capabilities, DbPool, Filter,
