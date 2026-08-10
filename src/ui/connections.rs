@@ -9,7 +9,9 @@
 use std::path::PathBuf;
 
 use dioxus::prelude::*;
-use dioxus_icons::lucide::{Pencil, Plug, ShieldAlert, Trash2, X};
+use dioxus_icons::lucide::{
+    ChevronDown, ChevronRight, ChevronUp, FolderPlus, Pencil, Plug, Search, ShieldAlert, Trash2, X,
+};
 
 use crate::config::{BackendKind, ConnectionColor, EditPrefill, SavedConnection, ServerAuth};
 use crate::db::{Dialect, WriteProtection};
@@ -19,22 +21,65 @@ use super::js::focus_on_mount;
 use super::notice::{Banner, BannerKind, EmptyState, Spinner};
 use super::state::{ActiveView, AppState, ConnectStep, ServerBackend};
 
-/// One saved connection's write protection and accent colour (FRE-111),
-/// edited inline under its row in the connections list.
+/// One saved connection's per-row settings, edited inline under its row in
+/// the connections list: which group it is filed under (FRE-120), and its
+/// write protection and accent colour (FRE-111).
 ///
 /// Every change writes straight through to the saved list — there is no OK
-/// button. Marking is a two-field setting with an immediately visible effect
-/// (the badge and the stripe update in place), so a confirm step would only
-/// add a way to lose the change.
+/// button. These are small settings with an immediately visible effect (the
+/// badge, the stripe and the row's section update in place), so a confirm
+/// step would only add a way to lose the change.
+///
+/// Grouping shares this drawer rather than taking a per-row control of its
+/// own: a second icon on every row costs more than the one line it saves,
+/// and the two settings are asked the same way — pick one of a few values,
+/// see it immediately.
 #[component]
-fn MarkingEditor(
+fn RowSettings(
     locator: String,
     protection: WriteProtection,
     color: Option<ConnectionColor>,
+    /// The group this connection is in, if any.
+    group: Option<String>,
+    /// Every group, in display order.
+    groups: Vec<String>,
 ) -> Element {
     let state = use_context::<AppState>();
     rsx! {
         div { class: "w-full border-t border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-900/60 px-4 py-3",
+            div { class: "mb-3 flex items-center gap-2",
+                span { class: "text-xs font-medium text-slate-600 dark:text-slate-400", "Group" }
+                if groups.is_empty() {
+                    span { class: "text-xs text-slate-500",
+                        "No groups yet — make one with “New group” above."
+                    }
+                } else {
+                    select {
+                        class: "rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 px-2 py-1 text-xs text-slate-900 dark:text-slate-200",
+                        aria_label: "Group",
+                        onchange: {
+                            let locator = locator.clone();
+                            move |evt: FormEvent| {
+                                // The empty value is "no group"; a group can
+                                // never be named "" (create_group refuses it),
+                                // so the two can't collide.
+                                let picked = evt.value();
+                                let picked = (!picked.is_empty()).then_some(picked);
+                                state.assign_saved_group(&locator, picked.as_deref());
+                            }
+                        },
+                        option { value: "", selected: group.is_none(), "No group" }
+                        for name in groups.iter() {
+                            option {
+                                key: "{name}",
+                                value: "{name}",
+                                selected: group.as_deref() == Some(name.as_str()),
+                                "{name}"
+                            }
+                        }
+                    }
+                }
+            }
             div { class: "flex flex-wrap items-center gap-x-6 gap-y-3",
                 div { class: "flex items-center gap-2",
                     span { class: "text-xs font-medium text-slate-600 dark:text-slate-400", "Writes" }
@@ -150,8 +195,221 @@ struct SavedRow {
     /// The row's write protection and accent colour (FRE-111).
     protection: WriteProtection,
     color: Option<ConnectionColor>,
+    /// The group this connection is filed under (FRE-120), if any.
+    group: Option<String>,
     tunnel: Option<crate::tunnel::TunnelConfig>,
     auth: ServerAuth,
+}
+
+/// One section of the connections list as it renders (FRE-120): a group and
+/// its rows, or — with `name` as `None` — the ungrouped ones.
+///
+/// `first`/`last` are about the group's place in the *configured* order
+/// rather than in this (possibly searched) arrangement, because that is what
+/// the reorder buttons act on.
+#[derive(Clone, PartialEq)]
+struct SectionView {
+    name: Option<String>,
+    rows: Vec<SavedRow>,
+    collapsed: bool,
+    first: bool,
+    last: bool,
+}
+
+/// Creates the group named in the "New group" field, closing the field on
+/// success and leaving it open (with the reason) on failure — a refused name
+/// is still on screen to fix.
+fn submit_new_group(
+    state: AppState,
+    name: Signal<String>,
+    mut naming: Signal<bool>,
+    mut error: Signal<Option<String>>,
+) {
+    match state.create_saved_group(&name.peek()) {
+        Ok(_) => {
+            error.set(None);
+            naming.set(false);
+        }
+        Err(err) => error.set(Some(err.to_string())),
+    }
+}
+
+/// One group's header: the fold control, its name and size, and the actions
+/// that only make sense on a group — rename, reorder, delete (FRE-120).
+///
+/// Reordering is a pair of one-step buttons rather than drag-and-drop: a drag
+/// implementation worth using is a dependency, and the thing being ordered is
+/// a handful of names.
+#[component]
+fn GroupHeader(
+    name: String,
+    count: usize,
+    collapsed: bool,
+    /// Whether this group is already at the top / bottom of the configured
+    /// order, which is what disables its Move button.
+    first: bool,
+    last: bool,
+    renaming_group: Signal<Option<String>>,
+    rename_draft: Signal<String>,
+    confirm_delete_group: Signal<Option<String>>,
+    group_error: Signal<Option<String>>,
+) -> Element {
+    let state = use_context::<AppState>();
+    let mut renaming_group = renaming_group;
+    let mut rename_draft = rename_draft;
+    let mut confirm_delete_group = confirm_delete_group;
+    let mut group_error = group_error;
+    let renaming = renaming_group() == Some(name.clone());
+    // Applies the rename, keeping the field open (with the reason) when the
+    // name is refused.
+    let commit_rename = {
+        let name = name.clone();
+        move || match state.rename_saved_group(&name, &rename_draft.peek()) {
+            Ok(_) => {
+                group_error.set(None);
+                renaming_group.set(None);
+            }
+            Err(err) => group_error.set(Some(err.to_string())),
+        }
+    };
+    rsx! {
+        div { class: "flex items-center gap-1 border-b border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-900/60 pr-2",
+            if renaming {
+                input {
+                    class: "m-1.5 min-w-0 flex-1 rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 px-2 py-1 text-sm text-slate-900 dark:text-slate-200",
+                    value: "{rename_draft}",
+                    onmounted: focus_on_mount,
+                    oninput: move |evt| rename_draft.set(evt.value()),
+                    onkeydown: {
+                        let mut commit = commit_rename.clone();
+                        move |evt: KeyboardEvent| match evt.key() {
+                            Key::Enter => commit(),
+                            Key::Escape => {
+                                group_error.set(None);
+                                renaming_group.set(None);
+                            }
+                            _ => {}
+                        }
+                    },
+                }
+                button {
+                    class: "cursor-pointer rounded bg-sky-600 px-2 py-1 text-xs font-medium text-white hover:bg-sky-500",
+                    onclick: {
+                        let mut commit = commit_rename.clone();
+                        move |_| commit()
+                    },
+                    "Rename"
+                }
+                button {
+                    class: "cursor-pointer rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
+                    onclick: move |_| {
+                        group_error.set(None);
+                        renaming_group.set(None);
+                    },
+                    "Cancel"
+                }
+            } else if confirm_delete_group() == Some(name.clone()) {
+                // Armed. Deleting a group is not deleting connections, and
+                // the confirmation is where that gets said.
+                div { class: "flex flex-1 flex-wrap items-center gap-2 px-3 py-1.5",
+                    span { class: "text-xs text-amber-700 dark:text-amber-300",
+                        "Delete “{name}”? Its connections stay, ungrouped."
+                    }
+                    button {
+                        class: "cursor-pointer rounded bg-amber-600 px-2 py-0.5 text-xs font-semibold text-slate-950 hover:bg-amber-500",
+                        onclick: {
+                            let name = name.clone();
+                            move |_| {
+                                state.remove_saved_group(&name);
+                                confirm_delete_group.set(None);
+                            }
+                        },
+                        "Delete"
+                    }
+                    button {
+                        class: "cursor-pointer rounded border border-slate-400 dark:border-slate-600 px-2 py-0.5 text-xs text-slate-900 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
+                        onclick: move |_| confirm_delete_group.set(None),
+                        "Keep"
+                    }
+                }
+            } else {
+                button {
+                    class: "flex min-w-0 flex-1 cursor-pointer items-center gap-2 px-3 py-2 text-left hover:bg-slate-200 dark:hover:bg-slate-800/60",
+                    title: if collapsed { "Expand this group" } else { "Collapse this group" },
+                    aria_expanded: if collapsed { "false" } else { "true" },
+                    onclick: {
+                        let name = name.clone();
+                        move |_| state.toggle_group_collapsed(&name)
+                    },
+                    span { class: "shrink-0 text-slate-500 dark:text-slate-400",
+                        if collapsed {
+                            ChevronRight { size: 14 }
+                        } else {
+                            ChevronDown { size: 14 }
+                        }
+                    }
+                    span { class: "truncate text-sm font-semibold text-slate-900 dark:text-slate-200",
+                        "{name}"
+                    }
+                    span { class: "shrink-0 text-xs text-slate-500 dark:text-slate-400", "{count}" }
+                }
+                button {
+                    class: "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
+                    title: "Rename group",
+                    aria_label: "Rename group",
+                    onclick: {
+                        let name = name.clone();
+                        move |_| {
+                            group_error.set(None);
+                            rename_draft.set(name.clone());
+                            renaming_group.set(Some(name.clone()));
+                        }
+                    },
+                    Pencil { size: 14 }
+                }
+                button {
+                    class: if first {
+                        "rounded p-1.5 text-slate-300 dark:text-slate-700"
+                    } else {
+                        "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200"
+                    },
+                    disabled: first,
+                    title: "Move group up",
+                    aria_label: "Move group up",
+                    onclick: {
+                        let name = name.clone();
+                        move |_| state.move_saved_group(&name, true)
+                    },
+                    ChevronUp { size: 14 }
+                }
+                button {
+                    class: if last {
+                        "rounded p-1.5 text-slate-300 dark:text-slate-700"
+                    } else {
+                        "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200"
+                    },
+                    disabled: last,
+                    title: "Move group down",
+                    aria_label: "Move group down",
+                    onclick: {
+                        let name = name.clone();
+                        move |_| state.move_saved_group(&name, false)
+                    },
+                    ChevronDown { size: 14 }
+                }
+                button {
+                    class: "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
+                    title: "Delete group",
+                    aria_label: "Delete group",
+                    onclick: {
+                        let name = name.clone();
+                        move |_| confirm_delete_group.set(Some(name.clone()))
+                    },
+                    Trash2 { size: 14 }
+                }
+            }
+        }
+    }
 }
 
 /// Which connection form the modal is showing (FRE-67). SQLite has no
@@ -163,7 +421,11 @@ enum ConnectForm {
     /// Editing an existing saved entry, prefilled from it (FRE-75). Carries
     /// the entry itself so the form knows which locator to replace — the
     /// edit may move it.
-    Edit(SavedConnection),
+    ///
+    /// Boxed because the entry dwarfs the other two variants, which carry
+    /// nothing: unboxed, every `Option<ConnectForm>` in the screen would be
+    /// the size of a whole saved connection.
+    Edit(Box<SavedConnection>),
 }
 
 /// Modal shell for the add-connection forms (FRE-67). Follows the app's
@@ -237,6 +499,262 @@ fn ConnectFormModal(
     }
 }
 
+/// One saved connection's row. Lifted out of [`ConnectionsScreen`] when
+/// grouping (FRE-120) put a second loop around it: the screen now walks
+/// sections of rows, and 200 lines of row markup inside that walk would have
+/// buried it.
+///
+/// The screen's signals are passed in rather than re-derived. A `Signal` is
+/// `Copy`, so this costs nothing, and it keeps "one row armed, one editor
+/// open" a property of the screen rather than something each row has to
+/// agree about.
+#[component]
+fn SavedConnectionRow(
+    row: SavedRow,
+    /// Every group, for the settings editor's picker.
+    groups: Vec<String>,
+    confirm_remove: Signal<Option<String>>,
+    settings_open: Signal<Option<String>>,
+    open_form: Signal<Option<ConnectForm>>,
+) -> Element {
+    let state = use_context::<AppState>();
+    let mut confirm_remove = confirm_remove;
+    let mut settings_open = settings_open;
+    let mut open_form = open_form;
+    rsx! {
+        // Same row-hover shade as the sidebar's table list. The
+        // Edit/Remove buttons hover one step further so they
+        // stay visible on top of it. Rounding the end rows
+        // keeps the highlight inside the list's rounded border.
+        //
+        // The row's padding lives on the connect button, not on
+        // the li: as li padding it was dead space that lit up on
+        // hover but swallowed the click.
+        li { class: "flex flex-wrap items-stretch first:rounded-t last:rounded-b hover:bg-slate-200 dark:hover:bg-slate-800/60",
+            // Accent stripe (FRE-111): the colour warns, and
+            // it reads before any text does.
+            if let Some(color) = row.color {
+                div {
+                    class: "w-1 shrink-0 first:rounded-tl last:rounded-bl",
+                    background_color: "{color.css()}",
+                    aria_hidden: "true",
+                }
+            }
+            button {
+                // Dimmed and inert while its connect runs, so
+                // the row reads as busy rather than ignored.
+                class: if row.connecting.is_some() {
+                    "min-w-0 flex-1 cursor-default px-4 py-3 text-left opacity-60"
+                } else {
+                    "min-w-0 flex-1 cursor-pointer px-4 py-3 text-left"
+                },
+                disabled: row.connecting.is_some(),
+                title: "Shift-click to open in the background",
+                onclick: {
+                    let row = row.clone();
+                    move |evt: MouseEvent| {
+                        // Shift-click opens the tab without
+                        // switching to it, for queueing up
+                        // several connections at once.
+                        state
+                            .start_connect(
+                                row.locator.clone(),
+                                row.name.clone(),
+                                row.backend,
+                                row.tunnel.clone(),
+                                row.auth.clone(),
+                                !evt.modifiers().shift(),
+                            );
+                    }
+                },
+                div { class: "flex items-center gap-2",
+                    span { class: "shrink-0 text-slate-500 dark:text-slate-400",
+                        if row.connecting.is_some() {
+                            Spinner {}
+                        } else {
+                            BackendIcon { dialect: Dialect::from(row.backend), size: 16 }
+                        }
+                    }
+                    span { class: "truncate text-sm font-medium text-slate-900 dark:text-slate-200",
+                        "{row.name}"
+                    }
+                    span {
+                        class: match row.backend {
+                            BackendKind::Postgres => "rounded bg-cyan-100 dark:bg-cyan-900/50 px-1.5 py-0.5 text-xs text-cyan-700 dark:text-cyan-300",
+                            BackendKind::SqlServer => "rounded bg-red-100 dark:bg-red-900/50 px-1.5 py-0.5 text-xs text-red-700 dark:text-red-300",
+                            // A step darker than the row's hover shade; at
+                            // bg-slate-200 the badge disappeared into it.
+                            BackendKind::Sqlite => "rounded bg-slate-300 dark:bg-slate-700 px-1.5 py-0.5 text-xs text-slate-600 dark:text-slate-300",
+                        },
+                        match row.backend {
+                            BackendKind::Postgres => "postgres",
+                            BackendKind::SqlServer => "sql server",
+                            BackendKind::Sqlite => "sqlite",
+                        }
+                    }
+                    if row.tunnel.is_some() {
+                        span { class: "rounded bg-teal-100 dark:bg-teal-900/50 px-1.5 py-0.5 text-xs text-teal-700 dark:text-teal-300",
+                            "ssh"
+                        }
+                    }
+                    if row.is_open {
+                        span { class: "rounded bg-sky-100 dark:bg-sky-900/60 px-1.5 py-0.5 text-xs text-sky-700 dark:text-sky-300",
+                            "open"
+                        }
+                    }
+                    // Protection is never silent (FRE-111):
+                    // the user should never wonder why a save
+                    // button is disabled or a prompt appeared.
+                    if let Some(badge) = row.protection.badge() {
+                        span { class: "rounded bg-amber-100 dark:bg-amber-900/50 px-1.5 py-0.5 text-xs text-amber-700 dark:text-amber-300",
+                            "{badge}"
+                        }
+                    }
+                }
+                // The step replaces the locator while connecting:
+                // the locator is already on screen in the name,
+                // and the phase is what the user needs.
+                //
+                // One element for both, never swapped out: a
+                // live region only announces changes made after
+                // it exists, so a region created together with
+                // the first step would stay silent for it.
+                div {
+                    class: if row.connecting.is_some() {
+                        "truncate text-xs text-slate-500 dark:text-slate-400"
+                    } else {
+                        "truncate font-mono text-xs text-slate-500"
+                    },
+                    aria_live: "polite",
+                    if let Some(step) = row.connecting {
+                        "{step.label()}"
+                    } else {
+                        "{row.locator}"
+                    }
+                }
+            }
+            // Only the row actions sit outside the connect
+            // button; everything left of them is one click
+            // target spanning the full row height.
+            // Icon-only to keep the row narrow; `title` carries
+            // the label the text used to, and `aria_label`
+            // keeps it named for screen readers.
+            div { class: "flex shrink-0 items-center gap-1 pr-2",
+                if row.connecting.is_some() {
+                    // Editing or removing a connection mid-connect
+                    // would fight the attempt in flight, so the
+                    // only action offered is calling it off.
+                    if row.cancellable {
+                        button {
+                            class: "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
+                            title: "Cancel",
+                            aria_label: "Cancel connecting",
+                            onclick: {
+                                let key = row.key.clone();
+                                move |_| state.cancel_connect(&key)
+                            },
+                            X { size: 14 }
+                        }
+                    }
+                } else if confirm_remove().as_deref() == Some(row.locator.as_str()) {
+                    // Armed: the icons step aside for the
+                    // confirmation, same shape as the editor's
+                    // "Clear this connection's history?".
+                    div { class: "flex items-center gap-2",
+                        span { class: "text-xs text-amber-700 dark:text-amber-300", "Remove?" }
+                        button {
+                            class: "cursor-pointer rounded bg-amber-600 px-2 py-0.5 text-xs font-semibold text-slate-950 hover:bg-amber-500",
+                            onclick: {
+                                let locator = row.locator.clone();
+                                move |_| {
+                                    state.remove_saved(&locator);
+                                    confirm_remove.set(None);
+                                }
+                            },
+                            "Remove"
+                        }
+                        button {
+                            class: "cursor-pointer rounded border border-slate-400 dark:border-slate-600 px-2 py-0.5 text-xs text-slate-900 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
+                            onclick: move |_| confirm_remove.set(None),
+                            "Keep"
+                        }
+                    }
+                } else {
+                    // Marking is offered for every backend,
+                    // including SQLite — which has no edit
+                    // form, so this is the only place it can
+                    // be protected from.
+                    button {
+                        class: if settings_open() == Some(row.locator.clone()) {
+                            "cursor-pointer rounded bg-slate-300 dark:bg-slate-700 p-1.5 text-slate-900 dark:text-slate-200"
+                        } else {
+                            "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200"
+                        },
+                        title: "Group, write protection and colour",
+                        aria_label: "Group, write protection and colour",
+                        aria_expanded: if settings_open() == Some(row.locator.clone()) { "true" } else { "false" },
+                        onclick: {
+                            let locator = row.locator.clone();
+                            move |_| {
+                                let open = settings_open() == Some(locator.clone());
+                                settings_open.set((!open).then(|| locator.clone()));
+                            }
+                        },
+                        ShieldAlert { size: 14 }
+                    }
+                    if row.backend != BackendKind::Sqlite {
+                        button {
+                            class: "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
+                            title: "Edit",
+                            aria_label: "Edit saved connection",
+                            onclick: {
+                                let locator = row.locator.clone();
+                                move |_| {
+                                    let entry = state
+                                        .saved
+                                        .read()
+                                        .entries()
+                                        .iter()
+                                        .find(|s| s.locator() == locator)
+                                        .cloned();
+                                    if let Some(entry) = entry {
+                                        open_form.set(Some(ConnectForm::Edit(Box::new(entry))));
+                                    }
+                                }
+                            },
+                            Pencil { size: 14 }
+                        }
+                    }
+                    button {
+                        class: "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
+                        title: "Remove",
+                        aria_label: "Remove saved connection",
+                        onclick: {
+                            let locator = row.locator.clone();
+                            move |_| confirm_remove.set(Some(locator.clone()))
+                        },
+                        Trash2 { size: 14 }
+                    }
+                }
+            }
+            // The settings editor (FRE-111, FRE-120), expanded
+            // inline below its row — the row is already a
+            // full-width click target, so a floating popover
+            // would have to be dismissed before the row could
+            // be used.
+            if settings_open() == Some(row.locator.clone()) {
+                RowSettings {
+                    locator: row.locator.clone(),
+                    protection: row.protection,
+                    color: row.color,
+                    group: row.group.clone(),
+                    groups: groups.clone(),
+                }
+            }
+        }
+    }
+}
+
 /// Launch screen: the persisted saved-connections list plus add flows for
 /// SQLite (native file picker) and Postgres (form or URL).
 #[component]
@@ -249,9 +767,25 @@ pub(super) fn ConnectionsScreen() -> Element {
     // and unrecoverable (a server entry takes its keyring password with it),
     // so the trash icon only arms the confirmation — one row at a time, since
     // arming another replaces this.
-    let mut confirm_remove = use_signal(|| Option::<String>::None);
-    // Which row's write-protection/colour editor is expanded (FRE-111).
-    let mut marking_open = use_signal(|| Option::<String>::None);
+    let confirm_remove = use_signal(|| Option::<String>::None);
+    // Which row's settings editor is expanded: group (FRE-120), write
+    // protection and colour (FRE-111).
+    let settings_open = use_signal(|| Option::<String>::None);
+    // The connections search (FRE-120). Local to this screen, like the
+    // sidebar's filter: it narrows a view rather than changing anything, so
+    // it is not persisted and the screen opens unfiltered.
+    let mut search = use_signal(String::new);
+    // The "New group" field, shown only while it is being typed into.
+    let mut naming_group = use_signal(|| false);
+    let mut new_group = use_signal(String::new);
+    // Which group's name is being edited, and the draft (FRE-120).
+    let renaming_group = use_signal(|| Option::<String>::None);
+    let rename_draft = use_signal(String::new);
+    // Which group's Delete is armed — same one-at-a-time arming as a row's.
+    let confirm_delete_group = use_signal(|| Option::<String>::None);
+    // Why the last group name was refused, shown under the field it was
+    // typed into.
+    let mut group_error = use_signal(|| Option::<String>::None);
     let error = state.connect_error.read().clone();
     let prompt = state.password_prompt.read().clone();
     let host_key_prompt = state.host_key_prompt.read().clone();
@@ -270,40 +804,64 @@ pub(super) fn ConnectionsScreen() -> Element {
             open_form.set(None);
         }
     });
-    let saved: Vec<SavedRow> = {
+    let query = search();
+    let groups: Vec<String> = state.saved.read().groups().to_vec();
+    let collapsed: Vec<String> = state.collapsed_groups.read().clone();
+    // Whether anything is saved at all — the empty state's condition, which
+    // a search that matches nothing must not trigger.
+    let has_saved = !state.saved.read().entries().is_empty();
+    // The list as it renders (FRE-120): each group in its configured order
+    // with the connections filed under it, then the ungrouped ones, narrowed
+    // by the search box. `arrange` owns those two rules so the render body
+    // stays a straight walk over what it returned.
+    let sections: Vec<SectionView> = {
         let open = state.open_locators.read();
         let connecting = state.connecting.read();
         let requests = state.connect_requests.read();
+        let row_for = |s: &SavedConnection| {
+            let canonical_locator = super::state::saved_open_locator(s);
+            let (tunnel, auth) = match s {
+                SavedConnection::Postgres { tunnel, auth, .. }
+                | SavedConnection::SqlServer { tunnel, auth, .. } => (tunnel.clone(), auth.clone()),
+                SavedConnection::Sqlite { .. } => (None, ServerAuth::Password),
+            };
+            SavedRow {
+                name: s.name().to_string(),
+                locator: s.locator(),
+                key: canonical_locator.clone(),
+                backend: s.backend(),
+                is_open: open.iter().any(|(_, l)| *l == canonical_locator),
+                connecting: connecting
+                    .iter()
+                    .find(|c| c.visible && c.locator == canonical_locator)
+                    .map(|c| c.step),
+                cancellable: requests.contains_key(&canonical_locator),
+                protection: s.protection(),
+                color: s.color(),
+                group: s.group().map(str::to_string),
+                tunnel,
+                auth,
+            }
+        };
         state
             .saved
             .read()
-            .entries()
-            .iter()
-            .map(|s| {
-                let canonical_locator = super::state::saved_open_locator(s);
-                let (tunnel, auth) = match s {
-                    SavedConnection::Postgres { tunnel, auth, .. }
-                    | SavedConnection::SqlServer { tunnel, auth, .. } => {
-                        (tunnel.clone(), auth.clone())
-                    }
-                    SavedConnection::Sqlite { .. } => (None, ServerAuth::Password),
-                };
-                SavedRow {
-                    name: s.name().to_string(),
-                    locator: s.locator(),
-                    key: canonical_locator.clone(),
-                    backend: s.backend(),
-                    is_open: open.iter().any(|(_, l)| *l == canonical_locator),
-                    connecting: connecting
-                        .iter()
-                        .find(|c| c.visible && c.locator == canonical_locator)
-                        .map(|c| c.step),
-                    cancellable: requests.contains_key(&canonical_locator),
-                    protection: s.protection(),
-                    color: s.color(),
-                    tunnel,
-                    auth,
-                }
+            .arrange(&query)
+            .into_iter()
+            .map(|section| SectionView {
+                collapsed: section
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| collapsed.iter().any(|c| c == name)),
+                // Whether the up/down buttons have anywhere to go is asked of
+                // the *configured* order, not of this arrangement: a search
+                // hides sections, and a Move Up that greyed out because the
+                // group above it was filtered away would move the group
+                // somewhere the user can't see.
+                first: groups.first() == section.name.as_ref(),
+                last: groups.last() == section.name.as_ref(),
+                rows: section.entries.iter().map(&row_for).collect(),
+                name: section.name,
             })
             .collect()
     };
@@ -326,13 +884,13 @@ pub(super) fn ConnectionsScreen() -> Element {
         div { class: "flex h-full flex-col items-center justify-center gap-6 overflow-y-auto py-8",
             div { class: "text-center",
                 h1 { class: "text-2xl font-semibold text-slate-900 dark:text-slate-200", "Hubro" }
-                if !saved.is_empty() {
+                if has_saved {
                     p { class: "mt-1 text-sm text-slate-500 dark:text-slate-400",
                         "Pick a saved connection, or add another database."
                     }
                 }
             }
-            if saved.is_empty() {
+            if !has_saved {
                 // Designed empty state; the Add buttons below are its action.
                 EmptyState {
                     icon: rsx! { Plug { size: 40 } },
@@ -340,234 +898,147 @@ pub(super) fn ConnectionsScreen() -> Element {
                     hint: "Add a SQLite file, Postgres server, or SQL Server to get started.",
                 }
             }
-            if !saved.is_empty() {
-                ul { class: "w-full max-w-xl divide-y divide-slate-200 dark:divide-slate-800 rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/60",
-                    for row in saved {
-                        // Same row-hover shade as the sidebar's table list. The
-                        // Edit/Remove buttons hover one step further so they
-                        // stay visible on top of it. Rounding the end rows
-                        // keeps the highlight inside the list's rounded border.
-                        //
-                        // The row's padding lives on the connect button, not on
-                        // the li: as li padding it was dead space that lit up on
-                        // hover but swallowed the click.
-                        li { class: "flex flex-wrap items-stretch first:rounded-t last:rounded-b hover:bg-slate-200 dark:hover:bg-slate-800/60",
-                            // Accent stripe (FRE-111): the colour warns, and
-                            // it reads before any text does.
-                            if let Some(color) = row.color {
-                                div {
-                                    class: "w-1 shrink-0 first:rounded-tl last:rounded-bl",
-                                    background_color: "{color.css()}",
-                                    aria_hidden: "true",
+            // Search and group creation (FRE-120). Both only appear once
+            // there is a list to organise — on an empty screen they would be
+            // two controls with nothing to act on.
+            if has_saved {
+                div { class: "flex w-full max-w-xl flex-col gap-2",
+                    div { class: "flex items-center gap-2",
+                        div { class: "flex min-w-0 flex-1 items-center gap-1 rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 focus-within:border-sky-500 dark:focus-within:border-sky-600",
+                            span { class: "shrink-0 text-slate-400 dark:text-slate-600",
+                                Search { size: 14 }
+                            }
+                            input {
+                                id: "dv-connection-search",
+                                class: "min-w-0 flex-1 bg-transparent text-sm text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600 focus:outline-none",
+                                placeholder: "Search connections by name…",
+                                value: "{query}",
+                                oninput: move |evt| search.set(evt.value()),
+                                // Handled here, not in the window listener,
+                                // which ignores keys typed into an input.
+                                onkeydown: move |evt: KeyboardEvent| {
+                                    if evt.key() == Key::Escape {
+                                        search.set(String::new());
+                                    }
+                                },
+                            }
+                            if !query.is_empty() {
+                                button {
+                                    class: "shrink-0 rounded text-slate-400 dark:text-slate-600 hover:text-slate-900 dark:hover:text-slate-200",
+                                    title: "Clear the search (Esc)",
+                                    aria_label: "Clear the search",
+                                    onclick: move |_| search.set(String::new()),
+                                    X { size: 14 }
                                 }
+                            }
+                        }
+                        button {
+                            class: "flex shrink-0 cursor-pointer items-center gap-1 rounded border border-slate-300 dark:border-slate-700 px-2 py-1.5 text-xs text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                            title: "Create a group to file connections under",
+                            aria_expanded: if naming_group() { "true" } else { "false" },
+                            onclick: move |_| {
+                                let open = naming_group();
+                                group_error.set(None);
+                                new_group.set(String::new());
+                                naming_group.set(!open);
+                            },
+                            FolderPlus { size: 14 }
+                            "New group"
+                        }
+                    }
+                    if naming_group() {
+                        div { class: "flex items-center gap-2",
+                            input {
+                                class: "min-w-0 flex-1 rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 text-sm text-slate-900 dark:text-slate-200",
+                                placeholder: "Group name, e.g. Production",
+                                value: "{new_group}",
+                                onmounted: focus_on_mount,
+                                oninput: move |evt| new_group.set(evt.value()),
+                                onkeydown: move |evt: KeyboardEvent| {
+                                    match evt.key() {
+                                        Key::Enter => {
+                                            submit_new_group(state, new_group, naming_group, group_error)
+                                        }
+                                        Key::Escape => {
+                                            group_error.set(None);
+                                            naming_group.set(false);
+                                        }
+                                        _ => {}
+                                    }
+                                },
                             }
                             button {
-                                // Dimmed and inert while its connect runs, so
-                                // the row reads as busy rather than ignored.
-                                class: if row.connecting.is_some() {
-                                    "min-w-0 flex-1 cursor-default px-4 py-3 text-left opacity-60"
-                                } else {
-                                    "min-w-0 flex-1 cursor-pointer px-4 py-3 text-left"
+                                class: "cursor-pointer rounded bg-sky-600 px-3 py-1 text-xs font-medium text-white hover:bg-sky-500",
+                                onclick: move |_| {
+                                    submit_new_group(state, new_group, naming_group, group_error)
                                 },
-                                disabled: row.connecting.is_some(),
-                                title: "Shift-click to open in the background",
-                                onclick: {
-                                    let row = row.clone();
-                                    move |evt: MouseEvent| {
-                                        // Shift-click opens the tab without
-                                        // switching to it, for queueing up
-                                        // several connections at once.
-                                        state
-                                            .start_connect(
-                                                row.locator.clone(),
-                                                row.name.clone(),
-                                                row.backend,
-                                                row.tunnel.clone(),
-                                                row.auth.clone(),
-                                                !evt.modifiers().shift(),
-                                            );
-                                    }
+                                "Create"
+                            }
+                            button {
+                                class: "cursor-pointer rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
+                                onclick: move |_| {
+                                    group_error.set(None);
+                                    naming_group.set(false);
                                 },
-                                div { class: "flex items-center gap-2",
-                                    span { class: "shrink-0 text-slate-500 dark:text-slate-400",
-                                        if row.connecting.is_some() {
-                                            Spinner {}
-                                        } else {
-                                            BackendIcon { dialect: Dialect::from(row.backend), size: 16 }
-                                        }
-                                    }
-                                    span { class: "truncate text-sm font-medium text-slate-900 dark:text-slate-200",
-                                        "{row.name}"
-                                    }
-                                    span {
-                                        class: match row.backend {
-                                            BackendKind::Postgres => "rounded bg-cyan-100 dark:bg-cyan-900/50 px-1.5 py-0.5 text-xs text-cyan-700 dark:text-cyan-300",
-                                            BackendKind::SqlServer => "rounded bg-red-100 dark:bg-red-900/50 px-1.5 py-0.5 text-xs text-red-700 dark:text-red-300",
-                                            // A step darker than the row's hover shade; at
-                                            // bg-slate-200 the badge disappeared into it.
-                                            BackendKind::Sqlite => "rounded bg-slate-300 dark:bg-slate-700 px-1.5 py-0.5 text-xs text-slate-600 dark:text-slate-300",
-                                        },
-                                        match row.backend {
-                                            BackendKind::Postgres => "postgres",
-                                            BackendKind::SqlServer => "sql server",
-                                            BackendKind::Sqlite => "sqlite",
-                                        }
-                                    }
-                                    if row.tunnel.is_some() {
-                                        span { class: "rounded bg-teal-100 dark:bg-teal-900/50 px-1.5 py-0.5 text-xs text-teal-700 dark:text-teal-300",
-                                            "ssh"
-                                        }
-                                    }
-                                    if row.is_open {
-                                        span { class: "rounded bg-sky-100 dark:bg-sky-900/60 px-1.5 py-0.5 text-xs text-sky-700 dark:text-sky-300",
-                                            "open"
-                                        }
-                                    }
-                                    // Protection is never silent (FRE-111):
-                                    // the user should never wonder why a save
-                                    // button is disabled or a prompt appeared.
-                                    if let Some(badge) = row.protection.badge() {
-                                        span { class: "rounded bg-amber-100 dark:bg-amber-900/50 px-1.5 py-0.5 text-xs text-amber-700 dark:text-amber-300",
-                                            "{badge}"
-                                        }
-                                    }
-                                }
-                                // The step replaces the locator while connecting:
-                                // the locator is already on screen in the name,
-                                // and the phase is what the user needs.
-                                //
-                                // One element for both, never swapped out: a
-                                // live region only announces changes made after
-                                // it exists, so a region created together with
-                                // the first step would stay silent for it.
-                                div {
-                                    class: if row.connecting.is_some() {
-                                        "truncate text-xs text-slate-500 dark:text-slate-400"
-                                    } else {
-                                        "truncate font-mono text-xs text-slate-500"
-                                    },
-                                    aria_live: "polite",
-                                    if let Some(step) = row.connecting {
-                                        "{step.label()}"
-                                    } else {
-                                        "{row.locator}"
-                                    }
+                                "Cancel"
+                            }
+                        }
+                    }
+                    if let Some(err) = group_error() {
+                        p { class: "text-xs text-red-600 dark:text-red-400", "{err}" }
+                    }
+                }
+            }
+            // A search that matches nothing says so, rather than looking like
+            // an empty connections list.
+            if has_saved && sections.is_empty() {
+                p { class: "text-sm text-slate-500 dark:text-slate-400",
+                    "No connection matches “{query}”."
+                }
+            }
+            for section in sections {
+                // One bordered block per section, so a group reads as
+                // containing its rows rather than sitting above them.
+                div {
+                    key: "{section.name:?}",
+                    class: "w-full max-w-xl overflow-hidden rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/60",
+                    if let Some(name) = section.name.clone() {
+                        GroupHeader {
+                            name,
+                            count: section.rows.len(),
+                            collapsed: section.collapsed,
+                            first: section.first,
+                            last: section.last,
+                            renaming_group,
+                            rename_draft,
+                            confirm_delete_group,
+                            group_error,
+                        }
+                    }
+                    // The ungrouped rows are labelled only once a group
+                    // exists: with no groups at all the list is exactly the
+                    // flat one it has always been, header and all.
+                    if section.name.is_none() && !groups.is_empty() {
+                        div { class: "border-b border-slate-200 dark:border-slate-800 px-3 py-1.5 text-xs font-semibold uppercase tracking-wide text-slate-500",
+                            "Ungrouped"
+                        }
+                    }
+                    if !section.collapsed {
+                        ul { class: "divide-y divide-slate-200 dark:divide-slate-800",
+                            for row in section.rows.clone() {
+                                SavedConnectionRow {
+                                    key: "{row.locator}",
+                                    row,
+                                    groups: groups.clone(),
+                                    confirm_remove,
+                                    settings_open,
+                                    open_form,
                                 }
                             }
-                            // Only the row actions sit outside the connect
-                            // button; everything left of them is one click
-                            // target spanning the full row height.
-                            // Icon-only to keep the row narrow; `title` carries
-                            // the label the text used to, and `aria_label`
-                            // keeps it named for screen readers.
-                            div { class: "flex shrink-0 items-center gap-1 pr-2",
-                                if row.connecting.is_some() {
-                                    // Editing or removing a connection mid-connect
-                                    // would fight the attempt in flight, so the
-                                    // only action offered is calling it off.
-                                    if row.cancellable {
-                                        button {
-                                            class: "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
-                                            title: "Cancel",
-                                            aria_label: "Cancel connecting",
-                                            onclick: {
-                                                let key = row.key.clone();
-                                                move |_| state.cancel_connect(&key)
-                                            },
-                                            X { size: 14 }
-                                        }
-                                    }
-                                } else if confirm_remove().as_deref() == Some(row.locator.as_str()) {
-                                    // Armed: the icons step aside for the
-                                    // confirmation, same shape as the editor's
-                                    // "Clear this connection's history?".
-                                    div { class: "flex items-center gap-2",
-                                        span { class: "text-xs text-amber-700 dark:text-amber-300", "Remove?" }
-                                        button {
-                                            class: "cursor-pointer rounded bg-amber-600 px-2 py-0.5 text-xs font-semibold text-slate-950 hover:bg-amber-500",
-                                            onclick: {
-                                                let locator = row.locator.clone();
-                                                move |_| {
-                                                    state.remove_saved(&locator);
-                                                    confirm_remove.set(None);
-                                                }
-                                            },
-                                            "Remove"
-                                        }
-                                        button {
-                                            class: "cursor-pointer rounded border border-slate-400 dark:border-slate-600 px-2 py-0.5 text-xs text-slate-900 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
-                                            onclick: move |_| confirm_remove.set(None),
-                                            "Keep"
-                                        }
-                                    }
-                                } else {
-                                    // Marking is offered for every backend,
-                                    // including SQLite — which has no edit
-                                    // form, so this is the only place it can
-                                    // be protected from.
-                                    button {
-                                        class: if marking_open() == Some(row.locator.clone()) {
-                                            "cursor-pointer rounded bg-slate-300 dark:bg-slate-700 p-1.5 text-slate-900 dark:text-slate-200"
-                                        } else {
-                                            "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200"
-                                        },
-                                        title: "Write protection and colour",
-                                        aria_label: "Write protection and colour",
-                                        aria_expanded: if marking_open() == Some(row.locator.clone()) { "true" } else { "false" },
-                                        onclick: {
-                                            let locator = row.locator.clone();
-                                            move |_| {
-                                                let open = marking_open() == Some(locator.clone());
-                                                marking_open.set((!open).then(|| locator.clone()));
-                                            }
-                                        },
-                                        ShieldAlert { size: 14 }
-                                    }
-                                    if row.backend != BackendKind::Sqlite {
-                                        button {
-                                            class: "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
-                                            title: "Edit",
-                                            aria_label: "Edit saved connection",
-                                            onclick: {
-                                                let locator = row.locator.clone();
-                                                move |_| {
-                                                    let entry = state
-                                                        .saved
-                                                        .read()
-                                                        .entries()
-                                                        .iter()
-                                                        .find(|s| s.locator() == locator)
-                                                        .cloned();
-                                                    if let Some(entry) = entry {
-                                                        open_form.set(Some(ConnectForm::Edit(entry)));
-                                                    }
-                                                }
-                                            },
-                                            Pencil { size: 14 }
-                                        }
-                                    }
-                                    button {
-                                        class: "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
-                                        title: "Remove",
-                                        aria_label: "Remove saved connection",
-                                        onclick: {
-                                            let locator = row.locator.clone();
-                                            move |_| confirm_remove.set(Some(locator.clone()))
-                                        },
-                                        Trash2 { size: 14 }
-                                    }
-                                }
-                            }
-                            // The marking editor (FRE-111), expanded inline
-                            // below its row — the row is already a full-width
-                            // click target, so a floating popover would have
-                            // to be dismissed before the row could be used.
-                            if marking_open() == Some(row.locator.clone()) {
-                                MarkingEditor {
-                                    locator: row.locator.clone(),
-                                    protection: row.protection,
-                                    color: row.color,
-                                }
+                        }
+                        if section.rows.is_empty() {
+                            p { class: "px-4 py-3 text-xs text-slate-500 dark:text-slate-400",
+                                "No connections here yet — open a connection's shield button and pick this group."
                             }
                         }
                     }
@@ -624,15 +1095,15 @@ pub(super) fn ConnectionsScreen() -> Element {
                         },
                         // Only server connections reach here; the Edit action
                         // isn't offered on SQLite entries.
-                        ConnectForm::Edit(saved @ SavedConnection::SqlServer { .. }) => rsx! {
+                        ConnectForm::Edit(saved) if matches!(*saved, SavedConnection::SqlServer { .. }) => rsx! {
                             SqlServerForm {
-                                edit: saved.clone(),
+                                edit: (*saved).clone(),
                                 on_done: move |_| open_form.set(None),
                             }
                         },
                         ConnectForm::Edit(saved) => rsx! {
                             PostgresForm {
-                                edit: saved.clone(),
+                                edit: (*saved).clone(),
                                 on_done: move |_| open_form.set(None),
                             }
                         },
