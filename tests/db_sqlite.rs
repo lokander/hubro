@@ -4,8 +4,8 @@ mod common;
 
 use common::FixtureDb;
 use hubro::db::{
-    apply_staged, Capabilities, DbError, DbPool, Restriction, RowCount, RowIdentity, RowLocator,
-    StagedChange, TableKind, TableMeta, Value,
+    apply_staged, explain_statement, Capabilities, DbError, DbPool, PlanDisplay, Restriction,
+    RowCount, RowIdentity, RowLocator, StagedChange, TableKind, TableMeta, Value,
 };
 
 fn table<'a>(tables: &'a [TableMeta], name: &str) -> &'a TableMeta {
@@ -502,5 +502,45 @@ async fn sqlite_reports_rows_only_after_analyze_and_never_reports_a_size() {
             .unwrap(),
         3
     );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_explains_a_query_as_raw_output() {
+    let fixture = FixtureDb::full().await;
+    let pool = fixture.open().await;
+
+    // SQLite gets the degrade path (FRE-119): a dialect-appropriate EXPLAIN,
+    // shown verbatim. Only PostgreSQL's JSON is parsed into a tree, and
+    // claiming otherwise here would render a plan hubro invented.
+    let support = pool
+        .explain_support()
+        .expect("sqlite has EXPLAIN QUERY PLAN");
+    assert!(!support.structured);
+
+    let sql = explain_statement("SELECT * FROM artists WHERE name = 'x'", support);
+    assert_eq!(
+        sql,
+        "EXPLAIN QUERY PLAN SELECT * FROM artists WHERE name = 'x'"
+    );
+    let result = pool.query(&sql).await.unwrap();
+    let PlanDisplay::Raw(text) = PlanDisplay::from_result(support.structured, &result) else {
+        panic!("only postgres produces a parsed tree");
+    };
+    // The server's own words, with the column names that make them readable.
+    assert!(text.starts_with("id | parent | notused | detail"), "{text}");
+    assert!(text.contains("artists"), "{text}");
+    assert!(text.contains("SCAN") || text.contains("SEARCH"), "{text}");
+
+    // And the statement was explained, not run: EXPLAIN QUERY PLAN of a
+    // DELETE reports the plan and leaves the rows alone. hubro never adds
+    // ANALYZE, and SQLite's EXPLAIN has no such option to add.
+    let before = pool.query("SELECT count(*) FROM artists").await.unwrap();
+    pool.query(&explain_statement("DELETE FROM artists", support))
+        .await
+        .unwrap();
+    let after = pool.query("SELECT count(*) FROM artists").await.unwrap();
+    assert_eq!(before.rows, after.rows);
+
     pool.close().await;
 }

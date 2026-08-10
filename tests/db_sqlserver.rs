@@ -1207,3 +1207,26 @@ async fn sqlserver_an_empty_table_reports_zero_rows_not_nothing() {
     run_all(&pool, &["DROP TABLE dbo.stats_empty"]).await;
     pool.close().await;
 }
+
+#[tokio::test]
+async fn sqlserver_offers_no_plan_view_rather_than_a_dangerous_one() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+
+    // T-SQL has no `EXPLAIN` statement (FRE-119). Its estimated plan comes
+    // from `SET SHOWPLAN_XML ON`, a session setting that must stand alone in
+    // its batch and makes the *next* batch return a plan instead of running
+    // it — and hubro's script path hands each statement to the pool
+    // separately, so the setting and the statement it is meant to cover can
+    // land on different connections. Getting that wrong executes a statement
+    // the user asked only to have explained, so the connection declares no
+    // plan support at all and the editor disables the action with a reason.
+    //
+    // Asserted against a live server rather than only against the dialect
+    // because this is what the UI reads: a backend that started answering
+    // `Some` here would silently start prefixing SQL Server statements with a
+    // keyword it does not have.
+    assert!(pool.explain_support().is_none());
+
+    pool.close().await;
+}

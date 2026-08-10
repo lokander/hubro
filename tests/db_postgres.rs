@@ -8,9 +8,10 @@
 //! ```
 
 use hubro::db::{
-    detect_row_identity, url_with_password, Capabilities, DbError, DbPool, Dialect, Filter,
-    Internal, PageRequest, PgFlavor, Restriction, RowCount, RowLocator, SortDir, TableKind,
-    TypeDetail, TypeRef, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
+    detect_row_identity, explain_statement, needs_confirmation, run_script, url_with_password,
+    Capabilities, DbError, DbPool, Dialect, Filter, Internal, PageRequest, PgFlavor, PlanDisplay,
+    Restriction, Rollback, RowCount, RowLocator, SortDir, TableKind, TypeDetail, TypeRef, Value,
+    PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 fn test_url() -> Option<String> {
@@ -1149,5 +1150,134 @@ async fn an_analyzed_empty_table_reports_zero_rows_rather_than_nothing() {
     assert_eq!(pool.count_table_rows(&meta).await.unwrap(), 0);
 
     pool.query("DROP TABLE stats_empty").await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_explains_a_query_as_a_structured_plan() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    fresh_fixture(&pool, "fruits_plan").await;
+
+    // Stock PostgreSQL is the one flavor that gets the JSON form (FRE-119).
+    let support = pool.explain_support().expect("postgres has EXPLAIN");
+    assert!(support.structured);
+
+    let sql = explain_statement(
+        "SELECT name FROM fruits_plan WHERE weight > 1 ORDER BY name",
+        support,
+    );
+    assert_eq!(
+        sql,
+        "EXPLAIN (FORMAT JSON) SELECT name FROM fruits_plan WHERE weight > 1 ORDER BY name"
+    );
+    let result = pool.query(&sql).await.unwrap();
+
+    // The whole point of the structured path: a real server's output parses
+    // into a tree, not into the raw-text fallback. A `FORMAT JSON` column that
+    // stopped decoding as JSON — or a plan shape this parser stopped
+    // recognizing — would land in Raw and still "work", which is exactly the
+    // silent degrade this asserts against.
+    let PlanDisplay::Tree(tree) = PlanDisplay::from_result(support.structured, &result) else {
+        panic!("a real postgres plan must parse as a tree, not degrade to raw text");
+    };
+    let rows = tree.rows();
+    // A sort over a scan: at least two nodes, parent before child.
+    assert!(rows.len() >= 2, "{rows:?}");
+    assert_eq!(rows[0].0, 0);
+    assert_eq!(rows[1].0, 1);
+    assert_eq!(rows[0].1.node_type, "Sort");
+    assert!(rows.iter().any(|(_, node)| node.node_type.contains("Scan")));
+    // Every node carries the numbers the view exists to show, and the scan
+    // names the table it reads.
+    for (_, node) in &rows {
+        assert!(node.total_cost.is_some(), "{node:?}");
+        assert!(node.plan_rows.is_some(), "{node:?}");
+        // A plain EXPLAIN measures nothing — the statement did not run.
+        assert_eq!(node.actual_rows, None, "{node:?}");
+    }
+    assert!(rows
+        .iter()
+        .any(|(_, node)| node.label().contains("on fruits_plan")));
+    assert_eq!(tree.execution_ms, None);
+    // Costs are shares of the same total, and something has to hold the cost.
+    assert_eq!(tree.total_cost, tree.root.total_cost.unwrap());
+    assert!(rows.iter().any(|(_, node)| node.expensive));
+
+    pool.query("DROP TABLE fruits_plan").await.unwrap();
+    pool.close().await;
+}
+
+/// The `fruits_guard` names, in id order — what "did the statement run?" is
+/// asked of.
+async fn guard_names(pool: &DbPool) -> Vec<String> {
+    pool.query("SELECT name FROM fruits_guard ORDER BY id")
+        .await
+        .unwrap()
+        .rows
+        .iter()
+        .map(|row| row[0].display())
+        .collect()
+}
+
+#[tokio::test]
+async fn postgres_explain_analyze_of_a_write_cannot_slip_past_the_gate() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    fresh_fixture(&pool, "fruits_guard").await;
+    let before = guard_names(&pool).await;
+
+    // What the Explain action generates for an UPDATE: a plain EXPLAIN, which
+    // costs the statement without running it. Asserted against the table
+    // rather than against the plan, because "did it run?" is the only question
+    // that matters here.
+    let planned = explain_statement(
+        "UPDATE fruits_guard SET name = 'planned'",
+        pool.explain_support().unwrap(),
+    );
+    pool.query(&planned).await.unwrap();
+    assert_eq!(
+        guard_names(&pool).await,
+        before,
+        "a plain EXPLAIN must not write"
+    );
+
+    // Why the gate exists: the same statement with ANALYZE — which hubro never
+    // adds, but a user can type — really does write. If this ever stops
+    // changing rows, the guard below is guarding nothing and the tests that
+    // rely on it are worth nothing.
+    let analyzed = "EXPLAIN (ANALYZE, FORMAT JSON) UPDATE fruits_guard SET name = 'analyzed'";
+    assert!(needs_confirmation(analyzed, Dialect::Postgres));
+
+    // The gate itself, at the layer the SQL pane calls: a connection whose
+    // capabilities forbid writes refuses the statement outright, and the run
+    // reports that nothing was sent.
+    let refused = run_script(
+        &pool,
+        Capabilities::FULL.read_only(),
+        &[analyzed.to_string()],
+        |_| panic!("a refused script must not execute a statement"),
+    )
+    .await
+    .expect_err("a read-only connection must refuse EXPLAIN ANALYZE of a write");
+    assert!(matches!(refused.error, DbError::Unsupported(_)));
+    assert_eq!(refused.rollback, Rollback::None);
+    assert_eq!(
+        guard_names(&pool).await,
+        before,
+        "a refused EXPLAIN ANALYZE must leave the table untouched"
+    );
+
+    // And with the capability, it writes — the fact the refusal above is
+    // protecting against, proved on the same server in the same test.
+    run_script(&pool, Capabilities::FULL, &[analyzed.to_string()], |_| {})
+        .await
+        .unwrap();
+    assert!(guard_names(&pool)
+        .await
+        .iter()
+        .all(|name| name == "analyzed"));
+
+    pool.query("DROP TABLE fruits_guard").await.unwrap();
     pool.close().await;
 }

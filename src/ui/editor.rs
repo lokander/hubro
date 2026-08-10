@@ -4,9 +4,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::db::{
-    needs_confirmation, ConnectionId, Dialect, ExportFormat, QueryResult, Rollback,
-    StatementOutcome, TableMeta, Value, MARKED_READ_ONLY, MAX_QUERY_ROWS, NO_DDL, NO_MUTATE,
-    NO_QUERY,
+    needs_confirmation, ConnectionId, Dialect, ExportFormat, PlanDisplay, PlanNode, PlanTree,
+    QueryResult, Rollback, StatementOutcome, TableMeta, Value, EXPENSIVE_SHARE, MARKED_READ_ONLY,
+    MAX_QUERY_ROWS, NO_DDL, NO_EXPLAIN, NO_MUTATE, NO_QUERY,
 };
 
 use super::history_panel::HistoryPanel;
@@ -73,6 +73,16 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
         .get(id)
         .map(|c| c.pool.dialect())
         .unwrap_or(Dialect::Sqlite);
+    // Whether this connection can produce a plan at all, and whether that
+    // plan will be structured (FRE-119). `None` disables the Explain button
+    // rather than hiding it: "SQL Server has no EXPLAIN" is worth saying once
+    // more than it is worth leaving the user to wonder.
+    let explain_support = state
+        .registry
+        .read()
+        .get(id)
+        .and_then(|c| c.pool.explain_support());
+    let structured_plans = explain_support.is_some_and(|support| support.structured);
     let editor_element = editor_element_id(id);
     // The query tabs and which one is showing (FRE-113). Both are memos: they
     // read `tab_ui`, which changes on every keystroke, and a memo's PartialEq
@@ -181,6 +191,24 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
                             "Cancel"
                         }
                     }
+                    button {
+                        class: if explain_support.is_some() {
+                            "rounded border border-slate-300 dark:border-slate-700 px-2 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100"
+                        } else {
+                            "rounded border border-slate-200 dark:border-slate-800 px-2 py-0.5 text-xs text-slate-400 dark:text-slate-600 cursor-not-allowed"
+                        },
+                        disabled: explain_support.is_none(),
+                        title: match explain_support {
+                            // Named rather than implied: EXPLAIN shows the
+                            // plan without running the statement, but an
+                            // EXPLAIN ANALYZE the user wrote themselves does
+                            // run it — and is passed through as written.
+                            Some(_) => "Show the query plan for this buffer, without running it",
+                            None => NO_EXPLAIN,
+                        },
+                        onclick: move |_| state.run_explain(id, active),
+                        "Explain"
+                    }
                     PanelButton { panel, target: EditorPanel::Saved, label: "Saved" }
                     PanelButton { panel, target: EditorPanel::History, label: "History" }
                 }
@@ -261,11 +289,20 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
                     },
                     Some(run) => rsx! {
                         for (index, statement) in run.statements.iter().enumerate() {
-                            StatementSection {
-                                key: "{index}",
-                                id,
-                                index: index + 1,
-                                result: statement.clone(),
+                            if run.explain {
+                                PlanSection {
+                                    key: "{index}",
+                                    index: index + 1,
+                                    structured: structured_plans,
+                                    result: statement.clone(),
+                                }
+                            } else {
+                                StatementSection {
+                                    key: "{index}",
+                                    id,
+                                    index: index + 1,
+                                    result: statement.clone(),
+                                }
                             }
                         }
                         RunStatusLine { status: run.status.clone(), statement_count: run.statements.len() }
@@ -765,6 +802,153 @@ fn result_cell(value: &Value) -> Element {
             div { class: "max-w-md truncate", title: "{display}", "{display}" }
         }
     }
+}
+
+/// One explained statement (FRE-119): the same header line a result section
+/// has, and below it the plan — a tree for stock PostgreSQL's JSON, the
+/// server's own output verbatim for every other backend (and for PostgreSQL
+/// output that isn't the JSON we asked for, e.g. a user-written `EXPLAIN
+/// ANALYZE`).
+///
+/// Takes the Arc-shared statement for the same reason [`StatementSection`]
+/// does: the prop diffs by pointer, so the plan is parsed once per run rather
+/// than once per render.
+#[component]
+fn PlanSection(index: usize, structured: bool, result: SharedStatement) -> Element {
+    let display = match &result.outcome {
+        StatementOutcome::Rows(rows) => PlanDisplay::from_result(structured, rows),
+        // An EXPLAIN returns rows on every backend hubro speaks; this is the
+        // shape the type allows rather than one seen in practice.
+        StatementOutcome::Affected(n) => PlanDisplay::Raw(format!("{n} rows affected")),
+    };
+    rsx! {
+        div { class: "border-b border-slate-200 dark:border-slate-800",
+            p { class: "flex items-baseline gap-2 bg-slate-100 dark:bg-slate-900/60 px-4 py-1.5 text-xs",
+                span { class: "font-mono text-slate-500", "{index}" }
+                span { class: "min-w-0 truncate font-mono text-slate-900 dark:text-slate-300", "{result.preview}" }
+                if let PlanDisplay::Tree(tree) = &display {
+                    span { class: "shrink-0 text-cyan-700 dark:text-cyan-400",
+                        "— total cost {format_cost(tree.total_cost)}"
+                    }
+                }
+            }
+            if result.truncated {
+                div { class: "px-4 pt-2",
+                    Banner {
+                        kind: BannerKind::Warning,
+                        message: format!(
+                            "Plan truncated — showing the first {MAX_QUERY_ROWS} rows of output.",
+                        ),
+                    }
+                }
+            }
+            match &display {
+                PlanDisplay::Tree(tree) => rsx! { PlanTreeView { tree: (**tree).clone() } },
+                PlanDisplay::Raw(text) if text.is_empty() => rsx! {
+                    p { class: "px-4 py-2 text-sm text-slate-500", "The server returned no plan." }
+                },
+                PlanDisplay::Raw(text) => rsx! {
+                    pre { class: "overflow-x-auto px-4 py-2 font-mono text-xs text-slate-900 dark:text-slate-200",
+                        "{text}"
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// A parsed plan as an indented tree, expensive nodes highlighted.
+#[component]
+fn PlanTreeView(tree: PlanTree) -> Element {
+    let expensive = tree.rows().iter().filter(|(_, n)| n.expensive).count();
+    rsx! {
+        div { class: "py-1",
+            for (position, (depth, node)) in tree.rows().into_iter().enumerate() {
+                div { key: "{position}", {plan_node_row(depth, node)} }
+            }
+        }
+        p { class: "px-4 pb-2 text-xs text-slate-500 dark:text-slate-400",
+            if expensive > 0 {
+                // Says what the highlight means, in the terms it was decided
+                // in — the share is read from the constant, so a change to the
+                // rule cannot leave this sentence describing the old one.
+                "Highlighted: each adds at least {(EXPENSIVE_SHARE * 100.0) as u32}% of the plan's total cost on its own."
+            }
+            if let Some(planning) = tree.planning_ms {
+                " Planning {format_ms(planning)} ms."
+            }
+            if let Some(execution) = tree.execution_ms {
+                " Execution {format_ms(execution)} ms — this plan was measured, so the statement ran."
+            }
+        }
+    }
+}
+
+/// One node's line: its label, what it costs, and what it is expected (or was
+/// measured) to return. A plain function rather than a component — like
+/// [`result_cell`] — so a wide plan doesn't pay for a component instance and
+/// an owned prop clone per node.
+fn plan_node_row(depth: usize, node: &PlanNode) -> Element {
+    let indent = format!("{}rem", depth as f64 * 1.25 + 1.0);
+    let class = if node.expensive {
+        "flex flex-wrap items-baseline gap-x-3 border-l-2 border-amber-500 bg-amber-100 dark:bg-amber-950/30 py-0.5 pr-4 text-xs"
+    } else {
+        "flex flex-wrap items-baseline gap-x-3 border-l-2 border-transparent py-0.5 pr-4 text-xs"
+    };
+    rsx! {
+        div { class, padding_left: "{indent}",
+            span { class: "font-mono font-semibold text-slate-900 dark:text-slate-200", "{node.label()}" }
+            if let (Some(startup), Some(total)) = (node.startup_cost, node.total_cost) {
+                span { class: "font-mono text-slate-500",
+                    "cost {format_cost(startup)}..{format_cost(total)}"
+                }
+            } else if let Some(total) = node.total_cost {
+                span { class: "font-mono text-slate-500", "cost {format_cost(total)}" }
+            }
+            if let Some(rows) = node.plan_rows {
+                span { class: "font-mono text-slate-500", "rows {format_rows(rows)}" }
+            }
+            if let Some(actual) = node.actual_rows {
+                span { class: "font-mono text-cyan-700 dark:text-cyan-400",
+                    "actual {format_rows(actual)}"
+                    if let Some(ms) = node.actual_ms {
+                        " in {format_ms(ms)} ms"
+                    }
+                    if let Some(loops) = node.loops {
+                        if loops > 1.0 {
+                            " × {format_rows(loops)} loops"
+                        }
+                    }
+                }
+            }
+            if node.expensive {
+                span { class: "rounded bg-amber-600 px-1.5 text-xs font-semibold text-slate-950",
+                    "{(node.cost_share * 100.0).round() as u32}% of cost"
+                }
+            }
+        }
+    }
+}
+
+/// A plan cost, in the two decimals PostgreSQL itself prints.
+fn format_cost(cost: f64) -> String {
+    format!("{cost:.2}")
+}
+
+/// A row count or loop count: whole numbers stay whole (the planner's
+/// estimates are integers), fractions keep two decimals (an `ANALYZE` actual
+/// row count is an average over loops).
+fn format_rows(rows: f64) -> String {
+    if rows.fract() == 0.0 && rows.abs() < 1e15 {
+        format!("{rows:.0}")
+    } else {
+        format!("{rows:.2}")
+    }
+}
+
+/// A millisecond timing, to three decimals like `EXPLAIN ANALYZE`.
+fn format_ms(ms: f64) -> String {
+    format!("{ms:.3}")
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ use super::ddl::{Ddl, DdlObject};
 use super::error::DbError;
 use super::export::ExportFormat;
 use super::page::{classify_column, ColumnClass, Page, PageRequest, PREVIEW_BYTES};
+use super::plan;
 use super::postgres;
 use super::rowkey::{detect_row_identity, RowIdentity};
 use super::schema::{ColumnMeta, TableMeta};
@@ -188,6 +189,30 @@ impl DbPool {
         match self {
             DbPool::Postgres(pg) => Some(pg.flavor()),
             DbPool::Sqlite(_) | DbPool::SqlServer(_) => None,
+        }
+    }
+
+    /// How this connection produces a query plan (FRE-119), or `None` when it
+    /// has no `EXPLAIN` statement to produce one with — see
+    /// [`NO_EXPLAIN`](super::plan::NO_EXPLAIN) for why SQL Server is that
+    /// case.
+    ///
+    /// Kept here rather than derived from [`Self::dialect`] at the call site
+    /// because it is a fact about the *server*, not the driver: the
+    /// Postgres-wire engines that are not PostgreSQL get the portable
+    /// spelling, in the shape [`Self::backend_capabilities`] established for
+    /// the same reason.
+    pub fn explain_support(&self) -> Option<plan::ExplainSupport> {
+        match self {
+            DbPool::Sqlite(_) => Some(plan::ExplainSupport::SQLITE),
+            DbPool::Postgres(pg) => Some(match pg.flavor() {
+                postgres::PgFlavor::Postgres => plan::ExplainSupport::PG_JSON,
+                postgres::PgFlavor::CockroachDB
+                | postgres::PgFlavor::Yugabyte
+                | postgres::PgFlavor::Materialize
+                | postgres::PgFlavor::RisingWave => plan::ExplainSupport::PG_TEXT,
+            }),
+            DbPool::SqlServer(_) => None,
         }
     }
 

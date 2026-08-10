@@ -124,7 +124,65 @@ impl AppState {
     /// A statement the connection's capabilities forbid (FRE-87) is refused
     /// here, *before* the confirmation banner — being asked to confirm a
     /// write that can never run is a prompt with no right answer.
-    pub fn run_sql(mut self, id: ConnectionId, buffer: u64, sql: String) {
+    pub fn run_sql(self, id: ConnectionId, buffer: u64, sql: String) {
+        let statements = match self.registry.read().get(id) {
+            Some(connection) => split_statements(&sql, connection.pool.dialect()),
+            None => return, // connection closed underneath the editor
+        };
+        self.start_sql(id, buffer, sql, statements, false);
+    }
+
+    /// Explains one query tab's buffer (FRE-119): every statement in it gets
+    /// its connection's `EXPLAIN` prefix, and the result renders as a query
+    /// plan instead of a grid.
+    ///
+    /// **Runs through [`Self::start_sql`] like any other script**, which is the
+    /// whole of the safety design. `EXPLAIN ANALYZE` executes what it explains,
+    /// so a plan view with an execution path of its own would be a second place
+    /// to keep the write-confirmation and capability gates correct — and the
+    /// first one to fall behind. [`explain_statement`] only ever *adds* a
+    /// prefix (never `ANALYZE`), and `script`'s `explaining_never_loosens_the_gate`
+    /// pins that such a prefix can never lower what a statement is charged for.
+    ///
+    /// Explains the buffer, not a selection: Ctrl+Enter reads the selection
+    /// from CodeMirror as it fires, and a button press has no such event to
+    /// read it from. It therefore also uses the buffer text as last synced
+    /// from the editor, which the bundle flushes on a 250 ms trailing timer —
+    /// the same small staleness the saved-query and history paths already
+    /// live with.
+    pub fn run_explain(self, id: ConnectionId, buffer: u64) {
+        let backend = self.registry.read().get(id).and_then(|connection| {
+            Some((
+                connection.pool.dialect(),
+                connection.pool.explain_support()?,
+            ))
+        });
+        // No EXPLAIN on this backend (or the tab closed underneath the
+        // button): nothing to run, and the disabled button already says why.
+        let Some((dialect, support)) = backend else {
+            return;
+        };
+        let statements: Vec<String> = split_statements(&self.sql_buffer_text(id, buffer), dialect)
+            .iter()
+            .map(|statement| explain_statement(statement, support))
+            .collect();
+        // What history records and the banner counts: the statements that
+        // will actually run, not the text they were built from.
+        let script = statements.join(";\n");
+        self.start_sql(id, buffer, script, statements, true);
+    }
+
+    /// The shared entry point behind [`Self::run_sql`] and
+    /// [`Self::run_explain`]: one capability gate, one confirmation gate, one
+    /// execution path.
+    fn start_sql(
+        mut self,
+        id: ConnectionId,
+        buffer: u64,
+        sql: String,
+        statements: Vec<String>,
+        explain: bool,
+    ) {
         self.pending_sql.write().remove(&(id, buffer));
         // Effective capabilities: the backend's, narrowed by the user's
         // marking (FRE-111). Reading `pool.backend_capabilities()` here instead would
@@ -133,7 +191,6 @@ impl AppState {
             Some(connection) => (connection.pool.dialect(), connection.capabilities()),
             None => return, // connection closed underneath the editor
         };
-        let statements = split_statements(&sql, dialect);
         if statements.is_empty() {
             return;
         }
@@ -150,6 +207,7 @@ impl AppState {
                         statement_index,
                         preview: statement_preview(&statements[statement_index]),
                     },
+                    explain,
                 },
             );
             return;
@@ -160,18 +218,25 @@ impl AppState {
                 PendingSql {
                     script: sql,
                     statements,
+                    explain,
                 },
             );
             return;
         }
-        self.execute_script(id, buffer, sql, statements);
+        self.execute_script(id, buffer, sql, statements, explain);
     }
 
     /// Confirms the write banner: runs the stashed script.
     pub fn confirm_pending_sql(mut self, id: ConnectionId, buffer: u64) {
         let pending = self.pending_sql.write().remove(&(id, buffer));
         if let Some(pending) = pending {
-            self.execute_script(id, buffer, pending.script, pending.statements);
+            self.execute_script(
+                id,
+                buffer,
+                pending.script,
+                pending.statements,
+                pending.explain,
+            );
         }
     }
 
@@ -233,6 +298,7 @@ impl AppState {
         buffer: u64,
         script: String,
         statements: Vec<String>,
+        explain: bool,
     ) {
         let Some((pool, caps)) = self
             .registry
@@ -248,6 +314,7 @@ impl AppState {
             SqlRun {
                 statements: Vec::new(),
                 status: RunStatus::Running,
+                explain,
             },
         );
         // spawn_forever: the run must survive pane/tab switches unmounting
