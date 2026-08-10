@@ -523,17 +523,26 @@ pub(super) fn cast_targets(table: &TableMeta, dialect: Dialect) -> HashMap<&str,
 ///   materialized-view half of the introspection UNION fills `type_name`
 ///   from `format_type()`, which can legitimately emit `myschema.mytype`
 ///   (the charset gate also guarantees the interpolated cast text is inert);
-/// - for type names whose **bare form implies a restrictive default
+/// - for `character`, whose **bare form implies a restrictive default
 ///   modifier**: `data_type` drops length modifiers, so a `character(3)`
 ///   column reports just "character" — and `::character` means `char(1)`,
 ///   which would silently TRUNCATE the value to one character on SET (and
 ///   make a `char(n)` key column never match its row, aborting every
-///   save); `::bit` likewise means `bit(1)` and errors loudly. These are
-///   exactly the bare names with restrictive defaults — `character
-///   varying` and `numeric` stay castable because their bare forms are
-///   unbounded/unconstrained. For the skipped types the uncast text
-///   parameter is correct: Postgres's assignment/comparison coercion
-///   handles text → char(n)/bit(n) with the column's true modifier.
+///   save). `character varying` and `numeric` stay castable because their
+///   bare forms are unbounded/unconstrained. For `character` the uncast
+///   text parameter is correct: Postgres's assignment coercion handles
+///   text → char(n) with the column's true modifier (verified against
+///   Postgres 17 — an uncast text parameter assigns to `character(3)`).
+///
+/// `bit` is the one bare name that is **rewritten rather than skipped**
+/// (FRE-159). It has the same restrictive default — `::bit` means `bit(1)`
+/// — but unlike `character` it has no assignment coercion from text, so
+/// skipping the cast made `bit(n)` columns unwritable outright: the server
+/// answers *"column is of type bit but expression is of type text"*. It
+/// casts to `bit varying` instead, which is unbounded and which Postgres
+/// then assigns into `bit(n)` under the column's true modifier. A `bit
+/// varying` column already worked, since its `data_type` is not the bare
+/// name and passes through verbatim.
 fn cast_target(column: &ColumnMeta) -> Option<String> {
     // An enum/array column casts to its real type name, which `data_type`
     // doesn't carry (FRE-71). Both halves are arbitrary identifiers — a
@@ -548,10 +557,15 @@ fn cast_target(column: &ColumnMeta) -> Option<String> {
         ));
     }
     let lowered = column.type_name.trim().to_ascii_lowercase();
+    // Bare `bit` is `bit(n)`, whose modifier `data_type` dropped. `::bit`
+    // would mean `bit(1)`, so it casts to the unbounded member of the family
+    // and lets the column's own modifier apply on assignment (FRE-159).
+    if lowered == "bit" {
+        return Some("bit varying".to_string());
+    }
     let plain = !lowered.is_empty()
         && lowered != "array"
         && lowered != "character"
-        && lowered != "bit"
         && lowered.chars().all(|c| {
             c.is_ascii_lowercase() || c.is_ascii_digit() || c == ' ' || c == '_' || c == '.'
         });
@@ -937,6 +951,61 @@ mod tests {
         assert!(statements[0].params.is_empty());
     }
 
+    #[test]
+    fn bit_columns_cast_to_the_unbounded_member_of_their_family() {
+        // `data_type` reports bare "bit" for a `bit(n)` column, dropping the
+        // modifier. `::bit` would therefore mean `bit(1)`, but skipping the
+        // cast is not the answer either: unlike `character`, a bit-string has
+        // no assignment coercion from text, so an uncast parameter is refused
+        // outright ("column is of type bit but expression is of type text")
+        // and the column is unwritable — FRE-159. `bit varying` is unbounded,
+        // so it accepts the value and the column's own modifier applies.
+        let mut table = typed_pg_table();
+        table.columns.push(ColumnMeta {
+            name: "flags".into(),
+            type_name: "bit varying".into(),
+            nullable: true,
+            primary_key_position: None,
+            default: None,
+            generated: Generated::Never,
+            type_detail: crate::db::TypeDetail::Plain,
+        });
+        let (statements, _) = build_statements(
+            &table,
+            &identity(),
+            Dialect::Postgres,
+            &[
+                update(1, "mask", Value::Text("1010".into())),
+                update(1, "flags", Value::Text("1101".into())),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            statements[0].sql,
+            "UPDATE \"app\".\"typed\" SET \
+             \"mask\" = $1::bit varying, \"flags\" = $2::bit varying \
+             WHERE \"id\" = $3::integer",
+            "a bit column must carry a cast — without one the server refuses \
+             the text parameter and the column cannot be written at all"
+        );
+
+        // A `bit(n)` key column has the same problem in the WHERE clause: an
+        // uncast key never matches its row, which aborts the whole save.
+        let mut keyed = typed_pg_table();
+        for column in &mut keyed.columns {
+            column.primary_key_position = match column.name.as_str() {
+                "mask" => Some(1),
+                _ => None,
+            };
+        }
+        let casts = cast_targets(&keyed, Dialect::Postgres);
+        assert_eq!(casts.get("mask").map(String::as_str), Some("bit varying"));
+
+        // And no other dialect casts anything.
+        assert!(cast_targets(&keyed, Dialect::Sqlite).is_empty());
+        assert!(cast_targets(&keyed, Dialect::SqlServer).is_empty());
+    }
+
     fn typed_pg_table() -> TableMeta {
         let typed = |name: &str, type_name: &str, pk: Option<u32>| ColumnMeta {
             name: name.into(),
@@ -1094,17 +1163,19 @@ mod tests {
              WHERE \"id\" = $5::integer"
         );
 
-        // Bare "character" and "bit" imply restrictive default modifiers
-        // (`::character` = char(1) would TRUNCATE a character(3) value) —
-        // no cast; assignment coercion handles the uncast text correctly.
+        // Bare "character" implies a restrictive default modifier
+        // (`::character` = char(1) would TRUNCATE a character(3) value) — no
+        // cast; assignment coercion handles the uncast text correctly, which
+        // is verified against a live server in tests/db_postgres.rs.
         // "character varying" is unbounded when bare and keeps its cast.
+        // "bit" is the exception that is rewritten rather than skipped
+        // (FRE-159) — see the test below.
         let (statements, _) = build_statements(
             &typed_pg_table(),
             &identity(),
             Dialect::Postgres,
             &[
                 update(1, "code", Value::Text("xyz".into())),
-                update(1, "mask", Value::Text("1010".into())),
                 update(1, "nick", Value::Text("zed".into())),
             ],
         )
@@ -1112,8 +1183,8 @@ mod tests {
         assert_eq!(
             statements[0].sql,
             "UPDATE \"app\".\"typed\" SET \
-             \"code\" = $1, \"mask\" = $2, \"nick\" = $3::character varying \
-             WHERE \"id\" = $4::integer"
+             \"code\" = $1, \"nick\" = $2::character varying \
+             WHERE \"id\" = $3::integer"
         );
 
         // SQLite never casts — its type affinity coerces on its own.

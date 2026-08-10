@@ -40,6 +40,15 @@
 //! - everything else (including an empty/unknown declared type, and
 //!   Postgres `point`, whose `int` substring is explicitly ignored) → text
 //!
+//! One rule needs more than the name. Postgres `bit`/`bit varying` are
+//! bit-strings — `1010` is one value, not four booleans — while SQL Server's
+//! `bit` is its boolean type, and the word alone cannot tell them apart. So
+//! the derivation also takes the connection's dialect and asks
+//! [`is_bit_string`](crate::db::is_bit_string), the same predicate the import
+//! uses, rather than a second name-based rule that could drift from it
+//! (FRE-159). Without a connection there is no dialect — and nothing to save
+//! through either — so the name-based classification stands.
+//!
 //! Values committed here are only ever **staged** (via
 //! [`AppState::stage_cell_edit`](super::state::AppState::stage_cell_edit));
 //! nothing touches the database until the user saves.
@@ -47,7 +56,10 @@
 use dioxus::prelude::*;
 use dioxus_icons::lucide::RotateCcw;
 
-use crate::db::{classify_type, parse_numeric_text, Dialect, TypeClass, TypeDetail, Value};
+use crate::db::{
+    classify_type, is_bit_string, parse_numeric_text, validate_bit_literal, Dialect, TypeClass,
+    TypeDetail, Value,
+};
 
 // The boolean rendering lives with the shared coercion rules (`db::coerce`)
 // so the cell editor and the file import stage a checkbox identically; it is
@@ -80,6 +92,10 @@ pub enum EditorKind {
     /// A Postgres array column: the array literal as text, validated for
     /// well-formedness before staging (FRE-71).
     Array,
+    /// A Postgres `bit`/`bit varying` column: the literal as text, checked for
+    /// `0`s and `1`s before staging (FRE-159). Not a checkbox — a bit string
+    /// is a *string*, and `1010` is one value, not four booleans.
+    BitString,
 }
 
 impl EditorKind {
@@ -107,7 +123,7 @@ pub enum NumericKind {
 /// their order). The detail wins where it applies: Postgres names enum and
 /// array columns `USER-DEFINED` and `ARRAY`, which carry no type information
 /// at all.
-pub fn editor_kind(type_name: &str, detail: &TypeDetail) -> EditorKind {
+pub fn editor_kind(type_name: &str, detail: &TypeDetail, dialect: Option<Dialect>) -> EditorKind {
     match detail {
         // An enum type whose variants failed to resolve falls through to the
         // name-based rules rather than offering an empty dropdown.
@@ -118,6 +134,14 @@ pub fn editor_kind(type_name: &str, detail: &TypeDetail) -> EditorKind {
         }
         TypeDetail::Array { .. } => return EditorKind::Array,
         _ => {}
+    }
+    // `bit` names two unrelated types, so this one rule needs the dialect
+    // (FRE-159) — and it is [`is_bit_string`], the same one the import uses,
+    // rather than a second name-based rule that could drift from it. Without a
+    // connection there is no dialect and nothing to save through either, so
+    // the name-based classification stands.
+    if dialect.is_some_and(|dialect| is_bit_string(type_name, dialect)) {
+        return EditorKind::BitString;
     }
     match classify_type(type_name) {
         TypeClass::Binary => EditorKind::Blob,
@@ -133,6 +157,11 @@ pub fn editor_kind(type_name: &str, detail: &TypeDetail) -> EditorKind {
         TypeClass::Float => EditorKind::Numeric {
             kind: NumericKind::Float,
         },
+        // Only reachable via the dialect-aware check above, which has already
+        // returned by this point; mapped consistently rather than made a
+        // panic, so a future `classify_type` that did produce it would still
+        // behave.
+        TypeClass::BitString => EditorKind::BitString,
         TypeClass::Text => EditorKind::Text,
     }
 }
@@ -164,6 +193,9 @@ pub fn parse_input(kind: &EditorKind, dialect: Dialect, text: &str) -> Result<Va
             }
         }
         EditorKind::Array => validate_array_literal(text).map(|_| Value::Text(text.to_string())),
+        // The same check the import applies — literally the same function, so
+        // a value the grid accepts is one a CSV of the same column would too.
+        EditorKind::BitString => validate_bit_literal(text).map(|()| Value::Text(text.to_string())),
     }
 }
 
@@ -573,7 +605,7 @@ mod tests {
     /// Type-name-only derivation (no enum/array detail), which is what the
     /// name-matching rules below exercise.
     fn plain_kind(type_name: &str) -> EditorKind {
-        editor_kind(type_name, &TypeDetail::Plain)
+        editor_kind(type_name, &TypeDetail::Plain, None)
     }
 
     const INTEGER: EditorKind = EditorKind::Numeric {
@@ -600,7 +632,8 @@ mod tests {
                         name: "mood".into(),
                     },
                     variants: variants.clone(),
-                }
+                },
+                None
             ),
             EditorKind::Enum { variants }
         );
@@ -612,7 +645,8 @@ mod tests {
                         schema: "pg_catalog".into(),
                         name: "_text".into(),
                     }
-                }
+                },
+                None
             ),
             EditorKind::Array
         );
@@ -627,12 +661,57 @@ mod tests {
                         name: "mood".into(),
                     },
                     variants: vec![],
-                }
+                },
+                None
             ),
             EditorKind::Text
         );
         // Detail never overrides a plain column's derived kind.
-        assert_eq!(editor_kind("integer", &TypeDetail::Plain), INTEGER);
+        assert_eq!(editor_kind("integer", &TypeDetail::Plain, None), INTEGER);
+    }
+
+    #[test]
+    fn a_postgres_bit_column_edits_as_a_bit_string_and_a_sql_server_one_as_a_bool() {
+        // The cell editor and the import must agree about what `bit` is, and
+        // the name alone cannot say — so this one kind depends on the dialect
+        // (FRE-159). A checkbox here would be actively wrong: "1010" is a
+        // single value, and a checkbox has nowhere to put it.
+        assert_eq!(
+            editor_kind("bit", &TypeDetail::Plain, Some(Dialect::Postgres)),
+            EditorKind::BitString
+        );
+        assert_eq!(
+            editor_kind("bit varying", &TypeDetail::Plain, Some(Dialect::Postgres)),
+            EditorKind::BitString
+        );
+        // SQL Server's `bit` must not become a bit-string — that would reject
+        // every "yes"/"no" its boolean vocabulary accepts. It stays the text
+        // editor it has always been here.
+        //
+        // Note the asymmetry, which is **pre-existing and deliberately left
+        // alone**: the *import* reads this column as a boolean
+        // (`effective_class`, FRE-112) while the cell editor reads it as text,
+        // because `editor_kind` applies only the bit-string refinement. Making
+        // the editor offer a checkbox too is a behaviour change beyond FRE-159.
+        let sqlserver_bit = editor_kind("bit", &TypeDetail::Plain, Some(Dialect::SqlServer));
+        assert_ne!(sqlserver_bit, EditorKind::BitString);
+        assert_eq!(sqlserver_bit, EditorKind::Text);
+
+        // No connection means no dialect — and nothing to save through
+        // either, so the name-based classification stands.
+        assert_eq!(
+            editor_kind("bit", &TypeDetail::Plain, None),
+            EditorKind::Text
+        );
+
+        // The editor validates with the import's rule rather than a second
+        // copy of it, so a value the grid accepts is one a CSV of the same
+        // column would be too.
+        assert_eq!(
+            parse_input(&EditorKind::BitString, Dialect::Postgres, "1010").unwrap(),
+            Value::Text("1010".into())
+        );
+        assert!(parse_input(&EditorKind::BitString, Dialect::Postgres, "1020").is_err());
     }
 
     #[test]

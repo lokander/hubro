@@ -50,6 +50,11 @@ pub enum TypeClass {
     DateTime,
     /// blob/bytea/binary/varbinary/image.
     Binary,
+    /// Postgres `bit`/`bit varying`: a string of `0`/`1`, not a number and
+    /// not a boolean (FRE-159). Only ever produced by [`effective_class`],
+    /// never by [`classify_type`] — see there for why the distinction cannot
+    /// be made from the type name alone.
+    BitString,
 }
 
 /// Classifies a declared column type. See the module docs for the rules; the
@@ -112,28 +117,86 @@ pub fn classify_type(type_name: &str) -> TypeClass {
     TypeClass::Text
 }
 
-/// [`classify_type`] with the one refinement that needs to know the backend.
+/// [`classify_type`] with the refinements that need to know the backend.
 ///
-/// SQL Server's `bit` **is** its boolean type, but the name cannot say so on
-/// its own: Postgres `bit`/`bit varying` are bit-strings, where `1010` is a
-/// value and `yes` is not — and `staged::cast_target` already refuses to cast
-/// to `::bit` for that reason. So `classify_type`, which the cell editor
-/// shares and which only ever sees a name, keeps calling it text, and the
-/// refinement lives here where the dialect is in hand.
+/// The word `bit` names two unrelated things, and the name alone cannot tell
+/// them apart — which is the whole reason this function exists:
 ///
-/// Without it the boolean vocabulary was unreachable for the very type
-/// [`bool_value`] names: a `yes`/`no` column against SQL Server reached the
-/// server as text and failed there — *unskippably*, since only rows hubro
-/// rejects itself can be skipped.
+/// - **SQL Server `bit` is its boolean type.** Without the refinement the
+///   boolean vocabulary was unreachable for the very type [`bool_value`]
+///   names: a `yes`/`no` column reached the server as text and failed there —
+///   *unskippably*, since only rows hubro rejects itself can be skipped.
+/// - **Postgres `bit`/`bit varying` are bit-strings**, where `1010` is a value
+///   and `yes` is not. They get [`TypeClass::BitString`], whose check is that
+///   the text is `0`s and `1`s (FRE-159).
+///
+/// `classify_type` — shared with the cell editor, and only ever handed a name
+/// — keeps calling both of them text, so neither refinement can leak into a
+/// backend it would be wrong for.
+///
+/// The **declared length is not checked here**, because it is not
+/// introspected: `ColumnMeta` carries no `character_maximum_length`, so
+/// `bit(4)` and `bit varying(8)` are indistinguishable at this point. A
+/// wrong-length value is refused by the server, which says so precisely
+/// ("bit string length 2 does not match type bit(4)"). Only the character
+/// check is worth making client-side, and it is the one that turns an
+/// import-aborting server error into a row that can be skipped.
 fn effective_class(column: &ColumnMeta, dialect: Dialect) -> TypeClass {
     let class = classify_type(&column.type_name);
-    if dialect == Dialect::SqlServer
-        && class == TypeClass::Text
-        && column.type_name.trim().eq_ignore_ascii_case("bit")
-    {
+    if class != TypeClass::Text {
+        return class;
+    }
+    if is_bit_string(&column.type_name, dialect) {
+        return TypeClass::BitString;
+    }
+    if dialect == Dialect::SqlServer && column.type_name.trim().eq_ignore_ascii_case("bit") {
         return TypeClass::Bool;
     }
     class
+}
+
+/// Whether `type_name` names a Postgres bit-string column.
+///
+/// The one definition of that rule: [`effective_class`] uses it for the
+/// import, and the cell editor's `editor_kind` uses it directly, so the two
+/// entry points cannot drift into disagreeing about what a `bit` column is
+/// (FRE-159). Dialect-gated rather than name-only, because SQL Server's `bit`
+/// is a boolean and must never reach here — see [`effective_class`].
+pub(crate) fn is_bit_string(type_name: &str, dialect: Dialect) -> bool {
+    dialect == Dialect::Postgres
+        && matches!(
+            type_name.trim().to_ascii_lowercase().as_str(),
+            "bit" | "bit varying"
+        )
+}
+
+/// Checks a Postgres bit-string literal: `0`s and `1`s, nothing else.
+///
+/// Shared by the cell editor and the import, because it is literally the same
+/// rule — the same arrangement [`parse_numeric_text`] has. Worth doing
+/// client-side even though the server would also refuse it: a row the *server*
+/// rejects aborts an import on every engine, while one hubro rejects itself
+/// can be skipped (see [`super::import`]).
+///
+/// The declared **length is not checked** — it is not introspected, so `bit(4)`
+/// and `bit varying(8)` are indistinguishable here. The server catches a
+/// wrong-length value and says so precisely ("bit string length 2 does not
+/// match type bit(4)").
+///
+/// Not trimmed: whitespace is not a bit, and silently accepting `" 101"` would
+/// only move the failure to the server.
+pub(crate) fn validate_bit_literal(text: &str) -> Result<(), String> {
+    if text.is_empty() {
+        return Err("a bit string cannot be empty".to_string());
+    }
+    match text.chars().position(|c| c != '0' && c != '1') {
+        Some(index) => Err(format!(
+            "a bit string takes only 0 and 1 — found {:?} at position {}",
+            text.chars().nth(index).unwrap_or('?'),
+            index + 1
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Parses a number for one of the three numeric classes. Whole numbers are
@@ -298,6 +361,7 @@ fn coerce_text(
                 TypeClass::Json => "JSON",
                 TypeClass::DateTime => "a date or time",
                 TypeClass::Binary => "binary data",
+                TypeClass::BitString => "a bit string",
                 // Unreachable: the guard above exempts Text, which is the
                 // one class an empty value means something for. Named
                 // rather than folded into an arm it is not, so this does
@@ -323,6 +387,9 @@ fn coerce_text(
             Ok(_) => Ok(Value::Text(text.to_string())),
             Err(err) => Err(format!("column \"{}\": invalid JSON ({err})", column.name)),
         },
+        TypeClass::BitString => validate_bit_literal(text)
+            .map(|()| Value::Text(text.to_string()))
+            .map_err(|why| format!("column \"{}\": {why}", column.name)),
         TypeClass::Binary => parse_hex(text).map(Value::Blob).ok_or_else(|| {
             format!(
                 "column \"{}\": {} is not hex — a binary column takes the \\x-prefixed form the \
@@ -437,6 +504,86 @@ mod tests {
 
     fn text(value: &str) -> SourceValue {
         SourceValue::Text(value.to_string())
+    }
+
+    #[test]
+    fn bit_means_two_different_things_and_the_dialect_decides_which() {
+        // The distinction FRE-112 introduced this function for, now carrying a
+        // second case (FRE-159). Conflating them is not a cosmetic error:
+        // reading a Postgres bit-string as a boolean would turn "1010" into
+        // `true`, and reading SQL Server's bit as a bit-string would reject
+        // every "yes"/"no" the boolean vocabulary exists to accept.
+        assert_eq!(
+            effective_class(&column("mask", "bit"), Dialect::Postgres),
+            TypeClass::BitString
+        );
+        assert_eq!(
+            effective_class(&column("flags", "bit varying"), Dialect::Postgres),
+            TypeClass::BitString
+        );
+        assert_eq!(
+            effective_class(&column("active", "bit"), Dialect::SqlServer),
+            TypeClass::Bool
+        );
+        // SQLite has neither; the name means nothing there.
+        assert_eq!(
+            effective_class(&column("mask", "bit"), Dialect::Sqlite),
+            TypeClass::Text
+        );
+
+        // `classify_type` is name-only and shared with the cell editor, so it
+        // must never produce either refinement on its own.
+        assert_eq!(classify_type("bit"), TypeClass::Text);
+        assert_eq!(classify_type("bit varying"), TypeClass::Text);
+
+        // The shared predicate agrees with the class, and is dialect-gated.
+        assert!(is_bit_string("bit", Dialect::Postgres));
+        assert!(is_bit_string("BIT VARYING", Dialect::Postgres));
+        assert!(!is_bit_string("bit", Dialect::SqlServer));
+        assert!(!is_bit_string("bigint", Dialect::Postgres));
+    }
+
+    #[test]
+    fn a_bit_string_takes_only_zeroes_and_ones() {
+        assert!(validate_bit_literal("1010").is_ok());
+        assert!(validate_bit_literal("0").is_ok());
+        // Rejected client-side so an import can *skip* the row: a value the
+        // server refuses aborts the whole transaction instead.
+        assert!(validate_bit_literal("1012").is_err());
+        assert!(validate_bit_literal("yes").is_err());
+        assert!(validate_bit_literal("").is_err());
+        // Not trimmed — whitespace is not a bit, and accepting it here would
+        // only move the failure to the server.
+        assert!(validate_bit_literal(" 101").is_err());
+        // The message points at the offending character, since "invalid" on
+        // its own does not help someone staring at a long mask.
+        let why = validate_bit_literal("1102").unwrap_err();
+        assert!(why.contains("'2'"), "{why}");
+        assert!(why.contains("position 4"), "{why}");
+
+        // The import reaches the same rule through the column's class.
+        let err = coerce_field(
+            &column("mask", "bit"),
+            Dialect::Postgres,
+            &text("10x0"),
+            EmptyField::EmptyText,
+        )
+        .unwrap_err();
+        assert!(err.contains("mask"), "the column must be named: {err}");
+        assert!(err.contains("only 0 and 1"), "{err}");
+
+        // A good one passes through as text — the `::bit varying` cast the
+        // statement carries is what types it.
+        assert_eq!(
+            coerce_field(
+                &column("mask", "bit"),
+                Dialect::Postgres,
+                &text("1010"),
+                EmptyField::EmptyText
+            )
+            .unwrap(),
+            Value::Text("1010".into())
+        );
     }
 
     fn json(raw: &str) -> SourceValue {

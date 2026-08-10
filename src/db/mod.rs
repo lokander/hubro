@@ -55,7 +55,7 @@ pub use clipboard::{raw_cell_text, render_copy, CopyBlock, CopyFormat};
 pub use coerce::{bool_checked, bool_value, classify_type, TypeClass};
 // The cell editor validates numbers with the import's rules rather than its
 // own copy of them (FRE-112); nothing outside the crate needs this.
-pub(crate) use coerce::parse_numeric_text;
+pub(crate) use coerce::{is_bit_string, parse_numeric_text, validate_bit_literal};
 pub use ddl::{Ddl, DdlObject, DdlSource};
 pub use error::DbError;
 pub use export::{write_result, ExportFormat};

@@ -900,6 +900,88 @@ async fn postgres_quoted_camelcase_enum_saves_through_the_staged_cast() {
     pool.close().await;
 }
 
+/// A `bit(n)` / `bit varying` column can actually be written (FRE-159).
+///
+/// The unit tests pin the SQL that is generated; only a live server can say
+/// whether Postgres accepts it. That distinction is the whole reason this bug
+/// existed: `staged.rs` documented, in prose, that skipping the cast was
+/// correct because "assignment coercion handles text → bit(n)" — and it does
+/// not. Nothing executed the claim, so it went unchallenged.
+///
+/// The `character(3)` half of that same sentence *is* true, so it is checked
+/// here too rather than left as the surviving half of a claim that was wrong.
+#[tokio::test]
+async fn bit_and_char_columns_save_through_the_staged_cast() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.query("DROP TABLE IF EXISTS bit_intro").await.unwrap();
+    pool.query(
+        "CREATE TABLE bit_intro (id int PRIMARY KEY, mask bit(4), flags bit varying(8), \
+         code character(3))",
+    )
+    .await
+    .unwrap();
+    pool.query("INSERT INTO bit_intro VALUES (1, B'0000', B'0', 'aaa')")
+        .await
+        .unwrap();
+
+    let tables = pool.introspect().await.unwrap();
+    let table = tables.iter().find(|t| t.name == "bit_intro").unwrap();
+    // The bare name is what makes `bit` ambiguous: the modifier is dropped, so
+    // `::bit` would mean `bit(1)`.
+    let mask = table.columns.iter().find(|c| c.name == "mask").unwrap();
+    assert_eq!(mask.type_name, "bit");
+    let flags = table.columns.iter().find(|c| c.name == "flags").unwrap();
+    assert_eq!(flags.type_name, "bit varying");
+
+    let identity = detect_row_identity(table, Dialect::Postgres).unwrap();
+    let locator = RowLocator {
+        identity_values: vec![Value::Integer(1)],
+    };
+    let applied = hubro::db::apply_staged(
+        &pool,
+        &pool.backend_access(table),
+        table,
+        &identity,
+        &[
+            hubro::db::StagedChange::Update {
+                locator: locator.clone(),
+                column: "mask".into(),
+                value: Value::Text("1010".into()),
+            },
+            hubro::db::StagedChange::Update {
+                locator: locator.clone(),
+                column: "flags".into(),
+                value: Value::Text("1101".into()),
+            },
+            hubro::db::StagedChange::Update {
+                locator,
+                column: "code".into(),
+                value: Value::Text("xyz".into()),
+            },
+        ],
+    )
+    .await
+    .expect("a bit column must be writable — an uncast text parameter is refused outright");
+    // One row, not three edits: changes to the same row coalesce into a single
+    // UPDATE, so all three casts are exercised by one statement.
+    assert_eq!(applied.updated_rows, 1);
+
+    let after = pool
+        .query("SELECT mask::text, flags::text, code FROM bit_intro WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(after.rows[0][0], Value::Text("1010".into()));
+    assert_eq!(after.rows[0][1], Value::Text("1101".into()));
+    // `character(3)` is blank-padded by the server; the point is that the
+    // value arrived whole rather than truncated to one character, which is
+    // what a `::character` cast would have done.
+    assert_eq!(after.rows[0][2], Value::Text("xyz".into()));
+
+    pool.query("DROP TABLE bit_intro").await.unwrap();
+    pool.close().await;
+}
+
 #[tokio::test]
 async fn partition_children_are_internal_but_their_parent_is_not() {
     let Some(url) = test_url() else { return };
