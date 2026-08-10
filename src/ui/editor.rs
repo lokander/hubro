@@ -26,8 +26,69 @@ const MAX_RENDERED_ROWS: usize = 500;
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum EditorMessage {
-    Run { sql: String },
-    Doc { doc: String },
+    Run {
+        sql: String,
+    },
+    Doc {
+        doc: String,
+    },
+    /// The bundle never turned up — see [`editor_mount_js`]. Carries the text
+    /// to show in the pane, because the alternative is a blank one.
+    Failed {
+        message: String,
+    },
+}
+
+/// How long the mount waits for `assets/codemirror.js` before giving up.
+///
+/// Generous on purpose: the cost of waiting is nothing (the editor appears as
+/// soon as the bundle does), while the cost of giving up early is a pane that
+/// says the editor is broken when it was merely slow. Under software rendering
+/// on a loaded machine the observed gap was well under a second.
+const EDITOR_LOAD_TIMEOUT_MS: u32 = 10_000;
+
+/// Gap between checks for the bundle's global. Short enough that the editor
+/// still appears instantly to a human.
+const EDITOR_LOAD_POLL_MS: u32 = 25;
+
+/// The JS that mounts one CodeMirror instance.
+///
+/// `DVEditor` is loaded by a separate `<script>` ([`super::CODEMIRROR_JS`]),
+/// and the mount effect can win the race against it — reliably so when a
+/// session restores straight into the SQL pane on a slow machine. Calling
+/// `DVEditor.create` regardless threw a `ReferenceError` into a channel nobody
+/// reads, and the pane then stayed **blank until it was remounted**, which
+/// reads as "no query here" rather than "the editor didn't load" (FRE-155).
+///
+/// So the create is gated on the global actually being there, and a genuine
+/// timeout reports itself over the same channel instead of failing silently.
+fn editor_mount_js(
+    element: &str,
+    dialect_name: &str,
+    initial_json: &str,
+    schema_json: &str,
+) -> String {
+    let unavailable = js_string(
+        "The SQL editor failed to load. Reopening this tab will try again; if it keeps \
+         happening, the editor bundle (assets/codemirror.js) is missing or failed to parse.",
+    );
+    format!(
+        r#"
+        window.__dvRun = (p) => dioxus.send(JSON.stringify({{ kind: "run", sql: p.sql }}));
+        window.__dvDoc = (p) => dioxus.send(JSON.stringify({{ kind: "doc", doc: p.doc }}));
+        (async () => {{
+            const deadline = Date.now() + {EDITOR_LOAD_TIMEOUT_MS};
+            while (typeof DVEditor === "undefined" || typeof DVEditor.create !== "function") {{
+                if (Date.now() > deadline) {{
+                    dioxus.send(JSON.stringify({{ kind: "failed", message: {unavailable} }}));
+                    return;
+                }}
+                await new Promise((resolve) => setTimeout(resolve, {EDITOR_LOAD_POLL_MS}));
+            }}
+            DVEditor.create("{element}", "{element}", "{dialect_name}", {initial_json}, {schema_json});
+        }})();
+        "#
+    )
 }
 
 /// Which side panel the SQL pane is showing. At most one at a time: they are
@@ -359,6 +420,10 @@ fn EditorSurface(id: ConnectionId, dialect: Dialect) -> Element {
         Dialect::Sqlite => "sqlite",
         Dialect::SqlServer => "mssql",
     };
+    // Set only if the bundle never arrives (FRE-155). CodeMirror owns this
+    // element's contents in every other case, so this stays `None` and the
+    // host div renders no children of its own.
+    let mut load_failure = use_signal(|| None::<String>);
 
     // Mount CodeMirror once and pump its messages. The eval channel stays
     // open for the component's lifetime; unmounting destroys the JS view.
@@ -380,13 +445,7 @@ fn EditorSurface(id: ConnectionId, dialect: Dialect) -> Element {
         };
         let initial_json = js_string(&initial);
         spawn(async move {
-            let js = format!(
-                r#"
-                window.__dvRun = (p) => dioxus.send(JSON.stringify({{ kind: "run", sql: p.sql }}));
-                window.__dvDoc = (p) => dioxus.send(JSON.stringify({{ kind: "doc", doc: p.doc }}));
-                DVEditor.create("{element}", "{element}", "{dialect_name}", {initial_json}, {schema_json});
-                "#
-            );
+            let js = editor_mount_js(&element, dialect_name, &initial_json, &schema_json);
             let mut channel = document::eval(&js);
             // The channel closes (Err) when the component unmounts.
             while let Ok(raw) = channel.recv::<String>().await {
@@ -402,6 +461,7 @@ fn EditorSurface(id: ConnectionId, dialect: Dialect) -> Element {
                         let buffer = state.active_sql_buffer(id);
                         state.set_sql_text(id, buffer, doc);
                     }
+                    Ok(EditorMessage::Failed { message }) => load_failure.set(Some(message)),
                     Err(_) => {}
                 }
             }
@@ -432,6 +492,11 @@ fn EditorSurface(id: ConnectionId, dialect: Dialect) -> Element {
         div {
             id: "{element}",
             class: "h-1/2 min-h-0 shrink-0 overflow-hidden border-b border-slate-300 dark:border-slate-700 text-sm",
+            // Only ever non-empty when CodeMirror never mounted, so this never
+            // competes with the view for ownership of the element.
+            if let Some(message) = load_failure() {
+                div { class: "p-3 text-rose-700 dark:text-rose-300", "{message}" }
+            }
         }
     }
 }
@@ -980,6 +1045,60 @@ mod tests {
             restriction: None,
             internal: None,
             kind_label: None,
+        }
+    }
+
+    /// The mount script as the effect builds it.
+    fn mount_js() -> String {
+        editor_mount_js("sql-editor-1-", "postgres", "\"SELECT 1\"", "{}")
+    }
+
+    #[test]
+    fn the_mount_waits_for_the_bundle_before_creating_an_editor() {
+        let js = mount_js();
+        // The property that matters is an ordering, not a presence: `create`
+        // has to sit *after* the guard. Asserting only that the guard exists
+        // would stay green if a stray `DVEditor.create` were left above it,
+        // which is the bug (FRE-155) exactly.
+        let guard = js
+            .find("typeof DVEditor.create !== \"function\"")
+            .expect("the mount must test for the bundle's global");
+        let create = js
+            .find("DVEditor.create(\"sql-editor-1-\"")
+            .expect("the mount must still create an editor");
+        assert!(
+            guard < create,
+            "DVEditor.create runs before the bundle is known to be loaded — on a \
+             slow mount that throws into a channel nobody reads and leaves a \
+             blank pane until the tab is switched away and back"
+        );
+        // And the wait must be able to end, or a missing bundle spins forever.
+        assert!(js.contains("Date.now() > deadline"));
+        assert!(js.contains(&EDITOR_LOAD_POLL_MS.to_string()));
+    }
+
+    #[test]
+    fn a_bundle_that_never_loads_reports_itself_instead_of_showing_nothing() {
+        let js = mount_js();
+        assert!(
+            js.contains(r#"kind: "failed""#),
+            "a timeout must send something back — a blank pane reads as \"no \
+             query here\" rather than \"the editor didn't load\""
+        );
+        // The message is interpolated as a JS string literal; an unescaped one
+        // would end the literal early and make the timeout path a syntax error
+        // — i.e. broken precisely when it is needed.
+        assert!(
+            js.contains(r#"message: "The SQL editor failed to load."#),
+            "the failure message must be a well-formed JS string literal"
+        );
+
+        // And the Rust side must understand what that path sends.
+        let parsed: EditorMessage =
+            serde_json::from_str(r#"{"kind":"failed","message":"boom"}"#).unwrap();
+        match parsed {
+            EditorMessage::Failed { message } => assert_eq!(message, "boom"),
+            other => panic!("expected Failed, got {other:?}"),
         }
     }
 
