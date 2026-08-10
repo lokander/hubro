@@ -20,13 +20,22 @@
 //!   `JSON` or SQL Server `nvarchar`, and a PNG in a `bytea` is a PNG only if
 //!   its magic bytes say so.
 //!
-//! **Every decode is bounded.** [`IMAGE_MAX_BYTES`], [`JSON_MAX_BYTES`],
-//! [`JSON_TREE_MAX_NODES`] and [`HEX_DUMP_MAX_BYTES`] are ceilings on what a
-//! viewer will turn into DOM; past one of them the viewer *declines in favour
-//! of a cheaper view and says so* rather than working on a value big enough to
-//! stall the webview. The same refusal covers an incomplete value: a blob that
-//! arrived as a prefix (past [`FETCH_CELL_MAX_BYTES`]) is never handed to
-//! `<img>`, because half a PNG is not an image.
+//! **Every decode into something richer than text is bounded.**
+//! [`IMAGE_MAX_BYTES`], [`JSON_MAX_BYTES`], [`JSON_TREE_MAX_NODES`] and
+//! [`HEX_DUMP_MAX_BYTES`] are ceilings on what a viewer will turn into DOM;
+//! past one of them the viewer *declines in favour of a cheaper view and says
+//! so* rather than working on a value big enough to stall the webview. The same
+//! refusal covers an incomplete value: a blob that arrived as a prefix (past
+//! [`FETCH_CELL_MAX_BYTES`]) is never handed to `<img>`, because half a PNG is
+//! not an image.
+//!
+//! The text pane is the exception, and deliberately so: it is what every
+//! decline falls back to, so a ceiling on it would leave nothing underneath. It
+//! carries no limit of its own and is bounded only by the fetch cap upstream —
+//! which counts *characters* for text, so a full one can still be several times
+//! [`FETCH_CELL_MAX_BYTES`] of UTF-8. That is one string in one `<pre>`, which
+//! is the cheapest shape this file has; it is pre-existing behaviour and not
+//! something these ceilings changed.
 
 use super::*;
 
@@ -38,7 +47,13 @@ use crate::db::{classify_column, ColumnClass};
 /// DOM on top of the bytes themselves, so the ceiling is on the decode as
 /// much as on the picture; 4 MiB comfortably covers the avatars, thumbnails
 /// and scanned pages that live in databases. Past it the viewer shows a hex
-/// dump and says why — the 200 MB blob case (FRE-115).
+/// dump and says why.
+///
+/// This gate fires for a **complete** blob between here and
+/// [`FETCH_CELL_MAX_BYTES`], and only there. A genuinely huge blob — the 200 MB
+/// case of FRE-115 — never reaches it: `fetch_cell` caps at
+/// [`FETCH_CELL_MAX_BYTES`], so it arrives as a prefix and the truncation gate
+/// in [`blob_view`] refuses it first. Two gates, two reasons, both reachable.
 pub(super) const IMAGE_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 /// Largest text a viewer will *attempt* to parse as JSON. Past it the text is
@@ -121,6 +136,18 @@ pub(super) fn sniff_image(bytes: &[u8]) -> Option<ImageFormat> {
     None
 }
 
+/// Appends `byte` as two lowercase hex digits.
+///
+/// By hand rather than through `format!`, which would allocate a `String` per
+/// byte — 16k of them for a full dump, in a file whose whole point is bounding
+/// what one cell costs. The exact-output test on [`hex_dump`] is what keeps
+/// this honest.
+fn push_hex(out: &mut String, byte: u8) {
+    const DIGITS: [u8; 16] = *b"0123456789abcdef";
+    out.push(DIGITS[(byte >> 4) as usize] as char);
+    out.push(DIGITS[(byte & 0x0f) as usize] as char);
+}
+
 /// `hexdump -C` layout: an 8-digit offset, 16 bytes as hex split into two
 /// groups of eight, then the printable ASCII with everything else as `.`.
 ///
@@ -130,11 +157,16 @@ pub(super) fn hex_dump(bytes: &[u8]) -> String {
     // 78 chars per full line, and the ceiling on `bytes` bounds the rest.
     let mut out = String::with_capacity(bytes.len() / HEX_COLUMNS * 78 + 16);
     for (line, chunk) in bytes.chunks(HEX_COLUMNS).enumerate() {
+        // One allocation per *line* (1024 at the ceiling), not per byte: the
+        // offset is four bytes wide and reads far better spelled this way.
         let offset = line * HEX_COLUMNS;
         out.push_str(&format!("{offset:08x}  "));
         for column in 0..HEX_COLUMNS {
             match chunk.get(column) {
-                Some(byte) => out.push_str(&format!("{byte:02x} ")),
+                Some(byte) => {
+                    push_hex(&mut out, *byte);
+                    out.push(' ');
+                }
                 // A short last line keeps the ASCII gutter aligned.
                 None => out.push_str("   "),
             }
@@ -155,9 +187,16 @@ pub(super) fn hex_dump(bytes: &[u8]) -> String {
     out
 }
 
-/// Nodes a document renders as a tree: itself plus every descendant. Bounded
-/// by serde_json's own 128-level nesting limit, so the recursion is safe on
-/// anything that parsed.
+/// Nodes a document renders as a tree: itself plus every descendant.
+///
+/// This recursion — and `to_string_pretty`'s, and the [`JsonNode`] component's
+/// — is depth-safe only because serde_json refuses to *parse* past 128 levels,
+/// so a cell can never hand us a document deep enough to overflow the stack.
+/// That is a property of the parser rather than of this file, and turning on
+/// `unbounded_depth` (or calling `disable_recursion_limit`) anywhere upstream
+/// would quietly remove it, so
+/// [`the_parser_depth_limit_this_recursion_relies_on_is_real`] checks the
+/// premise instead of this comment merely claiming it.
 pub(super) fn json_node_count(value: &serde_json::Value) -> usize {
     match value {
         serde_json::Value::Object(map) => 1 + map.values().map(json_node_count).sum::<usize>(),
@@ -218,9 +257,11 @@ impl CellView {
 
 /// Picks the viewer for one cell (FRE-115).
 ///
-/// `type_name` is the column's declared type as the panel shows it (empty when
-/// there is none — the free-form query grid knows only what the driver
-/// returned).
+/// `type_name` is the column's declared type as the panel shows it, or empty
+/// when [`TableRenderMeta::type_of`] could not name the column — a schema still
+/// loading, or a result whose columns aren't the table's.
+/// [`classify_column`] already reads an empty type as "unknown, treat it as
+/// text", which is the safe direction: it costs a sniff, not a wrong render.
 ///
 /// `truncated` is `None` when `value` is the whole cell, and `Some(full_len)`
 /// when it is only a prefix of a value that long (a page preview, or a fetch
@@ -598,9 +639,12 @@ mod tests {
 
     #[test]
     fn an_oversized_image_declines_with_a_reason_instead_of_decoding() {
-        // The 200 MB blob of the issue, at the boundary that decides it: one
-        // byte over the ceiling is a hex dump plus a sentence, and the same
-        // bytes at the ceiling are a picture. Neither answer is a hang.
+        // A *complete* blob between `IMAGE_MAX_BYTES` and the fetch cap —
+        // the only range this gate decides, since anything larger arrives
+        // truncated and is refused a step earlier
+        // (`a_partly_loaded_blob_is_never_rendered_as_an_image`). One byte over
+        // the ceiling is a hex dump plus a sentence, and the same bytes at the
+        // ceiling are a picture. Neither answer is a hang.
         let mut over = png();
         over.resize(IMAGE_MAX_BYTES + 1, 0);
         let view = choose_view(&Value::Blob(over.clone()), "bytea", None);
@@ -721,6 +765,30 @@ mod tests {
     }
 
     #[test]
+    fn the_parse_ceiling_admits_a_document_of_exactly_its_size() {
+        // The boundary, spelled to the byte: `["xxx…"]` is 4 characters of
+        // punctuation plus the filling, so this is exactly `JSON_MAX_BYTES`
+        // and the next one is exactly one over. Without this the ceiling's
+        // *direction* is unpinned — `>` and `>=` would behave identically for
+        // every other input in the suite.
+        let document = |len: usize| format!(r#"["{}"]"#, "x".repeat(len - 4));
+        let at_limit = document(JSON_MAX_BYTES);
+        assert_eq!(at_limit.len(), JSON_MAX_BYTES);
+        let view = choose_view(&Value::Text(at_limit), "jsonb", None);
+        assert!(
+            matches!(view.body, ViewBody::Json(_)),
+            "exactly at the ceiling still parses"
+        );
+        assert!(view.note.is_none());
+
+        let over = document(JSON_MAX_BYTES + 1);
+        assert_eq!(over.len(), JSON_MAX_BYTES + 1);
+        let view = choose_view(&Value::Text(over.clone()), "jsonb", None);
+        assert_eq!(view.body, ViewBody::Text(over), "one byte over is not");
+        assert!(view.note.is_some_and(|note| note.contains("1.0 MB")));
+    }
+
+    #[test]
     fn oversized_and_overgrown_documents_decline_to_text_with_a_reason() {
         // Past the parse ceiling nothing is parsed at all.
         let huge = format!(r#"{{"a":"{}"}}"#, "x".repeat(JSON_MAX_BYTES));
@@ -752,6 +820,31 @@ mod tests {
             None,
         );
         assert!(matches!(view.body, ViewBody::Json(_)));
+    }
+
+    /// The premise [`json_node_count`] rests on: three recursions here
+    /// (counting, `to_string_pretty`, and the [`JsonNode`] component) are
+    /// depth-safe only because a document deep enough to overflow the stack
+    /// cannot be parsed in the first place. Nothing in this file enforces
+    /// that, so assert it — if serde_json's recursion limit is ever raised or
+    /// switched off upstream, this fails instead of the stack.
+    #[test]
+    fn the_parser_depth_limit_this_recursion_relies_on_is_real() {
+        // Well inside the limit: parses, and the recursion handles it.
+        let shallow = format!("{}{}", "[".repeat(100), "]".repeat(100));
+        let value: serde_json::Value = serde_json::from_str(&shallow).expect("100 levels parse");
+        assert_eq!(json_node_count(&value), 100);
+        // Past it: refused by the parser, so no recursion of ours ever sees it.
+        let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&deep).is_err(),
+            "serde_json must refuse deeply nested input"
+        );
+        // …and the viewer treats such a cell as the plain text it is.
+        assert_eq!(
+            choose_view(&Value::Text(deep.clone()), "jsonb", None).body,
+            ViewBody::Text(deep)
+        );
     }
 
     #[test]

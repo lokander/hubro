@@ -1427,7 +1427,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                             ExpandView::Text { value, column } => {
                                 let type_name = meta.type_of(&column);
                                 rsx! {
-                                    CopyRawButton { raw: raw_cell_text(&value) }
+                                    CopyRawButton { value: value.clone() }
                                     CellViewer { value, type_name, truncated: None }
                                 }
                             },

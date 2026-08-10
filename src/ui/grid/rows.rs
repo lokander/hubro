@@ -1146,7 +1146,8 @@ pub(super) fn ExpandedValue(
                 } else {
                     // The clipboard gets the value, never the rendering: a
                     // blob copies as its hex, exactly as Ctrl+C over the cell.
-                    CopyRawButton { raw: raw_cell_text(&fetch.value) }
+                    // Rendered on click — see [`CopyRawButton`].
+                    CopyRawButton { value: fetch.value.clone() }
                 }
                 div { class: "mt-2",
                     CellViewer {
@@ -1161,16 +1162,22 @@ pub(super) fn ExpandedValue(
 }
 
 /// A right-aligned "Copy raw" action for the expand popup (FRE-77): always
-/// copies the raw cell value — the pane may be showing the pretty-printed
-/// form, which is for reading, not round-tripping.
+/// copies the raw cell value — the pane may be showing an image, a hex dump or
+/// a JSON tree, which are for reading, not round-tripping.
+///
+/// Takes the [`Value`] and renders it **on click** rather than being handed a
+/// finished string. [`raw_cell_text`] hexes a blob to twice its size, so the
+/// eager form retained ~17 MB for an 8 MiB cell nobody had asked to copy —
+/// beside a dump that deliberately stops at 16 KiB. Now that cost is paid once,
+/// by the click that wants it, and dropped after.
 #[component]
-pub(super) fn CopyRawButton(raw: String) -> Element {
+pub(super) fn CopyRawButton(value: Value) -> Element {
     rsx! {
         div { class: "mb-1 flex justify-end",
             button {
                 class: "rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
                 title: "Copy the raw value (not the formatted view)",
-                onclick: move |_| write_clipboard(&raw),
+                onclick: move |_| write_clipboard(&raw_cell_text(&value)),
                 "Copy raw"
             }
         }
