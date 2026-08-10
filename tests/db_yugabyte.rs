@@ -32,8 +32,8 @@
 //!
 //! The other two findings are not shared-suite failures at all under that
 //! invocation: they appear only when schema changes run *concurrently*, which
-//! is what removing `--test-threads=1` does. One of the two is a real
-//! robustness gap in hubro, filed rather than fixed here.
+//! is what removing `--test-threads=1` does. One of the two was a real
+//! robustness gap in hubro, filed here and since fixed (finding 2).
 //!
 //!  1. **Concurrent DDL is refused.** Two `CREATE TABLE`s in flight at once
 //!     fail with `could not serialize access due to concurrent update`, because
@@ -51,7 +51,7 @@
 //!     plain statement error carrying the engine's own explanation, with the
 //!     winner fully applied. This file serialises its own fixture DDL through
 //!     [`ddl_lock`] so it stays honest under the default threaded runner.
-//!  2. **Introspection can fail transiently, and hubro does not retry it.**
+//!  2. **Introspection can fail transiently — since fixed (FRE-147).**
 //!     `MISMATCHED_SCHEMA` — "the catalog snapshot used for this transaction
 //!     has been invalidated" — surfaces when a schema change lands between the
 //!     six queries introspection runs. It is a *read* failing, which is the
@@ -59,13 +59,17 @@
 //!     changing the schema can error out, and the message names a Yugabyte
 //!     internal rather than anything the user can act on. Not only a
 //!     multi-user hazard, either — the two routes in finding 1 reach it from a
-//!     single hubro window. Nor is it rare: instrumenting the retry below
-//!     showed it firing on roughly half of this binary's runs, with the second
-//!     attempt succeeding every time. Transient by construction, which is why
-//!     the tests here retry once via [`introspect_stable`], and why hubro
-//!     should too. Filed as FRE-147 rather
-//!     than fixed here: which errors are worth retrying is a cross-engine
-//!     decision, not a Yugabyte one.
+//!     single hubro window. Nor is it rare: instrumenting a retry here showed
+//!     it firing on roughly half of this binary's runs, with the second
+//!     attempt succeeding every time.
+//!
+//!     hubro now retries it once itself, so the tests below call
+//!     [`DbPool::introspect`] directly and the `introspect_stable` helper they
+//!     used to go through is gone. Yugabyte raises this as SQLSTATE `40001`
+//!     (`ERRCODE_T_R_SERIALIZATION_FAILURE`), which is why the fix classifies
+//!     on the code rather than on `MISMATCHED_SCHEMA` — the same code carries
+//!     CockroachDB's retryable conflicts, and no engine-internal string has to
+//!     be matched.
 //!  3. **A failing script does not roll back its DDL** — the same gap
 //!     CockroachDB has, for a different reason (Yugabyte simply commits each
 //!     schema change as it executes). DML in the same transaction rolls back
@@ -133,8 +137,8 @@ fn test_url() -> Option<String> {
 ///
 /// Held for fixture setup only, never across the assertions, so the tests still
 /// exercise concurrent reads and writes. Ordinary data reads are unaffected by
-/// a racing schema change; catalog reads are not, which is what
-/// [`introspect_stable`] exists for.
+/// a racing schema change; catalog reads are not, and hubro's own retry
+/// (finding 2) is what carries them past it.
 fn ddl_lock() -> &'static Mutex<()> {
     static DDL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     DDL_LOCK.get_or_init(|| Mutex::new(()))
@@ -187,31 +191,6 @@ async fn with_ddl(pool: &DbPool, statements: &[String]) {
     }
 }
 
-/// [`DbPool::introspect`], retried once past Yugabyte's transient catalog
-/// invalidation (finding 2 in the header).
-///
-/// Introspection is a *read*, but it is a multi-statement one: six queries on
-/// pooled connections. If a schema change lands between them, Yugabyte fails
-/// the batch with `MISMATCHED_SCHEMA` rather than serving a stale snapshot.
-/// It is transient by construction — the next attempt sees the new catalog
-/// version — so a retry is the correct response rather than a way to hide a
-/// failure, and it is what hubro itself should do (FRE-147).
-///
-/// Retried once, not looped: a second failure means something other than a
-/// racing schema change, and this must not turn a real breakage into a hang.
-async fn introspect_stable(pool: &DbPool) -> Vec<TableMeta> {
-    match pool.introspect().await {
-        Ok(tables) => tables,
-        Err(error) => {
-            assert!(
-                error.message().contains("MISMATCHED_SCHEMA"),
-                "only the catalog race is retried, got: {error:?}"
-            );
-            pool.introspect().await.unwrap()
-        }
-    }
-}
-
 fn find<'a>(tables: &'a [TableMeta], name: &str) -> &'a TableMeta {
     tables
         .iter()
@@ -247,7 +226,7 @@ async fn yugabyte_introspects_with_full_postgres_parity() {
     let pool = DbPool::open_postgres(&url).await.unwrap();
     let (readings, sensors) = fresh_fixture(&pool, "intro").await;
 
-    let tables = introspect_stable(&pool).await;
+    let tables = pool.introspect().await.unwrap();
     let table = find(&tables, &readings);
 
     assert_eq!(table.kind, TableKind::Table);
@@ -345,7 +324,7 @@ async fn yugabyte_rows_edit_through_the_composite_key() {
     let pool = DbPool::open_postgres(&url).await.unwrap();
     let (readings, _) = fresh_fixture(&pool, "edit").await;
 
-    let tables = introspect_stable(&pool).await;
+    let tables = pool.introspect().await.unwrap();
     let table = find(&tables, &readings);
     let identity = detect_row_identity(table, pool.dialect()).expect("composite pk");
     assert_eq!(
@@ -429,7 +408,7 @@ async fn yugabyte_table_without_a_key_is_read_only_like_postgres() {
         .await
         .unwrap();
 
-    let tables = introspect_stable(&pool).await;
+    let tables = pool.introspect().await.unwrap();
     let table = find(&tables, "yb_nokey");
     let columns: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(columns, ["a", "b"], "no implicit key column is exposed");
@@ -480,7 +459,7 @@ async fn yugabyte_materialized_view_browses_but_refuses_writes() {
     )
     .await;
 
-    let tables = introspect_stable(&pool).await;
+    let tables = pool.introspect().await.unwrap();
     let meta = find(&tables, &view);
     assert_eq!(meta.kind, TableKind::MaterializedView);
     assert!(
@@ -537,7 +516,7 @@ async fn yugabyte_extension_objects_are_attributed_like_any_postgres() {
     )
     .await;
 
-    let tables = introspect_stable(&pool).await;
+    let tables = pool.introspect().await.unwrap();
     let view = find(&tables, "pg_buffercache");
     assert_eq!(
         view.internal,
@@ -676,6 +655,13 @@ async fn yugabyte_refuses_concurrent_ddl_without_corrupting_anything() {
     // and a test that depends on losing a race is a test that goes flaky on a
     // faster machine. What must hold either way is that a loser fails
     // *cleanly*, which is the part hubro's behaviour actually rests on.
+    //
+    // The loser is also where hubro's transient classification (FRE-147) is
+    // pinned against a *real* server-sent SQLSTATE rather than a hand-built
+    // error: this is the one place in the suite that reliably makes a live
+    // engine raise `40001`. The retry that classification feeds is on the
+    // catalog reads, not here — a DDL conflict is reported, never re-run — but
+    // if the code stopped being recognised, this is what would notice.
     for outcome in [&a, &b] {
         if let Err(error) = outcome {
             let message = error.message().to_lowercase();
@@ -683,12 +669,16 @@ async fn yugabyte_refuses_concurrent_ddl_without_corrupting_anything() {
                 message.contains("concurrent update") || message.contains("catalog"),
                 "a DDL conflict should name itself, got: {message}"
             );
+            assert!(
+                error.is_transient(),
+                "a serialization failure should classify as transient, got: {error:?}"
+            );
         }
     }
 
     // Whichever succeeded is a complete, usable table — the conflict is a
     // refusal, not a partial apply.
-    let tables = introspect_stable(&pool).await;
+    let tables = pool.introspect().await.unwrap();
     for (name, outcome) in [("yb_race_a", &a), ("yb_race_b", &b)] {
         if outcome.is_ok() {
             let table = find(&tables, name);
