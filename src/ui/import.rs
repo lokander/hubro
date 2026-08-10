@@ -66,6 +66,12 @@ pub fn ImportDialog(
     /// Present means the dialog explains and offers nothing to press: the
     /// same sentence the disabled Save button shows.
     refusal: Option<String>,
+    /// The connection's name when it is marked *confirm writes* (FRE-111),
+    /// `None` otherwise — see [`import_action`]. Bulk-inserting a file is the
+    /// write that most wants "read which database you are about to change",
+    /// and it was the one write in the app that skipped the prompt a single
+    /// cell edit gets.
+    confirm_connection: Option<String>,
     on_close: EventHandler<()>,
 ) -> Element {
     let state = use_context::<AppState>();
@@ -113,6 +119,12 @@ pub fn ImportDialog(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string());
     let is_csv = matches!(format(), SourceFormat::Csv(_));
+    // The import a previous press confirmed, on a connection that asks
+    // (FRE-111). Holding the whole request rather than a flag is what makes
+    // the confirmation about *this* import: change a mapping or the error
+    // mode afterwards and it no longer matches, so the prompt returns.
+    let mut confirmed = use_signal(|| Option::<ImportRequest>::None);
+    let confirms = confirm_connection.is_some();
     let start = {
         let table = table.clone();
         let path = path.clone();
@@ -128,10 +140,23 @@ pub fn ImportDialog(
                     on_error: *on_error.peek(),
                 },
             };
-            state.start_import(id, request);
-            on_close.call(());
+            // Resolved before the write below, so the peek's borrow is
+            // released — a signal borrow must never span the write that
+            // follows it.
+            let action = import_action(confirms, confirmed.peek().as_ref(), &request);
+            match action {
+                ImportAction::Confirm => {
+                    confirmed.set(Some(request));
+                }
+                ImportAction::Start => {
+                    state.start_import(id, request);
+                    on_close.call(());
+                }
+            }
         }
     };
+    // Whether the button is currently armed, i.e. the next press writes.
+    let armed = confirms && confirmed.read().is_some();
 
     rsx! {
         div {
@@ -379,6 +404,19 @@ pub fn ImportDialog(
                     if let Some(problem) = problem() {
                         Banner { kind: BannerKind::Warning, message: problem }
                     }
+
+                    // The FRE-111 confirmation, naming the connection —
+                    // the whole point is to make you read which database you
+                    // are about to write a file into.
+                    if armed {
+                        Banner {
+                            kind: BannerKind::Warning,
+                            message: format!(
+                                "This writes to \"{}\", which you marked confirm-writes. Press Import again to go ahead.",
+                                confirm_connection.clone().unwrap_or_default()
+                            ),
+                        }
+                    }
                 }
 
                 div { class: "flex items-center justify-end gap-2",
@@ -388,14 +426,58 @@ pub fn ImportDialog(
                         "Cancel"
                     }
                     button {
-                        class: "rounded bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-50",
+                        class: if armed {
+                            "rounded bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-500 disabled:opacity-50"
+                        } else {
+                            "rounded bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-50"
+                        },
                         disabled: refusal.is_some() || problem().is_some(),
                         onclick: start,
-                        "Import"
+                        if armed { "Import anyway" } else { "Import" }
                     }
                 }
             }
         }
+    }
+}
+
+/// What pressing Import should do on a write-protected connection (FRE-111).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportAction {
+    /// Run it now.
+    Start,
+    /// Show the connection-naming confirmation first.
+    Confirm,
+}
+
+/// Resolves an Import press: `confirms` is whether the connection is marked
+/// *confirm writes*, `confirmed` the request a previous press already
+/// confirmed (if any), and `current` what the dialog holds now.
+///
+/// The comparison between `confirmed` and `current` is the substance, and it
+/// is the same rule Save follows
+/// ([`save_action`](crate::ui::state) in `ui::state::staging`): confirming
+/// authorizes a *specific* import, so changing the mapping, the error mode or
+/// how the file is read after the prompt appears sends the user back through
+/// it. Otherwise the prompt would launder whatever the dialog happened to
+/// hold by the time they pressed again — with a file behind it, which is
+/// exactly the accident FRE-111 exists to prevent.
+///
+/// `ReadOnly` never reaches here: it narrows `mutate`, so the import is
+/// refused by [`import_refusal`](crate::db::import_refusal) and the button is
+/// disabled with that reason. `Confirm` narrows nothing by design, which is
+/// why it needs this instead — and why it was missed.
+fn import_action(
+    confirms: bool,
+    confirmed: Option<&ImportRequest>,
+    current: &ImportRequest,
+) -> ImportAction {
+    if !confirms {
+        return ImportAction::Start;
+    }
+    match confirmed {
+        Some(previous) if previous == current => ImportAction::Start,
+        _ => ImportAction::Confirm,
     }
 }
 
@@ -613,6 +695,64 @@ mod tests {
                 .map(|b| b.column.as_str())
                 .collect::<Vec<_>>(),
             vec!["name"]
+        );
+    }
+
+    fn request(on_error: ErrorMode) -> ImportRequest {
+        ImportRequest {
+            path: PathBuf::from("/tmp/people.csv"),
+            format: SourceFormat::Csv(CsvDialect::default()),
+            encoding: Encoding::Utf8,
+            table: table(),
+            options: ImportOptions {
+                mapping: vec![ColumnBinding {
+                    source: SourceField::Index(0),
+                    column: "name".into(),
+                }],
+                empty_field: EmptyField::Null,
+                on_error,
+            },
+        }
+    }
+
+    #[test]
+    fn an_unmarked_connection_imports_without_a_prompt() {
+        assert_eq!(
+            import_action(false, None, &request(ErrorMode::Abort)),
+            ImportAction::Start
+        );
+    }
+
+    #[test]
+    fn a_confirm_marked_connection_needs_a_confirmed_press_first() {
+        // The bug this exists for: `Confirm` narrows no capability, so
+        // without this the file was written with no prompt at all — while a
+        // single staged cell edit on the same connection was parked behind
+        // one.
+        let current = request(ErrorMode::Abort);
+        assert_eq!(
+            import_action(true, None, &current),
+            ImportAction::Confirm,
+            "the first press must only arm"
+        );
+        assert_eq!(
+            import_action(true, Some(&current), &current),
+            ImportAction::Start,
+            "the second press, unchanged, runs it"
+        );
+    }
+
+    #[test]
+    fn changing_the_import_after_confirming_asks_again() {
+        // Confirming authorizes a specific import. Switching to skip mode
+        // afterwards is a different one — and it is the switch that decides
+        // whether a bad row aborts or is quietly dropped, so it must not ride
+        // in on a confirmation given for the other answer.
+        let confirmed = request(ErrorMode::Abort);
+        let changed = request(ErrorMode::Skip);
+        assert_eq!(
+            import_action(true, Some(&confirmed), &changed),
+            ImportAction::Confirm
         );
     }
 

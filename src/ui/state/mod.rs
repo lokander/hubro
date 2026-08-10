@@ -884,6 +884,10 @@ pub struct AppState {
     /// its outcome over one started after it — the same guard the export
     /// statuses carry.
     pub import_generations: Signal<HashMap<ConnectionId, u64>>,
+    /// The in-flight import's task per connection, so closing the connection
+    /// can cancel it rather than leaving it to commit into a pool that is
+    /// being torn down. Held for the same reason [`Self::sql_tasks`] is.
+    pub import_tasks: Signal<HashMap<ConnectionId, Task>>,
     /// Whether the keyboard-shortcut cheatsheet overlay is showing (FRE-15).
     /// App-global (one overlay for the whole window), toggled by `?` and
     /// dismissed by Escape / a backdrop click / `?` again.
@@ -997,6 +1001,7 @@ impl AppState {
             // spawn_forever import task.
             import_status: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             import_generations: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            import_tasks: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             // FK navigation state is only ever touched from UI event handlers,
             // so component scope is fine (like tab_ui / nav_guard).
             pending_focus: Signal::new(HashMap::new()),
@@ -1560,6 +1565,14 @@ impl AppState {
         self.export_generations
             .write()
             .retain(|(conn, _), _| *conn != id);
+        // Cancel an in-flight import before the pool is closed under it.
+        // Dropping the future drops its open transaction, so the rows it had
+        // written roll back — leaving it running would commit a partial file
+        // into a connection the user just closed, and its outcome would be
+        // dropped as stale, showing nothing.
+        if let Some(task) = self.import_tasks.write().remove(&id) {
+            task.cancel();
+        }
         self.import_status.write().remove(&id);
         self.import_generations.write().remove(&id);
         self.pending_focus.write().remove(&id);

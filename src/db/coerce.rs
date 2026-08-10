@@ -39,8 +39,10 @@ pub enum TypeClass {
     Integer,
     /// real/float/double: any finite number.
     Float,
-    /// numeric/decimal/money: any finite number, carried as text so exact
-    /// decimals never round-trip through `f64`.
+    /// numeric/decimal: any finite number, carried as text so exact decimals
+    /// never round-trip through `f64`. (Not `money`/`smallmoney`, which are
+    /// [`Self::Text`] — their literals carry currency symbols and grouping,
+    /// so passing them to the server verbatim is the better answer.)
     Exact,
     Bool,
     Json,
@@ -79,6 +81,19 @@ pub fn classify_type(type_name: &str) -> TypeClass {
     if t.contains("json") {
         return TypeClass::Json;
     }
+    // Postgres range and multirange types, before the tests they would
+    // otherwise trip: `int4range` contains "int", `daterange` contains
+    // "date", `tsrange` contains neither — so substring matching split one
+    // coherent family three ways and, worse, made an `int4range` column
+    // reject `[1,10)`, a literal the server takes happily. A skipped row the
+    // server would have accepted is data loss wearing a success message.
+    //
+    // Text is the right answer for all of them, and the same one
+    // [`classify_column`](super::page::classify_column) already gives ranges
+    // for the grid's previews.
+    if t.contains("range") {
+        return TypeClass::Text;
+    }
     if t.contains("date") || t.contains("time") || t.contains("interval") {
         return TypeClass::DateTime;
     }
@@ -95,6 +110,30 @@ pub fn classify_type(type_name: &str) -> TypeClass {
         return TypeClass::Float;
     }
     TypeClass::Text
+}
+
+/// [`classify_type`] with the one refinement that needs to know the backend.
+///
+/// SQL Server's `bit` **is** its boolean type, but the name cannot say so on
+/// its own: Postgres `bit`/`bit varying` are bit-strings, where `1010` is a
+/// value and `yes` is not — and `staged::cast_target` already refuses to cast
+/// to `::bit` for that reason. So `classify_type`, which the cell editor
+/// shares and which only ever sees a name, keeps calling it text, and the
+/// refinement lives here where the dialect is in hand.
+///
+/// Without it the boolean vocabulary was unreachable for the very type
+/// [`bool_value`] names: a `yes`/`no` column against SQL Server reached the
+/// server as text and failed there — *unskippably*, since only rows hubro
+/// rejects itself can be skipped.
+fn effective_class(column: &ColumnMeta, dialect: Dialect) -> TypeClass {
+    let class = classify_type(&column.type_name);
+    if dialect == Dialect::SqlServer
+        && class == TypeClass::Text
+        && column.type_name.trim().eq_ignore_ascii_case("bit")
+    {
+        return TypeClass::Bool;
+    }
+    class
 }
 
 /// Parses a number for one of the three numeric classes. Whole numbers are
@@ -206,7 +245,7 @@ pub(crate) fn coerce_field(
     field: &SourceValue,
     empty: EmptyField,
 ) -> Result<Value, String> {
-    let class = classify_type(&column.type_name);
+    let class = effective_class(column, dialect);
     let text = match field {
         SourceValue::Missing => return Ok(Value::Null),
         SourceValue::Json(serde_json::Value::Null) => return Ok(Value::Null),
@@ -245,7 +284,11 @@ fn coerce_text(
     // name, pointing at the option that would make it NULL instead. Silently
     // treating it as NULL anyway would make the option a lie in exactly the
     // place someone would go looking for it.
-    if text.is_empty() && class != TypeClass::Text {
+    // Trimmed, so a whitespace-only field takes this import-aware message
+    // rather than falling through to the numeric parser's — whose wording
+    // ("use the ∅ NULL button") belongs to the cell editor and names a
+    // button this dialog does not have.
+    if text.trim().is_empty() && class != TypeClass::Text {
         return Err(format!(
             "column \"{}\": an empty value is not {} — choose \"{}\" if it should be NULL",
             column.name,
@@ -254,7 +297,12 @@ fn coerce_text(
                 TypeClass::Bool => "a true/false value",
                 TypeClass::Json => "JSON",
                 TypeClass::DateTime => "a date or time",
-                TypeClass::Binary | TypeClass::Text => "binary data",
+                TypeClass::Binary => "binary data",
+                // Unreachable: the guard above exempts Text, which is the
+                // one class an empty value means something for. Named
+                // rather than folded into an arm it is not, so this does
+                // not read as a decision someone made.
+                TypeClass::Text => unreachable!("Text is exempted above"),
             },
             EmptyField::Null.label(),
         ));
@@ -444,6 +492,68 @@ mod tests {
         ] {
             assert_eq!(classify_type(type_name), expected, "{type_name}");
         }
+    }
+
+    #[test]
+    fn postgres_ranges_pass_through_instead_of_being_read_as_numbers() {
+        // `int4range` contains "int": read as an integer column it rejected
+        // `[1,10)`, a literal the server accepts — a row silently dropped in
+        // skip mode, which is data loss wearing a success message. The whole
+        // family answers the same way now, where before it split three ways.
+        for type_name in [
+            "int4range",
+            "int8range",
+            "numrange",
+            "tsrange",
+            "tstzrange",
+            "daterange",
+            "int4multirange",
+        ] {
+            assert_eq!(classify_type(type_name), TypeClass::Text, "{type_name}");
+            assert_eq!(
+                coerce(type_name, &text("[1,10)")),
+                Ok(Value::Text("[1,10)".into())),
+                "{type_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn sql_server_bit_is_boolean_but_postgres_bit_is_a_bit_string() {
+        // The one classification that has to know the backend: `bit` names
+        // two unrelated types. On SQL Server the boolean vocabulary applies
+        // (and `bool_value`'s SqlServer arm is finally reachable)...
+        let column = column("active", "bit");
+        assert_eq!(
+            coerce_field(&column, Dialect::SqlServer, &text("yes"), EmptyField::Null),
+            Ok(Value::Integer(1))
+        );
+        assert_eq!(
+            coerce_field(&column, Dialect::SqlServer, &text("no"), EmptyField::Null),
+            Ok(Value::Integer(0))
+        );
+        // ...and a value that is neither is refused here, where skip mode can
+        // still skip it, rather than by the server mid-transaction.
+        assert!(coerce_field(&column, Dialect::SqlServer, &text("2"), EmptyField::Null).is_err());
+
+        // On Postgres the same name is a bit-string: `1010` is a value and
+        // `yes` is not, so it stays text and the server judges it.
+        assert_eq!(
+            coerce_field(&column, Dialect::Postgres, &text("1010"), EmptyField::Null),
+            Ok(Value::Text("1010".into()))
+        );
+        assert_eq!(classify_type("bit"), TypeClass::Text);
+        assert_eq!(classify_type("bit varying"), TypeClass::Text);
+    }
+
+    #[test]
+    fn a_whitespace_only_field_gets_the_imports_own_message() {
+        // Not the cell editor's "use the ∅ NULL button", which names a
+        // button the import dialog does not have.
+        let err = coerce("integer", &text("   ")).unwrap_err();
+        assert!(!err.contains('∅'), "{err}");
+        assert!(err.contains("empty value is not a number"), "{err}");
+        assert!(err.contains(EmptyField::Null.label()), "{err}");
     }
 
     #[test]

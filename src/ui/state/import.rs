@@ -101,7 +101,7 @@ impl AppState {
     /// user's read-only marking (FRE-111) is read at the moment the import
     /// starts rather than whenever the dialog happened to open — and passed
     /// to [`run_import`], which refuses on the same resolved answer.
-    pub fn start_import(self, id: ConnectionId, request: ImportRequest) {
+    pub fn start_import(mut self, id: ConnectionId, request: ImportRequest) {
         let access = self
             .registry
             .read()
@@ -122,7 +122,14 @@ impl AppState {
         // or tab switch). A plain spawn would cancel it mid-transaction —
         // which would roll back, but silently and for no reason the user
         // asked for.
-        spawn_forever(async move {
+        //
+        // The handle is kept so ONE thing can stop it: closing the
+        // connection ([`AppState::close_connection`]), which cancels it the
+        // way it already cancels a running script. Dropping the future drops
+        // the open transaction with it, so the rows roll back — without this
+        // a 20 000-row import survived `pool.close()` and committed every row
+        // afterwards, with its outcome dropped as stale and nothing shown.
+        let task = spawn_forever(async move {
             let outcome = async {
                 let mut source = open_source(&request.path, request.format, request.encoding)
                     .map_err(|e| format!("opening the file failed: {e}"))?;
@@ -139,6 +146,7 @@ impl AppState {
             .await;
             self.finish_import(id, generation, outcome, Some(table_key));
         });
+        self.import_tasks.write().insert(id, task);
     }
 
     /// Marks the connection's import slot Running and returns its generation.
@@ -174,6 +182,7 @@ impl AppState {
         if latest != Some(generation) {
             return;
         }
+        self.release_import_task(id);
         let status = match outcome {
             Ok(report) => {
                 if let Some(key) = table_key {
@@ -184,6 +193,13 @@ impl AppState {
             Err(err) => ImportStatus::Failed(err),
         };
         self.import_status.write().insert(id, status);
+    }
+
+    /// Forgets a finished import's task handle — nothing to cancel once the
+    /// outcome is in, and a stale handle would let a later close "cancel" a
+    /// task that has already committed.
+    fn release_import_task(mut self, id: ConnectionId) {
+        self.import_tasks.write().remove(&id);
     }
 
     /// Clears the import line for one connection — the dialog's "dismiss"

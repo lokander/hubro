@@ -278,6 +278,44 @@ async fn sqlite_skip_mode_reports_every_bad_row_by_line_and_imports_the_rest() {
 }
 
 #[tokio::test]
+async fn sqlite_a_windows_file_with_a_trailing_blank_line_imports_exactly_its_rows() {
+    // CRLF with a trailing blank line is what Excel writes, i.e. the single
+    // most likely file anyone will import. The CR used to count as content,
+    // so the blank line became a record of one empty field: an all-NULL row
+    // committed here, and against the NOT NULL column below, the whole import
+    // aborted at a line with no data on it.
+    let fixture = FixtureDb::with_sql("").await;
+    let pool = fixture.open().await;
+    pool.execute("CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL, weight REAL)")
+        .await
+        .unwrap();
+    let tables = pool.introspect().await.unwrap();
+    let people = find(&tables, "people");
+
+    let text = "id,name,weight\r\n1,ada,1.5\r\n2,grace,2.5\r\n\r\n";
+    let report = import(
+        &pool,
+        people,
+        &options(
+            vec![bind(0, "id"), bind(1, "name"), bind(2, "weight")],
+            ErrorMode::Abort,
+        ),
+        csv(text).as_mut(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.inserted_rows, 2, "the blank line is not a row");
+    assert_eq!(
+        snapshot(&pool, people, "id").await,
+        vec![
+            vec!["1".to_string(), "ada".into(), "1.5".into()],
+            vec!["2".to_string(), "grace".into(), "2.5".into()],
+        ]
+    );
+}
+
+#[tokio::test]
 async fn sqlite_json_array_and_ndjson_import_the_same_rows() {
     let fixture = FixtureDb::with_sql("").await;
     let pool = fixture.open().await;
@@ -745,5 +783,171 @@ async fn mssql_skip_mode_reports_lines_and_commits_the_rest() {
     assert_eq!(pool.count_table_rows(table).await.unwrap(), 2);
 
     pool.execute("DROP TABLE dbo.import_skip").await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_a_partially_applied_batch_is_rolled_back_and_counted() {
+    // The row-count guard's own case, attacked the way the reviewer did: a
+    // BEFORE INSERT trigger drops half of every batch, so the statement
+    // affects fewer rows than it carried values for. The batch must not
+    // commit — and `undone_rows` must count the rows that DID land inside the
+    // transaction, since that is the number the safety claim is about.
+    let Some(url) = pg_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.execute("DROP TABLE IF EXISTS import_partial")
+        .await
+        .unwrap();
+    pool.execute("CREATE TABLE import_partial (id integer PRIMARY KEY, name text)")
+        .await
+        .unwrap();
+    pool.execute(
+        "CREATE OR REPLACE FUNCTION import_drop_odd() RETURNS trigger AS $$
+         BEGIN
+             IF NEW.id % 2 = 1 THEN RETURN NULL; END IF;
+             RETURN NEW;
+         END; $$ LANGUAGE plpgsql",
+    )
+    .await
+    .unwrap();
+    pool.execute(
+        "CREATE TRIGGER import_drop_odd BEFORE INSERT ON import_partial
+         FOR EACH ROW EXECUTE FUNCTION import_drop_odd()",
+    )
+    .await
+    .unwrap();
+    let tables = pool.introspect().await.unwrap();
+    let table = find(&tables, "import_partial");
+
+    let err = import(
+        &pool,
+        table,
+        &options(vec![bind(0, "id"), bind(1, "name")], ErrorMode::Abort),
+        csv("id,name\n1,a\n2,b\n3,c\n4,d\n").as_mut(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        err.message.contains("affected 2 rows, expected 4"),
+        "{}",
+        err.message
+    );
+    // The two rows the trigger let through were applied and then undone —
+    // reporting 0 here would under-count the one case the guard fires in.
+    assert_eq!(err.undone_rows, 2);
+    assert_eq!(pool.count_table_rows(table).await.unwrap(), 0);
+
+    pool.execute("DROP TABLE import_partial").await.unwrap();
+    pool.execute("DROP FUNCTION import_drop_odd()")
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_a_range_column_takes_the_literal_the_server_accepts() {
+    // `int4range` contains "int", so it used to be read as an integer column
+    // and `[1,10)` — which the server takes happily — was silently SKIPPED.
+    // A row dropped in skip mode is data loss wearing a success message.
+    let Some(url) = pg_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.execute("DROP TABLE IF EXISTS import_ranges")
+        .await
+        .unwrap();
+    pool.execute(
+        "CREATE TABLE import_ranges (id integer PRIMARY KEY, span int4range, days daterange)",
+    )
+    .await
+    .unwrap();
+    let tables = pool.introspect().await.unwrap();
+    let table = find(&tables, "import_ranges");
+
+    let report = import(
+        &pool,
+        table,
+        &options(
+            vec![bind(0, "id"), bind(1, "span"), bind(2, "days")],
+            ErrorMode::Skip,
+        ),
+        csv("id,span,days\n1,\"[1,10)\",\"[2024-01-01,2024-02-01)\"\n").as_mut(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.inserted_rows, 1, "skipped: {:?}", report.skipped);
+    assert_eq!(report.skipped_rows, 0);
+    // Read back through the server's own text rendering: hubro's grid shows a
+    // range as `<int4range>`, so `SELECT *` would say nothing about the value
+    // that landed.
+    let stored = pool
+        .query("SELECT span::text, days::text FROM import_ranges")
+        .await
+        .unwrap();
+    assert_eq!(stored.rows[0][0], Value::Text("[1,10)".into()));
+    assert_eq!(
+        stored.rows[0][1],
+        Value::Text("[2024-01-01,2024-02-01)".into())
+    );
+
+    pool.execute("DROP TABLE import_ranges").await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn mssql_a_bit_column_takes_the_boolean_spellings_people_export() {
+    // SQL Server's `bit` IS its boolean type, but the name alone cannot say
+    // so (Postgres `bit` is a bit-string). Without the dialect-aware
+    // refinement, `yes`/`no` reached the server as text and failed there —
+    // and a server-side failure is unskippable, so skip mode could not save
+    // the file either.
+    let Some(url) = mssql_url() else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    pool.execute("IF OBJECT_ID('dbo.import_bit', 'U') IS NOT NULL DROP TABLE dbo.import_bit")
+        .await
+        .unwrap();
+    pool.execute("CREATE TABLE dbo.import_bit (id int PRIMARY KEY, active bit NOT NULL)")
+        .await
+        .unwrap();
+    let tables = pool.introspect().await.unwrap();
+    let table = find(&tables, "import_bit");
+    let mapping = vec![bind(0, "id"), bind(1, "active")];
+
+    let report = import(
+        &pool,
+        table,
+        &options(mapping.clone(), ErrorMode::Abort),
+        csv("id,active\n1,yes\n2,no\n3,true\n4,0\n").as_mut(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.inserted_rows, 4);
+    assert_eq!(
+        snapshot(&pool, table, "id").await,
+        vec![
+            vec!["1".to_string(), "1".into()],
+            vec!["2".to_string(), "0".into()],
+            vec!["3".to_string(), "1".into()],
+            vec!["4".to_string(), "0".into()],
+        ]
+    );
+
+    // And a value that is neither is refused by hubro, so skip mode can
+    // actually skip it instead of the server aborting the whole import.
+    let report = import(
+        &pool,
+        table,
+        &options(mapping, ErrorMode::Skip),
+        csv("id,active\n5,maybe\n6,yes\n").as_mut(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.inserted_rows, 1);
+    assert_eq!(
+        report.skipped.iter().map(|s| s.line).collect::<Vec<_>>(),
+        vec![2]
+    );
+
+    pool.execute("DROP TABLE dbo.import_bit").await.unwrap();
     pool.close().await;
 }
