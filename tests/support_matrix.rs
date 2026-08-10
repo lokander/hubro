@@ -8,10 +8,11 @@
 //! which only holds if nobody can add an engine without saying so.
 //!
 //! So this asserts that every engine the code can *name* has a row. The
-//! mappings below are deliberately exhaustive `match`es rather than lists: a
-//! new [`PgFlavor`] or [`Dialect`] variant stops this file compiling until
-//! someone decides what it is called in the table, which is a better moment to
-//! be asked than after release.
+//! mapping is declared once through a macro that emits both the list to
+//! iterate and an exhaustive `match` to typecheck, so a new [`PgFlavor`]
+//! variant stops this file compiling until someone decides what it is called
+//! in the table — a better moment to be asked than after release. [`Dialect`]
+//! is matched exhaustively for the same reason.
 //!
 //! Deliberately not asserted: the Browse/Edit/Script cells. They restate what
 //! `backend_capabilities` and `TableAccess::resolve` decide, but a *server*'s
@@ -29,28 +30,38 @@ const README: &str = include_str!("../README.md");
 /// `#supported-databases`, and renaming the heading would silently break them.
 const HEADING: &str = "## Supported databases";
 
-/// How this engine is named in the table's first column.
+/// Declares the flavor-to-row-name mapping *once*, as both a list to iterate
+/// and an exhaustive `match` to typecheck.
 ///
-/// Exhaustive on purpose — see the module header.
-fn flavor_row(flavor: PgFlavor) -> &'static str {
-    match flavor {
-        PgFlavor::Postgres => "PostgreSQL",
-        PgFlavor::CockroachDB => "CockroachDB",
-        PgFlavor::Yugabyte => "YugabyteDB",
-        PgFlavor::Materialize => "Materialize",
-        PgFlavor::RisingWave => "RisingWave",
-    }
+/// The two have to come from one source or the guard has a hole: with a
+/// hand-written array beside a hand-written match, adding a [`PgFlavor`]
+/// variant and satisfying only the compiler — which asks about the match and
+/// not the array — leaves the new engine unlisted and every test green. That
+/// is precisely the drift this file exists to catch, so the array is generated
+/// rather than maintained.
+macro_rules! flavor_rows {
+    ($($variant:ident => $name:literal,)+) => {
+        /// Every flavor the detection can return, with its row name.
+        const FLAVORS: &[(PgFlavor, &str)] = &[$((PgFlavor::$variant, $name),)+];
+
+        /// Never called: it exists so the compiler rejects this file until a
+        /// new variant is added to the list above.
+        #[allow(dead_code)]
+        fn exhaustive(flavor: PgFlavor) -> &'static str {
+            match flavor {
+                $(PgFlavor::$variant => $name,)+
+            }
+        }
+    };
 }
 
-/// Every flavor the detection can return. Kept beside [`flavor_row`] so adding
-/// a variant fails in both places at once.
-const FLAVORS: [PgFlavor; 5] = [
-    PgFlavor::Postgres,
-    PgFlavor::CockroachDB,
-    PgFlavor::Yugabyte,
-    PgFlavor::Materialize,
-    PgFlavor::RisingWave,
-];
+flavor_rows! {
+    Postgres => "PostgreSQL",
+    CockroachDB => "CockroachDB",
+    Yugabyte => "YugabyteDB",
+    Materialize => "Materialize",
+    RisingWave => "RisingWave",
+}
 
 fn dialect_row(dialect: Dialect) -> &'static str {
     match dialect {
@@ -91,10 +102,9 @@ fn every_engine_the_code_names_has_a_row_in_the_matrix() {
     );
     let engines: Vec<&str> = rows.iter().map(|row| row[0].as_str()).collect();
 
-    for flavor in FLAVORS {
-        let name = flavor_row(flavor);
+    for (flavor, name) in FLAVORS {
         assert!(
-            engines.contains(&name),
+            engines.contains(name),
             "{flavor:?} is detected by hubro but has no row in the support matrix — \
              engines: {engines:?}"
         );
