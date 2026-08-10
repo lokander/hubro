@@ -229,8 +229,9 @@ pub enum RunStatus {
     /// The statement at `statement_index` (0-based, into the script)
     /// failed. Outcomes of the statements before it stay visible in
     /// [`SqlRun::statements`]. `rollback` says what the failure undid — an
-    /// atomic run (the whole script), a sequential one (nothing; earlier
-    /// statements persisted), or an atomic run on an engine whose rollback
+    /// atomic run (the whole script), a run that undid nothing (the sequential
+    /// path, where earlier statements persisted, or a failure before the
+    /// transaction opened), or an atomic run on an engine whose rollback
     /// doesn't reach schema changes (FRE-146).
     Failed {
         error: String,

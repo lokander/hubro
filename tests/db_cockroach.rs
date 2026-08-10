@@ -551,6 +551,71 @@ async fn cockroach_script_dml_rolls_back_but_its_ddl_does_not() {
 }
 
 #[tokio::test]
+async fn cockroach_reports_a_full_rollback_when_the_script_never_reached_its_ddl() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+
+    // The other side of the previous test, and the one that is easy to get
+    // wrong: whether a schema change escaped the rollback depends on whether it
+    // *ran*, not on whether the script contains one. Here the failure comes
+    // first, so the CREATE TABLE never reaches the server and the transaction
+    // rolls back completely — a warning about surviving schema changes would
+    // describe a table that does not exist, which is the same false claim
+    // FRE-146 removed, pointing the other way.
+    pool.query("DROP TABLE IF EXISTS crdb_unreached_ddl CASCADE")
+        .await
+        .unwrap();
+    pool.query("DROP TABLE IF EXISTS crdb_unreached_dml CASCADE")
+        .await
+        .unwrap();
+    pool.query("CREATE TABLE crdb_unreached_dml (id int PRIMARY KEY)")
+        .await
+        .unwrap();
+
+    let sql = "INSERT INTO crdb_unreached_dml VALUES (1); \
+               SELECT * FROM missing_relation; \
+               CREATE TABLE crdb_unreached_ddl (id int PRIMARY KEY)";
+    let statements = split_statements(sql, pool.dialect());
+    let error = run_script(&pool, pool.backend_capabilities(), &statements, |_| {})
+        .await
+        .expect_err("the second statement names no relation");
+    assert_eq!(error.statement_index, 1);
+    assert_eq!(
+        error.rollback,
+        Rollback::Full,
+        "the DDL never ran, so the rollback really did cover everything"
+    );
+
+    // ...and the database agrees on both halves.
+    let rows = pool
+        .query("SELECT count(*) FROM crdb_unreached_dml")
+        .await
+        .unwrap();
+    assert_eq!(
+        integer(&rows.rows[0][0]),
+        0,
+        "the INSERT rolled back — no DDL ran to commit it early"
+    );
+    let survivors = pool
+        .query(
+            "SELECT count(*) FROM information_schema.tables \
+             WHERE table_name = 'crdb_unreached_ddl'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        integer(&survivors.rows[0][0]),
+        0,
+        "the table was never created"
+    );
+
+    pool.query("DROP TABLE crdb_unreached_dml CASCADE")
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn cockroach_serial_is_unique_but_not_sequential() {
     let Some(url) = test_url() else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
