@@ -458,11 +458,15 @@ fn query_error(err: sqlx::Error, sql: &str) -> DbError {
 /// promised to keep.
 ///
 /// Deliberately just the one code. `40P01` (deadlock) is retryable in the same
-/// sense but means genuine contention rather than a racing schema change, and
-/// stock PostgreSQL raises neither on the paths that act on this: catalog reads
-/// run at READ COMMITTED in their own implicit transactions, where `40001`
-/// cannot occur. So this classification is inert on PostgreSQL, by
-/// construction rather than by a flavor check.
+/// sense but means genuine contention rather than a racing schema change.
+///
+/// On stock PostgreSQL this is near-inert without needing a flavor check: a
+/// catalog read runs in its own implicit transaction, which at the default READ
+/// COMMITTED cannot raise `40001`. Near-, not entirely — a server with
+/// `default_transaction_isolation = serializable` applies it to implicit
+/// transactions too, and a hot standby reports recovery conflicts as `40001`.
+/// Both are cases where running the read once more is the right answer anyway,
+/// so the classification needs no PostgreSQL-specific carve-out either way.
 fn is_transient(err: &sqlx::Error) -> bool {
     let sqlx::Error::Database(db_err) = err else {
         return false;

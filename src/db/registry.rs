@@ -532,13 +532,18 @@ impl DbPool {
 /// Runs a catalog read, running it a second time if the server called the
 /// first failure transient ([`DbError::Transient`], FRE-147).
 ///
-/// The two operations wrapped in this are the multi-statement reads:
-/// [`DbPool::introspect`] issues six catalog queries and
-/// [`DbPool::fetch_ddl`] up to three. Each runs in its own implicit
-/// transaction on a pooled connection, so a schema change landing *between*
-/// them can fail the call — on YugabyteDB the connection's catalog snapshot is
-/// invalidated outright. Nothing the user did, nothing they can act on, and
-/// the message names an engine internal.
+/// The two operations wrapped in this are the multi-statement reads.
+/// [`DbPool::introspect`] is the one this exists for: its catalog queries each
+/// run in their own implicit transaction on a pooled connection, so a schema
+/// change landing *between* them can fail the whole call — on YugabyteDB the
+/// connection's catalog snapshot is invalidated outright. Nothing the user did,
+/// nothing they can act on, and the message names an engine internal.
+///
+/// [`DbPool::fetch_ddl`] is wrapped at the same seam for the branches that can
+/// return an error at all — the single-query index and view lookups. Its
+/// table branch cannot: a failed catalog read there is folded into the output
+/// as a caveat rather than propagated, so it degrades instead of retrying, and
+/// deliberately so.
 ///
 /// **Once, never in a loop.** A second failure means something other than a
 /// racing schema change, and a schema tree that hangs is worse than one that
@@ -717,12 +722,25 @@ mod tests {
 
     /// Counts calls so each case can assert how many attempts a policy made,
     /// which is the whole content of "retry once, never in a loop".
+    ///
+    /// The last outcome repeats once the list runs out, so a case can say
+    /// "always fails transiently" with a one-element slice — but only up to
+    /// [`RUNAWAY`] calls, after which it hands back a *permanent* error. That
+    /// ceiling is what a looping regression would hit: without it, feeding an
+    /// endless transient failure to a policy that retried forever would hang
+    /// the test run instead of failing it, and a hang says far less than a
+    /// count does.
+    const RUNAWAY: usize = 4;
+
     async fn attempts(outcomes: &[Result<u8, DbError>]) -> (Result<u8, DbError>, usize) {
         let calls = std::cell::Cell::new(0);
         let result = retry_transient(|| {
             let index = calls.get();
             calls.set(index + 1);
-            let outcome = outcomes[index.min(outcomes.len() - 1)].clone();
+            let outcome = match index < RUNAWAY {
+                true => outcomes[index.min(outcomes.len() - 1)].clone(),
+                false => Err(DbError::Introspect("retried without bound".into())),
+            };
             async move { outcome }
         })
         .await;
