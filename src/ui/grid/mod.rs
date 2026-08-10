@@ -5,6 +5,7 @@
 //!   it;
 //! - [`nav`] — keyboard navigation and the windowed row range;
 //! - [`copy`] — copying a cell selection to the clipboard;
+//! - [`stats`] — the footer's aggregate readout for a cell selection;
 //! - [`detail`] — the row detail panel;
 //! - [`viewer`] — the rich cell viewers (JSON, images, binary, long text).
 //!
@@ -23,12 +24,14 @@ mod copy;
 mod detail;
 mod nav;
 mod rows;
+mod stats;
 mod viewer;
 
 use copy::*;
 use detail::*;
 use nav::*;
 use rows::*;
+use stats::*;
 use viewer::*;
 
 use std::collections::{HashMap, HashSet};
@@ -1397,7 +1400,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                 }
             }
             // Footer: paging + counts
-            GridFooter { rows_resource, count_resource, page }
+            GridFooter { rows_resource, count_resource, page, selection, grid_nav, copy_status }
             // Value-expand popup (FRE-15): Enter on a read-only / non-editable
             // focused cell shows its full value — fetched on demand for a
             // truncated cell (FRE-33). Dismissed by a backdrop click, the ✕,
@@ -1687,19 +1690,36 @@ fn GridToolbar(
     }
 }
 
-/// The grid's footer: which rows this page covers, of how many, and the page
-/// stepper.
+/// The grid's footer: which rows this page covers, of how many, the aggregate
+/// readout for the cell selection (FRE-117), and the page stepper.
 ///
 /// Reads the two resources itself rather than taking their values: the row
 /// range and the Next button's bound are derived from both at once, and the
 /// derivation is the only thing here worth naming.
+///
+/// The selection statistics are computed *here*, in a memo, for the same
+/// reason `copy_status` is read in the toolbar: read up in [`DataGrid`], every
+/// arrow key would re-render the whole grid body. The memo's `PartialEq` gate
+/// also means a selection change that leaves the numbers alone (arrowing along
+/// a row of equal values) repaints nothing.
 #[component]
 fn GridFooter(
     rows_resource: Resource<Result<(Page, Option<String>), crate::db::DbError>>,
     count_resource: Resource<Result<u64, crate::db::DbError>>,
     page: Signal<u64>,
+    selection: ReadSignal<Option<Selection>>,
+    grid_nav: Memo<GridNav>,
+    /// Where the click-to-copy confirmation goes — the same line a copy-as
+    /// reports on, so there is one place to look for "what just got copied".
+    copy_status: Signal<Option<CopyStatus>>,
 ) -> Element {
     let current = rows_resource.read();
+    // Cells already in memory only: `SelectionStats::compute` is a pure
+    // function of the page snapshot and the selection rectangle (FRE-117).
+    let selection_stats = use_memo(move || {
+        let selection = selection()?;
+        SelectionStats::for_readout(&grid_nav.read(), selection)
+    });
     rsx! {
         div { class: "flex items-center gap-3 border-t border-slate-200 dark:border-slate-800 px-3 py-1.5 text-xs text-slate-500 dark:text-slate-400",
             match current.as_ref() {
@@ -1728,19 +1748,53 @@ fn GridFooter(
                     let at_end = total.map(|t| last >= t).unwrap_or(true);
                     rsx! {
                         match total {
-                            Some(total) => rsx! { span { "rows {first}–{last} of {total}" } },
-                            None => rsx! { span { "rows {first}–{last} of …" } },
+                            Some(total) => rsx! { span { class: "shrink-0 whitespace-nowrap", "rows {first}–{last} of {total}" } },
+                            None => rsx! { span { class: "shrink-0 whitespace-nowrap", "rows {first}–{last} of …" } },
+                        }
+                        // Aggregate readout for the selected cells (FRE-117).
+                        // It sits beside the row range deliberately: the range
+                        // says what the *page* holds, this says what the
+                        // *selection* holds, and the two must never be
+                        // confused for one another.
+                        if let Some(stats) = selection_stats() {
+                            {
+                                let line = stats.line();
+                                let clipboard = line.clone();
+                                let note = stats.scope_note();
+                                rsx! {
+                                    button {
+                                        class: "min-w-0 truncate rounded px-1.5 py-0.5 text-left text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                                        // The readout is the element that gives
+                                        // way when the footer is narrow, so the
+                                        // tooltip repeats it in full — a
+                                        // truncated "avg 622.482…" is the one
+                                        // number a reader came for.
+                                        title: "{line}\n\n{note} Click to copy this readout.",
+                                        onclick: move |_| {
+                                            write_clipboard(&clipboard);
+                                            copy_status
+                                                .set(
+                                                    Some(CopyStatus::ok("Copied the selection stats".to_string())),
+                                                );
+                                        },
+                                        "{line}"
+                                    }
+                                }
+                            }
                         }
                         div { class: "flex-1" }
+                        // The stepper never gives way: the readout beside it
+                        // truncates instead, so a long selection summary can't
+                        // wrap "← Prev" onto two lines.
                         button {
-                            class: "rounded px-2 py-0.5 hover:bg-slate-200 dark:hover:bg-slate-800 disabled:opacity-40",
+                            class: "shrink-0 whitespace-nowrap rounded px-2 py-0.5 hover:bg-slate-200 dark:hover:bg-slate-800 disabled:opacity-40",
                             disabled: page() == 0,
                             onclick: move |_| { let p = page(); page.set(p.saturating_sub(1)); },
                             "← Prev"
                         }
-                        span { "page {page() + 1}" }
+                        span { class: "shrink-0 whitespace-nowrap", "page {page() + 1}" }
                         button {
-                            class: "rounded px-2 py-0.5 hover:bg-slate-200 dark:hover:bg-slate-800 disabled:opacity-40",
+                            class: "shrink-0 whitespace-nowrap rounded px-2 py-0.5 hover:bg-slate-200 dark:hover:bg-slate-800 disabled:opacity-40",
                             disabled: at_end,
                             onclick: move |_| { let p = page(); page.set(p + 1); },
                             "Next →"
