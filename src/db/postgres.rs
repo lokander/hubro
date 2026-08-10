@@ -67,20 +67,135 @@ pub fn build_url(
     super::url::POSTGRES.build(host, port, database, user, sslmode)
 }
 
+/// Which engine answered the Postgres wire handshake (FRE-90).
+///
+/// hubro speaks one protocol to a family of servers. Stock PostgreSQL and the
+/// extensions layered on it (TimescaleDB, Citus) are the same engine and share
+/// [`PgFlavor::Postgres`]; the reimplementations diverge in ways the backend
+/// has to know about, because each breaks something the Postgres path is
+/// entitled to assume — a schema the engine reserves that must not read as the
+/// user's data, a session default that quietly voids transactional DDL, an
+/// engine that cannot be written to at all.
+///
+/// Deliberately *not* a general version model: it answers "who is this" and
+/// nothing else. Anything that varies by version within one engine belongs in
+/// a catalog query, which reports what the server actually has rather than
+/// what its version number implies.
+///
+/// Detected once at connect and never re-checked — the server on the other end
+/// of an open connection does not change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgFlavor {
+    /// Stock PostgreSQL, and everything that is genuinely PostgreSQL
+    /// underneath: TimescaleDB and Citus (extensions on a real server), and
+    /// the hosted providers.
+    Postgres,
+    /// CockroachDB — a reimplementation of the wire protocol and SQL layer
+    /// over its own storage (FRE-90).
+    CockroachDB,
+    /// YugabyteDB — the real PostgreSQL query layer over its own storage
+    /// (FRE-91).
+    Yugabyte,
+    /// Materialize — a streaming engine speaking the Postgres wire protocol
+    /// (FRE-92).
+    Materialize,
+}
+
+/// Identifies the engine from its `version()` string.
+///
+/// Every engine here names itself in that one string, and every one of them
+/// *also* claims a PostgreSQL version for compatibility — Yugabyte reports
+/// `PostgreSQL 15.12-YB-…`, Materialize reports `PostgreSQL 9.5 … (Materialize
+/// 26.36.0)`. So the engine's own name is what identifies it, and stock
+/// Postgres is the answer only when no reimplementation named itself. Getting
+/// that backwards would file both of those as plain Postgres.
+///
+/// An unrecognized server is [`PgFlavor::Postgres`] because that is the
+/// behaviour it will be treated with: the standard catalog path, no special
+/// cases. A new engine misreads as Postgres and works as well as it did
+/// before it was known, rather than failing on a name nobody has heard of.
+fn detect_flavor(version: &str) -> PgFlavor {
+    let version = version.to_ascii_lowercase();
+    if version.contains("cockroachdb") {
+        PgFlavor::CockroachDB
+    } else if version.contains("materialize") {
+        PgFlavor::Materialize
+    } else if version.contains("-yb-") || version.contains("yugabyte") {
+        PgFlavor::Yugabyte
+    } else {
+        PgFlavor::Postgres
+    }
+}
+
+/// A Postgres-wire connection: the pool, plus which engine is on the other end.
+///
+/// The flavor travels with the pool rather than being re-derived where it is
+/// needed, so no code path can act on a guess about the server — mirroring
+/// [`MssqlPool`](super::sqlserver::MssqlPool), which likewise owns its own
+/// connection state instead of exposing a bare driver handle.
+#[derive(Clone)]
+pub struct PgConn {
+    pool: PgPool,
+    flavor: PgFlavor,
+}
+
+impl PgConn {
+    /// The underlying sqlx pool, for the execution paths that are identical on
+    /// every flavor (which is nearly all of them).
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    pub fn flavor(&self) -> PgFlavor {
+        self.flavor
+    }
+}
+
 /// Connects to Postgres from a URL (`postgres://user@host:port/db?sslmode=…`).
 /// The URL may carry a password; saved config never does — callers splice a
 /// session password in via [`url_with_password`].
-pub async fn open_postgres(url: &str) -> Result<PgPool, DbError> {
+pub async fn open_postgres(url: &str) -> Result<PgConn, DbError> {
+    // The flavor has to be known *before* the pool exists, not after: a
+    // reimplementation may need a session default applied to every connection
+    // the pool opens later, and `after_connect` is fixed when the pool is
+    // built. Hence a probe connection first — which also serves as the
+    // liveness check this function has always made, so the cost is one
+    // connect rather than a query that was already being run.
+    let flavor = probe_flavor(url).await?;
+
+    // Note on what is deliberately *not* set here (FRE-90). CockroachDB's
+    // `autocommit_before_ddl` defaults to on, committing the open transaction
+    // before each DDL statement — so a failing script's `CREATE TABLE`
+    // survives the rollback hubro reports (see `tests/db_cockroach.rs`).
+    // Turning it off does restore transactional DDL, and was tried; it also
+    // makes every `ALTER TABLE` / `CREATE INDEX` against a *schema-locked*
+    // table fail, and Cockroach creates tables schema-locked by default. That
+    // trades a gap in an uncommon operation for breaking a common one against
+    // tables hubro did not create, so the engine's default stands and the
+    // limitation is documented instead.
     let pool = PgPoolOptions::new()
         .max_connections(4)
         .connect(url)
         .await
         .map_err(|e| DbError::Connect(friendly_connect_error(&e)))?;
-    sqlx::query("SELECT 1")
-        .fetch_one(&pool)
+    Ok(PgConn { pool, flavor })
+}
+
+/// Opens one connection solely to ask the server who it is, then drops it.
+async fn probe_flavor(url: &str) -> Result<PgFlavor, DbError> {
+    use sqlx::Connection as _;
+
+    let mut conn = sqlx::postgres::PgConnection::connect(url)
         .await
         .map_err(|e| DbError::Connect(friendly_connect_error(&e)))?;
-    Ok(pool)
+    let version: String = sqlx::query_scalar("SELECT version()")
+        .fetch_one(&mut conn)
+        .await
+        .map_err(|e| DbError::Connect(friendly_connect_error(&e)))?;
+    // The probe has served its purpose; a close failure says nothing about
+    // whether the real pool will connect.
+    let _ = conn.close().await;
+    Ok(detect_flavor(&version))
 }
 
 /// Categorizes common failure modes so the connections screen reads well:
@@ -351,7 +466,8 @@ fn line_col(sql: &str, position: usize) -> Option<(usize, usize)> {
 /// with columns, primary keys, indexes (incl. unique), and foreign keys —
 /// parity with the SQLite metadata model. Six batched queries regardless
 /// of table count.
-pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
+pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
+    let pool = conn.pool();
     let map_err = |e: sqlx::Error| DbError::Introspect(e.to_string());
 
     // Objects that are the database's own bookkeeping rather than the user's
@@ -543,6 +659,31 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
         }
     }
 
+    // Schemas the engine reserves for its own catalog beyond the two the
+    // queries above already exclude (FRE-90).
+    //
+    // CockroachDB puts 119 objects in `crdb_internal` and `pg_extension` and
+    // lists both in `information_schema.tables` exactly as it lists the user's
+    // own tables — so without this the schema tree is mostly Cockroach's
+    // bookkeeping, and most of it does not even open (`crdb_internal` refuses
+    // to be read at all unless `allow_unsafe_internals` is set). None of it is
+    // reachable through `pg_depend`, which is how every other internal object
+    // here is found: these are not extension members, they are the engine.
+    //
+    // Matching on the name is what FRE-88 rules out — but the rule there is
+    // about *guessing* from a name, and this is not a guess on two counts.
+    // The connection has already identified itself as CockroachDB, so no
+    // stock-Postgres database can reach this; and on CockroachDB both names
+    // are reserved by the engine (`CREATE SCHEMA crdb_internal` is refused —
+    // it already exists), so no user's schema can ever be caught by it. That
+    // is the same standing the hardcoded `pg_catalog` and `information_schema`
+    // above have.
+    if conn.flavor() == PgFlavor::CockroachDB {
+        for schema in ["crdb_internal", "pg_extension"] {
+            internal_schemas.insert(schema.to_string(), Internal::System);
+        }
+    }
+
     // Tables and views across all non-system schemas. Materialized views
     // (relkind 'm') are not in information_schema, so they come from a
     // pg_catalog UNION (FRE-41).
@@ -574,11 +715,21 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
     // `format_type` yields the type name (with modifiers, e.g.
     // `character varying(255)`). `ord` orders columns within a relation across
     // both halves of the UNION.
+    //
+    // `pk_position` is cast to `int8` rather than taken as it comes: the SQL
+    // standard leaves `information_schema` positions as an implementation-
+    // defined exact numeric, and CockroachDB makes
+    // `key_column_usage.ordinal_position` a 64-bit integer where stock
+    // Postgres makes it 32-bit (FRE-90). Decoding is exact by wire type, so
+    // the mismatch failed the *whole* introspection — one column's width
+    // taking down the entire schema tree. Pinning the width in SQL costs
+    // nothing on Postgres and makes the decode independent of what any
+    // Postgres-wire engine chose here.
     let column_rows = sqlx::query(
         "SELECT c.table_schema, c.table_name, c.column_name, c.data_type, \
                 c.is_nullable, c.column_default, \
                 c.is_identity, c.identity_generation, c.is_generated, \
-                pk.ordinal_position AS pk_position, \
+                pk.ordinal_position::int8 AS pk_position, \
                 c.ordinal_position AS ord, \
                 ut.typtype::text AS typtype, ut.typcategory::text AS typcategory, \
                 ut.oid::int8 AS type_oid, \
@@ -604,7 +755,7 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
                 format_type(a.atttypid, a.atttypmod), \
                 CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END, \
                 NULL::text, 'NO', NULL::text, 'NEVER', \
-                NULL::int, a.attnum::int, \
+                NULL::int8, a.attnum::int, \
                 t.typtype::text, t.typcategory::text, t.oid::int8, \
                 tn.nspname, t.typname \
          FROM pg_attribute a \
@@ -742,7 +893,7 @@ pub async fn introspect(pool: &PgPool) -> Result<Vec<TableMeta>, DbError> {
             continue;
         };
         let nullable: String = get(row, "is_nullable")?;
-        let pk_position: Option<i32> = get(row, "pk_position")?;
+        let pk_position: Option<i64> = get(row, "pk_position")?;
         // Both `GENERATED ALWAYS AS IDENTITY` and `GENERATED ALWAYS AS
         // (expr) STORED` are database-assigned and not writable, so both map
         // to `Generated::Always`; `GENERATED BY DEFAULT AS IDENTITY` is
@@ -1305,6 +1456,68 @@ fn format_interval(iv: &PgInterval) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_engine_is_identified_from_the_version_string_it_really_sends() {
+        // Verbatim `version()` output from the containers the engine tests run
+        // against, so this stays a test of real strings rather than of strings
+        // written to match the parser (FRE-90/91/92).
+        for (version, expected) in [
+            (
+                "PostgreSQL 17.5 (Debian 17.5-1.pgdg120+1) on x86_64-pc-linux-gnu, \
+                 compiled by gcc (Debian 12.2.0-14) 12.2.0, 64-bit",
+                PgFlavor::Postgres,
+            ),
+            (
+                "CockroachDB CCL v26.2.5 (x86_64-pc-linux-gnu, built 2026/07/28 18:56:00, \
+                 go1.25.5)",
+                PgFlavor::CockroachDB,
+            ),
+            (
+                "PostgreSQL 15.12-YB-2026.1.0.1-b0 on x86_64-pc-linux-gnu, compiled by \
+                 clang version 21.1.1 (https://github.com/yugabyte/llvm-project.git \
+                 efca861cc42178cc4c555d605b36c79d7d121cc1), 64-bit",
+                PgFlavor::Yugabyte,
+            ),
+            (
+                "PostgreSQL 9.5 on x86_64-unknown-linux-gnu (Materialize 26.36.0)",
+                PgFlavor::Materialize,
+            ),
+        ] {
+            assert_eq!(detect_flavor(version), expected, "{version}");
+        }
+    }
+
+    #[test]
+    fn a_claimed_postgres_version_never_outvotes_the_engines_own_name() {
+        // The trap this parser exists to avoid: Yugabyte and Materialize both
+        // *lead* with "PostgreSQL <n>", so matching that first would file both
+        // as stock and skip everything they need.
+        for version in [
+            "PostgreSQL 15.12-YB-2026.1.0.1-b0 on x86_64-pc-linux-gnu",
+            "PostgreSQL 9.5 on x86_64-unknown-linux-gnu (Materialize 26.36.0)",
+        ] {
+            assert_ne!(detect_flavor(version), PgFlavor::Postgres, "{version}");
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_server_is_treated_as_plain_postgres() {
+        // The safe default: a server nobody has taught this about gets the
+        // standard catalog path and no special cases, which is exactly how it
+        // was handled before it had a name at all.
+        assert_eq!(detect_flavor(""), PgFlavor::Postgres);
+        assert_eq!(
+            detect_flavor("SomeFuturePostgresFork 1.0 on x86_64"),
+            PgFlavor::Postgres
+        );
+    }
+
+    #[test]
+    fn detection_ignores_case() {
+        assert_eq!(detect_flavor("cockroachdb ccl v26"), PgFlavor::CockroachDB);
+        assert_eq!(detect_flavor("COCKROACHDB CCL V26"), PgFlavor::CockroachDB);
+    }
 
     #[test]
     fn url_wrappers_bind_the_postgres_scheme() {

@@ -1,7 +1,6 @@
 use std::io::Write;
 use std::path::Path;
 
-use sqlx::postgres::PgPool;
 use sqlx::sqlite::SqlitePool;
 
 use super::caps::{self, Capabilities, TableAccess, WriteProtection};
@@ -61,7 +60,7 @@ pub struct ConnectionId(u64);
 #[derive(Clone)]
 pub enum DbPool {
     Sqlite(SqlitePool),
-    Postgres(PgPool),
+    Postgres(postgres::PgConn),
     SqlServer(MssqlPool),
 }
 
@@ -175,6 +174,22 @@ impl DbPool {
         }
     }
 
+    /// Which engine answered on a Postgres-wire connection (FRE-90), or `None`
+    /// on a backend where the question doesn't arise.
+    ///
+    /// Deliberately not a branching point for callers: what varies by flavor
+    /// is settled inside the backend, at connect time and during
+    /// introspection, so that a new engine is handled in one place rather than
+    /// wherever someone remembered to check. This exists to *report* the
+    /// answer — the engine tests assert on it, and it is what a future
+    /// connection-details panel would show.
+    pub fn pg_flavor(&self) -> Option<postgres::PgFlavor> {
+        match self {
+            DbPool::Postgres(pg) => Some(pg.flavor()),
+            DbPool::Sqlite(_) | DbPool::SqlServer(_) => None,
+        }
+    }
+
     /// This connection's default capabilities (FRE-87). All three current
     /// backends are full-featured OLTP engines — they query, write, run DDL,
     /// hold transactions and page by `LIMIT`/`OFFSET` — so each declares
@@ -228,7 +243,7 @@ impl DbPool {
     pub async fn query(&self, sql: &str) -> Result<QueryResult, DbError> {
         match self {
             DbPool::Sqlite(pool) => sqlite::query(pool, sql).await,
-            DbPool::Postgres(pool) => postgres::query(pool, sql).await,
+            DbPool::Postgres(pg) => postgres::query(pg.pool(), sql).await,
             // TDS reports result-set metadata for zero rows, so this backend
             // needs no separate entry point to hold the same contract.
             DbPool::SqlServer(pool) => sqlserver::query_with(pool, sql, &[]).await,
@@ -240,7 +255,7 @@ impl DbPool {
     pub async fn execute(&self, sql: &str) -> Result<u64, DbError> {
         match self {
             DbPool::Sqlite(pool) => sqlite::execute(pool, sql).await,
-            DbPool::Postgres(pool) => postgres::execute(pool, sql).await,
+            DbPool::Postgres(pg) => postgres::execute(pg.pool(), sql).await,
             DbPool::SqlServer(pool) => sqlserver::execute(pool, sql).await,
         }
     }
@@ -255,7 +270,8 @@ impl DbPool {
                 .await
                 .map(ScriptTx::Sqlite)
                 .map_err(|e| DbError::Query(e.to_string())),
-            DbPool::Postgres(pool) => pool
+            DbPool::Postgres(pg) => pg
+                .pool()
                 .begin()
                 .await
                 .map(ScriptTx::Postgres)
@@ -301,7 +317,7 @@ impl DbPool {
     ) -> Result<(), (Option<usize>, DbError)> {
         match self {
             DbPool::Sqlite(pool) => sqlite::execute_all_checked(pool, statements).await,
-            DbPool::Postgres(pool) => postgres::execute_all_checked(pool, statements).await,
+            DbPool::Postgres(pg) => postgres::execute_all_checked(pg.pool(), statements).await,
             DbPool::SqlServer(pool) => sqlserver::execute_all_checked(pool, statements).await,
         }
     }
@@ -309,7 +325,7 @@ impl DbPool {
     async fn query_with(&self, sql: &str, params: &[Value]) -> Result<QueryResult, DbError> {
         match self {
             DbPool::Sqlite(pool) => sqlite::query_with(pool, sql, params).await,
-            DbPool::Postgres(pool) => postgres::query_with(pool, sql, params).await,
+            DbPool::Postgres(pg) => postgres::query_with(pg.pool(), sql, params).await,
             DbPool::SqlServer(pool) => sqlserver::query_with(pool, sql, params).await,
         }
     }
@@ -357,8 +373,8 @@ impl DbPool {
             DbPool::Sqlite(pool) => {
                 sqlite::query_capped(pool, sql, params, max_rows, QUERY_CELL_CAP).await
             }
-            DbPool::Postgres(pool) => {
-                postgres::query_capped(pool, sql, params, max_rows, QUERY_CELL_CAP).await
+            DbPool::Postgres(pg) => {
+                postgres::query_capped(pg.pool(), sql, params, max_rows, QUERY_CELL_CAP).await
             }
             DbPool::SqlServer(pool) => {
                 sqlserver::query_capped(pool, sql, params, max_rows, QUERY_CELL_CAP).await
@@ -450,7 +466,7 @@ impl DbPool {
     ) -> Result<u64, DbError> {
         match self {
             DbPool::Sqlite(pool) => sqlite::export(pool, sql, params, format, out).await,
-            DbPool::Postgres(pool) => postgres::export(pool, sql, params, format, out).await,
+            DbPool::Postgres(pg) => postgres::export(pg.pool(), sql, params, format, out).await,
             DbPool::SqlServer(pool) => sqlserver::export(pool, sql, params, format, out).await,
         }
     }
@@ -462,7 +478,7 @@ impl DbPool {
     pub async fn fetch_ddl(&self, table: &TableMeta, object: &DdlObject) -> Result<Ddl, DbError> {
         match self {
             DbPool::Sqlite(pool) => sqlite::fetch_ddl(pool, table, object).await,
-            DbPool::Postgres(pool) => postgres::fetch_ddl(pool, table, object).await,
+            DbPool::Postgres(pg) => postgres::fetch_ddl(pg.pool(), table, object).await,
             DbPool::SqlServer(pool) => sqlserver::fetch_ddl(pool, table, object).await,
         }
     }
@@ -470,7 +486,7 @@ impl DbPool {
     pub async fn introspect(&self) -> Result<Vec<TableMeta>, DbError> {
         match self {
             DbPool::Sqlite(pool) => sqlite::introspect(pool).await,
-            DbPool::Postgres(pool) => postgres::introspect(pool).await,
+            DbPool::Postgres(pg) => postgres::introspect(pg).await,
             DbPool::SqlServer(pool) => sqlserver::introspect(pool).await,
         }
     }
@@ -478,7 +494,7 @@ impl DbPool {
     pub async fn close(&self) {
         match self {
             DbPool::Sqlite(pool) => pool.close().await,
-            DbPool::Postgres(pool) => pool.close().await,
+            DbPool::Postgres(pg) => pg.pool().close().await,
             DbPool::SqlServer(pool) => pool.close().await,
         }
     }
