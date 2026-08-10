@@ -129,9 +129,10 @@ pub(super) struct TableRenderMeta {
 
 impl TableRenderMeta {
     /// Reduces one table's introspected metadata to what rendering needs.
-    /// `dialect` only feeds the required-column rules, which are per-backend;
-    /// without a live connection nothing is flagged (there is nothing to save
-    /// through either). Empty when the schema isn't loaded yet.
+    /// `dialect` feeds the required-column rules and the one editor kind that
+    /// a type name alone cannot decide — Postgres `bit` versus SQL Server's
+    /// (FRE-159). Without a live connection neither applies, and there is
+    /// nothing to save through either. Empty when the schema isn't loaded yet.
     pub(super) fn build(meta: Option<&TableMeta>, dialect: Option<Dialect>) -> Self {
         let Some(meta) = meta else {
             return TableRenderMeta::default();
@@ -1440,6 +1441,42 @@ mod tests {
         assert!(TableRenderMeta::build(Some(&detail_table_meta()), None)
             .required
             .is_empty());
+    }
+
+    #[test]
+    fn the_connections_dialect_reaches_the_editor_kinds() {
+        // This is the only wiring that hands `editor_kind` a dialect in the
+        // running app, and `editor_kind` is total without it — so dropping it
+        // silently reverts every Postgres bit column to a plain text editor
+        // with nothing else failing (FRE-159). Hence a test at this level and
+        // not only on `editor_kind` itself.
+        let mut table = detail_table_meta();
+        table.columns.push(ColumnMeta {
+            name: "mask".into(),
+            type_name: "bit".into(),
+            nullable: true,
+            primary_key_position: None,
+            default: None,
+            generated: Generated::Never,
+            type_detail: crate::db::TypeDetail::Plain,
+        });
+
+        let pg = TableRenderMeta::build(Some(&table), Some(Dialect::Postgres));
+        assert_eq!(
+            pg.kind_of("mask"),
+            (EditorKind::BitString, true),
+            "the dialect is not reaching editor_kind, so a Postgres bit column \
+             edits as free text and is validated by nobody"
+        );
+
+        // SQL Server's `bit` is a boolean, and must not be caught by the same
+        // name — the distinction is the point of passing the dialect at all.
+        let ms = TableRenderMeta::build(Some(&table), Some(Dialect::SqlServer));
+        assert_ne!(ms.kind_of("mask").0, EditorKind::BitString);
+
+        // No connection, no dialect, no refinement.
+        let none = TableRenderMeta::build(Some(&table), None);
+        assert_eq!(none.kind_of("mask"), (EditorKind::Text, true));
     }
 
     #[test]

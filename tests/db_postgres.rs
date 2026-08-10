@@ -982,6 +982,71 @@ async fn bit_and_char_columns_save_through_the_staged_cast() {
     pool.close().await;
 }
 
+/// Bit values are readable, and a `bit(n)` **primary key** round-trips.
+///
+/// A writable column nobody can read is not usable: sqlx has no built-in
+/// decode for these OIDs, so before the `BIT`/`VARBIT` arm every bit cell
+/// showed the `<bit>` marker. That is not only a display gap — the marker
+/// becomes the row locator for a `bit(n)` key, so the UPDATE keys on `"<bit>"`
+/// and the (now correct) cast turns it into `"<" is not a valid binary digit`.
+/// Such a table was unsaveable no matter how right the cast was.
+#[tokio::test]
+async fn bit_values_are_readable_and_a_bit_key_round_trips() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.query("DROP TABLE IF EXISTS bit_key").await.unwrap();
+    pool.query("CREATE TABLE bit_key (m bit(4) PRIMARY KEY, label text, wide bit varying(64))")
+        .await
+        .unwrap();
+    pool.query("INSERT INTO bit_key VALUES (B'1010', 'a', B'110011001100')")
+        .await
+        .unwrap();
+
+    // Read: the value itself, not a marker.
+    let read = pool.query("SELECT m, wide FROM bit_key").await.unwrap();
+    assert_eq!(
+        read.rows[0][0],
+        Value::Text("1010".into()),
+        "a bit column must read as its bits — the `<bit>` marker also becomes \
+         the row locator, which makes a bit-keyed table unsaveable"
+    );
+    assert_eq!(read.rows[0][1], Value::Text("110011001100".into()));
+
+    // Write, keyed by that same bit value as the grid would hand it back.
+    let tables = pool.introspect().await.unwrap();
+    let table = tables.iter().find(|t| t.name == "bit_key").unwrap();
+    let identity = detect_row_identity(table, Dialect::Postgres).unwrap();
+    let applied = hubro::db::apply_staged(
+        &pool,
+        &pool.backend_access(table),
+        table,
+        &identity,
+        &[hubro::db::StagedChange::Update {
+            locator: RowLocator {
+                // Exactly what the read above produced — the point of the test.
+                identity_values: vec![read.rows[0][0].clone()],
+            },
+            column: "label".into(),
+            value: Value::Text("b".into()),
+        }],
+    )
+    .await
+    .expect("a bit(n) primary key must be usable as a row locator");
+    assert_eq!(
+        applied.updated_rows, 1,
+        "the key matched no row, so the save silently changed nothing"
+    );
+
+    let after = pool
+        .query("SELECT label FROM bit_key WHERE m = B'1010'")
+        .await
+        .unwrap();
+    assert_eq!(after.rows[0][0], Value::Text("b".into()));
+
+    pool.query("DROP TABLE bit_key").await.unwrap();
+    pool.close().await;
+}
+
 #[tokio::test]
 async fn partition_children_are_internal_but_their_parent_is_not() {
     let Some(url) = test_url() else { return };

@@ -1799,6 +1799,14 @@ fn decode_typed(row: &PgRow, idx: usize, raw: &PgValueRef) -> Option<Value> {
             row.try_get::<Decimal, _>(idx).ok()?.to_string(),
         )),
         "UUID" => Some(Value::Text(row.try_get::<Uuid, _>(idx).ok()?.to_string())),
+        // Bit strings, as the `0`/`1` text the server prints and the editor
+        // accepts back (FRE-159). sqlx has no built-in decode for these
+        // without the `bit-vec` feature, so without this arm they degraded to
+        // the `<bit>` marker — which is not merely a display gap: that marker
+        // becomes the row locator for a `bit(n)` primary key, so the save it
+        // keys with is refused ("<" is not a valid binary digit) and such a
+        // table is unsaveable however correct the cast is.
+        "BIT" | "VARBIT" => decode_bit_string(raw),
         // Compact JSON text (serde_json Display is compact).
         "JSON" | "JSONB" => Some(Value::Text(
             row.try_get::<JsonValue, _>(idx).ok()?.to_string(),
@@ -1817,6 +1825,38 @@ fn decode_typed(row: &PgRow, idx: usize, raw: &PgValueRef) -> Option<Value> {
         "UUID[]" => decode_array::<Uuid>(row, idx, |v| v.to_string()),
         "NUMERIC[]" => decode_array::<Decimal>(row, idx, |v| v.to_string()),
         _ => None,
+    }
+}
+
+/// Decodes a `bit`/`bit varying` value to its `0`/`1` text.
+///
+/// Read from the wire rather than through `try_get`, which refuses these OIDs
+/// unless sqlx is built with `bit-vec` — a dependency not worth taking for one
+/// display form. The binary encoding is a big-endian `i32` bit *count*
+/// followed by the bits packed MSB-first, so the last byte is padded and the
+/// count is what says where the value really ends.
+fn decode_bit_string(raw: &PgValueRef) -> Option<Value> {
+    let bytes = raw.as_bytes().ok()?;
+    match raw.format() {
+        PgValueFormat::Text => Some(Value::Text(std::str::from_utf8(bytes).ok()?.to_string())),
+        PgValueFormat::Binary => {
+            let (count, packed) = bytes.split_at_checked(4)?;
+            let count = usize::try_from(i32::from_be_bytes(count.try_into().ok()?)).ok()?;
+            // A count claiming more bits than were sent is a malformed value;
+            // degrading to the marker beats indexing past the end.
+            if count > packed.len() * 8 {
+                return None;
+            }
+            let bits = (0..count).map(|bit| {
+                let byte = packed[bit / 8];
+                if (byte >> (7 - bit % 8)) & 1 == 1 {
+                    '1'
+                } else {
+                    '0'
+                }
+            });
+            Some(Value::Text(bits.collect()))
+        }
     }
 }
 

@@ -185,10 +185,12 @@ pub(crate) fn is_bit_string(type_name: &str, dialect: Dialect) -> bool {
 ///
 /// Not trimmed: whitespace is not a bit, and silently accepting `" 101"` would
 /// only move the failure to the server.
+///
+/// The **empty string is accepted**, because `''::bit varying` is a legal
+/// zero-length value — refusing it here would stop a column taking something
+/// it took before this rule existed. `bit(n)` refuses it server-side, for the
+/// same reason it refuses any other wrong length.
 pub(crate) fn validate_bit_literal(text: &str) -> Result<(), String> {
-    if text.is_empty() {
-        return Err("a bit string cannot be empty".to_string());
-    }
     match text.chars().position(|c| c != '0' && c != '1') {
         Some(index) => Err(format!(
             "a bit string takes only 0 and 1 — found {:?} at position {}",
@@ -351,7 +353,10 @@ fn coerce_text(
     // rather than falling through to the numeric parser's — whose wording
     // ("use the ∅ NULL button") belongs to the cell editor and names a
     // button this dialog does not have.
-    if text.trim().is_empty() && class != TypeClass::Text {
+    // `BitString` joins Text in the exemption: the empty string is a legal
+    // zero-length `bit varying` value, so refusing it by name here would take
+    // away something the column accepts (see [`validate_bit_literal`]).
+    if text.trim().is_empty() && !matches!(class, TypeClass::Text | TypeClass::BitString) {
         return Err(format!(
             "column \"{}\": an empty value is not {} — choose \"{}\" if it should be NULL",
             column.name,
@@ -361,12 +366,13 @@ fn coerce_text(
                 TypeClass::Json => "JSON",
                 TypeClass::DateTime => "a date or time",
                 TypeClass::Binary => "binary data",
-                TypeClass::BitString => "a bit string",
-                // Unreachable: the guard above exempts Text, which is the
-                // one class an empty value means something for. Named
-                // rather than folded into an arm it is not, so this does
+                // Unreachable: the guard above exempts both of these, being
+                // the classes an empty value means something for. Named
+                // rather than folded into an arm they are not, so this does
                 // not read as a decision someone made.
-                TypeClass::Text => unreachable!("Text is exempted above"),
+                TypeClass::Text | TypeClass::BitString => {
+                    unreachable!("Text and BitString are exempted above")
+                }
             },
             EmptyField::Null.label(),
         ));
@@ -551,7 +557,10 @@ mod tests {
         // server refuses aborts the whole transaction instead.
         assert!(validate_bit_literal("1012").is_err());
         assert!(validate_bit_literal("yes").is_err());
-        assert!(validate_bit_literal("").is_err());
+        // The empty string is a legal zero-length `bit varying` value, so it
+        // passes here — refusing it would take away something the column
+        // accepts, and `bit(n)` refuses it server-side like any wrong length.
+        assert!(validate_bit_literal("").is_ok());
         // Not trimmed — whitespace is not a bit, and accepting it here would
         // only move the failure to the server.
         assert!(validate_bit_literal(" 101").is_err());
