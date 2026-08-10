@@ -461,14 +461,21 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         }
     });
 
-    // Whether this object has any rows to list at all (FRE-148). Resolved
-    // beside the other read-side facts, and through the same memo gate for the
-    // same reason, so that a declared-unbrowsable object never reaches the
-    // server: the query it would otherwise run is one the engine answers with
-    // an error about an object that stores nothing. A RisingWave sink is the
-    // case — it writes outward to Kafka or another database.
+    // Whether this object has any rows to list at all (FRE-148), so that a
+    // declared-unbrowsable object never reaches the server: the query it would
+    // otherwise run is one the engine answers with an error about an object
+    // that stores nothing. A RisingWave sink is the case — it writes outward
+    // to Kafka or another database.
+    //
+    // Resolved through a memo for the reason `fetch_meta` above is: `registry`
+    // and `schemas` are whole-map signals, so a raw read would make every
+    // other connection's open, close or protection change re-run this grid's
+    // page fetch and its `COUNT(*)` (FRE-129). `Option<Option<_>>` because
+    // "unknown" and "browsable" are different answers — a reload sets
+    // `SchemaLoad::Loading`, which empties the table list, so the outer `None`
+    // is the ordinary state during a sidebar Refresh rather than an edge case.
     let gate_table = table.clone();
-    let resolve_gate = move || {
+    let resolved_gate = use_memo(move || {
         let registry = state.registry.read();
         let schemas = state.schemas.read();
         match (
@@ -476,13 +483,10 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             registry.get(id),
         ) {
             (Some(meta), Some(connection)) => Some(connection.access(meta).unreadable),
-            // Not "browsable": *unknown*. A reload sets `SchemaLoad::Loading`,
-            // which empties the table list, so this is the ordinary state
-            // during a sidebar Refresh rather than an edge case.
             _ => None,
         }
-    };
-    let mut unbrowsable = use_signal(|| resolve_gate().flatten());
+    });
+    let mut unbrowsable = use_signal(|| resolved_gate().flatten());
     use_effect(move || {
         // Keeps the last known answer while the schema reloads, instead of
         // falling open and sending the very query the gate exists to stop —
@@ -493,8 +497,15 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         // restore before its schema has ever arrived has no answer to keep, so
         // one refused query can still go out and be corrected when the schema
         // lands. Self-correcting, because the resources read this signal.
-        if let Some(reason) = resolve_gate() {
-            unbrowsable.set(reason);
+        //
+        // Peeked before writing: `Signal::set` is unconditional, and both
+        // resources subscribe to this, so setting an unchanged value would
+        // re-fetch the page and re-count the rows for nothing — undoing the
+        // memo's gate one line above.
+        if let Some(reason) = resolved_gate() {
+            if *unbrowsable.peek() != reason {
+                unbrowsable.set(reason);
+            }
         }
     });
 
@@ -1122,14 +1133,24 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                         // The sentence is the backend's own, so it explains the
                         // object rather than naming the engine.
                         //
-                        // Guarded on `can_read` rather than on the error alone:
+                        // Guarded on the error alone would be wrong:
                         // `Unsupported` is also how `refuse_paged_read` reports
                         // a connection that cannot query or cannot page by
                         // offset, and rendering *that* as "nothing to browse
                         // here" would be a false claim about the object. No
                         // backend declares either today, which is exactly why
                         // the arm has to say which case it means.
-                        Some(Err(crate::db::DbError::Unsupported(reason))) if !can_read => rsx! {
+                        //
+                        // The guard reads the *same* signal the resources
+                        // refused on, not the resolved `can_read`: that one
+                        // comes back through `find_table_meta`, which reports
+                        // nothing while the schema reloads — so during a
+                        // Refresh it would say "readable" exactly when the
+                        // resource is returning this error, and the empty state
+                        // would flip to a red banner.
+                        Some(Err(crate::db::DbError::Unsupported(reason)))
+                            if unbrowsable().is_some() =>
+                        rsx! {
                             EmptyState {
                                 icon: rsx! { File { size: 40 } },
                                 title: "Nothing to browse here",
