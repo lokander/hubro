@@ -14,7 +14,7 @@
 #   scripts/test-db.sh env 1         # KEY=VALUE lines for set 1
 #   scripts/test-db.sh down 1        # stop, keeping the data
 #   scripts/test-db.sh rm 1          # stop and delete — releases the set
-#   scripts/test-db.sh status
+#   scripts/test-db.sh status       # which sets are up (0-3)
 #
 # The usual way to run a suite against a set:
 #
@@ -52,6 +52,22 @@ port_base() {
   esac
 }
 
+# The port each engine listens on inside its container — the other half of the
+# published mapping, and what a probe sharing the container's network namespace
+# has to dial. Written out rather than reusing `port_base`, which happens to
+# match for two of these and would be a coincidence to depend on.
+internal_port() {
+  case "$1" in
+    pg | timescale | citus) echo 5432 ;;
+    mssql) echo 1433 ;;
+    crdb) echo 26257 ;;
+    yugabyte) echo 5433 ;;
+    materialize) echo 6875 ;;
+    risingwave) echo 4566 ;;
+    *) die "unknown engine: $1" ;;
+  esac
+}
+
 # Yugabyte also publishes its admin UI; kept off everything else's ports.
 YUGABYTE_UI_BASE=15433
 
@@ -83,6 +99,7 @@ env_var() {
     yugabyte) echo HUBRO_YUGABYTE_TEST_URL ;;
     materialize) echo HUBRO_MATERIALIZE_TEST_URL ;;
     risingwave) echo HUBRO_RISINGWAVE_TEST_URL ;;
+    *) die "unknown engine: $1" ;;
   esac
 }
 
@@ -189,11 +206,10 @@ ready() {
   local engine=$1 set=$2 name
   name=$(name_for "$engine" "$set")
 
-  local port deadline
-  port=$(port_for "$engine" "$set")
+  local deadline
   deadline=$((SECONDS + ${TEST_DB_WAIT_SECONDS:-240}))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    if probe "$engine" "$name" "$port"; then
+    if probe "$engine" "$name"; then
       echo "  $name ready"
       return 0
     fi
@@ -206,7 +222,7 @@ ready() {
 # most of these the setup is a `CREATE DATABASE` that only succeeds once the
 # server is up, so a separate readiness probe would just be the same call twice.
 probe() {
-  local engine=$1 name=$2 # $3 is the host port, used by the outside-in probes
+  local engine=$1 name=$2
   case "$engine" in
     pg)
       docker exec "$name" pg_isready -U tester -d demo >/dev/null 2>&1
@@ -260,8 +276,14 @@ probe() {
       # before a client can connect. `pg_isready` speaks enough of the protocol
       # to tell the difference; both engines answer it (exit 0) once really up,
       # and an unused port gives exit 2.
-      docker run --rm --network host postgres:17-alpine \
-        pg_isready -h 127.0.0.1 -p "$3" >/dev/null 2>&1
+      #
+      # Joins the container's *own* network namespace rather than using
+      # `--network host`: host networking is unavailable or off by default on
+      # Docker Desktop, which the macOS and Windows dev machines run. Dialling
+      # the internal port from inside also skips `docker-proxy` entirely, which
+      # is the thing that was answering early.
+      docker run --rm --network "container:${name}" postgres:17-alpine \
+        pg_isready -h 127.0.0.1 -p "$(internal_port "$engine")" >/dev/null 2>&1
       ;;
   esac
 }
@@ -311,7 +333,8 @@ cmd_down() {
   for engine in "${SELECTED[@]}"; do
     name=$(name_for "$engine" "$set")
     if container_running "$name"; then
-      docker stop "$name" >/dev/null && echo "  stopped $name"
+      docker stop "$name" >/dev/null
+      echo "  stopped $name"
     fi
   done
 }
@@ -327,7 +350,8 @@ cmd_rm() {
   for engine in "${SELECTED[@]}"; do
     name=$(name_for "$engine" "$set")
     if container_exists "$name"; then
-      docker rm -f "$name" >/dev/null && echo "  removed $name"
+      docker rm -f "$name" >/dev/null
+      echo "  removed $name"
     fi
   done
 }
@@ -343,6 +367,11 @@ cmd_env() {
     # that is not running would make them fail instead, and look like the
     # engine broke.
     if container_running "$(name_for "$engine" "$set")"; then
+      # Checked here as well as in `create`: this output is what gets handed to
+      # cargo, and a URL for a container that is actually published somewhere
+      # else fails as a connection error the suite reports as the engine's
+      # fault. `create` catches it earlier, but only when `up` ran at all.
+      check_port "$(name_for "$engine" "$set")" "$(port_for "$engine" "$set")"
       echo "$(env_var "$engine")=$(url_for "$engine" "$set")"
     fi
   done
