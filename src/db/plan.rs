@@ -30,7 +30,7 @@ use super::value::QueryResult;
 /// land on different connections — and the failure mode of getting that wrong
 /// is executing a statement the user asked to have explained. Offering
 /// nothing is the honest answer until a backend can hold one connection for
-/// the pair (a follow-up, not this issue).
+/// the pair, which is FRE-158.
 pub const NO_EXPLAIN: &str = "This connection has no EXPLAIN statement.";
 
 /// How a connection produces a query plan.
@@ -213,12 +213,23 @@ pub struct PlanNode {
 /// One threshold rather than a gradient, because the highlight answers one
 /// question — *where does this plan spend its cost?* — and a gradient answers
 /// it in a way you have to squint at. A fifth of the plan in a single node is
-/// where looking is worth it: at most four nodes can cross it, so the
-/// highlight stays a pointer rather than a wash.
+/// where looking is worth it.
 ///
-/// A consequence worth stating rather than special-casing: a one-node plan
-/// highlights its only node, which holds 100% of the cost. That is the honest
-/// answer to the question being asked, not a bug — the cost is all there.
+/// **This bounds nothing**, and an earlier version of this comment claimed it
+/// bounded the highlight to four nodes. That was wrong twice over: even where
+/// the exclusive costs telescope to the root's total, five nodes at exactly
+/// 20% fit inside it — and they do not always telescope, because
+/// [`PlanNode::self_cost`] is floored at zero. A nested loop whose children
+/// each cost more than it does gives every child a self cost equal to its own
+/// total, so eight such children highlight all eight at 100%.
+/// `the_threshold_bounds_nothing` pins both shapes.
+///
+/// What keeps the highlight worth having is therefore not scarcity but what
+/// it means: a highlighted node really does hold at least a fifth of the
+/// plan's cost on its own. A plan where that is true of many nodes is one
+/// whose cost genuinely is spread across many nodes, and showing that is the
+/// answer to the question rather than a failure to answer it. Same for the
+/// one-node plan that highlights its only node — the cost is all there.
 pub const EXPENSIVE_SHARE: f64 = 0.2;
 
 impl PlanTree {
@@ -346,9 +357,21 @@ fn number(value: Option<&serde_json::Value>) -> Option<f64> {
 /// A total of zero (or a plan with no costs at all) marks nothing: dividing
 /// by it would make every node either infinite or NaN, and "everything is
 /// expensive" is no more useful than "nothing is".
+///
+/// The share is clamped into `0.0..=1.0`. Real PostgreSQL cannot produce a
+/// node costing more than its plan, but this parses a JSON document that only
+/// *claims* to be one — a negative or overflowing cost otherwise reaches the
+/// UI as a share above 1.0 or an infinity, which renders as a percentage
+/// nobody can read. Clamping is not hiding it: the node's own costs are shown
+/// beside the badge exactly as the document gave them.
 fn mark_expensive(node: &mut PlanNode, total: f64) {
     if total > 0.0 {
-        node.cost_share = node.self_cost / total;
+        let share = node.self_cost / total;
+        node.cost_share = if share.is_finite() {
+            share.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         node.expensive = node.cost_share >= EXPENSIVE_SHARE;
     }
     for child in &mut node.children {
@@ -560,6 +583,70 @@ mod tests {
             assert!(!tree.root.expensive);
             assert_eq!(tree.root.cost_share, 0.0);
             assert!(tree.root.cost_share.is_finite());
+        }
+    }
+
+    /// The corrected claim (review of PR #116): the threshold is a share of
+    /// the plan's total, and a share threshold bounds nothing.
+    ///
+    /// Both shapes are reachable from a document a server could send, so both
+    /// are pinned here rather than argued about in a comment — the previous
+    /// comment argued, and was wrong.
+    #[test]
+    fn the_threshold_bounds_nothing() {
+        // Five siblings at exactly a fifth each: the costs telescope, nothing
+        // is clamped, and five nodes cross a one-fifth threshold.
+        let tree = PlanTree::parse(&document(node(
+            "Append",
+            100.0,
+            (0..5).map(|_| node("Seq Scan", 20.0, vec![])).collect(),
+        )))
+        .unwrap();
+        let expensive = tree
+            .rows()
+            .iter()
+            .filter(|(_, node)| node.expensive)
+            .count();
+        // The Append itself adds nothing of its own; its five children do.
+        assert_eq!(expensive, 5);
+        assert!(!tree.root.expensive);
+
+        // And with the zero floor the sum of self costs is not bounded by the
+        // total at all: a nested loop's children are costed per iteration, so
+        // each can exceed the parent, and each keeps its whole total as its
+        // own contribution.
+        let tree = PlanTree::parse(&document(node(
+            "Nested Loop",
+            50.0,
+            (0..8).map(|_| node("Index Scan", 50.0, vec![])).collect(),
+        )))
+        .unwrap();
+        let shares: Vec<f64> = tree
+            .rows()
+            .iter()
+            .filter(|(_, node)| node.expensive)
+            .map(|(_, node)| node.cost_share)
+            .collect();
+        assert_eq!(shares, vec![1.0; 8]);
+    }
+
+    #[test]
+    fn an_impossible_cost_cannot_render_an_unreadable_share() {
+        // Not reachable from real PostgreSQL, but this parses a document that
+        // only claims to be a plan. A child with a negative cost inflates its
+        // parent's exclusive cost past the plan total; an overflowing one
+        // makes the ratio infinite. Both must leave a share the UI can print.
+        for child in [-500.0, 1e308 * 10.0] {
+            let tree = PlanTree::parse(&document(node(
+                "Nested Loop",
+                100.0,
+                vec![node("Seq Scan", child, vec![])],
+            )))
+            .unwrap();
+            for (_, node) in tree.rows() {
+                assert!(node.cost_share.is_finite(), "{node:?}");
+                assert!((0.0..=1.0).contains(&node.cost_share), "{node:?}");
+            }
         }
     }
 

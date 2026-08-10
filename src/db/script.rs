@@ -483,11 +483,19 @@ fn confirmation_needed(sql: &str, stripped: &str) -> bool {
 
 /// Words that may stand between `EXPLAIN` and the statement it explains,
 /// across the dialects hubro speaks: PostgreSQL's legacy un-parenthesized
-/// options (`EXPLAIN ANALYZE VERBOSE SELECT …`) and SQLite's `EXPLAIN QUERY
-/// PLAN`. None of them can change anything on its own, which is what makes
-/// skipping them safe — a word *not* in this list ends the header and is
-/// treated as the start of the explained statement.
-const EXPLAIN_OPTION_WORDS: [&str; 4] = ["analyze", "verbose", "query", "plan"];
+/// options (`EXPLAIN ANALYZE VERBOSE SELECT …`, and `ANALYSE`, which its
+/// grammar accepts as a synonym) and SQLite's `EXPLAIN QUERY PLAN`. None of
+/// them can change anything on its own, which is what makes skipping them
+/// safe — a word *not* in this list ends the header and is treated as the
+/// start of the explained statement.
+///
+/// **A word missing here costs a read its capability**, not the other way
+/// round: the unrecognized option becomes the first word of the "statement",
+/// which classifies as a write, so `EXPLAIN ANALYSE SELECT 1` would be
+/// refused on a read-only connection. `explaining_a_read_never_charges_it`
+/// is the property that keeps this list honest — a spelling learned later
+/// goes into its header list and fails there rather than in front of a user.
+const EXPLAIN_OPTION_WORDS: [&str; 5] = ["analyze", "analyse", "verbose", "query", "plan"];
 
 /// The statement an already-stripped `EXPLAIN …` explains: everything after
 /// the `EXPLAIN` keyword, its optional parenthesized option list, and any
@@ -1642,6 +1650,91 @@ mod tests {
                 script_refusal(Capabilities::FULL.read_only(), &stmts(&[sql]), dialect).is_some(),
                 "a read-only connection must refuse {sql:?}"
             );
+        }
+    }
+
+    /// Ways a server lets you spell the part between `EXPLAIN` and the
+    /// statement it explains — PostgreSQL's option list and its legacy bare
+    /// options, SQLite's `EXPLAIN QUERY PLAN`, in the casings people write.
+    ///
+    /// **This is where a newly-learned spelling goes.** The list is grounded
+    /// in a real server by `postgres_accepts_every_explain_header_hubro_tolerates`
+    /// (tests/db_postgres.rs), so it cannot drift into syntax that only
+    /// hubro believes in.
+    const EXPLAIN_HEADERS: [&str; 14] = [
+        "EXPLAIN",
+        "explain",
+        "EXPLAIN ANALYZE",
+        // PostgreSQL's grammar takes the British spelling as a synonym. Its
+        // absence from `EXPLAIN_OPTION_WORDS` made `EXPLAIN ANALYSE SELECT 1`
+        // a refusal on a read-only connection — the regression this property
+        // exists to have caught.
+        "EXPLAIN ANALYSE",
+        "EXPLAIN VERBOSE",
+        "EXPLAIN ANALYZE VERBOSE",
+        "explain analyse verbose",
+        "EXPLAIN (FORMAT JSON)",
+        "EXPLAIN (ANALYZE, FORMAT JSON)",
+        "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, FORMAT JSON)",
+        "EXPLAIN (COSTS OFF)",
+        "EXPLAIN /* just looking */ ANALYZE",
+        "EXPLAIN QUERY PLAN",
+        "explain query plan",
+    ];
+
+    /// **Explaining a read charges it nothing** — the counterpart to
+    /// [`explaining_never_loosens_the_gate`], over the same corpus.
+    ///
+    /// Both directions matter and only one of them was a property before.
+    /// Loosening the gate lets a write through; tightening it refuses a
+    /// `SELECT` on a read-only connection with a reason that doesn't describe
+    /// it, and trains the user to click through the banner that does. The
+    /// second failure is quieter, which is exactly why it needs the property
+    /// rather than a list of remembered cases — a fixed list is how
+    /// `ANALYSE` shipped.
+    ///
+    /// The reads are *derived* from [`GATE_CORPUS`] rather than written out
+    /// again, so a read added there is covered here without anyone
+    /// remembering to.
+    #[test]
+    fn explaining_a_read_never_charges_it() {
+        for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
+            let reads: Vec<&str> = GATE_CORPUS
+                .into_iter()
+                .filter(|sql| {
+                    statement_needs(sql, dialect) == StatementNeeds::default()
+                        && !needs_confirmation(sql, dialect)
+                })
+                .collect();
+            // A property over an empty set proves nothing; a corpus that
+            // stopped containing reads would leave this passing and checking
+            // nothing at all.
+            assert!(reads.len() >= 5, "{dialect:?}: {reads:?}");
+            for header in EXPLAIN_HEADERS {
+                for read in &reads {
+                    let explained = format!("{header} {read}");
+                    assert!(
+                        !needs_confirmation(&explained, dialect),
+                        "{explained:?} on {dialect:?} prompts to confirm a read"
+                    );
+                    assert_eq!(
+                        statement_needs(&explained, dialect),
+                        StatementNeeds::default(),
+                        "{explained:?} on {dialect:?} charges a read a capability"
+                    );
+                    // The gate the SQL pane actually calls: a read-only
+                    // connection runs reads, explained or not.
+                    assert_eq!(
+                        script_refusal(
+                            Capabilities::FULL.read_only(),
+                            &stmts(&[&explained]),
+                            dialect
+                        ),
+                        None,
+                        "a read-only connection refuses to explain the read {read:?}"
+                    );
+                }
+            }
         }
     }
 
