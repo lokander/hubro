@@ -451,6 +451,30 @@ impl SelectionStats {
     }
 }
 
+/// The CSS shrink factor for the counts span, and for the aggregate span
+/// beside it (FRE-117). The footer renders both with `truncate`, and the pair
+/// decides which one gives up its width first when the readout is wider than
+/// the footer.
+///
+/// (Spelled "shrink factor" rather than with the CSS property's own name on
+/// purpose: Tailwind scans these files for class candidates and emits a dead
+/// utility for the bare property name, even from a comment.)
+///
+/// The priority is expressed by making the **counts** shed fast, not by making
+/// the aggregates shed slowly, and the difference is not cosmetic. Flexbox
+/// splits an overflow by `factor × width`, so either spelling sheds the counts
+/// first — but a factor below 1 on the aggregates holds that span at its
+/// content width, and a box that never shrinks never fires its own
+/// `text-overflow: ellipsis`. The ancestor's `overflow-hidden` clips it
+/// instead, and *that* cut has no ellipsis: at 1000px the readout ended
+/// `sum 1.00000000000002`, a complete-looking number missing its `e16` and
+/// wrong by sixteen orders of magnitude, with nothing on screen saying so.
+/// Keeping the aggregates at the default 1 means the span itself shrinks and
+/// its ellipsis fires, so a reader who sees a cut number can see that it is
+/// cut. Pinned by `a_truncating_span_must_be_able_to_shrink`.
+pub(super) const COUNTS_SHRINK: &str = "1000";
+pub(super) const AGGREGATE_SHRINK: &str = "1";
+
 fn plural(n: usize, one: &'static str, many: &'static str) -> &'static str {
     if n == 1 {
         one
@@ -994,6 +1018,28 @@ mod tests {
     }
 
     #[test]
+    fn a_truncating_span_must_be_able_to_shrink() {
+        // The footer draws both halves with `truncate`, which only produces an
+        // ellipsis when the box is narrower than its text. A shrink factor
+        // below 1 pins a flex item at its content width, so it never narrows,
+        // never ellipsises, and gets cut without a mark by the ancestor's
+        // `overflow-hidden` — a number silently missing its exponent. So the
+        // shed order has to be expressed by making the counts shrink *faster*,
+        // never by making the aggregates shrink slower than the default.
+        let counts: f64 = COUNTS_SHRINK.parse().expect("a number");
+        let aggregates: f64 = AGGREGATE_SHRINK.parse().expect("a number");
+        assert!(
+            aggregates >= 1.0,
+            "the aggregate span must keep at least the default shrink of 1, or \
+             its own ellipsis can never fire and a cut number reads as a whole one"
+        );
+        assert!(
+            counts > aggregates,
+            "the counts must shed their width before the aggregates do"
+        );
+    }
+
+    #[test]
     fn the_copied_text_carries_the_scope_with_the_numbers() {
         // A pasted number outlives the tooltip that qualified it, so the
         // clipboard gets the caveat too — FRE-117's "describes the selection,
@@ -1057,14 +1103,16 @@ mod tests {
                 "`{forbidden}` in the statistics module: it must compute from the page in hand"
             );
         }
-        // The guard only means something if it is reading real code — and all
-        // of it. `compute` is the first item of the module and `format_float`
-        // the last, so requiring both pins the scanned region to the whole
-        // non-test half rather than to whatever prefix a stray marker left.
+        // These two only prove the scan is reading real code — an item near
+        // the start and the module's last function. They do *not* prove it
+        // read all of it, and it would be dangerous to think they did: a
+        // marker planted after `format_float` passes both sentinels happily,
+        // and only the count assertion above catches it. That assertion is
+        // what holds this guard up; don't remove it in favour of these.
         assert!(code.contains("fn compute"), "source scan found no code");
         assert!(
             code.contains("fn format_float"),
-            "source scan stopped before the end of the module"
+            "source scan stopped before the module's last function"
         );
     }
 
