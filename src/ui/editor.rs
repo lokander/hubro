@@ -86,15 +86,26 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
             .map(|(index, buffer)| (buffer.id, buffer_label(buffer, index)))
             .collect::<Vec<(u64, String)>>()
     });
-    let active_buffer = use_memo(move || state.active_sql_buffer(id));
-    let active = active_buffer();
+    // What the editor should be showing: the active buffer *and* the
+    // generation of the last text put into a buffer from outside the editor.
+    // The buffer id alone is not enough — opening a saved query into an
+    // untitled blank buffer reuses it, so the id does not change, and an
+    // id-gated effect would rename the tab while leaving the editor empty.
+    let doc_target = use_memo(move || state.sql_doc_target(id));
+    let active = doc_target().0;
 
-    // Show the active buffer's text. Runs on a real buffer *switch* only —
+    // Show the active buffer's text. Runs on a real switch or open only —
     // the memo gates it — and reads the text with `peek`, so a keystroke
     // never pushes the document back into the editor under the caret.
+    //
+    // Known gap (not introduced here): the bundle flushes the document to
+    // Rust on a 250 ms trailing timer and clears that timer on any change,
+    // including the one `setDoc` dispatches. Text typed in the last 250 ms
+    // before a switch is therefore lost. Closing it means flushing before
+    // `setDoc`, i.e. rebuilding the checked-in `assets/codemirror.js`.
     let element_for_switch = editor_element.clone();
     use_effect(move || {
-        let buffer = active_buffer();
+        let (buffer, _generation) = doc_target();
         let text = state
             .tab_ui
             .peek()
@@ -112,12 +123,7 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
     //
     // Filtered to the active buffer: one connection still runs one script at
     // a time, but its results belong to the buffer that ran them.
-    let run = state
-        .sql_runs
-        .read()
-        .get(&id)
-        .filter(|run| run.buffer == active)
-        .cloned();
+    let run = state.sql_runs.read().get(&(id, active)).cloned();
     let running = matches!(run.as_ref().map(|r| &r.status), Some(RunStatus::Running));
     // What this connection won't run, stated before the user writes it
     // (FRE-87). `run_sql` refuses the same cases, so the note explains a
@@ -135,18 +141,13 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
         Some(caps) if !caps.ddl => Some(NO_DDL),
         _ => None,
     };
-    let pending_writes = state
-        .pending_sql
-        .read()
-        .get(&id)
-        .filter(|pending| pending.buffer == active)
-        .map(|pending| {
-            pending
-                .statements
-                .iter()
-                .filter(|s| needs_confirmation(s, dialect))
-                .count()
-        });
+    let pending_writes = state.pending_sql.read().get(&(id, active)).map(|pending| {
+        pending
+            .statements
+            .iter()
+            .filter(|s| needs_confirmation(s, dialect))
+            .count()
+    });
     // Under Confirm (FRE-111) the banner names the connection: the whole
     // point of the state is to make you read *which* database you are about
     // to change, which "Run anyway?" alone never made you do.
@@ -176,7 +177,7 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
                     if running {
                         button {
                             class: "rounded border border-rose-300 dark:border-rose-800 px-2 py-0.5 text-xs text-rose-700 dark:text-rose-300 hover:bg-rose-100 dark:hover:bg-rose-950/50",
-                            onclick: move |_| state.cancel_sql(id),
+                            onclick: move |_| state.cancel_sql(id, active),
                             "Cancel"
                         }
                     }
@@ -240,12 +241,12 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
                         }
                         button {
                             class: "rounded bg-amber-600 px-2.5 py-0.5 text-xs font-semibold text-slate-950 hover:bg-amber-500",
-                            onclick: move |_| state.confirm_pending_sql(id),
+                            onclick: move |_| state.confirm_pending_sql(id, active),
                             "Run"
                         }
                         button {
                             class: "rounded border border-slate-400 dark:border-slate-600 px-2.5 py-0.5 text-xs text-slate-900 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
-                            onclick: move |_| state.dismiss_pending_sql(id),
+                            onclick: move |_| state.dismiss_pending_sql(id, active),
                             "Cancel"
                         }
                     }
