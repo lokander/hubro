@@ -400,15 +400,6 @@ pub struct EntraPrompt {
     pub backend: BackendKind,
 }
 
-/// Whether any table stage anywhere in the staged map has pending edits. Pure
-/// so the window-close guard's predicate can be unit-tested without a running
-/// reactive context.
-fn staged_has_dirty(staged: &HashMap<ConnectionId, HashMap<String, TableStage>>) -> bool {
-    staged
-        .values()
-        .any(|tables| tables.values().any(|stage| !stage.is_empty()))
-}
-
 /// Which phase of a connect is running, so the connections list can say more
 /// than "working". The slow, hang-prone steps are the ones worth naming: a
 /// tunnel to an unreachable jump host and a locked keyring both stall for a
@@ -497,7 +488,8 @@ pub struct AppState {
     /// connections screen.
     pub connect_error: Signal<Option<String>>,
     /// Secrets entered this session: Postgres passwords keyed by stored URL,
-    /// SSH key passphrases keyed by [`ssh_secret_key`]. Never persisted here
+    /// SSH key passphrases keyed by [`connect::ssh_secret_key`]. Never
+    /// persisted here
     /// — the OS keyring handles "remember".
     pub session_passwords: Signal<HashMap<String, String>>,
     /// When set, the connections screen asks for this connection's password
@@ -1299,53 +1291,6 @@ pub(crate) fn saved_open_locator(saved: &SavedConnection) -> String {
         SavedConnection::Postgres { url, .. } | SavedConnection::SqlServer { url, .. } => {
             url.clone()
         }
-    }
-}
-
-/// Sibling temp path for an atomic export write (`foo.csv` → `foo.csv.part`).
-/// Streaming into this and renaming on success keeps a mid-stream failure
-/// from clobbering an existing file at the destination.
-fn export_temp_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".part");
-    path.with_file_name(name)
-}
-
-/// What a Save click should do on a write-protected connection (FRE-111).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SaveAction {
-    /// Send the changes now.
-    Apply,
-    /// Hold them and show the connection-naming confirmation first.
-    Park,
-}
-
-/// Resolves a Save click: `protection` is the connection's marking, `parked`
-/// the change list a previous click already confirmed (if any), and `current`
-/// what the stage holds now.
-///
-/// The comparison between `parked` and `current` is the substance here.
-/// Confirming authorizes a *specific* set of changes, so editing, discarding
-/// or staging more after the prompt appears has to send the user back through
-/// it — otherwise the prompt would launder whatever the stage happened to
-/// contain by the time they clicked, which is exactly the accident FRE-111
-/// exists to prevent.
-///
-/// `ReadOnly` returns `Apply` rather than a third variant: there is nothing to
-/// confirm, and the write is refused underneath by the capability resolution
-/// (see [`TableAccess::resolve_protected`]) with a message naming the marking.
-/// Parking it instead would offer a prompt whose only outcome is a failure.
-fn save_action(
-    protection: WriteProtection,
-    parked: Option<&[StagedChange]>,
-    current: &[StagedChange],
-) -> SaveAction {
-    if !protection.confirms() {
-        return SaveAction::Apply;
-    }
-    match parked {
-        Some(confirmed) if confirmed == current => SaveAction::Apply,
-        _ => SaveAction::Park,
     }
 }
 
