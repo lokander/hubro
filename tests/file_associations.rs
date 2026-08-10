@@ -28,6 +28,7 @@ use hubro::cli::DATABASE_EXTENSIONS;
 
 const DIOXUS_TOML: &str = include_str!("../Dioxus.toml");
 const CARGO_TOML: &str = include_str!("../Cargo.toml");
+const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/release.yml");
 const DESKTOP_TEMPLATE: &str = include_str!("../packaging/linux/hubro.desktop.hbs");
 const INFO_PLIST: &str = include_str!("../packaging/macos/Info.plist");
 const WIX_FRAGMENT: &str = include_str!("../packaging/windows/file-associations.wxs");
@@ -64,6 +65,17 @@ fn plist_string(key: &str) -> String {
     after[open + "<string>".len()..close].to_string()
 }
 
+/// Every `<key>` in the plist, in document order.
+fn plist_keys() -> Vec<String> {
+    INFO_PLIST
+        .match_indices("<key>")
+        .filter_map(|(at, _)| {
+            let after = &INFO_PLIST[at + "<key>".len()..];
+            after.find("</key>").map(|end| after[..end].to_string())
+        })
+        .collect()
+}
+
 /// The value of a top-level `key = "value"` line in a TOML file. Same
 /// reasoning as `plist_string`: these files are checked in and simple, and the
 /// point is to re-derive a value, not to parse TOML in general.
@@ -82,21 +94,41 @@ fn toml_string(source: &str, key: &str) -> String {
 fn every_packaging_file_is_wired_into_the_build() {
     // A packaging file dx is never told about is a file that ships nothing,
     // and looks exactly like one that works.
-    for (path, setting) in [
-        ("packaging/linux/hubro.desktop.hbs", "desktop_template"),
-        ("packaging/linux/postinst", "post_install_script"),
-        ("packaging/linux/postrm", "post_remove_script"),
-        ("packaging/macos/Info.plist", "info_plist_path"),
-        ("packaging/windows/file-associations.wxs", "fragment_paths"),
+    //
+    // The assignment is matched in full, not just the path: a path that
+    // appears only in a comment, or one assigned to a misspelled key, would
+    // satisfy a bare substring search while shipping nothing — and the failure
+    // message names the key, so it had better be the key that was checked.
+    for (path, assignment) in [
+        (
+            "packaging/linux/hubro.desktop.hbs",
+            r#"desktop_template = "packaging/linux/hubro.desktop.hbs""#,
+        ),
+        (
+            "packaging/linux/postinst",
+            r#"post_install_script = "packaging/linux/postinst""#,
+        ),
+        (
+            "packaging/linux/postrm",
+            r#"post_remove_script = "packaging/linux/postrm""#,
+        ),
+        (
+            "packaging/macos/Info.plist",
+            r#"info_plist_path = "packaging/macos/Info.plist""#,
+        ),
+        (
+            "packaging/windows/file-associations.wxs",
+            r#"fragment_paths = ["packaging/windows/file-associations.wxs"]"#,
+        ),
     ] {
         assert!(
             std::path::Path::new(path).exists(),
             "{path} is referenced but missing"
         );
         assert!(
-            DIOXUS_TOML.contains(path),
-            "{path} exists but nothing in Dioxus.toml ({setting}) points at it, \
-             so `dx bundle` would never read it"
+            DIOXUS_TOML.contains(assignment),
+            "Dioxus.toml has no `{assignment}`, so `dx bundle` would never read \
+             {path}"
         );
     }
     // The WiX fragment installs nothing unless the feature references its
@@ -225,6 +257,87 @@ fn the_info_plist_still_mirrors_the_values_dx_would_have_generated() {
     assert!(
         INFO_PLIST.contains("<key>NSHighResolutionCapable</key>\n\t<true/>"),
         "dx sets NSHighResolutionCapable; without it the app renders at 1x"
+    );
+}
+
+#[test]
+fn the_info_plist_declares_exactly_the_keys_dx_would_have_written() {
+    // Re-deriving *values* leaves a whole class of drift invisible: a key dx
+    // writes and this mirror lacks is not a wrong value anywhere, it is an
+    // absence, and nothing that checks values can see one. So the key set is
+    // asserted outright, in the order the file declares it.
+    //
+    // Taken from `create_macos_info_plist` in dioxus-cli/src/bundler/macos.rs
+    // (dx 0.7.9, byte-identical in 0.7.10) — the generator behind `dx bundle
+    // --package-types macos`. dioxus-cli's other plist generators (widget
+    // extensions, frameworks, iOS) emit different keys, including
+    // CFBundleSupportedPlatforms; none of them runs for this bundle.
+    let expected = [
+        "CFBundleDevelopmentRegion",
+        "CFBundleDisplayName",
+        "CFBundleExecutable",
+        "CFBundleIconFile",
+        "CFBundleIdentifier",
+        "CFBundleInfoDictionaryVersion",
+        "CFBundleName",
+        "CFBundlePackageType",
+        "CFBundleShortVersionString",
+        "CFBundleVersion",
+        "LSMinimumSystemVersion",
+        "LSApplicationCategoryType",
+        "NSHumanReadableCopyright",
+        "NSHighResolutionCapable",
+        // The only key that is ours rather than dx's — the whole reason this
+        // file exists. Its nested keys are checked by the test below.
+        "CFBundleDocumentTypes",
+    ];
+    let keys = plist_keys();
+    let top_level: Vec<&str> = keys
+        .iter()
+        .map(String::as_str)
+        .take_while(|key| *key != "CFBundleTypeName")
+        .collect();
+    assert_eq!(
+        top_level, expected,
+        "the mirror no longer matches the key set dx writes — add the missing \
+         key, or drop the extra one"
+    );
+
+    // dx emits these two only when given config this project does not set, so
+    // their absence is correct *because* of what Dioxus.toml omits. If that
+    // ever changes, the mirror has to gain the key, and this says so.
+    for (key, setting) in [
+        ("ITSAppUsesNonExemptEncryption", "provider_short_name"),
+        ("NSAppTransportSecurity", "exception_domain"),
+    ] {
+        assert!(
+            !DIOXUS_TOML.contains(setting),
+            "Dioxus.toml now sets {setting}, so dx would write {key} and the \
+             mirror must gain it"
+        );
+    }
+}
+
+#[test]
+fn the_info_plist_records_the_dx_version_it_was_mirrored_from() {
+    // The hole a value check cannot cover: a *dx upgrade* adding a key. The
+    // mirror cannot detect that on its own, so it is pinned to the version it
+    // was taken from, and that version is pinned to the one the release
+    // workflow actually bundles with. Upgrading dx therefore fails here until
+    // someone re-reads `create_macos_info_plist` and moves the note — which
+    // turns "undetectable" into "detected at exactly the moment it matters".
+    let pinned = RELEASE_WORKFLOW
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("DX_VERSION:"))
+        .expect("release.yml pins no DX_VERSION")
+        .trim()
+        .trim_matches('"')
+        .to_string();
+    assert!(
+        INFO_PLIST.contains(&format!("MIRRORED FROM dx {pinned},")),
+        "packaging/macos/Info.plist says which dx version it mirrors, and \
+         release.yml bundles with {pinned} — they disagree, so the mirror was \
+         not re-derived when dx moved"
     );
 }
 

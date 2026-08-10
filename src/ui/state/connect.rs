@@ -624,7 +624,7 @@ impl AppState {
     /// keyring. Storing a credential permanently is a decision the "remember
     /// password" checkbox exists to take; a password that happened to be on a
     /// command line has not been through it.
-    pub async fn open_target(mut self, target: OpenTarget) {
+    pub async fn open_target(self, target: OpenTarget) {
         match target {
             OpenTarget::File(path) => self.connect(path).await,
             OpenTarget::Server {
@@ -632,20 +632,34 @@ impl AppState {
                 url,
                 password,
             } => {
-                if let Some(password) = password {
-                    // Statement temporary: the guard is dropped before the
-                    // await below.
-                    self.session_passwords.write().insert(url.clone(), password);
-                }
                 let name = crate::cli::display_name(&url);
-                self.connect_server(
-                    ServerBackend::of(backend),
-                    url,
-                    name,
-                    None,
-                    ServerAuth::Password,
-                )
-                .await;
+                let backend = ServerBackend::of(backend);
+                match password {
+                    // A password off the command line takes the same route as
+                    // one just typed into the prompt, and for the same reason:
+                    // nothing has validated it. Putting it into session memory
+                    // instead — where every other entry is a secret a connect
+                    // already accepted — makes a typo indistinguishable from a
+                    // stored password that has gone stale, and
+                    // [`Self::connect_server`] answers that by *deleting* the
+                    // keyring entry for the locator. A mistyped `hubro
+                    // postgres://u:typ0@host/db` would then destroy the saved
+                    // credential of the connection it names.
+                    //
+                    // This path stores nothing until the connect succeeds, and
+                    // never forgets anything when it fails. `remember: false`:
+                    // a password that happened to be on a command line has not
+                    // been through the "remember password" decision, so it
+                    // stays out of the keyring either way.
+                    Some(password) => {
+                        self.connect_server_with_password(backend, url, name, password, false, None)
+                            .await
+                    }
+                    None => {
+                        self.connect_server(backend, url, name, None, ServerAuth::Password)
+                            .await
+                    }
+                }
             }
         }
     }
@@ -714,6 +728,15 @@ impl AppState {
         // off-thread (a locked wallet can block on a user dialog) and only
         // after the session read guard is dropped; errors mean "no keyring"
         // and fall through to the prompt flow.
+        //
+        // **Both sources hold only secrets a connect already accepted**, and
+        // the `had_password` branch below relies on it: a rejection there is
+        // read as "the remembered password went stale" and answered by
+        // deleting it from the keyring. Anything that writes an *unvalidated*
+        // password into `session_passwords` turns a typo into the silent
+        // destruction of a saved credential, so a password the user has just
+        // supplied belongs in [`Self::connect_server_with_password`], which
+        // remembers it only once it has worked (see [`Self::open_target`]).
         self.set_step(&url, ConnectStep::Credentials);
         let mut session_password = self.session_passwords.read().get(&url).cloned();
         if session_password.is_none() {
@@ -1418,6 +1441,69 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The body of one `impl AppState` method, by brace matching from its
+    /// signature.
+    fn method_body(source: &str, signature: &str) -> String {
+        let from = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("no method `{signature}` in connect.rs"));
+        let open = source[from..]
+            .find('{')
+            .expect("a method signature is followed by a body");
+        let mut depth = 0usize;
+        for (offset, ch) in source[from + open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return source[from..from + open + offset + 1].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces after `{signature}`");
+    }
+
+    #[test]
+    fn a_command_line_password_never_enters_session_memory() {
+        // `session_passwords` holds secrets a connect has *accepted*, and
+        // `connect_server` acts on that: when a password read from there (or
+        // from the keyring) is rejected, it concludes the stored secret went
+        // stale and deletes the keyring entry for that locator. Writing an
+        // unvalidated password there therefore turns a typo into the silent
+        // destruction of a saved credential — `hubro postgres://u:typ0@host/db`
+        // wiping the password of the saved connection with the same URL.
+        //
+        // The fix is a routing decision, and this checks that decision at its
+        // source: the failure itself needs a live server, a keyring and a
+        // Dioxus runtime (`AppState::new` must be called from a component), so
+        // it is not reachable from a unit test — but the routing is, and the
+        // routing is where the bug was.
+        let body = method_body(
+            include_str!("connect.rs"),
+            "pub async fn open_target(self, target: OpenTarget)",
+        );
+        assert!(
+            !body.contains("session_passwords"),
+            "open_target writes session memory again — an unvalidated password \
+             there makes a mistyped command line delete a saved keyring password"
+        );
+        assert!(
+            body.contains("connect_server_with_password"),
+            "a command-line password must take the same route as one typed into \
+             the prompt: tried now, remembered only if it works, and never \
+             mistaken for a stored secret"
+        );
+        // The password must still be *used* — routing it nowhere would also
+        // pass the assertions above.
+        assert!(
+            body.contains("Some(password)"),
+            "the password that came with the URL is no longer being connected with"
+        );
+    }
 
     #[test]
     fn a_backend_descriptor_carries_its_engine_s_data() {

@@ -122,14 +122,21 @@ pub fn check_sqlite_file(path: &Path) -> Result<(), SqliteFileError> {
         return Ok(());
     }
     let mut header = [0u8; SQLITE_HEADER.len()];
-    let read = match std::fs::File::open(path).and_then(|mut file| {
+    // `read_exact` rather than `read`, so a short *file* and a short *read*
+    // are not the same answer: a single `read` may return fewer bytes than
+    // asked for on a perfectly good file, and calling that "not a database"
+    // would be a lie about a readable one. Only `UnexpectedEof` — the file
+    // really is shorter than a header — means what this check is looking for.
+    if let Err(err) = std::fs::File::open(path).and_then(|mut file| {
         use std::io::Read as _;
-        file.read(&mut header)
+        file.read_exact(&mut header)
     }) {
-        Ok(read) => read,
-        Err(err) => return fail(SqliteFileErrorKind::Unreadable(err.to_string())),
-    };
-    if read < SQLITE_HEADER.len() || &header != SQLITE_HEADER {
+        return match err.kind() {
+            std::io::ErrorKind::UnexpectedEof => fail(SqliteFileErrorKind::NotADatabase),
+            _ => fail(SqliteFileErrorKind::Unreadable(err.to_string())),
+        };
+    }
+    if &header != SQLITE_HEADER {
         return fail(SqliteFileErrorKind::NotADatabase);
     }
     Ok(())
