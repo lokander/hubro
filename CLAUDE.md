@@ -14,6 +14,7 @@ Licensed **GPL-3.0-only** (FRE-83), with copyright held solely by Fredrik Lokand
 - `dx build` — build the app via the Dioxus CLI.
 - `cargo check` / `cargo clippy` — type-check and lint without the Dioxus CLI.
 - `cargo fmt --check` — CI enforces rustfmt (the Actions job runs fmt, clippy, and test); run it before every push.
+- **A PR's CI checks Linux only.** The macOS and Windows legs run on push to `main`, so `gh pr checks` going green says nothing about them — and a red `main` is discovered after the merge, by which point several PRs may have inherited it (FRE-160). When a change is platform-shaped, prove it before merging with `gh workflow run ci.yml --ref <branch>` and wait for all three legs. `ci.yml` lists what counts, above `strategy:` — the short version is `cfg` blocks, path *syntax* (separators, drive letters, UNC, `file://`), a test comparing a checked-in file byte for byte or matching one against a literal `\n`, and process/signal/keyring code. The trigger used to say only `cfg(windows)`/`cfg(unix)`, which was too narrow: FRE-160 was three Windows failures across two merged PRs, none of which had a `cfg` block.
 - Tailwind is compiled automatically by `dx serve` (Dioxus 0.7+): it picks up `tailwind.css` next to Cargo.toml and outputs to `assets/tailwind.css`. No npm/Tailwind CLI setup is needed.
 
 - `cargo test` — run all tests: unit tests live in `#[cfg(test)]` modules next to the code, integration tests in `tests/`. Test fixture files go in `tests/fixtures/`. Run a single test with `cargo test <name>`.
