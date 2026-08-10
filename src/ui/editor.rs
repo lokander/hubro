@@ -4,8 +4,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::db::{
-    needs_confirmation, ConnectionId, Dialect, ExportFormat, QueryResult, StatementOutcome,
-    TableMeta, Value, MARKED_READ_ONLY, MAX_QUERY_ROWS, NO_DDL, NO_MUTATE, NO_QUERY,
+    needs_confirmation, ConnectionId, Dialect, ExportFormat, QueryResult, Rollback,
+    StatementOutcome, TableMeta, Value, MARKED_READ_ONLY, MAX_QUERY_ROWS, NO_DDL, NO_MUTATE,
+    NO_QUERY,
 };
 
 use super::history_panel::HistoryPanel;
@@ -354,18 +355,29 @@ fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
             statement_index,
             preview,
             elapsed_ms,
-            rolled_back,
+            rollback,
         } => rsx! {
             StatementErrorBlock {
                 statement_index,
                 preview,
                 message: error,
-                note: if rolled_back {
-                    format!("Script rolled back after {elapsed_ms} ms — no changes were applied.")
-                } else {
-                    format!(
+                note: match rollback {
+                    Rollback::Full => {
+                        format!("Script rolled back after {elapsed_ms} ms — no changes were applied.")
+                    }
+                    Rollback::None => format!(
                         "Script stopped after {elapsed_ms} ms; earlier statements were not rolled back.",
-                    )
+                    ),
+                    // The claim this exists to stop hubro making (FRE-146):
+                    // the rollback was real, but it did not reach the schema
+                    // changes, so "no changes were applied" would be false in
+                    // the one direction that matters.
+                    Rollback::ExceptSchemaChanges => format!(
+                        "Script rolled back after {elapsed_ms} ms, but this server does not undo \
+                         schema changes on rollback — the script's CREATE/ALTER/DROP statements, \
+                         and possibly data written before them, were kept. Check the schema \
+                         before running it again.",
+                    ),
                 },
             }
         },

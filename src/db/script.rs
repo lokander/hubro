@@ -577,6 +577,32 @@ pub struct StatementResult {
     pub truncated: bool,
 }
 
+/// What a failed script's rollback actually undid — the state the editor
+/// reports so the user knows what is in the database (FRE-146).
+///
+/// Three states rather than a bool because there are three, and the one a
+/// bool used to hide is the one that misleads: a rollback that covered the
+/// data but not the schema was reported as if it had covered everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rollback {
+    /// Nothing was undone. The sequential autocommit path, or a failure
+    /// before the transaction opened — statements before the failure stand.
+    None,
+    /// Everything the script had run was undone.
+    Full,
+    /// The transaction rolled back, but the connection has no
+    /// [`transactional_ddl`](super::caps::Capabilities::transactional_ddl)
+    /// and the script changes the schema, so the rollback could not cover all
+    /// of it.
+    ///
+    /// Says "at least the schema changes escaped" rather than naming exactly
+    /// what survived, because that differs by engine and hubro would have to
+    /// guess: CockroachDB also commits everything *before* each DDL statement,
+    /// while YugabyteDB rolls that DML back normally. Claiming less than is
+    /// known beats claiming more — the mistake this variant exists to stop.
+    ExceptSchemaChanges,
+}
+
 /// Where and how a script failed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScriptError {
@@ -585,10 +611,9 @@ pub struct ScriptError {
     /// Preview of the failing statement.
     pub preview: String,
     pub error: DbError,
-    /// Whether the whole script was rolled back (atomic run) rather than
-    /// leaving the statements before `statement_index` committed (sequential
-    /// run). The editor surfaces this so the user knows the database state.
-    pub rolled_back: bool,
+    /// What the rollback undid — see [`Rollback`]. The editor surfaces this so
+    /// the user knows the database state.
+    pub rollback: Rollback,
 }
 
 /// Runs a script's statements, calling `on_result` after each successful
@@ -621,9 +646,31 @@ pub async fn run_script(
         return Err(refusal);
     }
     if wrap_atomically(caps, pool.dialect(), statements) {
-        run_script_atomic(pool, statements, on_result).await
+        let cover = rollback_cover(caps, pool.dialect(), statements);
+        run_script_atomic(pool, statements, cover, on_result).await
     } else {
         run_script_sequential(pool, statements, on_result).await
+    }
+}
+
+/// What a rollback on this connection would cover for *these* statements
+/// (FRE-146) — resolved before the script runs, since it depends only on the
+/// script's text and the connection's declared capabilities.
+///
+/// [`Rollback::ExceptSchemaChanges`] needs both halves: an engine whose
+/// rollback lets DDL escape, *and* a script that actually contains DDL. A
+/// pure-DML script on CockroachDB rolls back completely, and saying otherwise
+/// would be its own false claim — the opposite one, and no better.
+///
+/// Uses [`statement_needs`] rather than [`classify_statement`] for the same
+/// reason the capability gate does: it catches a schema change that the first
+/// keyword doesn't advertise (`SELECT … INTO new_table`, `EXEC sp_rename`),
+/// which the conservative side here counts as DDL.
+fn rollback_cover(caps: Capabilities, dialect: Dialect, statements: &[String]) -> Rollback {
+    let changes_schema = || statements.iter().any(|s| statement_needs(s, dialect).ddl);
+    match caps.transactional_ddl || !changes_schema() {
+        true => Rollback::Full,
+        false => Rollback::ExceptSchemaChanges,
     }
 }
 
@@ -658,7 +705,8 @@ pub fn script_refusal(
 }
 
 /// [`script_refusal`] as a ready-to-return error. Nothing has run at this
-/// point, so `rolled_back` is false: the database is untouched either way.
+/// point, so the rollback is [`Rollback::None`]: there was nothing to undo,
+/// and the database is untouched either way.
 fn refuse_script(
     caps: Capabilities,
     statements: &[String],
@@ -668,12 +716,12 @@ fn refuse_script(
         statement_index,
         preview: statement_preview(&statements[statement_index]),
         error: DbError::Unsupported(message.to_string()),
-        rolled_back: false,
+        rollback: Rollback::None,
     })
 }
 
 /// The autocommit path: each statement commits on its own, so a failure leaves
-/// earlier statements' effects in place (`rolled_back: false`).
+/// earlier statements' effects in place ([`Rollback::None`]).
 async fn run_script_sequential(
     pool: &DbPool,
     statements: &[String],
@@ -702,7 +750,7 @@ async fn run_script_sequential(
                     statement_index,
                     preview: statement_preview(statement),
                     error,
-                    rolled_back: false,
+                    rollback: Rollback::None,
                 })
             }
         }
@@ -712,10 +760,13 @@ async fn run_script_sequential(
 
 /// The atomic path: all statements run in one transaction, committed only if
 /// every statement succeeds. Any failure (including a failed commit) rolls the
-/// whole script back (`rolled_back: true`).
+/// script back, and reports that rollback as the `cover`
+/// [`rollback_cover`] resolved for this connection and script — [`Rollback::Full`]
+/// unless the engine lets schema changes escape it (FRE-146).
 async fn run_script_atomic(
     pool: &DbPool,
     statements: &[String],
+    cover: Rollback,
     mut on_result: impl FnMut(StatementResult),
 ) -> Result<(), ScriptError> {
     let mut tx = match pool.begin_script_tx().await {
@@ -729,7 +780,7 @@ async fn run_script_atomic(
                     .map(|s| statement_preview(s))
                     .unwrap_or_default(),
                 error,
-                rolled_back: false,
+                rollback: Rollback::None,
             })
         }
     };
@@ -755,7 +806,7 @@ async fn run_script_atomic(
                     statement_index,
                     preview: statement_preview(statement),
                     error,
-                    rolled_back: true,
+                    rollback: cover,
                 });
             }
         }
@@ -768,7 +819,7 @@ async fn run_script_atomic(
             statement_index: statements.len().saturating_sub(1),
             preview: "COMMIT".to_string(),
             error,
-            rolled_back: true,
+            rollback: cover,
         });
     }
     Ok(())
@@ -1614,6 +1665,47 @@ mod tests {
     }
 
     #[test]
+    fn a_rollback_claims_less_when_the_engine_lets_schema_changes_escape() {
+        let escapes = Capabilities {
+            transactional_ddl: false,
+            ..Capabilities::FULL
+        };
+        let dml = stmts(&["INSERT INTO t VALUES (1)", "DELETE FROM t WHERE a = 2"]);
+        let with_ddl = stmts(&["INSERT INTO t VALUES (1)", "CREATE TABLE u (id int)"]);
+
+        // A full-featured engine covers everything, schema changes included.
+        for script in [&dml, &with_ddl] {
+            assert_eq!(
+                rollback_cover(Capabilities::FULL, Dialect::Postgres, script),
+                Rollback::Full
+            );
+        }
+
+        // The case this exists for: CockroachDB and YugabyteDB running a
+        // script that changes the schema.
+        assert_eq!(
+            rollback_cover(escapes, Dialect::Postgres, &with_ddl),
+            Rollback::ExceptSchemaChanges
+        );
+
+        // ...but *only* when there is a schema change to escape. Warning about
+        // one that isn't there would be the same mistake pointing the other
+        // way: a pure-DML script does roll back completely on those engines.
+        assert_eq!(
+            rollback_cover(escapes, Dialect::Postgres, &dml),
+            Rollback::Full
+        );
+
+        // A schema change the first keyword doesn't advertise still counts —
+        // `statement_needs` sees what `classify_statement` would call a read.
+        let hidden = stmts(&["SELECT 1", "SELECT * INTO backup FROM t"]);
+        assert_eq!(
+            rollback_cover(escapes, Dialect::Postgres, &hidden),
+            Rollback::ExceptSchemaChanges
+        );
+    }
+
+    #[test]
     fn multi_statement_scripts_wrap_atomically_by_default() {
         for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
             assert!(wraps(
@@ -1651,7 +1743,7 @@ mod tests {
         // The refusal names the offending statement, and nothing ran.
         assert_eq!(refusal.statement_index, 1);
         assert_eq!(refusal.preview, "DELETE FROM t");
-        assert!(!refusal.rolled_back);
+        assert_eq!(refusal.rollback, Rollback::None);
         assert_eq!(refusal.error, DbError::Unsupported(caps::NO_MUTATE.into()));
     }
 

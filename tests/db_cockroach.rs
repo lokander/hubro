@@ -45,9 +45,14 @@
 //!     the engine's default stands. See
 //!     `cockroach_script_dml_rolls_back_but_its_ddl_does_not`, which pins the
 //!     behaviour so the trade stays a decision rather than a surprise.
-//!     Telling the user is FRE-146 — and since YugabyteDB turned out to do the
-//!     same thing (FRE-91), that belongs behind a `Capabilities` flag rather
-//!     than a check against this one engine.
+//!
+//!     hubro no longer misreports it (FRE-146). This connection declares
+//!     `transactional_ddl: false`, so a failing script that changed the schema
+//!     says the rollback did not reach it instead of claiming no changes were
+//!     applied. Behind a `Capabilities` flag rather than a check against this
+//!     one engine, since YugabyteDB does the same thing for its own reasons
+//!     (FRE-91). Note what it is *not*: `transactions` stays true, because DML
+//!     in a script really does roll back here.
 //!
 //! And two are engine behaviour hubro should follow rather than fight:
 //!
@@ -74,9 +79,9 @@
 //! it to re-run it there, minus the cases resting on those five features.
 
 use hubro::db::{
-    apply_staged, detect_row_identity, run_script, split_statements, DbPool, Filter, Internal,
-    PageRequest, PgFlavor, Restriction, RowIdentity, RowLocator, SortDir, StagedChange, TableKind,
-    TableMeta, Value,
+    apply_staged, detect_row_identity, run_script, split_statements, Capabilities, DbPool, Filter,
+    Internal, PageRequest, PgFlavor, Restriction, Rollback, RowIdentity, RowLocator, SortDir,
+    StagedChange, TableKind, TableMeta, Value,
 };
 
 fn test_url() -> Option<String> {
@@ -452,11 +457,30 @@ async fn cockroach_script_dml_rolls_back_but_its_ddl_does_not() {
     let Some(url) = test_url() else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
 
-    // The known gap, pinned so it stays deliberate. Cockroach's
+    // The declaration that drives it, pinned separately from the behaviour: a
+    // rollback here covers DML and nothing else, so `transactional_ddl` is the
+    // one flag that differs from a full-featured engine. Declaring
+    // `transactions: false` instead would be the worse lie — the DML half
+    // below demonstrably works.
+    assert_eq!(
+        pool.backend_capabilities(),
+        Capabilities {
+            transactional_ddl: false,
+            ..Capabilities::FULL
+        }
+    );
+
+    // The engine behaviour, pinned so it stays deliberate. Cockroach's
     // `autocommit_before_ddl` defaults to on: it commits the open transaction
     // before each DDL statement, announcing it only as a NOTICE. A failing
     // script therefore rolls back its *writes* but leaves its schema changes
-    // standing, while hubro reports the batch as rolled back.
+    // standing.
+    //
+    // hubro no longer claims otherwise: this connection declares
+    // `transactional_ddl: false`, so a script containing DDL reports
+    // `Rollback::ExceptSchemaChanges` rather than a flat "rolled back"
+    // (FRE-146). What survives below is unchanged — the fix was to the claim,
+    // not to the engine.
     //
     // Setting `autocommit_before_ddl = false` fixes exactly this and was
     // tried. It also makes DDL against a schema-locked table fail, and
@@ -483,7 +507,11 @@ async fn cockroach_script_dml_rolls_back_but_its_ddl_does_not() {
     let error = run_script(&pool, pool.backend_capabilities(), &statements, |_| {})
         .await
         .expect_err("the final statement names no relation");
-    assert!(error.rolled_back, "hubro reports the batch as rolled back");
+    assert_eq!(
+        error.rollback,
+        Rollback::ExceptSchemaChanges,
+        "the rollback was real but did not reach the schema change, and hubro must say so"
+    );
 
     // The auto-commit fires *before* the DDL, so it also commits everything
     // staged ahead of it: this INSERT is not itself a schema change and still

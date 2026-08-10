@@ -187,7 +187,7 @@ impl AppState {
                         statement_index: err.statement_index,
                         preview: err.preview,
                         elapsed_ms,
-                        rolled_back: err.rolled_back,
+                        rollback: err.rollback,
                     },
                 };
             }

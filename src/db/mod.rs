@@ -70,7 +70,7 @@ pub use schema::{
 };
 pub use script::{
     classify_statement, needs_confirmation, run_script, script_refusal, split_statements,
-    statement_needs, statement_preview, ScriptError, StatementKind, StatementNeeds,
+    statement_needs, statement_preview, Rollback, ScriptError, StatementKind, StatementNeeds,
     StatementOutcome, StatementResult,
 };
 pub use sql::Dialect;

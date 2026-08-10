@@ -9,7 +9,8 @@ mod common;
 
 use common::FixtureDb;
 use hubro::db::{
-    run_script, split_statements, DbError, DbPool, StatementOutcome, StatementResult, Value,
+    run_script, split_statements, DbError, DbPool, Rollback, StatementOutcome, StatementResult,
+    Value,
 };
 
 fn pg_url() -> Option<String> {
@@ -85,7 +86,11 @@ async fn sqlite_script_rolls_back_the_whole_batch_on_error() {
     assert_eq!(err.statement_index, 2);
     assert_eq!(err.preview, "SELECT * FROM missing_table");
     assert!(matches!(err.error, DbError::Query(_)));
-    assert!(err.rolled_back, "a multi-statement script wraps atomically");
+    assert_eq!(
+        err.rollback,
+        Rollback::Full,
+        "a multi-statement script wraps atomically, schema changes included"
+    );
 
     // Atomic wrapping: the whole batch rolled back, so even the CREATE TABLE
     // is gone — the table never came into existence.
@@ -148,8 +153,9 @@ async fn sqlite_script_with_vacuum_runs_sequentially_and_keeps_prior_effects() {
     assert_eq!(results.len(), 2); // insert + vacuum ran; the select failed
     let err = outcome.unwrap_err();
     assert_eq!(err.statement_index, 2);
-    assert!(
-        !err.rolled_back,
+    assert_eq!(
+        err.rollback,
+        Rollback::None,
         "a VACUUM-containing script runs sequentially, not atomically"
     );
 
@@ -278,7 +284,11 @@ async fn postgres_script_rolls_back_the_whole_batch_on_error() {
     assert_eq!(results[1].outcome, StatementOutcome::Affected(2));
     let err = outcome.unwrap_err();
     assert_eq!(err.statement_index, 2);
-    assert!(err.rolled_back, "a multi-statement script wraps atomically");
+    assert_eq!(
+        err.rollback,
+        Rollback::Full,
+        "a multi-statement script wraps atomically, schema changes included"
+    );
 
     // Atomic wrapping: the whole batch rolled back, so the CREATE TABLE is
     // undone and the relation does not exist.
@@ -357,8 +367,9 @@ async fn postgres_script_with_vacuum_runs_sequentially_and_keeps_prior_effects()
     assert_eq!(results.len(), 2); // insert + vacuum ran; the select failed
     let err = outcome.unwrap_err();
     assert_eq!(err.statement_index, 2);
-    assert!(
-        !err.rolled_back,
+    assert_eq!(
+        err.rollback,
+        Rollback::None,
         "a VACUUM-containing script runs sequentially on Postgres too"
     );
 

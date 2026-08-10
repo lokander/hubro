@@ -219,16 +219,31 @@ impl DbPool {
             DbPool::Postgres(pg) => match pg.flavor() {
                 postgres::PgFlavor::RisingWave => Capabilities {
                     transactions: false,
+                    // Nothing rolls back here at all, so schema changes
+                    // certainly don't (FRE-146).
+                    transactional_ddl: false,
                     ..Capabilities::FULL
                 },
-                // Stock Postgres and the rest of the family hold real
-                // transactions — including Materialize, whose rollback is
-                // genuine (FRE-92), and CockroachDB and YugabyteDB, whose
-                // rollback covers DML and merely lets DDL escape (FRE-146).
-                postgres::PgFlavor::Postgres
-                | postgres::PgFlavor::CockroachDB
-                | postgres::PgFlavor::Yugabyte
-                | postgres::PgFlavor::Materialize => Capabilities::FULL,
+                // Real transactions that cover DML, and schema changes that
+                // escape them anyway (FRE-146). CockroachDB commits the open
+                // transaction *before* each DDL statement
+                // (`autocommit_before_ddl`, on by default), so the schema
+                // change and everything written before it survive a rollback;
+                // YugabyteDB commits each schema change as it executes, so
+                // only the DDL itself does. Both are wrong in the same
+                // direction — hubro would claim a rollback undid more than it
+                // did — and one flag covers both without hubro having to say
+                // which engine is which.
+                postgres::PgFlavor::CockroachDB | postgres::PgFlavor::Yugabyte => Capabilities {
+                    transactional_ddl: false,
+                    ..Capabilities::FULL
+                },
+                // Stock Postgres and Materialize roll back everything they
+                // are given, schema changes included (Materialize's rollback
+                // is genuine — FRE-92).
+                postgres::PgFlavor::Postgres | postgres::PgFlavor::Materialize => {
+                    Capabilities::FULL
+                }
             },
         }
     }
