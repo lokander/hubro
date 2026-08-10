@@ -41,10 +41,12 @@ fn RowSettings(
     color: Option<ConnectionColor>,
     /// The group this connection is in, if any.
     group: Option<String>,
-    /// Every group, in display order.
-    groups: Vec<String>,
 ) -> Element {
     let state = use_context::<AppState>();
+    // Read here rather than passed down from the screen: at most one drawer
+    // is open, so this is one clone of the group names per open drawer
+    // instead of one per row per render.
+    let groups: Vec<String> = state.saved.read().groups().to_vec();
     rsx! {
         div { class: "w-full border-t border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-900/60 px-4 py-3",
             div { class: "mb-3 flex items-center gap-2",
@@ -214,6 +216,24 @@ struct SectionView {
     collapsed: bool,
     first: bool,
     last: bool,
+}
+
+/// Whether a section renders folded (FRE-120).
+///
+/// **A search overrides the fold.** [`SavedList::arrange`] has already dropped
+/// every section that matched nothing, so the ones left are hits; leaving one
+/// folded would draw a header with a count and no rows — the same "headers
+/// rather than hits" that `arrange` exists to prevent, and a dead end, since
+/// the row the user searched for is the thing behind the fold.
+///
+/// The stored fold is only overridden, never cleared, so clearing the search
+/// folds the group back up rather than costing the user the collapse they set.
+/// The ungrouped section has no fold of its own — it is not a group.
+fn section_collapsed(name: Option<&str>, collapsed: &[String], searching: bool) -> bool {
+    match name {
+        Some(name) if !searching => collapsed.iter().any(|folded| folded == name),
+        _ => false,
+    }
 }
 
 /// Creates the group named in the "New group" field, closing the field on
@@ -511,8 +531,6 @@ fn ConnectFormModal(
 #[component]
 fn SavedConnectionRow(
     row: SavedRow,
-    /// Every group, for the settings editor's picker.
-    groups: Vec<String>,
     confirm_remove: Signal<Option<String>>,
     settings_open: Signal<Option<String>>,
     open_form: Signal<Option<ConnectForm>>,
@@ -748,7 +766,6 @@ fn SavedConnectionRow(
                     protection: row.protection,
                     color: row.color,
                     group: row.group.clone(),
-                    groups: groups.clone(),
                 }
             }
         }
@@ -805,6 +822,9 @@ pub(super) fn ConnectionsScreen() -> Element {
         }
     });
     let query = search();
+    // The same test `arrange` applies, so the fold override below and the
+    // section filtering can't disagree about what "searching" means.
+    let searching = !query.trim().is_empty();
     let groups: Vec<String> = state.saved.read().groups().to_vec();
     let collapsed: Vec<String> = state.collapsed_groups.read().clone();
     // Whether anything is saved at all — the empty state's condition, which
@@ -849,10 +869,7 @@ pub(super) fn ConnectionsScreen() -> Element {
             .arrange(&query)
             .into_iter()
             .map(|section| SectionView {
-                collapsed: section
-                    .name
-                    .as_ref()
-                    .is_some_and(|name| collapsed.iter().any(|c| c == name)),
+                collapsed: section_collapsed(section.name.as_deref(), &collapsed, searching),
                 // Whether the up/down buttons have anywhere to go is asked of
                 // the *configured* order, not of this arrangement: a search
                 // hides sections, and a Move Up that greyed out because the
@@ -1024,21 +1041,23 @@ pub(super) fn ConnectionsScreen() -> Element {
                         }
                     }
                     if !section.collapsed {
+                        // The emptiness check comes first so the loop below
+                        // can *move* the rows instead of cloning every row of
+                        // every section on every render.
+                        if section.rows.is_empty() {
+                            p { class: "px-4 py-3 text-xs text-slate-500 dark:text-slate-400",
+                                "No connections here yet — open a connection's shield button and pick this group."
+                            }
+                        }
                         ul { class: "divide-y divide-slate-200 dark:divide-slate-800",
-                            for row in section.rows.clone() {
+                            for row in section.rows {
                                 SavedConnectionRow {
                                     key: "{row.locator}",
                                     row,
-                                    groups: groups.clone(),
                                     confirm_remove,
                                     settings_open,
                                     open_form,
                                 }
-                            }
-                        }
-                        if section.rows.is_empty() {
-                            p { class: "px-4 py-3 text-xs text-slate-500 dark:text-slate-400",
-                                "No connections here yet — open a connection's shield button and pick this group."
                             }
                         }
                     }
@@ -2073,6 +2092,24 @@ mod tests {
         assert_eq!(embedded_url_password(true, "postgres://u@h:5432/db"), None);
         assert_eq!(embedded_url_password(true, "not a url"), None);
         assert_eq!(embedded_url_password(true, ""), None);
+    }
+
+    #[test]
+    fn a_search_expands_a_folded_group_so_its_hits_are_never_a_bare_header() {
+        let collapsed = vec!["Production".to_string()];
+        // Unsearched, the fold holds.
+        assert!(section_collapsed(Some("Production"), &collapsed, false));
+        assert!(!section_collapsed(Some("Archive"), &collapsed, false));
+        // Searching, it does not: `arrange` only returns sections that
+        // matched, so a folded one would be a header with a count and no rows
+        // — and the row behind it is the one being searched for.
+        assert!(!section_collapsed(Some("Production"), &collapsed, true));
+        // The override doesn't clear the fold, so it comes back when the
+        // search does.
+        assert!(section_collapsed(Some("Production"), &collapsed, false));
+        // The ungrouped section is not a group and has no fold.
+        assert!(!section_collapsed(None, &collapsed, false));
+        assert!(!section_collapsed(None, &collapsed, true));
     }
 
     #[test]

@@ -321,6 +321,47 @@ fn open_browser(auth_url: &str) -> Result<(), azure::AzureError> {
         .map_err(|e| azure::AzureError::Browser(e.to_string()))
 }
 
+/// Carries a renamed group's fold across the rename (FRE-120).
+///
+/// The fold is remembered by name, in a *different file* from the group
+/// itself: the group lives in connections.toml, the fold in session.toml. So
+/// a rename that moved only the group would silently expand it and leave a
+/// dead name behind to accumulate. Free functions over the plain `Vec` rather
+/// than signal code inline, so the claim is a test rather than a comment.
+///
+/// The dedup at the end is not hypothetical bookkeeping: a rename onto a name
+/// the list already holds (a fold left by an earlier group of that name)
+/// would otherwise leave it twice, and every later `retain`/rename would have
+/// to cope with that.
+fn rename_collapsed(collapsed: &mut Vec<String>, old: &str, new: &str) {
+    for name in collapsed.iter_mut() {
+        if name == old {
+            *name = new.to_string();
+        }
+    }
+    let mut seen: Vec<String> = Vec::with_capacity(collapsed.len());
+    collapsed.retain(|name| {
+        let fresh = !seen.iter().any(|s| s == name);
+        if fresh {
+            seen.push(name.clone());
+        }
+        fresh
+    });
+}
+
+/// Whether `old` is folded, i.e. whether [`rename_collapsed`] has anything to
+/// do — kept separate so the caller can take the cheap read before the write.
+fn collapsed_needs_rename(collapsed: &[String], old: &str) -> bool {
+    collapsed.iter().any(|name| name == old)
+}
+
+/// Drops a deleted group's fold (FRE-120). A name nothing can expand again
+/// would sit in session.toml forever, and would silently re-collapse a group
+/// later created with the same name.
+fn forget_collapsed(collapsed: &mut Vec<String>, name: &str) {
+    collapsed.retain(|folded| folded != name);
+}
+
 impl AppState {
     /// Adds a database file to the saved list (deduped by path) and
     /// persists the list.
@@ -394,23 +435,14 @@ impl AppState {
     }
 
     /// Renames a group, carrying its members and its collapsed state with it.
-    ///
-    /// The fold is remembered by name in a different file (the session), so a
-    /// rename that moved only the group would silently expand it — and leave
-    /// a dead name behind to accumulate.
     pub fn rename_saved_group(mut self, old: &str, new: &str) -> Result<String, GroupError> {
         let renamed = { self.saved.write().rename_group(old, new) };
         let Ok(new_name) = renamed else {
             return renamed;
         };
         self.persist_saved();
-        if new_name != old {
-            let mut collapsed = self.collapsed_groups.write();
-            for name in collapsed.iter_mut() {
-                if name == old {
-                    *name = new_name.clone();
-                }
-            }
+        if new_name != old && collapsed_needs_rename(&self.collapsed_groups.peek(), old) {
+            rename_collapsed(&mut self.collapsed_groups.write(), old, &new_name);
         }
         Ok(new_name)
     }
@@ -424,7 +456,7 @@ impl AppState {
         }
         self.persist_saved();
         if self.collapsed_groups.peek().iter().any(|g| g == name) {
-            self.collapsed_groups.write().retain(|g| g != name);
+            forget_collapsed(&mut self.collapsed_groups.write(), name);
         }
     }
 
@@ -1533,5 +1565,46 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    fn v(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_renamed_group_keeps_its_fold_and_leaves_no_dead_name() {
+        let mut collapsed = v(&["Production", "Archive"]);
+        assert!(collapsed_needs_rename(&collapsed, "Production"));
+        rename_collapsed(&mut collapsed, "Production", "Prod (live)");
+        assert_eq!(collapsed, v(&["Prod (live)", "Archive"]));
+        assert!(
+            !collapsed.iter().any(|n| n == "Production"),
+            "the old name must not linger"
+        );
+
+        // An expanded group has no fold to carry, and renaming it must not
+        // invent one.
+        let mut collapsed = v(&["Archive"]);
+        assert!(!collapsed_needs_rename(&collapsed, "Production"));
+        rename_collapsed(&mut collapsed, "Production", "Prod (live)");
+        assert_eq!(collapsed, v(&["Archive"]));
+
+        // Renaming onto a name already in the list leaves it once, not twice.
+        let mut collapsed = v(&["A", "B"]);
+        rename_collapsed(&mut collapsed, "A", "B");
+        assert_eq!(collapsed, v(&["B"]));
+    }
+
+    #[test]
+    fn a_deleted_groups_fold_is_forgotten() {
+        // Left behind, it would re-collapse a group later made with the same
+        // name — a fold the user never set, restored from a group that no
+        // longer exists.
+        let mut collapsed = v(&["Production", "Archive"]);
+        forget_collapsed(&mut collapsed, "Production");
+        assert_eq!(collapsed, v(&["Archive"]));
+        // Deleting an expanded (or unknown) group changes nothing.
+        forget_collapsed(&mut collapsed, "Production");
+        assert_eq!(collapsed, v(&["Archive"]));
     }
 }
