@@ -65,11 +65,19 @@ const _: () = assert!(
     "the load budget must allow many polls"
 );
 
-/// What the pane says when the editor could not be mounted. Interpolated
-/// through [`js_string`], so it is safe to reword freely.
+/// What the pane says when the bundle never arrived. Interpolated through
+/// [`js_string`], so it is safe to reword freely.
 const EDITOR_UNAVAILABLE: &str = "The SQL editor failed to load. Reopening this tab will try \
      again; if it keeps happening, the editor bundle (assets/codemirror.js) is missing or failed \
      to parse.";
+
+/// What it says when the bundle *did* arrive and `create` threw. A separate
+/// message because [`EDITOR_UNAVAILABLE`] names a cause that is provably not
+/// this one — the bundle loaded — and a status line that states something
+/// untrue is worse than a vaguer one (the FRE-146 precedent). The thrown
+/// error is appended, since that is where the real information is.
+const EDITOR_CREATE_FAILED: &str =
+    "The SQL editor could not start. Reopening this tab will try again.";
 
 /// The JS that mounts one CodeMirror instance.
 ///
@@ -104,6 +112,7 @@ fn editor_mount_js(
     schema_json: &str,
 ) -> String {
     let unavailable = js_string(EDITOR_UNAVAILABLE);
+    let create_failed = js_string(EDITOR_CREATE_FAILED);
     format!(
         r#"
         window.__dvRun = (p) => dioxus.send(JSON.stringify({{ kind: "run", sql: p.sql }}));
@@ -125,13 +134,46 @@ fn editor_mount_js(
             try {{
                 DVEditor.create("{element}", "{element}", "{dialect_name}", {initial_json}, {schema_json});
             }} catch (err) {{
-                dioxus.send(JSON.stringify({{ kind: "failed", message: {unavailable} + " (" + err + ")" }}));
+                dioxus.send(JSON.stringify({{ kind: "failed", message: {create_failed} + " (" + err + ")" }}));
                 return;
             }}
             dioxus.send(JSON.stringify({{ kind: "ready" }}));
         }})();
         "#
     )
+}
+
+/// The JS that redoes the pushes lost while the bundle was loading, run once
+/// on [`EditorMessage::Ready`].
+///
+/// The document is always pushed: the editor was created from a snapshot taken
+/// before the wait, and if a tab switch happened in between it is holding the
+/// *previous* buffer's text — whose first keystroke would flush over the
+/// current buffer.
+///
+/// The schema is pushed **only when there is one** (`None` while a reload is in
+/// flight or after one failed), mirroring the schema effect's own rule. Pushing
+/// an empty namespace instead would strip the completions `create` was handed,
+/// and a reload that subsequently failed would leave them stripped for the
+/// session.
+/// Takes the schema entry itself rather than a prepared namespace, so the
+/// "only when `Ready`" rule has no second home in the caller to drift from —
+/// there is simply no decision left there to get wrong.
+fn editor_redo_js(
+    element: &str,
+    dialect_name: &str,
+    dialect: Dialect,
+    doc_json: &str,
+    schema: Option<&SchemaLoad>,
+) -> String {
+    let mut js = format!(r#"DVEditor.setDoc("{element}", {doc_json});"#);
+    if let Some(SchemaLoad::Ready(tables)) = schema {
+        let schema_json = completion_schema(tables, dialect);
+        js.push_str(&format!(
+            r#"DVEditor.updateSchema("{element}", "{dialect_name}", {schema_json});"#
+        ));
+    }
+    js
 }
 
 /// Which side panel the SQL pane is showing. At most one at a time: they are
@@ -518,17 +560,20 @@ fn EditorSurface(id: ConnectionId, dialect: Dialect) -> Element {
                             state.tab_ui.peek().get(&id).map_or(String::new(), |ui| {
                                 ui.sql.text(ui.sql.active()).to_string()
                             });
-                        let schema_json = match state.schemas.peek().get(&id) {
-                            Some(SchemaLoad::Ready(tables)) => {
-                                completion_schema(tables, dialect).to_string()
-                            }
-                            _ => "{}".to_string(),
-                        };
-                        document::eval(&format!(
-                            r#"DVEditor.setDoc("{element}", {});
-                               DVEditor.updateSchema("{element}", "{dialect_name}", {schema_json});"#,
-                            js_string(&doc)
-                        ));
+                        // The schema entry goes in as-is: whether it is fit to
+                        // push is `editor_redo_js`'s rule, not a second copy
+                        // of it here. The guard is a local so nothing is held
+                        // across the eval.
+                        let schemas = state.schemas.peek();
+                        let js = editor_redo_js(
+                            &element,
+                            dialect_name,
+                            dialect,
+                            &js_string(&doc),
+                            schemas.get(&id),
+                        );
+                        drop(schemas);
+                        document::eval(&js);
                     }
                     Err(_) => {}
                 }
@@ -1178,10 +1223,17 @@ mod tests {
         let create = js
             .find("DVEditor.create(\"sql-editor-1-\"")
             .expect("checked above");
+        // The wait itself is an anchor, not just an ordering of claim/check:
+        // a recheck hoisted to immediately after the claim keeps
+        // `claim < check < create` true while doing nothing, since the whole
+        // point is to recheck once the await has let a remount happen.
+        let wait = js
+            .find("while (typeof DVEditor")
+            .expect("the mount waits for the bundle");
         assert!(
-            claim < check && check < create,
+            claim < wait && wait < check && check < create,
             "the generation must be claimed before the wait and rechecked \
-             after it, or a remount's stale poller still wins the create"
+             *after* it, or a remount's stale poller still wins the create"
         );
     }
 
@@ -1206,6 +1258,26 @@ mod tests {
         assert!(
             js[catch..].contains(r#"kind: "failed""#),
             "the catch must report, not swallow"
+        );
+        // It must name a cause that is true on this path. The bundle demonstrably
+        // loaded, so the timeout's wording would be a status line stating
+        // something false.
+        assert!(
+            js[catch..].contains(&js_string(EDITOR_CREATE_FAILED)),
+            "a create that threw must not be reported as a missing bundle"
+        );
+        assert!(
+            !js[catch..].contains(&js_string(EDITOR_UNAVAILABLE)),
+            "the two failure paths must not share the missing-bundle wording"
+        );
+        // And it must return, or a failed mount also announces ready.
+        let send_end = js[catch..]
+            .find("}));")
+            .map(|offset| catch + offset + "}));".len())
+            .expect("the catch reports as a statement");
+        assert!(
+            js[send_end..].trim_start().starts_with("return;"),
+            "the catch must return rather than fall through to ready"
         );
     }
 
@@ -1251,6 +1323,57 @@ mod tests {
     }
 
     #[test]
+    fn the_redo_always_restores_the_document_and_never_strips_completions() {
+        // The document carries the text, so it is pushed unconditionally: the
+        // editor was created from a pre-wait snapshot, and after a tab switch
+        // it holds the *previous* buffer, whose first keystroke would flush
+        // over the current one.
+        let ready = SchemaLoad::Ready(vec![table(None, "artists", &["id", "name"])]);
+        let js = editor_redo_js(
+            "sql-editor-1-",
+            "sqlite",
+            Dialect::Sqlite,
+            "\"SELECT 1\"",
+            Some(&ready),
+        );
+        assert!(
+            js.contains(r#"DVEditor.setDoc("sql-editor-1-", "SELECT 1")"#),
+            "the redo must restore the document — without it this whole \
+             message is decoration and a tab switch during the wait still \
+             loses text: {js}"
+        );
+        assert!(js.contains(r#"DVEditor.updateSchema("sql-editor-1-", "sqlite", {"artists""#));
+
+        // Anything that is not `Ready` must produce NO updateSchema at all.
+        // Pushing an empty namespace would *strip* the completions `create`
+        // was handed, and a reload that then failed would leave them stripped
+        // for the session — the outcome this redo exists to prevent, arrived
+        // at from the other direction.
+        //
+        // Every non-Ready state is exercised, not just the absent entry: the
+        // realistic trigger is `Loading` (a reload starting during the wait).
+        let failed = SchemaLoad::Failed("boom".to_string());
+        for schema in [None, Some(&SchemaLoad::Loading), Some(&failed)] {
+            let js = editor_redo_js(
+                "sql-editor-1-",
+                "sqlite",
+                Dialect::Sqlite,
+                "\"SELECT 1\"",
+                schema,
+            );
+            assert!(
+                js.contains("setDoc"),
+                "the document is pushed regardless of the schema"
+            );
+            assert!(
+                !js.contains("updateSchema"),
+                "a reload in flight or failed must leave the existing \
+                 completions alone, exactly as the schema effect does: {js}"
+            );
+        }
+    }
+
+    #[test]
     fn a_bundle_that_never_loads_reports_itself_instead_of_showing_nothing() {
         let js = mount_js();
         assert!(
@@ -1258,20 +1381,20 @@ mod tests {
             "a timeout must send something back — a blank pane reads as \"no \
              query here\" rather than \"the editor didn't load\""
         );
-        // The message is interpolated as a JS string literal, so it must go
-        // through `js_string` — a raw `format!("\"{}\"", …)` would end the
-        // literal early on any quote the text later acquired, making the
-        // timeout path a syntax error precisely when it is needed. Asserting
-        // against `js_string`'s own output is what makes that checkable: a
-        // plain substring check passes either way, because today's message
-        // happens to contain nothing needing escaping.
+        // What this pins is that the message reaches the script intact — the
+        // whole of it, as a closed literal.
+        //
+        // It does **not** pin the escaping, and cannot: today's wording
+        // contains nothing `js_string` would alter, so a raw
+        // `format!("\"{}\"", …)` produces identical bytes and passes too.
+        // The escaping is a property of `js_string` and is pinned where it can
+        // actually fail, in `js::tests` — the risk here would only become real
+        // if the message ever gained a quote or a backslash, which is the
+        // reason it goes through the helper at all.
         assert!(
             js.contains(&js_string(EDITOR_UNAVAILABLE)),
-            "the failure message must be escaped as a JS string literal"
+            "the failure message must reach the script as a closed JS literal"
         );
-        // The escaping is a property of the helper, not of today's wording,
-        // so it is pinned where it can actually fail.
-        assert_eq!(js_string(r#"say "hi""#), r#""say \"hi\"""#);
 
         // And the Rust side must understand what that path sends.
         let parsed: EditorMessage =
