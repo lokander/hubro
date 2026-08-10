@@ -38,17 +38,35 @@
 //!
 //! One wart is recorded rather than fixed: Materialize returns the *string*
 //! `NULL` for `column_default` where Postgres returns SQL NULL, so every column
-//! reads as auto-assigned. Harmless — a column with no default does default to
-//! NULL, and the only consumer is insert required-column detection (FRE-25),
-//! which no Materialize object reaches because none of them are editable.
+//! reads as having a default. Two consumers see it, and it is harmless to both
+//! — a column with no default really does default to NULL. Insert
+//! required-column detection (FRE-25) treats every column as auto-assigned,
+//! which no Materialize object reaches anyway because none are editable; and
+//! Show DDL (FRE-108) emits an explicit `DEFAULT NULL` on every column, which
+//! is redundant but true and re-runnable.
 //!
 //! And 265 objects across five reserved schemas would have buried the user's
 //! own. Nothing cross-engine reaches them — unlike CockroachDB's they are
 //! ordinary tables and views, not `SYSTEM VIEW`, and `pg_depend` is empty — but
-//! `mz_schemas.id` marks them, prefixing system schemas with `s` and user
-//! schemas with `u`. That is the case [`PgFlavor`] exists for: the engine's
-//! identity says *which* catalog to ask, and the catalog still supplies the
-//! answer.
+//! `mz_schemas` marks them: `database_id` is null exactly for the schemas that
+//! belong to no database, which is what a system schema is. That is the case
+//! [`PgFlavor`] exists for — the engine's identity says *which* catalog to ask,
+//! and the catalog still supplies the answer.
+//!
+//! (The `pg_depend` path that finds extension objects on other engines finds
+//! nothing here. Not because the table is empty — it has rows — but because
+//! none of them are `deptype = 'e'`: Materialize has no extensions, and these
+//! schemas are the engine itself.)
+//!
+//! ## What the schema tree deliberately does not show
+//!
+//! FRE-92 asked how much of Materialize's object model to surface. Clusters,
+//! sinks and indexes are first-class there and have no Postgres equivalent, and
+//! they stay unrepresented: hubro's tree is relations you can read rows from,
+//! and none of the three is one. A sink writes *out* to Kafka, a cluster is
+//! compute, an index is already carried as [`TableMeta::indexes`] where it
+//! applies. Sources are the exception, and are included, because a source *is*
+//! readable — `SELECT` works on it, which is the whole test.
 //!
 //! ## What the capability model concluded, and why it is not what was expected
 //!
@@ -235,9 +253,9 @@ async fn materialize_reserved_catalog_schemas_are_marked_as_the_engines_own() {
     let reserved: Vec<&TableMeta> = tables
         .iter()
         .filter(|t| {
-            t.schema
-                .as_deref()
-                .is_some_and(|s| s.starts_with("mz_") && s != "mz_readings")
+            // The fixtures are tables named `mz_*` inside `public`, never
+            // schemas, so matching the schema name cannot catch them.
+            t.schema.as_deref().is_some_and(|s| s.starts_with("mz_"))
         })
         .collect();
     assert!(
