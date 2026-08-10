@@ -1358,7 +1358,6 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
 /// read *here* rather than in [`DataGrid`] — read up there, every copy would
 /// re-render the whole grid body.
 #[component]
-#[allow(clippy::too_many_arguments)]
 fn GridToolbar(
     id: ConnectionId,
     table: TableRef,
@@ -1377,11 +1376,12 @@ fn GridToolbar(
     page: Signal<u64>,
     sort: Signal<Option<(String, SortDir)>>,
     selection: ReadSignal<Option<Selection>>,
-    grid_nav: ReadSignal<GridNav>,
+    grid_nav: Memo<GridNav>,
     copy_status: Signal<Option<CopyStatus>>,
     copy_menu: Signal<bool>,
 ) -> Element {
     let state = use_context::<AppState>();
+    // Whether the FK Back stack has anywhere to return to (reactive).
     let can_back = state.can_go_back(id);
     let export_status: Option<ExportStatus> = state
         .export_status
@@ -1652,7 +1652,6 @@ fn GridFooter(
 /// stop re-rendering the grid body when they change. The stage-derived counts
 /// stay props: [`DataGrid`] reads the stage anyway to tint the rows.
 #[component]
-#[allow(clippy::too_many_arguments)]
 fn GridBars(
     id: ConnectionId,
     table: TableRef,
@@ -1674,6 +1673,10 @@ fn GridBars(
 ) -> Element {
     let state = use_context::<AppState>();
     // Read here, not in `DataGrid`: these three are what this chrome is for.
+    //
+    // A save parked on the FRE-111 confirmation, and the connection name it
+    // has to state. Named rather than just "Are you sure?" — the state exists
+    // to make you read which database you are about to change.
     let awaiting_confirm = state.save_awaiting_confirmation(id, &table.key());
     let connection_name: String = state
         .registry
@@ -1681,6 +1684,8 @@ fn GridBars(
         .get(id)
         .map(|c| c.name.clone())
         .unwrap_or_default();
+    // The two-step navigation guard parks blocked navigations here; the Save
+    // bar explains how to proceed (see AppState::nav_guard for the UX).
     let nav_blocked = state
         .nav_guard
         .read()
@@ -1986,7 +1991,7 @@ fn next_sort(current: &Option<(String, SortDir)>, column: &str) -> Option<(Strin
 /// Fixtures shared by the grid submodules' tests. Lives here because more
 /// than one of them builds a page against the same two-column table.
 #[cfg(test)]
-pub(super) mod fixtures {
+mod fixtures {
     use super::*;
 
     /// A two-column table (`id` int PK, `title` text) with a foreign key on
