@@ -359,22 +359,32 @@ cmd_rm() {
 cmd_env() {
   local set=$1
   shift
-  local engine
+  local engine name var url
+  local lines=()
   select_engines "$@"
   for engine in "${SELECTED[@]}"; do
+    name=$(name_for "$engine" "$set")
     # Only engines that are actually up: an unset variable makes that engine's
     # tests skip, which is the honest outcome. Printing a URL for a container
     # that is not running would make them fail instead, and look like the
     # engine broke.
-    if container_running "$(name_for "$engine" "$set")"; then
-      # Checked here as well as in `create`: this output is what gets handed to
-      # cargo, and a URL for a container that is actually published somewhere
-      # else fails as a connection error the suite reports as the engine's
-      # fault. `create` catches it earlier, but only when `up` ran at all.
-      check_port "$(name_for "$engine" "$set")" "$(port_for "$engine" "$set")"
-      echo "$(env_var "$engine")=$(url_for "$engine" "$set")"
-    fi
+    container_running "$name" || continue
+    # Checked here as well as in `create`: this output is what gets handed to
+    # cargo, and a URL for a container that is actually published somewhere
+    # else fails as a connection error the suite reports as the engine's
+    # fault. `create` catches it earlier, but only when `up` ran at all.
+    check_port "$name" "$(port_for "$engine" "$set")"
+    var=$(env_var "$engine")
+    url=$(url_for "$engine" "$set")
+    lines+=("$var=$url")
   done
+  # Collected first, printed last, so a refusal part-way through emits nothing
+  # at all. Half a list is the worst outcome available here: the caller gets a
+  # loud error on stderr *and* a usable-looking set of exports, and whichever
+  # engines fell off simply skip their tests.
+  if [ "${#lines[@]}" -gt 0 ]; then
+    printf '%s\n' "${lines[@]}"
+  fi
 }
 
 cmd_status() {
@@ -396,8 +406,27 @@ usage() {
   exit 1
 }
 
+# Every engine in ENGINES must resolve in all four lookup tables.
+#
+# Their `*)` arms cannot enforce this themselves: each is called as `$(…)`, and
+# `die`'s `exit 1` there kills only the command substitution — the caller
+# carries on with an empty string and exits 0. That is the same shape as the
+# process-substitution bug `select_engines` exists to avoid, one layer down.
+# Assigning on its own line is where `set -e` sees the failure, so the check
+# lives here rather than being trusted to fire where it is written.
+check_tables() {
+  local engine _value
+  for engine in "${ENGINES[@]}"; do
+    _value=$(port_base "$engine")
+    _value=$(internal_port "$engine")
+    _value=$(env_var "$engine")
+    _value=$(url_for "$engine" 0)
+  done
+}
+
 main() {
   command -v docker >/dev/null || die "docker is not on PATH"
+  check_tables
   local command=${1:-}
   shift || true
   case "$command" in
