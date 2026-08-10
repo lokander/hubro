@@ -32,11 +32,16 @@ enum EditorMessage {
     Doc {
         doc: String,
     },
-    /// The bundle never turned up — see [`editor_mount_js`]. Carries the text
-    /// to show in the pane, because the alternative is a blank one.
+    /// The bundle never turned up, or `create` threw — see
+    /// [`editor_mount_js`]. Carries the text to show in the pane, because the
+    /// alternative is a blank one.
     Failed {
         message: String,
     },
+    /// The editor exists now. Sent once, right after a successful `create`,
+    /// so the pushes that happened *during* the wait can be redone — see the
+    /// handler for what was being lost.
+    Ready,
 }
 
 /// How long the mount waits for `assets/codemirror.js` before giving up.
@@ -51,6 +56,21 @@ const EDITOR_LOAD_TIMEOUT_MS: u32 = 10_000;
 /// still appears instantly to a human.
 const EDITOR_LOAD_POLL_MS: u32 = 25;
 
+/// Collapsing the budget turns this fix inside out — the pane would give up
+/// after a poll or two and claim the editor failed, in exactly the slow-mount
+/// case it exists for. Enforced here rather than in a test, since both values
+/// are known at compile time.
+const _: () = assert!(
+    EDITOR_LOAD_TIMEOUT_MS >= 100 * EDITOR_LOAD_POLL_MS,
+    "the load budget must allow many polls"
+);
+
+/// What the pane says when the editor could not be mounted. Interpolated
+/// through [`js_string`], so it is safe to reword freely.
+const EDITOR_UNAVAILABLE: &str = "The SQL editor failed to load. Reopening this tab will try \
+     again; if it keeps happening, the editor bundle (assets/codemirror.js) is missing or failed \
+     to parse.";
+
 /// The JS that mounts one CodeMirror instance.
 ///
 /// `DVEditor` is loaded by a separate `<script>` ([`super::CODEMIRROR_JS`]),
@@ -60,23 +80,37 @@ const EDITOR_LOAD_POLL_MS: u32 = 25;
 /// reads, and the pane then stayed **blank until it was remounted**, which
 /// reads as "no query here" rather than "the editor didn't load" (FRE-155).
 ///
-/// So the create is gated on the global actually being there, and a genuine
-/// timeout reports itself over the same channel instead of failing silently.
+/// So the create is gated on the global actually being there, and every way
+/// this can still fail reports itself over the same channel instead of leaving
+/// a blank pane: a timeout, and a `create` that throws once the bundle is
+/// present.
+///
+/// Two consequences of *waiting* are handled here rather than left implicit:
+///
+/// - **A remount during the wait leaves a stale poller.** Switching away from
+///   the SQL pane and back inside the load window starts a second one for the
+///   same element, and whichever calls `create` last wins — measurably the
+///   stale one. It would build the editor from the older document snapshot, so
+///   each poller claims a generation and the outdated one stands down.
+/// - **Pushes made during the wait are lost**, because `setDoc` and
+///   `updateSchema` throw while the global is missing. That is why a
+///   [`EditorMessage::Ready`] is sent on success: the Rust side re-pushes the
+///   current document and schema, which is what keeps a tab switch mid-wait
+///   from mounting the *previous* buffer's text.
 fn editor_mount_js(
     element: &str,
     dialect_name: &str,
     initial_json: &str,
     schema_json: &str,
 ) -> String {
-    let unavailable = js_string(
-        "The SQL editor failed to load. Reopening this tab will try again; if it keeps \
-         happening, the editor bundle (assets/codemirror.js) is missing or failed to parse.",
-    );
+    let unavailable = js_string(EDITOR_UNAVAILABLE);
     format!(
         r#"
         window.__dvRun = (p) => dioxus.send(JSON.stringify({{ kind: "run", sql: p.sql }}));
         window.__dvDoc = (p) => dioxus.send(JSON.stringify({{ kind: "doc", doc: p.doc }}));
         (async () => {{
+            window.__dvGen = window.__dvGen || {{}};
+            const mine = (window.__dvGen["{element}"] = (window.__dvGen["{element}"] || 0) + 1);
             const deadline = Date.now() + {EDITOR_LOAD_TIMEOUT_MS};
             while (typeof DVEditor === "undefined" || typeof DVEditor.create !== "function") {{
                 if (Date.now() > deadline) {{
@@ -85,7 +119,16 @@ fn editor_mount_js(
                 }}
                 await new Promise((resolve) => setTimeout(resolve, {EDITOR_LOAD_POLL_MS}));
             }}
-            DVEditor.create("{element}", "{element}", "{dialect_name}", {initial_json}, {schema_json});
+            if (window.__dvGen["{element}"] !== mine) {{
+                return;
+            }}
+            try {{
+                DVEditor.create("{element}", "{element}", "{dialect_name}", {initial_json}, {schema_json});
+            }} catch (err) {{
+                dioxus.send(JSON.stringify({{ kind: "failed", message: {unavailable} + " (" + err + ")" }}));
+                return;
+            }}
+            dioxus.send(JSON.stringify({{ kind: "ready" }}));
         }})();
         "#
     )
@@ -462,6 +505,31 @@ fn EditorSurface(id: ConnectionId, dialect: Dialect) -> Element {
                         state.set_sql_text(id, buffer, doc);
                     }
                     Ok(EditorMessage::Failed { message }) => load_failure.set(Some(message)),
+                    // The editor exists now, but it was built from the
+                    // snapshot this effect took *before* the wait. Anything
+                    // pushed in between — a tab switch, a saved query opened,
+                    // an introspection that finished — threw against the
+                    // missing global and was lost. Re-push both so the pane
+                    // cannot show the previous buffer's text (whose first
+                    // keystroke would then flush it over the current buffer)
+                    // or sit without completions for the rest of the session.
+                    Ok(EditorMessage::Ready) => {
+                        let doc =
+                            state.tab_ui.peek().get(&id).map_or(String::new(), |ui| {
+                                ui.sql.text(ui.sql.active()).to_string()
+                            });
+                        let schema_json = match state.schemas.peek().get(&id) {
+                            Some(SchemaLoad::Ready(tables)) => {
+                                completion_schema(tables, dialect).to_string()
+                            }
+                            _ => "{}".to_string(),
+                        };
+                        document::eval(&format!(
+                            r#"DVEditor.setDoc("{element}", {});
+                               DVEditor.updateSchema("{element}", "{dialect_name}", {schema_json});"#,
+                            js_string(&doc)
+                        ));
+                    }
                     Err(_) => {}
                 }
             }
@@ -492,8 +560,11 @@ fn EditorSurface(id: ConnectionId, dialect: Dialect) -> Element {
         div {
             id: "{element}",
             class: "h-1/2 min-h-0 shrink-0 overflow-hidden border-b border-slate-300 dark:border-slate-700 text-sm",
-            // Only ever non-empty when CodeMirror never mounted, so this never
-            // competes with the view for ownership of the element.
+            // Dioxus keeps a comment placeholder here while this is `None`, so
+            // the element is not literally childless — but the placeholder is
+            // swapped by node id rather than by child index, so CodeMirror's
+            // own subtree cannot misdirect it. The message only ever appears
+            // when CodeMirror never mounted.
             if let Some(message) = load_failure() {
                 div { class: "p-3 text-rose-700 dark:text-rose-300", "{message}" }
             }
@@ -1074,7 +1145,109 @@ mod tests {
         );
         // And the wait must be able to end, or a missing bundle spins forever.
         assert!(js.contains("Date.now() > deadline"));
-        assert!(js.contains(&EDITOR_LOAD_POLL_MS.to_string()));
+
+        // The budget itself has to reach the script. Dropping it (`const
+        // deadline = Date.now();`) or collapsing the constant turns the fix
+        // inside out: the pane gives up after a single poll and claims the
+        // editor failed, in exactly the slow-mount case this exists for. So
+        // the deadline expression is pinned, and the two constants are pinned
+        // in relation to each other rather than to their own values.
+        assert!(
+            js.contains(&format!("Date.now() + {EDITOR_LOAD_TIMEOUT_MS}")),
+            "the timeout budget never reaches the script, so the wait ends \
+             immediately and a slow bundle is reported as a failure"
+        );
+        // (The budget/poll relation itself is a compile-time assertion beside
+        // the constants — both values are known then.)
+        assert!(js.contains(&format!("setTimeout(resolve, {EDITOR_LOAD_POLL_MS})")));
+    }
+
+    #[test]
+    fn a_stale_poller_from_a_remount_stands_down() {
+        // Switching away from the SQL pane and back inside the load window
+        // starts a second poller for the same element, and whichever calls
+        // `create` last wins — measurably the stale one, which would build the
+        // editor from the older document snapshot.
+        let js = mount_js();
+        let claim = js
+            .find(r#"window.__dvGen["sql-editor-1-"] = "#)
+            .expect("each mount must claim a generation for its element");
+        let check = js
+            .find(r#"window.__dvGen["sql-editor-1-"] !== mine"#)
+            .expect("a poller must check its claim is still current");
+        let create = js
+            .find("DVEditor.create(\"sql-editor-1-\"")
+            .expect("checked above");
+        assert!(
+            claim < check && check < create,
+            "the generation must be claimed before the wait and rechecked \
+             after it, or a remount's stale poller still wins the create"
+        );
+    }
+
+    #[test]
+    fn a_create_that_throws_is_reported_rather_than_leaving_a_blank_pane() {
+        // The wait covers "the global never appeared". A bundle that loads and
+        // then throws inside `create` is the other half of the same symptom,
+        // and without the catch it is not merely silent — it becomes an
+        // unhandled rejection, since the IIFE is never awaited.
+        let js = mount_js();
+        let guarded = js
+            .find("try {")
+            .expect("the create must be guarded against throwing");
+        let create = js
+            .find("DVEditor.create(\"sql-editor-1-\"")
+            .expect("checked above");
+        let catch = js.find("catch (err)").expect("and the throw handled");
+        assert!(
+            guarded < create && create < catch,
+            "a create that throws still leaves a blank pane with no reason given"
+        );
+        assert!(
+            js[catch..].contains(r#"kind: "failed""#),
+            "the catch must report, not swallow"
+        );
+    }
+
+    #[test]
+    fn a_successful_mount_announces_itself_so_lost_pushes_can_be_redone() {
+        // `setDoc`/`updateSchema` throw while the global is missing, so a tab
+        // switch or a finished introspection during the wait is lost — and a
+        // lost `setDoc` is worse than a lost schema: the editor then holds the
+        // *previous* buffer's text, whose first keystroke flushes over the
+        // current buffer.
+        let js = mount_js();
+        let create = js
+            .find("DVEditor.create(\"sql-editor-1-\"")
+            .expect("checked above");
+        let ready = js
+            .find(r#"kind: "ready""#)
+            .expect("a successful mount must announce itself");
+        assert!(
+            create < ready,
+            "the ready signal must follow the create it reports"
+        );
+        // It must not fire on the failure paths. Checked as "the statement
+        // immediately after the send is a return", not as "a return appears
+        // somewhere before ready" — the latter is satisfied by the generation
+        // recheck's return and the catch's, so it passes even when the timeout
+        // path falls straight through.
+        let failed = js.find(r#"kind: "failed""#).expect("checked above");
+        let send_end = js[failed..]
+            .find("}));")
+            .map(|offset| failed + offset + "}));".len())
+            .expect("the timeout report is a statement");
+        assert!(
+            js[send_end..].trim_start().starts_with("return;"),
+            "the timeout path must return immediately after reporting — \
+             otherwise it falls through to ready (a failed mount reporting \
+             success), and the loop sends a fresh failure every poll for the \
+             life of the window"
+        );
+
+        // And the Rust side must understand it.
+        let parsed: EditorMessage = serde_json::from_str(r#"{"kind":"ready"}"#).unwrap();
+        assert!(matches!(parsed, EditorMessage::Ready));
     }
 
     #[test]
@@ -1085,13 +1258,20 @@ mod tests {
             "a timeout must send something back — a blank pane reads as \"no \
              query here\" rather than \"the editor didn't load\""
         );
-        // The message is interpolated as a JS string literal; an unescaped one
-        // would end the literal early and make the timeout path a syntax error
-        // — i.e. broken precisely when it is needed.
+        // The message is interpolated as a JS string literal, so it must go
+        // through `js_string` — a raw `format!("\"{}\"", …)` would end the
+        // literal early on any quote the text later acquired, making the
+        // timeout path a syntax error precisely when it is needed. Asserting
+        // against `js_string`'s own output is what makes that checkable: a
+        // plain substring check passes either way, because today's message
+        // happens to contain nothing needing escaping.
         assert!(
-            js.contains(r#"message: "The SQL editor failed to load."#),
-            "the failure message must be a well-formed JS string literal"
+            js.contains(&js_string(EDITOR_UNAVAILABLE)),
+            "the failure message must be escaped as a JS string literal"
         );
+        // The escaping is a property of the helper, not of today's wording,
+        // so it is pinned where it can actually fail.
+        assert_eq!(js_string(r#"say "hi""#), r#""say \"hi\"""#);
 
         // And the Rust side must understand what that path sends.
         let parsed: EditorMessage =
