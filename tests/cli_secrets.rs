@@ -36,6 +36,21 @@ fn rejected_lines() -> Vec<Vec<String>> {
         vec![format!("postgres://user:{SECRET}@")],
         // An option that isn't ours, whose value is the URL.
         vec![format!("--connect=postgres://user:{SECRET}@host/app")],
+        // The same, with the separators that a URL uses structurally but that
+        // are ordinary characters *inside a password*. Each of these defeated
+        // the first redactor, which bounded the userinfo at the first `/`, `?`
+        // or `#` after the scheme and so stopped looking before the `@`; the
+        // whole argument was then echoed verbatim by the unknown-option error.
+        // `--dbname=<url>` is the shape a psql habit produces, and a password
+        // with a slash in it is not unusual.
+        vec![format!("--connect=postgres://user:{SECRET}/x@host/app")],
+        vec![format!("--dbname=postgres://user:{SECRET}?q@host/app")],
+        vec![format!("--url=postgres://user:{SECRET}#f@host/app")],
+        // …and as a positional, where the URL validation reports the failure.
+        vec![format!("postgres://user:{SECRET}/x@host/app")],
+        // An option that is itself URL-shaped, so there is no `=` to truncate
+        // at and redaction is the only thing standing between it and stderr.
+        vec![format!("--postgres://user:{SECRET}@host/app")],
         // Two positionals: the second is never even looked at.
         vec![
             "app.db".to_string(),
@@ -98,9 +113,40 @@ fn redaction_survives_text_that_is_not_a_valid_url() {
         format!("invalid URL: postgres://u:{SECRET}@h:99999/db"),
         format!("mssql://user:{SECRET}@[not-an-ipv6/app"),
         format!("connecting to postgres://u:{SECRET}@h/db failed, and then"),
+        // The separators a URL gives structural meaning and a password does
+        // not: nothing about them may end the search for the `@`.
+        format!("postgres://user:{SECRET}/x@host/app"),
+        format!("postgres://user:{SECRET}?q@host/app"),
+        format!("postgres://user:{SECRET}#f@host/app"),
+        format!("postgres://user:a/b?c#d{SECRET}@host/app"),
+        // Two URLs in one message: redacting the first must not stop the scan.
+        format!("tried postgres://a:{SECRET}@h/db then mssql://b:{SECRET}@h2/db"),
     ] {
         assert_secret_free(&redact_url(&text), "redacted text");
     }
+}
+
+#[test]
+fn redaction_leaves_ordinary_text_and_password_free_urls_alone() {
+    // The counterweight to the test above: a redactor that mangled everything
+    // would pass it. Over-reaching is the safe direction, but not into text
+    // that has no credential in it at all.
+    for text in [
+        "postgres://user@host:5432/app",
+        "mssql://host/app",
+        "no such file: /var/lib/app.db",
+        "unknown option `--frobnicate`",
+        "postgres://user@h/db and mail admin@example.com",
+        "",
+        "://",
+    ] {
+        assert_eq!(redact_url(text), text, "{text}");
+    }
+    // A password is replaced, and nothing around it is.
+    assert_eq!(
+        redact_url("postgres://user:hunter2/x@host:5432/app?sslmode=require"),
+        "postgres://user:***@host:5432/app?sslmode=require"
+    );
 }
 
 #[test]

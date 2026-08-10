@@ -7,15 +7,30 @@
   READ THIS BEFORE EDITING. dx does not merge: pointing `info_plist_path` at a
   file makes dx copy it verbatim *instead of* generating one, so every key it
   would have generated has to be repeated here. Everything above
-  CFBundleDocumentTypes is exactly that — a copy of dx 0.7's generated plist
-  for this project — and only CFBundleDocumentTypes is ours.
+  CFBundleDocumentTypes is exactly that — and only CFBundleDocumentTypes is
+  ours.
 
-  A hand-maintained copy of a generated file goes stale silently: bump the
-  crate version and the About box would keep reporting 0.7.0. So
-  tests/file_associations.rs re-derives every mirrored value from Cargo.toml
-  and Dioxus.toml and fails when one drifts. If a dx upgrade adds a key to its
-  generated plist, that test cannot know — check `create_macos_info_plist` in
-  the dioxus-cli source when upgrading dx.
+  MIRRORED FROM dx 0.7.9, `create_macos_info_plist` in
+  dioxus-cli/src/bundler/macos.rs — the function `dx bundle --package-types
+  macos` reaches, via `bundle_macos_app`. That is the only plist generator that
+  applies here; dioxus-cli has several others, for widget extensions,
+  frameworks and iOS, and those write keys this bundle neither gets nor wants
+  (CFBundleSupportedPlatforms is one of them). The function is byte-identical
+  in dx 0.7.9 and 0.7.10.
+
+  0.7.9 is the version .github/workflows/release.yml pins, which is what makes
+  this mirror checkable: tests/file_associations.rs asserts the version named
+  above still matches that pin, so upgrading dx cannot silently leave the
+  mirror behind — it fails until someone re-reads the function.
+
+  A hand-maintained copy of a generated file also goes stale in place: bump the
+  crate version and the About box would keep reporting the old one. So the test
+  re-derives every mirrored value from Cargo.toml and Dioxus.toml, and asserts
+  the exact key set below — no more, no fewer. Two keys dx can emit are
+  deliberately absent because dx writes them only when given config this
+  project does not set: ITSAppUsesNonExemptEncryption (needs
+  `provider_short_name`) and NSAppTransportSecurity (needs `exception_domain`).
+  Set either in Dioxus.toml and this file has to gain the key.
 -->
 <plist version="1.0">
 <dict>

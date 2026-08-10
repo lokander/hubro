@@ -22,7 +22,8 @@
 //! - The password is split off the URL at classification time. What reaches
 //!   the connect flow is the normalized, password-free locator — the same
 //!   string the saved-connections list and the keyring key are built from —
-//!   with the password carried beside it, put into session memory only.
+//!   with the password carried beside it, to be tried once and remembered only
+//!   if it works (see `AppState::open_target`).
 //! - [`display_name`] builds a tab/entry name from the URL's host and database
 //!   components rather than from the URL text, so the name that *is* persisted
 //!   cannot contain a credential.
@@ -33,6 +34,8 @@
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
+#[cfg(test)]
+use std::time::Duration;
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -43,12 +46,14 @@ use crate::db::{
 
 /// The file extensions hubro registers itself as a handler for.
 ///
-/// The single source of truth for the packaging declarations: the `.desktop`
-/// MIME globs, the macOS `CFBundleDocumentTypes`, and the Windows registry
-/// fragment all list exactly these, and `tests/file_associations.rs` fails if
-/// one of them drifts. `db` is deliberately included even though it is a
-/// contested extension — hubro registers as *a* handler for it, never as the
-/// default (see `packaging/README.md`).
+/// The single source of truth for the two packaging declarations that name
+/// extensions — the macOS `CFBundleDocumentTypes` and the Windows registry
+/// fragment — which must list exactly these; `tests/file_associations.rs`
+/// fails if either drifts. Linux names a MIME type instead and claims no
+/// extension at all, for the reason measured in `packaging/README.md`.
+///
+/// `db` is deliberately included even though it is a contested extension —
+/// hubro registers as *a* handler for it, never as the default.
 pub const DATABASE_EXTENSIONS: [&str; 3] = ["db", "sqlite", "sqlite3"];
 
 /// hubro's version, as reported by `--version`.
@@ -109,7 +114,11 @@ pub enum OpenTarget {
         url: String,
         /// The password lifted out of the URL, percent-decoded, or `None` when
         /// the URL carried none (the ordinary case, and the one the help text
-        /// asks for). Only ever placed in session memory.
+        /// asks for).
+        ///
+        /// Nothing has validated it, so it is never treated as a remembered
+        /// secret: `AppState::open_target` connects with it directly and it
+        /// enters session memory only once a connect has accepted it.
         password: Option<String>,
     },
 }
@@ -157,7 +166,8 @@ impl std::fmt::Debug for OpenTarget {
 /// [`redact_url`].
 #[derive(Clone, PartialEq, Eq)]
 pub enum CliError {
-    /// An option hubro doesn't have.
+    /// An option hubro doesn't have. Holds the option *name* only — see
+    /// [`CliError::unknown_option`], which is the only way to build it.
     UnknownOption(String),
     /// A second positional argument. hubro opens one database per window.
     TooManyArguments,
@@ -174,6 +184,21 @@ pub enum CliError {
 }
 
 impl CliError {
+    /// Builds [`CliError::UnknownOption`] from the argument as typed, keeping
+    /// only the part before any `=`.
+    ///
+    /// The value of an option hubro does not have is of no use in the message
+    /// — "unknown option `--connect`" names the mistake completely — and it is
+    /// the one place an arbitrary user string was echoed back. `--connect=<a
+    /// URL with a password>` is not a contrived shape: it is what a `psql`
+    /// habit produces. Redaction still runs on the name, but truncating here
+    /// means the error never *holds* the secret in the first place, which is
+    /// the stronger of the two guarantees.
+    pub fn unknown_option(arg: &str) -> CliError {
+        let name = arg.split_once('=').map_or(arg, |(name, _)| name);
+        CliError::UnknownOption(name.to_string())
+    }
+
     /// Process exit status. `2` is the conventional "you invoked me wrong"
     /// code — a usage problem, fixable by retyping the command; `1` is an
     /// ordinary failure to do what was asked.
@@ -224,40 +249,57 @@ impl std::fmt::Debug for CliError {
 
 impl std::error::Error for CliError {}
 
-/// Replaces the password in any `scheme://user:password@host` text with `***`.
+/// Replaces the password in every `scheme://user:password@…` run in `text`
+/// with `***`.
 ///
 /// Works on the raw string rather than on a parsed [`url::Url`], because the
 /// strings that most need redacting are the ones that failed to parse — an
 /// error message about a malformed URL must not quote the malformed URL back
-/// with its password intact. Text with no `://`, or with no `user:pw@`
-/// authority, is returned unchanged, so this is safe to apply to any message.
+/// with its password intact.
+///
+/// It therefore must not assume the text *is* a well-formed URL. An earlier
+/// version bounded the userinfo by the first `/`, `?` or `#` after the scheme,
+/// on the reasoning that those end a URL's authority. That is true of a valid
+/// URL and false of the input this is for: a password containing an unencoded
+/// `/` — `postgres://user:hun/ter@host/db`, which is what someone types when
+/// their password has a slash in it — ended the search before the `@`, so no
+/// userinfo was found and the secret was returned verbatim. Whatever bounds
+/// the search has to be something a password genuinely cannot contain.
+///
+/// So the run is bounded by **whitespace**, which no URL may contain
+/// unescaped, and the userinfo is whatever lies between the scheme and the
+/// last `@` in that run. That over-reaches rather than under-reaches: it will
+/// redact `scheme://a:b@c` inside a sentence, which is the direction to err in.
+///
+/// The one shape it does not catch is a password with an unescaped space,
+/// which splits the run before the `@`. No path reaches a message with one:
+/// such a URL fails `url::Url::parse`, and the parse errors this crate
+/// surfaces never quote their input (`tests/cli_secrets.rs` pins that).
 pub fn redact_url(text: &str) -> String {
-    let Some(scheme_end) = text.find("://") else {
-        return text.to_string();
-    };
-    let authority_start = scheme_end + 3;
-    // The authority runs to the first path/query/fragment separator.
-    let authority_end = text[authority_start..]
-        .find(['/', '?', '#'])
-        .map(|i| authority_start + i)
-        .unwrap_or(text.len());
-    let authority = &text[authority_start..authority_end];
-    // Userinfo ends at the *last* `@` in the authority: `@` is legal inside a
-    // percent-encoded password, and taking the first one would leave the tail
-    // of the secret in place.
-    let Some(at) = authority.rfind('@') else {
-        return text.to_string();
-    };
-    let userinfo = &authority[..at];
-    let Some(colon) = userinfo.find(':') else {
-        return text.to_string(); // a user with no password
-    };
-    format!(
-        "{}{}:***{}",
-        &text[..authority_start],
-        &userinfo[..colon],
-        &text[authority_start + at..]
-    )
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(scheme_end) = rest.find("://") {
+        let authority_start = scheme_end + 3;
+        out.push_str(&rest[..authority_start]);
+        rest = &rest[authority_start..];
+        // A URL cannot contain unescaped whitespace, so the surrounding prose
+        // — not a `/` that may well be part of the secret — is what bounds it.
+        let run = &rest[..rest.find(char::is_whitespace).unwrap_or(rest.len())];
+        // Userinfo ends at the *last* `@` in the run: `@` is legal inside a
+        // percent-encoded password, and taking the first would leave the tail
+        // of the secret in place.
+        let Some(at) = run.rfind('@') else {
+            continue; // no userinfo here; keep scanning for a later URL
+        };
+        let Some(colon) = run[..at].find(':') else {
+            continue; // a user with no password
+        };
+        out.push_str(&run[..colon]);
+        out.push_str(":***");
+        rest = &rest[at..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Parses hubro's arguments (the caller passes `args_os().skip(1)`).
@@ -282,9 +324,7 @@ where
                 }
                 Some("-h") | Some("--help") => return Ok(Invocation::Help),
                 Some("-V") | Some("--version") => return Ok(Invocation::Version),
-                Some(flag) if flag.starts_with('-') => {
-                    return Err(CliError::UnknownOption(flag.to_string()))
-                }
+                Some(flag) if flag.starts_with('-') => return Err(CliError::unknown_option(flag)),
                 // Not an option, or not valid UTF-8 (so it can't be one of
                 // ours, and a path must survive byte-for-byte).
                 _ => {}
@@ -439,6 +479,42 @@ pub fn deliver_opened_url(url: &url::Url) {
 /// deliveries from the first.
 pub fn take_opened() -> Option<UnboundedReceiver<OpenTarget>> {
     opened_channel().rx.lock().ok()?.take()
+}
+
+/// Yields the databases to open, in the order they must be opened: the
+/// command-line target first, then whatever the OS hands over, one at a time,
+/// for as long as the app runs.
+///
+/// A function rather than two `spawn`s so the ordering is a property of a
+/// single loop instead of a race between tasks. The queue used to be drained
+/// by a task of its own, started in parallel with the session restore — which
+/// on macOS, the only platform that delivers through it, meant a
+/// double-clicked database could be opened *during* the restore and then lose
+/// the foreground to the tab the restore activates last. That is exactly the
+/// failure the command-line path orders itself to avoid, and it does not
+/// survive being written as one sequence.
+///
+/// Both sources are consumed in place: `startup` is taken on the first call,
+/// and `opened` yields until the queue closes. Returns `None` when neither can
+/// produce anything again, which ends the caller's loop.
+pub async fn next_startup_target(
+    startup: &mut Option<OpenTarget>,
+    opened: &mut Option<UnboundedReceiver<OpenTarget>>,
+) -> Option<OpenTarget> {
+    if let Some(target) = startup.take() {
+        return Some(target);
+    }
+    let receiver = opened.as_mut()?;
+    match receiver.recv().await {
+        Some(target) => Some(target),
+        None => {
+            // The sender is a `'static` in this process, so this only happens
+            // in tests; dropping the receiver keeps the caller's loop from
+            // spinning on a closed queue.
+            *opened = None;
+            None
+        }
+    }
 }
 
 /// The startup target, handed to the app as a launch context so the UI can
@@ -662,5 +738,99 @@ mod tests {
         let first = take_opened();
         assert!(first.is_some());
         assert!(take_opened().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_command_line_target_opens_before_anything_the_os_delivers() {
+        // The ordering this function exists for. The queue used to be drained
+        // by a task of its own, racing the session restore; the restore ends by
+        // activating whichever tab was in front last time, so anything opened
+        // alongside it silently loses the foreground. Sequencing every source
+        // through one function is what makes "after the restore, then argv,
+        // then the OS queue, one at a time" a property of the code rather than
+        // of a comment.
+        let (tx, rx) = unbounded_channel();
+        let queued = |name: &str| OpenTarget::File(PathBuf::from(name));
+        tx.send(queued("first-delivered.db")).unwrap();
+        tx.send(queued("second-delivered.db")).unwrap();
+        drop(tx); // no more deliveries, so the loop can end
+
+        let mut startup = Some(OpenTarget::File(PathBuf::from("argv.db")));
+        let mut opened = Some(rx);
+        let mut order = Vec::new();
+        while let Some(target) = next_startup_target(&mut startup, &mut opened).await {
+            order.push(target.to_string());
+        }
+        assert_eq!(
+            order,
+            ["argv.db", "first-delivered.db", "second-delivered.db"],
+            "the command line comes first, then the OS queue in arrival order"
+        );
+        // Both sources are spent: the caller's loop ends rather than spinning.
+        assert!(startup.is_none());
+        assert!(opened.is_none());
+    }
+
+    #[tokio::test]
+    async fn each_source_works_without_the_other() {
+        // A plain `hubro` on a platform that never delivers an Opened event —
+        // every launch on Linux and Windows — has neither source, and must not
+        // hang waiting on a queue that will never speak.
+        let mut startup = None;
+        let mut opened = None;
+        assert!(next_startup_target(&mut startup, &mut opened)
+            .await
+            .is_none());
+
+        // Only a command-line target.
+        let mut startup = Some(OpenTarget::File(PathBuf::from("only.db")));
+        let mut opened = None;
+        assert_eq!(
+            next_startup_target(&mut startup, &mut opened)
+                .await
+                .map(|t| t.to_string()),
+            Some("only.db".to_string())
+        );
+        assert!(next_startup_target(&mut startup, &mut opened)
+            .await
+            .is_none());
+
+        // Only a delivery (macOS double-click with no argument).
+        let (tx, rx) = unbounded_channel();
+        tx.send(OpenTarget::File(PathBuf::from("delivered.db")))
+            .unwrap();
+        drop(tx);
+        let mut startup = None;
+        let mut opened = Some(rx);
+        assert_eq!(
+            next_startup_target(&mut startup, &mut opened)
+                .await
+                .map(|t| t.to_string()),
+            Some("delivered.db".to_string())
+        );
+        assert!(next_startup_target(&mut startup, &mut opened)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_delivery_that_arrives_later_is_still_yielded() {
+        // The launch-by-double-click case on macOS is the *early* delivery, but
+        // the queue also has to stay live afterwards: hubro is a running app
+        // and the OS can hand it another file at any time.
+        let (tx, rx) = unbounded_channel();
+        let mut startup = None;
+        let mut opened = Some(rx);
+        let sender = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            tx.send(OpenTarget::File(PathBuf::from("late.db"))).unwrap();
+        });
+        assert_eq!(
+            next_startup_target(&mut startup, &mut opened)
+                .await
+                .map(|t| t.to_string()),
+            Some("late.db".to_string())
+        );
+        sender.await.unwrap();
     }
 }

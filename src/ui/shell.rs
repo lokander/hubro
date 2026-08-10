@@ -117,30 +117,26 @@ pub fn Shell() -> Element {
     // connect flow, which writes the core connection signals — running it here
     // keeps those writes in a live scope, matching the manual connect path.
     //
-    // A database named on the command line (FRE-114) opens *after* the
-    // restore, in the same task: restore ends by setting the active view to
-    // whichever tab was in front last time, so opening first would leave the
-    // database the user just asked for behind a tab they didn't.
+    // The same task then opens every database hubro was *told* to open
+    // (FRE-114): the command-line target, then the ones the OS hands over
+    // (on macOS a double-clicked file arrives as an `open` Apple Event rather
+    // than in argv; the queue is unbounded, so one delivered before the first
+    // render is opened rather than dropped).
+    //
+    // All of it runs after `restore_session().await` and one at a time, which
+    // is a property of this being one sequence rather than of any comment:
+    // restore ends by activating whichever tab was in front last time, so
+    // anything opened alongside it would be silently pushed to the background
+    // — the very thing the user asked for, behind a tab they did not.
+    // `next_startup_target` holds the ordering, and its tests hold it.
     use_hook(|| {
-        let startup = try_consume_context::<Startup>().and_then(|Startup(target)| target);
+        let mut startup = try_consume_context::<Startup>().and_then(|Startup(target)| target);
+        let mut opened = crate::cli::take_opened();
         spawn(async move {
             state.restore_session().await;
-            if let Some(target) = startup {
-                state.open_target(target).await;
-            }
-        });
-    });
-
-    // Databases the OS hands to the *running* app: on macOS a double-clicked
-    // file arrives as an `open` Apple Event rather than in argv (FRE-114).
-    // Claimed once, and the queue is unbounded, so an event delivered before
-    // this task starts is still opened rather than dropped.
-    use_hook(|| {
-        let Some(mut opened) = crate::cli::take_opened() else {
-            return;
-        };
-        spawn(async move {
-            while let Some(target) = opened.recv().await {
+            while let Some(target) =
+                crate::cli::next_startup_target(&mut startup, &mut opened).await
+            {
                 state.open_target(target).await;
             }
         });
