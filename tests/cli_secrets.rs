@@ -51,6 +51,14 @@ fn rejected_lines() -> Vec<Vec<String>> {
         // An option that is itself URL-shaped, so there is no `=` to truncate
         // at and redaction is the only thing standing between it and stderr.
         vec![format!("--postgres://user:{SECRET}@host/app")],
+        // One argument holding an option *and* a URL, quoted so the shell does
+        // not split it, with a space inside the password. This is the shape
+        // `redact_url` cannot see past — whitespace is what bounds its search,
+        // and no other character class is left to bound it by — so what keeps
+        // the secret out of the message is the option name being truncated at
+        // whitespace, not the redaction.
+        vec![format!("-x postgres://user:{SECRET} tail@host/app")],
+        vec![format!("--connect postgres://user:{SECRET} tail@host/app")],
         // Two positionals: the second is never even looked at.
         vec![
             "app.db".to_string(),
