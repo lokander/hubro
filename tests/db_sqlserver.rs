@@ -18,8 +18,8 @@
 use hubro::db::{
     apply_staged, detect_row_identity, mssql_url_with_password, run_script, split_statements,
     Capabilities, DbError, DbPool, Dialect, ExportFormat, Filter, Generated, PageRequest,
-    Restriction, Rollback, RowIdentity, RowLocator, SortDir, StagedChange, StatementOutcome,
-    TableKind, TableMeta, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
+    Restriction, Rollback, RowCount, RowIdentity, RowLocator, SortDir, StagedChange,
+    StatementOutcome, TableKind, TableMeta, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 fn test_url() -> Option<String> {
@@ -1077,5 +1077,100 @@ async fn sqlserver_sql_variant_cells_browse_and_fetch_safely() {
     assert!(!cell.capped);
 
     run_all(&pool, &["DROP TABLE dbo.variant_probe"]).await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_table_stats_come_from_the_partition_counters() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "IF OBJECT_ID('dbo.stats_idx_view') IS NOT NULL DROP VIEW dbo.stats_idx_view",
+            "IF OBJECT_ID('dbo.stats_view') IS NOT NULL DROP VIEW dbo.stats_view",
+            "IF OBJECT_ID('dbo.stats_rows') IS NOT NULL DROP TABLE dbo.stats_rows",
+            "CREATE TABLE dbo.stats_rows (id int IDENTITY(1,1) PRIMARY KEY, name nvarchar(50) NOT NULL)",
+            "INSERT INTO dbo.stats_rows (name) VALUES ('a'), ('b'), ('c')",
+            "CREATE INDEX ix_stats_rows_name ON dbo.stats_rows (name)",
+        ],
+    )
+    .await;
+
+    // sys.dm_db_partition_stats is maintained as rows are written, so unlike
+    // Postgres there is nothing to ANALYZE first — but the number is still
+    // documented as approximate, so it must still arrive labelled.
+    let meta = introspect_table(&pool, "stats_rows").await;
+    let stats = pool.fetch_table_stats(&meta).await.unwrap();
+    assert_eq!(stats.rows, Some(RowCount::Estimated(3)));
+    assert_ne!(
+        stats.rows,
+        Some(RowCount::Exact(3)),
+        "a maintained counter is still not a COUNT(*)"
+    );
+    // Summed over index_id 0/1 only: the nonclustered index above holds the
+    // same three rows, and adding its partition would report six.
+    assert!(
+        stats.bytes.is_some_and(|b| b > 0),
+        "reserved pages must be reported: {:?}",
+        stats.bytes
+    );
+    assert_eq!(pool.count_table_rows(&meta).await.unwrap(), 3);
+
+    // A plain view owns no partitions, so both sums are over zero rows and
+    // come back absent rather than as zeroes.
+    run_all(
+        &pool,
+        // CREATE VIEW must lead its own batch, which the driver's RPC path
+        // cannot provide — EXEC() gives it one.
+        &["EXEC('CREATE VIEW dbo.stats_view AS SELECT id, name FROM dbo.stats_rows')"],
+    )
+    .await;
+    let view = pool
+        .fetch_table_stats(&introspect_table(&pool, "stats_view").await)
+        .await
+        .unwrap();
+    assert!(
+        view.is_empty(),
+        "a non-indexed view has no partitions to report: {view:?}"
+    );
+    assert_eq!(
+        pool.count_table_rows(&introspect_table(&pool, "stats_view").await)
+            .await
+            .unwrap(),
+        3
+    );
+
+    // An indexed view does own partitions, and nothing here filters views out
+    // — the catalog decides, so this one reports real numbers.
+    run_all(
+        &pool,
+        &[
+            "EXEC('CREATE VIEW dbo.stats_idx_view WITH SCHEMABINDING AS \
+             SELECT id, name FROM dbo.stats_rows')",
+            "CREATE UNIQUE CLUSTERED INDEX ix_stats_idx_view ON dbo.stats_idx_view (id)",
+        ],
+    )
+    .await;
+    let indexed = pool
+        .fetch_table_stats(&introspect_table(&pool, "stats_idx_view").await)
+        .await
+        .unwrap();
+    assert_eq!(
+        indexed.rows,
+        Some(RowCount::Estimated(3)),
+        "an indexed view materializes its rows and counts them"
+    );
+    assert!(indexed.bytes.is_some_and(|b| b > 0));
+
+    run_all(
+        &pool,
+        &[
+            "DROP VIEW dbo.stats_idx_view",
+            "DROP VIEW dbo.stats_view",
+            "DROP TABLE dbo.stats_rows",
+        ],
+    )
+    .await;
     pool.close().await;
 }

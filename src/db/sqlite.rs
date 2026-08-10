@@ -23,6 +23,7 @@ use super::schema::{
 use super::sql::Dialect;
 use super::sqlx_common::{self, get};
 use super::staged::CheckedStatement;
+use super::stats::{RowCount, TableStats};
 use super::value::{QueryResult, Value};
 
 /// Opens an existing SQLite database file and validates it is actually a
@@ -438,6 +439,66 @@ async fn table_foreign_keys(
     Ok(foreign_keys)
 }
 
+/// Row count and on-disk size for one table (FRE-118) — of which SQLite can
+/// cheaply answer only the first, and only sometimes.
+///
+/// **Rows** come from `sqlite_stat1`, the table `ANALYZE` writes: the first
+/// whitespace-separated token of each `stat` string is that table's row count
+/// at the time it ran. SQLite keeps no statistics otherwise, so a database
+/// nobody has analyzed reports nothing here — correctly, and the exact count is
+/// one click away. The table itself does not exist until the first `ANALYZE`,
+/// so its presence is checked in `sqlite_master` first: selecting from a
+/// missing table is an error, and "this database has no statistics" is not one.
+///
+/// **Size is deliberately absent.** SQLite's only per-table size is the
+/// `dbstat` virtual table, which computes its answer by walking every page of
+/// the b-trees it reports on — the same order of cost as the `COUNT(*)` this
+/// whole path exists to avoid, and paid on merely opening the schema pane. The
+/// cheap alternatives (`PRAGMA page_count`) measure the *file*, not the table,
+/// and reporting a database's size as a table's would be a wrong number rather
+/// than a missing one.
+pub async fn fetch_table_stats(
+    pool: &SqlitePool,
+    table: &TableMeta,
+) -> Result<TableStats, DbError> {
+    let analyzed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| DbError::Introspect(e.to_string()))?;
+    if analyzed == 0 {
+        return Ok(TableStats::default());
+    }
+    // Any of the table's rows will do: ANALYZE writes one per index, plus one
+    // with a NULL `idx` when there is no index, and every one of them opens
+    // with the table's own row count.
+    let stat: Option<String> =
+        sqlx::query_scalar("SELECT stat FROM sqlite_stat1 WHERE tbl = ?1 AND stat IS NOT NULL")
+            .bind(&table.name)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| DbError::Introspect(e.to_string()))?;
+    Ok(TableStats {
+        rows: stat
+            .as_deref()
+            .and_then(sqlite_stat_rows)
+            .map(RowCount::Estimated),
+        bytes: None,
+    })
+}
+
+/// The row count leading a `sqlite_stat1.stat` string ("10000 500 1" → 10000),
+/// or `None` if it does not lead with one.
+///
+/// Parsed rather than trusted: the column is documented as opaque text whose
+/// later tokens SQLite is free to change, and a `stat` written by a future
+/// version that opened with something else would otherwise be read as a row
+/// count. Unparseable means unknown, which renders as nothing.
+fn sqlite_stat_rows(stat: &str) -> Option<u64> {
+    stat.split_whitespace().next()?.parse().ok()
+}
+
 /// DDL for one object (FRE-108). SQLite stores the original `CREATE`
 /// statement text in `sqlite_master`, so tables, views, and explicitly
 /// created indexes all come back exactly as they were written — no
@@ -572,5 +633,21 @@ mod tests {
         assert_eq!(quote_ident("plain"), "\"plain\"");
         assert_eq!(quote_ident("we\"ird"), "\"we\"\"ird\"");
         assert_eq!(quote_ident("with space"), "\"with space\"");
+    }
+
+    #[test]
+    fn a_stat1_row_count_is_read_only_when_it_really_leads_the_string() {
+        use super::sqlite_stat_rows;
+        // What ANALYZE writes: the table's rows, then per-column selectivity.
+        assert_eq!(sqlite_stat_rows("10000 500 1"), Some(10_000));
+        // A table with no index gets the bare count.
+        assert_eq!(sqlite_stat_rows("7"), Some(7));
+        assert_eq!(sqlite_stat_rows("0 1"), Some(0));
+        // SQLite may prefix the string with a keyword (`unordered`, `sz=…`)
+        // and is free to add more; anything that does not open with a count is
+        // unknown rather than guessed at.
+        assert_eq!(sqlite_stat_rows("unordered 42"), None);
+        assert_eq!(sqlite_stat_rows(""), None);
+        assert_eq!(sqlite_stat_rows("-3 1"), None);
     }
 }

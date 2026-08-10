@@ -726,3 +726,38 @@ async fn cockroach_serial_is_unique_but_not_sequential() {
     pool.query("DROP TABLE crdb_serial CASCADE").await.unwrap();
     pool.close().await;
 }
+
+#[tokio::test]
+async fn cockroach_keeps_no_statistics_this_can_read_so_the_pane_stays_empty() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let (readings, _) = fresh_fixture(&pool, "stats").await;
+    let tables = pool.introspect().await.unwrap();
+    let meta = find(&tables, &readings);
+
+    // Cockroach has `pg_class.reltuples` and leaves it NULL for every
+    // relation, and ships no `pg_total_relation_size` at all — its own
+    // `crdb_internal.table_row_statistics` is refused outright ("Access to
+    // crdb_internal and system is restricted"). So the honest answer is that
+    // there is no answer.
+    //
+    // What this pins is that the absence stays an absence: the shape probe
+    // must return `Ok` with nothing in it rather than erroring the pane, and
+    // nothing may substitute a zero for the missing numbers (FRE-118).
+    let stats = pool.fetch_table_stats(meta).await.unwrap();
+    assert!(
+        stats.is_empty(),
+        "CockroachDB keeps no readable statistics, so nothing may be claimed: {stats:?}"
+    );
+    assert_eq!(stats.rows, None);
+    assert_eq!(stats.bytes, None);
+
+    // The exact count is the number this engine *can* give, and the reason
+    // the action exists separately from the estimate.
+    assert_eq!(pool.count_table_rows(meta).await.unwrap(), 16);
+
+    pool.query(&format!("DROP TABLE IF EXISTS {readings} CASCADE"))
+        .await
+        .unwrap();
+    pool.close().await;
+}

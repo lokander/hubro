@@ -39,6 +39,7 @@ mod sqlite;
 mod sqlserver;
 mod sqlx_common;
 mod staged;
+mod stats;
 mod url;
 mod value;
 
@@ -82,4 +83,5 @@ pub use sqlserver::{
 pub use staged::{
     apply_staged, AppliedCounts, CheckedStatement, RowLocator, StagedChange, StagedError,
 };
+pub use stats::{RowCount, TableStats};
 pub use value::{ColumnInfo, QueryResult, Value};

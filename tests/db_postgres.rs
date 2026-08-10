@@ -9,8 +9,8 @@
 
 use hubro::db::{
     detect_row_identity, url_with_password, Capabilities, DbError, DbPool, Dialect, Filter,
-    Internal, PageRequest, PgFlavor, Restriction, RowLocator, SortDir, TableKind, TypeDetail,
-    TypeRef, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
+    Internal, PageRequest, PgFlavor, Restriction, RowCount, RowLocator, SortDir, TableKind,
+    TypeDetail, TypeRef, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 fn test_url() -> Option<String> {
@@ -934,5 +934,180 @@ async fn partition_children_are_internal_but_their_parent_is_not() {
     );
 
     pool.query("DROP TABLE parted_intro CASCADE").await.unwrap();
+    pool.close().await;
+}
+
+/// Whether this server accounts for an object's size as soon as it is written
+/// (FRE-118).
+///
+/// This binary is pointed at TimescaleDB, Citus and YugabyteDB as well as
+/// stock Postgres, and the last of those answers `pg_total_relation_size` with
+/// 0 for a table it was handed rows a moment ago — its size accounting arrives
+/// later, out of band. Its *row* estimate is ordinary and needs no allowance,
+/// so only the size claims are guarded. `tests/db_yugabyte.rs` pins that
+/// engine's side of this directly.
+///
+/// The claims that hold everywhere — that a zero never surfaces as a
+/// measurement, that a view reports no size — stay unguarded, which is where
+/// most of the value is.
+fn accounts_for_size_immediately(pool: &DbPool) -> bool {
+    pool.pg_flavor() != Some(PgFlavor::Yugabyte)
+}
+
+/// Helper: the introspected metadata for one `public` table.
+async fn meta_of(pool: &DbPool, name: &str) -> hubro::db::TableMeta {
+    pool.introspect()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == name && t.schema.as_deref() == Some("public"))
+        .unwrap_or_else(|| panic!("{name} missing from introspection"))
+}
+
+#[tokio::test]
+async fn table_stats_estimate_rows_only_once_something_has_measured_them() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    fresh_fixture(&pool, "stats_intro").await;
+    let meta = meta_of(&pool, "stats_intro").await;
+
+    // Nothing has analyzed the table yet, so `pg_class.reltuples` is -1. The
+    // whole point of FRE-118's absent case: a viewer that reported this as
+    // "0 rows" would be stating something false about a table with four.
+    let before = pool.fetch_table_stats(&meta).await.unwrap();
+    assert_eq!(
+        before.rows, None,
+        "an unanalyzed table must report no estimate, not a zero"
+    );
+    // A size is either a real measurement or absent; a zero is neither, and
+    // is dropped rather than rendered as "0 B" beside a populated table.
+    assert_ne!(before.bytes, Some(0));
+    if accounts_for_size_immediately(&pool) {
+        // The size, by contrast, is known from the moment the table has pages
+        // — the two halves really are independent.
+        assert!(
+            before.bytes.is_some_and(|b| b > 0),
+            "a populated table occupies disk: {:?}",
+            before.bytes
+        );
+    }
+
+    pool.query("ANALYZE stats_intro").await.unwrap();
+    let after = pool.fetch_table_stats(&meta).await.unwrap();
+    assert_eq!(
+        after.rows,
+        Some(RowCount::Estimated(4)),
+        "ANALYZE measured four rows, and the number must arrive labelled as an estimate"
+    );
+    assert!(after.rows.is_some_and(RowCount::is_estimate));
+
+    // The exact count is the same number arriving a completely different way,
+    // and it must never be confused for the estimate.
+    assert_eq!(pool.count_table_rows(&meta).await.unwrap(), 4);
+    assert_ne!(after.rows, Some(RowCount::Exact(4)));
+
+    pool.query("DROP TABLE stats_intro").await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn a_view_reports_no_size_because_it_occupies_none() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    // The dependents come down first: `fresh_fixture` drops without CASCADE,
+    // so a leftover view from an interrupted run would otherwise pin the base
+    // table and fail the setup rather than the assertion.
+    pool.query("DROP VIEW IF EXISTS stats_view").await.unwrap();
+    pool.query("DROP MATERIALIZED VIEW IF EXISTS stats_matview")
+        .await
+        .unwrap();
+    fresh_fixture(&pool, "stats_base").await;
+    pool.query("CREATE VIEW stats_view AS SELECT * FROM stats_base")
+        .await
+        .unwrap();
+    pool.query("CREATE MATERIALIZED VIEW stats_matview AS SELECT * FROM stats_base")
+        .await
+        .unwrap();
+
+    // `pg_total_relation_size` answers 0 for a plain view, which would render
+    // as a measured "0 B" rather than as the absence it is.
+    let view = pool
+        .fetch_table_stats(&meta_of(&pool, "stats_view").await)
+        .await
+        .unwrap();
+    assert_eq!(view.bytes, None, "a view has no storage to report");
+    assert_eq!(view.rows, None);
+    assert!(view.is_empty());
+
+    // A materialized view does have storage, and the relkind test must not
+    // sweep it up with the plain one.
+    let matview = pool
+        .fetch_table_stats(&meta_of(&pool, "stats_matview").await)
+        .await
+        .unwrap();
+    if accounts_for_size_immediately(&pool) {
+        assert!(
+            matview.bytes.is_some_and(|b| b > 0),
+            "a materialized view stores its rows: {:?}",
+            matview.bytes
+        );
+    }
+
+    // Counting a view exactly is still meaningful — it is the rows it would
+    // return, and it is the only number available for one.
+    assert_eq!(
+        pool.count_table_rows(&meta_of(&pool, "stats_view").await)
+            .await
+            .unwrap(),
+        4
+    );
+
+    pool.query("DROP VIEW stats_view").await.unwrap();
+    pool.query("DROP MATERIALIZED VIEW stats_matview")
+        .await
+        .unwrap();
+    pool.query("DROP TABLE stats_base").await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn an_exact_count_ignores_a_quoted_name_and_a_non_public_schema() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.query("CREATE SCHEMA IF NOT EXISTS \"stats sch\"")
+        .await
+        .unwrap();
+    pool.query("DROP TABLE IF EXISTS \"stats sch\".\"odd.name\"")
+        .await
+        .unwrap();
+    pool.query("CREATE TABLE \"stats sch\".\"odd.name\" (id int)")
+        .await
+        .unwrap();
+    pool.query("INSERT INTO \"stats sch\".\"odd.name\" VALUES (1), (2)")
+        .await
+        .unwrap();
+    pool.query("ANALYZE \"stats sch\".\"odd.name\"")
+        .await
+        .unwrap();
+
+    let meta = pool
+        .introspect()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == "odd.name" && t.schema.as_deref() == Some("stats sch"))
+        .expect("qualified fixture missing from introspection");
+
+    // Both paths qualify and quote through the same helper the rest of the
+    // app uses; a schema with a space and a table with a dot in its name are
+    // where a hand-built name would silently resolve elsewhere.
+    assert_eq!(pool.count_table_rows(&meta).await.unwrap(), 2);
+    let stats = pool.fetch_table_stats(&meta).await.unwrap();
+    assert_eq!(stats.rows, Some(RowCount::Estimated(2)));
+
+    pool.query("DROP TABLE \"stats sch\".\"odd.name\"")
+        .await
+        .unwrap();
+    pool.query("DROP SCHEMA \"stats sch\"").await.unwrap();
     pool.close().await;
 }

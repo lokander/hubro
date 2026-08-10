@@ -481,3 +481,40 @@ async fn materialize_rolls_back_a_transaction_including_its_ddl() {
 
     pool.close().await;
 }
+
+#[tokio::test]
+async fn materialize_reports_no_statistics_rather_than_a_row_of_zeroes() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let (readings, view, matview) = fresh_fixture(&pool, "stats").await;
+    let tables = pool.introspect().await.unwrap();
+
+    // Materialize's `pg_class` is a stub: it has `reltuples` (always -1) but
+    // no `relpages`, and there is no `pg_total_relation_size`. Both halves of
+    // the shape probe therefore say no, and every object — table, view and
+    // materialized view alike — reports nothing rather than the zeroes a
+    // credulous query would have produced (FRE-118).
+    for name in [&readings, &view, &matview] {
+        let stats = pool.fetch_table_stats(find(&tables, name)).await.unwrap();
+        assert!(
+            stats.is_empty(),
+            "{name}: Materialize keeps no such statistics: {stats:?}"
+        );
+    }
+
+    assert_eq!(
+        pool.count_table_rows(find(&tables, &readings))
+            .await
+            .unwrap(),
+        5
+    );
+
+    for sql in [
+        format!("DROP MATERIALIZED VIEW IF EXISTS {matview}"),
+        format!("DROP VIEW IF EXISTS {view}"),
+        format!("DROP TABLE IF EXISTS {readings}"),
+    ] {
+        pool.query(&sql).await.unwrap();
+    }
+    pool.close().await;
+}
