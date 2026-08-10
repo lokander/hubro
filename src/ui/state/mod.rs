@@ -489,8 +489,7 @@ pub struct AppState {
     pub connect_error: Signal<Option<String>>,
     /// Secrets entered this session: Postgres passwords keyed by stored URL,
     /// SSH key passphrases keyed by [`connect::ssh_secret_key`]. Never
-    /// persisted here
-    /// — the OS keyring handles "remember".
+    /// persisted here — the OS keyring handles "remember".
     pub session_passwords: Signal<HashMap<String, String>>,
     /// When set, the connections screen asks for this connection's password
     /// or SSH key passphrase.
