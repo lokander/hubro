@@ -190,13 +190,22 @@ impl DbPool {
         }
     }
 
-    /// This connection's default capabilities (FRE-87). All three current
-    /// backends are full-featured OLTP engines — they query, write, run DDL,
-    /// hold transactions and page by `LIMIT`/`OFFSET` — so each declares
+    /// This connection's default capabilities (FRE-87). The three drivers are
+    /// full-featured OLTP engines — they query, write, run DDL, hold
+    /// transactions and page by `LIMIT`/`OFFSET` — so each declares
     /// [`Capabilities::FULL`]. Objects that are nonetheless not writable
     /// (views, key-less tables) narrow this per object in
-    /// [`TableAccess::resolve`]; a backend that is read-only or
-    /// non-transactional as a whole declares the narrower set right here.
+    /// [`TableAccess::resolve`].
+    ///
+    /// A *server* reached through one of those drivers may still be narrower,
+    /// which is what the Postgres arm is for: RisingWave speaks the Postgres
+    /// wire protocol and has real editable tables, but no read-write
+    /// transactions at all — `BEGIN` raises a notice saying none was started
+    /// and `ROLLBACK` does nothing (FRE-93). Declaring that here is what makes
+    /// the script tab stop wrapping batches
+    /// ([`wrap_atomically`](super::script::wrap_atomically)) and editing
+    /// refuse rather than run unguarded
+    /// ([`NO_GUARDED_WRITE`](super::caps::NO_GUARDED_WRITE)).
     ///
     /// **This is what the engine can do, not what this connection may do.**
     /// It knows nothing about the user's write protection (FRE-111), so a
@@ -206,7 +215,21 @@ impl DbPool {
     /// these, which is the whole reason they carry it.
     pub fn backend_capabilities(&self) -> Capabilities {
         match self {
-            DbPool::Sqlite(_) | DbPool::Postgres(_) | DbPool::SqlServer(_) => Capabilities::FULL,
+            DbPool::Sqlite(_) | DbPool::SqlServer(_) => Capabilities::FULL,
+            DbPool::Postgres(pg) => match pg.flavor() {
+                postgres::PgFlavor::RisingWave => Capabilities {
+                    transactions: false,
+                    ..Capabilities::FULL
+                },
+                // Stock Postgres and the rest of the family hold real
+                // transactions — including Materialize, whose rollback is
+                // genuine (FRE-92), and CockroachDB and YugabyteDB, whose
+                // rollback covers DML and merely lets DDL escape (FRE-146).
+                postgres::PgFlavor::Postgres
+                | postgres::PgFlavor::CockroachDB
+                | postgres::PgFlavor::Yugabyte
+                | postgres::PgFlavor::Materialize => Capabilities::FULL,
+            },
         }
     }
 
