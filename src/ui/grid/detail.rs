@@ -467,24 +467,21 @@ pub(super) fn RowDetailRow(
                     // Truncated and unaddressable (a view, a keyless table):
                     // the preview is all there will ever be, and the same
                     // refusal the copy path states says why.
-                    (Some(preview), None) => {
-                        // A blob renders as `<blob N>`, and `N` derived from
-                        // the value in hand would be the *prefix's* size. The
-                        // page already reports the real length, so read it
-                        // rather than recompute it from something known to be
-                        // truncated — the re-derive trap the SQL Server length
-                        // probe fix closed on main.
-                        let shown = match &field.value {
-                            Value::Blob(_) => format!("<blob {}>", human_bytes(preview.full_len)),
-                            other => format!("{}…", other.display()),
-                        };
-                        rsx! {
-                            Banner {
-                                kind: BannerKind::Warning,
-                                message: CopyRefusal::Unaddressable { column: field.column.clone() }.message(),
-                            }
-                            pre { class: "mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
-                                "{shown}"
+                    (Some(preview), None) => rsx! {
+                        Banner {
+                            kind: BannerKind::Warning,
+                            message: CopyRefusal::Unaddressable { column: field.column.clone() }.message(),
+                        }
+                        // The viewer is told the value is a prefix and how
+                        // long the stored one is (FRE-115) — the page already
+                        // reports that length, so nothing here re-derives a
+                        // size from bytes known to be truncated, the trap the
+                        // SQL Server length probe fix closed on main.
+                        div { class: "mt-1",
+                            CellViewer {
+                                value: field.value.clone(),
+                                type_name: field.type_name.clone(),
+                                truncated: Some(preview.full_len),
                             }
                         }
                     },
@@ -549,13 +546,20 @@ pub(super) fn RowDetailFullValue(
         },
         Some(Ok(fetch)) if fetch.capped => {
             let note = format!(
-                "Value is very large; showing the first {} and not offering an editor.",
+                "Value is very large; only the first {} was loaded, so there is no editor for it.",
                 human_bytes(FETCH_CELL_MAX_BYTES as u64),
             );
             rsx! {
                 Banner { kind: BannerKind::Warning, message: note }
-                pre { class: "mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
-                    "{fetch.value.display()}"
+                // What is on screen is the viewer's to say — the banner states
+                // the consequence (no editor), the viewer states what it is
+                // showing and of how much, so neither restates the other.
+                div { class: "mt-1",
+                    CellViewer {
+                        value: fetch.value.clone(),
+                        type_name: field.type_name.clone(),
+                        truncated: Some(fetch.full_len),
+                    }
                 }
             }
         }
@@ -669,7 +673,6 @@ pub(super) fn RowDetailValue(
     let button_row = row_key.clone();
     let dbl_column = field.column.clone();
     let button_column = field.column.clone();
-    let display = value.display();
     rsx! {
         div { class: "flex items-start gap-1",
             div {
@@ -679,20 +682,14 @@ pub(super) fn RowDetailValue(
                         activate(&dbl_row, &dbl_column);
                     }
                 },
-                match &value {
-                    // NULL reads distinctly from an empty string, exactly as
-                    // it does in the grid.
-                    Value::Null => rsx! {
-                        span { class: "font-mono text-xs italic text-slate-400 dark:text-slate-600", "NULL" }
-                    },
-                    Value::Blob(_) => rsx! {
-                        span { class: "font-mono text-xs text-violet-700 dark:text-violet-400", "{display}" }
-                    },
-                    _ => rsx! {
-                        pre { class: "max-h-64 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
-                            "{display}"
-                        }
-                    },
+                // The whole value is in hand here — the previewed path fetched
+                // it — so the viewer may decode it (FRE-115). Read-only: the
+                // editor below still opens on the raw value, never on a
+                // rendering of it.
+                CellViewer {
+                    value: value.clone(),
+                    type_name: field.type_name.clone(),
+                    truncated: None,
                 }
             }
             if editable {

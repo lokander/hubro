@@ -159,6 +159,20 @@ impl TableRenderMeta {
         column_kind(column, &self.column_kinds)
     }
 
+    /// One column's declared type, as the Schema pane spells it — the string
+    /// the rich viewers classify on (FRE-115). Empty for a column the loaded
+    /// schema doesn't name (a schema still loading, a result whose columns
+    /// aren't the table's), which
+    /// [`classify_column`](crate::db::classify_column) already reads as
+    /// "unknown, so treat it as text".
+    pub(super) fn type_of(&self, column: &str) -> String {
+        self.columns
+            .iter()
+            .find(|meta| meta.name == column)
+            .map(display_type)
+            .unwrap_or_default()
+    }
+
     /// The foreign key this column belongs to, when following it leads
     /// somewhere: a NULL key references nothing (FRE-29).
     pub(super) fn fk_of(&self, column: &str, value: &Value) -> Option<&ForeignKeyMeta> {
@@ -1076,15 +1090,19 @@ pub(super) fn TruncatedCellEditor(
 }
 
 /// The full-value body of the expand popup for a truncated cell (FRE-33):
-/// loads the value via [`AppState::load_cell`] and renders it. Text/json show
-/// in full (a value over the fetch cap shows its first chunk with a note);
-/// binary values show their size only.
+/// loads the value via [`AppState::load_cell`] and hands it to [`CellViewer`]
+/// (FRE-115) — a JSON tree, a picture, a hex dump or a text pane. A value over
+/// the fetch cap arrives as a prefix, and the viewer is told so, which is what
+/// keeps it from decoding half a document or half an image as a whole one.
 #[component]
 pub(super) fn ExpandedValue(
     id: ConnectionId,
     table: TableRef,
     locator: RowLocator,
     column: String,
+    /// The column's declared type, looked up by the popup (empty when the
+    /// schema doesn't name it) — see [`TableRenderMeta::type_of`].
+    type_name: String,
 ) -> Element {
     let state = use_context::<AppState>();
     let fetch_table = table.clone();
@@ -1105,28 +1123,15 @@ pub(super) fn ExpandedValue(
             Banner { kind: BannerKind::Error, message: err.clone() }
         },
         Some(Ok(fetch)) => {
-            if let Value::Blob(_) = &fetch.value {
-                return rsx! {
-                    p { class: "font-mono text-xs text-slate-500 dark:text-slate-400",
-                        "Binary value — {human_bytes(fetch.full_len)} (content not shown)."
-                    }
-                };
-            }
-            let text = fetch.value.display();
             let capped = fetch.capped;
-            // A capped fetch may be cut mid-document — only pretty-print
-            // JSON when the full value is held (FRE-77).
-            let display = if capped {
-                text.clone()
-            } else {
-                pretty_json(&text).unwrap_or_else(|| text.clone())
-            };
             // A capped fetch holds a prefix, so Copy raw is withdrawn rather
             // than handed a truncated value — the same refusal `plan_copy`
-            // makes for this cell, worded identically (FRE-110).
+            // makes for this cell, worded identically (FRE-110). What is on
+            // screen is the viewer's to describe; this says only what was
+            // loaded and what that costs.
             let capped_note = capped.then(|| {
                 format!(
-                    "Value is very large; showing the first {}. {}",
+                    "Value is very large; only the first {} was loaded. {}",
                     human_bytes(FETCH_CELL_MAX_BYTES as u64),
                     CopyRefusal::TooLarge {
                         column: column.clone(),
@@ -1139,29 +1144,20 @@ pub(super) fn ExpandedValue(
                 if let Some(note) = capped_note {
                     Banner { kind: BannerKind::Warning, message: note }
                 } else {
-                    CopyRawButton { raw: text.clone() }
+                    // The clipboard gets the value, never the rendering: a
+                    // blob copies as its hex, exactly as Ctrl+C over the cell.
+                    CopyRawButton { raw: raw_cell_text(&fetch.value) }
                 }
-                pre { class: "mt-2 whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
-                    "{display}"
+                div { class: "mt-2",
+                    CellViewer {
+                        value: fetch.value.clone(),
+                        type_name: type_name.clone(),
+                        truncated: capped.then_some(fetch.full_len),
+                    }
                 }
             }
         }
     }
-}
-
-/// Pretty-printed rendering of a JSON cell value for the expand popup
-/// (FRE-77): `Some` only when the text parses as a JSON object or array —
-/// scalars re-serialize identically and everything else (including a JSON
-/// document cut off by the fetch cap) falls back to the raw text.
-pub(super) fn pretty_json(text: &str) -> Option<String> {
-    let parsed: serde_json::Value = serde_json::from_str(text).ok()?;
-    if !matches!(
-        parsed,
-        serde_json::Value::Object(_) | serde_json::Value::Array(_)
-    ) {
-        return None;
-    }
-    serde_json::to_string_pretty(&parsed).ok()
 }
 
 /// A right-aligned "Copy raw" action for the expand popup (FRE-77): always
@@ -1185,23 +1181,6 @@ pub(super) fn CopyRawButton(raw: String) -> Element {
 mod tests {
     use super::*;
     use crate::ui::grid::fixtures::*;
-
-    #[test]
-    fn pretty_json_formats_objects_and_arrays_only() {
-        // Note: serde_json's default map sorts keys — fine for reading, and
-        // jsonb has no stable key order anyway; Copy raw keeps the original.
-        assert_eq!(
-            pretty_json(r#"{"b":1,"a":[2,3]}"#).as_deref(),
-            Some("{\n  \"a\": [\n    2,\n    3\n  ],\n  \"b\": 1\n}")
-        );
-        assert_eq!(pretty_json("[1,2]").as_deref(), Some("[\n  1,\n  2\n]"));
-        // Scalars re-serialize identically — no point reformatting.
-        assert_eq!(pretty_json("42"), None);
-        assert_eq!(pretty_json("\"hi\""), None);
-        // Non-JSON and truncated documents fall back to raw.
-        assert_eq!(pretty_json("plain text"), None);
-        assert_eq!(pretty_json(r#"{"cut": "mid-docu"#), None);
-    }
 
     #[test]
     fn staged_edits_and_deletes_mark_the_right_rows() {
