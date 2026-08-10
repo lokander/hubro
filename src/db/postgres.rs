@@ -468,6 +468,23 @@ fn line_col(sql: &str, position: usize) -> Option<(usize, usize)> {
     (position == seen + 1).then_some((line, column))
 }
 
+/// Why a streaming engine's source is not editable.
+///
+/// Worded for the object rather than the engine: both Materialize (FRE-92) and
+/// RisingWave (FRE-93) report `SOURCE`, and naming one of them in a message the
+/// other also shows would be worse than saying nothing.
+const STREAMING_SOURCE: &str =
+    "A source is written by the engine from an external system, not by hand.";
+
+/// Why a streaming engine's sink is neither editable nor browsable.
+///
+/// A sink is the only object here with no rows *at all* — it writes outward, to
+/// Kafka or another database. Without this it fell through to an ordinary
+/// table, which offered editing on nothing and failed on open with the
+/// engine's own "table or source not found" (FRE-93).
+const STREAMING_SINK: &str =
+    "A sink writes to an external system; it has no rows of its own to show.";
+
 /// Which optional catalog columns a server actually has (FRE-92).
 ///
 /// Every Postgres-wire engine claims an `information_schema`, and they do not
@@ -883,6 +900,25 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
         }
     }
 
+    // RisingWave's own catalog (FRE-93). `rw_catalog` holds 74 objects and is
+    // listed like any user schema, so without this it is most of the schema
+    // tree.
+    //
+    // Not reachable by catalog fact alone, and the near-miss is worth
+    // recording: 61 of the 74 report `table_type = 'SYSTEM TABLE'`, which the
+    // classification above now picks up and which no other engine emits
+    // outside `pg_catalog`. The remaining 13 are plain `VIEW`, indistinguishable
+    // from a user's own. So the schema is what identifies them.
+    //
+    // Matching the name is sound here on the same two grounds as
+    // `pg_catalog`: the connection has already identified itself as
+    // RisingWave, so no other server can reach this; and on RisingWave
+    // `rw_catalog` is reserved — `CREATE SCHEMA rw_catalog` is refused because
+    // it already exists — so no user schema can ever be caught by it.
+    if conn.flavor() == PgFlavor::RisingWave {
+        internal_schemas.insert("rw_catalog".to_string(), Internal::System);
+    }
+
     // Tables and views across all non-system schemas. Materialized views
     // (relkind 'm') are not in stock Postgres's information_schema, so they
     // come from a pg_catalog UNION (FRE-41).
@@ -1057,12 +1093,15 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
         // PostgreSQL never emits the value — it has nothing left to classify
         // once `pg_catalog` and `information_schema` are excluded — so the
         // rule needs no engine check and costs nothing to carry.
-        let system = table_type == "SYSTEM VIEW";
-        // Materialize's streaming inputs (FRE-92). A source is continuously
-        // written by the engine from somewhere else — Kafka, Postgres
-        // replication, a load generator — so it is readable and never
-        // writable, which is a view's contract rather than a table's.
+        let system = matches!(table_type.as_str(), "SYSTEM VIEW" | "SYSTEM TABLE");
+        // A streaming engine's edges, on both Materialize (FRE-92) and
+        // RisingWave (FRE-93). A source is continuously written by the engine
+        // from somewhere else — Kafka, Postgres replication, a load generator
+        // — so it is readable and never writable by hand, which is a view's
+        // contract rather than a table's. A sink is the mirror image: it
+        // *writes* to an external system and has no rows of its own at all.
         let source = table_type == "SOURCE";
+        let sink = table_type == "SINK";
         // The object's own rule first, then its schema's — most specific wins.
         // Naming the extension beats naming the engine for the same reason it
         // beats naming the shape above: it is the part the user can act on.
@@ -1077,7 +1116,13 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
             // as a mysteriously unwritable view. Same treatment `hypertable`
             // and `continuous aggregate` get on Timescale (FRE-88): the label
             // refines the kind rather than replacing it.
-            source.then(|| "source".to_string())
+            if source {
+                Some("source".to_string())
+            } else if sink {
+                Some("sink".to_string())
+            } else {
+                None
+            }
         });
         tables.push(TableMeta {
             schema: Some(schema),
@@ -1090,7 +1135,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
                 // objects that mostly cannot even be read. A Materialize
                 // `SOURCE` is a view for the same reason — derived, readable,
                 // never written by the user.
-                "VIEW" | "SYSTEM VIEW" | "SOURCE" => TableKind::View,
+                "VIEW" | "SYSTEM VIEW" | "SOURCE" | "SINK" => TableKind::View,
                 "MATERIALIZED VIEW" => TableKind::MaterializedView,
                 _ => TableKind::Table,
             },
@@ -1103,9 +1148,13 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
             // source — which resolves to a view, and would otherwise be
             // refused with "Views are read-only", a sentence that sends the
             // reader looking for a view definition that does not exist.
-            restriction: source.then_some(Restriction::Declared(
-                "Materialize sources are written by the engine, not by hand.",
-            )),
+            restriction: if source {
+                Some(Restriction::Declared(STREAMING_SOURCE))
+            } else if sink {
+                Some(Restriction::Declared(STREAMING_SINK))
+            } else {
+                None
+            },
             internal,
             kind_label,
         });

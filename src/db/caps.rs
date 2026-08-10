@@ -118,6 +118,10 @@ pub const NO_OFFSET_PAGING: &str = "This connection can't page through rows with
 /// So a non-transactional backend is not offered unguarded editing. RisingWave
 /// is the first (FRE-93): `BEGIN` there raises a notice saying no transaction
 /// was started, and `ROLLBACK` silently does nothing.
+///
+/// Reported *last* among the reasons an object is unwritable — see
+/// [`TableAccess::resolve`]. It applies to everything, which is exactly why it
+/// makes a poor explanation for an object that was never writable anyway.
 pub const NO_GUARDED_WRITE: &str =
     "This connection can't run transactions, so an edit that turned out to affect the wrong \
      rows couldn't be undone.";
@@ -241,13 +245,6 @@ impl TableAccess {
         let identity = detect_row_identity(table, dialect);
         let restriction = if !defaults.mutate {
             Some(CONNECTION_READ_ONLY)
-        } else if !defaults.transactions {
-            // Checked before the object's own reasons for the same rule the
-            // connection-level refusal above follows: a limit of the
-            // connection stands whatever the object is, and telling someone
-            // "this view is read-only" would send them to find a writable
-            // table that is equally refused. See [`NO_GUARDED_WRITE`].
-            Some(UNGUARDED_WRITES)
         } else if let Some(declared) = table.restriction {
             Some(declared)
         } else {
@@ -255,6 +252,18 @@ impl TableAccess {
                 TableKind::View => Some(Restriction::View),
                 TableKind::MaterializedView => Some(Restriction::MaterializedView),
                 TableKind::Table if identity.is_none() => Some(Restriction::NoRowIdentity),
+                // Last, not first: a connection that cannot hold a transaction
+                // cannot guard *any* write (see [`NO_GUARDED_WRITE`]), but it
+                // only becomes the interesting reason once the object would
+                // otherwise have been writable. Reporting it ahead of the
+                // object's own reason would tell someone their streaming
+                // source is refused for want of transactions, when it has no
+                // hand-writable rows on any engine.
+                //
+                // The same asymmetry [`Self::resolve_protected`] applies to the
+                // user's marking, and for the same reason: name what actually
+                // changed the answer.
+                TableKind::Table if !defaults.transactions => Some(UNGUARDED_WRITES),
                 TableKind::Table => None,
             }
         };
@@ -426,19 +435,41 @@ mod tests {
     }
 
     #[test]
-    fn losing_transactions_does_not_relabel_an_object_already_unwritable() {
-        // A view is a view. The connection-level reason is checked first by
-        // design, but it must not be the one *shown* for an object that would
-        // be refused anyway — same asymmetry the marking rules follow.
+    fn an_objects_own_reason_survives_the_missing_transaction() {
+        // The missing transaction is reported only when it is what changed the
+        // answer — the same asymmetry `resolve_protected` applies to the user's
+        // marking. An object with its own reason keeps it: "this source is
+        // written by the engine" is actionable, where "this connection can't
+        // run transactions" would send the reader looking for a writable
+        // object that does not exist.
         let defaults = Capabilities {
             transactions: false,
             ..Capabilities::FULL
         };
-        for kind in [TableKind::View, TableKind::MaterializedView] {
+        for (kind, expected) in [
+            (TableKind::View, Restriction::View),
+            (TableKind::MaterializedView, Restriction::MaterializedView),
+        ] {
             let t = table(kind, vec![col("id", Some(1))]);
             let access = TableAccess::resolve(defaults, &t, Dialect::Postgres);
             assert!(!access.can_mutate(), "{kind:?}");
+            assert_eq!(access.restriction, Some(expected), "{kind:?}");
         }
+
+        // A declared restriction — a streaming source — likewise stands.
+        let mut declared = keyed_table();
+        declared.restriction = Some(Restriction::Declared("A source is written by the engine."));
+        assert_eq!(
+            TableAccess::resolve(defaults, &declared, Dialect::Postgres).restriction,
+            Some(Restriction::Declared("A source is written by the engine."))
+        );
+
+        // ...and a key-less table keeps the more specific reason too.
+        let keyless = table(TableKind::Table, vec![col("data", None)]);
+        assert_eq!(
+            TableAccess::resolve(defaults, &keyless, Dialect::Postgres).restriction,
+            Some(Restriction::NoRowIdentity)
+        );
     }
 
     #[test]

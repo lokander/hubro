@@ -78,15 +78,30 @@
 //!
 //! No `SERIAL`, no `CREATE TYPE`/enums, no `DROP TYPE`, no declarative
 //! partitioning, and dates outside the ordinary range are rejected rather than
-//! stored. Each surfaces as an ordinary statement error. RisingWave also keeps
-//! its own `rw_catalog` out of `pg_namespace` entirely, so unlike CockroachDB
-//! and Materialize there is no engine bookkeeping to hide — the schema tree
-//! shows the user's objects and nothing else.
+//! stored. Each surfaces as an ordinary statement error.
+//!
+//! ## The engine's own catalog, and its streaming edges
+//!
+//! `rw_catalog` holds 74 objects listed exactly like a user schema, so it would
+//! otherwise be most of the schema tree — the same problem CockroachDB (119)
+//! and Materialize (265) each posed. 61 of the 74 report `table_type =
+//! 'SYSTEM TABLE'`, which is now classified as the engine's own alongside
+//! `SYSTEM VIEW` and which no other engine emits outside `pg_catalog`; the
+//! other 13 are plain `VIEW`, indistinguishable from a user's, so the reserved
+//! schema name identifies them, gated on the flavor.
+//!
+//! Sources and sinks are RisingWave's other objects with no Postgres
+//! equivalent. Both are now views rather than tables: a `SOURCE` is written by
+//! the engine from outside, and a `SINK` writes *outward* and has no rows of
+//! its own — before this it read as an ordinary browsable table and failed on
+//! open with `table or source not found`. The source's reason is worded for
+//! the object rather than the engine, since Materialize reports `SOURCE` too
+//! and was previously naming itself in a message RisingWave also showed.
 
 use hubro::db::{
     apply_staged, detect_row_identity, run_script, split_statements, Capabilities, DbPool, Filter,
-    PageRequest, PgFlavor, Restriction, RowIdentity, RowLocator, SortDir, StagedChange, TableKind,
-    TableMeta, Value, NO_GUARDED_WRITE,
+    Internal, PageRequest, PgFlavor, Restriction, RowIdentity, RowLocator, SortDir, StagedChange,
+    TableKind, TableMeta, Value, NO_GUARDED_WRITE,
 };
 
 fn test_url() -> Option<String> {
@@ -382,18 +397,9 @@ async fn risingwave_introspects_tables_keys_and_materialized_views() {
 
     assert_eq!(find(&tables, &matview).kind, TableKind::MaterializedView);
 
-    // RisingWave keeps `rw_catalog` out of `pg_namespace`, so unlike
-    // CockroachDB and Materialize there is no engine bookkeeping to mark
-    // internal — the tree is the user's objects and nothing else.
-    assert!(
-        tables.iter().all(|t| t.internal.is_none()),
-        "expected no internal objects, got {:?}",
-        tables
-            .iter()
-            .filter(|t| t.internal.is_some())
-            .map(|t| (&t.schema, &t.name))
-            .collect::<Vec<_>>()
-    );
+    // The user's own objects are not the engine's.
+    assert_eq!(table.internal, None);
+    assert_eq!(find(&tables, &matview).internal, None);
 
     pool.close().await;
 }
@@ -435,5 +441,98 @@ async fn risingwave_pages_sorts_and_filters_over_a_materialized_view() {
     assert_eq!(mv_page.rows.len(), 1);
     assert_eq!(integer(&mv_page.rows[0][0]), 2);
 
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn risingwave_own_catalog_is_marked_as_the_engines_own() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    fresh_fixture(&pool, "catalog").await;
+
+    let tables = pool.introspect().await.unwrap();
+
+    // Selected by schema even though the backend reaches most of these through
+    // `table_type`, so the test names the objects independently of the rule
+    // under test. The previous version of this test asserted that *nothing*
+    // was internal and passed for the wrong reason — it could not fail in
+    // either state, and hid 74 unmarked objects.
+    let engine: Vec<&TableMeta> = tables
+        .iter()
+        .filter(|t| t.schema.as_deref() == Some("rw_catalog"))
+        .collect();
+    assert!(
+        engine.len() > 50,
+        "expected RisingWave's catalog to be populated, got {}",
+        engine.len()
+    );
+    for table in &engine {
+        assert_eq!(table.internal, Some(Internal::System), "{table:?}");
+    }
+
+    // ...and the user's own schema is untouched by the rule.
+    for table in tables
+        .iter()
+        .filter(|t| t.schema.as_deref() == Some("public"))
+    {
+        assert_eq!(table.internal, None, "{table:?}");
+    }
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn risingwave_source_and_sink_are_read_only_and_say_which_they_are() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+
+    // Both object kinds the issue named, created rather than assumed. The
+    // `blackhole` sink connector and the `datagen` source need no external
+    // system, which is what makes them testable here at all.
+    for sql in [
+        "DROP SINK IF EXISTS rw_edge_sink",
+        "DROP SOURCE IF EXISTS rw_edge_source",
+        "DROP TABLE IF EXISTS rw_edge_base",
+        "CREATE TABLE rw_edge_base (id int, PRIMARY KEY (id))",
+        "CREATE SINK rw_edge_sink FROM rw_edge_base WITH (connector = 'blackhole')",
+        "CREATE SOURCE rw_edge_source (v1 int) \
+         WITH (connector = 'datagen', datagen.rows.per.second = '1') \
+         FORMAT PLAIN ENCODE JSON",
+    ] {
+        pool.query(sql).await.unwrap();
+    }
+
+    let tables = pool.introspect().await.unwrap();
+
+    let source = find(&tables, "rw_edge_source");
+    assert_eq!(source.kind, TableKind::View);
+    assert_eq!(source.kind_label.as_deref(), Some("source"));
+    assert!(!pool.backend_access(source).can_mutate());
+    let notice = pool.backend_access(source).read_only_notice().unwrap();
+    assert!(
+        notice.contains("written by the engine") && !notice.contains("Materialize"),
+        "a source's reason must describe the object, not another engine: {notice}"
+    );
+
+    // The sink is the object that previously read as an ordinary table: it has
+    // no rows at all, so offering it for browsing produced the engine's own
+    // "table or source not found" on open.
+    let sink = find(&tables, "rw_edge_sink");
+    assert_eq!(sink.kind, TableKind::View);
+    assert_eq!(sink.kind_label.as_deref(), Some("sink"));
+    assert!(!pool.backend_access(sink).can_mutate());
+    assert!(pool
+        .backend_access(sink)
+        .read_only_notice()
+        .unwrap()
+        .contains("no rows of its own"));
+
+    for sql in [
+        "DROP SINK rw_edge_sink",
+        "DROP SOURCE rw_edge_source",
+        "DROP TABLE rw_edge_base",
+    ] {
+        pool.query(sql).await.unwrap();
+    }
     pool.close().await;
 }
