@@ -2140,6 +2140,7 @@ mod tests {
             auth: ServerAuth::Entra(crate::azure::EntraAuth::interactive_default()),
             protection: WriteProtection::ReadOnly,
             color: Some(ConnectionColor::Red),
+            group: None,
         }));
 
         let bare = SavedConnection::Postgres {
@@ -2149,6 +2150,7 @@ mod tests {
             auth: ServerAuth::Password,
             protection: WriteProtection::Open,
             color: None,
+            group: None,
         };
         assert!(list.add(bare), "the entry is rewritten, and reports it");
         match &list.entries()[0] {
