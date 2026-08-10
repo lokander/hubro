@@ -463,6 +463,62 @@ fn line_col(sql: &str, position: usize) -> Option<(usize, usize)> {
     (position == seen + 1).then_some((line, column))
 }
 
+/// Which optional catalog columns a server actually has (FRE-92).
+///
+/// Every Postgres-wire engine claims an `information_schema`, and they do not
+/// agree on what is in it: Materialize's `columns` view has eleven columns to
+/// stock Postgres's forty-four, and `pg_index.indnkeyatts` only exists where
+/// there are INCLUDE columns to exclude. Selecting a column the server does not
+/// have fails the whole statement, which empties the schema tree exactly as
+/// CockroachDB's `pk_position` width did (FRE-90).
+struct CatalogShape {
+    column_query: ColumnQuery,
+    /// Whether the index query may bound its key columns with `indnkeyatts`.
+    bounded_index_keys: bool,
+}
+
+/// Asks the catalog which shape it is, once per introspection.
+///
+/// **Deliberately a probe rather than a try-and-fall-back.** Falling back on
+/// any error conflates "this server lacks the column" with "that query
+/// happened to fail", and the two want opposite handling: the first should
+/// degrade, the second must not. A transient failure — YugabyteDB's
+/// `MISMATCHED_SCHEMA` fires during introspection on roughly half of that
+/// engine's test runs (FRE-147) — would otherwise be swallowed by a retry in
+/// the portable shape that *succeeds with wrong answers*: identity columns
+/// reported as ordinary, enums stripped of their variants, arrays of their
+/// structure. Silently, on an engine that has all three. A real error now
+/// stays a real error.
+///
+/// Unknown counts as rich: it is what stock Postgres needs, it is the shape
+/// this code has always used, and being wrong that way surfaces an error
+/// rather than quietly wrong metadata.
+async fn catalog_shape(pool: &PgPool) -> CatalogShape {
+    let probe = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT \
+           (SELECT count(*) FROM information_schema.columns \
+            WHERE table_schema = 'information_schema' AND table_name = 'columns' \
+              AND column_name IN ('udt_schema', 'udt_name', \
+                                  'is_identity', 'identity_generation', 'is_generated')), \
+           (SELECT count(*) FROM information_schema.columns \
+            WHERE table_schema = 'pg_catalog' AND table_name = 'pg_index' \
+              AND column_name = 'indnkeyatts')",
+    )
+    .fetch_one(pool)
+    .await;
+    let (columns, index_keys) = probe.unwrap_or((5, 1));
+    CatalogShape {
+        // All five or none: the rich shape needs every one of them, and no
+        // engine has been seen to offer a subset.
+        column_query: if columns == 5 {
+            ColumnQuery::Rich
+        } else {
+            ColumnQuery::Portable
+        },
+        bounded_index_keys: index_keys > 0,
+    }
+}
+
 /// Which shape of the column query to run — see [`column_query`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ColumnQuery {
@@ -472,6 +528,12 @@ enum ColumnQuery {
     /// Only the columns every Postgres-wire `information_schema` has. The
     /// missing ones are selected as the constants they would decode to, so the
     /// result shape — and therefore the decoding below — is identical.
+    ///
+    /// What it gives up is real: no identity/generated classification, and no
+    /// enum or array structure. On a server that lacks these columns all three
+    /// are absent anyway, so the degraded answer is also the correct one —
+    /// which is exactly why it must be chosen by [`catalog_shape`] asking, and
+    /// never by a query having failed.
     Portable,
 }
 
@@ -763,20 +825,27 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     // objects between them, which would otherwise be the overwhelming majority
     // of the schema tree.
     //
-    // No cross-engine catalog fact reaches these: unlike CockroachDB's, they
-    // are reported as ordinary tables and views rather than `SYSTEM VIEW`, and
-    // `pg_depend` is empty. Materialize does record it, in the one place only
-    // Materialize has — `mz_schemas.id`, where a leading `s` means the system
-    // created the schema and `u` means a user did. So this is the case
-    // `PgFlavor` exists for: knowing the engine is what tells us *which*
-    // catalog to ask, and the answer still comes from the catalog rather than
-    // from a list of names.
+    // No cross-engine catalog fact reaches these. Unlike CockroachDB's they are
+    // reported as ordinary tables and views rather than `SYSTEM VIEW`, and the
+    // extension path above finds nothing: Materialize's `pg_depend` has rows,
+    // but none with `deptype = 'e'`, because it has no extensions — these
+    // schemas are the engine itself.
+    //
+    // Materialize does record it, in the one place only Materialize has.
+    // `mz_schemas.database_id` is null exactly for the schemas that belong to
+    // no database, which is what a system schema is; the `s`/`u` prefix on
+    // `mz_schemas.id` says the same thing, but it is an id encoding rather than
+    // a documented column contract and its representation has changed before.
+    //
+    // So this is the case `PgFlavor` exists for: knowing the engine is what
+    // tells us *which* catalog to ask, and the answer still comes from the
+    // catalog rather than from a list of names.
     //
     // Best-effort, like the Timescale and Citus queries above: a schema tree
     // cluttered with Materialize's internals is worse than one without the
     // badge, but neither is worth failing the whole introspection over.
     if conn.flavor() == PgFlavor::Materialize {
-        if let Ok(rows) = sqlx::query("SELECT name FROM mz_schemas WHERE id LIKE 's%'")
+        if let Ok(rows) = sqlx::query("SELECT name FROM mz_schemas WHERE database_id IS NULL")
             .fetch_all(pool)
             .await
         {
@@ -839,36 +908,14 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     // taking down the entire schema tree. Pinning the width in SQL costs
     // nothing on Postgres and makes the decode independent of what any
     // Postgres-wire engine chose here.
-    // Stock Postgres supplies the identity/generated flags and the
-    // `udt_schema`/`udt_name` pair from `information_schema.columns`; a
-    // Postgres-wire engine with a slimmer `information_schema` supplies
-    // neither, and selecting a column the server does not have fails the
-    // statement outright — taking the whole schema tree with it, the same way
-    // the `pk_position` width did (FRE-90). Materialize's
-    // `information_schema.columns` has eleven columns to stock's forty-four
-    // (FRE-92), so it needs the portable shape.
-    //
-    // Tried first and fallen back from, rather than probed for: the fallback
-    // is one wasted round trip on the engines that need it and none at all on
-    // the ones that don't, and it degrades on *any* missing column rather than
-    // on the specific five known today. What it costs is real and worth
-    // stating — an engine in the portable shape reports no identity columns
-    // and no enum/array detail. Both are absent on such an engine anyway
-    // (Materialize has neither), so the degraded answer is also the correct
-    // one; if that stops being true for some future engine, this is where it
-    // will be wrong.
-    let column_rows = match sqlx::query(&column_query(ColumnQuery::Rich))
+    // Which of the optional catalog columns this server actually has (FRE-92).
+    // Asked once, before anything depends on the answer.
+    let shape = catalog_shape(pool).await;
+
+    let column_rows = sqlx::query(&column_query(shape.column_query))
         .fetch_all(pool)
         .await
-    {
-        Ok(rows) => rows,
-        Err(_) => sqlx::query(&column_query(ColumnQuery::Portable))
-            .fetch_all(pool)
-            .await
-            // The fallback's own failure is the one worth reporting: the rich
-            // query failing is expected on these engines and says nothing.
-            .map_err(map_err)?,
-    };
+        .map_err(map_err)?;
 
     // Enum variants for every enum type in the database, keyed by type OID
     // (FRE-71). One query rather than per-column: enum types are few and a
@@ -896,11 +943,10 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     // no guarantees at all and are dropped entirely.
     // `indnkeyatts` separates an index's key columns from its INCLUDE payload,
     // and is absent on engines that have no INCLUDE to separate — Materialize
-    // among them (FRE-92). Same fallback shape as the column query above: the
-    // clause is dropped rather than the query failing. On an engine without
-    // INCLUDE that changes nothing; on one that has it but hides the count,
-    // payload columns would be read as key columns, which is why the narrower
-    // form is tried first.
+    // among them (FRE-92). Dropped from the query on those servers rather than
+    // failing it. On an engine without INCLUDE that changes nothing; there is
+    // no engine with INCLUDE that hides the count, and if one appeared its
+    // payload columns would read as key columns.
     let index_sql = |bound_keys: bool| {
         format!(
             "SELECT n.nspname AS table_schema, t.relname AS table_name, \
@@ -925,13 +971,10 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
             }
         )
     };
-    let index_rows = match sqlx::query(&index_sql(true)).fetch_all(pool).await {
-        Ok(rows) => rows,
-        Err(_) => sqlx::query(&index_sql(false))
-            .fetch_all(pool)
-            .await
-            .map_err(map_err)?,
-    };
+    let index_rows = sqlx::query(&index_sql(shape.bounded_index_keys))
+        .fetch_all(pool)
+        .await
+        .map_err(map_err)?;
 
     // Foreign keys from pg_constraint; conkey/confkey arrays preserve the
     // multi-column ordering that information_schema loses.
