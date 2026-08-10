@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 use dioxus_icons::lucide::{Database, RefreshCw, Search, X};
 
-use crate::db::{ConnectionId, Restriction};
+use crate::db::{unreadable_reason, ConnectionId};
 
 use super::filter::{
     count_internal_tables, filter_tables, group_by_schema, parse_query, toggle_column_mode,
@@ -344,15 +344,13 @@ fn TableNode(
             // (FRE-88).
             table.kind_label.clone(),
             // Why this object has no rows to open, when it has none (FRE-148).
-            // Read from the object's own declaration through the same
-            // predicate `TableAccess::resolve` uses, rather than resolving the
-            // full access here: whether something stores rows is a fact about
-            // the object, so the connection is not an input and the registry
-            // does not need reading.
-            table
-                .restriction
-                .filter(|r| r.hides_rows())
-                .map(Restriction::message),
+            // The same derivation `TableAccess::resolve` uses, called rather
+            // than repeated, so the sidebar and the grid cannot disagree about
+            // which objects are openable. Resolving the full access here would
+            // need the registry and answer a question the connection is not an
+            // input to: whether something stores rows is a fact about the
+            // object.
+            unreadable_reason(table),
             matched,
         )
     };
@@ -388,9 +386,13 @@ fn TableNode(
                     // An object with no rows is dimmed and carries its reason
                     // as a tooltip, so it does not read as openable (FRE-148).
                     // Still a button, deliberately: disabling it would drop the
-                    // row out of the Ctrl+B/↑↓ walk above, and selecting it is
-                    // how the grid gets to state the reason in full.
-                    title: unbrowsable.unwrap_or_default(),
+                    // row out of the Ctrl+B/↑↓ walk above (which focuses
+                    // `.dv-table-btn` elements, and focusing a disabled button
+                    // is a no-op), and selecting it is how the grid gets to
+                    // state the reason in full. `aria-disabled` carries to
+                    // assistive tech what the dimming carries visually.
+                    title: unbrowsable,
+                    "aria-disabled": unbrowsable.is_some(),
                     onclick: move |_| state.select_table(id, &select_ref),
                     span {
                         class: if unbrowsable.is_some() {

@@ -468,15 +468,33 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // an error about an object that stores nothing. A RisingWave sink is the
     // case — it writes outward to Kafka or another database.
     let gate_table = table.clone();
-    let unbrowsable = use_memo(move || {
+    let resolve_gate = move || {
         let registry = state.registry.read();
         let schemas = state.schemas.read();
         match (
             find_table_meta(schemas.get(&id), &gate_table),
             registry.get(id),
         ) {
-            (Some(meta), Some(connection)) => connection.access(meta).unreadable,
+            (Some(meta), Some(connection)) => Some(connection.access(meta).unreadable),
+            // Not "browsable": *unknown*. A reload sets `SchemaLoad::Loading`,
+            // which empties the table list, so this is the ordinary state
+            // during a sidebar Refresh rather than an edge case.
             _ => None,
+        }
+    };
+    let mut unbrowsable = use_signal(|| resolve_gate().flatten());
+    use_effect(move || {
+        // Keeps the last known answer while the schema reloads, instead of
+        // falling open and sending the very query the gate exists to stop —
+        // the same treatment the SQL editor gives its completions. A table
+        // does not stop being a sink because its schema is being re-read.
+        //
+        // Covers reloads, not the first load: a grid mounted by session
+        // restore before its schema has ever arrived has no answer to keep, so
+        // one refused query can still go out and be corrected when the schema
+        // lands. Self-correcting, because the resources read this signal.
+        if let Some(reason) = resolve_gate() {
+            unbrowsable.set(reason);
         }
     });
 
@@ -1103,7 +1121,15 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                         // Kafka or another database and stores nothing itself.
                         // The sentence is the backend's own, so it explains the
                         // object rather than naming the engine.
-                        Some(Err(crate::db::DbError::Unsupported(reason))) => rsx! {
+                        //
+                        // Guarded on `can_read` rather than on the error alone:
+                        // `Unsupported` is also how `refuse_paged_read` reports
+                        // a connection that cannot query or cannot page by
+                        // offset, and rendering *that* as "nothing to browse
+                        // here" would be a false claim about the object. No
+                        // backend declares either today, which is exactly why
+                        // the arm has to say which case it means.
+                        Some(Err(crate::db::DbError::Unsupported(reason))) if !can_read => rsx! {
                             EmptyState {
                                 icon: rsx! { File { size: 40 } },
                                 title: "Nothing to browse here",

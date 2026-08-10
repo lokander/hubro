@@ -282,6 +282,20 @@ pub struct TableAccess {
     pub unreadable: Option<&'static str>,
 }
 
+/// Why `table` has no rows to show, when it has none (FRE-148).
+///
+/// The single derivation behind both [`TableAccess::unreadable`] and the
+/// sidebar's dimming of such an object. It exists so those two cannot drift
+/// into disagreeing about which objects are openable — the sidebar answers the
+/// question without a connection in hand, so it would otherwise have to
+/// re-derive this from [`TableMeta::restriction`] itself.
+pub fn unreadable_reason(table: &TableMeta) -> Option<&'static str> {
+    table
+        .restriction
+        .filter(|r| r.hides_rows())
+        .map(Restriction::message)
+}
+
 impl TableAccess {
     /// Resolves `defaults` for one object: connection capabilities first,
     /// then the object's own [`TableMeta::restriction`], then its
@@ -296,10 +310,7 @@ impl TableAccess {
         // on a read-only connection and would otherwise never look at the
         // object at all. Whether something has rows to show is a fact about
         // the object; whether this connection may write is not.
-        let unreadable = table
-            .restriction
-            .filter(|r| r.hides_rows())
-            .map(Restriction::message);
+        let unreadable = unreadable_reason(table);
         let restriction = if !defaults.mutate {
             Some(CONNECTION_READ_ONLY)
         } else if let Some(declared) = table.restriction {
@@ -385,9 +396,12 @@ impl TableAccess {
         self.restriction.map(Restriction::message)
     }
 
-    /// Whether this object's rows can be listed at all (FRE-148). False only
-    /// for an object that stores none — everything else is browsable, however
-    /// unwritable.
+    /// Whether this object's rows can be listed at all (FRE-148).
+    ///
+    /// False for an object that stores none, and — since this is the resolved
+    /// capability rather than the object's own fact — also on a connection
+    /// that cannot query at all. Every object that *has* rows is browsable,
+    /// however unwritable.
     pub fn can_read(&self) -> bool {
         self.caps.read_query
     }
@@ -473,6 +487,13 @@ mod tests {
 
         // Every other restriction leaves reading alone. Without this the gate
         // would silently take the whole schema tree with it.
+        //
+        // Both axes, because they fail differently: a *kind* that resolves to
+        // its own restriction (a view), and a restriction *declared* by the
+        // backend — which is the one that matters here, since a streaming
+        // source arrives as `Declared` and must stay browsable while the sink
+        // beside it does not. Iterating kinds alone left `Declared` and
+        // `NoRowIdentity` never reaching `hides_rows()` at all.
         for kind in [
             TableKind::View,
             TableKind::MaterializedView,
@@ -482,6 +503,22 @@ mod tests {
             let access = TableAccess::resolve(Capabilities::FULL, &ordinary, Dialect::Postgres);
             assert!(access.can_read(), "{kind:?} must stay browsable");
             assert_eq!(access.unreadable, None);
+        }
+        for declared in [
+            Restriction::Declared("A source is written by the engine."),
+            Restriction::View,
+            Restriction::MaterializedView,
+            Restriction::NoRowIdentity,
+        ] {
+            let mut other = table(TableKind::Table, vec![col("id", Some(1))]);
+            other.restriction = Some(declared);
+            let access = TableAccess::resolve(Capabilities::FULL, &other, Dialect::Postgres);
+            assert!(
+                access.can_read(),
+                "{declared:?} narrows writing, not reading"
+            );
+            assert_eq!(access.unreadable, None);
+            assert!(!declared.hides_rows());
         }
     }
 

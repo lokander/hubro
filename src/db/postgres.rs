@@ -1184,10 +1184,11 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
             foreign_keys: Vec::new(),
             // Per-object narrowing only where the driver knows something the
             // resolver cannot derive (FRE-87). Kind and row identity carry the
-            // rest, so this is `None` for everything except a Materialize
-            // source — which resolves to a view, and would otherwise be
+            // rest, so this is `None` for everything but a streaming engine's
+            // two edges. A *source* resolves to a view and would otherwise be
             // refused with "Views are read-only", a sentence that sends the
-            // reader looking for a view definition that does not exist.
+            // reader looking for a view definition that does not exist; a
+            // *sink* has no rows at all, which nothing about its kind says.
             restriction: if source {
                 Some(Restriction::Declared(STREAMING_SOURCE))
             } else if sink {
