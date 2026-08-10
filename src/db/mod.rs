@@ -43,9 +43,9 @@ mod url;
 mod value;
 
 pub use caps::{
-    Capabilities, Restriction, TableAccess, WriteProtection, CONNECTION_READ_ONLY,
-    MARKED_READ_ONLY, NO_DDL, NO_GUARDED_WRITE, NO_MUTATE, NO_OFFSET_PAGING, NO_QUERY,
-    UNGUARDED_WRITES, USER_READ_ONLY,
+    unreadable_reason, Capabilities, Restriction, TableAccess, WriteProtection,
+    CONNECTION_READ_ONLY, MARKED_READ_ONLY, NO_DDL, NO_GUARDED_WRITE, NO_MUTATE, NO_OFFSET_PAGING,
+    NO_QUERY, UNGUARDED_WRITES, USER_READ_ONLY,
 };
 pub use clipboard::{raw_cell_text, render_copy, CopyBlock, CopyFormat};
 pub use ddl::{Ddl, DdlObject, DdlSource};
