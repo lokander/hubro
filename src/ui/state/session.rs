@@ -42,7 +42,14 @@ impl AppState {
                 .map(|(_, locator)| locator.clone()),
             ActiveView::Connections => None,
         };
-        Session { tabs, active }
+        Session {
+            tabs,
+            active,
+            // Read (not peeked) on purpose: the persistence effect re-runs on
+            // the signals this function reads, so collapsing a group is what
+            // schedules the write that remembers it (FRE-120).
+            collapsed_groups: self.collapsed_groups.read().clone(),
+        }
     }
 
     /// Persists the current session (best-effort, off the UI path). Called by
@@ -71,6 +78,11 @@ impl AppState {
             return;
         };
         let session = load_session(&path);
+        // Before the early return: which groups were folded is remembered
+        // whether or not any tab was open (FRE-120).
+        if !session.collapsed_groups.is_empty() {
+            self.collapsed_groups.set(session.collapsed_groups.clone());
+        }
         if session.tabs.is_empty() {
             return;
         }

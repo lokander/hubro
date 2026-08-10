@@ -42,7 +42,7 @@ use crate::azure::{self, EntraAuth};
 use crate::config::{
     default_config_path, default_session_path, default_settings_path, load_session, load_settings,
     plan_session_restore, save_session, save_show_internal_objects, save_theme, BackendKind,
-    ConnectionColor, RestoreCandidate, SavedConnection, SavedList, ServerAuth, Session,
+    ConnectionColor, GroupError, RestoreCandidate, SavedConnection, SavedList, ServerAuth, Session,
     SessionPane, SessionTab, Theme,
 };
 use crate::db::{
@@ -599,6 +599,11 @@ pub struct AppState {
     /// per-connection, since it expresses what the user wants to look at
     /// rather than anything about one database.
     pub show_internal_objects: Signal<bool>,
+    /// Connection groups the user has collapsed in the connections list
+    /// (FRE-120), by name. Seeded from session.toml at restore and written
+    /// back with the rest of the session: a fold is view state, not
+    /// connection data (see [`Session::collapsed_groups`]).
+    pub collapsed_groups: Signal<Vec<String>>,
     /// A saved-connection edit awaiting the connect that confirms it
     /// (FRE-75). Root-scoped: the Entra sign-in card resolves it from a
     /// background task after the form has closed.
@@ -715,6 +720,10 @@ impl AppState {
             // demotes internal objects unconditionally, so it never reads
             // this at all.)
             show_internal_objects: Signal::new(settings.show_internal_objects),
+            // Seeded by `restore_session` rather than here: session.toml is
+            // read once, at restore, and reading it twice would be two
+            // chances to disagree about what the last session was.
+            collapsed_groups: Signal::new(Vec::new()),
             // Root-scoped: resolved from the Entra sign-in task, which
             // outlives the form that registered the edit.
             pending_edit: Signal::new_in_scope(None, ScopeId::ROOT),

@@ -1,0 +1,43 @@
+[[connections]]
+kind = "sqlite"
+name = "music.db"
+path = "/data/music.db"
+
+[[connections]]
+kind = "sqlite"
+name = "archive"
+path = "/data/archive.sqlite"
+protection = "read-only"
+color = "gray"
+
+[[connections]]
+kind = "postgres"
+name = "prod"
+url = "postgres://app@db.example.com:5432/app?sslmode=require"
+protection = "confirm"
+color = "red"
+
+[connections.tunnel]
+host = "bastion.example.com"
+port = 2222
+user = "deploy"
+
+[connections.tunnel.auth]
+method = "keyfile"
+path = "/home/me/.ssh/id_ed25519"
+
+[[connections]]
+kind = "postgres"
+name = "staging"
+url = "postgres://app@staging.example.com:5432/app"
+
+[[connections]]
+kind = "sqlserver"
+name = "azure sql"
+url = "mssql://you@myserver.database.windows.net:1433/app?encrypt=on"
+color = "blue"
+
+[connections.auth]
+kind = "entra"
+method = "interactive"
+tenant = "contoso.onmicrosoft.com"

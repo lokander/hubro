@@ -260,6 +260,7 @@ impl ServerBackend {
                 auth,
                 protection: WriteProtection::Open,
                 color: None,
+                group: None,
             },
             _ => SavedConnection::Postgres {
                 name,
@@ -268,6 +269,7 @@ impl ServerBackend {
                 auth,
                 protection: WriteProtection::Open,
                 color: None,
+                group: None,
             },
         }
     }
@@ -329,6 +331,7 @@ impl AppState {
             path,
             protection: WriteProtection::Open,
             color: None,
+            group: None,
         });
         if added {
             self.persist_saved();
@@ -374,6 +377,89 @@ impl AppState {
             .map(saved_open_locator);
         if let Some(open_locator) = open_locator {
             self.remark_open_connections(&open_locator);
+        }
+    }
+
+    /// Creates a connection group (FRE-120) and persists the list. The error
+    /// is handed back for the connections screen to show next to the field
+    /// the name was typed into.
+    pub fn create_saved_group(mut self, name: &str) -> Result<String, GroupError> {
+        // Scoped so the write borrow is released before `persist_saved`
+        // takes a read one.
+        let created = { self.saved.write().create_group(name) };
+        if created.is_ok() {
+            self.persist_saved();
+        }
+        created
+    }
+
+    /// Renames a group, carrying its members and its collapsed state with it.
+    ///
+    /// The fold is remembered by name in a different file (the session), so a
+    /// rename that moved only the group would silently expand it — and leave
+    /// a dead name behind to accumulate.
+    pub fn rename_saved_group(mut self, old: &str, new: &str) -> Result<String, GroupError> {
+        let renamed = { self.saved.write().rename_group(old, new) };
+        let Ok(new_name) = renamed else {
+            return renamed;
+        };
+        self.persist_saved();
+        if new_name != old {
+            let mut collapsed = self.collapsed_groups.write();
+            for name in collapsed.iter_mut() {
+                if name == old {
+                    *name = new_name.clone();
+                }
+            }
+        }
+        Ok(new_name)
+    }
+
+    /// Removes a group; its connections become ungrouped rather than being
+    /// removed with it.
+    pub fn remove_saved_group(mut self, name: &str) {
+        let removed = { self.saved.write().remove_group(name) };
+        if !removed {
+            return;
+        }
+        self.persist_saved();
+        if self.collapsed_groups.peek().iter().any(|g| g == name) {
+            self.collapsed_groups.write().retain(|g| g != name);
+        }
+    }
+
+    /// Moves a group one step up or down the display order.
+    pub fn move_saved_group(mut self, name: &str, up: bool) {
+        let moved = { self.saved.write().move_group(name, up) };
+        if moved {
+            self.persist_saved();
+        }
+    }
+
+    /// Files a saved connection under a group (FRE-120), or ungroups it with
+    /// `None`. A connection is in at most one group, so this replaces rather
+    /// than adds.
+    ///
+    /// Nothing about an *open* tab depends on the group — unlike the marking,
+    /// which has to reach the live connection — so there is no counterpart
+    /// here to [`Self::set_saved_marking`]'s re-marking step.
+    pub fn assign_saved_group(mut self, locator: &str, group: Option<&str>) {
+        let changed = { self.saved.write().assign_group(locator, group) };
+        if changed {
+            self.persist_saved();
+        }
+    }
+
+    /// Folds or unfolds a group in the connections list. Persisted with the
+    /// session by the shell's snapshot effect, which re-runs because
+    /// `current_session` reads this signal.
+    pub fn toggle_group_collapsed(mut self, name: &str) {
+        let mut collapsed = self.collapsed_groups.write();
+        match collapsed.iter().position(|g| g == name) {
+            Some(index) => {
+                collapsed.remove(index);
+            }
+            None => collapsed.push(name.to_string()),
         }
     }
 

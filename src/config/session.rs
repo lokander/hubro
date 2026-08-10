@@ -75,6 +75,25 @@ pub struct Session {
     /// Locator of the active tab, or `None` for the connections screen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<String>,
+    /// Connection groups the user has collapsed in the connections list
+    /// (FRE-120), by name.
+    ///
+    /// **View state, so it lives here and not in connections.toml.** The two
+    /// files differ in what losing them costs: connections.toml is the user's
+    /// data under a strict error policy — a malformed one is an error and
+    /// blocks a save — while the session is transient, churns often, and is
+    /// fine to lose. A folded twisty belongs in the second category, and
+    /// keeping it out of the first means a collapse can never be the reason a
+    /// connections file fails to parse. It also matches where the rest of the
+    /// per-view state already sits: the selected table, the pane, the row
+    /// detail panel.
+    ///
+    /// The trade is that the groups themselves live in connections.toml while
+    /// their fold state lives here, so deleting session.toml expands
+    /// everything. That is the intended failure — the alternative loses a
+    /// group instead of a twisty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collapsed_groups: Vec<String>,
 }
 
 /// Default location: `$XDG_CONFIG_HOME/hubro/session.toml`. Kept separate
@@ -188,9 +207,45 @@ mod tests {
                 },
             ],
             active: Some("postgres://u@h:5432/app".into()),
+            collapsed_groups: vec!["Production".into(), "Archive".into()],
         };
         save_session(&path, &session).unwrap();
         assert_eq!(load_session(&path), session);
+    }
+
+    #[test]
+    fn collapsed_groups_stay_out_of_a_session_that_has_none() {
+        // The unaffected-entries-serialize-unchanged half of the convention
+        // (FRE-120): a session with nothing collapsed writes no key, and a
+        // session written before groups existed still loads.
+        let expanded = Session {
+            tabs: vec![SessionTab {
+                locator: "/data/music.db".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&expanded).unwrap();
+        assert!(!text.contains("collapsed_groups"), "{text}");
+        assert_eq!(toml::from_str::<Session>(&text).unwrap(), expanded);
+
+        // A collapsed group survives the round trip…
+        let mut collapsed = expanded.clone();
+        collapsed.collapsed_groups = vec!["Production".into()];
+        let text = toml::to_string_pretty(&collapsed).unwrap();
+        assert_eq!(toml::from_str::<Session>(&text).unwrap(), collapsed);
+
+        // …and a pre-FRE-120 file loads with everything expanded.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.toml");
+        std::fs::write(
+            &path,
+            "active = \"/data/music.db\"\n\n[[tabs]]\nlocator = \"/data/music.db\"\n",
+        )
+        .unwrap();
+        let loaded = load_session(&path);
+        assert!(loaded.collapsed_groups.is_empty());
+        assert_eq!(loaded.tabs.len(), 1);
     }
 
     #[test]
@@ -238,6 +293,7 @@ mod tests {
                 ..Default::default()
             }],
             active: None,
+            ..Default::default()
         };
         let text = toml::to_string_pretty(&closed).unwrap();
         assert!(!text.contains("row_detail"), "{text}");
@@ -263,6 +319,7 @@ mod tests {
                     ..Default::default()
                 }],
                 active: None,
+                ..Default::default()
             };
             save_session(&path, &session).unwrap();
             assert_eq!(load_session(&path).tabs[0].pane, pane, "{pane:?}");

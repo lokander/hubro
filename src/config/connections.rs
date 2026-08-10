@@ -5,6 +5,7 @@
 //! [`SavedList`] refuses to persist over a file that failed to load so a
 //! parse error can't turn into data loss on the next save.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -99,12 +100,13 @@ impl ServerAuth {
 /// One entry in the saved-connections list. Internally tagged on `kind`, so
 /// existing `kind = "sqlite"` + `path` TOML entries keep deserializing.
 ///
-/// The `protection` and `color` fields (FRE-111) repeat on every variant
-/// rather than being hoisted into a shared struct: an internally-tagged enum
-/// can't `#[serde(flatten)]` one in without changing the on-disk shape, and
-/// both serialize as plain strings, so they stay safe to place anywhere in a
-/// TOML table. Read them through [`SavedConnection::protection`] and
-/// [`SavedConnection::color`] rather than matching.
+/// The `protection` and `color` fields (FRE-111) and `group` (FRE-120) repeat
+/// on every variant rather than being hoisted into a shared struct: an
+/// internally-tagged enum can't `#[serde(flatten)]` one in without changing
+/// the on-disk shape, and all three serialize as plain strings, so they stay
+/// safe to place anywhere in a TOML table. Read them through
+/// [`SavedConnection::protection`], [`SavedConnection::color`] and
+/// [`SavedConnection::group`] rather than matching.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum SavedConnection {
@@ -119,6 +121,12 @@ pub enum SavedConnection {
         /// Accent colour (FRE-111), stored exactly like `protection`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         color: Option<ConnectionColor>,
+        /// The group this connection is filed under (FRE-120), by name, or
+        /// `None` for ungrouped. One name, not a list: a connection belongs
+        /// to at most one group. Stored exactly like `color`, so pre-FRE-120
+        /// files load and ungrouped entries' TOML is unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
     },
     Postgres {
         name: String,
@@ -142,6 +150,9 @@ pub enum SavedConnection {
         /// Accent colour (FRE-111); see the `Sqlite` variant.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         color: Option<ConnectionColor>,
+        /// Group membership (FRE-120); see the `Sqlite` variant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
     },
     /// SQL Server (FRE-57), serialized with `kind = "sqlserver"`. Like
     /// Postgres, the URL is stored **without** a password in the canonical
@@ -165,6 +176,9 @@ pub enum SavedConnection {
         /// Accent colour (FRE-111); see the `Sqlite` variant.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         color: Option<ConnectionColor>,
+        /// Group membership (FRE-120); see the `Sqlite` variant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
     },
 }
 
@@ -223,6 +237,45 @@ impl SavedConnection {
             SavedConnection::Sqlite { color, .. }
             | SavedConnection::Postgres { color, .. }
             | SavedConnection::SqlServer { color, .. } => *color,
+        }
+    }
+
+    /// The group this connection is filed under (FRE-120), or `None` when it
+    /// is ungrouped.
+    pub fn group(&self) -> Option<&str> {
+        match self {
+            SavedConnection::Sqlite { group, .. }
+            | SavedConnection::Postgres { group, .. }
+            | SavedConnection::SqlServer { group, .. } => group.as_deref(),
+        }
+    }
+
+    /// Files this connection under `group` (FRE-120), or ungroups it with
+    /// `None`. Assigning replaces rather than adds: the field holds one name,
+    /// which is what makes "at most one group" a property of the type instead
+    /// of a rule every caller has to remember.
+    pub fn set_group(&mut self, new_group: Option<String>) {
+        match self {
+            SavedConnection::Sqlite { group, .. }
+            | SavedConnection::Postgres { group, .. }
+            | SavedConnection::SqlServer { group, .. } => *group = new_group,
+        }
+    }
+
+    /// Adopts `other`'s group when this entry has none — the group half of
+    /// the same "two entries collapse into one" rule as
+    /// [`Self::merge_marking_from`].
+    ///
+    /// Kept separate because the rule differs. Protection takes the *stricter*
+    /// of the two, since one side of that trade is losing protection the user
+    /// asked for; a group has no strict/loose ordering, so the survivor's own
+    /// filing wins and the other's only fills a gap. The shared part is that
+    /// neither may silently become `None`: a connection that quietly leaves
+    /// its group between one launch and the next is exactly as confusing as
+    /// one that quietly leaves its colour behind.
+    pub fn merge_group_from(&mut self, other: &SavedConnection) {
+        if self.group().is_none() {
+            self.set_group(other.group().map(str::to_string));
         }
     }
 
@@ -452,10 +505,23 @@ impl EditPrefill {
     }
 }
 
+/// The whole connections file: the group list (FRE-120) and the entries.
+///
+/// `groups` is declared first because TOML has to emit a plain array before
+/// the `[[connections]]` tables, and it exists at all — rather than being
+/// derived from the entries' `group` fields — for two reasons a derived list
+/// can't cover: it fixes the **display order** of the groups, and it lets an
+/// **empty group** exist. A group created and not yet filled would otherwise
+/// vanish the moment it was written.
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct ConnectionsFile {
+pub struct ConnectionsFile {
+    /// Group names in display order (FRE-120). `default` +
+    /// `skip_serializing_if` keep pre-FRE-120 files loading, and a file with
+    /// no groups is written exactly as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
     #[serde(default)]
-    connections: Vec<SavedConnection>,
+    pub connections: Vec<SavedConnection>,
 }
 
 /// Default location: `$XDG_CONFIG_HOME/hubro/connections.toml`.
@@ -463,26 +529,98 @@ pub fn default_config_path() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("hubro").join("connections.toml"))
 }
 
-/// Loads the saved connections. A missing file is an empty list, not an
-/// error; a malformed file is an error (don't silently drop user data).
-pub fn load_connections(path: &Path) -> Result<Vec<SavedConnection>, ConfigError> {
+/// Loads the whole file — groups and entries. A missing file is an empty
+/// file, not an error; a malformed one is an error (don't silently drop user
+/// data).
+pub fn load_connections_file(path: &Path) -> Result<ConnectionsFile, ConfigError> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ConnectionsFile::default())
+        }
         Err(err) => return Err(ConfigError(format!("reading {}: {err}", path.display()))),
     };
-    let file: ConnectionsFile =
-        toml::from_str(&text).map_err(|err| ConfigError(format!("{}: {err}", path.display())))?;
-    Ok(file.connections)
+    toml::from_str(&text).map_err(|err| ConfigError(format!("{}: {err}", path.display())))
 }
 
-/// Saves the list, creating parent directories as needed. Writes to a temp
-/// file and renames so a crash mid-write can't corrupt the config.
+/// Saves the whole file, creating parent directories as needed. Writes to a
+/// temp file and renames so a crash mid-write can't corrupt the config.
+pub fn save_connections_file(path: &Path, file: &ConnectionsFile) -> Result<(), ConfigError> {
+    write_toml_atomic(path, file)
+}
+
+/// Loads just the saved connections, for callers with no interest in the
+/// group list.
+pub fn load_connections(path: &Path) -> Result<Vec<SavedConnection>, ConfigError> {
+    Ok(load_connections_file(path)?.connections)
+}
+
+/// Saves a group-less list — the shape of the file before FRE-120, and what
+/// a caller holding only entries can write.
 pub fn save_connections(path: &Path, connections: &[SavedConnection]) -> Result<(), ConfigError> {
-    let file = ConnectionsFile {
-        connections: connections.to_vec(),
-    };
-    write_toml_atomic(path, &file)
+    save_connections_file(
+        path,
+        &ConnectionsFile {
+            groups: Vec::new(),
+            connections: connections.to_vec(),
+        },
+    )
+}
+
+/// Why a group name was refused (FRE-120). Both cases are user input from
+/// the connections screen, so each carries the sentence shown there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupError {
+    /// The name was empty, or only whitespace.
+    Empty,
+    /// Another group already has this name (compared case-insensitively).
+    Duplicate(String),
+}
+
+impl fmt::Display for GroupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GroupError::Empty => write!(f, "a group needs a name"),
+            GroupError::Duplicate(name) => write!(f, "there is already a group called “{name}”"),
+        }
+    }
+}
+
+impl std::error::Error for GroupError {}
+
+/// One section of the connections list as it is rendered (FRE-120): a group
+/// and the connections filed under it, or — with `name` as `None` — the
+/// ungrouped ones.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupSection {
+    pub name: Option<String>,
+    pub entries: Vec<SavedConnection>,
+}
+
+/// Whether a connection's name matches a search box's contents (FRE-120):
+/// case-insensitive substring, with an empty (or whitespace-only) query
+/// matching everything so the unfiltered list renders through the same path.
+///
+/// Deliberately the *name* alone, which is what the issue asked for and what
+/// the box says it does. Matching the URL or the group name as well would
+/// make hits appear that the user can't see the reason for.
+pub fn name_matches(name: &str, query: &str) -> bool {
+    let query = query.trim();
+    if query.is_empty() {
+        return true;
+    }
+    name.to_lowercase().contains(&query.to_lowercase())
+}
+
+/// Whether two group names are the same name (FRE-120).
+///
+/// Identity is exact — that is what a connection's `group` field is matched
+/// against — but *creating* or *renaming* compares case-insensitively, so
+/// "Prod" and "prod" can't both be made through the UI. A hand-edited file
+/// can still hold both, and then both are shown: reconciling them by folding
+/// one into the other would move connections the user never asked to move.
+fn same_group_name(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
 }
 
 /// The saved-connections list plus the load outcome. Mutations go through
@@ -491,6 +629,8 @@ pub fn save_connections(path: &Path, connections: &[SavedConnection]) -> Result<
 #[derive(Debug, Clone, PartialEq)]
 pub struct SavedList {
     entries: Vec<SavedConnection>,
+    /// Group names in display order (FRE-120).
+    groups: Vec<String>,
     load_failed: bool,
 }
 
@@ -527,26 +667,64 @@ fn normalize_and_dedup(entries: Vec<SavedConnection>) -> Vec<SavedConnection> {
             .iter_mut()
             .find(|existing| existing.locator() == locator)
         {
-            Some(kept) => kept.merge_marking_from(&entry),
+            Some(kept) => {
+                kept.merge_marking_from(&entry);
+                kept.merge_group_from(&entry);
+            }
             None => out.push(entry),
         }
     }
     out
 }
 
+/// Reconciles the entries' group names with the group list (FRE-120), so the
+/// one invariant the rest of this module relies on holds however the file was
+/// written: **every group an entry names is in `groups`**.
+///
+/// Trims each entry's name and treats an empty one as ungrouped, then appends
+/// any group named by an entry but missing from the list, in the order the
+/// entries appear. A hand-edited file that files a connection under a group
+/// it never declared would otherwise render that connection nowhere — the
+/// list is drawn from `groups`, so a section that doesn't exist can't show
+/// its members.
+fn reconcile_groups(groups: &mut Vec<String>, entries: &mut [SavedConnection]) {
+    for name in groups.iter_mut() {
+        *name = name.trim().to_string();
+    }
+    groups.retain(|name| !name.is_empty());
+    for entry in entries.iter_mut() {
+        let trimmed = entry.group().map(str::trim).unwrap_or_default().to_string();
+        if trimmed.is_empty() {
+            entry.set_group(None);
+            continue;
+        }
+        entry.set_group(Some(trimmed.clone()));
+        if !groups.contains(&trimmed) {
+            groups.push(trimmed);
+        }
+    }
+}
+
 impl SavedList {
     pub fn load(path: &Path) -> (Self, Option<ConfigError>) {
-        match load_connections(path) {
-            Ok(entries) => (
-                Self {
-                    entries: normalize_and_dedup(entries),
-                    load_failed: false,
-                },
-                None,
-            ),
+        match load_connections_file(path) {
+            Ok(file) => {
+                let mut entries = normalize_and_dedup(file.connections);
+                let mut groups = file.groups;
+                reconcile_groups(&mut groups, &mut entries);
+                (
+                    Self {
+                        entries,
+                        groups,
+                        load_failed: false,
+                    },
+                    None,
+                )
+            }
             Err(err) => (
                 Self {
                     entries: Vec::new(),
+                    groups: Vec::new(),
                     load_failed: true,
                 },
                 Some(err),
@@ -556,6 +734,168 @@ impl SavedList {
 
     pub fn entries(&self) -> &[SavedConnection] {
         &self.entries
+    }
+
+    /// The groups (FRE-120) in display order.
+    pub fn groups(&self) -> &[String] {
+        &self.groups
+    }
+
+    /// Creates a group, appended last so a new one appears where it was made
+    /// rather than jumping the order. Returns the trimmed name it was
+    /// created under.
+    pub fn create_group(&mut self, name: &str) -> Result<String, GroupError> {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err(GroupError::Empty);
+        }
+        if let Some(existing) = self.groups.iter().find(|g| same_group_name(g, &name)) {
+            return Err(GroupError::Duplicate(existing.clone()));
+        }
+        self.groups.push(name.clone());
+        Ok(name)
+    }
+
+    /// Renames a group, carrying its members with it.
+    ///
+    /// Membership is stored as the group's name, so the rename has to rewrite
+    /// every member in the same step — a rename that renamed only the header
+    /// would empty the group and strand its connections under a name nothing
+    /// displays. Returns the trimmed new name (validated even when `old`
+    /// names no group, in which case nothing is renamed).
+    pub fn rename_group(&mut self, old: &str, new: &str) -> Result<String, GroupError> {
+        let new = new.trim().to_string();
+        if new.is_empty() {
+            return Err(GroupError::Empty);
+        }
+        // A case-only change of the group's own name is a rename, not a
+        // collision with itself.
+        if let Some(existing) = self
+            .groups
+            .iter()
+            .find(|g| g.as_str() != old && same_group_name(g, &new))
+        {
+            return Err(GroupError::Duplicate(existing.clone()));
+        }
+        let Some(index) = self.groups.iter().position(|g| g == old) else {
+            return Ok(new);
+        };
+        self.groups[index] = new.clone();
+        for entry in &mut self.entries {
+            if entry.group() == Some(old) {
+                entry.set_group(Some(new.clone()));
+            }
+        }
+        Ok(new)
+    }
+
+    /// Removes a group; its members become ungrouped rather than being
+    /// removed with it — deleting a folder must never delete the databases in
+    /// it. Returns whether anything changed.
+    pub fn remove_group(&mut self, name: &str) -> bool {
+        let Some(index) = self.groups.iter().position(|g| g == name) else {
+            return false;
+        };
+        self.groups.remove(index);
+        for entry in &mut self.entries {
+            if entry.group() == Some(name) {
+                entry.set_group(None);
+            }
+        }
+        true
+    }
+
+    /// Moves a group one step up or down the display order — the whole of
+    /// "reorder", expressed as single steps because that is what a pair of
+    /// buttons can drive without a drag-and-drop dependency. Returns false at
+    /// the ends of the list (and for an unknown name), which is what greys
+    /// the button out.
+    pub fn move_group(&mut self, name: &str, up: bool) -> bool {
+        let Some(index) = self.groups.iter().position(|g| g == name) else {
+            return false;
+        };
+        let target = if up {
+            match index.checked_sub(1) {
+                Some(target) => target,
+                None => return false,
+            }
+        } else if index + 1 < self.groups.len() {
+            index + 1
+        } else {
+            return false;
+        };
+        self.groups.swap(index, target);
+        true
+    }
+
+    /// Files the connection at `locator` under `group` (FRE-120), or
+    /// ungroups it with `None`. Assigning replaces any previous group, so a
+    /// connection is never in two.
+    ///
+    /// An unknown group name assigns nothing and returns false: the only way
+    /// to reach one is a stale UI, and inventing the group instead would let
+    /// a typo create one silently. Returns false when nothing changed, so the
+    /// caller can skip a write to disk.
+    pub fn assign_group(&mut self, locator: &str, group: Option<&str>) -> bool {
+        if let Some(name) = group {
+            if !self.groups.iter().any(|g| g == name) {
+                return false;
+            }
+        }
+        let Some(entry) = self.entries.iter_mut().find(|s| s.locator() == locator) else {
+            return false;
+        };
+        if entry.group() == group {
+            return false;
+        }
+        entry.set_group(group.map(str::to_string));
+        true
+    }
+
+    /// The list arranged for display (FRE-120): every group in order with the
+    /// connections filed under it, then the ungrouped ones last, narrowed to
+    /// the connections whose name matches `query` ([`name_matches`]).
+    ///
+    /// Two rules the callers would otherwise each have to get right:
+    ///
+    /// - An **empty group is kept** while the query is empty — it is a thing
+    ///   the user made, and a group that disappeared until it had a member
+    ///   could not be filled in the first place. Under a search it is
+    ///   dropped, along with every other section that matched nothing, so the
+    ///   result reads as hits rather than as headers.
+    /// - The ungrouped section is omitted when it is empty, so a fully
+    ///   grouped list grows no stray "Ungrouped" header.
+    pub fn arrange(&self, query: &str) -> Vec<GroupSection> {
+        let searching = !query.trim().is_empty();
+        let mut sections: Vec<GroupSection> = Vec::with_capacity(self.groups.len() + 1);
+        for group in &self.groups {
+            let entries: Vec<SavedConnection> = self
+                .entries
+                .iter()
+                .filter(|e| e.group() == Some(group.as_str()) && name_matches(e.name(), query))
+                .cloned()
+                .collect();
+            if searching && entries.is_empty() {
+                continue;
+            }
+            sections.push(GroupSection {
+                name: Some(group.clone()),
+                entries,
+            });
+        }
+        let ungrouped: Vec<SavedConnection> = self
+            .entries
+            .iter()
+            .filter(|e| e.group().is_none() && name_matches(e.name(), query))
+            .cloned()
+            .collect();
+        if !ungrouped.is_empty() {
+            sections.push(GroupSection {
+                name: None,
+                entries: ungrouped,
+            });
+        }
+        sections
     }
 
     /// Adds unless an entry with the same locator exists. Returns whether
@@ -612,13 +952,14 @@ impl SavedList {
     /// locator, that duplicate is dropped so the list stays keyed one-to-one.
     /// Returns false when `old_locator` names no entry.
     ///
-    /// **The write protection and colour (FRE-111) survive the overwrite.**
-    /// They are not part of what the edit form collects, so `connection`
-    /// always carries the defaults for them — taking those literally would
-    /// silently unprotect a connection the moment its name or sslmode was
-    /// edited, and the loss would only show up at the next launch. No caller
-    /// of `update` can intend to change the marking; the one path that does
-    /// is [`Self::set_marking`].
+    /// **The write protection and colour (FRE-111) and the group (FRE-120)
+    /// survive the overwrite.** None of them are part of what the edit form
+    /// collects, so `connection` always carries the defaults for them —
+    /// taking those literally would silently unprotect a connection, and
+    /// unfile it, the moment its name or sslmode was edited, and the loss
+    /// would only show up at the next launch. No caller of `update` can
+    /// intend to change either; the paths that do are [`Self::set_marking`]
+    /// and [`Self::assign_group`].
     ///
     /// When the edit collides with another entry, the surviving entry takes
     /// the **stricter** of the two markings. Repointing an unprotected
@@ -634,11 +975,14 @@ impl SavedList {
             self.entries[index].protection(),
             self.entries[index].color(),
         );
-        // Fold in the marking of any entry this edit is about to absorb.
+        connection.set_group(self.entries[index].group().map(str::to_string));
+        // Fold in the marking and group of any entry this edit is about to
+        // absorb.
         for i in 0..self.entries.len() {
             if i != index && self.entries[i].locator() == new_locator {
                 let absorbed = self.entries[i].clone();
                 connection.merge_marking_from(&absorbed);
+                connection.merge_group_from(&absorbed);
             }
         }
         self.entries[index] = connection;
@@ -691,7 +1035,13 @@ impl SavedList {
                 path.display()
             )));
         }
-        save_connections(path, &self.entries)
+        save_connections_file(
+            path,
+            &ConnectionsFile {
+                groups: self.groups.clone(),
+                connections: self.entries.clone(),
+            },
+        )
     }
 }
 
@@ -705,6 +1055,7 @@ mod tests {
             path: PathBuf::from(path),
             protection: WriteProtection::Open,
             color: None,
+            group: None,
         }
     }
 
@@ -716,6 +1067,7 @@ mod tests {
             auth: ServerAuth::Password,
             protection: WriteProtection::Open,
             color: None,
+            group: None,
         }
     }
 
@@ -727,6 +1079,7 @@ mod tests {
             auth: ServerAuth::Password,
             protection: WriteProtection::Open,
             color: None,
+            group: None,
         }
     }
 
@@ -737,6 +1090,313 @@ mod tests {
             user: "deploy".into(),
             auth,
         }
+    }
+
+    #[test]
+    fn a_connection_belongs_to_at_most_one_group() {
+        // Assigning replaces: there is one field, and the second assignment
+        // has to move the connection rather than add to it.
+        let mut list = list_of(&[saved("a", "/tmp/a.db")]);
+        assert_eq!(list.create_group("Production").unwrap(), "Production");
+        assert_eq!(list.create_group("Staging").unwrap(), "Staging");
+        assert!(list.assign_group("/tmp/a.db", Some("Production")));
+        assert_eq!(list.entries()[0].group(), Some("Production"));
+        assert!(list.assign_group("/tmp/a.db", Some("Staging")));
+        assert_eq!(list.entries()[0].group(), Some("Staging"));
+        // It appears in exactly one section, and it is the new one.
+        let sections = list.arrange("");
+        assert_eq!(sections[0].name.as_deref(), Some("Production"));
+        assert!(sections[0].entries.is_empty());
+        assert_eq!(sections[1].name.as_deref(), Some("Staging"));
+        assert_eq!(sections[1].entries.len(), 1);
+        assert_eq!(sections.len(), 2, "nothing is left ungrouped: {sections:?}");
+        // Ungrouping puts it back in the ungrouped section.
+        assert!(list.assign_group("/tmp/a.db", None));
+        assert_eq!(list.entries()[0].group(), None);
+        assert_eq!(list.arrange("").last().unwrap().name, None);
+        // Re-applying the same assignment reports no change, so the caller
+        // can skip a write to disk.
+        assert!(!list.assign_group("/tmp/a.db", None));
+    }
+
+    #[test]
+    fn assigning_an_unknown_group_or_locator_changes_nothing() {
+        let mut list = list_of(&[saved("a", "/tmp/a.db")]);
+        list.create_group("Production").unwrap();
+        // A group that does not exist is refused rather than invented — the
+        // only way to reach one is a stale UI, and a typo must not create a
+        // group behind the user's back.
+        assert!(!list.assign_group("/tmp/a.db", Some("Prodcution")));
+        assert_eq!(list.entries()[0].group(), None);
+        assert_eq!(list.groups(), ["Production"]);
+        // An unknown connection assigns nothing.
+        assert!(!list.assign_group("/tmp/missing.db", Some("Production")));
+    }
+
+    #[test]
+    fn renaming_a_group_carries_its_members() {
+        // Membership is stored by name, so a rename that touched only the
+        // header would strand every member under a name nothing displays.
+        let mut list = list_of(&[saved("a", "/tmp/a.db"), saved("b", "/tmp/b.db")]);
+        list.create_group("Prod").unwrap();
+        list.create_group("Other").unwrap();
+        assert!(list.assign_group("/tmp/a.db", Some("Prod")));
+        assert_eq!(
+            list.rename_group("Prod", "  Production  ").unwrap(),
+            "Production"
+        );
+        assert_eq!(list.groups(), ["Production", "Other"], "order is kept");
+        assert_eq!(list.entries()[0].group(), Some("Production"));
+        // The non-member is untouched.
+        assert_eq!(list.entries()[1].group(), None);
+        assert_eq!(list.arrange("")[0].entries.len(), 1);
+
+        // A case-only change is a rename, not a collision with itself…
+        assert_eq!(
+            list.rename_group("Production", "PRODUCTION").unwrap(),
+            "PRODUCTION"
+        );
+        assert_eq!(list.entries()[0].group(), Some("PRODUCTION"));
+        // …but another group's name is refused however it is cased.
+        assert_eq!(
+            list.rename_group("PRODUCTION", "other"),
+            Err(GroupError::Duplicate("Other".to_string()))
+        );
+        assert_eq!(
+            list.rename_group("PRODUCTION", "   "),
+            Err(GroupError::Empty)
+        );
+        assert_eq!(list.groups(), ["PRODUCTION", "Other"]);
+    }
+
+    #[test]
+    fn an_empty_or_duplicate_group_name_is_refused() {
+        let mut list = list_of(&[]);
+        assert_eq!(list.create_group("  "), Err(GroupError::Empty));
+        assert_eq!(list.create_group("  Prod  ").unwrap(), "Prod");
+        assert_eq!(
+            list.create_group("prod"),
+            Err(GroupError::Duplicate("Prod".to_string())),
+            "two groups differing only in case cannot both be made"
+        );
+        assert_eq!(list.groups(), ["Prod"]);
+    }
+
+    #[test]
+    fn groups_reorder_one_step_at_a_time_and_stop_at_the_ends() {
+        let mut list = list_of(&[]);
+        for name in ["a", "b", "c"] {
+            list.create_group(name).unwrap();
+        }
+        assert!(list.move_group("c", true));
+        assert_eq!(list.groups(), ["a", "c", "b"]);
+        assert!(list.move_group("c", true));
+        assert_eq!(list.groups(), ["c", "a", "b"]);
+        // At the ends the move is refused, which is what greys the button out.
+        assert!(!list.move_group("c", true));
+        assert_eq!(list.groups(), ["c", "a", "b"]);
+        assert!(list.move_group("c", false));
+        assert_eq!(list.groups(), ["a", "c", "b"]);
+        assert!(!list.move_group("b", false));
+        assert!(!list.move_group("nope", true));
+
+        // The display order follows the group order, not the entry order.
+        let mut list = list_of(&[saved("z", "/tmp/z.db")]);
+        list.create_group("one").unwrap();
+        list.create_group("two").unwrap();
+        assert!(list.assign_group("/tmp/z.db", Some("two")));
+        assert!(list.move_group("two", true));
+        let names: Vec<Option<String>> = list.arrange("").into_iter().map(|s| s.name).collect();
+        assert_eq!(
+            names,
+            vec![Some("two".to_string()), Some("one".to_string())]
+        );
+    }
+
+    #[test]
+    fn removing_a_group_ungroups_its_members_rather_than_removing_them() {
+        // Deleting a folder must never delete the databases in it.
+        let mut list = list_of(&[saved("a", "/tmp/a.db"), saved("b", "/tmp/b.db")]);
+        list.create_group("Prod").unwrap();
+        assert!(list.assign_group("/tmp/a.db", Some("Prod")));
+        assert!(list.remove_group("Prod"));
+        assert!(list.groups().is_empty());
+        assert_eq!(list.entries().len(), 2, "both connections survive");
+        assert_eq!(list.entries()[0].group(), None);
+        assert!(
+            !list.remove_group("Prod"),
+            "removing it twice changes nothing"
+        );
+    }
+
+    #[test]
+    fn a_group_survives_an_edit_of_its_connection() {
+        // The edit form collects no group, so it always supplies `None`.
+        // Taking that literally would unfile a connection the moment its name
+        // was changed — the FRE-111 failure, one field over.
+        let mut list = list_of(&[saved_pg("prod", "postgres://u@h:5432/d")]);
+        list.create_group("Production").unwrap();
+        assert!(list.assign_group("postgres://u@h:5432/d", Some("Production")));
+        for edited in [
+            saved_pg("prod (renamed)", "postgres://u@h:5432/d"),
+            saved_pg("prod", "postgres://u@h:5432/other"),
+        ] {
+            let mut list = list.clone();
+            assert!(list.update("postgres://u@h:5432/d", edited));
+            assert_eq!(list.entries()[0].group(), Some("Production"));
+        }
+    }
+
+    #[test]
+    fn a_group_survives_an_absorbed_collision_and_the_load_time_dedup() {
+        // Both paths where two entries collapse into one. The survivor keeps
+        // its own filing; the other's only fills a gap.
+        let mut list = list_of(&[
+            saved_pg("staging", "postgres://u@h:5432/staging"),
+            saved_pg("prod", "postgres://u@h:5432/prod"),
+        ]);
+        list.create_group("Production").unwrap();
+        assert!(list.assign_group("postgres://u@h:5432/prod", Some("Production")));
+        assert!(list.update(
+            "postgres://u@h:5432/staging",
+            saved_pg("staging", "postgres://u@h:5432/prod"),
+        ));
+        assert_eq!(list.entries().len(), 1);
+        assert_eq!(list.entries()[0].group(), Some("Production"));
+
+        // The load-time dedup, which collapses two spellings of one server.
+        let mut grouped = saved_pg("prod", "postgres://u@h:5432/db");
+        grouped.set_group(Some("Production".into()));
+        let plain = saved_pg("staging", "postgres://u@h/db");
+        for entries in [
+            vec![grouped.clone(), plain.clone()],
+            vec![plain.clone(), grouped.clone()],
+        ] {
+            let deduped = normalize_and_dedup(entries);
+            assert_eq!(deduped.len(), 1);
+            assert_eq!(deduped[0].group(), Some("Production"));
+        }
+    }
+
+    #[test]
+    fn groups_stay_out_of_the_toml_until_one_exists() {
+        // The unaffected-entries-serialize-unchanged half of the convention:
+        // no groups means no `groups` key and no `group` key anywhere.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.toml");
+        let mut list = list_of(&[saved("plain", "/tmp/a.db")]);
+        list.persist(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("group"), "{text}");
+
+        list.create_group("Production").unwrap();
+        assert!(list.assign_group("/tmp/a.db", Some("Production")));
+        list.persist(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("groups = [\"Production\"]"), "{text}");
+        assert!(text.contains("group = \"Production\""), "{text}");
+        // And it all comes back.
+        let (reloaded, err) = SavedList::load(&path);
+        assert!(err.is_none());
+        assert_eq!(reloaded.groups(), ["Production"]);
+        assert_eq!(reloaded.entries()[0].group(), Some("Production"));
+    }
+
+    #[test]
+    fn a_pre_fre_120_config_file_loads_ungrouped() {
+        // The back-compat contract: a file written before FRE-120 has neither
+        // key, and must load as an ungrouped list rather than failing.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.toml");
+        std::fs::write(
+            &path,
+            "[[connections]]\nkind = \"sqlite\"\nname = \"old\"\npath = \"/tmp/old.db\"\n\
+             \n[[connections]]\nkind = \"postgres\"\nname = \"pg\"\nurl = \"postgres://u@h:5432/d\"\n",
+        )
+        .unwrap();
+        let (list, err) = SavedList::load(&path);
+        assert!(err.is_none());
+        assert!(list.groups().is_empty());
+        for entry in list.entries() {
+            assert_eq!(entry.group(), None);
+        }
+        // One ungrouped section, so the list renders exactly as it did.
+        let sections = list.arrange("");
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].name, None);
+        assert_eq!(sections[0].entries.len(), 2);
+    }
+
+    #[test]
+    fn a_member_of_an_undeclared_group_adopts_it_at_load() {
+        // Hand-edited files: the list is drawn from `groups`, so a group only
+        // an entry names would render its members nowhere. An empty name is
+        // not a group at all.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.toml");
+        std::fs::write(
+            &path,
+            "groups = [\"Declared\", \"  \"]\n\
+             \n[[connections]]\nkind = \"sqlite\"\nname = \"a\"\npath = \"/tmp/a.db\"\ngroup = \"Invented\"\n\
+             \n[[connections]]\nkind = \"sqlite\"\nname = \"b\"\npath = \"/tmp/b.db\"\ngroup = \"  \"\n",
+        )
+        .unwrap();
+        let (list, err) = SavedList::load(&path);
+        assert!(err.is_none());
+        assert_eq!(list.groups(), ["Declared", "Invented"]);
+        assert_eq!(list.entries()[0].group(), Some("Invented"));
+        assert_eq!(list.entries()[1].group(), None, "whitespace is not a group");
+        // Every entry is reachable from a section.
+        let listed: usize = list.arrange("").iter().map(|s| s.entries.len()).sum();
+        assert_eq!(listed, 2);
+    }
+
+    #[test]
+    fn search_matches_connection_names_case_insensitively() {
+        assert!(name_matches("Production DB", "prod"));
+        assert!(name_matches("production db", "DB"));
+        assert!(name_matches("Årsrapport", "årsrapp"));
+        assert!(!name_matches("Production", "staging"));
+        // An empty (or whitespace-only) query matches everything, so the
+        // unfiltered list renders through the same path.
+        assert!(name_matches("anything", ""));
+        assert!(name_matches("anything", "   "));
+        // The name alone — not the URL, whatever the box sits next to.
+        assert!(!name_matches("prod", "db.example.com"));
+    }
+
+    #[test]
+    fn a_search_narrows_the_sections_and_drops_the_ones_with_no_hit() {
+        let mut list = list_of(&[
+            saved("music.db", "/tmp/music.db"),
+            saved_pg("prod orders", "postgres://u@h:5432/orders"),
+            saved_pg("prod billing", "postgres://u@h:5432/billing"),
+        ]);
+        list.create_group("Production").unwrap();
+        list.create_group("Empty").unwrap();
+        assert!(list.assign_group("postgres://u@h:5432/orders", Some("Production")));
+        assert!(list.assign_group("postgres://u@h:5432/billing", Some("Production")));
+
+        // Unfiltered: both groups show, the empty one included — it is a thing
+        // the user made, and a group that hid until it had a member could
+        // never be filled.
+        let all = list.arrange("");
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[1].name.as_deref(), Some("Empty"));
+        assert!(all[1].entries.is_empty());
+
+        // Searching: only sections with a hit, and only the hits.
+        let hits = list.arrange("BILL");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name.as_deref(), Some("Production"));
+        assert_eq!(hits[0].entries.len(), 1);
+        assert_eq!(hits[0].entries[0].name(), "prod billing");
+        // A hit in the ungrouped section alone leaves only that section.
+        let hits = list.arrange("music");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, None);
+        // Nothing at all is an empty arrangement, not a page of headers.
+        assert!(list.arrange("zzz").is_empty());
     }
 
     #[test]
@@ -997,6 +1657,7 @@ mod tests {
             auth: ServerAuth::Entra(EntraAuth::interactive_default()),
             protection: WriteProtection::Open,
             color: None,
+            group: None,
         };
         let mut marked = original.clone();
         marked.set_marking(WriteProtection::ReadOnly, Some(ConnectionColor::Red));
@@ -1066,6 +1727,7 @@ mod tests {
             }),
             protection: WriteProtection::Open,
             color: None,
+            group: None,
         }];
         save_connections(&path, &entries).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -1088,6 +1750,7 @@ mod tests {
             auth: ServerAuth::Entra(EntraAuth::interactive_default()),
             protection: WriteProtection::Open,
             color: None,
+            group: None,
         };
         assert!(list.add(updated.clone()));
         assert_eq!(list.entries().len(), 1);
@@ -1147,6 +1810,7 @@ mod tests {
                 auth: ServerAuth::Password,
                 protection: WriteProtection::Open,
                 color: None,
+                group: None,
             },
             SavedConnection::Postgres {
                 name: "via key".into(),
@@ -1157,6 +1821,7 @@ mod tests {
                 auth: ServerAuth::Password,
                 protection: WriteProtection::Open,
                 color: None,
+                group: None,
             },
         ];
         save_connections(&path, &connections).unwrap();
@@ -1244,6 +1909,7 @@ mod tests {
                 }),
                 protection: WriteProtection::Open,
                 color: None,
+                group: None,
             },
             SavedConnection::Postgres {
                 name: "azure-mi".into(),
@@ -1254,6 +1920,7 @@ mod tests {
                 }),
                 protection: WriteProtection::Open,
                 color: None,
+                group: None,
             },
         ];
         save_connections(&path, &entries).unwrap();
@@ -1278,6 +1945,7 @@ mod tests {
             auth: ServerAuth::Entra(EntraAuth::interactive_default()),
             protection: WriteProtection::Open,
             color: None,
+            group: None,
         };
         assert!(list.add(entra));
         assert_eq!(list.entries().len(), 1);
@@ -1296,6 +1964,7 @@ mod tests {
             auth: ServerAuth::Entra(EntraAuth::interactive_default()),
             protection: WriteProtection::Open,
             color: None,
+            group: None,
         };
         assert!(!list.add(same));
     }
@@ -1313,6 +1982,7 @@ mod tests {
             auth: ServerAuth::Password,
             protection: WriteProtection::Open,
             color: None,
+            group: None,
         };
         assert!(list.add(with_tunnel.clone()));
         assert_eq!(list.entries().len(), 1);
@@ -1511,6 +2181,7 @@ mod tests {
             }),
             protection: WriteProtection::Open,
             color: None,
+            group: None,
         };
         let prefill = EditPrefill::from_saved(entra);
         assert_eq!(prefill.auth_mode, "entra-interactive");
@@ -1536,6 +2207,7 @@ mod tests {
             auth: ServerAuth::Entra(EntraAuth::ManagedIdentity { client_id: None }),
             protection: WriteProtection::Open,
             color: None,
+            group: None,
         };
         let prefill = EditPrefill::from_saved(mi);
         assert_eq!(prefill.auth_mode, "entra-mi");
