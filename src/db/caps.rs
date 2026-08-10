@@ -36,6 +36,24 @@ pub struct Capabilities {
     /// Multi-statement atomicity: a real
     /// [`ScriptTx`](super::registry::ScriptTx) rather than autocommit-only.
     pub transactions: bool,
+    /// Whether a rollback also undoes *schema* changes (FRE-146).
+    ///
+    /// Its own flag rather than a narrowing of [`Self::transactions`], which
+    /// would be the worse lie: CockroachDB and YugabyteDB roll DML back
+    /// correctly and only let DDL escape, so declaring them non-transactional
+    /// would disable the script tab's atomicity guarantee for the one case
+    /// where it does hold.
+    ///
+    /// Unique among these flags in that it gates nothing. Every other
+    /// capability decides whether an affordance is offered; this one only
+    /// decides what hubro *claims afterwards*. A script that changes the
+    /// schema still runs, and still runs wrapped — the rollback covering its
+    /// DML is worth having — but the report of what the rollback undid stops
+    /// overstating itself.
+    ///
+    /// Moot wherever `transactions` is false, and declared false there too:
+    /// something that rolls nothing back does not roll schema changes back.
+    pub transactional_ddl: bool,
     /// Paging with `LIMIT`/`OFFSET` (see
     /// [`PageRequest`](super::page::PageRequest)) rather than a cursor.
     pub offset_paging: bool,
@@ -48,6 +66,7 @@ impl Capabilities {
         mutate: true,
         ddl: true,
         transactions: true,
+        transactional_ddl: true,
         offset_paging: true,
     };
 

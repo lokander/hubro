@@ -18,8 +18,8 @@
 use hubro::db::{
     apply_staged, detect_row_identity, mssql_url_with_password, run_script, split_statements,
     Capabilities, DbError, DbPool, Dialect, ExportFormat, Filter, Generated, PageRequest,
-    Restriction, RowIdentity, RowLocator, SortDir, StagedChange, StatementOutcome, TableKind,
-    TableMeta, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
+    Restriction, Rollback, RowIdentity, RowLocator, SortDir, StagedChange, StatementOutcome,
+    TableKind, TableMeta, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 fn test_url() -> Option<String> {
@@ -714,7 +714,11 @@ async fn sqlserver_script_errors_roll_the_whole_script_back() {
     .await
     .expect_err("the duplicate key must fail the script");
     assert_eq!(err.statement_index, 2);
-    assert!(err.rolled_back, "an atomic script failure must roll back");
+    assert_eq!(
+        err.rollback,
+        Rollback::Full,
+        "an atomic script failure must roll back, schema changes included"
+    );
     assert_eq!(results.len(), 2, "the first two statements had succeeded");
 
     // Nothing survived — not even the CREATE TABLE (DDL is transactional).

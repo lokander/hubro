@@ -70,11 +70,16 @@
 //!     on the code rather than on `MISMATCHED_SCHEMA` — the same code carries
 //!     CockroachDB's retryable conflicts, and no engine-internal string has to
 //!     be matched.
-//!  3. **A failing script does not roll back its DDL** — the same gap
-//!     CockroachDB has, for a different reason (Yugabyte simply commits each
-//!     schema change as it executes). DML in the same transaction rolls back
-//!     correctly, so the fix is to narrow what hubro *claims*, not to disable
-//!     transactions: FRE-146.
+//!  3. **A failing script does not roll back its DDL — since reported
+//!     honestly (FRE-146).** The same behaviour CockroachDB has, for a
+//!     different reason: Yugabyte commits each schema change as it executes.
+//!     DML in the same transaction rolls back correctly, so the fix narrowed
+//!     what hubro *claims* rather than disabling transactions — this
+//!     connection declares `transactional_ddl: false` and `transactions: true`,
+//!     and a failing script that changed the schema now says the rollback did
+//!     not cover it. Unlike CockroachDB, the DML written before the schema
+//!     change *is* undone here, which is why the message hubro shows names only
+//!     what it is certain of.
 //!  4. **`numeric 'NaN'` is not storable** (`DECIMAL does not support NaN
 //!     yet`), so the shared suite's undecodable-cell fixture cannot be built
 //!     here. The decode path it exercises is engine-independent.
@@ -110,9 +115,9 @@
 use std::sync::OnceLock;
 
 use hubro::db::{
-    apply_staged, detect_row_identity, run_script, split_statements, DbPool, DdlObject, DdlSource,
-    Filter, Internal, PageRequest, PgFlavor, Restriction, RowIdentity, RowLocator, SortDir,
-    StagedChange, TableKind, TableMeta, Value,
+    apply_staged, detect_row_identity, run_script, split_statements, Capabilities, DbPool,
+    DdlObject, DdlSource, Filter, Internal, PageRequest, PgFlavor, Restriction, Rollback,
+    RowIdentity, RowLocator, SortDir, StagedChange, TableKind, TableMeta, Value,
 };
 use tokio::sync::Mutex;
 
@@ -550,6 +555,19 @@ async fn yugabyte_script_dml_rolls_back_but_its_ddl_does_not() {
     let Some(url) = test_url() else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
 
+    // The declaration that drives it, pinned separately from the behaviour: a
+    // rollback here covers DML and nothing else, so `transactional_ddl` is the
+    // one flag that differs from a full-featured engine. Declaring
+    // `transactions: false` instead would be the worse lie — the DML half
+    // below demonstrably works.
+    assert_eq!(
+        pool.backend_capabilities(),
+        Capabilities {
+            transactional_ddl: false,
+            ..Capabilities::FULL
+        }
+    );
+
     // The same gap CockroachDB has, reached differently: Yugabyte commits each
     // schema change as it executes rather than auto-committing the transaction
     // around it. Pinned here as well as there because it is what makes this a
@@ -574,7 +592,11 @@ async fn yugabyte_script_dml_rolls_back_but_its_ddl_does_not() {
     let error = run_script(&pool, pool.backend_capabilities(), &statements, |_| {})
         .await
         .expect_err("the final statement names no relation");
-    assert!(error.rolled_back, "hubro reports the batch as rolled back");
+    assert_eq!(
+        error.rollback,
+        Rollback::ExceptSchemaChanges,
+        "the rollback covered the DML but not the schema change, and hubro must say so"
+    );
     drop(guard);
 
     let survivors = pool

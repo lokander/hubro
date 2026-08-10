@@ -107,8 +107,8 @@
 
 use hubro::db::{
     apply_staged, detect_row_identity, run_script, split_statements, Capabilities, DbPool, Filter,
-    Internal, PageRequest, PgFlavor, Restriction, RowIdentity, RowLocator, SortDir, StagedChange,
-    TableKind, TableMeta, Value, NO_GUARDED_WRITE,
+    Internal, PageRequest, PgFlavor, Restriction, Rollback, RowIdentity, RowLocator, SortDir,
+    StagedChange, TableKind, TableMeta, Value, NO_GUARDED_WRITE,
 };
 
 fn test_url() -> Option<String> {
@@ -264,13 +264,20 @@ async fn risingwave_declares_itself_non_transactional() {
     // The first backend in the project to declare anything narrower than FULL.
     let caps = pool.backend_capabilities();
     assert!(!caps.transactions);
-    // ...and narrower in exactly one respect. It queries, writes, runs DDL and
+    // ...and narrower only about transactions. It queries, writes, runs DDL and
     // pages by LIMIT/OFFSET like any other; overstating the loss would disable
     // the SQL editor's write paths, which work.
+    //
+    // `transactional_ddl` goes with it (FRE-146) rather than being a second,
+    // independent loss: that flag asks what a *rollback* covers, and nothing
+    // here rolls back at all. Unlike CockroachDB and YugabyteDB — which have
+    // real transactions and lose only the schema half — the two are not
+    // separable on this engine.
     assert_eq!(
         caps,
         Capabilities {
             transactions: false,
+            transactional_ddl: false,
             ..Capabilities::FULL
         }
     );
@@ -348,7 +355,7 @@ async fn risingwave_scripts_run_sequentially_instead_of_claiming_atomicity() {
 
     // The other half that falls out of the declaration: `wrap_atomically`
     // returns false, so a failing multi-statement script reports
-    // `rolled_back: false` and leaves the earlier statement standing. That is
+    // `Rollback::None` and leaves the earlier statement standing. That is
     // the truth on this engine, and saying it is the point — the alternative
     // is a rollback message that means nothing.
     let table = "rw_script_probe";
@@ -367,8 +374,9 @@ async fn risingwave_scripts_run_sequentially_instead_of_claiming_atomicity() {
     let error = run_script(&pool, pool.backend_capabilities(), &statements, |_| {})
         .await
         .expect_err("the second statement names no relation");
-    assert!(
-        !error.rolled_back,
+    assert_eq!(
+        error.rollback,
+        Rollback::None,
         "a non-transactional backend must not claim to have rolled back"
     );
 

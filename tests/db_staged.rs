@@ -15,8 +15,8 @@ use std::collections::HashSet;
 
 use common::FixtureDb;
 use hubro::db::{
-    apply_staged, detect_row_identity, run_script, DbPool, Dialect, PageRequest, RowIdentity,
-    RowLocator, StagedChange, TableAccess, TableMeta, Value, WriteProtection,
+    apply_staged, detect_row_identity, run_script, DbPool, Dialect, PageRequest, Rollback,
+    RowIdentity, RowLocator, StagedChange, TableAccess, TableMeta, Value, WriteProtection,
 };
 use hubro::ui::editing::bool_value;
 use hubro::ui::stage::required_insert_columns;
@@ -1104,7 +1104,11 @@ async fn a_read_only_marking_refuses_a_delete_from_the_sql_editor() {
     let err = run_script(&pool, caps, &statements, |_| {})
         .await
         .expect_err("a script write must be refused on a marked connection");
-    assert!(!err.rolled_back, "nothing ran, so nothing was rolled back");
+    assert_eq!(
+        err.rollback,
+        Rollback::None,
+        "nothing ran, so nothing was rolled back"
+    );
 
     let count = pool.query("SELECT COUNT(*) FROM albums").await.unwrap();
     assert_ne!(

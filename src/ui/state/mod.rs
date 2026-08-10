@@ -50,7 +50,7 @@ use crate::db::{
     mssql_url_with_password, needs_confirmation, run_script, script_refusal, split_statements,
     statement_preview, url_target, url_via_local_port, url_with_password, write_result,
     Capabilities, CellFetch, Connection, ConnectionId, ConnectionRegistry, DbError, DbPool, Ddl,
-    DdlObject, ExportFormat, Filter, ForeignKeyMeta, MssqlAuth, QueryResult, RowLocator,
+    DdlObject, ExportFormat, Filter, ForeignKeyMeta, MssqlAuth, QueryResult, Rollback, RowLocator,
     StagedChange, StatementResult, TableAccess, TableMeta, Value, WriteProtection,
 };
 use crate::history::HistoryStore;
@@ -228,15 +228,16 @@ pub enum RunStatus {
     },
     /// The statement at `statement_index` (0-based, into the script)
     /// failed. Outcomes of the statements before it stay visible in
-    /// [`SqlRun::statements`]. `rolled_back` distinguishes an atomic run (the
-    /// whole script was undone) from a sequential one (earlier statements
-    /// persisted).
+    /// [`SqlRun::statements`]. `rollback` says what the failure undid — an
+    /// atomic run (the whole script), a sequential one (nothing; earlier
+    /// statements persisted), or an atomic run on an engine whose rollback
+    /// doesn't reach schema changes (FRE-146).
     Failed {
         error: String,
         statement_index: usize,
         preview: String,
         elapsed_ms: u64,
-        rolled_back: bool,
+        rollback: Rollback,
     },
     /// The connection's capabilities forbid the statement at
     /// `statement_index` (FRE-87), so **nothing was sent**. Distinct from
