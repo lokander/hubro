@@ -1813,33 +1813,51 @@ mod tests {
             body.contains("forget_failed_ssh_passphrase("),
             "the rejection path must go through the shared policy"
         );
-        // Both arms have to be reachable, or the policy is being handed a
-        // constant and the distinction it exists for is gone. Assert the
-        // *assignments*, not mere mentions: a version that labels every hit
-        // `Keyring` still contains both names.
+        // Which read produced which label is the whole fix, so that *binding*
+        // is what gets asserted — not that both names appear somewhere. Trading
+        // the two labels between the arms leaves every name, the call and the
+        // gate intact while restoring the bug exactly, so the body is split at
+        // the two reads and each half checked for its own label alone.
+        //
+        // Sliced by the reads themselves rather than by `match`/`if let` shape,
+        // so a refactor of the surrounding control flow doesn't quietly stop
+        // testing anything.
+        let read = &body[..body
+            .find("stored.unzip()")
+            .expect("value and source are read together")];
+        let session_at = read
+            .find("session_passwords.read()")
+            .expect("session memory is consulted");
+        let keyring_at = read
+            .find("get_password_async")
+            .expect("the keyring is consulted");
         assert!(
-            body.contains("(value, PassphraseSource::Session)"),
-            "nothing marks a session-sourced passphrase, so a typo is \
-             indistinguishable from a stale stored secret again"
+            session_at < keyring_at,
+            "the keyring is consulted before session memory — the passphrase \
+             just typed at the prompt would lose to a stale stored one, and the \
+             re-entrant retry would never see what the user entered"
+        );
+        let (session_read, keyring_read) = (&read[session_at..keyring_at], &read[keyring_at..]);
+        assert!(
+            session_read.contains("PassphraseSource::Session")
+                && !session_read.contains("PassphraseSource::Keyring"),
+            "the session read is not labelled Session — with the labels traded, \
+             a passphrase typed at the prompt is read as a stale stored secret, \
+             which is the FRE-151 bug verbatim"
         );
         assert!(
-            body.contains("(value, PassphraseSource::Keyring)"),
-            "nothing marks a keyring-sourced passphrase, so a genuinely stale \
-             stored secret is never cleaned up"
+            keyring_read.contains("PassphraseSource::Keyring")
+                && !keyring_read.contains("PassphraseSource::Session"),
+            "the keyring read is not labelled Keyring, so a genuinely stale \
+             stored passphrase is never cleaned up"
         );
-        // The policy must be handed the *tracked* source. Passing a literal
-        // compiles, keeps both names above present, and restores the original
-        // bug in full — so the call's arguments are checked, not just its name.
-        let call_start = body
-            .find("forget_failed_ssh_passphrase(")
-            .expect("checked above");
-        let call = &body[call_start..];
-        let call = &call[..call.find(';').expect("the call is a statement")];
+        // And no constant anywhere in the rejection block — not merely inside
+        // the call, since a `source.or(Some(…))` default would sit just outside
+        // it and delete a correct entry whenever a keyring read errored.
         assert!(
-            !call.contains("PassphraseSource::"),
-            "the policy is being handed a constant instead of the source that \
-             was actually tracked — with `Keyring` that is the FRE-151 bug \
-             verbatim, and with `Session` no stale passphrase is ever cleaned up"
+            !method_body(&body, "if let Some(source) = ").contains("PassphraseSource::"),
+            "the rejection path is manufacturing a source instead of using the \
+             one that was tracked"
         );
 
         // And the delete must be *inside* the gate, not merely somewhere near
