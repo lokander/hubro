@@ -1794,25 +1794,26 @@ fn GridFooter(
                                                 );
                                         },
                                         span { class: "shrink-0 whitespace-nowrap", "{prefix}" }
-                                        span { class: "min-w-0 truncate", "· {counts}" }
+                                        // The counts shed their width first —
+                                        // 1000× faster than the aggregates, so
+                                        // they are gone before a digit of a sum
+                                        // is. The priority is expressed here,
+                                        // on the half we are willing to lose,
+                                        // rather than as a sub-1 factor on the
+                                        // aggregates: a span that cannot shrink
+                                        // cannot ellipsise, and gets cut by the
+                                        // group's `overflow-hidden` with no
+                                        // mark that anything was cut. See
+                                        // COUNTS_SHRINK.
+                                        span {
+                                            class: "min-w-0 truncate",
+                                            flex_shrink: COUNTS_SHRINK,
+                                            "· {counts}"
+                                        }
                                         if let Some(aggregates) = aggregates {
-                                            // Not `shrink-0`: a selection whose
-                                            // max is a full-width i64 runs
-                                            // wider than the footer on its own,
-                                            // and an unshrinkable span would
-                                            // overrun the group and the stepper
-                                            // with it. A shrink factor this far
-                                            // below the counts' 1 is a priority
-                                            // rather than a ratio — flexbox
-                                            // splits the overflow by
-                                            // factor × width, so the counts
-                                            // collapse to nothing before these
-                                            // numbers give up a pixel, and only
-                                            // aggregates too wide for the whole
-                                            // footer truncate at all.
                                             span {
                                                 class: "min-w-0 truncate",
-                                                flex_shrink: "0.001",
+                                                flex_shrink: AGGREGATE_SHRINK,
                                                 "· {aggregates}"
                                             }
                                         }
