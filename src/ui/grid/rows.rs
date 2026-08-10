@@ -145,7 +145,7 @@ impl TableRenderMeta {
         TableRenderMeta {
             schema_columns: meta.columns.iter().map(|c| c.name.clone()).collect(),
             columns: meta.columns.clone(),
-            column_kinds: column_kinds_of(Some(meta)),
+            column_kinds: column_kinds_of(Some(meta), dialect),
             foreign_keys: meta.foreign_keys.clone(),
             col_to_fk,
             required: dialect
@@ -296,7 +296,10 @@ pub(super) fn selection_locators(selected: &HashMap<String, RowLocator>) -> Vec<
 /// Per-column editor kind + nullability from introspected metadata.
 /// Database-assigned `GENERATED ALWAYS` columns become a read-only kind
 /// rather than inviting doomed input. Empty when the schema isn't ready.
-pub(super) fn column_kinds_of(meta: Option<&TableMeta>) -> HashMap<String, (EditorKind, bool)> {
+pub(super) fn column_kinds_of(
+    meta: Option<&TableMeta>,
+    dialect: Option<Dialect>,
+) -> HashMap<String, (EditorKind, bool)> {
     meta.map(|meta| {
         meta.columns
             .iter()
@@ -304,7 +307,7 @@ pub(super) fn column_kinds_of(meta: Option<&TableMeta>) -> HashMap<String, (Edit
                 let kind = if c.generated == Generated::Always {
                     EditorKind::Generated
                 } else {
-                    editor_kind(&c.type_name, &c.type_detail)
+                    editor_kind(&c.type_name, &c.type_detail, dialect)
                 };
                 (c.name.clone(), (kind, c.nullable))
             })

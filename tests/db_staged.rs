@@ -658,12 +658,21 @@ async fn postgres_char_n_columns_round_trip_uncast() {
     pool.close().await;
 }
 
-/// bit(n) columns cannot take a text parameter at all (text → bit has no
-/// assignment cast, and `$1::bit` would mean bit(1)); with the cast
-/// skipped the save fails LOUDLY and rolls back — never a silent wrong
-/// value. Documented limitation until a dedicated bit editor exists.
+/// bit(n) columns are writable (FRE-159), and a bad value still rolls back.
+///
+/// This previously asserted the opposite — that the save *always* failed — and
+/// called it a documented limitation. Its own reasoning was right ("text → bit
+/// has no assignment cast, and `$1::bit` would mean bit(1)"), and was in fact
+/// the standing evidence that `staged.rs`'s prose claim to the contrary was
+/// wrong. What the limitation missed is the third option: cast to the
+/// unbounded `bit varying` and let the column's own modifier apply on
+/// assignment.
+///
+/// The half worth keeping is the rollback — a value the server refuses must
+/// never leave a partial write behind — so a wrong-length edit is still
+/// exercised here.
 #[tokio::test]
-async fn postgres_bit_n_edit_fails_loudly_and_rolls_back() {
+async fn postgres_bit_n_edits_save_and_a_wrong_length_still_rolls_back() {
     let Some(url) = test_url() else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     for sql in [
@@ -681,10 +690,35 @@ async fn postgres_bit_n_edit_fails_loudly_and_rolls_back() {
     let items = find(&tables, Some("staged_bitn"), "items").clone();
     let identity = detect_row_identity(&items, Dialect::Postgres).unwrap();
 
+    // A well-formed value of the declared width now saves.
     let changes = vec![update(
         vec![Value::Integer(1)],
         "mask",
         Value::Text("110".into()),
+    )];
+    apply_staged(
+        &pool,
+        &pool.backend_access(&items),
+        &items,
+        &identity,
+        &changes,
+    )
+    .await
+    .expect("a bit(n) column must be writable");
+
+    let check = pool
+        .query("SELECT mask::text FROM staged_bitn.items WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(check.rows[0][0], Value::Text("110".into()));
+
+    // The declared length is not introspected, so hubro cannot check it
+    // client-side (see `coerce::validate_bit_literal`). The server does, and
+    // that refusal must still roll back rather than half-apply.
+    let changes = vec![update(
+        vec![Value::Integer(1)],
+        "mask",
+        Value::Text("1100".into()),
     )];
     let err = apply_staged(
         &pool,
@@ -703,7 +737,7 @@ async fn postgres_bit_n_edit_fails_loudly_and_rolls_back() {
         .unwrap();
     assert_eq!(
         check.rows[0][0],
-        Value::Text("101".into()),
+        Value::Text("110".into()),
         "failed bit edit must roll back, never store a wrong value"
     );
 
