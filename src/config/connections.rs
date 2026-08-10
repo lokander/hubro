@@ -929,6 +929,19 @@ impl SavedList {
     /// Re-adding an existing Postgres or SQL Server URL keeps the entry (and
     /// its name) but adopts a changed tunnel config or auth mode, so
     /// reconnecting with different tunnel/auth settings persists them.
+    ///
+    /// **"Adopts" runs in both directions, and that is sharp** (FRE-114): a
+    /// `None` tunnel replaces a saved one, and `ServerAuth::Password` replaces
+    /// a saved Entra mode — erasing configuration the user entered, from a
+    /// call that reads as though it only ever adds. The write protection and
+    /// colour are the deliberate opposite, never touched here, because a
+    /// connect must not undo a marking (FRE-111).
+    ///
+    /// So a caller has to pass the settings the connection is *actually* saved
+    /// with, not defaults it happens to have on hand. The command-line path
+    /// learned that the hard way and now looks the entry up first (see
+    /// `ui::state::saved_server_settings`). Both directions are pinned by the
+    /// tests below, so changing either is at least deliberate.
     pub fn add(&mut self, connection: SavedConnection) -> bool {
         let existing = self
             .entries
@@ -2106,6 +2119,58 @@ mod tests {
         }
         // Identical tunnel again: no change.
         assert!(!list.add(with_tunnel));
+    }
+
+    #[test]
+    fn add_also_clears_a_tunnel_and_downgrades_auth_which_is_the_sharp_edge() {
+        // The other direction of "adopts", which had no test and cost FRE-114 a
+        // bug: re-adding the same locator with `None`/`Password` *erases* a
+        // saved tunnel and a saved Entra sign-in. Pinned rather than changed —
+        // the connection form legitimately re-adds a URL with settings the user
+        // has just chosen, so refusing the downgrade here would need its own
+        // judgement about that path. What must not happen is a caller reaching
+        // it by accident, and that is the caller's job (see the doc on `add`).
+        let dir = tempfile::tempdir().unwrap();
+        let (mut list, _) = SavedList::load(&dir.path().join("connections.toml"));
+        let url = "postgres://u@h:5432/db";
+        assert!(list.add(SavedConnection::Postgres {
+            name: "prod".into(),
+            url: url.into(),
+            tunnel: Some(tunnel(crate::tunnel::TunnelAuth::Agent)),
+            auth: ServerAuth::Entra(crate::azure::EntraAuth::interactive_default()),
+            protection: WriteProtection::ReadOnly,
+            color: Some(ConnectionColor::Red),
+        }));
+
+        let bare = SavedConnection::Postgres {
+            name: "ignored".into(),
+            url: url.into(),
+            tunnel: None,
+            auth: ServerAuth::Password,
+            protection: WriteProtection::Open,
+            color: None,
+        };
+        assert!(list.add(bare), "the entry is rewritten, and reports it");
+        match &list.entries()[0] {
+            SavedConnection::Postgres {
+                name,
+                tunnel,
+                auth,
+                protection,
+                color,
+                ..
+            } => {
+                assert!(tunnel.is_none(), "the saved tunnel is gone");
+                assert!(matches!(auth, ServerAuth::Password), "Entra was downgraded");
+                // …while these three are never touched by `add`: the name is
+                // the entry's own, and a connect must not undo a marking
+                // (FRE-111).
+                assert_eq!(name, "prod");
+                assert_eq!(*protection, WriteProtection::ReadOnly);
+                assert_eq!(*color, Some(ConnectionColor::Red));
+            }
+            other => panic!("unexpected entry {other:?}"),
+        }
     }
 
     #[test]

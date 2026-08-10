@@ -288,13 +288,26 @@ impl std::error::Error for CliError {}
 /// userinfo, so `postgres://user:SEK RET@host/db` parses and connects
 /// perfectly well.)
 ///
-/// It is closed one level up instead, by no error variant holding raw user
-/// text that reaches past a space: [`CliError::unknown_option`] truncates at
-/// the first `=` *or* whitespace, [`CliError::UnsupportedScheme`] holds only a
-/// scheme, [`CliError::UnusableUrl`] holds only validation messages that never
-/// quote their input, and [`CliError::File`] holds a path. Anything added to
-/// [`CliError`] that echoes an argument has to keep that true — redaction
-/// alone will not.
+/// It is closed one level up instead, by no [`CliError`] variant carrying a
+/// *credential* past a space. Variant by variant:
+///
+/// - [`CliError::unknown_option`] truncates at the first `=` or whitespace, so
+///   the value never enters the error.
+/// - [`CliError::UnsupportedScheme`] holds only what [`url_scheme`] returned,
+///   a grammar admitting a leading letter then alphanumerics and `+-.` — so it
+///   can contain neither whitespace nor `:` nor `@`.
+/// - [`CliError::UnusableUrl`] holds a constant, or a message from
+///   `UrlScheme::normalize`, none of which quote their input.
+/// - [`CliError::TooManyArguments`] carries nothing at all.
+/// - [`CliError::File`] is the exception, and is named as one: its path is
+///   arbitrary user text and *does* reach past a space. No credential can land
+///   there — anything with a valid `scheme://` is routed to the URL branch by
+///   [`classify`], so getting URL-shaped text here means the user named it as a
+///   file — but that is an argument about reachability, not a bound this
+///   function provides.
+///
+/// A new variant that echoes an argument has to establish one of those for
+/// itself. Redaction alone will not do it.
 pub fn redact_url(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;

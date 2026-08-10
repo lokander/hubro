@@ -305,6 +305,44 @@ async fn acquire_entra(
     .await
 }
 
+/// How an already-saved server connection is configured to connect: its SSH
+/// tunnel and its auth mode, or the no-tunnel/password defaults when hubro has
+/// never seen this locator.
+///
+/// Exists for [`AppState::open_target`], and pure so that its consequence is
+/// testable without a runtime: a connect *persists how it connected*, so
+/// handing the connect flow anything other than what the entry already records
+/// silently rewrites `connections.toml`. The saved locator and the normalized
+/// URL a command line produces are the same string by construction — both come
+/// out of `normalize_pg_url`/`normalize_mssql_url` — so this is an equality
+/// match rather than a fuzzy one.
+///
+/// SQLite entries never match: they are keyed by path, have no URL, and reach
+/// none of the server flows.
+pub(super) fn saved_server_settings(
+    saved: &[SavedConnection],
+    url: &str,
+) -> (Option<TunnelConfig>, ServerAuth) {
+    saved
+        .iter()
+        .find_map(|entry| match entry {
+            SavedConnection::Postgres {
+                url: saved_url,
+                tunnel,
+                auth,
+                ..
+            }
+            | SavedConnection::SqlServer {
+                url: saved_url,
+                tunnel,
+                auth,
+                ..
+            } if saved_url == url => Some((tunnel.clone(), auth.clone())),
+            _ => None,
+        })
+        .unwrap_or((None, ServerAuth::Password))
+}
+
 /// The opener a *silent* acquisition passes: it refuses to open a browser, so
 /// an interactive sign-in with no usable refresh token errors here and the
 /// flow can park the sign-in card instead of popping a window unasked.
@@ -620,6 +658,19 @@ impl AppState {
     ///   does ([`Self::save_server_if_open`]). What is saved is the normalized
     ///   locator, which carries no password.
     ///
+    /// A URL that names an **already-saved** connection is connected the way
+    /// that connection is saved — its tunnel and its auth mode — rather than
+    /// as a bare URL. Partly because that is what someone typing the URL of
+    /// their tunneled connection means, and partly because the alternative
+    /// destroys it: a connect persists how it connected
+    /// ([`SavedList::add`](crate::config::SavedList::add) adopts the tunnel
+    /// and auth it is handed, in *both* directions), so connecting with
+    /// `None`/`Password` would erase a saved SSH tunnel and downgrade a saved
+    /// Entra sign-in to a password, on disk, with nothing shown to the user.
+    /// It does not even need the connect to succeed: `focus_or_reserve`
+    /// short-circuits when the tab is already open — which a session restore
+    /// has just made likely — and saves on the way out.
+    ///
     /// Any password from the URL goes into session memory only — never the
     /// keyring. Storing a credential permanently is a decision the "remember
     /// password" checkbox exists to take; a password that happened to be on a
@@ -634,6 +685,11 @@ impl AppState {
             } => {
                 let name = crate::cli::display_name(&url);
                 let backend = ServerBackend::of(backend);
+                // Scoped so the read guard is dropped before the awaits below.
+                let (tunnel, auth) = {
+                    let saved = self.saved.read();
+                    saved_server_settings(saved.entries(), &url)
+                };
                 match password {
                     // A password off the command line takes the same route as
                     // one just typed into the prompt, and for the same reason:
@@ -651,14 +707,19 @@ impl AppState {
                     // a password that happened to be on a command line has not
                     // been through the "remember password" decision, so it
                     // stays out of the keyring either way.
-                    Some(password) => {
-                        self.connect_server_with_password(backend, url, name, password, false, None)
-                            .await
+                    //
+                    // Only for a password-authenticated connection, though:
+                    // this flow saves with `ServerAuth::Password`, which for an
+                    // Entra-saved entry would be the same downgrade by another
+                    // route. An Entra connection signs in with a token and has
+                    // no use for a password anyway, so it connects as saved.
+                    Some(password) if matches!(auth, ServerAuth::Password) => {
+                        self.connect_server_with_password(
+                            backend, url, name, password, false, tunnel,
+                        )
+                        .await
                     }
-                    None => {
-                        self.connect_server(backend, url, name, None, ServerAuth::Password)
-                            .await
-                    }
+                    _ => self.connect_server(backend, url, name, tunnel, auth).await,
                 }
             }
         }
@@ -1465,6 +1526,90 @@ mod tests {
             }
         }
         panic!("unbalanced braces after `{signature}`");
+    }
+
+    /// A saved Postgres entry with an SSH tunnel and interactive Entra auth —
+    /// the two fields `SavedList::add` adopts, and so the two an argv connect
+    /// can destroy.
+    fn saved_with_tunnel_and_entra(url: &str) -> SavedConnection {
+        SavedConnection::Postgres {
+            name: "prod".into(),
+            url: url.into(),
+            tunnel: Some(TunnelConfig {
+                host: "bastion.example.com".into(),
+                port: 22,
+                user: "jump".into(),
+                auth: TunnelAuth::Agent,
+            }),
+            auth: ServerAuth::Entra(EntraAuth::interactive_default()),
+            protection: WriteProtection::Open,
+            color: None,
+        }
+    }
+
+    #[test]
+    fn a_saved_connection_lends_the_command_line_its_tunnel_and_auth() {
+        const URL: &str = "postgres://u@h:5432/db";
+        let saved = vec![saved_with_tunnel_and_entra(URL)];
+
+        let (tunnel, auth) = saved_server_settings(&saved, URL);
+        assert_eq!(tunnel.as_ref().unwrap().host, "bastion.example.com");
+        assert!(matches!(auth, ServerAuth::Entra(_)));
+
+        // A locator hubro has never seen keeps the bare-URL defaults: there is
+        // nothing to preserve, and inventing a tunnel would be worse.
+        let (tunnel, auth) = saved_server_settings(&saved, "postgres://u@other:5432/db");
+        assert!(tunnel.is_none());
+        assert!(matches!(auth, ServerAuth::Password));
+
+        // A SQLite entry is keyed by path and reaches no server flow, so it can
+        // never be mistaken for a match.
+        let sqlite = vec![SavedConnection::Sqlite {
+            name: "app.db".into(),
+            path: PathBuf::from(URL),
+            protection: WriteProtection::Open,
+            color: None,
+        }];
+        let (tunnel, auth) = saved_server_settings(&sqlite, URL);
+        assert!(tunnel.is_none());
+        assert!(matches!(auth, ServerAuth::Password));
+    }
+
+    #[test]
+    fn an_argv_connect_to_a_saved_connection_rewrites_nothing_on_disk() {
+        // The consequence that makes the lookup load-bearing rather than a
+        // nicety. A connect persists how it connected, and `SavedList::add`
+        // adopts the tunnel and auth it is handed in *both* directions — so
+        // connecting a saved, tunneled, Entra connection as a bare URL erases
+        // its tunnel and downgrades its sign-in, on disk, silently. This walks
+        // the same values `open_target` now passes through the same `add` the
+        // save path calls, and asserts the entry does not change.
+        const URL: &str = "postgres://u@h:5432/db";
+        let dir = tempfile::tempdir().unwrap();
+        let (mut list, _) = SavedList::load(&dir.path().join("connections.toml"));
+        assert!(list.add(saved_with_tunnel_and_entra(URL)));
+
+        let (tunnel, auth) = saved_server_settings(list.entries(), URL);
+        let would_save = ServerBackend::POSTGRES.saved("cli-derived-name", URL, tunnel, auth);
+        assert!(
+            !list.add(would_save),
+            "an argv connect to a saved connection must leave the entry alone — \
+             a `true` here is a rewrite of connections.toml the user never asked \
+             for and never sees"
+        );
+
+        match &list.entries()[0] {
+            SavedConnection::Postgres {
+                name, tunnel, auth, ..
+            } => {
+                assert_eq!(tunnel.as_ref().unwrap().host, "bastion.example.com");
+                assert!(matches!(auth, ServerAuth::Entra(_)));
+                // The name was never at risk (`add` keeps it), but a rewrite
+                // that took it would be just as invisible.
+                assert_eq!(name, "prod");
+            }
+            other => panic!("unexpected entry {other:?}"),
+        }
     }
 
     #[test]
