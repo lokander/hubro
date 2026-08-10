@@ -9,8 +9,8 @@
 
 use hubro::db::{
     detect_row_identity, url_with_password, Capabilities, DbError, DbPool, Dialect, Filter,
-    Internal, PageRequest, Restriction, RowLocator, SortDir, TableKind, TypeDetail, TypeRef, Value,
-    PREVIEW_BYTES, QUERY_CELL_CAP,
+    Internal, PageRequest, PgFlavor, Restriction, RowLocator, SortDir, TableKind, TypeDetail,
+    TypeRef, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 fn test_url() -> Option<String> {
@@ -46,6 +46,22 @@ async fn fresh_fixture(pool: &DbPool, table: &str) {
     ))
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn stock_postgres_is_detected_as_stock_postgres() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+
+    // The safety claim behind flavor detection (FRE-90), asserted from the
+    // side CI can actually reach: an engine-specific branch must never fire
+    // against real PostgreSQL. `tests/db_cockroach.rs` pins the other
+    // direction, but that binary needs a Cockroach container and CI has none —
+    // so without this, a detection change that swept stock Postgres into an
+    // engine branch would pass everything CI runs.
+    assert_eq!(pool.pg_flavor(), Some(PgFlavor::Postgres));
+
+    pool.close().await;
 }
 
 #[tokio::test]
