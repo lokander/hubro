@@ -184,6 +184,16 @@ pub enum Internal {
     /// read directly, but the parent is what you browse — and a table
     /// partitioned by day floods the tree exactly as Timescale's chunks do.
     Partition,
+    /// The engine's own catalog, in a schema it reserves for itself.
+    ///
+    /// Stock Postgres keeps all of this in `pg_catalog` and
+    /// `information_schema`, which introspection excludes outright, so this
+    /// arises only on a reimplementation that reserves *more* schemas —
+    /// CockroachDB's `crdb_internal` and `pg_extension` (FRE-90). Recorded
+    /// rather than excluded for the same reason as everything else here: the
+    /// objects are real, and hiding them by default is the sidebar's call
+    /// rather than introspection's.
+    System,
 }
 
 impl Internal {
@@ -192,6 +202,7 @@ impl Internal {
         match self {
             Internal::Extension(name) => format!("created by the {name} extension"),
             Internal::Partition => "a partition of another table".to_string(),
+            Internal::System => "part of the database's own catalog".to_string(),
         }
     }
 }

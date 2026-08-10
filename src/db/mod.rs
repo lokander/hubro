@@ -56,7 +56,7 @@ pub use page::{
     PREVIEW_BYTES,
 };
 pub use postgres::{
-    build_url, normalize_pg_url, url_target, url_via_local_port, url_with_password,
+    build_url, normalize_pg_url, url_target, url_via_local_port, url_with_password, PgFlavor,
 };
 pub use registry::{
     CellFetch, Connection, ConnectionId, ConnectionRegistry, DbPool, FETCH_CELL_MAX_BYTES,
