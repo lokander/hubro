@@ -872,7 +872,7 @@ fn PlanTreeView(tree: PlanTree) -> Element {
                 // Says what the highlight means, in the terms it was decided
                 // in — the share is read from the constant, so a change to the
                 // rule cannot leave this sentence describing the old one.
-                "Highlighted: each adds at least {(EXPENSIVE_SHARE * 100.0) as u32}% of the plan's total cost on its own."
+                "Highlighted: each adds at least {(EXPENSIVE_SHARE * 100.0).round() as u32}% of the plan's total cost on its own."
             }
             if let Some(planning) = tree.planning_ms {
                 " Planning {format_ms(planning)} ms."

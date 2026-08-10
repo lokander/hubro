@@ -8,10 +8,10 @@
 //! ```
 
 use hubro::db::{
-    detect_row_identity, explain_statement, needs_confirmation, run_script, url_with_password,
-    Capabilities, DbError, DbPool, Dialect, Filter, Internal, PageRequest, PgFlavor, PlanDisplay,
-    Restriction, Rollback, RowCount, RowLocator, SortDir, TableKind, TypeDetail, TypeRef, Value,
-    PREVIEW_BYTES, QUERY_CELL_CAP,
+    detect_row_identity, explain_statement, needs_confirmation, run_script, script_refusal,
+    url_with_password, Capabilities, DbError, DbPool, Dialect, Filter, Internal, PageRequest,
+    PgFlavor, PlanDisplay, Restriction, Rollback, RowCount, RowLocator, SortDir, TableKind,
+    TypeDetail, TypeRef, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 fn test_url() -> Option<String> {
@@ -1279,5 +1279,62 @@ async fn postgres_explain_analyze_of_a_write_cannot_slip_past_the_gate() {
         .all(|name| name == "analyzed"));
 
     pool.query("DROP TABLE fruits_guard").await.unwrap();
+    pool.close().await;
+}
+
+/// Every `EXPLAIN` header spelling hubro's header skipper tolerates is
+/// spelling a real PostgreSQL server accepts — and none of them costs a read
+/// its capability.
+///
+/// The list here is the PostgreSQL-valid half of `EXPLAIN_HEADERS` in
+/// `src/db/script.rs`'s tests (that one also carries SQLite's `EXPLAIN QUERY
+/// PLAN`, which this server would reject). The two exist as a pair: the unit
+/// test makes a missing spelling fail a test instead of a user's read-only
+/// connection, and this one keeps the list from drifting into syntax only
+/// hubro believes in.
+///
+/// `ANALYSE` is why. PostgreSQL takes the British spelling as a synonym for
+/// `ANALYZE`; hubro's skipper did not, so the option became the "statement",
+/// classified as a write, and `EXPLAIN ANALYSE SELECT 1` was refused on a
+/// read-only connection. Nothing offline could have told us the word is real.
+#[tokio::test]
+async fn postgres_accepts_every_explain_header_hubro_tolerates() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+
+    for header in [
+        "EXPLAIN",
+        "explain",
+        "EXPLAIN ANALYZE",
+        "EXPLAIN ANALYSE",
+        "EXPLAIN VERBOSE",
+        "EXPLAIN ANALYZE VERBOSE",
+        "explain analyse verbose",
+        "EXPLAIN (FORMAT JSON)",
+        "EXPLAIN (ANALYZE, FORMAT JSON)",
+        "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, FORMAT JSON)",
+        "EXPLAIN (COSTS OFF)",
+        "EXPLAIN /* just looking */ ANALYZE",
+    ] {
+        let sql = format!("{header} SELECT 1");
+        pool.query(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("postgres rejected {sql:?}: {e}"));
+        // And hubro reads it as what it is: a plan of a read.
+        assert!(
+            !needs_confirmation(&sql, Dialect::Postgres),
+            "{sql:?} prompts to confirm a read"
+        );
+        assert_eq!(
+            script_refusal(
+                Capabilities::FULL.read_only(),
+                std::slice::from_ref(&sql),
+                Dialect::Postgres
+            ),
+            None,
+            "a read-only connection refuses {sql:?}"
+        );
+    }
+
     pool.close().await;
 }
