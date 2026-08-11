@@ -9,7 +9,8 @@ This repo uses Dioxus 0.7, which changed every API. **`cx`, `Scope`, and `use_st
 Components are `#[component]` functions returning `Element` (function name must start with a capital letter or contain an underscore). A component re-renders only when its props change (by `PartialEq`) or a reactive state it reads is updated.
 
 - Props must be owned values (`String`, `Vec<T>`, not `&str`/`&[T]`) implementing `PartialEq + Clone`.
-- Wrap a prop type in `ReadOnlySignal<T>` to make it reactive and `Copy` — memos/resources reading it re-run when the prop changes.
+- Wrap a prop type in `ReadSignal<T>` to make it reactive and `Copy` — memos/resources reading it re-run when the prop changes. (`ReadOnlySignal` is the older spelling and is now a deprecated alias, which `-D warnings` rejects.) **A plain prop read inside a `use_memo` closure is captured once and never re-read**, so the memo goes on describing what the component mounted with — that left FRE-122's dialog holding a stale capability gate after the connection's write protection changed under it.
+- **`use_effect` subscribes to the signals its closure *reads*.** A `bool` computed during render and captured by the closure subscribes to nothing, so the effect runs once at mount and never again; read the signal inside the closure. Some effects here read nothing deliberately (`shell.rs`, `grid/detail.rs` — both say so); the trap is one that *looks* conditional on changing state and is not. FRE-122's dialog seemed to work anyway, because a schema reload unmounted its subtree — a side effect of someone else's loading state, found by review rather than by driving the app.
 
 ## RSX syntax
 

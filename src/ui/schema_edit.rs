@@ -79,6 +79,12 @@ pub(super) fn run_action(press: Press) -> RunAction {
     if let Some(problem) = press.problem {
         return RunAction::Incomplete(problem);
     }
+    // The box is editable, so it can be emptied. Without this the press runs a
+    // script with no statements, which reports nothing at all — a button that
+    // silently does nothing is the worst of the three states it could be in.
+    if press.sql.trim().is_empty() {
+        return RunAction::Incomplete(NOTHING_TO_RUN);
+    }
     if press.destroys_data && press.typed.trim() != press.table_name {
         return RunAction::TypeTheName;
     }
@@ -87,6 +93,9 @@ pub(super) fn run_action(press: Press) -> RunAction {
     }
     RunAction::Run
 }
+
+/// What an emptied SQL box reports.
+pub(super) const NOTHING_TO_RUN: &str = "There is no statement to run.";
 
 /// Everything a Run press is decided from — see [`run_action`], whose
 /// arguments these are.
@@ -142,13 +151,24 @@ pub fn SchemaEditDialog(
     /// The object the operation applies to. Its columns and indexes are what
     /// the forms offer, and its kind is half of whether anything is offered
     /// at all.
-    table: TableMeta,
+    ///
+    /// A [`ReadSignal`], with `dialect` and `caps` below, because the
+    /// memos in this component read all three: a plain prop is captured once
+    /// into a memo's closure and never re-read, so the generated SQL and the
+    /// refusal would go on describing the metadata the dialog opened with.
+    /// `caps` is the one that would mislead — write protection can be changed
+    /// on a live connection (`ConnectionRegistry::set_protection`), and a stale
+    /// gate would leave the button offering what the user just forbade. The
+    /// write itself is still refused (`start_schema_edit` re-resolves
+    /// capabilities and `run_script` checks the text), so this is about the
+    /// button not lying rather than about the guard.
+    table: ReadSignal<TableMeta>,
     /// The operation, seeded by whichever button opened the dialog — a per-index
     /// Drop arrives with its index name, a per-column Rename with its column.
     op: SchemaOp,
-    dialect: Dialect,
+    dialect: ReadSignal<Dialect>,
     /// The connection's effective capabilities (FRE-87/111).
-    caps: Capabilities,
+    caps: ReadSignal<Capabilities>,
     /// The connection's name when it is marked *confirm writes*, `None`
     /// otherwise.
     confirm_connection: Option<String>,
@@ -163,28 +183,42 @@ pub fn SchemaEditDialog(
     let mut edited = use_signal(|| Option::<String>::None);
     let mut typed_name = use_signal(String::new);
     let mut confirmed = use_signal(|| Option::<String>::None);
-    // A previous edit's line belongs to the pane, not to this dialog: without
-    // clearing it, reopening after a success would close immediately on the
-    // stale Done.
-    use_hook(move || state.clear_schema_edit_status(id));
+    // A *finished* previous edit's line belongs to the pane, not to this
+    // dialog: without clearing it, reopening after a success would close
+    // immediately on the stale Done. A `Running` one is left alone — clearing
+    // it would re-enable Run while a statement is still in flight, and the
+    // second press would send a second one.
+    use_hook(move || {
+        if !state.schema_edit_status(id).is_some_and(|s| s.is_running()) {
+            state.clear_schema_edit_status(id);
+        }
+    });
 
-    let meta = table.clone();
-    let generated = use_memo(move || schema_op_sql(dialect, &meta, &op()));
+    let generated = use_memo(move || schema_op_sql(dialect(), &table.read(), &op()));
     let sql = use_memo(move || edited().unwrap_or_else(&*generated));
 
-    let refusal_table = table.clone();
-    let refusal = use_memo(move || schema_edit_refusal(caps, dialect, &refusal_table, &op()));
+    let refusal = use_memo(move || schema_edit_refusal(caps(), dialect(), &table.read(), &op()));
     let problem = use_memo(move || op_problem(&op()));
-    let note = use_memo(move || op().note(dialect));
+    let note = use_memo(move || op().note(dialect()));
 
     let status = state.schema_edit_status(id);
     let running = status.as_ref().is_some_and(|s| s.is_running());
     // Done closes the dialog — the pane's line reports what happened, and
     // keeping a dialog open around a statement that has already run invites
     // running it twice.
-    let done = matches!(status, Some(ref s) if !s.is_running() && s.error().is_none());
+    //
+    // **The status is read inside the closure**, not captured as a bool from
+    // the render above. `use_effect` subscribes to the signals its closure
+    // reads; a captured value subscribes to nothing, so the effect would run
+    // once at mount — when there is deliberately no status — and never again.
+    // The dialog appeared to close anyway, because a successful edit reloads
+    // the schema and the pane unmounts this whole subtree while it loads. That
+    // is somebody else's side effect, not a way to dismiss a dialog.
     use_effect(move || {
-        if done {
+        let finished = state
+            .schema_edit_status(id)
+            .is_some_and(|s| !s.is_running() && s.error().is_none());
+        if finished {
             on_close.call(());
         }
     });
@@ -195,7 +229,7 @@ pub fn SchemaEditDialog(
         refusal: refusal(),
         problem: problem(),
         destroys_data: op().destroys_data(),
-        table_name: &table.name,
+        table_name: &table.read().name,
         typed: &typed_name(),
         confirms,
         confirmed: confirmed().as_deref(),
@@ -203,7 +237,6 @@ pub fn SchemaEditDialog(
     });
     let armed = action == RunAction::Run && confirms;
 
-    let run_table = table.clone();
     let run = move |_| {
         let sql = sql();
         if action != RunAction::Run {
@@ -212,18 +245,24 @@ pub fn SchemaEditDialog(
             }
             return;
         }
+        let meta = table.read().clone();
         let target = TableRef {
-            schema: run_table.schema.clone(),
-            name: run_table.name.clone(),
+            schema: meta.schema.clone(),
+            name: meta.name.clone(),
         };
         let op = op();
+        // Whether the statement *differs* from the generated one, not whether
+        // the box was touched: retyping a character and undoing it leaves an
+        // override that says nothing about what runs. This is what decides
+        // whether the selection may follow a rename.
+        let edited = sql != generated();
         state.start_schema_edit(
             id,
             SchemaEditRequest {
-                after: after_edit(&op, edited.peek().is_some(), &target),
+                after: after_edit(&op, edited, &target),
                 table: target,
-                running_label: running_label(&op, &run_table),
-                done_label: done_label(&op, &run_table),
+                running_label: running_label(&op, &meta),
+                done_label: done_label(&op, &meta),
                 sql,
             },
         );
@@ -248,11 +287,11 @@ pub fn SchemaEditDialog(
                         "{op().label()}"
                     }
                     span { class: "truncate font-mono text-xs text-slate-500 dark:text-slate-400",
-                        "{table_label(&table)}"
+                        "{table_label(&table.read())}"
                     }
                 }
 
-                OpForm { table: table.clone(), op }
+                OpForm { table: table(), op }
 
                 if let Some(note) = note() {
                     div { class: "mb-2",
@@ -291,7 +330,7 @@ pub fn SchemaEditDialog(
                 // you sure?", because reading which table it is is the point.
                 if op().destroys_data() && refusal().is_none() {
                     label { class: "mb-2 flex flex-wrap items-center gap-2 text-xs text-slate-600 dark:text-slate-300",
-                        "Type {table.name} to confirm"
+                        "Type {table.read().name} to confirm"
                         input {
                             class: INPUT_CLASS,
                             value: "{typed_name()}",
@@ -550,6 +589,27 @@ mod tests {
     #[test]
     fn an_ordinary_operation_runs_on_one_press() {
         assert_eq!(run_action(press()), RunAction::Run);
+    }
+
+    #[test]
+    fn an_emptied_box_says_so_instead_of_running_nothing() {
+        for sql in ["", "   ", "\n\t "] {
+            assert_eq!(
+                run_action(Press { sql, ..press() }),
+                RunAction::Incomplete(NOTHING_TO_RUN),
+                "{sql:?}"
+            );
+        }
+        // …and a refusal still outranks it: the connection's answer is the
+        // more useful one, and it does not depend on what is in the box.
+        assert_eq!(
+            run_action(Press {
+                sql: "",
+                refusal: Some(NO_DDL),
+                ..press()
+            }),
+            RunAction::Refused(NO_DDL)
+        );
     }
 
     #[test]

@@ -206,6 +206,13 @@ pub fn schema_edit_refusal(
 /// Every identifier is quoted through [`quote_ident`], including the ones the
 /// user typed: they are names, never SQL, and a name with a quote or a space in
 /// it is legal on all three backends.
+///
+/// Every name is also trimmed, uniformly. Surrounding space in a typed name is
+/// never meant — and since quoting makes it *significant*, an untrimmed one
+/// silently creates an object nobody can refer to by the name they typed. On a
+/// rename it is worse than cosmetic: [`after_edit`](crate::ui::state::after_edit)
+/// points the pane at the trimmed name, so the two must agree
+/// (`names_are_trimmed_so_a_stray_space_is_not_part_of_the_identifier`).
 pub fn schema_op_sql(dialect: Dialect, table: &TableMeta, op: &SchemaOp) -> String {
     let object = qualified(table.schema.as_deref(), &table.name);
     match op {
@@ -215,7 +222,7 @@ pub fn schema_op_sql(dialect: Dialect, table: &TableMeta, op: &SchemaOp) -> Stri
             unique,
         } => {
             let unique = if *unique { "UNIQUE " } else { "" };
-            let columns: Vec<String> = columns.iter().map(|c| quote_ident(c)).collect();
+            let columns: Vec<String> = columns.iter().map(|c| quote_ident(c.trim())).collect();
             format!(
                 "CREATE {unique}INDEX {} ON {object} ({});",
                 quote_ident(name.trim()),
@@ -226,8 +233,10 @@ pub fn schema_op_sql(dialect: Dialect, table: &TableMeta, op: &SchemaOp) -> Stri
         // index is a schema object addressed on its own; on SQL Server it is
         // owned by its table and cannot be dropped without naming it.
         SchemaOp::DropIndex { name } => match dialect {
-            Dialect::SqlServer => format!("DROP INDEX {} ON {object};", quote_ident(name)),
-            Dialect::Sqlite => format!("DROP INDEX {};", quote_ident(name)),
+            Dialect::SqlServer => {
+                format!("DROP INDEX {} ON {object};", quote_ident(name.trim()))
+            }
+            Dialect::Sqlite => format!("DROP INDEX {};", quote_ident(name.trim())),
             Dialect::Postgres => format!(
                 "DROP INDEX {};",
                 qualified(table.schema.as_deref(), name.trim())
@@ -280,13 +289,13 @@ pub fn schema_op_sql(dialect: Dialect, table: &TableMeta, op: &SchemaOp) -> Stri
                     "EXEC sp_rename {}, {}, 'COLUMN';",
                     string_literal(&sp_rename_target(
                         table.schema.as_deref(),
-                        &[&table.name, column]
+                        &[&table.name, column.trim()]
                     )),
                     string_literal(new_name)
                 ),
                 Dialect::Sqlite | Dialect::Postgres => format!(
                     "ALTER TABLE {object} RENAME COLUMN {} TO {};",
-                    quote_ident(column),
+                    quote_ident(column.trim()),
                     quote_ident(new_name)
                 ),
             }
@@ -304,11 +313,15 @@ pub fn schema_op_sql(dialect: Dialect, table: &TableMeta, op: &SchemaOp) -> Stri
 
 /// The dotted name `sp_rename` takes for its first argument, bracket-quoted.
 ///
-/// **Brackets rather than the `"…"` used everywhere else in this crate.**
-/// `sp_rename` parses this out of a *string*, and how it reads a `"` there
-/// depends on the session's QUOTED_IDENTIFIER setting — brackets do not depend
-/// on anything. `]` is escaped by doubling, exactly as `"` is in
-/// [`quote_ident`].
+/// **Brackets rather than the `"…"` used everywhere else in this crate.** Not
+/// because `"` fails: it was measured, and `EXEC sp_rename '"dbo"."t"', 't2'`
+/// renames the table on SQL Server 2022 (16.0.4265) even under
+/// `SET QUOTED_IDENTIFIER OFF` — `sp_rename` parses the name itself rather than
+/// letting the session's quoting rules at it. The reason is narrower and
+/// local: this name is built *inside a string literal* whose own delimiter is
+/// `'`, and nesting a second `"`-escape inside that is a spelling nobody
+/// re-reading it can check at a glance. `]` is doubled, exactly as `"` is in
+/// [`quote_ident`], and `sqlserver_renames_through_sp_rename` runs the result.
 fn sp_rename_target(schema: Option<&str>, parts: &[&str]) -> String {
     let mut out = String::new();
     for part in schema.iter().copied().chain(parts.iter().copied()) {
@@ -578,17 +591,69 @@ mod tests {
         assert_eq!(split_statements(&sql, Dialect::Sqlite).len(), 1);
     }
 
+    /// Every name the user can type, padded — the property below feeds these
+    /// through every operation and dialect.
+    fn every_op_padded() -> Vec<SchemaOp> {
+        vec![
+            SchemaOp::CreateIndex {
+                name: "  idx_new  ".into(),
+                columns: vec!["  id  ".into()],
+                unique: false,
+            },
+            SchemaOp::DropIndex {
+                name: "  idx_t_id  ".into(),
+            },
+            SchemaOp::AddColumn {
+                name: "  note  ".into(),
+                type_name: "  text  ".into(),
+            },
+            SchemaOp::RenameTable {
+                new_name: "  t2  ".into(),
+            },
+            SchemaOp::RenameColumn {
+                column: "  id  ".into(),
+                new_name: "  ident  ".into(),
+            },
+        ]
+    }
+
     #[test]
     fn names_are_trimmed_so_a_stray_space_is_not_part_of_the_identifier() {
         let meta = table(None, "t");
-        let op = SchemaOp::AddColumn {
-            name: "  note  ".into(),
-            type_name: "  text  ".into(),
-        };
         assert_eq!(
-            schema_op_sql(Dialect::Sqlite, &meta, &op),
+            schema_op_sql(
+                Dialect::Sqlite,
+                &meta,
+                &SchemaOp::AddColumn {
+                    name: "  note  ".into(),
+                    type_name: "  text  ".into(),
+                }
+            ),
             "ALTER TABLE \"t\" ADD COLUMN \"note\" text;"
         );
+
+        // Every operation, every dialect: a padded name must never reach the
+        // statement with its padding. This is not cosmetic on a rename —
+        // `after_edit` points the pane at the *trimmed* name, so a generator
+        // that created `"  t2  "` would send the selection to a table that
+        // does not exist, which is the failure that whole function exists to
+        // avoid.
+        let meta = table(Some("s"), "t");
+        for dialect in DIALECTS {
+            for op in every_op_padded() {
+                let sql = schema_op_sql(dialect, &meta, &op);
+                assert!(
+                    !sql.contains("\"  ") && !sql.contains("  \""),
+                    "{dialect:?} {op:?} kept the padding: {sql}"
+                );
+                // The bracket-quoted sp_rename target is a second spelling of
+                // the same identifiers, and has to be trimmed too.
+                assert!(
+                    !sql.contains("[  ") && !sql.contains("  ]"),
+                    "{dialect:?} {op:?} kept the padding inside sp_rename: {sql}"
+                );
+            }
+        }
     }
 
     /// Every combination of the two capabilities the gate can turn on.
