@@ -53,7 +53,9 @@ keyring = { version = "3", features = ["apple-native"] }
 keyring = { version = "3", features = ["windows-native"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "time", "io-util", "net"] }
+# `sync` is for the OnceCell the SQL Server suites use to build their
+# per-process database exactly once (FRE-127).
+tokio = { version = "1", features = ["rt", "macros", "time", "io-util", "net", "sync"] }
 tempfile = "3"
 
 [features]

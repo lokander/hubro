@@ -13,7 +13,13 @@
 //! `trustServerCertificate=true` (the form's dev checkbox equivalent).
 //!
 //! Every test creates and drops its own uniquely-named objects in `dbo`, so
-//! the suite is re-runnable and tests stay independent of each other.
+//! the suite is re-runnable and tests stay independent of each other *within*
+//! this binary. Isolation from the other SQL Server suites — which cargo runs
+//! concurrently against the same server, with the same fixture names — comes
+//! from [`common::mssql_test_url`], which puts this process in a database of
+//! its own (FRE-127).
+
+mod common;
 
 use hubro::db::{
     apply_staged, detect_row_identity, mssql_url_with_password, run_script, split_statements,
@@ -22,14 +28,8 @@ use hubro::db::{
     StatementOutcome, TableKind, TableMeta, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
-fn test_url() -> Option<String> {
-    match std::env::var("HUBRO_MSSQL_TEST_URL") {
-        Ok(url) => Some(url),
-        Err(_) => {
-            eprintln!("skipping sql server test: HUBRO_MSSQL_TEST_URL not set");
-            None
-        }
-    }
+async fn test_url() -> Option<String> {
+    common::mssql_test_url().await
 }
 
 /// Whether an error is SQL Server picking this session as a deadlock victim
@@ -97,7 +97,7 @@ fn page_request(table: &str) -> PageRequest {
 
 #[tokio::test]
 async fn sqlserver_connects_and_validates_with_a_round_trip() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     // open_mssql itself validates with a SELECT 1 round-trip.
     let pool = DbPool::open_mssql(&url).await.unwrap();
     assert_eq!(pool.dialect(), Dialect::SqlServer);
@@ -108,7 +108,7 @@ async fn sqlserver_connects_and_validates_with_a_round_trip() {
 
 #[tokio::test]
 async fn sqlserver_bad_password_is_an_authentication_error() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let wrong = mssql_url_with_password(&url, "definitely-wrong-password").unwrap();
     let err = DbPool::open_mssql(&wrong)
         .await
@@ -125,7 +125,7 @@ async fn sqlserver_bad_password_is_an_authentication_error() {
 
 #[tokio::test]
 async fn sqlserver_introspection_covers_identity_computed_rowversion_and_defaults() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -194,7 +194,7 @@ async fn sqlserver_introspection_covers_identity_computed_rowversion_and_default
 
 #[tokio::test]
 async fn sqlserver_introspection_covers_indexes_fks_and_views() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -328,7 +328,7 @@ async fn sqlserver_introspection_covers_indexes_fks_and_views() {
 
 #[tokio::test]
 async fn sqlserver_paging_sorting_filtering_and_values_work() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -403,7 +403,7 @@ async fn sqlserver_paging_sorting_filtering_and_values_work() {
 
 #[tokio::test]
 async fn sqlserver_rich_types_render_correctly() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -493,7 +493,7 @@ async fn sqlserver_rich_types_render_correctly() {
 
 #[tokio::test]
 async fn sqlserver_staged_edits_round_trip_and_identity_stays_server_assigned() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -583,7 +583,7 @@ async fn sqlserver_staged_edits_round_trip_and_identity_stays_server_assigned() 
 
 #[tokio::test]
 async fn sqlserver_staged_row_count_mismatch_rolls_the_batch_back() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -647,7 +647,7 @@ async fn sqlserver_staged_row_count_mismatch_rolls_the_batch_back() {
 
 #[tokio::test]
 async fn sqlserver_script_go_batches_split_and_execute() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(&pool, &["DROP TABLE IF EXISTS dbo.script_go_probe"]).await;
 
@@ -693,7 +693,7 @@ async fn sqlserver_script_go_batches_split_and_execute() {
 
 #[tokio::test]
 async fn sqlserver_script_errors_roll_the_whole_script_back() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(&pool, &["DROP TABLE IF EXISTS dbo.script_rb_probe"]).await;
 
@@ -733,7 +733,7 @@ async fn sqlserver_script_errors_roll_the_whole_script_back() {
 
 #[tokio::test]
 async fn sqlserver_query_capped_stops_and_bounds_cells() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
 
     // Row cap: 25 rows exist, ask for 10.
@@ -784,7 +784,7 @@ async fn sqlserver_query_capped_stops_and_bounds_cells() {
 /// here keeps the contract from drifting back apart.
 #[tokio::test]
 async fn sqlserver_empty_results_keep_their_column_headers() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -813,7 +813,7 @@ async fn sqlserver_empty_results_keep_their_column_headers() {
 
 #[tokio::test]
 async fn sqlserver_export_streams_csv_and_json() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -881,7 +881,7 @@ async fn sqlserver_export_streams_csv_and_json() {
 
 #[tokio::test]
 async fn sqlserver_bounded_page_previews_large_text_and_binary() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -971,7 +971,7 @@ async fn sqlserver_trailing_spaces_still_count_toward_the_preview_length() {
     // to come back as a silent 2048-character prefix carrying no
     // `PreviewInfo` — which the grid then copies to the clipboard, and worse,
     // saves back over the real data on an inline edit.
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     let body = PREVIEW_BYTES - 48;
     let padding = 1000;
@@ -1026,7 +1026,7 @@ async fn sqlserver_trailing_spaces_still_count_toward_the_preview_length() {
 
 #[tokio::test]
 async fn sqlserver_sql_variant_cells_browse_and_fetch_safely() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -1082,7 +1082,7 @@ async fn sqlserver_sql_variant_cells_browse_and_fetch_safely() {
 
 #[tokio::test]
 async fn sqlserver_table_stats_come_from_the_partition_counters() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -1178,7 +1178,7 @@ async fn sqlserver_table_stats_come_from_the_partition_counters() {
 
 #[tokio::test]
 async fn sqlserver_an_empty_table_reports_zero_rows_not_nothing() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -1210,7 +1210,7 @@ async fn sqlserver_an_empty_table_reports_zero_rows_not_nothing() {
 
 #[tokio::test]
 async fn sqlserver_offers_no_plan_view_rather_than_a_dangerous_one() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
 
     // T-SQL has no `EXPLAIN` statement (FRE-119). Its estimated plan comes

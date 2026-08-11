@@ -278,7 +278,7 @@ async fn budget_big_value_page_bounded() {
 #[tokio::test]
 #[ignore = "needs HUBRO_PG_TEST_URL; run with --ignored"]
 async fn budget_postgres_parity() {
-    let Ok(url) = std::env::var("HUBRO_PG_TEST_URL") else {
+    let Some(url) = common::pg_test_url().await else {
         eprintln!("skipping postgres parity: HUBRO_PG_TEST_URL not set");
         return;
     };

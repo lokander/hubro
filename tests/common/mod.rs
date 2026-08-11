@@ -526,3 +526,223 @@ impl Timings {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// A database per test binary (FRE-127)
+// ---------------------------------------------------------------------------
+
+/// The SQL Server URL this test binary should use: `HUBRO_MSSQL_TEST_URL` with
+/// the database swapped for one created for this process alone. `None` when
+/// the variable is unset, which is how every SQL Server suite skips.
+///
+/// See [`per_process_database`] for why.
+pub async fn mssql_test_url() -> Option<String> {
+    static URL: tokio::sync::OnceCell<Option<String>> = tokio::sync::OnceCell::const_new();
+    URL.get_or_init(|| per_process_database(Engine::SqlServer))
+        .await
+        .clone()
+}
+
+/// The Postgres URL this test binary should use — the same treatment, for the
+/// same reason. `HUBRO_PG_TEST_URL`, database swapped.
+pub async fn pg_test_url() -> Option<String> {
+    static URL: tokio::sync::OnceCell<Option<String>> = tokio::sync::OnceCell::const_new();
+    URL.get_or_init(|| per_process_database(Engine::Postgres))
+        .await
+        .clone()
+}
+
+/// Which server a per-process database is being built on. The two differ in
+/// how they are opened, how identifiers are quoted, and — the awkward one —
+/// how the sweep below can tell a database's age.
+#[derive(Clone, Copy)]
+enum Engine {
+    Postgres,
+    SqlServer,
+}
+
+impl Engine {
+    fn env(self) -> &'static str {
+        match self {
+            Engine::Postgres => "HUBRO_PG_TEST_URL",
+            Engine::SqlServer => "HUBRO_MSSQL_TEST_URL",
+        }
+    }
+
+    async fn open(self, url: &str) -> Result<DbPool, hubro::db::DbError> {
+        match self {
+            Engine::Postgres => DbPool::open_postgres(url).await,
+            Engine::SqlServer => DbPool::open_mssql(url).await,
+        }
+    }
+
+    fn quote(self, name: &str) -> String {
+        match self {
+            Engine::Postgres => format!("\"{name}\""),
+            Engine::SqlServer => format!("[{name}]"),
+        }
+    }
+
+    /// Lists leftover databases old enough to sweep.
+    ///
+    /// SQL Server records `create_date`, so it can be asked directly. Postgres
+    /// records no creation time for a database at all, which is why the name
+    /// carries a unix timestamp — the alternative, reading it off the data
+    /// directory with `pg_stat_file`, needs superuser and a server-local path.
+    fn stale_query(self) -> String {
+        match self {
+            Engine::Postgres => format!(
+                "SELECT datname FROM pg_database
+                  WHERE datname LIKE '{TEST_DB_PREFIX}%'
+                    AND split_part(datname, '_', 4) ~ '^[0-9]+$'
+                    AND split_part(datname, '_', 4)::bigint
+                        < EXTRACT(EPOCH FROM now()) - {STALE_TEST_DB_SECONDS}"
+            ),
+            Engine::SqlServer => format!(
+                "SELECT name FROM sys.databases
+                  WHERE name LIKE '{TEST_DB_PREFIX}%'
+                    AND create_date < DATEADD(second, -{STALE_TEST_DB_SECONDS}, GETDATE())"
+            ),
+        }
+    }
+}
+
+/// How old a leftover database must be before a later run sweeps it.
+///
+/// The only real race is a binary that has created its database but not yet
+/// connected to it — a window of milliseconds. Ten minutes is far beyond that
+/// while keeping leftovers from piling up. A suite still running after ten
+/// minutes is safe regardless: `DROP DATABASE` fails outright on a database
+/// with live connections, and the sweep ignores that.
+const STALE_TEST_DB_SECONDS: u64 = 600;
+
+/// Prefix for the per-process databases, and so also the sweep's pattern.
+const TEST_DB_PREFIX: &str = "hubro_test_";
+
+/// Builds this process a database of its own and returns the URL naming it.
+///
+/// # Why
+///
+/// The gated server suites built their fixtures in whatever database the URL
+/// named — in practice one shared database per engine. Cargo runs test
+/// binaries in parallel, so several suites ran concurrently against it using
+/// the *same fixture names*, and dropped each other's tables. Measured on
+/// stock containers: two concurrent copies of `db_sqlserver` failed 4-9 tests
+/// each, `db_postgres` 4-13, with errors like "Invalid object name" and
+/// `relation "bit_key" does not exist`, plus SQL Server's deadlock-victim kill
+/// (error 1205) as the tail.
+///
+/// A database per process fixes both halves and, unlike a per-test name
+/// prefix, needs no change to a single fixture: names stay as they were and
+/// only the URL moves. It also isolates the *catalog*, which is where the
+/// deadlocks were coming from.
+///
+/// # Lifetime
+///
+/// Created on first use and left behind at exit: a Rust test binary has no
+/// teardown hook, and there is no safe point to run an async drop from. Each
+/// run instead sweeps databases older than [`STALE_TEST_DB_SECONDS`] first,
+/// which self-cleans without a race.
+async fn per_process_database(engine: Engine) -> Option<String> {
+    let base = match std::env::var(engine.env()) {
+        Ok(url) => url,
+        Err(_) => {
+            eprintln!("skipping: {} not set", engine.env());
+            return None;
+        }
+    };
+    let admin = engine
+        .open(&base)
+        .await
+        .unwrap_or_else(|e| panic!("{} must be connectable: {e}", engine.env()));
+
+    // Best effort throughout: a sweep that fails leaves rubbish behind, which
+    // is not a reason to fail the suite. Dropped one at a time and ignored
+    // individually, because a database still in use makes `DROP DATABASE` fail
+    // — and in one batch that failure would abort the rest of the sweep, so
+    // the tidying would stop working exactly when there is something to tidy.
+    match admin.query(&engine.stale_query()).await {
+        Ok(stale) => {
+            for row in &stale.rows {
+                if let Some(hubro::db::Value::Text(name)) = row.first() {
+                    let _ = admin
+                        .query(&format!("DROP DATABASE {}", engine.quote(name)))
+                        .await;
+                }
+            }
+        }
+        // Said out loud rather than swallowed. A sweep that silently stopped
+        // working would look exactly like a sweep with nothing to do, and the
+        // only symptom would be leftovers accumulating for months.
+        Err(e) => eprintln!("warning: could not list stale test databases: {e}"),
+    }
+
+    // PID keeps concurrent binaries apart; the timestamp keeps successive runs
+    // of the same binary apart, since PIDs are reused — and it is what the
+    // Postgres sweep reads the age from, so its format is load-bearing.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let name = format!("{TEST_DB_PREFIX}{}_{secs}", std::process::id());
+    admin
+        .query(&format!("CREATE DATABASE {}", engine.quote(&name)))
+        .await
+        .unwrap_or_else(|e| panic!("could not create the test database {name}: {e}"));
+    admin.close().await;
+    Some(with_database(&base, &name))
+}
+
+/// Rewrites a database URL to name a different database.
+///
+/// The database is the URL's path, between the authority's `/` and the query.
+/// Written out here rather than pulled from `src/db` because nothing there
+/// needs it: the app connects to the database the user named.
+pub fn with_database(url: &str, database: &str) -> String {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let (authority, tail) = match rest.find('/') {
+        Some(at) => (&rest[..at], &rest[at + 1..]),
+        None => (rest, ""),
+    };
+    let query = tail.find('?').map(|at| &tail[at..]).unwrap_or("");
+    format!("{scheme}://{authority}/{database}{query}")
+}
+
+#[test]
+fn a_rewritten_url_keeps_everything_but_the_database() {
+    // The credentials, port and parameters all have to survive, or the suites
+    // silently reconnect to the wrong place — or not at all.
+    assert_eq!(
+        with_database(
+            "mssql://sa:Str0ng%21Passw0rd@localhost:14333/master?encrypt=on&trustServerCertificate=true",
+            "hubro_test_1_2"
+        ),
+        "mssql://sa:Str0ng%21Passw0rd@localhost:14333/hubro_test_1_2?encrypt=on&trustServerCertificate=true"
+    );
+    // Percent-encoded userinfo passes through untouched. The database is
+    // located as the first `/` after the scheme, which is correct precisely
+    // because userinfo may not contain a bare `/` — a password that does has
+    // to be encoded, and would not survive sqlx or tiberius either. This case
+    // is here because the naive reading of "the first slash" looks wrong until
+    // you check that.
+    assert_eq!(
+        with_database("postgres://u:a%2Fb@h:5432/demo", "db"),
+        "postgres://u:a%2Fb@h:5432/db"
+    );
+    assert_eq!(
+        with_database(
+            "postgres://tester:testpass@localhost:5433/demo",
+            "hubro_test_1_2"
+        ),
+        "postgres://tester:testpass@localhost:5433/hubro_test_1_2"
+    );
+    // No path at all, and a path that is already empty.
+    assert_eq!(
+        with_database("postgres://u@h:5432", "db"),
+        "postgres://u@h:5432/db"
+    );
+    assert_eq!(
+        with_database("postgres://u@h:5432/?sslmode=disable", "db"),
+        "postgres://u@h:5432/db?sslmode=disable"
+    );
+}
