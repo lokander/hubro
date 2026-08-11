@@ -25,6 +25,8 @@
 
 use super::*;
 
+use crate::ui::schema_edit::NOTHING_TO_RUN;
+
 /// Progress of the most recent schema edit on one connection.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SchemaEditStatus {
@@ -149,6 +151,13 @@ impl AppState {
         };
         let statements = split_statements(&request.sql, pool.dialect());
         if statements.is_empty() {
+            // Reachable past the dialog's own blank check: `-- nothing` and
+            // `;` are not blank, and `split_statements` skips comment-only and
+            // empty statements. Reported rather than returned silently — a
+            // press that does nothing at all is indistinguishable from one
+            // that failed to register.
+            let generation = self.begin_schema_edit(id, &request.running_label);
+            self.finish_schema_edit(id, generation, Err(NOTHING_TO_RUN.into()), &request);
             return;
         }
         let generation = self.begin_schema_edit(id, &request.running_label);

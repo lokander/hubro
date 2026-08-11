@@ -210,7 +210,7 @@ pub fn schema_edit_refusal(
 /// Every name is also trimmed, uniformly. Surrounding space in a typed name is
 /// never meant — and since quoting makes it *significant*, an untrimmed one
 /// silently creates an object nobody can refer to by the name they typed. On a
-/// rename it is worse than cosmetic: [`after_edit`](crate::ui::state::after_edit)
+/// rename it is worse than cosmetic: `after_edit` (in `ui::state::schema_edit`)
 /// points the pane at the trimmed name, so the two must agree
 /// (`names_are_trimmed_so_a_stray_space_is_not_part_of_the_identifier`).
 pub fn schema_op_sql(dialect: Dialect, table: &TableMeta, op: &SchemaOp) -> String {
