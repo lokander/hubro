@@ -677,6 +677,11 @@ pub struct PasswordPrompt {
     /// Auth mode of the attempt, carried through so the retry (e.g. after an
     /// SSH passphrase) resumes the same Entra/password flow.
     pub auth: ServerAuth,
+    /// What the card's "remember in the keyring" box offers. A first prompt
+    /// asks with it ticked; a re-prompt after a rejected SSH passphrase offers
+    /// the answer the user already gave, so a mistyped passphrase cannot
+    /// silently restore a decision to store one they had cleared (FRE-162).
+    pub remember: bool,
 }
 
 /// A pending host-key trust decision for a tunneled Postgres or SQL Server
