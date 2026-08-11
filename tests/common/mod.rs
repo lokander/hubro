@@ -604,11 +604,16 @@ impl Engine {
                         < EXTRACT(EPOCH FROM now()) - {STALE_TEST_DB_SECONDS}"
             ),
             // T-SQL has no regex; `[_]` escapes the wildcard, and `create_date`
-            // means the name's timestamp is not load-bearing here.
+            // means the name's timestamp is not load-bearing here. Built from
+            // the constant rather than written out: a hardcoded pattern that
+            // drifted from the prefix would match nothing, and "no rows" is
+            // indistinguishable from a clean server, so the warning below
+            // could never catch it.
             Engine::SqlServer => format!(
                 "SELECT name FROM sys.databases
-                  WHERE name LIKE 'hubro[_]test[_]%'
-                    AND create_date < DATEADD(second, -{STALE_TEST_DB_SECONDS}, GETDATE())"
+                  WHERE name LIKE '{}%'
+                    AND create_date < DATEADD(second, -{STALE_TEST_DB_SECONDS}, GETDATE())",
+                TEST_DB_PREFIX.replace('_', "[_]")
             ),
         }
     }
@@ -616,14 +621,22 @@ impl Engine {
 
 /// How old a leftover database must be before a later run sweeps it.
 ///
-/// The only real race is a binary that has created its database but not yet
-/// connected to it — a window of well under a millisecond. A minute is
-/// several orders beyond that, and 15-60x the longest test binary observed
-/// (0.6-4s), while keeping leftovers to roughly a minute's worth rather than
-/// ten. A suite that *does* run longer is safe regardless: `DROP DATABASE`
-/// fails on a database with live connections — including merely idle ones,
-/// which was checked on both engines rather than assumed — and the sweep
-/// tolerates that failure.
+/// **The age is the whole of the safety story**, so it is worth stating what
+/// it is not. It is tempting to think a running suite is protected because
+/// `DROP DATABASE` fails while a session holds the database — that is true and
+/// it does not help, because these suites open a pool per test and close it
+/// again, so they hold nothing between tests, which is most of the wall clock.
+/// Dropping a *running* suite's own database was tried and succeeded within
+/// about two seconds, failing four of its tests with
+/// `database "hubro_test_…" does not exist`.
+///
+/// So the number has to cover a whole binary's life, not just the
+/// create-to-first-connect gap. Measured exposure from `CREATE DATABASE` to
+/// exit is 0.95-2.6s under ten-way concurrency and 1.7-3.0s serialised, so a
+/// minute is a 20-40x margin — while keeping leftovers to about a minute's
+/// worth rather than ten. (A sweep clearing a backlog can make a *run* take
+/// far longer than that, but it happens before the `CREATE`, so it does not
+/// extend the window.)
 const STALE_TEST_DB_SECONDS: u64 = 60;
 
 /// Prefix for the per-process databases, and so also the sweep's pattern.
@@ -720,17 +733,20 @@ async fn per_process_database(engine: Engine) -> Option<String> {
 /// needs it: the app connects to the database the user named.
 pub fn with_database(url: &str, database: &str) -> String {
     let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
-    // The authority ends at the first `/` — or, when there is no path at all,
-    // at the `?` that starts the query. Missing that second case appended the
-    // database *inside the last query value* (`…&trustServerCertificate=true/NEW`),
-    // which then fails to parse.
-    let authority_end = rest
-        .find('/')
-        .map(|at| (at, at + 1))
-        .or_else(|| rest.find('?').map(|at| (at, at)))
-        .unwrap_or((rest.len(), rest.len()));
-    let (authority, tail) = (&rest[..authority_end.0], &rest[authority_end.1..]);
-    let query = tail.find('?').map(|at| &tail[at..]).unwrap_or("");
+    // Query first, *then* the path inside what precedes it. Looking for the
+    // path separator first is what made this wrong twice: a `/` in a query
+    // value — `?sslrootcert=/etc/ssl/root.crt`, a stock sqlx parameter — reads
+    // as the start of the path, and a URL with a query but no path put the
+    // database name inside the last parameter. Split in this order and neither
+    // is expressible.
+    let (before_query, query) = match rest.find('?') {
+        Some(at) => (&rest[..at], &rest[at..]),
+        None => (rest, ""),
+    };
+    let authority = match before_query.find('/') {
+        Some(at) => &before_query[..at],
+        None => before_query,
+    };
     format!("{scheme}://{authority}/{database}{query}")
 }
 
@@ -780,6 +796,21 @@ fn a_rewritten_url_keeps_everything_but_the_database() {
     assert_eq!(
         with_database("postgres://u@[::1]:5432/demo", "db"),
         "postgres://u@[::1]:5432/db"
+    );
+    // A `/` inside a query value is not the start of a path. `sslrootcert`
+    // and friends are stock sqlx parameters holding absolute paths, and
+    // reading that slash as the path both misplaced the database *and*
+    // truncated the query.
+    assert_eq!(
+        with_database("postgres://u:p@h:5432?sslrootcert=/etc/ssl/root.crt", "db"),
+        "postgres://u:p@h:5432/db?sslrootcert=/etc/ssl/root.crt"
+    );
+    assert_eq!(
+        with_database(
+            "postgres://u:p@h:5432/demo?sslrootcert=/etc/ssl/root.crt",
+            "db"
+        ),
+        "postgres://u:p@h:5432/db?sslrootcert=/etc/ssl/root.crt"
     );
     assert_eq!(
         with_database("postgres://u@h:5432/?sslmode=disable", "db"),
