@@ -58,7 +58,7 @@ use crate::db::{
     ConnectionRegistry, DbError, DbPool, Ddl, DdlObject, Encoding, ExportFormat, Filter,
     ForeignKeyMeta, ImportOptions, ImportReport, MssqlAuth, QueryResult, Rollback, RowLocator,
     SchemaOp, SourceFormat, StagedChange, StatementResult, TableAccess, TableMeta, TableStats,
-    Value, WriteProtection,
+    Value, WriteProtection, NOTHING_TO_RUN,
 };
 use crate::history::{HistoryStore, SaveOutcome};
 use crate::tunnel::{HostKeyInfo, Tunnel, TunnelAuth, TunnelConfig, TunnelError};

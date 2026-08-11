@@ -25,8 +25,6 @@
 
 use super::*;
 
-use crate::ui::schema_edit::NOTHING_TO_RUN;
-
 /// Progress of the most recent schema edit on one connection.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SchemaEditStatus {
