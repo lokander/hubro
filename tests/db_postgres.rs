@@ -8,8 +8,10 @@
 //! ```
 //!
 //! The suite runs in a database of its own, created by `common::pg_test_url`
-//! (FRE-127): cargo runs the Postgres suites in parallel and they use the same
-//! fixture names, so sharing one database meant dropping each other's tables.
+//! (FRE-127): the Postgres suites all use the same fixture names, so any two
+//! running at once against one database dropped each other's tables. Cargo
+//! runs test targets sequentially, so the trigger is two concurrent `cargo
+//! test` invocations rather than one.
 
 mod common;
 

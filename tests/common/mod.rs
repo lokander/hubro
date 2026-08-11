@@ -591,16 +591,23 @@ impl Engine {
     /// directory with `pg_stat_file`, needs superuser and a server-local path.
     fn stale_query(self) -> String {
         match self {
+            // One whole-name regex, so the `::bigint` below can only ever see
+            // digits. Splitting the shape check from the cast across two
+            // ANDed quals left the cast's safety resting on the planner not
+            // reordering them — true here, but not something a reader should
+            // have to verify. It also matches exactly: `_` is a wildcard in
+            // LIKE, so `'{TEST_DB_PREFIX}%'` would also match `hubroXtestY…`.
             Engine::Postgres => format!(
                 "SELECT datname FROM pg_database
-                  WHERE datname LIKE '{TEST_DB_PREFIX}%'
-                    AND split_part(datname, '_', 4) ~ '^[0-9]+$'
+                  WHERE datname ~ '^{TEST_DB_PREFIX}[0-9]+_[0-9]+$'
                     AND split_part(datname, '_', 4)::bigint
                         < EXTRACT(EPOCH FROM now()) - {STALE_TEST_DB_SECONDS}"
             ),
+            // T-SQL has no regex; `[_]` escapes the wildcard, and `create_date`
+            // means the name's timestamp is not load-bearing here.
             Engine::SqlServer => format!(
                 "SELECT name FROM sys.databases
-                  WHERE name LIKE '{TEST_DB_PREFIX}%'
+                  WHERE name LIKE 'hubro[_]test[_]%'
                     AND create_date < DATEADD(second, -{STALE_TEST_DB_SECONDS}, GETDATE())"
             ),
         }
@@ -610,11 +617,14 @@ impl Engine {
 /// How old a leftover database must be before a later run sweeps it.
 ///
 /// The only real race is a binary that has created its database but not yet
-/// connected to it — a window of milliseconds. Ten minutes is far beyond that
-/// while keeping leftovers from piling up. A suite still running after ten
-/// minutes is safe regardless: `DROP DATABASE` fails outright on a database
-/// with live connections, and the sweep ignores that.
-const STALE_TEST_DB_SECONDS: u64 = 600;
+/// connected to it — a window of well under a millisecond. A minute is
+/// several orders beyond that, and 15-60x the longest test binary observed
+/// (0.6-4s), while keeping leftovers to roughly a minute's worth rather than
+/// ten. A suite that *does* run longer is safe regardless: `DROP DATABASE`
+/// fails on a database with live connections — including merely idle ones,
+/// which was checked on both engines rather than assumed — and the sweep
+/// tolerates that failure.
+const STALE_TEST_DB_SECONDS: u64 = 60;
 
 /// Prefix for the per-process databases, and so also the sweep's pattern.
 const TEST_DB_PREFIX: &str = "hubro_test_";
@@ -624,13 +634,23 @@ const TEST_DB_PREFIX: &str = "hubro_test_";
 /// # Why
 ///
 /// The gated server suites built their fixtures in whatever database the URL
-/// named — in practice one shared database per engine. Cargo runs test
-/// binaries in parallel, so several suites ran concurrently against it using
-/// the *same fixture names*, and dropped each other's tables. Measured on
-/// stock containers: two concurrent copies of `db_sqlserver` failed 4-9 tests
-/// each, `db_postgres` 4-13, with errors like "Invalid object name" and
-/// `relation "bit_key" does not exist`, plus SQL Server's deadlock-victim kill
-/// (error 1205) as the tail.
+/// named — in practice one shared database per engine — using the *same
+/// fixture names*. Any two suites running at once therefore dropped each
+/// other's tables.
+///
+/// Note what does **not** cause that: cargo runs test *targets* sequentially
+/// (measured — never more than one test binary alive at a time), so a plain
+/// `cargo test` was never the trigger. Two concurrent `cargo test`
+/// **invocations** are: two agents on one container set, which the root
+/// CLAUDE.md warns about and which this does not make safe — the databases in
+/// the fixture *set* are still shared. Measured on stock containers, two
+/// concurrent copies of one suite: `db_sqlserver` 4-9 failures each,
+/// `db_postgres` 4-13, with errors like "Invalid object name" and
+/// `relation "bit_key" does not exist`.
+///
+/// SQL Server's deadlock-victim kill (1205) is a second, smaller effect and
+/// was never only about concurrency: 30 solo runs of `db_ddl` against the
+/// shared `master` produced 4 failures, all 1205, against 0 in 80 runs here.
 ///
 /// A database per process fixes both halves and, unlike a per-test name
 /// prefix, needs no change to a single fixture: names stay as they were and
@@ -700,10 +720,16 @@ async fn per_process_database(engine: Engine) -> Option<String> {
 /// needs it: the app connects to the database the user named.
 pub fn with_database(url: &str, database: &str) -> String {
     let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
-    let (authority, tail) = match rest.find('/') {
-        Some(at) => (&rest[..at], &rest[at + 1..]),
-        None => (rest, ""),
-    };
+    // The authority ends at the first `/` — or, when there is no path at all,
+    // at the `?` that starts the query. Missing that second case appended the
+    // database *inside the last query value* (`…&trustServerCertificate=true/NEW`),
+    // which then fails to parse.
+    let authority_end = rest
+        .find('/')
+        .map(|at| (at, at + 1))
+        .or_else(|| rest.find('?').map(|at| (at, at)))
+        .unwrap_or((rest.len(), rest.len()));
+    let (authority, tail) = (&rest[..authority_end.0], &rest[authority_end.1..]);
     let query = tail.find('?').map(|at| &tail[at..]).unwrap_or("");
     format!("{scheme}://{authority}/{database}{query}")
 }
@@ -736,10 +762,24 @@ fn a_rewritten_url_keeps_everything_but_the_database() {
         ),
         "postgres://tester:testpass@localhost:5433/hubro_test_1_2"
     );
-    // No path at all, and a path that is already empty.
+    // No path at all, and — the case the first version of this test claimed
+    // to cover and didn't — no path *with* a query, where the database was
+    // being appended inside the last parameter value.
     assert_eq!(
         with_database("postgres://u@h:5432", "db"),
         "postgres://u@h:5432/db"
+    );
+    assert_eq!(
+        with_database(
+            "mssql://sa:p@h:14333?encrypt=on&trustServerCertificate=true",
+            "db"
+        ),
+        "mssql://sa:p@h:14333/db?encrypt=on&trustServerCertificate=true"
+    );
+    // An IPv6 literal host keeps its brackets and colons.
+    assert_eq!(
+        with_database("postgres://u@[::1]:5432/demo", "db"),
+        "postgres://u@[::1]:5432/db"
     );
     assert_eq!(
         with_database("postgres://u@h:5432/?sslmode=disable", "db"),
