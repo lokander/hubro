@@ -23,14 +23,25 @@ use super::state::{
 const MAX_RENDERED_ROWS: usize = 500;
 
 /// Messages the CodeMirror bundle sends over the eval channel.
+///
+/// The two that carry text name the **buffer** they belong to, rather than
+/// leaving the handler to ask which buffer is active when the message lands.
+/// Those stopped being the same question in FRE-154: the editor now flushes
+/// its pending text on the way *out* of a buffer, so a message describing the
+/// outgoing one arrives, by design, after the switch. `Doc` carries the
+/// document generation for the same reason — see
+/// [`SqlBuffers::set_text`](super::state::SqlBuffers::set_text).
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum EditorMessage {
     Run {
         sql: String,
+        buffer: u64,
     },
     Doc {
         doc: String,
+        buffer: u64,
+        generation: u64,
     },
     /// The bundle never turned up, or `create` threw — see
     /// [`editor_mount_js`]. Carries the text to show in the pane, because the
@@ -125,14 +136,16 @@ fn editor_mount_js(
     dialect: Dialect,
     initial_json: &str,
     schema_json: &str,
+    buffer: u64,
+    generation: u64,
 ) -> String {
     let dialect_name = dialect_name(dialect);
     let unavailable = js_string(EDITOR_UNAVAILABLE);
     let create_failed = js_string(EDITOR_CREATE_FAILED);
     format!(
         r#"
-        window.__dvRun = (p) => dioxus.send(JSON.stringify({{ kind: "run", sql: p.sql }}));
-        window.__dvDoc = (p) => dioxus.send(JSON.stringify({{ kind: "doc", doc: p.doc }}));
+        window.__dvRun = (p) => dioxus.send(JSON.stringify({{ kind: "run", sql: p.sql, buffer: p.buffer }}));
+        window.__dvDoc = (p) => dioxus.send(JSON.stringify({{ kind: "doc", doc: p.doc, buffer: p.buffer, generation: p.generation }}));
         (async () => {{
             window.__dvGen = window.__dvGen || {{}};
             const mine = (window.__dvGen["{element}"] = (window.__dvGen["{element}"] || 0) + 1);
@@ -148,7 +161,7 @@ fn editor_mount_js(
                 return;
             }}
             try {{
-                DVEditor.create("{element}", "{element}", "{dialect_name}", {initial_json}, {schema_json});
+                DVEditor.create("{element}", "{element}", "{dialect_name}", {initial_json}, {schema_json}, {buffer}, {generation});
             }} catch (err) {{
                 dioxus.send(JSON.stringify({{ kind: "failed", message: {create_failed} + " (" + err + ")" }}));
                 return;
@@ -179,9 +192,11 @@ fn editor_redo_js(
     element: &str,
     dialect: Dialect,
     doc_json: &str,
+    buffer: u64,
+    generation: u64,
     schema: Option<&SchemaLoad>,
 ) -> String {
-    let mut js = format!(r#"DVEditor.setDoc("{element}", {doc_json});"#);
+    let mut js = format!(r#"DVEditor.setDoc("{element}", {doc_json}, {buffer}, {generation});"#);
     if let Some(SchemaLoad::Ready(tables)) = schema {
         let dialect_name = dialect_name(dialect);
         let schema_json = completion_schema(tables, dialect);
@@ -270,21 +285,20 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
     // the memo gates it — and reads the text with `peek`, so a keystroke
     // never pushes the document back into the editor under the caret.
     //
-    // Known gap (not introduced here): the bundle flushes the document to
-    // Rust on a 250 ms trailing timer and clears that timer on any change,
-    // including the one `setDoc` dispatches. Text typed in the last 250 ms
-    // before a switch is therefore lost. Closing it means flushing before
-    // `setDoc`, i.e. rebuilding the checked-in `assets/codemirror.js`.
+    // The target goes to the bundle as well as the text: `setDoc` flushes
+    // whatever the outgoing document still owed under its *old* token before
+    // taking the new one (FRE-154), which is what keeps the last 250 ms of
+    // typing from vanishing into the buffer being switched away from.
     let element_for_switch = editor_element.clone();
     use_effect(move || {
-        let (buffer, _generation) = doc_target();
+        let (buffer, generation) = doc_target();
         let text = state
             .tab_ui
             .peek()
             .get(&id)
             .map_or(String::new(), |ui| ui.sql.text(buffer).to_string());
         document::eval(&format!(
-            r#"DVEditor.setDoc("{element_for_switch}", {});"#,
+            r#"DVEditor.setDoc("{element_for_switch}", {}, {buffer}, {generation});"#,
             js_string(&text)
         ));
     });
@@ -475,7 +489,7 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
         match panel() {
             EditorPanel::None => rsx! {},
             EditorPanel::History => rsx! {
-                HistoryPanel { id, buffer: active, editor_element: editor_element.clone() }
+                HistoryPanel { id, buffer: active }
             },
             EditorPanel::Saved => rsx! {
                 SavedQueriesPanel { id, buffer: active }
@@ -528,11 +542,7 @@ fn EditorSurface(id: ConnectionId, dialect: Dialect) -> Element {
         let element = element_for_effect.clone();
         // Peeked, not read: this effect must run on mount and never again,
         // or every keystroke would recreate the editor.
-        let initial = state
-            .tab_ui
-            .peek()
-            .get(&id)
-            .map_or(String::new(), |ui| ui.sql.text(ui.sql.active()).to_string());
+        let (buffer, generation, initial) = state.peek_sql_document(id);
         // Whatever the introspection has produced so far; the refresh
         // effect below pushes updates once (re)loads finish.
         let schema_json = match state.schemas.peek().get(&id) {
@@ -541,22 +551,35 @@ fn EditorSurface(id: ConnectionId, dialect: Dialect) -> Element {
         };
         let initial_json = js_string(&initial);
         spawn(async move {
-            let js = editor_mount_js(&element, dialect, &initial_json, &schema_json);
+            let js = editor_mount_js(
+                &element,
+                dialect,
+                &initial_json,
+                &schema_json,
+                buffer,
+                generation,
+            );
             let mut channel = document::eval(&js);
             // The channel closes (Err) when the component unmounts.
             while let Ok(raw) = channel.recv::<String>().await {
                 match serde_json::from_str::<EditorMessage>(&raw) {
-                    Ok(EditorMessage::Run { sql }) => {
+                    // Both text-carrying messages are filed under the buffer
+                    // the *editor* names, not under whichever is active when
+                    // they arrive. The editor flushes on the way out of a
+                    // buffer (FRE-154), so those differ exactly when it
+                    // matters: asking here would file the outgoing buffer's
+                    // tail — or its Ctrl+Enter — under the incoming one.
+                    Ok(EditorMessage::Run { sql, buffer }) => {
                         let trimmed = sql.trim();
                         if !trimmed.is_empty() {
-                            let buffer = state.active_sql_buffer(id);
                             state.run_sql(id, buffer, trimmed.to_string());
                         }
                     }
-                    Ok(EditorMessage::Doc { doc }) => {
-                        let buffer = state.active_sql_buffer(id);
-                        state.set_sql_text(id, buffer, doc);
-                    }
+                    Ok(EditorMessage::Doc {
+                        doc,
+                        buffer,
+                        generation,
+                    }) => state.set_sql_text(id, buffer, generation, doc),
                     Ok(EditorMessage::Failed { message }) => load_failure.set(Some(message)),
                     // The editor exists now, but it was built from the
                     // snapshot this effect took *before* the wait. Anything
@@ -567,17 +590,25 @@ fn EditorSurface(id: ConnectionId, dialect: Dialect) -> Element {
                     // keystroke would then flush it over the current buffer)
                     // or sit without completions for the rest of the session.
                     Ok(EditorMessage::Ready) => {
-                        let doc =
-                            state.tab_ui.peek().get(&id).map_or(String::new(), |ui| {
-                                ui.sql.text(ui.sql.active()).to_string()
-                            });
+                        // The *current* target, not the one `create` was
+                        // handed: that is the point of the redo, and it is
+                        // also the token the editor must hold from now on, or
+                        // its next flush would be filed under a buffer it
+                        // stopped showing during the wait.
+                        let (buffer, generation, doc) = state.peek_sql_document(id);
                         // The schema entry goes in as-is: whether it is fit to
                         // push is `editor_redo_js`'s rule, not a second copy
                         // of it here. The guard is a local so nothing is held
                         // across the eval.
                         let schemas = state.schemas.peek();
-                        let js =
-                            editor_redo_js(&element, dialect, &js_string(&doc), schemas.get(&id));
+                        let js = editor_redo_js(
+                            &element,
+                            dialect,
+                            &js_string(&doc),
+                            buffer,
+                            generation,
+                            schemas.get(&id),
+                        );
                         drop(schemas);
                         document::eval(&js);
                     }
@@ -1171,9 +1202,121 @@ mod tests {
         }
     }
 
-    /// The mount script as the effect builds it.
+    /// The mount script as the effect builds it. Buffer 7, generation 3:
+    /// values that are neither the first buffer's id nor zero, so an argument
+    /// dropped on the way to `create` cannot coincide with a plausible
+    /// default and pass anyway.
     fn mount_js() -> String {
-        editor_mount_js("sql-editor-1-", Dialect::Postgres, "\"SELECT 1\"", "{}")
+        editor_mount_js(
+            "sql-editor-1-",
+            Dialect::Postgres,
+            "\"SELECT 1\"",
+            "{}",
+            7,
+            3,
+        )
+    }
+
+    #[test]
+    fn the_editor_is_told_which_document_it_is_holding() {
+        // FRE-154. The editor stamps every message with this pair, and the
+        // handler files the text by it rather than by whichever buffer is
+        // active when the message lands. Without it reaching `create`, the
+        // first flush after a mount is stamped `undefined` and the message
+        // fails to deserialize — the tail is lost exactly as before, only
+        // more quietly.
+        let js = mount_js();
+        assert!(
+            js.contains(r#""postgres", "SELECT 1", {}, 7, 3);"#),
+            "create must be handed the document target alongside the text: {js}"
+        );
+        // And the wire must carry it back. The mount script is what copies the
+        // bundle's payload onto the message, so a rename on either side shows
+        // up here.
+        assert!(
+            js.contains("buffer: p.buffer") && js.contains("generation: p.generation"),
+            "the doc message must carry the buffer and generation it was \
+             typed under, or the handler is back to guessing: {js}"
+        );
+        assert!(
+            js.contains(r#"kind: "run", sql: p.sql, buffer: p.buffer"#),
+            "a run must name its buffer too — Ctrl+Enter can be the last thing \
+             before a switch, and its results belong to the tab it was pressed \
+             in: {js}"
+        );
+
+        // The Rust side must understand both, including the fields.
+        let parsed: EditorMessage =
+            serde_json::from_str(r#"{"kind":"doc","doc":"SELECT 1","buffer":7,"generation":3}"#)
+                .unwrap();
+        match parsed {
+            EditorMessage::Doc {
+                doc,
+                buffer,
+                generation,
+            } => {
+                assert_eq!(doc, "SELECT 1");
+                assert_eq!((buffer, generation), (7, 3));
+            }
+            other => panic!("expected Doc, got {other:?}"),
+        }
+        let parsed: EditorMessage =
+            serde_json::from_str(r#"{"kind":"run","sql":"SELECT 1","buffer":7}"#).unwrap();
+        match parsed {
+            EditorMessage::Run { sql, buffer } => {
+                assert_eq!((sql.as_str(), buffer), ("SELECT 1", 7));
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+        // A message without the stamp is rejected rather than defaulted: a
+        // silent `0` would file every flush under a buffer id that never
+        // exists (ids start at 1), losing the text with no sign of it.
+        assert!(serde_json::from_str::<EditorMessage>(r#"{"kind":"doc","doc":"x"}"#).is_err());
+    }
+
+    /// The committed bundle, which is where the FRE-154 flush actually lives.
+    const BUNDLE: &str = include_str!("../../assets/codemirror.js");
+
+    #[test]
+    fn the_committed_bundle_still_flushes_on_the_way_out() {
+        // `assets/codemirror.js` is a build artifact that is committed, and
+        // rebuilt by hand (see `assets/codemirror-README.md`). So an edit to
+        // `codemirror-entry.js` that lands without the rebuild changes
+        // nothing the app runs, and every other test here — which only ever
+        // reads the *Rust* side of the boundary — stays green while the fix is
+        // absent.
+        //
+        // Matched on object-literal keys and a DOM event name: the things a
+        // minifier cannot rename. The mangled locals around them are free to
+        // change with the esbuild version.
+        assert!(
+            BUNDLE.contains("blur:"),
+            "the bundle has no blur handler, so nothing flushes the pending \
+             document before a pane switch tears the editor down — rebuild it \
+             from codemirror-entry.js (assets/codemirror-README.md)"
+        );
+        assert!(BUNDLE.contains("domEventHandlers"));
+
+        let doc_payload = payload(BUNDLE, "window.__dvDoc({");
+        assert!(
+            doc_payload.contains("buffer:") && doc_payload.contains("generation:"),
+            "the bundle sends documents unstamped, so a flush of the outgoing \
+             buffer is indistinguishable from a reply about the incoming one \
+             — rebuild it: {doc_payload}"
+        );
+        let run_payload = payload(BUNDLE, "window.__dvRun({");
+        assert!(run_payload.contains("buffer:"), "{run_payload}");
+    }
+
+    /// The object literal a bundle call site passes, from `opening` to the
+    /// `})` that closes it.
+    fn payload<'a>(bundle: &'a str, opening: &str) -> &'a str {
+        let (_, rest) = bundle
+            .split_once(opening)
+            .unwrap_or_else(|| panic!("the bundle no longer calls {opening}"));
+        rest.split_once("})")
+            .expect("an unterminated call would not have parsed")
+            .0
     }
 
     #[test]
@@ -1340,10 +1483,12 @@ mod tests {
             "sql-editor-1-",
             Dialect::Sqlite,
             "\"SELECT 1\"",
+            7,
+            3,
             Some(&ready),
         );
         assert!(
-            js.contains(r#"DVEditor.setDoc("sql-editor-1-", "SELECT 1")"#),
+            js.contains(r#"DVEditor.setDoc("sql-editor-1-", "SELECT 1", 7, 3)"#),
             "the redo must restore the document — without it this whole \
              message is decoration and a tab switch during the wait still \
              loses text: {js}"
@@ -1360,7 +1505,14 @@ mod tests {
         // realistic trigger is `Loading` (a reload starting during the wait).
         let failed = SchemaLoad::Failed("boom".to_string());
         for schema in [None, Some(&SchemaLoad::Loading), Some(&failed)] {
-            let js = editor_redo_js("sql-editor-1-", Dialect::Sqlite, "\"SELECT 1\"", schema);
+            let js = editor_redo_js(
+                "sql-editor-1-",
+                Dialect::Sqlite,
+                "\"SELECT 1\"",
+                7,
+                3,
+                schema,
+            );
             assert!(
                 js.contains("setDoc"),
                 "the document is pushed regardless of the schema"

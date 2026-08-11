@@ -19,24 +19,43 @@ impl AppState {
         }
     }
 
-    /// Which buffer one tab's SQL pane is showing.
-    pub fn active_sql_buffer(&self, id: ConnectionId) -> u64 {
-        self.tab_ui
-            .read()
-            .get(&id)
-            .map_or(FIRST_SQL_BUFFER, |ui| ui.sql.active())
-    }
+    // There is deliberately no `active_sql_buffer`. Its only caller was the
+    // editor's message handler, asking which buffer was active in order to
+    // file text the editor had just sent — and since FRE-154 those are
+    // different buffers exactly when it matters, because the editor flushes on
+    // the way *out* of one. Every message now names its own buffer. Leaving
+    // the accessor behind would leave the wrong answer one call away.
 
     /// What the SQL pane should currently be displaying: the active buffer
-    /// and the generation of the last text placed into a buffer from outside
-    /// the editor (see [`SqlBuffers::doc_target`]). The pane pushes the
-    /// document into CodeMirror whenever this changes — the buffer id alone
-    /// would miss an open that reuses the buffer already on screen.
+    /// and that buffer's document generation (see [`SqlBuffers::doc_target`]).
+    /// The pane pushes the document into CodeMirror whenever this changes —
+    /// the buffer id alone would miss an open that reuses the buffer already
+    /// on screen — and hands the pair to the editor as the token every reply
+    /// comes back stamped with.
     pub fn sql_doc_target(&self, id: ConnectionId) -> (u64, u64) {
         self.tab_ui
             .read()
             .get(&id)
             .map_or((FIRST_SQL_BUFFER, 0), |ui| ui.sql.doc_target())
+    }
+
+    /// The active buffer, its document generation, and its text, read
+    /// **without subscribing**.
+    ///
+    /// For the two paths that hand CodeMirror a whole document: the mount and
+    /// the post-wait redo. Both run inside effects that must not re-run on a
+    /// keystroke, while [`Self::sql_doc_target`] reads the signal. Keeping the
+    /// peek in one place is what stops either call site being rewritten as a
+    /// `read` later — which would recreate the editor on every keystroke.
+    pub fn peek_sql_document(&self, id: ConnectionId) -> (u64, u64, String) {
+        let tab_ui = self.tab_ui.peek();
+        match tab_ui.get(&id) {
+            Some(ui) => {
+                let (buffer, generation) = ui.sql.doc_target();
+                (buffer, generation, ui.sql.text(buffer).to_string())
+            }
+            None => (FIRST_SQL_BUFFER, 0, String::new()),
+        }
     }
 
     /// One buffer's text, empty when it is gone.
@@ -47,19 +66,48 @@ impl AppState {
             .map_or(String::new(), |ui| ui.sql.text(buffer).to_string())
     }
 
-    /// Stores one buffer's editor text (synced from the webview on change).
-    /// An actual text change invalidates that buffer's pending write
-    /// confirmation — the banner must never run SQL that no longer matches
-    /// the buffer.
-    pub fn set_sql_text(mut self, id: ConnectionId, buffer: u64, text: String) {
+    /// Stores one buffer's editor text, as the webview reported it.
+    ///
+    /// `generation` is the document generation the editor was holding when the
+    /// text was typed; a message stamped with an older one describes a
+    /// document that has since been replaced and is dropped (see
+    /// [`SqlBuffers::set_text`]). An actual text change invalidates that
+    /// buffer's pending write confirmation — the banner must never run SQL
+    /// that no longer matches the buffer.
+    pub fn set_sql_text(mut self, id: ConnectionId, buffer: u64, generation: u64, text: String) {
         let changed = self
             .tab_ui
             .write()
             .entry(id)
             .or_default()
             .sql
-            .set_text(buffer, text);
+            .set_text(buffer, generation, text);
         if changed {
+            self.pending_sql.write().remove(&(id, buffer));
+        }
+    }
+
+    /// Replaces one buffer's text from outside the editor — the history
+    /// panel's Load and Run.
+    ///
+    /// Moves that buffer's document generation, which does two things at once:
+    /// the SQL pane pushes the new text into CodeMirror (so the call site
+    /// needs no `setDoc` of its own), and the editor's in-flight report of the
+    /// text being replaced is discarded instead of undoing the load.
+    ///
+    /// Invalidates the pending write confirmation unconditionally: unlike a
+    /// keystroke this is a replacement, and a banner parked against the old
+    /// text must not survive it even in the (harmless-looking) case where the
+    /// loaded text happens to be identical.
+    pub fn load_sql_text(mut self, id: ConnectionId, buffer: u64, text: String) {
+        let loaded = self
+            .tab_ui
+            .write()
+            .entry(id)
+            .or_default()
+            .sql
+            .load(buffer, text);
+        if loaded {
             self.pending_sql.write().remove(&(id, buffer));
         }
     }
@@ -147,9 +195,11 @@ impl AppState {
     /// Explains the buffer, not a selection: Ctrl+Enter reads the selection
     /// from CodeMirror as it fires, and a button press has no such event to
     /// read it from. It therefore also uses the buffer text as last synced
-    /// from the editor, which the bundle flushes on a 250 ms trailing timer —
+    /// from the editor, which the bundle sends on a 250 ms trailing timer —
     /// the same small staleness the saved-query and history paths already
-    /// live with.
+    /// live with. Pressing the button blurs the editor, which flushes that
+    /// timer early (FRE-154), but the flush and the click reach Rust over
+    /// different channels, so this is narrowed rather than closed.
     pub fn run_explain(self, id: ConnectionId, buffer: u64) {
         let backend = self.registry.read().get(id).and_then(|connection| {
             Some((

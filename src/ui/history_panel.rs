@@ -4,8 +4,11 @@
 //!
 //! Its own module rather than part of [`super::editor`]: the panel is a
 //! self-contained feature that touches the editor at exactly two points —
-//! pushing text into the CodeMirror instance by element id, and asking
-//! [`AppState`] to run it.
+//! loading text into the buffer on screen, and asking [`AppState`] to run it.
+//! Neither speaks to CodeMirror directly. Loading goes through
+//! [`AppState::load_sql_text`], which moves the buffer's document target and
+//! so makes the SQL pane push the text in; a `setDoc` here as well would be a
+//! second way to do the same thing, and the one to fall behind.
 
 use chrono::{DateTime, Local};
 use dioxus::prelude::*;
@@ -13,7 +16,7 @@ use dioxus::prelude::*;
 use crate::db::ConnectionId;
 use crate::history::{HistoryEntry, HISTORY_CAP};
 
-use super::js::{copy_to_clipboard, js_string};
+use super::js::copy_to_clipboard;
 use super::notice::{Banner, BannerKind, LoadingLine};
 use super::state::AppState;
 
@@ -26,7 +29,7 @@ const HISTORY_PANEL_LIMIT: i64 = HISTORY_CAP;
 /// history: search, per-entry Load / Run / Copy, clear-history, and the
 /// recording opt-out.
 #[component]
-pub(super) fn HistoryPanel(id: ConnectionId, buffer: u64, editor_element: String) -> Element {
+pub(super) fn HistoryPanel(id: ConnectionId, buffer: u64) -> Element {
     let state = use_context::<AppState>();
     // The controlled input; `search` only follows it on Enter (or when the
     // input is cleared) so each keystroke doesn't hit the database.
@@ -129,7 +132,6 @@ pub(super) fn HistoryPanel(id: ConnectionId, buffer: u64, editor_element: String
                                         key: "{entry.id}",
                                         id,
                                         buffer,
-                                        editor_element: editor_element.clone(),
                                         entry: entry.clone(),
                                     }
                                 }
@@ -185,18 +187,14 @@ fn HistoryRow(
     id: ConnectionId,
     /// The SQL buffer Load and Run target: the one on screen.
     buffer: u64,
-    editor_element: String,
     entry: HistoryEntry,
 ) -> Element {
     let state = use_context::<AppState>();
     let time = format_history_time(entry.executed_at);
     let preview: String = entry.sql.split_whitespace().collect::<Vec<_>>().join(" ");
-    let json_for_load = js_string(&entry.sql);
-    let json_for_run = json_for_load.clone();
     let sql_for_load = entry.sql.clone();
     let sql_for_run = entry.sql.clone();
     let sql_for_copy = entry.sql.clone();
-    let element_for_run = editor_element.clone();
     let title = match &entry.error {
         Some(error) => format!("{}\n\n{error}", entry.sql),
         None => entry.sql.clone(),
@@ -219,12 +217,7 @@ fn HistoryRow(
             div { class: "mt-1 flex gap-1 pl-4",
                 button {
                     class: "rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
-                    onclick: move |_| {
-                        document::eval(&format!(
-                            r#"DVEditor.setDoc("{editor_element}", {json_for_load});"#
-                        ));
-                        state.set_sql_text(id, buffer, sql_for_load.clone());
-                    },
+                    onclick: move |_| state.load_sql_text(id, buffer, sql_for_load.clone()),
                     "Load"
                 }
                 button {
@@ -232,10 +225,7 @@ fn HistoryRow(
                     // Load into the editor buffer first so a write-confirm
                     // banner is confirmed against the text on screen (FRE-72).
                     onclick: move |_| {
-                        document::eval(&format!(
-                            r#"DVEditor.setDoc("{element_for_run}", {json_for_run});"#
-                        ));
-                        state.set_sql_text(id, buffer, sql_for_run.clone());
+                        state.load_sql_text(id, buffer, sql_for_run.clone());
                         state.run_sql(id, buffer, sql_for_run.clone());
                     },
                     "Run"
