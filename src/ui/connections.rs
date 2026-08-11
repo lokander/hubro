@@ -1165,6 +1165,13 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
     let mut password = use_signal(String::new);
     // Seeded from the prompt, not from `true`: a re-prompt after a rejected
     // passphrase carries the answer the user already gave (FRE-162).
+    //
+    // The seed only decides the box when this card was actually unmounted in
+    // between — its `key:` is url + kind, which a re-prompt for the same
+    // connection reuses. It is unmounted in practice, because the submit
+    // clears `password_prompt` before the retry awaits. Both routes land on
+    // the same value anyway: a surviving signal is holding the choice the user
+    // just made, which is what the prompt now carries.
     let offered = prompt.remember;
     let mut remember = use_signal(move || offered);
     let prompt_for_submit = prompt.clone();
@@ -2093,9 +2100,13 @@ mod tests {
              it and then mistyping the passphrase silently restores the \
              decision to store it (FRE-162): {body}"
         );
+        // Polarity, not merely the mention: `let offered = !prompt.remember;`
+        // reads as correctly wired up while offering every user the opposite
+        // of what they chose.
         assert!(
-            body.contains("prompt.remember"),
-            "the card ignores the choice the prompt carries: {body}"
+            body.contains("let offered = prompt.remember;")
+                && body.contains("use_signal(move || offered)"),
+            "the card ignores the choice the prompt carries, or inverts it: {body}"
         );
     }
 
