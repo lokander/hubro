@@ -908,7 +908,7 @@ pub struct AppState {
     pub theme: Signal<Theme>,
     /// Resolved dark/light, driving the root `.dark` class. Derived from
     /// `theme` and — for `System` — a one-time startup read of the OS
-    /// preference. Root-scoped: written from the startup detection task.
+    /// preference; written from the startup detection task.
     pub dark: Signal<bool>,
     /// Whether the schema sidebar lists the objects a backend declared
     /// internal (FRE-88). Persisted by
@@ -922,11 +922,11 @@ pub struct AppState {
     /// connection data (see [`Session::collapsed_groups`]).
     pub collapsed_groups: Signal<Vec<String>>,
     /// A saved-connection edit awaiting the connect that confirms it
-    /// (FRE-75). Root-scoped: the Entra sign-in card resolves it from a
-    /// background task after the form has closed.
+    /// (FRE-75). The Entra sign-in card resolves it from a background task
+    /// after the form has closed.
     pub pending_edit: Signal<Option<PendingEdit>>,
-    /// Latest export progress per connection and pane. Root-scoped: written
-    /// from the `spawn_forever` export task.
+    /// Latest export progress per connection and pane. Written from the
+    /// `spawn_forever` export task.
     pub export_status: Signal<HashMap<(ConnectionId, ExportPane), ExportStatus>>,
     /// Monotonic id per export slot; a finishing task only records its
     /// outcome while it is still the slot's latest export, so a slow export
@@ -942,8 +942,8 @@ pub struct AppState {
     /// foreign-key jumps, most recent last. [`Self::navigate_back`] pops one;
     /// a manual table selection clears the stack.
     pub nav_history: Signal<HashMap<ConnectionId, Vec<FocusTarget>>>,
-    /// Latest import progress per connection (FRE-112). Root-scoped: written
-    /// from the `spawn_forever` import task. Keyed per connection only — an
+    /// Latest import progress per connection (FRE-112). Written from the
+    /// `spawn_forever` import task. Keyed per connection only — an
     /// import is always started from the grid, so there is no second pane to
     /// tell apart.
     pub import_status: Signal<HashMap<ConnectionId, ImportStatus>>,
@@ -1012,13 +1012,19 @@ impl AppState {
         // `__copy_value_hoisted` and can fail once the creating scope drops.
         //
         // These were scoped field by field, and that judgement does not
-        // survive contact with the code: a task that calls a method that
-        // touches a signal reaches it just as surely as one naming the field,
-        // and nothing at the call site shows it. Six fields were reachable
-        // that way and only three had been noticed (FRE-156). Scoping them all
-        // the same way retires the question instead of re-answering it per
-        // field — and costs nothing, since the alternative owner outlives the
-        // app too.
+        // survive contact with the code. Six previously component-scoped
+        // fields are named *directly* inside a `spawn_forever` body, and only
+        // three of those had been noticed (FRE-156) — but a task that calls a
+        // method that touches a signal reaches it just as surely, and nothing
+        // at the call site shows it. Following those calls, 18 of the 27 were
+        // reachable. One connect handler alone reaches twelve.
+        //
+        // Scoping them all the same way retires the question instead of
+        // re-answering it per field, per task, and per intervening call — and
+        // costs nothing, since the alternative owner outlives the app too.
+        // (A few fields, `show_internal_objects` among them, were genuinely
+        // unreachable and correctly reasoned about. Uniformity is still worth
+        // more than a correct exception that has to be re-verified forever.)
         //
         // `every_app_state_signal_is_root_scoped` enforces this.
         let state = Self {
@@ -1054,6 +1060,9 @@ impl AppState {
             saved_nonce: Signal::new_in_scope(0, ScopeId::ROOT),
             saved_status: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             theme: Signal::new_in_scope(theme, ScopeId::ROOT),
+            // `false`: assume a light system default until the startup
+            // detection task below resolves the real one. An explicit
+            // Light/Dark choice overrides it either way.
             dark: Signal::new_in_scope(theme.resolve_dark(false), ScopeId::ROOT),
             show_internal_objects: Signal::new_in_scope(
                 settings.show_internal_objects,
@@ -1103,11 +1112,15 @@ impl AppState {
         });
         // Session restore is triggered once from the Shell component (see
         // `Shell`), not here: it drives the normal `connect`/`connect_server`
-        // flow, which writes the core connection signals (registry,
-        // open_locators, active, tab_ui, …). Those are owned by the root App
-        // scope, so running restore from a component-scoped task keeps the
-        // writes in a live scope — a root `spawn_forever` here would write
-        // them from a foreign scope (the `__copy_value_hoisted` case).
+        // flow, and doing it there keeps it beside the manual connect path it
+        // mirrors.
+        //
+        // It used to be justified by scope — the signals it writes were owned
+        // by `App`, so a root task here would have written them from a foreign
+        // scope. That reason is gone: every signal above is root-scoped now,
+        // and `ScopeId::ROOT` is an ancestor of every scope, so no reader is
+        // foreign to them. The placement is a structural preference now, not a
+        // constraint.
         state
     }
 
