@@ -1,5 +1,5 @@
 //! Integration tests for schema editing (FRE-122), against every engine hubro
-//! supports.
+//! supports — nine of them: SQLite plus the eight behind a `HUBRO_*_TEST_URL`.
 //!
 //! The unit tests in `src/db/schema_edit.rs` pin what the generator *emits*.
 //! These pin what the servers *accept and do* — which is the only thing that
@@ -17,7 +17,7 @@
 //!
 //! ## What the sweep found (2026-08-11)
 //!
-//! **Six of the eight engines apply all seven operations as generated**:
+//! **Seven of the nine engines apply all seven operations as generated**:
 //! SQLite, PostgreSQL, TimescaleDB, Citus, CockroachDB, YugabyteDB and SQL
 //! Server. The narrow scope holds: nothing needed a per-engine special case
 //! beyond the three dialect differences the generator already makes

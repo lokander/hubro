@@ -229,15 +229,25 @@ fn SchemaBody(id: ConnectionId, meta: TableMeta) -> Element {
                                     },
                                     "DDL"
                                 }
+                                // Only on a table, matching the action row
+                                // above. The index list is deliberately kept
+                                // for materialized views and indexed views,
+                                // where every schema edit is refused — so
+                                // rendering the button here would put a
+                                // permanently disabled control on every one
+                                // of their index rows, which is the "guard
+                                // that cannot fire" the header avoids.
                                 if let Some((dialect, caps, _)) = connection.clone() {
-                                    {
-                                        let op = SchemaOp::DropIndex { name: index.name.clone() };
-                                        rsx! {
-                                            SchemaAction {
-                                                refusal: schema_edit_refusal(caps, dialect, &meta, &op),
-                                                op,
-                                                editing,
-                                                label: "Drop",
+                                    if meta.kind == TableKind::Table {
+                                        {
+                                            let op = SchemaOp::DropIndex { name: index.name.clone() };
+                                            rsx! {
+                                                SchemaAction {
+                                                    refusal: schema_edit_refusal(caps, dialect, &meta, &op),
+                                                    op,
+                                                    editing,
+                                                    label: "Drop",
+                                                }
                                             }
                                         }
                                     }
