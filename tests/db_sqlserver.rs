@@ -14,10 +14,10 @@
 //!
 //! Every test creates and drops its own uniquely-named objects in `dbo`, so
 //! the suite is re-runnable and tests stay independent of each other *within*
-//! this binary. Isolation from the other SQL Server suites — which cargo runs
-//! concurrently against the same server, with the same fixture names — comes
-//! from [`common::mssql_test_url`], which puts this process in a database of
-//! its own (FRE-127).
+//! this binary. Isolation from the other SQL Server suites — which use the
+//! same fixture names against the same server — comes from
+//! [`common::mssql_test_url`], which puts this process in a database of its
+//! own (FRE-127).
 
 mod common;
 
