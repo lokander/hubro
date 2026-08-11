@@ -581,6 +581,35 @@ mod tests {
         assert!(err.contains("mask"), "the column must be named: {err}");
         assert!(err.contains("only 0 and 1"), "{err}");
 
+        // An empty CSV field must reach the server as `''` — a legal
+        // zero-length `bit varying` value. It gets there only because
+        // `BitString` shares Text's exemption from the empty-value guard, so
+        // this is asserted through `coerce_field` rather than through the
+        // validator alone: reverting that exemption refuses the field with
+        // "an empty value is not a bit string" and never reaches the
+        // validator at all.
+        assert_eq!(
+            coerce_field(
+                &column("mask", "bit"),
+                Dialect::Postgres,
+                &text(""),
+                EmptyField::EmptyText
+            )
+            .unwrap(),
+            Value::Text(String::new())
+        );
+        // …while the option that says an empty field means NULL still wins.
+        assert_eq!(
+            coerce_field(
+                &column("mask", "bit"),
+                Dialect::Postgres,
+                &text(""),
+                EmptyField::Null
+            )
+            .unwrap(),
+            Value::Null
+        );
+
         // A good one passes through as text — the `::bit varying` cast the
         // statement carries is what types it.
         assert_eq!(
