@@ -30,7 +30,7 @@ use dioxus_icons::lucide::X;
 
 use crate::db::{
     op_problem, schema_edit_refusal, schema_op_sql, Capabilities, ConnectionId, Dialect, SchemaOp,
-    TableMeta,
+    TableMeta, NOTHING_TO_RUN,
 };
 
 use super::notice::{Banner, BannerKind};
@@ -93,9 +93,6 @@ pub(super) fn run_action(press: Press) -> RunAction {
     }
     RunAction::Run
 }
-
-/// What an emptied SQL box reports.
-pub(super) const NOTHING_TO_RUN: &str = "There is no statement to run.";
 
 /// Everything a Run press is decided from — see [`run_action`], whose
 /// arguments these are.
@@ -228,7 +225,19 @@ pub fn SchemaEditDialog(
             on_close.call(());
         }
     });
-    let failure = status.as_ref().and_then(|s| s.error().map(str::to_string));
+    // Gated on `started` for the same reason the close is: the status is per
+    // connection, and an error from an edit this dialog did not start would
+    // render directly above this dialog's Run button, reading as though *this*
+    // operation had failed. Nothing is hidden by the gate — `SchemaEditLine`
+    // reports it above the pane, which is what that component was hoisted out
+    // of the body to do.
+    //
+    // `running` below is deliberately **not** gated: it disables Run while any
+    // edit is in flight on the connection, which is what keeps a second
+    // statement from being sent alongside the first.
+    let failure = started()
+        .then(|| status.as_ref().and_then(|s| s.error().map(str::to_string)))
+        .flatten();
 
     let confirms = confirm_connection.is_some();
     let action = run_action(Press {

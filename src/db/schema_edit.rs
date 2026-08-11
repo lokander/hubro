@@ -74,6 +74,15 @@ pub enum SchemaOp {
 /// cannot be. The sentences a disabled action shows.
 pub const NOT_A_TABLE: &str = "Schema editing is offered for tables, not views.";
 
+/// What an SQL box holding no statement reports.
+///
+/// Here rather than in the dialog because two layers need the same sentence
+/// and the question is this layer's: the dialog can see that the box is blank,
+/// but "holds no *statement*" is what
+/// [`split_statements`](super::script::split_statements) decides — `-- nothing`
+/// is not blank and is not a statement either.
+pub const NOTHING_TO_RUN: &str = "There is no statement to run.";
+
 impl SchemaOp {
     /// The label the UI shows for this operation.
     pub fn label(&self) -> &'static str {
