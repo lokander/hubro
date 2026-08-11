@@ -842,7 +842,13 @@ pub struct AppState {
     /// An entry is consumed on acceptance, and replaced by whatever the next
     /// prompt is answered with — so a later "don't remember" is not overridden
     /// by an earlier attempt that said otherwise.
-    pub ssh_remember: Signal<HashSet<String>>,
+    ///
+    /// The answer is stored rather than implied by membership, so that "the
+    /// user said no" stays distinct from "nobody asked" — the re-prompt after
+    /// a rejected passphrase offers a ticked box only in the second case, and
+    /// the connection form reaches `open_tunnel` with a passphrase and no
+    /// parked answer at all (FRE-162).
+    pub ssh_remember: Signal<HashMap<String, bool>>,
     /// Introspected schema per open connection.
     pub schemas: Signal<HashMap<ConnectionId, SchemaLoad>>,
     /// Sidebar/grid UI state per open connection.
@@ -1081,7 +1087,7 @@ impl AppState {
             entra_prompt: Signal::new_in_scope(None, ScopeId::ROOT),
             confirm_quit: Signal::new_in_scope(false, ScopeId::ROOT),
             tunnels: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
-            ssh_remember: Signal::new_in_scope(HashSet::new(), ScopeId::ROOT),
+            ssh_remember: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             schemas: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             tab_ui: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             staged: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
