@@ -1002,78 +1002,76 @@ impl AppState {
             .map(|path| load_settings(&path))
             .unwrap_or_default();
         let theme = settings.theme;
+        // Every signal is root-scoped, without exception.
+        //
+        // `AppState` is app-global by construction: `App` provides exactly one
+        // via `use_context_provider`, and it lives as long as the process. But
+        // it is *created* inside that component's scope, which is not an
+        // ancestor of the root scope the `spawn_forever` tasks run in — so a
+        // component-scoped field read or written from one of those tasks trips
+        // `__copy_value_hoisted` and can fail once the creating scope drops.
+        //
+        // These were scoped field by field, and that judgement does not
+        // survive contact with the code: a task that calls a method that
+        // touches a signal reaches it just as surely as one naming the field,
+        // and nothing at the call site shows it. Six fields were reachable
+        // that way and only three had been noticed (FRE-156). Scoping them all
+        // the same way retires the question instead of re-answering it per
+        // field — and costs nothing, since the alternative owner outlives the
+        // app too.
+        //
+        // `every_app_state_signal_is_root_scoped` enforces this.
         let state = Self {
-            registry: Signal::new(ConnectionRegistry::default()),
-            active: Signal::new(ActiveView::Connections),
-            saved: Signal::new(saved),
-            open_locators: Signal::new(Vec::new()),
-            connecting: Signal::new(Vec::new()),
-            connect_requests: Signal::new(HashMap::new()),
-            connect_error: Signal::new(load_error),
-            session_passwords: Signal::new(HashMap::new()),
-            password_prompt: Signal::new(None),
-            host_key_prompt: Signal::new(None),
-            entra_prompt: Signal::new(None),
-            confirm_quit: Signal::new(false),
-            tunnels: Signal::new(HashMap::new()),
-            schemas: Signal::new(HashMap::new()),
-            tab_ui: Signal::new(HashMap::new()),
-            // Root-scoped: written from the spawn_forever save task.
+            registry: Signal::new_in_scope(ConnectionRegistry::default(), ScopeId::ROOT),
+            active: Signal::new_in_scope(ActiveView::Connections, ScopeId::ROOT),
+            saved: Signal::new_in_scope(saved, ScopeId::ROOT),
+            open_locators: Signal::new_in_scope(Vec::new(), ScopeId::ROOT),
+            connecting: Signal::new_in_scope(Vec::new(), ScopeId::ROOT),
+            connect_requests: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            connect_error: Signal::new_in_scope(load_error, ScopeId::ROOT),
+            session_passwords: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            password_prompt: Signal::new_in_scope(None, ScopeId::ROOT),
+            host_key_prompt: Signal::new_in_scope(None, ScopeId::ROOT),
+            entra_prompt: Signal::new_in_scope(None, ScopeId::ROOT),
+            confirm_quit: Signal::new_in_scope(false, ScopeId::ROOT),
+            tunnels: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            schemas: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            tab_ui: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             staged: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             grid_refresh: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
-            nav_guard: Signal::new(None),
-            sql_runs: Signal::new(HashMap::new()),
-            pending_sql: Signal::new(HashMap::new()),
-            pending_saves: Signal::new(HashMap::new()),
-            connection_colors: Signal::new(HashMap::new()),
-            sql_tasks: Signal::new(HashMap::new()),
-            sql_generations: Signal::new(HashMap::new()),
-            // Root-scoped: these are written from `spawn_forever` tasks
-            // (which run in the root scope), so the component scope that
-            // built the state must not own them.
+            nav_guard: Signal::new_in_scope(None, ScopeId::ROOT),
+            sql_runs: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            pending_sql: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            pending_saves: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            connection_colors: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            sql_tasks: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            sql_generations: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             history: Signal::new_in_scope(None, ScopeId::ROOT),
             history_error: Signal::new_in_scope(None, ScopeId::ROOT),
             history_record_error: Signal::new_in_scope(None, ScopeId::ROOT),
             history_nonce: Signal::new_in_scope(0, ScopeId::ROOT),
             history_recording: Signal::new_in_scope(true, ScopeId::ROOT),
-            // Root-scoped for the same reason as their history neighbours:
-            // written from the `spawn_forever` save/delete tasks.
             saved_nonce: Signal::new_in_scope(0, ScopeId::ROOT),
             saved_status: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
-            // Root-scoped: the startup detection task below (a
-            // `spawn_forever` running in the root scope) reads it, so a
-            // component-scoped signal would trip `__copy_value_hoisted`.
             theme: Signal::new_in_scope(theme, ScopeId::ROOT),
-            // Start from the persisted theme assuming a light system default;
-            // the startup detection task (below) corrects `System`. Root-
-            // scoped: written from that spawn_forever task.
             dark: Signal::new_in_scope(theme.resolve_dark(false), ScopeId::ROOT),
-            // Component-scoped, unlike its neighbours: only the sidebar
-            // reads it, and its setter writes it before spawning, so no
-            // root-scoped task ever touches it. (The completion namespace
-            // demotes internal objects unconditionally, so it never reads
-            // this at all.)
-            show_internal_objects: Signal::new(settings.show_internal_objects),
+            show_internal_objects: Signal::new_in_scope(
+                settings.show_internal_objects,
+                ScopeId::ROOT,
+            ),
             // Seeded by `restore_session` rather than here: session.toml is
             // read once, at restore, and reading it twice would be two
             // chances to disagree about what the last session was.
-            collapsed_groups: Signal::new(Vec::new()),
-            // Root-scoped: resolved from the Entra sign-in task, which
-            // outlives the form that registered the edit.
+            collapsed_groups: Signal::new_in_scope(Vec::new(), ScopeId::ROOT),
             pending_edit: Signal::new_in_scope(None, ScopeId::ROOT),
-            // Root-scoped: written from the spawn_forever export task.
             export_status: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             export_generations: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
-            // Root-scoped for the same reason: written from the
-            // spawn_forever import task.
             import_status: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             import_generations: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             import_tasks: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
-            // FK navigation state is only ever touched from UI event handlers,
-            // so component scope is fine (like tab_ui / nav_guard).
-            pending_focus: Signal::new(HashMap::new()),
-            nav_history: Signal::new(HashMap::new()),
-            show_cheatsheet: Signal::new(false),
+            pending_focus: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            nav_history: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            show_cheatsheet: Signal::new_in_scope(false, ScopeId::ROOT),
         };
         // Resolve the OS dark-mode preference once at startup. Reacting to
         // live OS theme changes is out of scope (a startup read suffices);
@@ -1713,6 +1711,48 @@ pub fn tab_title(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_app_state_signal_is_root_scoped() {
+        // FRE-156. A component-scoped field touched from a `spawn_forever`
+        // task warns at runtime and can fail once the creating scope drops —
+        // and *nothing else in this suite can see it*, because the warning
+        // only exists while the app is running. Five were being logged on
+        // every connection open, from three fields; three more fields were
+        // reachable the same way and simply hadn't been hit yet.
+        //
+        // Checked against the source rather than the values because there is
+        // nothing to inspect at runtime: `Signal` does not expose its owning
+        // scope, and building an `AppState` needs a Dioxus runtime. The
+        // constructor is one contiguous struct literal, so slicing it suffices.
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("let state = Self {")
+            .expect("AppState's constructor must still be one struct literal");
+        let end = start
+            + source[start..]
+                .find("\n        };")
+                .expect("...and must still end where it always has");
+        let ctor = &source[start..end];
+        let strays: Vec<&str> = ctor
+            .lines()
+            .filter(|line| line.contains("Signal::new("))
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "these fields are owned by the component that built the state, so \
+             a root task touching them — directly, or through any method it \
+             calls — trips __copy_value_hoisted and can fail after that scope \
+             drops. Use Signal::new_in_scope(.., ScopeId::ROOT):\n{}",
+            strays.join("\n")
+        );
+        // The slice must actually contain the fields, or the assertion above
+        // passes by matching nothing at all.
+        assert!(
+            ctor.matches("Signal::new_in_scope(").count() > 20,
+            "the constructor slice came out too small to be the real one: {ctor}"
+        );
+    }
 
     #[test]
     fn tab_title_uses_the_file_name() {
