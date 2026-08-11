@@ -2088,6 +2088,28 @@ mod tests {
              the box is re-ticked after every typo, or offers the opposite of \
              what the user chose (FRE-162): {rejection}"
         );
+        // And the write must sit *inside* the verdict's gate, the way
+        // `open_tunnel_decides_on_the_passphrase_s_source_not_its_presence`
+        // pins the delete against `if drop_stored`. Of the two keyring
+        // decisions this function makes, that one was pinned and this one was
+        // not — and an inverted `if redeem` is the worse half: the delete gate
+        // inverted destroys a saved secret, while this one stores the
+        // passphrase precisely when the user declined it and never when they
+        // asked. Every other assertion here is positional or presence-based,
+        // and inverting a gate moves nothing.
+        let gate = method_body(&body, "if redeem {");
+        assert!(
+            gate.contains("persist_ssh_passphrase(url)"),
+            "the keyring write is not conditional on the redeemed choice, so \
+             the consent this whole mechanism exists to carry decides nothing \
+             (FRE-161): {gate}"
+        );
+        assert_eq!(
+            body.matches("persist_ssh_passphrase").count(),
+            1,
+            "a second, ungated write would store the passphrase whatever the \
+             user chose, leaving the gate above inert"
+        );
     }
 
     #[test]
