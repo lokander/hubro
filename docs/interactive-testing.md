@@ -25,6 +25,8 @@ Gotchas: **`xdotool type` silently drops keystrokes** into the webview — seven
 
 **Build a negative control.** Nothing in the suite covers rendering, so a passing interactive check does not show the script exercises the bug. Rebuild with only the fix reverted and re-run the identical script: if it still passes, the script is testing nothing. That turned a "verified" FRE-154 run — which would have passed either way — into a real before/after.
 
+**Driving can confirm a bug.** The negative control catches a script that tests nothing; the harder case is one that attributes the right outcome to the wrong cause. FRE-122's dialog closed after every successful edit exactly as designed — via an unrelated schema reload unmounting its subtree, while the `use_effect` written to close it had never fired once. No sequence of clicks separates those two: they produce identical pixels. When an observable has two plausible causes, driving cannot attribute it — isolate the component in a real `VirtualDom` and count the effect runs, or say plainly that you verified the outcome and not the mechanism.
+
 ## macOS
 
 The app is a native Cocoa bundle — there is no display server to nest, so **synthetic input drives the real cursor** (no Xephyr-style isolation exists). Keep interactions short: screenshot → verify → act, and save/restore the pointer around clicks. Tools: `brew install cliclick smokris/getwindowid/getwindowid`. One-time grants for the terminal app in System Settings → Privacy & Security: **Accessibility** (cliclick/System Events) and **Screen Recording** (screencapture).
