@@ -113,9 +113,10 @@ pub fn Shell() -> Element {
     });
 
     // Restore the previous session exactly once, from this component's scope
-    // (not a root `spawn_forever` in AppState::new): restore drives the normal
-    // connect flow, which writes the core connection signals — running it here
-    // keeps those writes in a live scope, matching the manual connect path.
+    // rather than a root `spawn_forever` in AppState::new: restore drives the
+    // normal connect flow, so it belongs beside the manual connect path it
+    // mirrors. (It used to be justified by signal scope as well; that reason
+    // went away when every AppState signal became root-scoped — FRE-156.)
     //
     // The same task then opens every database hubro was *told* to open
     // (FRE-114): the command-line target, then the ones the OS hands over
