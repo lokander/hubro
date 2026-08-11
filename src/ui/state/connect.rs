@@ -88,6 +88,46 @@ pub(super) fn forget_failed_ssh_passphrase(
     source == PassphraseSource::Keyring
 }
 
+/// Parks — or withdraws — the user's "remember this passphrase" choice for
+/// `url`, to be redeemed by [`redeem_ssh_remember`] once a tunnel open accepts
+/// it (FRE-161).
+///
+/// Withdrawing matters as much as parking: the intent is keyed by locator and
+/// outlives a failed attempt, so a box ticked once would otherwise make every
+/// later passphrase for that connection persist — including ones the user
+/// deliberately declined to save.
+pub(super) fn park_ssh_remember(pending: &mut HashSet<String>, url: &str, remember: bool) {
+    if remember {
+        pending.insert(url.to_string());
+    } else {
+        pending.remove(url);
+    }
+}
+
+/// Consumes any parked choice for `url` and reports whether the passphrase
+/// that just opened a tunnel should be written to the keyring.
+///
+/// The intent is consumed whichever source supplied the passphrase, so it can
+/// never outlive the attempt that redeemed it and surprise a later one. It is
+/// only *acted* on for a session-sourced passphrase: a keyring-sourced one is
+/// already stored, so re-storing it is a write whose only possible effect is
+/// to fail — on every reconnect.
+///
+/// A free function over the map, like [`forget_failed_ssh_passphrase`] above,
+/// so the policy can be executed by a test rather than read off the source:
+/// this decides whether a secret reaches the OS keyring, and *both* polarities
+/// are ways to get it wrong — one silently loses the user's choice, the other
+/// stores a secret they declined.
+#[must_use = "the verdict decides whether the passphrase is written to the keyring"]
+pub(super) fn redeem_ssh_remember(
+    pending: &mut HashSet<String>,
+    url: &str,
+    source: Option<PassphraseSource>,
+) -> bool {
+    let parked = pending.remove(url);
+    parked && source == Some(PassphraseSource::Session)
+}
+
 /// Keyring key for a connection's cached Entra refresh token. Disjoint from the
 /// password (bare URL) and SSH passphrase (`#ssh`) keys, so the three never
 /// collide. Only a refresh token is ever cached here — never an access token.
@@ -1078,9 +1118,13 @@ impl AppState {
 
     /// Completes the SSH-passphrase prompt: remembers the passphrase for the
     /// session and re-runs the parked connect (which now finds it), on the
-    /// backend and auth mode the prompt carried. Keyring persistence happens
-    /// only after the connect succeeded, so a mistyped passphrase is never
-    /// stored.
+    /// backend and auth mode the prompt carried.
+    ///
+    /// Keyring persistence does **not** happen here. The "remember" choice is
+    /// parked for [`Self::open_tunnel`] to redeem at the moment a tunnel open
+    /// accepts the passphrase, which is both the FRE-151 condition and — since
+    /// the connect frequently resumes elsewhere, via a host-key or password
+    /// prompt — the only point that reliably happens (FRE-161).
     ///
     /// Takes the whole prompt rather than its parts because that is what it
     /// completes — and an SSH-passphrase prompt always carries the tunnel
@@ -1129,14 +1173,10 @@ impl AppState {
     }
 
     /// Records — or withdraws — the user's "remember this SSH passphrase"
-    /// choice for `url`, pending a tunnel open that accepts it.
+    /// choice for `url`, pending a tunnel open that accepts it. The policy
+    /// itself is [`park_ssh_remember`], where a test can execute it.
     fn set_ssh_remember(mut self, url: &str, remember: bool) {
-        let mut pending = self.ssh_remember.write();
-        if remember {
-            pending.insert(url.to_string());
-        } else {
-            pending.remove(url);
-        }
+        park_ssh_remember(&mut self.ssh_remember.write(), url, remember);
     }
 
     /// A successful server connect always joins the saved list (add is a
@@ -1284,18 +1324,20 @@ impl AppState {
         let known_hosts = crate::tunnel::default_known_hosts_read();
         match Tunnel::open(config.clone(), passphrase, target.0, target.1, &known_hosts).await {
             Ok(live) => {
-                // The tunnel opened, so the passphrase it was handed is one the
-                // server accepted — the single condition FRE-151 places on
-                // writing it to the keyring, and the reason this happens here
-                // rather than wherever the connect eventually ends (FRE-161).
+                // The tunnel opened, so the passphrase it was handed is good:
+                // it decrypted the key file (the server never sees it — this
+                // is a key passphrase, not a credential) and the session that
+                // key authenticated came up. That is the condition FRE-151
+                // places on writing it to the keyring, and the reason the
+                // write lives here rather than wherever the connect eventually
+                // ends (FRE-161).
                 //
                 // Only for a session-sourced one: a keyring-sourced passphrase
                 // is already stored, and re-storing it would be a write whose
                 // only possible effect is to fail.
                 // The write guard is a statement temporary: nothing is held
                 // across the keyring await below.
-                let redeem = source == Some(PassphraseSource::Session)
-                    && self.ssh_remember.write().remove(url);
+                let redeem = redeem_ssh_remember(&mut self.ssh_remember.write(), url, source);
                 if redeem {
                     self.persist_ssh_passphrase(url).await;
                 }
@@ -1309,6 +1351,11 @@ impl AppState {
             }
             Err(err @ TunnelError::NeedsPassphrase(_)) => {
                 self.release_connect(url);
+                // The choice was made for the passphrase that just failed, so
+                // it dies with it: the re-prompt asks again, and leaving it
+                // parked would let some later attempt redeem a choice the user
+                // made about a different secret.
+                park_ssh_remember(&mut self.ssh_remember.write(), url, false);
                 if let Some(source) = source {
                     // Something was tried and rejected. It leaves session
                     // memory either way; only a keyring-sourced one is stale
@@ -1818,8 +1865,9 @@ mod tests {
         // *connection* being open re-breaks FRE-161.
         let body = ssh_passphrase_body();
         assert!(
-            body.contains("set_ssh_remember"),
-            "the remember choice is dropped rather than parked: {body}"
+            body.contains("set_ssh_remember(&url, remember)"),
+            "the remember choice is dropped, or parked as something other than \
+             what the user actually chose: {body}"
         );
         assert!(
             !body.contains("persist_ssh_passphrase"),
@@ -1854,38 +1902,118 @@ mod tests {
             "the passphrase is stored outside the arm where the tunnel \
              accepted it: {body}"
         );
-        // Session-sourced only. A keyring-sourced passphrase is already
-        // stored, so re-storing it is a write whose only possible effect is to
-        // fail — and it would run on every reconnect.
-        //
-        // Matched inside the redemption, not across the whole method:
-        // `open_tunnel` names `PassphraseSource::Session` earlier, where it
-        // records which source supplied the passphrase, so a whole-body match
-        // stays green with this guard deleted.
+        // The decision must go through `redeem_ssh_remember`, and be handed
+        // the source rather than deciding without it. *What* it decides — the
+        // polarity, the source rule, the consumption — is executed directly by
+        // `a_parked_choice_decides_whether_the_passphrase_is_stored` and
+        // `a_redeemed_choice_is_consumed_and_never_rewrites_the_keyring`,
+        // because an inversion here moves no call and this test would not see
+        // it.
         let redemption = &body[accepted..persist];
         assert!(
-            redemption.contains("PassphraseSource::Session"),
-            "the redemption does not distinguish a passphrase just typed from \
-             one already in the keyring: {redemption}"
+            redemption.contains("redeem_ssh_remember(") && redemption.contains("source"),
+            "the redemption bypasses the policy, or decides without knowing \
+             where the passphrase came from: {redemption}"
         );
     }
 
     #[test]
-    fn an_unticked_box_withdraws_an_earlier_remember() {
-        // The intent is keyed by locator and outlives a single attempt, so it
-        // has to be *cleared* as well as set — otherwise ticking the box once
-        // makes every later passphrase for that connection persist, including
-        // ones the user deliberately declined to save.
-        let body = method_body(
-            include_str!("connect.rs"),
-            "fn set_ssh_remember(mut self, url: &str, remember: bool)",
-        );
-        assert!(
-            body.contains("insert") && body.contains("remove"),
-            "the parked choice is set but never withdrawn: {body}"
-        );
+    fn a_parked_choice_decides_whether_the_passphrase_is_stored() {
+        // The policy itself, executed rather than read. The tests around it
+        // pin *where* the write happens; these pin *what it decides*, which is
+        // the half that can be inverted without moving a single call.
+        //
+        // Both polarities are defects, and the second is the worse one: losing
+        // the choice is FRE-161 again, but storing a secret the user declined
+        // is a privacy failure the app never mentions.
+        let url = "postgres://u@h:5432/db";
+        let mut pending = HashSet::new();
+
+        // Ticked, then accepted from a passphrase just typed: stored.
+        park_ssh_remember(&mut pending, url, true);
+        assert!(redeem_ssh_remember(
+            &mut pending,
+            url,
+            Some(PassphraseSource::Session)
+        ));
+
+        // Unticked: never stored, however the passphrase was accepted.
+        park_ssh_remember(&mut pending, url, false);
+        assert!(!redeem_ssh_remember(
+            &mut pending,
+            url,
+            Some(PassphraseSource::Session)
+        ));
+
+        // An earlier tick must not survive a later untick — the intent is
+        // keyed by locator and outlives the attempt that made it.
+        park_ssh_remember(&mut pending, url, true);
+        park_ssh_remember(&mut pending, url, false);
+        assert!(!redeem_ssh_remember(
+            &mut pending,
+            url,
+            Some(PassphraseSource::Session)
+        ));
+
+        // Never stored with no choice parked at all.
+        assert!(!redeem_ssh_remember(
+            &mut HashSet::new(),
+            url,
+            Some(PassphraseSource::Session)
+        ));
     }
 
+    #[test]
+    fn a_redeemed_choice_is_consumed_and_never_rewrites_the_keyring() {
+        let url = "postgres://u@h:5432/db";
+
+        // One tick, one write: the next acceptance must not store again.
+        let mut pending = HashSet::new();
+        park_ssh_remember(&mut pending, url, true);
+        assert!(redeem_ssh_remember(
+            &mut pending,
+            url,
+            Some(PassphraseSource::Session)
+        ));
+        assert!(
+            !redeem_ssh_remember(&mut pending, url, Some(PassphraseSource::Session)),
+            "the parked choice survived the write it authorised, so every \
+             later reconnect stores again"
+        );
+
+        // A keyring-sourced passphrase is already stored, so it is never
+        // re-written — but the intent is still consumed, so it cannot lie in
+        // wait for an unrelated later attempt.
+        let mut pending = HashSet::new();
+        park_ssh_remember(&mut pending, url, true);
+        assert!(!redeem_ssh_remember(
+            &mut pending,
+            url,
+            Some(PassphraseSource::Keyring)
+        ));
+        assert!(
+            pending.is_empty(),
+            "a choice redeemed against a stored passphrase stayed parked"
+        );
+
+        // No passphrase at all (agent auth, or an unencrypted key) stores
+        // nothing and leaves nothing behind either.
+        let mut pending = HashSet::new();
+        park_ssh_remember(&mut pending, url, true);
+        assert!(!redeem_ssh_remember(&mut pending, url, None));
+        assert!(pending.is_empty());
+
+        // Other locators are untouched throughout.
+        let mut pending = HashSet::new();
+        park_ssh_remember(&mut pending, url, true);
+        park_ssh_remember(&mut pending, "postgres://u@other:5432/db", true);
+        assert!(redeem_ssh_remember(
+            &mut pending,
+            url,
+            Some(PassphraseSource::Session)
+        ));
+        assert_eq!(pending.len(), 1, "redeeming one locator cleared another");
+    }
     #[test]
     fn only_a_keyring_sourced_passphrase_is_deleted_when_it_is_rejected() {
         const KEY: &str = "postgres://u@h:5432/db#ssh";
