@@ -13,12 +13,17 @@ Xephyr :2 -screen 900x700 &
 DISPLAY=:2 GDK_BACKEND=x11 ./target/dx/hubro/debug/linux/app/hubro &   # binary path from `dx build`
 DISPLAY=:2 xdotool search --name "Hubro" windowmove 50 50                  # window is named "Hubro"; may spawn offscreen
 DISPLAY=:2 xdotool mousemove X Y click 1                                     # full pointer control
+DISPLAY=:2 xdotool key --clearmodifiers s e l e c t space 1                  # keyboard: keysyms, not `type` — see gotchas
 import -display :2 -window root shot.png                                     # screenshot the nested display
 ```
 
 Driving the app directly on the desktop half-works and isn't worth it: `spectacle -b -n -a -o shot.png` captures windows and `xdotool key` reaches XWayland windows (after a one-time KDE "Remote Control" approval), but KWin ignores XTEST pointer events, so mouse control is impossible outside Xephyr.
 
-Gotchas: native `<select>` dropdowns are driven by click → `key Down/Up` → `key Return` (options aren't clickable elements). Xephyr runs no window manager, so nothing delivers `WindowEvent::CloseRequested` — send a synthetic `WM_DELETE_WINDOW` ClientMessage (a ~30-line Xlib/`gcc -lX11` helper) to test the window-close guard.
+Gotchas: **`xdotool type` silently drops keystrokes** into the webview — seven characters arrive as five, or as none at all. Send keysyms instead (`xdotool key --clearmodifiers a b c`), which is reliable and still fast enough to land inside a 250 ms debounce window. Screenshot the field and count the characters before submitting anything that matters. Native `<select>` dropdowns are driven by click → `key Down/Up` → `key Return` (options aren't clickable elements). Xephyr runs no window manager, so nothing delivers `WindowEvent::CloseRequested` — send a synthetic `WM_DELETE_WINDOW` ClientMessage (a ~30-line Xlib/`gcc -lX11` helper) to test the window-close guard.
+
+**"Nothing happened" is not a measurement unless the app ran.** A negative case once reported exactly the expected zero because Xephyr had never come up. Assert the display (`xdpyinfo`) and the window (`xdotool search`) before believing a null result, and show the run reached the state under test — a screenshot of the *next* screen is what makes "it didn't fire" mean something.
+
+**Build a negative control.** Nothing in the suite covers rendering, so a passing interactive check does not show the script exercises the bug. Rebuild with only the fix reverted and re-run the identical script: if it still passes, the script is testing nothing. That turned a "verified" FRE-154 run — which would have passed either way — into a real before/after.
 
 ## macOS
 
