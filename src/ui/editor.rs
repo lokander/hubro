@@ -131,6 +131,18 @@ const EDITOR_CREATE_FAILED: &str =
 ///   [`EditorMessage::Ready`] is sent on success: the Rust side re-pushes the
 ///   current document and schema, which is what keeps a tab switch mid-wait
 ///   from mounting the *previous* buffer's text.
+///
+/// `__dvRun`/`__dvDoc` are single globals, reassigned by whichever editor
+/// mounted last, so both check that the message is for **this** element before
+/// sending. That check earns its keep as of FRE-154: teardown now *flushes*
+/// where it used to only cancel, so a closing editor can emit — and one whose
+/// connection tab is gone would otherwise be filed against the connection
+/// whose channel the global currently points at. Buffer ids and generations
+/// both start small and are per connection, so such a message would plausibly
+/// match and quietly overwrite a real buffer. A mismatch is dropped rather
+/// than rerouted: the owning channel is closing anyway, and losing one tail is
+/// the bug this fix is about, while corrupting another connection's buffer
+/// would be a worse one.
 fn editor_mount_js(
     element: &str,
     dialect: Dialect,
@@ -144,8 +156,14 @@ fn editor_mount_js(
     let create_failed = js_string(EDITOR_CREATE_FAILED);
     format!(
         r#"
-        window.__dvRun = (p) => dioxus.send(JSON.stringify({{ kind: "run", sql: p.sql, buffer: p.buffer }}));
-        window.__dvDoc = (p) => dioxus.send(JSON.stringify({{ kind: "doc", doc: p.doc, buffer: p.buffer, generation: p.generation }}));
+        window.__dvRun = (p) => {{
+            if (p.id !== "{element}") return;
+            dioxus.send(JSON.stringify({{ kind: "run", sql: p.sql, buffer: p.buffer }}));
+        }};
+        window.__dvDoc = (p) => {{
+            if (p.id !== "{element}") return;
+            dioxus.send(JSON.stringify({{ kind: "doc", doc: p.doc, buffer: p.buffer, generation: p.generation }}));
+        }};
         (async () => {{
             window.__dvGen = window.__dvGen || {{}};
             const mine = (window.__dvGen["{element}"] = (window.__dvGen["{element}"] || 0) + 1);
@@ -1274,35 +1292,143 @@ mod tests {
         assert!(serde_json::from_str::<EditorMessage>(r#"{"kind":"doc","doc":"x"}"#).is_err());
     }
 
-    /// The committed bundle, which is where the FRE-154 flush actually lives.
+    #[test]
+    fn a_closing_editor_cannot_send_down_another_connections_channel() {
+        // `__dvRun`/`__dvDoc` are single globals that the last mount owns. A
+        // teardown flush (new in FRE-154 — teardown used to only cancel) can
+        // therefore run against a channel belonging to a *different*
+        // connection, and buffer ids and generations are per connection and
+        // both start small, so the message would plausibly match a real buffer
+        // and overwrite it. Dropped rather than rerouted: the owning channel
+        // is closing anyway, and one lost tail beats one corrupted buffer.
+        let js = mount_js();
+        for global in ["window.__dvRun", "window.__dvDoc"] {
+            let (_, body) = js
+                .split_once(global)
+                .unwrap_or_else(|| panic!("{global} must still be installed"));
+            let guard = body
+                .find(r#"if (p.id !== "sql-editor-1-") return;"#)
+                .unwrap_or_else(|| {
+                    panic!("{global} sends without checking the message is its own: {body}")
+                });
+            let send = body
+                .find("dioxus.send")
+                .unwrap_or_else(|| panic!("{global} must still send: {body}"));
+            assert!(
+                guard < send,
+                "{global} checks the id after sending, which is not a check: {body}"
+            );
+        }
+    }
+
+    /// The editor's JavaScript: the readable source, and the minified build of
+    /// it that actually ships.
+    const ENTRY: &str = include_str!("../../assets/codemirror-entry.js");
     const BUNDLE: &str = include_str!("../../assets/codemirror.js");
 
     #[test]
-    fn the_committed_bundle_still_flushes_on_the_way_out() {
-        // `assets/codemirror.js` is a build artifact that is committed, and
-        // rebuilt by hand (see `assets/codemirror-README.md`). So an edit to
-        // `codemirror-entry.js` that lands without the rebuild changes
-        // nothing the app runs, and every other test here — which only ever
-        // reads the *Rust* side of the boundary — stays green while the fix is
-        // absent.
-        //
-        // Matched on object-literal keys and a DOM event name: the things a
-        // minifier cannot rename. The mangled locals around them are free to
-        // change with the esbuild version.
+    fn every_way_out_of_the_editor_flushes_rather_than_cancels() {
+        // The whole of FRE-154, checked against the source that is readable
+        // enough to check it in. Three exits, and the two orderings that make
+        // two of them correct rather than merely present.
+        let set_doc = entry_fn("setDoc");
+        let flush = set_doc
+            .find("flush(id)")
+            .expect("setDoc must flush what the outgoing document still owes");
+        let retoken = set_doc
+            .find("tokens.set(id,")
+            .expect("setDoc must take the incoming document's token");
         assert!(
-            BUNDLE.contains("blur:"),
-            "the bundle has no blur handler, so nothing flushes the pending \
-             document before a pane switch tears the editor down — rebuild it \
-             from codemirror-entry.js (assets/codemirror-README.md)"
+            flush < retoken,
+            "setDoc flushes *after* re-stamping, so the outgoing buffer's tail \
+             is filed under the incoming buffer — a silent misfile, which is \
+             worse than the silent loss it replaced: {set_doc}"
         );
-        assert!(BUNDLE.contains("domEventHandlers"));
 
+        let destroy = entry_fn("destroy");
+        let flush = destroy
+            .find("flush(id)")
+            .expect("destroy must flush before tearing the view down");
+        let teardown = destroy
+            .find("view.destroy()")
+            .expect("destroy must still destroy the view");
+        assert!(
+            flush < teardown,
+            "destroy reads the document off the view, so flushing after the \
+             teardown reads nothing: {destroy}"
+        );
+
+        // And blur, which is the one that does the work — it fires on the
+        // mousedown that begins a switch, long before the teardown.
+        let create = entry_fn("create");
+        let blur = create
+            .find("blur:")
+            .expect("the editor must flush when it loses focus");
+        assert!(
+            create[blur..]
+                .split_once('}')
+                .is_some_and(|(handler, _)| handler.contains("flush(id)")),
+            "the blur handler does not flush: {}",
+            &create[blur..blur + 120.min(create.len() - blur)]
+        );
+
+        // And teardown must not cancel *at all*. `flush` takes the timer
+        // whenever there is one, so a `clearTimeout` here could only ever be a
+        // no-op — but "cancel on the way out" is the pre-FRE-154 behaviour
+        // exactly, and one placed above the flush rather than below it is the
+        // whole bug back. Excluding it outright is cheaper to hold than an
+        // ordering, and gives up nothing.
+        assert!(
+            !destroy.contains("clearTimeout"),
+            "teardown cancels the pending send rather than leaving it to \
+             flush(), which is how the tail was being lost: {destroy}"
+        );
+    }
+
+    /// One top-level function's text in `codemirror-entry.js`, from its
+    /// signature to the start of the next one. Not a parser — the file is
+    /// rustfmt-adjacent prettier output with every top-level `function` in
+    /// column zero, and a test that mis-slices fails loudly rather than
+    /// silently passing.
+    fn entry_fn(name: &str) -> &'static str {
+        let start = ENTRY
+            .find(&format!("function {name}("))
+            .unwrap_or_else(|| panic!("codemirror-entry.js no longer defines {name}()"));
+        let rest = &ENTRY[start..];
+        let end = rest[1..]
+            .find("\nfunction ")
+            .or_else(|| rest[1..].find("\nexport function "))
+            .map_or(rest.len(), |offset| offset + 1);
+        &rest[..end]
+    }
+
+    #[test]
+    fn the_committed_bundle_was_rebuilt_after_the_entry_file_changed() {
+        // `assets/codemirror.js` is a committed build artifact, rebuilt by
+        // hand (see `assets/codemirror-README.md`), so an edit to the entry
+        // file that lands without the rebuild changes nothing the app runs —
+        // and the test above, which reads only the entry file, would not
+        // notice.
+        //
+        // What this pins is deliberately narrower than "the bundle is a build
+        // of the entry file", which nothing short of running esbuild in CI can
+        // establish: it catches a bundle reverted or never rebuilt *at all*,
+        // by requiring the FRE-154 wire format and the blur handler to be
+        // present in it. An entry-file edit confined to the `setDoc`/`destroy`
+        // flushes would still slip past. Matched on object-literal keys and a
+        // DOM event name — the things a minifier cannot rename — so the
+        // mangled locals around them stay free to change with esbuild.
+        assert!(
+            BUNDLE.contains("blur:") && BUNDLE.contains("domEventHandlers"),
+            "the shipped bundle has no blur handler — rebuild it from \
+             codemirror-entry.js (assets/codemirror-README.md)"
+        );
         let doc_payload = payload(BUNDLE, "window.__dvDoc({");
         assert!(
             doc_payload.contains("buffer:") && doc_payload.contains("generation:"),
-            "the bundle sends documents unstamped, so a flush of the outgoing \
-             buffer is indistinguishable from a reply about the incoming one \
-             — rebuild it: {doc_payload}"
+            "the shipped bundle sends documents unstamped, so a flush of the \
+             outgoing buffer is indistinguishable from a reply about the \
+             incoming one — rebuild it: {doc_payload}"
         );
         let run_payload = payload(BUNDLE, "window.__dvRun({");
         assert!(run_payload.contains("buffer:"), "{run_payload}");
