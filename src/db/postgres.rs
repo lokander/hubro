@@ -1838,26 +1838,42 @@ fn decode_typed(row: &PgRow, idx: usize, raw: &PgValueRef) -> Option<Value> {
 fn decode_bit_string(raw: &PgValueRef) -> Option<Value> {
     let bytes = raw.as_bytes().ok()?;
     match raw.format() {
+        // Postgres prints the bits verbatim in text format. Present for
+        // completeness of the match rather than for coverage: every
+        // row-returning path here goes through `sqlx::query`, which carries
+        // arguments and therefore always negotiates the binary format.
         PgValueFormat::Text => Some(Value::Text(std::str::from_utf8(bytes).ok()?.to_string())),
-        PgValueFormat::Binary => {
-            let (count, packed) = bytes.split_at_checked(4)?;
-            let count = usize::try_from(i32::from_be_bytes(count.try_into().ok()?)).ok()?;
-            // A count claiming more bits than were sent is a malformed value;
-            // degrading to the marker beats indexing past the end.
-            if count > packed.len() * 8 {
-                return None;
-            }
-            let bits = (0..count).map(|bit| {
+        PgValueFormat::Binary => bits_from_binary(bytes).map(Value::Text),
+    }
+}
+
+/// The binary half of [`decode_bit_string`], split out so its rejections are
+/// reachable from a test: `PgValueRef` cannot be constructed outside sqlx, so
+/// left inline these would be four claims nothing could execute.
+///
+/// `None` for anything malformed — the caller then degrades to the `<bit>`
+/// marker, which beats indexing past the end of the payload.
+fn bits_from_binary(bytes: &[u8]) -> Option<String> {
+    let (count, packed) = bytes.split_at_checked(4)?;
+    let count = usize::try_from(i32::from_be_bytes(count.try_into().ok()?)).ok()?;
+    // The bound is exact, not conservative: the last index read is
+    // `(count - 1) / 8`, which is `<= packed.len() - 1` precisely when
+    // `count <= packed.len() * 8`.
+    if count > packed.len() * 8 {
+        return None;
+    }
+    Some(
+        (0..count)
+            .map(|bit| {
                 let byte = packed[bit / 8];
                 if (byte >> (7 - bit % 8)) & 1 == 1 {
                     '1'
                 } else {
                     '0'
                 }
-            });
-            Some(Value::Text(bits.collect()))
-        }
-    }
+            })
+            .collect(),
+    )
 }
 
 /// Graceful degradation for values [`decode_typed`] can't produce: enum
@@ -1991,6 +2007,67 @@ fn format_interval(iv: &PgInterval) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bit-string wire value: big-endian `i32` count, then packed bytes.
+    fn wire(count: i32, packed: &[u8]) -> Vec<u8> {
+        let mut bytes = count.to_be_bytes().to_vec();
+        bytes.extend_from_slice(packed);
+        bytes
+    }
+
+    #[test]
+    fn bit_strings_decode_to_their_bits_and_stop_at_the_count() {
+        // The count, not the byte length, is what ends the value: the last
+        // byte is padded, and reading it whole would append phantom bits.
+        // `bit(7)` is the case that catches it in both directions.
+        assert_eq!(
+            bits_from_binary(&wire(7, &[0b1111_1110])).as_deref(),
+            Some("1111111")
+        );
+        assert_eq!(
+            bits_from_binary(&wire(7, &[0b0000_0010])).as_deref(),
+            Some("0000001")
+        );
+        // MSB-first, across a byte boundary.
+        assert_eq!(
+            bits_from_binary(&wire(9, &[0b1000_0000, 0b1000_0000])).as_deref(),
+            Some("100000001")
+        );
+        assert_eq!(
+            bits_from_binary(&wire(4, &[0b1010_0000])).as_deref(),
+            Some("1010")
+        );
+        // A zero-length `bit varying` is a legal value, and must not index.
+        assert_eq!(bits_from_binary(&wire(0, &[])).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn a_malformed_bit_string_degrades_instead_of_panicking() {
+        // Each of these would otherwise index past the payload. They are
+        // reachable only because the binary half is its own function — the
+        // reason it is one.
+        assert_eq!(bits_from_binary(&[0, 0, 1]), None, "header truncated");
+        assert_eq!(
+            bits_from_binary(&wire(-1, &[0xFF])),
+            None,
+            "negative bit count"
+        );
+        assert_eq!(
+            bits_from_binary(&wire(9, &[0xFF])),
+            None,
+            "count claims more bits than were sent"
+        );
+        assert_eq!(
+            bits_from_binary(&wire(1, &[])),
+            None,
+            "count without payload"
+        );
+        // The bound is exact: one bit fewer than the claim is fine.
+        assert_eq!(
+            bits_from_binary(&wire(8, &[0xFF])).as_deref(),
+            Some("11111111")
+        );
+    }
 
     #[test]
     fn an_unmeasured_relation_estimates_nothing() {
