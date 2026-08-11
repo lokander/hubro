@@ -189,11 +189,12 @@ pub(super) fn secret_keys(locator: &str) -> [String; 3] {
 /// is still holding.
 ///
 /// **The parked "remember" choice deliberately does not move**, though it is
-/// keyed by locator too, and FRE-162 was filed saying it should. An edit is
-/// applied only after a connect to the *new* locator has succeeded
-/// ([`AppState::save_or_apply_edit`] is reached through
-/// [`AppState::save_server_if_open`]), so that connect has already redeemed or
-/// recorded its own answer by the time this runs. Anything carried over can
+/// keyed by locator too, and FRE-162 was filed saying it should. An edit lands
+/// only while the *new* locator is open ([`AppState::save_or_apply_edit`] is
+/// reached through [`AppState::save_server_if_open`], which no-ops otherwise),
+/// so a connect to it has already succeeded — in this call, or in an earlier
+/// one when the form re-submits onto an already-open connection — and that
+/// connect redeemed or recorded its own answer. Anything carried over can
 /// therefore only be consumed by some *later* attempt — precisely what
 /// [`park_ssh_remember`] exists to prevent, and a way to store a passphrase the
 /// user declined: tick on the old locator, abandon the attempt at a host-key
@@ -777,10 +778,13 @@ impl AppState {
             self.persist_saved();
         }
         if new_locator != old_locator {
-            // In memory first, and synchronously: the parked choice may be
-            // waiting on a connect that is itself parked on a host-key prompt,
-            // and that connect can resume the moment this returns. The keyring
-            // migration below is off-thread because it is I/O; this is not.
+            // Synchronously, and before the spawn: session memory is what the
+            // *next* connect reads first, and the next connect can begin as
+            // soon as this returns — the user is back on the connections
+            // screen. Inside the spawned block it would instead land after
+            // three keyring round-trips, and a reconnect in that window would
+            // re-prompt for a secret the app is holding. The keyring migration
+            // is spawned because it is I/O; this is a map write.
             carry_session_secrets(
                 &mut self.session_passwords.write(),
                 &old_locator,
@@ -2227,45 +2231,6 @@ mod tests {
     }
 
     #[test]
-    fn an_edit_leaves_the_parked_choice_with_the_attempt_that_made_it() {
-        // FRE-162 asked for the parked choice to move with the locator. It
-        // must not, and the reason is the one that makes the edit safe at all:
-        // `update_saved` runs only after a connect to the NEW locator has
-        // succeeded, so that connect has already redeemed or recorded its own
-        // answer. Anything carried across can only be consumed by a later
-        // attempt — which is what `park_ssh_remember` exists to prevent.
-        //
-        // The path this closes: tick on the old locator, abandon the attempt
-        // at a host-key card, edit the URL, untick at the new prompt, connect.
-        // Migrating would put the old `true` where the new `false` had just
-        // been consumed, and the next reconnect would store a passphrase the
-        // user had declined.
-        const OLD: &str = "postgres://u@old:5432/db";
-        const NEW: &str = "postgres://u@new:5432/db";
-        let mut session = session_for(OLD);
-        let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, OLD, true);
-
-        carry_session_secrets(&mut session, OLD, NEW);
-
-        assert!(
-            !redeem_ssh_remember(&mut pending, NEW, Some(PassphraseSource::Session)),
-            "an old attempt's tick was handed to the edited connection, where a \
-             later reconnect redeems a choice made about a different attempt"
-        );
-        // It stays where it was made: that attempt's host-key card is still on
-        // screen, and trusting the key reconnects to the old URL.
-        let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, OLD, true);
-        carry_session_secrets(&mut session_for(OLD), OLD, NEW);
-        assert!(
-            redeem_ssh_remember(&mut pending, OLD, Some(PassphraseSource::Session)),
-            "the abandoned attempt lost the tick it made, so resuming it stores \
-             nothing (FRE-161)"
-        );
-    }
-
-    #[test]
     fn an_edit_never_overwrites_a_secret_the_successful_connect_just_wrote() {
         // The edit is applied *after* the connect that confirms it, and that
         // connect files its validated password under the NEW locator. Carrying
@@ -2279,26 +2244,45 @@ mod tests {
         // drifting.
         const OLD: &str = "postgres://u@old:5432/db";
         const NEW: &str = "postgres://u@new:5432/db";
+        // Every key, not just the bare locator: the passphrase and the Entra
+        // token are filed under the same moved locator and reach the same
+        // "read a session hit as already accepted" path, so a rule that held
+        // for the password alone would be three-quarters of a fix.
         let mut session = session_for(OLD);
-        session.insert(NEW.to_string(), "validated-just-now".to_string());
+        for (index, key) in secret_keys(NEW).into_iter().enumerate() {
+            session.insert(key, format!("validated-just-now-{index}"));
+        }
 
         carry_session_secrets(&mut session, OLD, NEW);
 
-        assert_eq!(
-            session.get(NEW).map(String::as_str),
-            Some("validated-just-now"),
-            "the edit overwrote the password the successful connect had just \
-             validated with the pre-edit one"
-        );
-        // The old copy still goes: it is redundant, and leaving it lets a
-        // later connection reusing that URL inherit it.
-        assert!(!session.contains_key(OLD));
-        // Keys with nothing under the new locator still move.
+        for (index, key) in secret_keys(NEW).into_iter().enumerate() {
+            assert_eq!(
+                session.get(&key).map(String::as_str),
+                Some(format!("validated-just-now-{index}").as_str()),
+                "the edit overwrote {key}, which the successful connect had \
+                 just validated, with the pre-edit value"
+            );
+        }
+        // The old copies still go: they are redundant, and leaving them lets a
+        // later connection reusing that URL inherit them.
+        for key in secret_keys(OLD) {
+            assert!(!session.contains_key(&key), "{key} survived the edit");
+        }
+
+        // A key with nothing under the new locator still moves — otherwise
+        // "never overwrite" could be satisfied by never carrying anything.
+        let mut session = session_for(OLD);
+        session.insert(NEW.to_string(), "validated-just-now".to_string());
+        carry_session_secrets(&mut session, OLD, NEW);
         assert_eq!(
             session
                 .get(ssh_secret_key(NEW).as_str())
                 .map(String::as_str),
             Some("letmein")
+        );
+        assert_eq!(
+            session.get(NEW).map(String::as_str),
+            Some("validated-just-now")
         );
     }
 
@@ -2435,6 +2419,21 @@ mod tests {
             old_at < new_at,
             "the carry runs backwards — the secrets move onto the locator the \
              edit abandoned: {call}"
+        );
+        // And it runs before the keyring migration is spawned, not inside it:
+        // session memory is what the next connect reads first, and the next
+        // connect can start as soon as this returns.
+        let carry_at = update
+            .find("carry_session_secrets(")
+            .expect("checked above");
+        let spawn_at = update
+            .find("spawn_forever(")
+            .expect("the keyring migration must still be spawned");
+        assert!(
+            carry_at < spawn_at,
+            "the session carry moved into the spawned keyring work, so it lands \
+             three keyring round-trips late and a reconnect in that window \
+             re-prompts for a secret the app is holding: {update}"
         );
 
         let remove = method_body(
