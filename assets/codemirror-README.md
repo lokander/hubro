@@ -12,13 +12,15 @@ npx esbuild codemirror-entry.js --bundle --format=iife \
   --global-name=DVEditor --minify --outfile=codemirror.js
 ```
 
-`editor.rs`'s `the_committed_bundle_was_rebuilt_after_the_entry_file_changed`
-is a partial backstop for skipping that step: it reads `codemirror.js` and
-fails if the wire format or the blur handler is missing from it, which catches
-a bundle that was reverted or never rebuilt at all. It cannot catch an
-entry-file edit whose effect is confined to code it doesn't name — only running
-esbuild in CI would, and the point of committing the bundle is that the build
-needs no JS toolchain. So the rebuild remains a step you have to remember.
+`editor.rs`'s `the_committed_bundle_is_not_a_pre_fre_154_build` is a partial
+backstop for skipping that step: it reads `codemirror.js` and fails if the wire
+format or the blur handler is missing from it, which catches a bundle that was
+reverted or never rebuilt at all. It cannot catch an
+entry-file edit whose effect is confined to code it doesn't name — only
+rebuilding and diffing in CI would, which would put a JS toolchain in CI's path
+on all three platforms. That is a weaker objection than "the build needs one"
+(it doesn't, and wouldn't), but it is still a cost the committed bundle exists
+to avoid. So the rebuild remains a step you have to remember.
 
 The bundle exposes:
 
