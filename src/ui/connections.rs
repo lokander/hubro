@@ -2108,6 +2108,17 @@ mod tests {
                 && body.contains("use_signal(move || offered)"),
             "the card ignores the choice the prompt carries, or inverts it: {body}"
         );
+        // The other end of the same value, which this slice already covers:
+        // what the box holds when the card submits. Older than FRE-162 and
+        // unchanged by it, but it is the same one-line inversion at the same
+        // seam — and `!*remember.peek()` would send every user the opposite of
+        // the box they ticked, on the read this test is already looking at.
+        assert!(
+            body.contains("let remember_choice = *remember.peek();"),
+            "the card submits something other than the box as ticked, so the \
+             answer the user gave is not the one that reaches the keyring \
+             decision: {body}"
+        );
     }
 
     #[test]
