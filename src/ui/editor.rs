@@ -1372,6 +1372,25 @@ mod tests {
             &create[blur..blur + 120.min(create.len() - blur)]
         );
 
+        // `flush` must take the timer *before* the guard that can abandon the
+        // send, which is what makes teardown's lack of a cancel safe rather
+        // than merely tidy: consume it below the guard and an armed timer can
+        // outlive the view. Nothing bad follows today — in `destroy` the guard
+        // passes anyway — but the reasoning above is only sound while this
+        // holds, so it is checked rather than remembered.
+        let flush_fn = entry_fn("flush");
+        let consume = flush_fn
+            .find("debounces.delete(id)")
+            .expect("flush must take the pending timer");
+        let abandon = flush_fn
+            .find("if (!view")
+            .expect("flush must still bail when there is nothing to send to");
+        assert!(
+            consume < abandon,
+            "flush can return with the timer still armed, so teardown would \
+             leave one behind: {flush_fn}"
+        );
+
         // And teardown must not cancel *at all*. `flush` takes the timer
         // whenever there is one, so a `clearTimeout` here could only ever be a
         // no-op — but "cancel on the way out" is the pre-FRE-154 behaviour
@@ -1403,19 +1422,19 @@ mod tests {
     }
 
     #[test]
-    fn the_committed_bundle_was_rebuilt_after_the_entry_file_changed() {
+    fn the_committed_bundle_is_not_a_pre_fre_154_build() {
         // `assets/codemirror.js` is a committed build artifact, rebuilt by
         // hand (see `assets/codemirror-README.md`), so an edit to the entry
         // file that lands without the rebuild changes nothing the app runs —
         // and the test above, which reads only the entry file, would not
         // notice.
         //
-        // What this pins is deliberately narrower than "the bundle is a build
-        // of the entry file", which nothing short of running esbuild in CI can
-        // establish: it catches a bundle reverted or never rebuilt *at all*,
-        // by requiring the FRE-154 wire format and the blur handler to be
-        // present in it. An entry-file edit confined to the `setDoc`/`destroy`
-        // flushes would still slip past. Matched on object-literal keys and a
+        // The name is the exact limit of the claim. What this pins is
+        // narrower than "the bundle is a build of the entry file", which
+        // nothing short of running esbuild can establish: it catches a bundle
+        // reverted or never rebuilt *at all*, by requiring the FRE-154 wire
+        // format and the blur handler to be present in it. An entry-file edit
+        // confined to the `setDoc`/`destroy` flushes would still slip past. Matched on object-literal keys and a
         // DOM event name — the things a minifier cannot rename — so the
         // mangled locals around them stay free to change with esbuild.
         assert!(
