@@ -22,12 +22,14 @@
 
 mod connect;
 mod import;
+mod schema_edit;
 mod session;
 mod sql;
 mod staging;
 
 pub use connect::ServerBackend;
 pub use import::{ImportRequest, ImportStatus};
+pub use schema_edit::{after_edit, SchemaEditRequest, SchemaEditStatus};
 // Reached from `session`'s restore path; defined beside the flow that
 // writes it.
 pub(crate) use connect::entra_secret_key;
@@ -55,8 +57,8 @@ use crate::db::{
     url_with_password, write_result, Capabilities, CellFetch, Connection, ConnectionId,
     ConnectionRegistry, DbError, DbPool, Ddl, DdlObject, Encoding, ExportFormat, Filter,
     ForeignKeyMeta, ImportOptions, ImportReport, MssqlAuth, QueryResult, Rollback, RowLocator,
-    SourceFormat, StagedChange, StatementResult, TableAccess, TableMeta, TableStats, Value,
-    WriteProtection,
+    SchemaOp, SourceFormat, StagedChange, StatementResult, TableAccess, TableMeta, TableStats,
+    Value, WriteProtection,
 };
 use crate::history::{HistoryStore, SaveOutcome};
 use crate::tunnel::{HostKeyInfo, Tunnel, TunnelAuth, TunnelConfig, TunnelError};
@@ -976,6 +978,18 @@ pub struct AppState {
     /// can cancel it rather than leaving it to commit into a pool that is
     /// being torn down. Held for the same reason [`Self::sql_tasks`] is.
     pub import_tasks: Signal<HashMap<ConnectionId, Task>>,
+    /// Latest schema-edit progress per connection (FRE-122). Written from the
+    /// `spawn_forever` task in [`schema_edit`]. Per connection rather than per
+    /// table: one dialog is open at a time, and the line it leaves behind
+    /// belongs to the tab.
+    pub schema_edits: Signal<HashMap<ConnectionId, SchemaEditStatus>>,
+    /// Monotonic id per connection's schema edit — the same staleness guard
+    /// the import and export statuses carry.
+    pub schema_edit_generations: Signal<HashMap<ConnectionId, u64>>,
+    /// The in-flight schema edit's task per connection, so closing the
+    /// connection drops it rather than leaving a statement running against a
+    /// pool being torn down.
+    pub schema_edit_tasks: Signal<HashMap<ConnectionId, Task>>,
     /// Whether the keyboard-shortcut cheatsheet overlay is showing (FRE-15).
     /// App-global (one overlay for the whole window), toggled by `?` and
     /// dismissed by Escape / a backdrop click / `?` again.
@@ -1100,6 +1114,9 @@ impl AppState {
             import_status: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             import_generations: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             import_tasks: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            schema_edits: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            schema_edit_generations: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            schema_edit_tasks: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             pending_focus: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             nav_history: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             show_cheatsheet: Signal::new_in_scope(false, ScopeId::ROOT),
@@ -1675,6 +1692,14 @@ impl AppState {
         }
         self.import_status.write().remove(&id);
         self.import_generations.write().remove(&id);
+        // Same treatment for an in-flight schema edit: the statement is
+        // already at the server, but nothing here will be able to report what
+        // it did once the pool is gone.
+        if let Some(task) = self.schema_edit_tasks.write().remove(&id) {
+            task.cancel();
+        }
+        self.schema_edits.write().remove(&id);
+        self.schema_edit_generations.write().remove(&id);
         self.pending_focus.write().remove(&id);
         self.nav_history.write().remove(&id);
         // Abort every query tab's in-flight run and drop the bookkeeping;

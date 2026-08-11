@@ -18,6 +18,7 @@ use super::editor::SqlEditor;
 use super::grid::DataGrid;
 use super::icons::BackendIcon;
 use super::schema::SchemaPane;
+use super::schema_edit::SchemaEditLine;
 use super::sidebar::SchemaSidebar;
 use super::state::{ActiveView, AppState};
 
@@ -624,15 +625,23 @@ fn ConnectionView(id: ConnectionId) -> Element {
                     },
                     // Same selected-table semantics as Data, so the two panes
                     // always describe the same table (FRE-69).
-                    super::state::Pane::Schema => match selected {
-                        Some(table) => rsx! {
-                            SchemaPane { key: "schema-{table.key()}", id, table: table.clone() }
-                        },
-                        None => rsx! {
-                            div { class: "flex flex-1 items-center justify-center",
-                                p { class: "text-slate-500", "Select a table to view its schema." }
-                            }
-                        },
+                    super::state::Pane::Schema => rsx! {
+                        // Above the pane body rather than inside it (FRE-122):
+                        // a drop deselects the table it dropped, so a line
+                        // living in the body would take the report of the most
+                        // consequential operation down with the object it
+                        // reported on.
+                        SchemaEditLine { id }
+                        match selected {
+                            Some(table) => rsx! {
+                                SchemaPane { key: "schema-{table.key()}", id, table: table.clone() }
+                            },
+                            None => rsx! {
+                                div { class: "flex flex-1 items-center justify-center",
+                                    p { class: "text-slate-500", "Select a table to view its schema." }
+                                }
+                            },
+                        }
                     },
                     super::state::Pane::Browser => match selected {
                         // Keyed by table so grid state (page, sort, filter)

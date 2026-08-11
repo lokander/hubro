@@ -36,6 +36,7 @@ mod postgres;
 mod registry;
 mod rowkey;
 mod schema;
+mod schema_edit;
 mod script;
 mod sql;
 mod sqlite;
@@ -86,6 +87,7 @@ pub use schema::{
     ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, Internal, TableKind, TableMeta, TypeDetail,
     TypeRef,
 };
+pub use schema_edit::{op_problem, schema_edit_refusal, schema_op_sql, SchemaOp, NOT_A_TABLE};
 pub use script::{
     classify_statement, needs_confirmation, run_script, script_refusal, split_statements,
     statement_needs, statement_preview, Rollback, ScriptError, StatementKind, StatementNeeds,
