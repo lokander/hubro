@@ -81,8 +81,12 @@ export function create(id, parentId, dialectName, initialDoc, schema, buffer, ge
           const text = sel.empty
             ? view.state.doc.toString()
             : view.state.sliceDoc(sel.from, sel.to);
-          const token = tokens.get(id) || {};
-          if (window.__dvRun)
+          // Same guard as flush(), and for the same reason: a message with no
+          // buffer on it stringifies without the field and fails to
+          // deserialize on the host, so a defaulted `{}` would turn Ctrl+Enter
+          // into a silent no-op rather than an obvious one.
+          const token = tokens.get(id);
+          if (token && window.__dvRun)
             window.__dvRun({ id, sql: text, selection: !sel.empty, buffer: token.buffer });
           return true;
         },
@@ -173,6 +177,10 @@ export function destroy(id) {
   }
   sqlCompartments.delete(id);
   tokens.delete(id);
-  clearTimeout(debounces.get(id));
-  debounces.delete(id);
+  // Teardown deliberately cancels nothing: flush() above takes the pending
+  // timer whenever there is one, so a cancel down here could only ever be a
+  // no-op — and cancelling on the way out is the pre-FRE-154 behaviour that
+  // lost the tail, so keeping one for symmetry would leave the bug one edit
+  // away. (`every_way_out_of_the_editor_flushes_rather_than_cancels` reads
+  // this function and enforces it.)
 }

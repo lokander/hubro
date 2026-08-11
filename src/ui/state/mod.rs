@@ -215,8 +215,15 @@ pub struct SqlBuffer {
     /// The editor text, synced from the webview so it survives buffer, pane,
     /// and tab switches.
     pub text: String,
-    /// How many times text has been placed into *this* buffer from outside
-    /// the editor — by [`SqlBuffers::open`] or [`SqlBuffers::load`].
+    /// A version of the document held under *this* buffer id. It moves when
+    /// text is placed into the buffer from outside the editor **and the editor
+    /// is already showing that buffer**: [`SqlBuffers::load`], and the
+    /// [`SqlBuffers::open`] branch that reuses a buffer.
+    ///
+    /// Deliberately not a count of placements — a buffer `open` *creates*
+    /// starts at `0` despite having been given text. Its id has never been on
+    /// screen, so the id alone already tells the pane the editor's document is
+    /// stale, and nothing can be in flight stamped for it.
     ///
     /// It does two jobs, both of which need it to be per buffer rather than
     /// per tab:
@@ -1904,9 +1911,23 @@ mod tests {
         assert_eq!(buffers.text(FIRST_SQL_BUFFER), "SELECT loaded");
 
         // And once the editor has been told about the load, its next reply is
-        // current again — the guard must not wedge the buffer read-only.
-        assert!(typed(&mut buffers, FIRST_SQL_BUFFER, "SELECT loaded, more"));
+        // current again — the guard must not wedge the buffer read-only. The
+        // generation is named rather than looked up: `typed` reads whatever
+        // the buffer is at, so a guard that advanced on every accepted write
+        // would keep passing through it while the real editor — which only
+        // learns a new generation from a `setDoc` — fell permanently behind.
+        assert_eq!(generation_of(&buffers, FIRST_SQL_BUFFER), stale + 1);
+        assert!(buffers.set_text(FIRST_SQL_BUFFER, stale + 1, "SELECT loaded, more".into()));
         assert_eq!(buffers.text(FIRST_SQL_BUFFER), "SELECT loaded, more");
+        assert!(
+            buffers.set_text(
+                FIRST_SQL_BUFFER,
+                stale + 1,
+                "SELECT loaded, more, more".into()
+            ),
+            "the generation must not move on text arriving *from* the editor, \
+             or every keystroke after the first is refused"
+        );
     }
 
     #[test]
