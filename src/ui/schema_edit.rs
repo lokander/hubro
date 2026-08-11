@@ -183,6 +183,10 @@ pub fn SchemaEditDialog(
     let mut edited = use_signal(|| Option::<String>::None);
     let mut typed_name = use_signal(String::new);
     let mut confirmed = use_signal(|| Option::<String>::None);
+    // Whether *this* dialog started the edit it is watching. Without it, a run
+    // left in flight by an earlier dialog (Run → Escape → reopen) closes this
+    // one when it finishes, discarding whatever has been typed into it since.
+    let mut started = use_signal(|| false);
     // A *finished* previous edit's line belongs to the pane, not to this
     // dialog: without clearing it, reopening after a success would close
     // immediately on the stale Done. A `Running` one is left alone — clearing
@@ -218,7 +222,9 @@ pub fn SchemaEditDialog(
         let finished = state
             .schema_edit_status(id)
             .is_some_and(|s| !s.is_running() && s.error().is_none());
-        if finished {
+        // `started` as well as `finished`: the status is per connection, so a
+        // success this dialog did not ask for is not its cue to close.
+        if started() && finished {
             on_close.call(());
         }
     });
@@ -251,6 +257,7 @@ pub fn SchemaEditDialog(
             name: meta.name.clone(),
         };
         let op = op();
+        started.set(true);
         // Whether the statement *differs* from the generated one, not whether
         // the box was touched: retyping a character and undoing it leaves an
         // override that says nothing about what runs. This is what decides
