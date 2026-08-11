@@ -13,6 +13,7 @@ mod js;
 mod notice;
 mod saved_panel;
 mod schema;
+mod schema_edit;
 mod selection;
 mod shell;
 mod sidebar;

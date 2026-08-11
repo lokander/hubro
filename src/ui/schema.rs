@@ -11,13 +11,14 @@ use dioxus::prelude::*;
 use dioxus_icons::lucide::X;
 
 use crate::db::{
-    unreadable_reason, ColumnMeta, ConnectionId, DdlObject, DdlSource, Generated, RowCount,
-    TableKind, TableMeta, TypeDetail,
+    schema_edit_refusal, unreadable_reason, ColumnMeta, ConnectionId, DdlObject, DdlSource,
+    Generated, RowCount, SchemaOp, TableKind, TableMeta, TypeDetail,
 };
 use crate::util::{human_bytes, human_count};
 
 use super::js::{copy_to_clipboard, focus_on_mount};
 use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState, KindBadge};
+use super::schema_edit::SchemaEditDialog;
 use super::state::{AppState, SchemaLoad, TableRef};
 
 /// What the pane should show, derived from [`SchemaLoad`] inside one `read()`
@@ -84,6 +85,7 @@ fn TableIcon() -> Element {
 
 #[component]
 fn SchemaBody(id: ConnectionId, meta: TableMeta) -> Element {
+    let state = use_context::<AppState>();
     let qualified = match &meta.schema {
         Some(schema) => format!("{schema}.{}", meta.name),
         None => meta.name.clone(),
@@ -95,6 +97,37 @@ fn SchemaBody(id: ConnectionId, meta: TableMeta) -> Element {
     // Which object's DDL the overlay is showing, if any (FRE-108). Local to
     // the pane: closing it or switching table drops the request with it.
     let mut showing_ddl = use_signal(|| Option::<DdlObject>::None);
+    // The schema edit being set up, if any (FRE-122) — likewise local, so
+    // switching table abandons a half-filled form rather than carrying it to
+    // an object it was never about.
+    let mut editing = use_signal(|| Option::<SchemaOp>::None);
+    // Read together: one lookup, and the three answers cannot come from
+    // different moments of the registry.
+    let connection = state
+        .registry
+        .read()
+        .get(id)
+        .map(|c| (c.pool.dialect(), c.capabilities(), c.name.clone()));
+    let confirm_connection = state
+        .confirms_writes(id)
+        .then(|| connection.as_ref().map(|(_, _, name)| name.clone()))
+        .flatten();
+    // Resolved once for the whole column list: the answer is the same for
+    // every column, and asking per row would rebuild the statement once per
+    // column on every render.
+    let rename_column = match connection.as_ref() {
+        Some((dialect, caps, _)) if meta.kind == TableKind::Table => {
+            let probe = SchemaOp::RenameColumn {
+                column: String::new(),
+                new_name: String::new(),
+            };
+            match schema_edit_refusal(*caps, *dialect, &meta, &probe) {
+                Some(reason) => Rename::Disabled(reason),
+                None => Rename::Offered,
+            }
+        }
+        _ => Rename::Hidden,
+    };
     // Plain views have no indexes, so the section (and its "No indexes."
     // line) would just be noise. Materialized views are indexed on purpose,
     // and SQL Server indexed views report them as well, so anything that
@@ -114,6 +147,26 @@ fn SchemaBody(id: ConnectionId, meta: TableMeta) -> Element {
                     "Show DDL"
                 }
             }
+            // Schema editing (FRE-122). Offered on tables only — every
+            // operation here is refused on a view, and four disabled buttons
+            // on every view would be noise where the kind badge above already
+            // says why. On a table they stay visible and are disabled with
+            // their reason, so a connection that refuses schema changes says
+            // so once, where the action would have been.
+            if let Some((dialect, caps, _)) = connection.clone() {
+                if meta.kind == TableKind::Table {
+                    div { class: "mb-3 flex flex-wrap items-center gap-2",
+                        for op in table_actions(&meta) {
+                            SchemaAction {
+                                key: "{op.label()}",
+                                refusal: schema_edit_refusal(caps, dialect, &meta, &op),
+                                op,
+                                editing,
+                            }
+                        }
+                    }
+                }
+            }
             // How big the thing is (FRE-118) — under the name it describes and
             // above the columns, since it is read far more often than any one
             // column. Withheld from objects with no rows at all (a RisingWave
@@ -130,11 +183,19 @@ fn SchemaBody(id: ConnectionId, meta: TableMeta) -> Element {
                         th { class: "px-3 py-1.5 text-xs uppercase tracking-wide text-slate-500", "Null" }
                         th { class: "px-3 py-1.5 text-xs uppercase tracking-wide text-slate-500", "Key" }
                         th { class: "px-3 py-1.5 text-xs uppercase tracking-wide text-slate-500", "Default" }
+                        if rename_column != Rename::Hidden {
+                            th { class: "px-3 py-1.5" }
+                        }
                     }
                 }
                 tbody {
                     for column in meta.columns.clone() {
-                        ColumnRow { key: "{column.name}", column }
+                        ColumnRow {
+                            key: "{column.name}",
+                            column,
+                            editing,
+                            rename: rename_column,
+                        }
                     }
                 }
             }
@@ -168,6 +229,19 @@ fn SchemaBody(id: ConnectionId, meta: TableMeta) -> Element {
                                     },
                                     "DDL"
                                 }
+                                if let Some((dialect, caps, _)) = connection.clone() {
+                                    {
+                                        let op = SchemaOp::DropIndex { name: index.name.clone() };
+                                        rsx! {
+                                            SchemaAction {
+                                                refusal: schema_edit_refusal(caps, dialect, &meta, &op),
+                                                op,
+                                                editing,
+                                                label: "Drop",
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -181,6 +255,74 @@ fn SchemaBody(id: ConnectionId, meta: TableMeta) -> Element {
                 object,
                 on_close: move |_| showing_ddl.set(None),
             }
+        }
+        if let (Some(op), Some((dialect, caps, _))) = (editing(), connection.clone()) {
+            SchemaEditDialog {
+                id,
+                table: meta.clone(),
+                op,
+                dialect,
+                caps,
+                confirm_connection: confirm_connection.clone(),
+                on_close: move |_| editing.set(None),
+            }
+        }
+    }
+}
+
+/// The table-level operations the pane offers, each seeded with what is
+/// already known: a rename starts from the current name, so the field shows
+/// what it is changing rather than an empty box.
+///
+/// Ordered least to most destructive, and the two that lose data come last —
+/// the same reason a dialog puts Cancel before Delete.
+fn table_actions(meta: &TableMeta) -> Vec<SchemaOp> {
+    vec![
+        SchemaOp::CreateIndex {
+            name: String::new(),
+            columns: Vec::new(),
+            unique: false,
+        },
+        SchemaOp::AddColumn {
+            name: String::new(),
+            type_name: String::new(),
+        },
+        SchemaOp::RenameTable {
+            new_name: meta.name.clone(),
+        },
+        SchemaOp::Truncate,
+        SchemaOp::DropTable,
+    ]
+}
+
+/// One schema-edit action: opens the dialog, or states why it cannot.
+///
+/// A refused action stays on screen, disabled, wearing its reason — the rule
+/// [`Restriction`](crate::db::Restriction) exists for. Hiding it would leave
+/// someone looking for a button that is not missing so much as unavailable.
+#[component]
+fn SchemaAction(
+    op: SchemaOp,
+    refusal: Option<&'static str>,
+    editing: Signal<Option<SchemaOp>>,
+    /// Overrides the operation's own label, for the per-index Drop where the
+    /// row already names the index.
+    label: Option<&'static str>,
+) -> Element {
+    let mut editing = editing;
+    let text = label.unwrap_or_else(|| op.label());
+    let destructive = op.destroys_data();
+    rsx! {
+        button {
+            class: match (refusal.is_some(), destructive) {
+                (true, _) => "rounded border border-slate-200 dark:border-slate-800 px-1.5 py-0.5 text-xs text-slate-400 dark:text-slate-600 cursor-not-allowed",
+                (false, true) => "rounded border border-rose-300 dark:border-rose-800 px-1.5 py-0.5 text-xs text-rose-700 dark:text-rose-300 hover:bg-rose-100 dark:hover:bg-rose-950/50",
+                (false, false) => "rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+            },
+            disabled: refusal.is_some(),
+            title: refusal.unwrap_or(""),
+            onclick: move |_| editing.set(Some(op.clone())),
+            "{text}"
         }
     }
 }
@@ -432,8 +574,22 @@ fn CopyDdlButton(text: String) -> Element {
     }
 }
 
+/// Whether a column row offers to rename the column, and why it does not when
+/// it is offered but unavailable (FRE-122).
+///
+/// [`Hidden`](Self::Hidden) is for objects where the operation makes no sense
+/// at all — a view — so the column list keeps its shape instead of growing a
+/// column of permanently dead buttons. The other two are the ordinary rule:
+/// visible, with its reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rename {
+    Hidden,
+    Disabled(&'static str),
+    Offered,
+}
+
 #[component]
-fn ColumnRow(column: ColumnMeta) -> Element {
+fn ColumnRow(column: ColumnMeta, editing: Signal<Option<SchemaOp>>, rename: Rename) -> Element {
     let type_name = display_type(&column);
     rsx! {
         tr { class: "border-b border-slate-200 dark:border-slate-800/60",
@@ -467,6 +623,24 @@ fn ColumnRow(column: ColumnMeta) -> Element {
                             {column.default.clone().unwrap_or_default()}
                         }
                     },
+                }
+            }
+            if rename != Rename::Hidden {
+                td { class: "px-3 py-1 text-right",
+                    SchemaAction {
+                        refusal: match rename {
+                            Rename::Disabled(reason) => Some(reason),
+                            _ => None,
+                        },
+                        op: SchemaOp::RenameColumn {
+                            column: column.name.clone(),
+                            // Seeded with the current name: the field shows
+                            // what is being changed rather than an empty box.
+                            new_name: column.name.clone(),
+                        },
+                        editing,
+                        label: "Rename",
+                    }
                 }
             }
         }
