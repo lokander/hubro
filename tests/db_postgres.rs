@@ -6,6 +6,12 @@
 //!   -e POSTGRES_USER=tester -e POSTGRES_DB=demo -p 5433:5432 postgres:17-alpine
 //! HUBRO_PG_TEST_URL=postgres://tester:testpass@localhost:5433/demo cargo test
 //! ```
+//!
+//! The suite runs in a database of its own, created by `common::pg_test_url`
+//! (FRE-127): cargo runs the Postgres suites in parallel and they use the same
+//! fixture names, so sharing one database meant dropping each other's tables.
+
+mod common;
 
 use hubro::db::{
     detect_row_identity, explain_statement, needs_confirmation, run_script, script_refusal,
@@ -14,14 +20,8 @@ use hubro::db::{
     TypeDetail, TypeRef, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
-fn test_url() -> Option<String> {
-    match std::env::var("HUBRO_PG_TEST_URL") {
-        Ok(url) => Some(url),
-        Err(_) => {
-            eprintln!("skipping postgres test: HUBRO_PG_TEST_URL not set");
-            None
-        }
-    }
+async fn test_url() -> Option<String> {
+    common::pg_test_url().await
 }
 
 async fn fresh_fixture(pool: &DbPool, table: &str) {
@@ -51,7 +51,7 @@ async fn fresh_fixture(pool: &DbPool, table: &str) {
 
 #[tokio::test]
 async fn stock_postgres_is_detected_as_stock_postgres() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
 
     // The safety claim behind flavor detection (FRE-90), asserted from the
@@ -67,7 +67,7 @@ async fn stock_postgres_is_detected_as_stock_postgres() {
 
 #[tokio::test]
 async fn postgres_introspection_lists_public_tables_and_columns() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     fresh_fixture(&pool, "fruits_intro").await;
 
@@ -87,7 +87,7 @@ async fn postgres_introspection_lists_public_tables_and_columns() {
 
 #[tokio::test]
 async fn postgres_paging_sorting_filtering_and_values_work() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     fresh_fixture(&pool, "fruits_page").await;
 
@@ -128,7 +128,7 @@ async fn postgres_paging_sorting_filtering_and_values_work() {
 
 #[tokio::test]
 async fn same_named_pk_and_fk_constraints_do_not_confuse_pk_detection() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     for sql in [
         "DROP SCHEMA IF EXISTS pkbug CASCADE",
@@ -162,7 +162,7 @@ async fn same_named_pk_and_fk_constraints_do_not_confuse_pk_detection() {
 
 #[tokio::test]
 async fn postgres_rich_types_render_correctly() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     for sql in [
         "DROP TABLE IF EXISTS rich_types",
@@ -303,7 +303,7 @@ async fn postgres_rich_types_render_correctly() {
 
 #[tokio::test]
 async fn postgres_undecodable_cells_degrade_without_erroring_the_page() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     for sql in [
         "DROP TABLE IF EXISTS degrade_cells",
@@ -379,7 +379,7 @@ async fn postgres_undecodable_cells_degrade_without_erroring_the_page() {
 
 #[tokio::test]
 async fn postgres_bad_password_is_an_authentication_error() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let wrong = url_with_password(&url, "definitely-wrong-password").unwrap();
     let err = DbPool::open_postgres(&wrong)
         .await
@@ -396,7 +396,7 @@ async fn postgres_bad_password_is_an_authentication_error() {
 
 #[tokio::test]
 async fn postgres_multi_schema_introspection_has_parity_metadata() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     for sql in [
         "DROP SCHEMA IF EXISTS warehouse CASCADE",
@@ -579,7 +579,7 @@ async fn postgres_multi_schema_introspection_has_parity_metadata() {
 
 #[tokio::test]
 async fn finite_datetimes_beyond_chrono_range_degrade_to_markers() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     // Postgres accepts these; chrono caps at ~year 262143, and sqlx's
     // decode would panic on the overflow without the guard.
@@ -607,7 +607,7 @@ async fn finite_datetimes_beyond_chrono_range_degrade_to_markers() {
 
 #[tokio::test]
 async fn postgres_bounded_page_previews_large_text_and_bytea() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pool.query("DROP TABLE IF EXISTS bounded_docs")
         .await
@@ -693,7 +693,7 @@ async fn postgres_bounded_page_previews_large_text_and_bytea() {
 
 #[tokio::test]
 async fn postgres_query_capped_stops_and_bounds_cells() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
 
     // Row cap: 25 rows exist, ask for 10.
@@ -734,7 +734,7 @@ async fn postgres_query_capped_stops_and_bounds_cells() {
 /// contract the SQLite and SQL Server backends hold to.
 #[tokio::test]
 async fn postgres_empty_results_keep_their_column_headers() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     fresh_fixture(&pool, "fruits_empty").await;
 
@@ -773,7 +773,7 @@ async fn postgres_empty_results_keep_their_column_headers() {
 /// from pg_catalog for the type-aware editors (FRE-71).
 #[tokio::test]
 async fn postgres_introspection_resolves_enum_variants_and_array_columns() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pool.query("DROP TABLE IF EXISTS enum_intro").await.unwrap();
     pool.query("DROP TYPE IF EXISTS intro_mood").await.unwrap();
@@ -838,7 +838,7 @@ async fn postgres_introspection_resolves_enum_variants_and_array_columns() {
 /// doesn't exist. Regression test for the FRE-71 review.
 #[tokio::test]
 async fn postgres_quoted_camelcase_enum_saves_through_the_staged_cast() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pool.query("DROP TABLE IF EXISTS camel_intro")
         .await
@@ -912,7 +912,7 @@ async fn postgres_quoted_camelcase_enum_saves_through_the_staged_cast() {
 /// here too rather than left as the surviving half of a claim that was wrong.
 #[tokio::test]
 async fn bit_and_char_columns_save_through_the_staged_cast() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pool.query("DROP TABLE IF EXISTS bit_intro").await.unwrap();
     pool.query(
@@ -992,7 +992,7 @@ async fn bit_and_char_columns_save_through_the_staged_cast() {
 /// Such a table was unsaveable no matter how right the cast was.
 #[tokio::test]
 async fn bit_values_are_readable_and_a_bit_key_round_trips() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pool.query("DROP TABLE IF EXISTS bit_key").await.unwrap();
     pool.query("CREATE TABLE bit_key (m bit(4) PRIMARY KEY, label text, wide bit varying(64))")
@@ -1049,7 +1049,7 @@ async fn bit_values_are_readable_and_a_bit_key_round_trips() {
 
 #[tokio::test]
 async fn partition_children_are_internal_but_their_parent_is_not() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pool.query("DROP TABLE IF EXISTS parted_intro CASCADE")
         .await
@@ -1114,7 +1114,7 @@ async fn meta_of(pool: &DbPool, name: &str) -> hubro::db::TableMeta {
 
 #[tokio::test]
 async fn table_stats_estimate_rows_only_once_something_has_measured_them() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     fresh_fixture(&pool, "stats_intro").await;
     let meta = meta_of(&pool, "stats_intro").await;
@@ -1160,7 +1160,7 @@ async fn table_stats_estimate_rows_only_once_something_has_measured_them() {
 
 #[tokio::test]
 async fn a_view_reports_no_size_because_it_occupies_none() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     // The dependents come down first: `fresh_fixture` drops without CASCADE,
     // so a leftover view from an interrupted run would otherwise pin the base
@@ -1220,7 +1220,7 @@ async fn a_view_reports_no_size_because_it_occupies_none() {
 
 #[tokio::test]
 async fn an_exact_count_ignores_a_quoted_name_and_a_non_public_schema() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pool.query("CREATE SCHEMA IF NOT EXISTS \"stats sch\"")
         .await
@@ -1262,7 +1262,7 @@ async fn an_exact_count_ignores_a_quoted_name_and_a_non_public_schema() {
 
 #[tokio::test]
 async fn an_analyzed_empty_table_reports_zero_rows_rather_than_nothing() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pool.query("DROP TABLE IF EXISTS stats_empty")
         .await
@@ -1302,7 +1302,7 @@ async fn an_analyzed_empty_table_reports_zero_rows_rather_than_nothing() {
 
 #[tokio::test]
 async fn postgres_explains_a_query_as_a_structured_plan() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     fresh_fixture(&pool, "fruits_plan").await;
 
@@ -1369,7 +1369,7 @@ async fn guard_names(pool: &DbPool) -> Vec<String> {
 
 #[tokio::test]
 async fn postgres_explain_analyze_of_a_write_cannot_slip_past_the_gate() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     fresh_fixture(&pool, "fruits_guard").await;
     let before = guard_names(&pool).await;
@@ -1446,7 +1446,7 @@ async fn postgres_explain_analyze_of_a_write_cannot_slip_past_the_gate() {
 /// read-only connection. Nothing offline could have told us the word is real.
 #[tokio::test]
 async fn postgres_accepts_every_explain_header_hubro_tolerates() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
 
     for header in [

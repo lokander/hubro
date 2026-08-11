@@ -22,14 +22,8 @@ use hubro::ui::editing::bool_value;
 use hubro::ui::stage::required_insert_columns;
 use hubro::ui::TableStage;
 
-fn test_url() -> Option<String> {
-    match std::env::var("HUBRO_PG_TEST_URL") {
-        Ok(url) => Some(url),
-        Err(_) => {
-            eprintln!("skipping postgres test: HUBRO_PG_TEST_URL not set");
-            None
-        }
-    }
+async fn test_url() -> Option<String> {
+    common::pg_test_url().await
 }
 
 fn find<'a>(tables: &'a [TableMeta], schema: Option<&str>, name: &str) -> &'a TableMeta {
@@ -362,7 +356,7 @@ async fn pg_fixture(pool: &DbPool, schema: &str) {
 
 #[tokio::test]
 async fn postgres_multi_change_batch_applies_atomically() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pg_fixture(&pool, "staged_batch").await;
     let tables = pool.introspect().await.unwrap();
@@ -410,7 +404,7 @@ async fn postgres_multi_change_batch_applies_atomically() {
 
 #[tokio::test]
 async fn postgres_failure_mid_batch_rolls_everything_back_and_names_the_change() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pg_fixture(&pool, "staged_rollback").await;
     let tables = pool.introspect().await.unwrap();
@@ -507,7 +501,7 @@ async fn sqlite_bool_checkbox_stages_integers_end_to_end() {
 /// updates fails the bind-type check (documented on postgres::bind_params).
 #[tokio::test]
 async fn postgres_staged_text_values_coerce_to_column_types() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     for sql in [
         "DROP SCHEMA IF EXISTS staged_casts CASCADE",
@@ -596,7 +590,7 @@ async fn postgres_staged_text_values_coerce_to_column_types() {
 /// true modifier.
 #[tokio::test]
 async fn postgres_char_n_columns_round_trip_uncast() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     for sql in [
         "DROP SCHEMA IF EXISTS staged_charn CASCADE",
@@ -673,7 +667,7 @@ async fn postgres_char_n_columns_round_trip_uncast() {
 /// exercised here.
 #[tokio::test]
 async fn postgres_bit_n_edits_save_and_a_wrong_length_still_rolls_back() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     for sql in [
         "DROP SCHEMA IF EXISTS staged_bitn CASCADE",
@@ -748,7 +742,7 @@ async fn postgres_bit_n_edits_save_and_a_wrong_length_still_rolls_back() {
 /// with text values from the same editors).
 #[tokio::test]
 async fn postgres_staged_text_insert_coerces_to_column_types() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     for sql in [
         "DROP SCHEMA IF EXISTS staged_cast_insert CASCADE",
@@ -797,7 +791,7 @@ async fn postgres_staged_text_insert_coerces_to_column_types() {
 
 #[tokio::test]
 async fn postgres_set_null_on_integer_column_works_via_literal_null() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pg_fixture(&pool, "staged_null").await;
     let tables = pool.introspect().await.unwrap();
@@ -939,7 +933,7 @@ async fn sqlite_staged_insert_leaves_defaults_to_the_database() {
 async fn postgres_staged_insert_gets_serial_and_identity_values() {
     use hubro::db::Generated;
 
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     for sql in [
         "DROP SCHEMA IF EXISTS staged_insert_defaults CASCADE",

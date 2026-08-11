@@ -148,14 +148,8 @@ async fn sqlite_export_empty_result_still_writes_header_and_empty_array() {
 
 // ---- Postgres -------------------------------------------------------------
 
-fn pg_url() -> Option<String> {
-    match std::env::var("HUBRO_PG_TEST_URL") {
-        Ok(url) => Some(url),
-        Err(_) => {
-            eprintln!("skipping postgres export test: HUBRO_PG_TEST_URL not set");
-            None
-        }
-    }
+async fn pg_url() -> Option<String> {
+    common::pg_test_url().await
 }
 
 async fn pg_fixture(pool: &DbPool, table: &str) {
@@ -184,7 +178,7 @@ async fn pg_fixture(pool: &DbPool, table: &str) {
 
 #[tokio::test]
 async fn postgres_export_csv_and_json_match_expected_bytes() {
-    let Some(url) = pg_url() else { return };
+    let Some(url) = pg_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pg_fixture(&pool, "export_items").await;
 
@@ -225,7 +219,7 @@ async fn postgres_export_csv_and_json_match_expected_bytes() {
 
 #[tokio::test]
 async fn postgres_export_respects_filter_and_sort() {
-    let Some(url) = pg_url() else { return };
+    let Some(url) = pg_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pg_fixture(&pool, "export_filtered").await;
 

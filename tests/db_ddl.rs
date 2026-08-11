@@ -228,14 +228,8 @@ async fn sqlite_ddl_recreates_the_whole_fixture_schema_identically() {
 // Postgres — native view/index definitions, reconstructed tables.
 // ---------------------------------------------------------------------------
 
-fn pg_url() -> Option<String> {
-    match std::env::var("HUBRO_PG_TEST_URL") {
-        Ok(url) => Some(url),
-        Err(_) => {
-            eprintln!("skipping postgres test: HUBRO_PG_TEST_URL not set");
-            None
-        }
-    }
+async fn pg_url() -> Option<String> {
+    common::pg_test_url().await
 }
 
 /// A table with one of everything the reconstruction has to carry: an
@@ -282,7 +276,7 @@ CREATE VIEW ddl_view_{tag} AS SELECT id, code FROM ddl_child_{tag};
 
 #[tokio::test]
 async fn postgres_table_ddl_carries_every_attribute_the_catalog_knows() {
-    let Some(url) = pg_url() else { return };
+    let Some(url) = pg_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pg_fixture(&pool, "attrs").await;
     let tables = pool.introspect().await.unwrap();
@@ -331,7 +325,7 @@ async fn postgres_table_ddl_carries_every_attribute_the_catalog_knows() {
 
 #[tokio::test]
 async fn postgres_table_ddl_round_trips_through_the_server() {
-    let Some(url) = pg_url() else { return };
+    let Some(url) = pg_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pg_fixture(&pool, "trip").await;
     let original = pool.introspect().await.unwrap();
@@ -374,7 +368,7 @@ async fn postgres_table_ddl_round_trips_through_the_server() {
 
 #[tokio::test]
 async fn postgres_generated_column_storage_matches_the_catalog() {
-    let Some(url) = pg_url() else { return };
+    let Some(url) = pg_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     run_one(&pool, "DROP TABLE IF EXISTS ddl_gen").await;
     run_one(
@@ -435,7 +429,7 @@ async fn postgres_generated_column_storage_matches_the_catalog() {
 
 #[tokio::test]
 async fn postgres_plain_table_claims_no_missing_constraints() {
-    let Some(url) = pg_url() else { return };
+    let Some(url) = pg_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     run_one(&pool, "DROP TABLE IF EXISTS ddl_plain").await;
     run_one(&pool, "CREATE TABLE ddl_plain (a integer, b text)").await;
@@ -472,7 +466,7 @@ async fn postgres_plain_table_claims_no_missing_constraints() {
 
 #[tokio::test]
 async fn postgres_view_and_index_ddl_are_the_servers_own() {
-    let Some(url) = pg_url() else { return };
+    let Some(url) = pg_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pg_fixture(&pool, "native").await;
     let tables = pool.introspect().await.unwrap();
@@ -517,14 +511,8 @@ async fn postgres_view_and_index_ddl_are_the_servers_own() {
 // SQL Server — native view text, reconstructed tables and indexes.
 // ---------------------------------------------------------------------------
 
-fn mssql_url() -> Option<String> {
-    match std::env::var("HUBRO_MSSQL_TEST_URL") {
-        Ok(url) => Some(url),
-        Err(_) => {
-            eprintln!("skipping sql server test: HUBRO_MSSQL_TEST_URL not set");
-            None
-        }
-    }
+async fn mssql_url() -> Option<String> {
+    common::mssql_test_url().await
 }
 
 /// The T-SQL counterpart of [`pg_fixture`], plus the three things only SQL
@@ -580,7 +568,7 @@ CREATE INDEX IX_ddl_child_big_{tag} ON dbo.ddl_child_{tag} (parent_id DESC)
 
 #[tokio::test]
 async fn sqlserver_table_ddl_carries_every_attribute_the_catalog_knows() {
-    let Some(url) = mssql_url() else { return };
+    let Some(url) = mssql_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     mssql_fixture(&pool, "attrs").await;
     let tables = pool.introspect().await.unwrap();
@@ -643,7 +631,7 @@ async fn sqlserver_table_ddl_carries_every_attribute_the_catalog_knows() {
 
 #[tokio::test]
 async fn sqlserver_table_ddl_round_trips_through_the_server() {
-    let Some(url) = mssql_url() else { return };
+    let Some(url) = mssql_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     mssql_fixture(&pool, "trip").await;
     let original = pool.introspect().await.unwrap();
@@ -695,7 +683,7 @@ async fn sqlserver_table_ddl_round_trips_through_the_server() {
 
 #[tokio::test]
 async fn sqlserver_plain_table_claims_no_missing_constraints() {
-    let Some(url) = mssql_url() else { return };
+    let Some(url) = mssql_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_one(&pool, "DROP TABLE IF EXISTS dbo.ddl_plain").await;
     run_one(&pool, "CREATE TABLE dbo.ddl_plain (a int, b nvarchar(10))").await;
@@ -722,7 +710,7 @@ async fn sqlserver_plain_table_claims_no_missing_constraints() {
 
 #[tokio::test]
 async fn sqlserver_declares_what_it_cannot_express_instead_of_faking_it() {
-    let Some(url) = mssql_url() else { return };
+    let Some(url) = mssql_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_one(&pool, "DROP TABLE IF EXISTS dbo.ddl_exotic").await;
     // An unnamed default (SQL Server invents `DF__ddl_exot__n__…`), a check
@@ -784,7 +772,7 @@ async fn sqlserver_declares_what_it_cannot_express_instead_of_faking_it() {
 
 #[tokio::test]
 async fn sqlserver_view_ddl_is_the_stored_module_text() {
-    let Some(url) = mssql_url() else { return };
+    let Some(url) = mssql_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     mssql_fixture(&pool, "module").await;
     let tables = pool.introspect().await.unwrap();
@@ -809,7 +797,7 @@ async fn sqlserver_view_ddl_is_the_stored_module_text() {
 
 #[tokio::test]
 async fn sqlserver_index_ddl_is_reconstructed_and_runnable() {
-    let Some(url) = mssql_url() else { return };
+    let Some(url) = mssql_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     mssql_fixture(&pool, "index").await;
     let tables = pool.introspect().await.unwrap();

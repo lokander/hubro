@@ -27,24 +27,12 @@ use hubro::db::{
     RecordSource, SourceField, TableAccess, TableMeta, Value,
 };
 
-fn pg_url() -> Option<String> {
-    match std::env::var("HUBRO_PG_TEST_URL") {
-        Ok(url) => Some(url),
-        Err(_) => {
-            eprintln!("skipping postgres import test: HUBRO_PG_TEST_URL not set");
-            None
-        }
-    }
+async fn pg_url() -> Option<String> {
+    common::pg_test_url().await
 }
 
-fn mssql_url() -> Option<String> {
-    match std::env::var("HUBRO_MSSQL_TEST_URL") {
-        Ok(url) => Some(url),
-        Err(_) => {
-            eprintln!("skipping sql server import test: HUBRO_MSSQL_TEST_URL not set");
-            None
-        }
-    }
+async fn mssql_url() -> Option<String> {
+    common::mssql_test_url().await
 }
 
 fn find<'a>(tables: &'a [TableMeta], name: &str) -> &'a TableMeta {
@@ -482,7 +470,7 @@ async fn pg_fixture(pool: &DbPool, table: &str) {
 
 #[tokio::test]
 async fn postgres_csv_import_coerces_every_column_type() {
-    let Some(url) = pg_url() else { return };
+    let Some(url) = pg_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pg_fixture(&pool, "import_types").await;
     let tables = pool.introspect().await.unwrap();
@@ -530,7 +518,7 @@ async fn postgres_csv_import_coerces_every_column_type() {
 
 #[tokio::test]
 async fn postgres_a_bad_row_rolls_back_every_row_already_inserted() {
-    let Some(url) = pg_url() else { return };
+    let Some(url) = pg_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pool.execute("DROP TABLE IF EXISTS import_rollback")
         .await
@@ -584,7 +572,7 @@ async fn postgres_a_server_side_failure_also_rolls_the_whole_import_back() {
     // The other half of the guarantee: a row hubro accepts but the *server*
     // refuses (a duplicate key) is not skippable in either mode, and must
     // leave nothing behind.
-    let Some(url) = pg_url() else { return };
+    let Some(url) = pg_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pool.execute("DROP TABLE IF EXISTS import_conflict")
         .await
@@ -625,7 +613,7 @@ async fn postgres_a_server_side_failure_also_rolls_the_whole_import_back() {
 
 #[tokio::test]
 async fn postgres_skip_mode_reports_lines_and_commits_the_rest() {
-    let Some(url) = pg_url() else { return };
+    let Some(url) = pg_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pg_fixture(&pool, "import_skip").await;
     let tables = pool.introspect().await.unwrap();
@@ -668,7 +656,7 @@ async fn postgres_skip_mode_reports_lines_and_commits_the_rest() {
 
 #[tokio::test]
 async fn mssql_csv_import_lands_rows_and_rolls_a_bad_file_back() {
-    let Some(url) = mssql_url() else { return };
+    let Some(url) = mssql_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     pool.execute("IF OBJECT_ID('dbo.import_rows', 'U') IS NOT NULL DROP TABLE dbo.import_rows")
         .await
@@ -745,7 +733,7 @@ async fn mssql_csv_import_lands_rows_and_rolls_a_bad_file_back() {
 
 #[tokio::test]
 async fn mssql_skip_mode_reports_lines_and_commits_the_rest() {
-    let Some(url) = mssql_url() else { return };
+    let Some(url) = mssql_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     pool.execute("IF OBJECT_ID('dbo.import_skip', 'U') IS NOT NULL DROP TABLE dbo.import_skip")
         .await
@@ -793,7 +781,7 @@ async fn postgres_a_partially_applied_batch_is_rolled_back_and_counted() {
     // affects fewer rows than it carried values for. The batch must not
     // commit — and `undone_rows` must count the rows that DID land inside the
     // transaction, since that is the number the safety claim is about.
-    let Some(url) = pg_url() else { return };
+    let Some(url) = pg_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pool.execute("DROP TABLE IF EXISTS import_partial")
         .await
@@ -850,7 +838,7 @@ async fn postgres_a_range_column_takes_the_literal_the_server_accepts() {
     // `int4range` contains "int", so it used to be read as an integer column
     // and `[1,10)` — which the server takes happily — was silently SKIPPED.
     // A row dropped in skip mode is data loss wearing a success message.
-    let Some(url) = pg_url() else { return };
+    let Some(url) = pg_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pool.execute("DROP TABLE IF EXISTS import_ranges")
         .await
@@ -901,7 +889,7 @@ async fn mssql_a_bit_column_takes_the_boolean_spellings_people_export() {
     // refinement, `yes`/`no` reached the server as text and failed there —
     // and a server-side failure is unskippable, so skip mode could not save
     // the file either.
-    let Some(url) = mssql_url() else { return };
+    let Some(url) = mssql_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     pool.execute("IF OBJECT_ID('dbo.import_bit', 'U') IS NOT NULL DROP TABLE dbo.import_bit")
         .await

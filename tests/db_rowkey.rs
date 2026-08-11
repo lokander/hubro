@@ -25,14 +25,8 @@ fn locator(values: Vec<Value>) -> RowLocator {
     }
 }
 
-fn test_url() -> Option<String> {
-    match std::env::var("HUBRO_PG_TEST_URL") {
-        Ok(url) => Some(url),
-        Err(_) => {
-            eprintln!("skipping postgres test: HUBRO_PG_TEST_URL not set");
-            None
-        }
-    }
+async fn test_url() -> Option<String> {
+    common::pg_test_url().await
 }
 
 fn find<'a>(tables: &'a [TableMeta], schema: Option<&str>, name: &str) -> &'a TableMeta {
@@ -277,7 +271,7 @@ async fn sqlite_rowid_identity_edits_a_keyless_table() {
 
 #[tokio::test]
 async fn postgres_detection_on_real_introspection_output() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     for sql in [
         "DROP SCHEMA IF EXISTS rowkey CASCADE",
@@ -362,7 +356,7 @@ async fn postgres_detection_on_real_introspection_output() {
 
 #[tokio::test]
 async fn postgres_invalid_index_is_not_introspected() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     for sql in [
         "DROP SCHEMA IF EXISTS rowkey_invalid CASCADE",
@@ -410,7 +404,7 @@ async fn postgres_invalid_index_is_not_introspected() {
 
 #[tokio::test]
 async fn postgres_staged_writes_guard_and_commit() {
-    let Some(url) = test_url() else { return };
+    let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     for sql in [
         "DROP SCHEMA IF EXISTS rowkey_exec CASCADE",

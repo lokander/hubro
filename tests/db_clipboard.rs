@@ -98,7 +98,7 @@ async fn sqlite_generated_inserts_round_trip() {
 
 #[tokio::test]
 async fn postgres_generated_inserts_round_trip() {
-    let Ok(url) = std::env::var("HUBRO_PG_TEST_URL") else {
+    let Some(url) = common::pg_test_url().await else {
         eprintln!("skipping postgres clipboard test: HUBRO_PG_TEST_URL not set");
         return;
     };
@@ -155,7 +155,7 @@ async fn postgres_generated_inserts_carry_non_finite_floats() {
     // Postgres is the one backend whose floats can hold NaN/±Infinity, and
     // they have no numeric literal form — the copy has to spell them as
     // quoted casts or the paste either fails or lands as NULL.
-    let Ok(url) = std::env::var("HUBRO_PG_TEST_URL") else {
+    let Some(url) = common::pg_test_url().await else {
         eprintln!("skipping postgres clipboard test: HUBRO_PG_TEST_URL not set");
         return;
     };
@@ -207,7 +207,7 @@ async fn postgres_generated_inserts_carry_non_finite_floats() {
 
 #[tokio::test]
 async fn sqlserver_generated_inserts_round_trip() {
-    let Ok(url) = std::env::var("HUBRO_MSSQL_TEST_URL") else {
+    let Some(url) = common::mssql_test_url().await else {
         eprintln!("skipping sql server clipboard test: HUBRO_MSSQL_TEST_URL not set");
         return;
     };

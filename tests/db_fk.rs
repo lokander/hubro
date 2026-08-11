@@ -213,7 +213,7 @@ async fn sqlite_fk_jump_selects_the_referenced_rows() {
 
 #[tokio::test]
 async fn postgres_fk_jump_selects_the_referenced_rows() {
-    let Some(url) = std::env::var("HUBRO_PG_TEST_URL").ok() else {
+    let Some(url) = common::pg_test_url().await else {
         eprintln!("skipping postgres FK test: HUBRO_PG_TEST_URL not set");
         return;
     };

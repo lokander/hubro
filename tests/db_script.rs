@@ -13,14 +13,8 @@ use hubro::db::{
     Value,
 };
 
-fn pg_url() -> Option<String> {
-    match std::env::var("HUBRO_PG_TEST_URL") {
-        Ok(url) => Some(url),
-        Err(_) => {
-            eprintln!("skipping postgres test: HUBRO_PG_TEST_URL not set");
-            None
-        }
-    }
+async fn pg_url() -> Option<String> {
+    common::pg_test_url().await
 }
 
 /// Runs a script (split from one SQL text) collecting per-statement results.
@@ -202,7 +196,7 @@ async fn sqlite_script_mixes_reads_and_writes() {
 
 #[tokio::test]
 async fn postgres_execute_reports_rows_affected() {
-    let Some(url) = pg_url() else { return };
+    let Some(url) = pg_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
 
     pool.execute("DROP TABLE IF EXISTS exec_counts")
@@ -238,7 +232,7 @@ async fn postgres_execute_reports_rows_affected() {
 
 #[tokio::test]
 async fn postgres_errors_carry_line_and_column_positions() {
-    let Some(url) = pg_url() else { return };
+    let Some(url) = pg_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
 
     // The undefined column starts at line 2, column 3.
@@ -265,7 +259,7 @@ async fn postgres_errors_carry_line_and_column_positions() {
 
 #[tokio::test]
 async fn postgres_script_rolls_back_the_whole_batch_on_error() {
-    let Some(url) = pg_url() else { return };
+    let Some(url) = pg_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
 
     pool.execute("DROP TABLE IF EXISTS script_seq")
@@ -310,7 +304,7 @@ async fn postgres_script_rolls_back_the_whole_batch_on_error() {
 
 #[tokio::test]
 async fn postgres_script_commits_every_statement_on_success() {
-    let Some(url) = pg_url() else { return };
+    let Some(url) = pg_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
 
     pool.execute("DROP TABLE IF EXISTS script_ok")
@@ -344,7 +338,7 @@ async fn postgres_script_commits_every_statement_on_success() {
 
 #[tokio::test]
 async fn postgres_script_with_vacuum_runs_sequentially_and_keeps_prior_effects() {
-    let Some(url) = pg_url() else { return };
+    let Some(url) = pg_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
 
     // VACUUM can't run inside a transaction block, so the script falls back to
