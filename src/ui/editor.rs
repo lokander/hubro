@@ -65,6 +65,21 @@ const _: () = assert!(
     "the load budget must allow many polls"
 );
 
+/// The bundle's name for a dialect (its `create`/`updateSchema` argument;
+/// anything unrecognized falls back to SQLite there).
+///
+/// Derived from the enum wherever it is needed rather than passed alongside
+/// it: a `dialect_name: &str` next to a `dialect: Dialect` is two arguments
+/// that must agree with nothing enforcing it, and a mismatch would hand the
+/// editor one engine's completions under another's grammar.
+fn dialect_name(dialect: Dialect) -> &'static str {
+    match dialect {
+        Dialect::Postgres => "postgres",
+        Dialect::Sqlite => "sqlite",
+        Dialect::SqlServer => "mssql",
+    }
+}
+
 /// What the pane says when the bundle never arrived. Interpolated through
 /// [`js_string`], so it is safe to reword freely.
 const EDITOR_UNAVAILABLE: &str = "The SQL editor failed to load. Reopening this tab will try \
@@ -107,10 +122,11 @@ const EDITOR_CREATE_FAILED: &str =
 ///   from mounting the *previous* buffer's text.
 fn editor_mount_js(
     element: &str,
-    dialect_name: &str,
+    dialect: Dialect,
     initial_json: &str,
     schema_json: &str,
 ) -> String {
+    let dialect_name = dialect_name(dialect);
     let unavailable = js_string(EDITOR_UNAVAILABLE);
     let create_failed = js_string(EDITOR_CREATE_FAILED);
     format!(
@@ -161,13 +177,13 @@ fn editor_mount_js(
 /// there is simply no decision left there to get wrong.
 fn editor_redo_js(
     element: &str,
-    dialect_name: &str,
     dialect: Dialect,
     doc_json: &str,
     schema: Option<&SchemaLoad>,
 ) -> String {
     let mut js = format!(r#"DVEditor.setDoc("{element}", {doc_json});"#);
     if let Some(SchemaLoad::Ready(tables)) = schema {
+        let dialect_name = dialect_name(dialect);
         let schema_json = completion_schema(tables, dialect);
         js.push_str(&format!(
             r#"DVEditor.updateSchema("{element}", "{dialect_name}", {schema_json});"#
@@ -500,11 +516,6 @@ fn PanelButton(panel: Signal<EditorPanel>, target: EditorPanel, label: String) -
 fn EditorSurface(id: ConnectionId, dialect: Dialect) -> Element {
     let state = use_context::<AppState>();
     let element = editor_element_id(id);
-    let dialect_name = match dialect {
-        Dialect::Postgres => "postgres",
-        Dialect::Sqlite => "sqlite",
-        Dialect::SqlServer => "mssql",
-    };
     // Set only if the bundle never arrives (FRE-155). CodeMirror owns this
     // element's contents in every other case, so this stays `None` and the
     // host div renders no children of its own.
@@ -530,7 +541,7 @@ fn EditorSurface(id: ConnectionId, dialect: Dialect) -> Element {
         };
         let initial_json = js_string(&initial);
         spawn(async move {
-            let js = editor_mount_js(&element, dialect_name, &initial_json, &schema_json);
+            let js = editor_mount_js(&element, dialect, &initial_json, &schema_json);
             let mut channel = document::eval(&js);
             // The channel closes (Err) when the component unmounts.
             while let Ok(raw) = channel.recv::<String>().await {
@@ -565,13 +576,8 @@ fn EditorSurface(id: ConnectionId, dialect: Dialect) -> Element {
                         // of it here. The guard is a local so nothing is held
                         // across the eval.
                         let schemas = state.schemas.peek();
-                        let js = editor_redo_js(
-                            &element,
-                            dialect_name,
-                            dialect,
-                            &js_string(&doc),
-                            schemas.get(&id),
-                        );
+                        let js =
+                            editor_redo_js(&element, dialect, &js_string(&doc), schemas.get(&id));
                         drop(schemas);
                         document::eval(&js);
                     }
@@ -592,7 +598,8 @@ fn EditorSurface(id: ConnectionId, dialect: Dialect) -> Element {
             _ => return,
         };
         document::eval(&format!(
-            r#"DVEditor.updateSchema("{element_for_schema}", "{dialect_name}", {schema_json});"#
+            r#"DVEditor.updateSchema("{element_for_schema}", "{}", {schema_json});"#,
+            dialect_name(dialect)
         ));
     });
 
@@ -1166,7 +1173,7 @@ mod tests {
 
     /// The mount script as the effect builds it.
     fn mount_js() -> String {
-        editor_mount_js("sql-editor-1-", "postgres", "\"SELECT 1\"", "{}")
+        editor_mount_js("sql-editor-1-", Dialect::Postgres, "\"SELECT 1\"", "{}")
     }
 
     #[test]
@@ -1331,7 +1338,6 @@ mod tests {
         let ready = SchemaLoad::Ready(vec![table(None, "artists", &["id", "name"])]);
         let js = editor_redo_js(
             "sql-editor-1-",
-            "sqlite",
             Dialect::Sqlite,
             "\"SELECT 1\"",
             Some(&ready),
@@ -1354,13 +1360,7 @@ mod tests {
         // realistic trigger is `Loading` (a reload starting during the wait).
         let failed = SchemaLoad::Failed("boom".to_string());
         for schema in [None, Some(&SchemaLoad::Loading), Some(&failed)] {
-            let js = editor_redo_js(
-                "sql-editor-1-",
-                "sqlite",
-                Dialect::Sqlite,
-                "\"SELECT 1\"",
-                schema,
-            );
+            let js = editor_redo_js("sql-editor-1-", Dialect::Sqlite, "\"SELECT 1\"", schema);
             assert!(
                 js.contains("setDoc"),
                 "the document is pushed regardless of the schema"
