@@ -2051,11 +2051,21 @@ mod tests {
         // `a_redeemed_choice_is_consumed_and_never_rewrites_the_keyring`,
         // because an inversion here moves no call and this test would not see
         // it.
+        // Sliced past the comments before matching: the prose here says
+        // "session-sourced" and "keyring-sourced", which satisfies a bare
+        // search for `source` even when the call has hard-coded a source and
+        // stopped consulting the one it was handed.
         let redemption = &body[accepted..persist];
+        let redemption_code: String = redemption
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            redemption.contains("redeem_ssh_remember(") && redemption.contains("source"),
-            "the redemption bypasses the policy, or decides without knowing \
-             where the passphrase came from: {redemption}"
+            redemption_code.contains("redeem_ssh_remember(") && redemption_code.contains("source)"),
+            "the redemption bypasses the policy, or hard-codes where the \
+             passphrase came from instead of passing what it was handed: \
+             {redemption_code}"
         );
         // And a rejected passphrase takes the choice with it — while handing
         // it to the re-prompt, which is FRE-162. Both halves are one call, so
@@ -2068,10 +2078,15 @@ mod tests {
             "a rejected passphrase leaves its remember choice parked, where an \
              unrelated later attempt can redeem it: {rejection}"
         );
+        // The field as written, not merely mentioned: `remember: !remember,`
+        // contains `remember,` and restores the defect in *both* polarities —
+        // a ticked box lost to a typo, and an unticked one turned into a
+        // keyring write.
         assert!(
-            rejection.contains("remember,"),
-            "the withdrawn choice is not reaching the re-prompt, so the box is \
-             back to being re-ticked after every typo (FRE-162): {rejection}"
+            rejection.contains("\n                    remember,\n"),
+            "the withdrawn choice is not reaching the re-prompt as written, so \
+             the box is re-ticked after every typo, or offers the opposite of \
+             what the user chose (FRE-162): {rejection}"
         );
     }
 
@@ -2434,6 +2449,23 @@ mod tests {
             "the session carry moved into the spawned keyring work, so it lands \
              three keyring round-trips late and a reconnect in that window \
              re-prompts for a secret the app is holding: {update}"
+        );
+        // The keyring migration is paired the same way, and fails the same
+        // silent way: zipping a locator with itself makes `migrate_secret` a
+        // no-op on every key, so the stored password stays under the old
+        // locator and the edited connection loses it at the next restart —
+        // FRE-75's original bug, restored without moving a call.
+        let migration = &update[spawn_at..];
+        let from = migration
+            .find("secret_keys(&old_locator)")
+            .expect("the migration must read the old locator's keys");
+        let to = migration
+            .find("secret_keys(&new_locator)")
+            .expect("the migration must write the new locator's keys");
+        assert!(
+            from < to,
+            "the keyring migration runs backwards, or pairs a locator with \
+             itself and silently migrates nothing: {migration}"
         );
 
         let remove = method_body(
