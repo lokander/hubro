@@ -1101,6 +1101,22 @@ impl AppState {
         } = prompt;
         let Some(tunnel) = tunnel else { return };
         self.stash_ssh_passphrase(&url, passphrase);
+        // Park the choice for [`Self::open_tunnel`] to redeem once a tunnel
+        // open has actually accepted this passphrase (FRE-161).
+        //
+        // It used to be acted on right here, once the connect returned, gated
+        // on the connection being open. That gate is wrong in both directions:
+        // the connect has frequently not *finished* at this point — an
+        // untrusted host key, a database password prompt or an Entra sign-in
+        // each park it and resume it from somewhere else — while the
+        // passphrase may already have been accepted by then. Trusting a host
+        // key and connecting therefore stored nothing and said nothing, and
+        // session memory kept the passphrase, so the loss only showed up as a
+        // re-prompt after the next restart.
+        //
+        // Set *or cleared*, so an unticked box on a later attempt is not
+        // ignored because an earlier one ticked it.
+        self.set_ssh_remember(&url, remember);
         self.password_prompt.set(None);
         self.connect_server(
             ServerBackend::of(backend),
@@ -1110,9 +1126,16 @@ impl AppState {
             auth,
         )
         .await;
-        let connected = self.open_locators.read().iter().any(|(_, l)| *l == url);
-        if remember && connected {
-            self.persist_ssh_passphrase(&url).await;
+    }
+
+    /// Records — or withdraws — the user's "remember this SSH passphrase"
+    /// choice for `url`, pending a tunnel open that accepts it.
+    fn set_ssh_remember(mut self, url: &str, remember: bool) {
+        let mut pending = self.ssh_remember.write();
+        if remember {
+            pending.insert(url.to_string());
+        } else {
+            pending.remove(url);
         }
     }
 
@@ -1260,13 +1283,30 @@ impl AppState {
         };
         let known_hosts = crate::tunnel::default_known_hosts_read();
         match Tunnel::open(config.clone(), passphrase, target.0, target.1, &known_hosts).await {
-            Ok(live) => match (backend.via_local_port)(url, live.local_port()) {
-                Ok(rewritten) => Some((rewritten, Some(live))),
-                Err(err) => {
-                    self.fail_connect(url, err.to_string());
-                    None
+            Ok(live) => {
+                // The tunnel opened, so the passphrase it was handed is one the
+                // server accepted — the single condition FRE-151 places on
+                // writing it to the keyring, and the reason this happens here
+                // rather than wherever the connect eventually ends (FRE-161).
+                //
+                // Only for a session-sourced one: a keyring-sourced passphrase
+                // is already stored, and re-storing it would be a write whose
+                // only possible effect is to fail.
+                // The write guard is a statement temporary: nothing is held
+                // across the keyring await below.
+                let redeem = source == Some(PassphraseSource::Session)
+                    && self.ssh_remember.write().remove(url);
+                if redeem {
+                    self.persist_ssh_passphrase(url).await;
                 }
-            },
+                match (backend.via_local_port)(url, live.local_port()) {
+                    Ok(rewritten) => Some((rewritten, Some(live))),
+                    Err(err) => {
+                        self.fail_connect(url, err.to_string());
+                        None
+                    }
+                }
+            }
             Err(err @ TunnelError::NeedsPassphrase(_)) => {
                 self.release_connect(url);
                 if let Some(source) = source {
@@ -1752,6 +1792,97 @@ mod tests {
         assert!(
             body.contains("Some(password)"),
             "the password that came with the URL is no longer being connected with"
+        );
+    }
+
+    /// The source of [`AppState::connect_server_with_ssh_passphrase`], read
+    /// for the reason [`open_target_body`] documents.
+    fn ssh_passphrase_body() -> String {
+        method_body(
+            include_str!("connect.rs"),
+            "pub async fn connect_server_with_ssh_passphrase(",
+        )
+    }
+
+    #[test]
+    fn the_remember_choice_is_redeemed_where_the_passphrase_is_accepted() {
+        // FRE-161. The choice is made at the prompt, but FRE-151 permits the
+        // keyring write only once a tunnel open has *accepted* the passphrase.
+        // Those are different moments — and, the part that was wrong here,
+        // frequently different connects: an untrusted host key, a database
+        // password prompt or an Entra sign-in each park the attempt and finish
+        // it from somewhere else.
+        //
+        // So the prompt parks an intent and `open_tunnel` redeems it. Putting
+        // the write back at the prompt re-breaks FRE-151; gating it on the
+        // *connection* being open re-breaks FRE-161.
+        let body = ssh_passphrase_body();
+        assert!(
+            body.contains("set_ssh_remember"),
+            "the remember choice is dropped rather than parked: {body}"
+        );
+        assert!(
+            !body.contains("persist_ssh_passphrase"),
+            "the prompt writes the passphrase itself, so one the server never \
+             accepted can reach the keyring — which `open_tunnel` then reads \
+             as previously validated and deletes on rejection (FRE-151): {body}"
+        );
+        assert!(
+            !body.contains("open_locators"),
+            "the prompt is gating on the connection being open again. A \
+             connect parked on a host key or a password prompt has not opened \
+             yet, which is exactly how the choice went missing (FRE-161): \
+             {body}"
+        );
+
+        // And the redemption sits in the arm that means "accepted".
+        let body = open_tunnel_body();
+        let accepted = body
+            .find("Ok(live)")
+            .expect("open_tunnel must still have a success arm");
+        let redeem = body
+            .find("ssh_remember")
+            .expect("open_tunnel must redeem the parked choice");
+        let persist = body
+            .find("persist_ssh_passphrase")
+            .expect("...and act on it");
+        let rejected = body
+            .find("TunnelError::NeedsPassphrase")
+            .expect("open_tunnel must still handle a rejected passphrase");
+        assert!(
+            accepted < redeem && redeem < persist && persist < rejected,
+            "the passphrase is stored outside the arm where the tunnel \
+             accepted it: {body}"
+        );
+        // Session-sourced only. A keyring-sourced passphrase is already
+        // stored, so re-storing it is a write whose only possible effect is to
+        // fail — and it would run on every reconnect.
+        //
+        // Matched inside the redemption, not across the whole method:
+        // `open_tunnel` names `PassphraseSource::Session` earlier, where it
+        // records which source supplied the passphrase, so a whole-body match
+        // stays green with this guard deleted.
+        let redemption = &body[accepted..persist];
+        assert!(
+            redemption.contains("PassphraseSource::Session"),
+            "the redemption does not distinguish a passphrase just typed from \
+             one already in the keyring: {redemption}"
+        );
+    }
+
+    #[test]
+    fn an_unticked_box_withdraws_an_earlier_remember() {
+        // The intent is keyed by locator and outlives a single attempt, so it
+        // has to be *cleared* as well as set — otherwise ticking the box once
+        // makes every later passphrase for that connection persist, including
+        // ones the user deliberately declined to save.
+        let body = method_body(
+            include_str!("connect.rs"),
+            "fn set_ssh_remember(mut self, url: &str, remember: bool)",
+        );
+        assert!(
+            body.contains("insert") && body.contains("remove"),
+            "the parked choice is set but never withdrawn: {body}"
         );
     }
 

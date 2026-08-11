@@ -815,6 +815,27 @@ pub struct AppState {
     /// Live SSH tunnels, one per tunneled open connection. Removing an entry
     /// drops the [`Tunnel`], which shuts the forward down.
     pub tunnels: Signal<HashMap<ConnectionId, Tunnel>>,
+    /// Locators whose SSH key passphrase the user asked to remember, waiting
+    /// for a tunnel open to accept it (FRE-161).
+    ///
+    /// The choice is made at the passphrase prompt but cannot be acted on
+    /// there: FRE-151 established that only a passphrase a tunnel open has
+    /// **accepted** may reach the keyring, because `open_tunnel` reads a
+    /// keyring hit as "previously validated" and deletes it when the server
+    /// rejects it. So the choice is parked here and redeemed at the one place
+    /// that learns the passphrase was good.
+    ///
+    /// An intent rather than an argument because the connect that validates
+    /// the passphrase is frequently **not** the one the choice was made on: an
+    /// untrusted host key, a database password prompt and an Entra sign-in
+    /// each park the attempt and resume it from somewhere else. Threading a
+    /// `remember` flag through all of those means getting all of them right;
+    /// this way there is one producer and one consumer.
+    ///
+    /// An entry is consumed on acceptance, and replaced by whatever the next
+    /// prompt is answered with — so a later "don't remember" is not overridden
+    /// by an earlier attempt that said otherwise.
+    pub ssh_remember: Signal<HashSet<String>>,
     /// Introspected schema per open connection.
     pub schemas: Signal<HashMap<ConnectionId, SchemaLoad>>,
     /// Sidebar/grid UI state per open connection.
@@ -1041,6 +1062,7 @@ impl AppState {
             entra_prompt: Signal::new_in_scope(None, ScopeId::ROOT),
             confirm_quit: Signal::new_in_scope(false, ScopeId::ROOT),
             tunnels: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            ssh_remember: Signal::new_in_scope(HashSet::new(), ScopeId::ROOT),
             schemas: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             tab_ui: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             staged: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
