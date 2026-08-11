@@ -93,9 +93,11 @@ pub(super) fn forget_failed_ssh_passphrase(
 /// it (FRE-161).
 ///
 /// Withdrawing matters as much as parking: the intent is keyed by locator and
-/// outlives a failed attempt, so a box ticked once would otherwise make every
-/// later passphrase for that connection persist — including ones the user
-/// deliberately declined to save.
+/// outlives the attempt that parked it whenever that attempt *pauses* — on a
+/// host-key prompt — or is abandoned. (A passphrase the tunnel rejects
+/// withdraws it there and then.) Without the withdrawal, a box ticked once
+/// would make every later passphrase for that connection persist, including
+/// ones the user deliberately declined to save.
 pub(super) fn park_ssh_remember(pending: &mut HashSet<String>, url: &str, remember: bool) {
     if remember {
         pending.insert(url.to_string());
@@ -1324,10 +1326,12 @@ impl AppState {
         let known_hosts = crate::tunnel::default_known_hosts_read();
         match Tunnel::open(config.clone(), passphrase, target.0, target.1, &known_hosts).await {
             Ok(live) => {
-                // The tunnel opened, so the passphrase it was handed is good:
-                // it decrypted the key file (the server never sees it — this
-                // is a key passphrase, not a credential) and the session that
-                // key authenticated came up. That is the condition FRE-151
+                // The tunnel opened, so the passphrase it was handed is good
+                // as far as anything here can tell: the key loaded and the
+                // session it authenticated came up. Note what that is *not* —
+                // the server never sees this passphrase (it decrypts a local
+                // key file), and for an unencrypted key it was ignored
+                // outright. It is the condition FRE-151
                 // places on writing it to the keyring, and the reason the
                 // write lives here rather than wherever the connect eventually
                 // ends (FRE-161).
@@ -1914,6 +1918,15 @@ mod tests {
             redemption.contains("redeem_ssh_remember(") && redemption.contains("source"),
             "the redemption bypasses the policy, or decides without knowing \
              where the passphrase came from: {redemption}"
+        );
+        // And a rejected passphrase takes the choice with it. Defence in depth
+        // rather than load-bearing — the re-prompt re-parks whatever the user
+        // answers — but a choice made about a secret the server refused should
+        // not sit waiting for an unrelated attempt to redeem it.
+        let rejection = &body[rejected..];
+        assert!(
+            rejection.contains("park_ssh_remember") && rejection.contains("false"),
+            "a rejected passphrase leaves its remember choice parked: {rejection}"
         );
     }
 
