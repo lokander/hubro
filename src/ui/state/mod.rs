@@ -215,6 +215,25 @@ pub struct SqlBuffer {
     /// The editor text, synced from the webview so it survives buffer, pane,
     /// and tab switches.
     pub text: String,
+    /// How many times text has been placed into *this* buffer from outside
+    /// the editor — by [`SqlBuffers::open`] or [`SqlBuffers::load`].
+    ///
+    /// It does two jobs, both of which need it to be per buffer rather than
+    /// per tab:
+    ///
+    /// - With the buffer id it forms [`SqlBuffers::doc_target`], the thing the
+    ///   SQL pane's `setDoc` effect is gated on. The id alone cannot carry it:
+    ///   opening a saved query into an untitled blank buffer reuses that
+    ///   buffer, so the id stays the same and an id-gated effect never fires —
+    ///   the tab renames itself and the editor stays empty.
+    /// - It is handed to the editor and comes back on every message from it,
+    ///   which is what lets [`SqlBuffers::set_text`] tell a reply describing
+    ///   the current document from one describing a document that has since
+    ///   been replaced (FRE-154).
+    ///
+    /// Text arriving *from* the editor deliberately does not move it: pushing
+    /// a keystroke back into CodeMirror would fight the caret.
+    pub doc_generation: u64,
 }
 
 impl SqlBuffer {
@@ -224,6 +243,7 @@ impl SqlBuffer {
             id,
             title: None,
             text: String::new(),
+            doc_generation: 0,
         }
     }
 
@@ -252,18 +272,6 @@ pub struct SqlBuffers {
     /// handing a closed buffer's id to a later one would re-attach them to a
     /// query they did not come from.
     issued: u64,
-    /// Bumped every time text is placed into a buffer from *outside* the
-    /// editor, i.e. by [`Self::open`].
-    ///
-    /// The SQL pane pushes the document into CodeMirror when
-    /// [`Self::doc_target`] changes. The buffer id alone cannot carry that:
-    /// opening a saved query into an untitled blank buffer reuses it, so the
-    /// id stays the same and an id-gated effect never fires — the tab renames
-    /// itself and the editor stays empty, which is the state layer and the
-    /// screen disagreeing. Text arriving *from* the editor
-    /// ([`Self::set_text`]) deliberately does not bump it: pushing a
-    /// keystroke back into CodeMirror would fight the caret.
-    doc_generation: u64,
 }
 
 impl Default for SqlBuffers {
@@ -272,7 +280,6 @@ impl Default for SqlBuffers {
             list: vec![SqlBuffer::scratch(FIRST_SQL_BUFFER)],
             active: FIRST_SQL_BUFFER,
             issued: FIRST_SQL_BUFFER,
-            doc_generation: 0,
         }
     }
 }
@@ -289,11 +296,19 @@ impl SqlBuffers {
     }
 
     /// What the editor should currently be displaying: the active buffer and
-    /// the generation of the last text put into a buffer from outside it.
-    /// Either changing means the editor's document is stale — see
-    /// [`Self::doc_generation`].
+    /// that buffer's [`SqlBuffer::doc_generation`]. Either changing means the
+    /// editor's document is stale, and it is also the token handed to the
+    /// editor so its replies can be dated.
     pub fn doc_target(&self) -> (u64, u64) {
-        (self.active, self.doc_generation)
+        (self.active, self.doc_generation(self.active))
+    }
+
+    /// One buffer's document generation, `0` for an id that is gone.
+    fn doc_generation(&self, buffer: u64) -> u64 {
+        self.list
+            .iter()
+            .find(|b| b.id == buffer)
+            .map_or(0, |b| b.doc_generation)
     }
 
     /// One buffer's text, empty for an id that is gone.
@@ -304,15 +319,53 @@ impl SqlBuffers {
             .map_or("", |b| b.text.as_str())
     }
 
-    /// Stores one buffer's text, reporting whether it actually changed. A
-    /// write to an id that is gone is dropped: a closed buffer's last
-    /// message from the webview must not resurrect it.
-    pub fn set_text(&mut self, buffer: u64, text: String) -> bool {
+    /// Stores one buffer's text **as reported by the editor**, reporting
+    /// whether it actually changed.
+    ///
+    /// `generation` is the [`SqlBuffer::doc_generation`] the editor was
+    /// holding when that text was typed, which it sends back with the text.
+    /// Two writes are therefore dropped rather than applied:
+    ///
+    /// - **A buffer that is gone.** A closed tab's last message from the
+    ///   webview must not resurrect it.
+    /// - **A stale generation.** Something has replaced that buffer's document
+    ///   since — a saved query opened into it, a history entry loaded — so the
+    ///   message describes text that is no longer on screen, and applying it
+    ///   would silently undo the load. This matters because the editor now
+    ///   *flushes* its pending text on the way out (FRE-154) instead of
+    ///   dropping it, so such a message is a message in flight rather than a
+    ///   hypothetical.
+    ///
+    /// Note what is deliberately **not** dropped: a message for a buffer that
+    /// is no longer active. Its generation still matches, because switching
+    /// tabs replaces no document — and that message is precisely the tail of
+    /// typing this fix exists to keep.
+    pub fn set_text(&mut self, buffer: u64, generation: u64, text: String) -> bool {
         match self.list.iter_mut().find(|b| b.id == buffer) {
-            Some(existing) => {
+            Some(existing) if existing.doc_generation == generation => {
                 let changed = existing.text != text;
                 existing.text = text;
                 changed
+            }
+            _ => false,
+        }
+    }
+
+    /// Puts `text` into an existing buffer from *outside* the editor — the
+    /// history panel's Load and Run. Ignores an id that is gone.
+    ///
+    /// Moving the generation is what makes this safe: the editor's reply about
+    /// the text being replaced is already in flight when this runs, and
+    /// without the bump [`Self::set_text`] would apply it and undo the load.
+    /// The bump also moves [`Self::doc_target`], so the pane pushes the loaded
+    /// text into the editor — this is the whole of the load, with no second
+    /// `setDoc` at the call site to drift from it.
+    pub fn load(&mut self, buffer: u64, text: String) -> bool {
+        match self.list.iter_mut().find(|b| b.id == buffer) {
+            Some(existing) => {
+                existing.text = text;
+                existing.doc_generation += 1;
+                true
             }
             None => false,
         }
@@ -344,10 +397,6 @@ impl SqlBuffers {
     /// in which case that one is reused. Makes it active and returns its id.
     pub fn open(&mut self, title: Option<String>, text: String) -> u64 {
         let active = self.active;
-        // Both branches place text the editor has not seen, so both move the
-        // document generation — the reuse branch especially, since it is the
-        // one whose buffer id does not change.
-        self.doc_generation += 1;
         if let Some(buffer) = self
             .list
             .iter_mut()
@@ -355,11 +404,22 @@ impl SqlBuffers {
         {
             buffer.title = title;
             buffer.text = text;
+            // The reuse branch is the one that needs this: its buffer id does
+            // not change, so the generation is all that tells the pane the
+            // editor is holding a document that has been replaced.
+            buffer.doc_generation += 1;
             return active;
         }
         let id = self.issue();
-        self.list.push(SqlBuffer { id, title, text });
+        self.list.push(SqlBuffer {
+            id,
+            title,
+            text,
+            doc_generation: 0,
+        });
         self.active = id;
+        // The new buffer's id has never been active before, so the target has
+        // moved regardless of where its generation starts.
         id
     }
 
@@ -1691,11 +1751,28 @@ mod tests {
     /// Buffers holding text nobody has saved, in tab order.
     fn buffers(texts: &[&str]) -> SqlBuffers {
         let mut buffers = SqlBuffers::default();
-        buffers.set_text(FIRST_SQL_BUFFER, texts[0].to_string());
+        typed(&mut buffers, FIRST_SQL_BUFFER, texts[0]);
         for text in &texts[1..] {
             buffers.open(None, (*text).to_string());
         }
         buffers
+    }
+
+    /// The generation the editor is holding for `buffer` — what a message from
+    /// it is stamped with while nothing has replaced that document.
+    fn generation_of(buffers: &SqlBuffers, buffer: u64) -> u64 {
+        buffers
+            .list()
+            .iter()
+            .find(|b| b.id == buffer)
+            .map_or(0, |b| b.doc_generation)
+    }
+
+    /// Text arriving from an editor that is up to date — the ordinary case.
+    /// Tests about *staleness* pass the generation by hand instead.
+    fn typed(buffers: &mut SqlBuffers, buffer: u64, text: &str) -> bool {
+        let generation = generation_of(buffers, buffer);
+        buffers.set_text(buffer, generation, text.to_string())
     }
 
     #[test]
@@ -1741,9 +1818,9 @@ mod tests {
     /// A blank, untitled *inactive* first buffer, with the second active.
     fn buffers_with_blank_first() -> SqlBuffers {
         let mut buffers = SqlBuffers::default();
-        buffers.set_text(FIRST_SQL_BUFFER, "typing".into());
+        typed(&mut buffers, FIRST_SQL_BUFFER, "typing");
         let second = buffers.open(None, "SELECT keep_me".into());
-        buffers.set_text(FIRST_SQL_BUFFER, String::new());
+        typed(&mut buffers, FIRST_SQL_BUFFER, "");
         assert_eq!(buffers.list().len(), 2);
         assert_eq!(buffers.active(), second);
         buffers
@@ -1779,13 +1856,89 @@ mod tests {
         // document back into it, or every keystroke would fight the caret.
         let mut buffers = SqlBuffers::default();
         let before = buffers.doc_target();
-        assert!(buffers.set_text(FIRST_SQL_BUFFER, "SELECT 1".into()));
+        assert!(typed(&mut buffers, FIRST_SQL_BUFFER, "SELECT 1"));
         assert_eq!(buffers.doc_target(), before);
         // Nor does naming a buffer after a save, or selecting the buffer that
         // is already active.
         buffers.set_title(FIRST_SQL_BUFFER, "Counts".into());
         buffers.select(FIRST_SQL_BUFFER);
         assert_eq!(buffers.doc_target(), before);
+    }
+
+    #[test]
+    fn the_tail_of_typing_lands_in_the_buffer_it_was_typed_in() {
+        // FRE-154. The editor flushes what it still owes on the way *out* of a
+        // buffer, so that message arrives after the switch by design. It has
+        // to be filed under the buffer named in it: filing it under whichever
+        // buffer is active on arrival would paste the outgoing tab's tail into
+        // the incoming one, which is worse than the loss it replaced.
+        let mut buffers = buffers(&["SELECT a", "SELECT b"]);
+        let ids: Vec<u64> = buffers.list().iter().map(|b| b.id).collect();
+        buffers.select(ids[1]);
+        assert!(
+            typed(&mut buffers, ids[0], "SELECT a_tail"),
+            "a switch replaces no document, so the outgoing buffer's \
+             generation still matches and its tail is not stale"
+        );
+        assert_eq!(buffers.text(ids[0]), "SELECT a_tail");
+        assert_eq!(
+            buffers.text(ids[1]),
+            "SELECT b",
+            "the tail went nowhere near the buffer being switched to"
+        );
+    }
+
+    #[test]
+    fn a_stale_reply_from_the_editor_cannot_undo_a_load() {
+        // The other half of the same change. Flushing means there is now a
+        // message in flight describing the document a load is replacing —
+        // apply it and the history panel's Load silently reverts a moment
+        // after it lands.
+        let mut buffers = SqlBuffers::default();
+        let stale = generation_of(&buffers, FIRST_SQL_BUFFER);
+        buffers.load(FIRST_SQL_BUFFER, "SELECT loaded".into());
+        assert!(
+            !buffers.set_text(FIRST_SQL_BUFFER, stale, "SELECT half_typed".into()),
+            "a reply about the replaced document must be dropped"
+        );
+        assert_eq!(buffers.text(FIRST_SQL_BUFFER), "SELECT loaded");
+
+        // And once the editor has been told about the load, its next reply is
+        // current again — the guard must not wedge the buffer read-only.
+        assert!(typed(&mut buffers, FIRST_SQL_BUFFER, "SELECT loaded, more"));
+        assert_eq!(buffers.text(FIRST_SQL_BUFFER), "SELECT loaded, more");
+    }
+
+    #[test]
+    fn opening_elsewhere_does_not_invalidate_another_buffers_tail() {
+        // Why the generation is per buffer rather than per tab: opening a
+        // saved query replaces the document of the buffer it opens into, and
+        // of no other. A tab-wide counter would date-stamp the buffer being
+        // typed in as stale as well, throwing away the very text this fix
+        // exists to keep.
+        let mut buffers = buffers(&["SELECT a"]);
+        let first = buffers.list()[0].id;
+        let typing_generation = generation_of(&buffers, first);
+        let opened = buffers.open(Some("Counts".into()), "SELECT count(*)".into());
+        assert_ne!(opened, first, "this test needs the new-buffer branch");
+        assert!(buffers.set_text(first, typing_generation, "SELECT a_tail".into()));
+        assert_eq!(buffers.text(first), "SELECT a_tail");
+    }
+
+    #[test]
+    fn loading_moves_the_document_target_so_the_pane_pushes_the_text() {
+        // Load has no `setDoc` of its own any more — moving the target *is*
+        // how the text reaches CodeMirror. If this stopped holding, the
+        // history panel would write the state and leave the screen showing the
+        // query that was there before.
+        let mut buffers = SqlBuffers::default();
+        let before = buffers.doc_target();
+        assert!(buffers.load(FIRST_SQL_BUFFER, "SELECT loaded".into()));
+        assert_ne!(buffers.doc_target(), before);
+
+        // A buffer that is gone is reported, not silently created: the caller
+        // clears a parked write confirmation on the strength of this.
+        assert!(!buffers.load(FIRST_SQL_BUFFER + 999, "SELECT nowhere".into()));
     }
 
     #[test]
@@ -1849,7 +2002,7 @@ mod tests {
         let mut buffers = buffers(&["a", "b"]);
         let ids: Vec<u64> = buffers.list().iter().map(|b| b.id).collect();
         buffers.close(ids[1]);
-        assert!(!buffers.set_text(ids[1], "late".into()));
+        assert!(!typed(&mut buffers, ids[1], "late"));
         assert_eq!(buffers.list().len(), 1);
         assert_eq!(buffers.text(ids[1]), "");
         // A select for a buffer that is gone is ignored too, so `active`
