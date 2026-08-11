@@ -88,9 +88,9 @@ pub(super) fn forget_failed_ssh_passphrase(
     source == PassphraseSource::Keyring
 }
 
-/// Parks — or withdraws — the user's "remember this passphrase" choice for
-/// `url`, to be redeemed by [`redeem_ssh_remember`] once a tunnel open accepts
-/// it (FRE-161).
+/// Records the user's "remember this passphrase" answer for `url` — ticked or
+/// cleared — to be redeemed by [`redeem_ssh_remember`] once a tunnel open
+/// accepts it (FRE-161).
 ///
 /// Withdrawing matters as much as parking: the intent is keyed by locator and
 /// outlives the attempt that parked it whenever that attempt *pauses* — on a
@@ -183,18 +183,27 @@ pub(super) fn secret_keys(locator: &str) -> [String; 3] {
 ///
 /// [`AppState::update_saved`] migrates the keyring entries for a reason that
 /// applies just as much here: the locator is the key, so an edit that changes
-/// host, port or database moves every store keyed by it. Session memory and
-/// the parked intent are two such stores the migration used to walk past. The
-/// intent then sat under a locator nothing would look up again — the tick
-/// silently dropped, which is FRE-161's failure reached by another route — and
-/// the session passphrase stayed behind, so an edit re-prompted for a secret
-/// the app was still holding.
-pub(super) fn rekey_connection_secrets(
-    session: &mut HashMap<String, String>,
-    pending: &mut HashMap<String, bool>,
-    old: &str,
-    new: &str,
-) {
+/// host, port or database moves every session secret keyed by it. Left behind,
+/// they are a passphrase and a password filed under a locator nothing will look
+/// up again, while the connection they belong to re-prompts for secrets the app
+/// is still holding.
+///
+/// **The parked "remember" choice deliberately does not move**, though it is
+/// keyed by locator too, and FRE-162 was filed saying it should. An edit is
+/// applied only after a connect to the *new* locator has succeeded
+/// ([`AppState::save_or_apply_edit`] is reached through
+/// [`AppState::save_server_if_open`]), so that connect has already redeemed or
+/// recorded its own answer by the time this runs. Anything carried over can
+/// therefore only be consumed by some *later* attempt — precisely what
+/// [`park_ssh_remember`] exists to prevent, and a way to store a passphrase the
+/// user declined: tick on the old locator, abandon the attempt at a host-key
+/// card, edit the URL, untick at the new prompt, and the old answer would
+/// overwrite the new one the successful connect had just consumed.
+///
+/// The abandoned attempt keeps its own answer under the old locator, where it
+/// stays redeemable if that attempt ever resumes — its host-key card is still
+/// on screen, and trusting the key reconnects to the old URL.
+pub(super) fn carry_session_secrets(session: &mut HashMap<String, String>, old: &str, new: &str) {
     // No `old == new` guard: the only caller already checks it, and moving a
     // key onto itself is a no-op regardless — which
     // `an_unmoved_locator_and_unrelated_connections_are_untouched_by_an_edit`
@@ -211,9 +220,6 @@ pub(super) fn rekey_connection_secrets(
         // stored copy when it fails, which is FRE-151 reached through an edit.
         session.entry(new_key).or_insert(secret);
     }
-    if let Some(answer) = pending.remove(old) {
-        pending.insert(new.to_string(), answer);
-    }
 }
 
 /// Drops what a removed connection leaves behind in memory (FRE-162).
@@ -222,6 +228,11 @@ pub(super) fn rekey_connection_secrets(
 /// counterparts, and leaving them is not merely untidy. A parked intent
 /// outliving its connection means recreating the same URL in the same session
 /// writes back to the keyring the very passphrase the deletion removed.
+///
+/// The answer is *removed* rather than set to `false`, because those are
+/// different states here too: a recreated connection has never been asked, so
+/// its first prompt must come up ticked like any other
+/// ([`withdraw_ssh_remember`] is what tells them apart).
 pub(super) fn forget_connection_secrets(
     session: &mut HashMap<String, String>,
     pending: &mut HashMap<String, bool>,
@@ -770,9 +781,8 @@ impl AppState {
             // waiting on a connect that is itself parked on a host-key prompt,
             // and that connect can resume the moment this returns. The keyring
             // migration below is off-thread because it is I/O; this is not.
-            rekey_connection_secrets(
+            carry_session_secrets(
                 &mut self.session_passwords.write(),
-                &mut self.ssh_remember.write(),
                 &old_locator,
                 &new_locator,
             );
@@ -2175,26 +2185,17 @@ mod tests {
     }
 
     #[test]
-    fn an_edited_locator_carries_its_parked_choice_and_session_secrets_with_it() {
+    fn an_edited_locator_carries_its_session_secrets_with_it() {
         // FRE-162. The keyring entries already move — `update_saved` migrates
-        // all three — but the two in-memory stores keyed by the same locator
-        // did not. The parked intent is the one that bites: it is redeemed by
-        // whichever connect finally opens the tunnel, so a connect sitting on
-        // a host-key prompt (on the connections screen, beside the edit
-        // button) redeems nothing, and the user's tick is gone with no notice.
+        // all three — but the session copies keyed by the same locator did
+        // not, so the edited connection re-prompted for secrets the app was
+        // still holding and the old ones sat under a locator naming nothing.
         const OLD: &str = "postgres://u@old:5432/db";
         const NEW: &str = "postgres://u@new:5432/db";
         let mut session = session_for(OLD);
-        let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, OLD, true);
 
-        rekey_connection_secrets(&mut session, &mut pending, OLD, NEW);
+        carry_session_secrets(&mut session, OLD, NEW);
 
-        assert!(
-            redeem_ssh_remember(&mut pending, NEW, Some(PassphraseSource::Session)),
-            "the remember choice was stranded under the old locator, so the \
-             connect that opens the tunnel finds nothing parked"
-        );
         assert_eq!(
             session
                 .get(ssh_secret_key(NEW).as_str())
@@ -2223,7 +2224,45 @@ mod tests {
                 "{key} survived the edit under the old locator"
             );
         }
-        assert!(!pending.contains_key(OLD));
+    }
+
+    #[test]
+    fn an_edit_leaves_the_parked_choice_with_the_attempt_that_made_it() {
+        // FRE-162 asked for the parked choice to move with the locator. It
+        // must not, and the reason is the one that makes the edit safe at all:
+        // `update_saved` runs only after a connect to the NEW locator has
+        // succeeded, so that connect has already redeemed or recorded its own
+        // answer. Anything carried across can only be consumed by a later
+        // attempt — which is what `park_ssh_remember` exists to prevent.
+        //
+        // The path this closes: tick on the old locator, abandon the attempt
+        // at a host-key card, edit the URL, untick at the new prompt, connect.
+        // Migrating would put the old `true` where the new `false` had just
+        // been consumed, and the next reconnect would store a passphrase the
+        // user had declined.
+        const OLD: &str = "postgres://u@old:5432/db";
+        const NEW: &str = "postgres://u@new:5432/db";
+        let mut session = session_for(OLD);
+        let mut pending = HashMap::new();
+        park_ssh_remember(&mut pending, OLD, true);
+
+        carry_session_secrets(&mut session, OLD, NEW);
+
+        assert!(
+            !redeem_ssh_remember(&mut pending, NEW, Some(PassphraseSource::Session)),
+            "an old attempt's tick was handed to the edited connection, where a \
+             later reconnect redeems a choice made about a different attempt"
+        );
+        // It stays where it was made: that attempt's host-key card is still on
+        // screen, and trusting the key reconnects to the old URL.
+        let mut pending = HashMap::new();
+        park_ssh_remember(&mut pending, OLD, true);
+        carry_session_secrets(&mut session_for(OLD), OLD, NEW);
+        assert!(
+            redeem_ssh_remember(&mut pending, OLD, Some(PassphraseSource::Session)),
+            "the abandoned attempt lost the tick it made, so resuming it stores \
+             nothing (FRE-161)"
+        );
     }
 
     #[test]
@@ -2242,9 +2281,8 @@ mod tests {
         const NEW: &str = "postgres://u@new:5432/db";
         let mut session = session_for(OLD);
         session.insert(NEW.to_string(), "validated-just-now".to_string());
-        let mut pending = HashMap::new();
 
-        rekey_connection_secrets(&mut session, &mut pending, OLD, NEW);
+        carry_session_secrets(&mut session, OLD, NEW);
 
         assert_eq!(
             session.get(NEW).map(String::as_str),
@@ -2270,23 +2308,14 @@ mod tests {
         // must not disturb what is filed under it.
         const URL: &str = "postgres://u@h:5432/db";
         let mut session = session_for(URL);
-        let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, URL, true);
-        rekey_connection_secrets(&mut session, &mut pending, URL, URL);
+        carry_session_secrets(&mut session, URL, URL);
         assert_eq!(session, session_for(URL), "a no-op edit lost a secret");
-        assert!(
-            pending.contains_key(URL),
-            "a no-op edit dropped the parked choice"
-        );
 
         // A different connection's secrets are never collateral.
         const OTHER: &str = "postgres://u@other:5432/db";
         let mut session = session_for(OTHER);
-        let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, OTHER, true);
-        rekey_connection_secrets(&mut session, &mut pending, URL, "postgres://u@new:5432/db");
+        carry_session_secrets(&mut session, URL, "postgres://u@new:5432/db");
         assert_eq!(session, session_for(OTHER));
-        assert!(pending.contains_key(OTHER));
     }
 
     #[test]
@@ -2323,6 +2352,24 @@ mod tests {
             "the deleted connection's remember choice is still parked, so \
              recreating the URL re-stores the passphrase the user deleted"
         );
+        // Probed through `withdraw` as well, because `redeem` cannot tell a
+        // cleared entry from one left behind as `false` — and that difference
+        // is user-visible: a recreated connection has never been asked, so its
+        // first prompt must come up ticked.
+        let mut pending = HashMap::new();
+        park_ssh_remember(&mut pending, URL, true);
+        forget_connection_secrets(&mut session_for(URL), &mut pending, URL);
+        assert!(
+            withdraw_ssh_remember(&mut pending, URL),
+            "the deleted connection left an answer behind, so recreating it \
+             offers an unticked box the user never cleared"
+        );
+        assert!(pending.is_empty(), "the deletion left an entry behind");
+
+        let mut session = session_for(URL);
+        let mut pending = HashMap::new();
+        park_ssh_remember(&mut pending, URL, true);
+        forget_connection_secrets(&mut session, &mut pending, URL);
         for key in secret_keys(URL) {
             assert!(
                 !session.contains_key(&key),
@@ -2357,25 +2404,36 @@ mod tests {
             "pub fn update_saved(mut self, old_locator: String, connection: SavedConnection) {",
         );
         assert!(
-            update.contains("rekey_connection_secrets("),
+            update.contains("carry_session_secrets("),
             "an edit migrates the keyring entries but strands the session \
-             passphrase and the parked remember choice under the old locator \
-             (FRE-162): {update}"
+             passphrase and password under the old locator (FRE-162): {update}"
         );
         assert!(
-            update.contains("ssh_remember") && update.contains("session_passwords"),
-            "the rekey is not being handed both in-memory stores: {update}"
+            update.contains("session_passwords"),
+            "the carry is not being handed session memory: {update}"
+        );
+        // And it must not reach for the parked choice: carrying that across is
+        // how an abandoned attempt's tick comes to be redeemed by a later one.
+        assert!(
+            !update.contains("ssh_remember"),
+            "an edit is moving the parked remember choice onto the new locator, \
+             where a later reconnect redeems a choice made about a different \
+             attempt: {update}"
         );
         // Direction, not just presence: migrating new→old passes every
         // assertion above and every policy test, while moving the secrets
-        // backwards onto the locator the edit just abandoned.
+        // backwards onto the locator the edit just abandoned. Positions are
+        // unwrapped rather than compared as `Option`s, so an argument that
+        // stops appearing fails instead of comparing `None < Some(_)`.
         let call = &update[update
-            .find("rekey_connection_secrets(")
+            .find("carry_session_secrets(")
             .expect("checked above")..];
         let call = &call[..call.find(");").expect("the call must be closed")];
+        let old_at = call.find("&old_locator").expect("the source locator");
+        let new_at = call.find("&new_locator").expect("the destination locator");
         assert!(
-            call.find("&old_locator") < call.find("&new_locator"),
-            "the rekey runs backwards — the secrets move onto the locator the \
+            old_at < new_at,
+            "the carry runs backwards — the secrets move onto the locator the \
              edit abandoned: {call}"
         );
 
