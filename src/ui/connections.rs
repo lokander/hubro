@@ -1163,7 +1163,10 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
     use super::state::PromptKind;
     let state = use_context::<AppState>();
     let mut password = use_signal(String::new);
-    let mut remember = use_signal(|| true);
+    // Seeded from the prompt, not from `true`: a re-prompt after a rejected
+    // passphrase carries the answer the user already gave (FRE-162).
+    let offered = prompt.remember;
+    let mut remember = use_signal(move || offered);
     let prompt_for_submit = prompt.clone();
     let submit = move || {
         let prompt = prompt_for_submit.clone();
@@ -2064,6 +2067,37 @@ const FORM_SELECT_CLASS: &str = "rounded border border-slate-300 dark:border-sla
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_prompt_card_offers_the_choice_the_prompt_carries() {
+        // The last hop of FRE-162, and the one that can silently undo all of
+        // it: `withdraw_ssh_remember` can compute the right answer and
+        // `PasswordPrompt` can carry it faithfully while the card initialises
+        // its checkbox from a literal `true` — which is exactly the code this
+        // replaced. Every state-side test stays green through that.
+        //
+        // A component needs a Dioxus runtime to render, so the seed is checked
+        // at its source: the card is a function, and the initialiser is one
+        // line of it.
+        let source = include_str!("connections.rs");
+        let card = source
+            .find("fn PasswordPromptCard(")
+            .expect("the prompt card must still exist");
+        let body = &source[card..card
+            + source[card..]
+                .find("rsx!")
+                .expect("the card must still render")];
+        assert!(
+            !body.contains("use_signal(|| true)"),
+            "the card re-ticks the remember box on every prompt, so unticking \
+             it and then mistyping the passphrase silently restores the \
+             decision to store it (FRE-162): {body}"
+        );
+        assert!(
+            body.contains("prompt.remember"),
+            "the card ignores the choice the prompt carries: {body}"
+        );
+    }
 
     #[test]
     fn an_embedded_password_is_only_taken_from_a_pasted_url() {
