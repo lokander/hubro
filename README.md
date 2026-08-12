@@ -270,7 +270,7 @@ Notes on the data grid's performance work live in
 
 Releases are cut by pushing a version tag. The
 [`release` workflow](.github/workflows/release.yml) then bundles the app with
-`dx bundle` and publishes the artifacts:
+`dx bundle` and publishes the artifacts.
 
 The version is authored in **two** files, and both have to agree with the tag:
 `Cargo.toml`, which dx stamps into the Linux and Windows artifacts, and

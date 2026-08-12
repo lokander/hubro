@@ -162,6 +162,12 @@ fn declared_needs(body: &str) -> Vec<String> {
     };
     let mut value = first.trim().trim_start_matches("needs:").trim().to_string();
     for line in lines {
+        // A blank line inside the list is whitespace, not the end of it —
+        // stopping there would drop the rest of the dependencies and read as
+        // "this job needs less than it does".
+        if line.trim().is_empty() {
+            continue;
+        }
         match line.trim().strip_prefix('-') {
             Some(item) => value.push_str(&format!(" {item}")),
             None => break,
@@ -172,6 +178,32 @@ fn declared_needs(body: &str) -> Vec<String> {
         .filter(|token| !token.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// Whether `id` waits for `verify`, directly or through jobs it needs.
+///
+/// Transitive rather than direct on purpose: `publish` is gated because the
+/// bundle jobs are, and pinning only the direct edges meant naming the jobs to
+/// check, which meant a naming convention, which a rename walks straight
+/// through.
+fn needs_verify_transitively(jobs: &[(String, String)], id: &str) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut pending = vec![id.to_string()];
+    while let Some(current) = pending.pop() {
+        if !seen.insert(current.clone()) {
+            continue;
+        }
+        let Some((_, body)) = jobs.iter().find(|(job_id, _)| *job_id == current) else {
+            continue;
+        };
+        for need in declared_needs(body) {
+            if need == "verify" {
+                return true;
+            }
+            pending.push(need);
+        }
+    }
+    false
 }
 
 /// The value of a top-level `key = "value"` line in a TOML file. Same
@@ -436,55 +468,69 @@ fn the_info_plist_records_the_dx_version_it_was_mirrored_from() {
 }
 
 #[test]
-fn nothing_bundles_or_publishes_before_the_version_check() {
+fn no_release_job_runs_without_the_version_check_passing() {
     // The version a release *claims* is the tag; the version its artifacts
     // *carry* comes from Cargo.toml (Linux, Windows) and Info.plist (macOS,
     // which dx copies verbatim). release.yml's `verify` job is what stops
     // those three disagreeing — v0.6.0's tag names a commit whose Cargo.toml
     // still said 0.5.0, and shipped saying so.
     //
-    // The job is only a guard while every job that produces or publishes an
-    // artifact waits for it. Deleting three `needs:` lines silently restores
-    // the old behaviour, and the test above would not notice — so this reads
-    // the wire rather than the spot: every bundle job needs `verify`, and
-    // `publish` needs every bundle job, both derived from the file so a
-    // fourth platform has to be wired in rather than merely added.
+    // The rule is every job, not "every job named `Bundle …`" and not a list
+    // of the three that exist. Both of those pin an *enumeration*: the first
+    // is walked through by a rename, the second by adding a fourth platform.
+    // The invariant is that nothing in a release runs until the version has
+    // been checked, so that is what this asserts — transitively, since
+    // `publish` is gated by needing the bundle jobs rather than `verify`.
     let jobs = release_jobs();
     assert!(
         jobs.iter().any(|(id, _)| id == "verify"),
         "release.yml has no `verify` job (FRE-166)"
     );
-
-    let bundlers: Vec<&(String, String)> = jobs
-        .iter()
-        .filter(|(_, body)| body.contains("name: Bundle "))
-        .collect();
     assert!(
-        !bundlers.is_empty(),
-        "no job in release.yml is named `Bundle …`, so this test now checks \
-         nothing — were the bundle jobs renamed?"
+        jobs.len() > 1,
+        "release.yml has nothing but the `verify` job, so this test now checks \
+         nothing"
     );
 
-    for (id, body) in &bundlers {
+    for (id, _) in &jobs {
+        if id == "verify" {
+            continue;
+        }
         assert!(
-            declared_needs(body).iter().any(|need| need == "verify"),
-            "release.yml's `{id}` job does not need `verify`, so a tag whose \
-             version disagrees with Cargo.toml or Info.plist would bundle and \
-             publish under it anyway (FRE-166)"
+            needs_verify_transitively(&jobs, id),
+            "release.yml's `{id}` job does not wait for `verify`, directly or \
+             through a job it needs, so a tag whose version disagrees with \
+             Cargo.toml or Info.plist would build and publish anyway (FRE-166)"
         );
     }
+}
 
-    let (_, publish) = jobs
-        .iter()
-        .find(|(id, _)| id == "publish")
-        .expect("release.yml has no `publish` job");
-    let published = declared_needs(publish);
-    for (id, _) in &bundlers {
-        assert!(
-            published.contains(id),
-            "release.yml's `publish` job does not need `{id}`, so it can \
-             publish a release without that platform's artifacts"
-        );
+#[test]
+fn no_release_job_can_run_past_a_failed_dependency() {
+    // `needs: verify` is an edge, and an edge is only a gate while it is
+    // unconditional. Two documented GitHub features turn the whole graph above
+    // into decoration while leaving every `needs:` line in place: `if:
+    // always()` runs a job whose dependency failed, and `continue-on-error`
+    // makes a failed step or job conclude success. Either one leaves `verify`
+    // present, needed, and inert — which reads as gated to anyone skimming.
+    //
+    // release.yml contains neither today, so pinning their absence costs
+    // nothing. If a release job ever genuinely needs one, this failing is the
+    // prompt to re-argue that the version check still gates the release.
+    for (number, line) in RELEASE_WORKFLOW.lines().enumerate() {
+        let trimmed = line.trim().trim_start_matches("- ").trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        for escape in ["if:", "continue-on-error:"] {
+            assert!(
+                !trimmed.starts_with(escape),
+                "release.yml line {} declares `{escape}`, which can let a job \
+                 run or report success despite `verify` having failed — the \
+                 `needs:` edges then gate nothing (FRE-166)",
+                number + 1
+            );
+        }
     }
 }
 
@@ -500,16 +546,39 @@ fn the_plist_is_the_only_packaging_file_that_authors_a_version() {
     // a version appearing in one of these means `verify` has a third file to
     // check, and until it does, a release can still name one version and ship
     // another.
-    for (name, source) in [
-        ("Dioxus.toml", DIOXUS_TOML),
-        ("packaging/linux/hubro.desktop.hbs", DESKTOP_TEMPLATE),
-        ("packaging/windows/file-associations.wxs", WIX_FRAGMENT),
-    ] {
+    //
+    // Every file under packaging/ is read, not a list of the three that carry
+    // a declaration today: `postinst`, `postrm` and anything added later ship
+    // just as much as the WiX fragment does. Three *and* four components count
+    // — `1.0.0.0` is the canonical MSI `ProductVersion` shape, in exactly the
+    // file where it would appear.
+    let mut sources = vec![("Dioxus.toml".to_string(), DIOXUS_TOML.to_string())];
+    let mut directories = vec![std::path::PathBuf::from("packaging")];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(&directory).expect("packaging/ is readable") {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                directories.push(path);
+            } else if path != std::path::Path::new("packaging/macos/Info.plist") {
+                // The plist is the one packaging file that *does* author a
+                // version, and `verify` checks it.
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                sources.push((path.display().to_string(), text));
+            }
+        }
+    }
+    assert!(
+        sources.len() > 3,
+        "only {} files scanned — packaging/ is not being walked",
+        sources.len()
+    );
+
+    for (name, source) in &sources {
         let versions: Vec<&str> = source
             .split(|c: char| !(c.is_ascii_digit() || c == '.'))
             .filter(|token| {
                 let parts: Vec<&str> = token.split('.').collect();
-                parts.len() == 3
+                (3..=4).contains(&parts.len())
                     && parts
                         .iter()
                         .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
