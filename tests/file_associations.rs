@@ -154,7 +154,9 @@ fn release_jobs() -> Vec<(String, String)> {
 /// `needs: a`) or block (`needs:` then `- a`) form — a reformat between the
 /// two is a reformat, not a change of meaning, and should not read as one.
 fn declared_needs(body: &str) -> Vec<String> {
-    let mut lines = body.lines().skip_while(|line| !line.trim().starts_with("needs:"));
+    let mut lines = body
+        .lines()
+        .skip_while(|line| !line.trim().starts_with("needs:"));
     let Some(first) = lines.next() else {
         return Vec::new();
     };
@@ -482,6 +484,43 @@ fn nothing_bundles_or_publishes_before_the_version_check() {
             published.contains(id),
             "release.yml's `publish` job does not need `{id}`, so it can \
              publish a release without that platform's artifacts"
+        );
+    }
+}
+
+#[test]
+fn the_plist_is_the_only_packaging_file_that_authors_a_version() {
+    // release.yml's `verify` job checks two versions — Cargo.toml's and this
+    // plist's — and that is only sufficient because they are the only two
+    // authored anywhere. Everything else derives from Cargo.toml through dx,
+    // measured against the published v0.8.0 artifacts: the deb's control file
+    // says `Version: 0.8.0`, the packaged Windows exe's VERSIONINFO says
+    // `ProductVersion 0.8.0`, and the shipped `.desktop` carries no version at
+    // all. That measurement is a claim about *today's* files, so it is pinned:
+    // a version appearing in one of these means `verify` has a third file to
+    // check, and until it does, a release can still name one version and ship
+    // another.
+    for (name, source) in [
+        ("Dioxus.toml", DIOXUS_TOML),
+        ("packaging/linux/hubro.desktop.hbs", DESKTOP_TEMPLATE),
+        ("packaging/windows/file-associations.wxs", WIX_FRAGMENT),
+    ] {
+        let versions: Vec<&str> = source
+            .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .filter(|token| {
+                let parts: Vec<&str> = token.split('.').collect();
+                parts.len() == 3
+                    && parts
+                        .iter()
+                        .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+            })
+            .collect();
+        assert!(
+            versions.is_empty(),
+            "{name} now carries what looks like a version ({versions:?}). If \
+             the packaging really does author a version here, release.yml's \
+             `verify` job has to check it against the tag too — it checks \
+             Cargo.toml and Info.plist only (FRE-166)."
         );
     }
 }
