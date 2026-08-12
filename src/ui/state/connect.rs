@@ -2088,8 +2088,12 @@ mod tests {
         );
         // The field as written too: `remember: !remember,` contains
         // `remember,` and inverts the same decision one line lower.
+        //
+        // Matched a line at a time, not against a literal containing `\n`:
+        // that is the FRE-160 trap, and `tests/line_endings.rs` records that
+        // this file does not depend on the checkout's line endings.
         assert!(
-            rejection.contains("\n                    remember,\n"),
+            rejection.lines().any(|line| line.trim() == "remember,"),
             "the withdrawn choice is not reaching the re-prompt as written, so \
              the box is re-ticked after every typo, or offers the opposite of \
              what the user chose (FRE-162): {rejection}"

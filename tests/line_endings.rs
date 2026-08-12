@@ -25,9 +25,16 @@
 ///
 /// `README.md` is deliberately absent even though `.gitattributes` names it:
 /// `tests/support_matrix.rs` reads it through `str::lines()`, which strips a
-/// trailing `\r`, so it does not care. Same for the two modules that read
-/// their own source — `ui/grid/stats.rs` counts markers and `connect.rs`'s
-/// `method_body` matches braces; neither compares a `\n`.
+/// trailing `\r`, so it does not care. Same for the three modules that read
+/// their own source — `ui/grid/stats.rs` counts markers, `connect.rs`'s
+/// `method_body` matches braces, and `connections.rs` slices its prompt card
+/// by lines; none compares a `\n`.
+///
+/// That last one is a rule the source tests have to keep choosing (FRE-162):
+/// the natural way to pin a line of code is a literal like `"\n    field,\n"`,
+/// which reads as precise and fails on a CRLF checkout for a reason that has
+/// nothing to do with the code under test. `lines()` plus `trim` says the same
+/// thing and costs nothing.
 const LF_ONLY: &[(&str, &str)] = &[
     (
         "tests/fixtures/connections_pre_fre_120.toml",
