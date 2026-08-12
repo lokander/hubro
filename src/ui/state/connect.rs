@@ -2098,24 +2098,10 @@ mod tests {
              the box is re-ticked after every typo, or offers the opposite of \
              what the user chose (FRE-162): {rejection}"
         );
-        // And negation in any *other* form: a second binding
-        // (`let remember = !remember;`) inverts the same decision while
-        // leaving both the call and the field shorthand above intact. Read
-        // over code only — the prose here discusses what is deliberately not
-        // stored. Renaming the binding fails these assertions on purpose: the
-        // field is passed as shorthand, so the name is load-bearing already,
-        // and the looser match this replaced is what let the inversion past
-        // five rounds of review.
-        let rejection_code: String = rejection
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            !rejection_code.contains("!remember") && !rejection_code.contains("!withdraw"),
-            "the withdrawn answer is negated before it reaches the prompt: \
-             {rejection_code}"
-        );
+        // Negation in any *other* form — a second binding, or a `!` on the
+        // call — is covered for every verdict at once by
+        // `no_verdict_is_negated_between_the_policy_and_the_gate`. Scoping a
+        // sweep to this arm is what left the accepted arm open.
         // And the write must sit *inside* the verdict's gate, the way
         // `open_tunnel_decides_on_the_passphrase_s_source_not_its_presence`
         // pins the delete against `if drop_stored`. Of the two keyring
@@ -2138,6 +2124,70 @@ mod tests {
             "a second, ungated write would store the passphrase whatever the \
              user chose, leaving the gate above inert"
         );
+    }
+
+    #[test]
+    fn no_verdict_is_negated_between_the_policy_and_the_gate() {
+        // `open_tunnel` asks three policies for a verdict and acts on each a
+        // few lines later. Every one of those hops is a `let`, and a `!` on
+        // any of them inverts a decision about a secret while moving no call,
+        // leaving every gate intact and every source label in place.
+        //
+        // This is the defect class the whole file kept losing to. Five rounds
+        // of review closed it one instance at a time — `remember: !remember,`,
+        // then `if !redeem`, then `!withdraw_ssh_remember(…)` — and each fix
+        // pinned the spot that had just been found. A sweep scoped to one arm
+        // and two names is what left `!redeem_ssh_remember(…)` and
+        // `!forget_failed_ssh_passphrase(…)` alive after all of it. So: every
+        // verdict, over the whole body, in one place.
+        //
+        // What each inversion costs, so the list is not a mystery to whoever
+        // trips it:
+        //
+        // - `redeem` — the passphrase reaches the keyring exactly when the
+        //   user declined it, and never when they asked (FRE-161 inverted).
+        // - `remember` — the re-prompt offers the opposite of their last
+        //   answer, so a typo restores a decision they had cleared (FRE-162).
+        // - `drop_stored` — a mistyped passphrase deletes the saved one, and
+        //   a genuinely stale one is kept forever (FRE-151 verbatim).
+        //
+        // Comment lines are stripped first: the prose here discusses what is
+        // *not* stored and would otherwise match. Verified: no legitimate
+        // occurrence of any pattern exists in the body today.
+        let code: String = open_tunnel_body()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for negation in [
+            "!redeem",
+            "!withdraw",
+            "!remember",
+            "!drop_stored",
+            "!forget",
+        ] {
+            assert!(
+                !code.contains(negation),
+                "`{negation}` inverts a verdict about a secret between the \
+                 policy that decides it and the gate that acts on it — every \
+                 gate and label around it still reads correctly: {code}"
+            );
+        }
+
+        // And each verdict is bound from its own policy, as written. Without
+        // this, `let redeem = false;` passes the sweep above.
+        for binding in [
+            "let redeem = redeem_ssh_remember(",
+            "let remember = withdraw_ssh_remember(",
+            "let drop_stored = forget_failed_ssh_passphrase(",
+        ] {
+            assert!(
+                code.contains(binding),
+                "`{binding}…` is gone, so a verdict is being decided by \
+                 something other than its policy: {code}"
+            );
+        }
     }
 
     #[test]
