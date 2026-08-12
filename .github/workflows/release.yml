@@ -63,19 +63,28 @@ jobs:
           tag = sys.argv[1]
           expected = tag[1:] if tag.startswith("v") else tag
 
-          # Scan for the key and take the string after it, the way
-          # tests/file_associations.rs does. Not a plist parser: the file's
-          # header comment contains `--package-types`, and `--` inside an XML
-          # comment is malformed XML, so a strict parser (plistlib) rejects a
-          # file that macOS itself accepts.
+          # Scan for the key and take the element right after it, the way
+          # plist_string() in tests/file_associations.rs does. Not a plist
+          # parser: the file's header comment contains `--package-types`, and
+          # `--` inside an XML comment is malformed XML, so a strict parser
+          # (plistlib) rejects a file that macOS itself accepts.
+          #
+          # Comments are stripped first, and the value must *immediately*
+          # follow the key. Both matter: the header is a long comment naming
+          # these very keys, so a version quoted in prose would answer for the
+          # real one, and searching forward for the next <string> anywhere
+          # would let a key with a non-string value answer with some later
+          # key's value. Either way a stale version reads as current, which is
+          # the whole failure this job exists to catch.
           def plist_string(key):
               text = open("packaging/macos/Info.plist", encoding="utf-8").read()
+              text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
               _, marker, after = text.partition(f"<key>{key}</key>")
               if not marker:
                   sys.exit(f"Info.plist has no <key>{key}</key>")
-              match = re.search(r"<string>(.*?)</string>", after, re.S)
+              match = re.match(r"\s*<string>(.*?)</string>", after, re.S)
               if not match:
-                  sys.exit(f"{key} is not followed by a string value")
+                  sys.exit(f"{key} is not immediately followed by a <string> value")
               return match.group(1).strip()
 
           with open("Cargo.toml", "rb") as f:
