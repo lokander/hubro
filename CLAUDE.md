@@ -64,6 +64,16 @@ Milestones are **scoped deliverables that complete**, not categories. Three rule
 - **Don't create catch-all milestones.** A milestone with no completion condition ("Misc polish", "Follow-ups") sits at partial progress forever. Loose work gets **no milestone** plus a `Feature`/`Bug`/`Improvement` label and lives in the project backlog. `Nice to have (future)` is the one deliberate exception — designed-but-deferred work, not a general backlog.
 - **A long list of completed milestones is fine.** They're the project's changelog and the reason leftover work is scopeable later.
 
+## Releases
+
+A release is cut by pushing a `vX.Y.Z` tag; `release.yml` bundles five artifacts (deb, AppImage, dmg, msi, setup exe) and publishes them with generated notes.
+
+- **The version is authored in two files, and only one is obvious.** `Cargo.toml` is what dx stamps into the Linux and Windows artifacts; `packaging/macos/Info.plist` (`CFBundleShortVersionString` **and** `CFBundleVersion`) is what the macOS bundle carries, because dx *replaces* its generated plist with that file rather than merging. Measured against the v0.8.0 artifacts: the deb's control says `Version: 0.8.0`, the packaged exe's VERSIONINFO says `ProductVersion 0.8.0`, and the shipped `Hubro.app/Contents/Info.plist` is byte-identical to the checked-in one. Nothing else authors a version — `tests/file_associations.rs` now pins that absence across `packaging/` and `Dioxus.toml`.
+- **Order, because getting it wrong is invisible afterwards:** bump both files, commit `chore: release vX.Y.Z`, push, **wait for all three CI legs**, then tag *that* commit. `v0.6.0`'s tag names a commit whose `Cargo.toml` still said `0.5.0`. The dmg's *filename* comes from `Cargo.toml`, so a stale plist ships as `Hubro_X.Y.Z_aarch64.dmg` containing an app that tells Finder and Gatekeeper it is the previous version — invisible from the release page.
+- **Two guards, deliberately on different triggers.** `tests/file_associations.rs` pins the plist to `Cargo.toml`, so a `Cargo.toml`-only bump reddens **all three** CI legs (not a flaky macOS leg — the test reads the checked-in file everywhere). `release.yml`'s `verify` job re-checks both against the tag before any bundle job runs, because the test only runs on a push to `main` and a tag cut from a stale checkout never meets it. FRE-166 proved the gate end to end with a throwaway tag: `verify` failed, all three bundles and publish skipped, no release created.
+- **A tag pushed while Actions is disabled produces no run**, and deleting and re-pushing it does not reliably create one (observed on v0.7.0). Build it by hand: `gh workflow run release.yml --ref main -f tag=vX.Y.Z`.
+- Artifacts are **unsigned** (FRE-48, FRE-49), so Gatekeeper and SmartScreen both warn on first launch; the README documents the workarounds. Green release jobs prove the bundles *build*, not that they run.
+
 ## Commits
 
 Use [Conventional Commits](https://www.conventionalcommits.org/) with **subject line only** — no body, no footers (including no Co-Authored-By trailers). Example: `feat: add csv import`.
