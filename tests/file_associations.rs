@@ -23,6 +23,18 @@
 //! honours the document types, that Windows Explorer offers hubro, that dx's
 //! generated plist has not grown a key since this copy was taken. Those need
 //! the platform. This checks everything that does not.
+//!
+//! One more, added with the release gate (FRE-166) and worth stating plainly
+//! because it is the kind of gap that reads as covered: the tests below pin
+//! that `verify` **runs** — that every release job waits for it and that
+//! nothing can run past it having failed — but not **what it checks**.
+//! Replacing that job's script with `run: echo ok` leaves this file green. The
+//! comparison is Python embedded in YAML, which `cargo test` cannot execute,
+//! and re-implementing it here would pin a copy rather than the original. It
+//! is verified by running the script extracted from the workflow against
+//! mutated fixtures, and by the throwaway tag pushed in FRE-166 (a tag that
+//! could not match, which failed `verify` and skipped every bundle and the
+//! publish).
 
 use hubro::cli::DATABASE_EXTENSIONS;
 
@@ -482,6 +494,12 @@ fn no_release_job_runs_without_the_version_check_passing() {
     // been checked, so that is what this asserts — transitively, since
     // `publish` is gated by needing the bundle jobs rather than `verify`.
     let jobs = release_jobs();
+    // Not a formality, and not redundant with the loop below: delete the
+    // `verify` job while leaving the `needs: verify` lines in place and
+    // `needs_verify_transitively` answers true for every job — it compares the
+    // *named* dependency before looking it up, so the loop would pass
+    // vacuously against a workflow with no version check in it at all. This
+    // assertion is the only thing standing between that mutation and green.
     assert!(
         jobs.iter().any(|(id, _)| id == "verify"),
         "release.yml has no `verify` job (FRE-166)"
@@ -517,20 +535,35 @@ fn no_release_job_can_run_past_a_failed_dependency() {
     // release.yml contains neither today, so pinning their absence costs
     // nothing. If a release job ever genuinely needs one, this failing is the
     // prompt to re-argue that the version check still gates the release.
+    //
+    // `if:` is banned at job level only — four spaces of indent. A *step's*
+    // `if:` cannot make a skipped job run, so banning it there would fail an
+    // honest `if: runner.os == 'Linux'` while pinning nothing. The key is read
+    // as everything before the first colon rather than matched as the prefix
+    // `if:`, because `if : always()` is valid YAML for the same key and would
+    // otherwise walk straight through.
+    const JOB_INDENT: usize = 4;
     for (number, line) in RELEASE_WORKFLOW.lines().enumerate() {
-        let trimmed = line.trim().trim_start_matches("- ").trim_start();
+        let trimmed = line.trim_start();
         if trimmed.starts_with('#') {
             continue;
         }
-        for escape in ["if:", "continue-on-error:"] {
-            assert!(
-                !trimmed.starts_with(escape),
-                "release.yml line {} declares `{escape}`, which can let a job \
-                 run or report success despite `verify` having failed — the \
-                 `needs:` edges then gate nothing (FRE-166)",
-                number + 1
-            );
-        }
+        let indent = line.len() - trimmed.len();
+        let Some((key, _)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().trim_start_matches("- ").trim();
+        let escape = match key {
+            "continue-on-error" => "continue-on-error",
+            "if" if indent == JOB_INDENT => "if",
+            _ => continue,
+        };
+        panic!(
+            "release.yml line {} declares `{escape}:`, which can let a job run \
+             or report success despite `verify` having failed — the `needs:` \
+             edges then gate nothing (FRE-166)",
+            number + 1
+        );
     }
 }
 
