@@ -41,28 +41,53 @@ const WIX_FRAGMENT: &str = include_str!("../packaging/windows/file-associations.
 const SQLITE_MIME: &str = "application/vnd.sqlite3";
 const SQLITE_MIME_ALIAS: &str = "application/x-sqlite3";
 
+/// `Info.plist` with its XML comments removed, so prose mentioning a tag
+/// cannot be mistaken for one. The file's header is a long comment that names
+/// keys and quotes dx's source, which is exactly the material a scanner would
+/// otherwise read as markup.
+fn plist_without_comments() -> String {
+    let mut source = String::with_capacity(INFO_PLIST.len());
+    let mut rest = INFO_PLIST;
+    while let Some(start) = rest.find("<!--") {
+        source.push_str(&rest[..start]);
+        rest = match rest[start..].find("-->") {
+            Some(end) => &rest[start + end + "-->".len()..],
+            None => "",
+        };
+    }
+    source.push_str(rest);
+    source
+}
+
 /// Reads a `plist` `<key>name</key><string>value</string>` pair.
 ///
-/// A five-line scanner instead of a plist parser: the file is checked in, its
+/// A short scanner instead of a plist parser: the file is checked in, its
 /// shape is known, and the alternative is a dependency in the shipped tree for
-/// one test.
+/// one test. (A parser is not merely unnecessary here but unavailable —
+/// `--package-types` in the header comment makes the file malformed XML, which
+/// strict parsers reject and macOS accepts.)
+///
+/// Two things this deliberately does *not* do, both of which let a stale
+/// version pass as current: read comments (a `<string>` inside the header
+/// prose would answer for the real key), and search forward for a `<string>`
+/// anywhere later in the file (a key given a different value type would answer
+/// with some *other* key's value). The value has to be the element
+/// immediately after the key.
 fn plist_string(key: &str) -> String {
+    let source = plist_without_comments();
     let marker = format!("<key>{key}</key>");
-    let after = INFO_PLIST
+    let after = source
         .split_once(&marker)
         .unwrap_or_else(|| panic!("Info.plist has no <key>{key}</key>"))
-        .1;
-    let open = after
-        .find("<string>")
-        .unwrap_or_else(|| panic!("{key} has no string value"));
-    let close = after
+        .1
+        .trim_start();
+    let value = after.strip_prefix("<string>").unwrap_or_else(|| {
+        panic!("{key} is not immediately followed by a <string> — is it a different value type?")
+    });
+    let close = value
         .find("</string>")
-        .unwrap_or_else(|| panic!("{key} has no string value"));
-    assert!(
-        open < close,
-        "{key} is not followed by a string — is it a different value type?"
-    );
-    after[open + "<string>".len()..close].to_string()
+        .unwrap_or_else(|| panic!("{key}'s <string> is never closed"));
+    value[..close].to_string()
 }
 
 /// The keys of the plist's outermost `<dict>`, in document order — the ones
@@ -76,16 +101,7 @@ fn plist_string(key: &str) -> String {
 /// Comments are stripped first, so prose mentioning a tag cannot be mistaken
 /// for one.
 fn top_level_plist_keys() -> Vec<String> {
-    let mut source = String::with_capacity(INFO_PLIST.len());
-    let mut rest = INFO_PLIST;
-    while let Some(start) = rest.find("<!--") {
-        source.push_str(&rest[..start]);
-        rest = match rest[start..].find("-->") {
-            Some(end) => &rest[start + end + "-->".len()..],
-            None => "",
-        };
-    }
-    source.push_str(rest);
+    let source = plist_without_comments();
 
     let mut keys = Vec::new();
     let mut depth = 0usize;
@@ -107,6 +123,53 @@ fn top_level_plist_keys() -> Vec<String> {
         rest = &rest[close + 1..];
     }
     keys
+}
+
+/// The top-level jobs of `release.yml` as `(id, body)`, the body being every
+/// line up to the next job. A scanner rather than a YAML parser, for the same
+/// reason as the plist one: one property of one checked-in file does not repay
+/// a dependency.
+fn release_jobs() -> Vec<(String, String)> {
+    let after_jobs = RELEASE_WORKFLOW
+        .split_once("\njobs:\n")
+        .expect("release.yml declares no jobs")
+        .1;
+    let mut jobs: Vec<(String, String)> = Vec::new();
+    for line in after_jobs.lines() {
+        let starts_a_job = line.starts_with("  ")
+            && !line.starts_with("   ")
+            && !line.trim_start().starts_with('#')
+            && line.trim_end().ends_with(':');
+        if starts_a_job {
+            jobs.push((line.trim().trim_end_matches(':').to_string(), String::new()));
+        } else if let Some((_, body)) = jobs.last_mut() {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    jobs
+}
+
+/// The job ids a job's `needs:` names, in either the inline (`needs: [a, b]`,
+/// `needs: a`) or block (`needs:` then `- a`) form — a reformat between the
+/// two is a reformat, not a change of meaning, and should not read as one.
+fn declared_needs(body: &str) -> Vec<String> {
+    let mut lines = body.lines().skip_while(|line| !line.trim().starts_with("needs:"));
+    let Some(first) = lines.next() else {
+        return Vec::new();
+    };
+    let mut value = first.trim().trim_start_matches("needs:").trim().to_string();
+    for line in lines {
+        match line.trim().strip_prefix('-') {
+            Some(item) => value.push_str(&format!(" {item}")),
+            None => break,
+        }
+    }
+    value
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// The value of a top-level `key = "value"` line in a TOML file. Same
@@ -368,6 +431,59 @@ fn the_info_plist_records_the_dx_version_it_was_mirrored_from() {
          release.yml bundles with {pinned} — they disagree, so the mirror was \
          not re-derived when dx moved"
     );
+}
+
+#[test]
+fn nothing_bundles_or_publishes_before_the_version_check() {
+    // The version a release *claims* is the tag; the version its artifacts
+    // *carry* comes from Cargo.toml (Linux, Windows) and Info.plist (macOS,
+    // which dx copies verbatim). release.yml's `verify` job is what stops
+    // those three disagreeing — v0.6.0's tag names a commit whose Cargo.toml
+    // still said 0.5.0, and shipped saying so.
+    //
+    // The job is only a guard while every job that produces or publishes an
+    // artifact waits for it. Deleting three `needs:` lines silently restores
+    // the old behaviour, and the test above would not notice — so this reads
+    // the wire rather than the spot: every bundle job needs `verify`, and
+    // `publish` needs every bundle job, both derived from the file so a
+    // fourth platform has to be wired in rather than merely added.
+    let jobs = release_jobs();
+    assert!(
+        jobs.iter().any(|(id, _)| id == "verify"),
+        "release.yml has no `verify` job (FRE-166)"
+    );
+
+    let bundlers: Vec<&(String, String)> = jobs
+        .iter()
+        .filter(|(_, body)| body.contains("name: Bundle "))
+        .collect();
+    assert!(
+        !bundlers.is_empty(),
+        "no job in release.yml is named `Bundle …`, so this test now checks \
+         nothing — were the bundle jobs renamed?"
+    );
+
+    for (id, body) in &bundlers {
+        assert!(
+            declared_needs(body).iter().any(|need| need == "verify"),
+            "release.yml's `{id}` job does not need `verify`, so a tag whose \
+             version disagrees with Cargo.toml or Info.plist would bundle and \
+             publish under it anyway (FRE-166)"
+        );
+    }
+
+    let (_, publish) = jobs
+        .iter()
+        .find(|(id, _)| id == "publish")
+        .expect("release.yml has no `publish` job");
+    let published = declared_needs(publish);
+    for (id, _) in &bundlers {
+        assert!(
+            published.contains(id),
+            "release.yml's `publish` job does not need `{id}`, so it can \
+             publish a release without that platform's artifacts"
+        );
+    }
 }
 
 #[test]
