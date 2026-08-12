@@ -272,11 +272,22 @@ Releases are cut by pushing a version tag. The
 [`release` workflow](.github/workflows/release.yml) then bundles the app with
 `dx bundle` and publishes the artifacts:
 
+The version is authored in **two** files, and both have to agree with the tag:
+`Cargo.toml`, which dx stamps into the Linux and Windows artifacts, and
+`packaging/macos/Info.plist`, which dx copies verbatim into the macOS bundle
+rather than generating one of its own.
+
 ```bash
-# bump the version in Cargo.toml first, then:
+# bump `version` in Cargo.toml *and* CFBundleShortVersionString /
+# CFBundleVersion in packaging/macos/Info.plist, then commit and push. Tag the
+# commit carrying the bump — not the one before it.
 git tag v0.1.0
 git push origin v0.1.0
 ```
+
+The workflow's `verify` job refuses to build when the tag and those two files
+disagree, so a mismatch fails the release rather than publishing artifacts that
+name a different version than the tag they were built from.
 
 Bundle metadata (identifier, category, description, icons, package
 dependencies) lives in the `[bundle]` section of `Dioxus.toml`. To build a
