@@ -2086,14 +2086,23 @@ mod tests {
         // A component needs a Dioxus runtime to render, so the seed is checked
         // at its source: the card is a function, and the initialiser is one
         // line of it.
+        // Read a line at a time rather than by byte offsets into literals
+        // containing `\n`: a `"\n}\n"` search for the end of the function
+        // would fail on a CRLF checkout, which is the FRE-160 trap that
+        // `tests/line_endings.rs` keeps this file clear of.
         let source = include_str!("connections.rs");
-        let card = source
-            .find("fn PasswordPromptCard(")
-            .expect("the prompt card must still exist");
-        let body = &source[card..card
-            + source[card..]
-                .find("rsx!")
-                .expect("the card must still render")];
+        let card: Vec<&str> = source
+            .lines()
+            .skip_while(|line| !line.contains("fn PasswordPromptCard("))
+            .take_while(|line| line.trim_end() != "}")
+            .collect();
+        let renders_at = card
+            .iter()
+            .position(|line| line.contains("rsx!"))
+            .expect("the card must still exist and render");
+        let (setup, rendered) = card.split_at(renders_at);
+        let body = setup.join("\n");
+        let rendered = rendered.join("\n");
         assert!(
             !body.contains("use_signal(|| true)"),
             "the card re-ticks the remember box on every prompt, so unticking \
@@ -2123,13 +2132,8 @@ mod tests {
         // box displays. Rendering is not testable without a runtime, but the
         // *binding* is text like the other two, and `checked: !remember()`
         // shows every user the opposite of the state they are about to submit.
-        // Sliced from `rsx!` to the end of the function, so all three ends of
-        // the value — seed, display, submit — are covered by one test.
-        let rendered = &source[card + body.len()
-            ..card
-                + source[card..]
-                    .find("\n}\n")
-                    .expect("the card function must be closed")];
+        // Split at `rsx!`, so all three ends of the value — seed, display,
+        // submit — are covered by one test.
         assert!(
             rendered.contains("checked: remember(),"),
             "the checkbox displays something other than the choice it holds, \
