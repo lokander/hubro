@@ -2075,12 +2075,15 @@ mod tests {
         // `a_re_prompt_offers_the_choice_the_user_already_made` executes what
         // it decides.
         let rejection = &body[rejected..];
-        // The binding as written, not merely the call: `!withdraw_ssh_remember(…)`
+        // The binding, not merely the call: `!withdraw_ssh_remember(…)`
         // satisfies a search for the call and leaves the `remember,` field
         // below untouched, so the answer inverts one line above everything
         // else this test reads. That is exactly how it got through.
+        //
+        // Whitespace-collapsed, so wrapping the line reads as the reformat it
+        // is rather than as the answer being severed from its policy.
         assert!(
-            rejection.contains("let remember = withdraw_ssh_remember("),
+            collapsed(rejection).contains("let remember = withdraw_ssh_remember("),
             "a rejected passphrase leaves its remember choice parked, or the \
              withdrawn answer is negated on the way to the prompt — which \
              re-ticks a box the user cleared and ends in a keyring write of a \
@@ -2098,10 +2101,10 @@ mod tests {
              the box is re-ticked after every typo, or offers the opposite of \
              what the user chose (FRE-162): {rejection}"
         );
-        // Negation in any *other* form — a second binding, or a `!` on the
-        // call — is covered for every verdict at once by
-        // `no_verdict_is_negated_between_the_policy_and_the_gate`. Scoping a
-        // sweep to this arm is what left the accepted arm open.
+        // Negation in any *other* form — a second binding, a `!` on the call,
+        // or an inversion one hop away in another function — is covered for
+        // every verdict at once by
+        // `the_remember_answer_is_not_inverted_at_any_hop_of_its_wire`.
         // And the write must sit *inside* the verdict's gate, the way
         // `open_tunnel_decides_on_the_passphrase_s_source_not_its_presence`
         // pins the delete against `if drop_stored`. Of the two keyring
@@ -2126,57 +2129,113 @@ mod tests {
         );
     }
 
+    /// The code of a function with its comment lines removed — the prose
+    /// around these decisions discusses what is deliberately *not* stored, and
+    /// would otherwise match every pattern the sweep below looks for.
+    fn code_of(body: &str) -> String {
+        body.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `code` with every run of whitespace collapsed to a single space, so a
+    /// pinned line still matches once rustfmt wraps it. Matching the line as
+    /// typed instead turns a reformat into a failure claiming the decision was
+    /// severed from its policy — wrong, and alarming to whoever hits it.
+    fn collapsed(code: &str) -> String {
+        code.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The first tracked identifier that appears negated in `code`, skipping
+    /// `!=` and macro bangs. Receivers are stepped over, so `!prompt.remember`
+    /// and `!*remember.peek()` are found as readily as `!remember`.
+    fn negated(code: &str, names: &[&str]) -> Option<String> {
+        code.match_indices('!').find_map(|(at, _)| {
+            let rest = code[at + 1..].trim_start_matches(['*', '&', '(']);
+            let rest = ["prompt.", "self.", "state."]
+                .iter()
+                .find_map(|receiver| rest.strip_prefix(receiver))
+                .unwrap_or(rest);
+            names
+                .iter()
+                .find(|name| rest.starts_with(**name))
+                .map(|name| format!("!{name}"))
+        })
+    }
+
     #[test]
-    fn no_verdict_is_negated_between_the_policy_and_the_gate() {
-        // `open_tunnel` asks three policies for a verdict and acts on each a
-        // few lines later. Every one of those hops is a `let`, and a `!` on
-        // any of them inverts a decision about a secret while moving no call,
-        // leaving every gate intact and every source label in place.
+    fn the_remember_answer_is_not_inverted_at_any_hop_of_its_wire() {
+        // One `!` anywhere on this wire inverts a decision about a secret
+        // while moving no call, leaving every gate, label and ordering
+        // assertion around it reading correctly.
         //
-        // This is the defect class the whole file kept losing to. Five rounds
-        // of review closed it one instance at a time — `remember: !remember,`,
-        // then `if !redeem`, then `!withdraw_ssh_remember(…)` — and each fix
-        // pinned the spot that had just been found. A sweep scoped to one arm
-        // and two names is what left `!redeem_ssh_remember(…)` and
-        // `!forget_failed_ssh_passphrase(…)` alive after all of it. So: every
-        // verdict, over the whole body, in one place.
+        // This test names the **wire**, not a function, because scoping is
+        // what kept failing. Six rounds of review closed this class one scope
+        // at a time — one field, then one arm, then one function — and every
+        // next instance sat exactly one hop outside the last fix: the card's
+        // submit call after its binding was pinned, `update_saved`'s gate
+        // after its call was pinned, `save_server_if_open`'s gate after the
+        // argument resting on it was documented. Adding another per-function
+        // sweep would invite the seventh.
         //
-        // What each inversion costs, so the list is not a mystery to whoever
+        // The wire, in order: the card's checkbox → its submit → the state
+        // layer parks the answer → `open_tunnel` withdraws or redeems it →
+        // the prompt carries it back → the card. Plus the two gates the edit
+        // paths hang on, which decide whether any of it runs at all.
+        //
+        // What an inversion costs, so the list is not a mystery to whoever
         // trips it:
         //
         // - `redeem` — the passphrase reaches the keyring exactly when the
         //   user declined it, and never when they asked (FRE-161 inverted).
-        // - `remember` — the re-prompt offers the opposite of their last
-        //   answer, so a typo restores a decision they had cleared (FRE-162).
+        // - `remember` / `remember_choice` / `offered` — the box, the submit
+        //   and the re-prompt disagree about the answer the user gave, so a
+        //   typo restores a decision they had cleared (FRE-162).
         // - `drop_stored` — a mistyped passphrase deletes the saved one, and
         //   a genuinely stale one is kept forever (FRE-151 verbatim).
-        //
-        // Comment lines are stripped first: the prose here discusses what is
-        // *not* stored and would otherwise match. Verified: no legitimate
-        // occurrence of any pattern exists in the body today.
-        let code: String = open_tunnel_body()
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        for negation in [
-            "!redeem",
-            "!withdraw",
-            "!remember",
-            "!drop_stored",
-            "!forget",
-        ] {
-            assert!(
-                !code.contains(negation),
-                "`{negation}` inverts a verdict about a secret between the \
-                 policy that decides it and the gate that acts on it — every \
-                 gate and label around it still reads correctly: {code}"
+        // - `is_open` — edits apply exactly when the connect *failed*, which
+        //   is the premise `carry_session_secrets` rests its whole
+        //   don't-migrate-the-answer argument on.
+        const NAMES: &[&str] = &[
+            "redeem",
+            "withdraw",
+            "remember",
+            "drop_stored",
+            "forget",
+            "is_open",
+            "offered",
+        ];
+        let source = include_str!("connect.rs");
+        let card = include_str!("../connections.rs");
+        let hops = [
+            ("the card", method_body(card, "fn PasswordPromptCard(")),
+            (
+                "the prompt's completion",
+                method_body(source, "pub async fn connect_server_with_ssh_passphrase("),
+            ),
+            ("open_tunnel", open_tunnel_body()),
+            ("update_saved", method_body(source, "pub fn update_saved(")),
+            (
+                "save_server_if_open",
+                method_body(source, "fn save_server_if_open("),
+            ),
+        ];
+        for (hop, body) in &hops {
+            let code = code_of(body);
+            assert_eq!(
+                negated(&code, NAMES),
+                None,
+                "a verdict about a secret is negated in {hop}, which inverts \
+                 the decision without moving a call: {code}"
             );
         }
 
-        // And each verdict is bound from its own policy, as written. Without
-        // this, `let redeem = false;` passes the sweep above.
+        // Negation is not the only way to sever a decision from its policy:
+        // `let redeem = true;` passes the sweep, and a gate can be turned
+        // round without a `!` at all. Both are pinned — whitespace-collapsed,
+        // so rustfmt wrapping a line is not read as a severed decision.
+        let code = collapsed(&code_of(&open_tunnel_body()));
         for binding in [
             "let redeem = redeem_ssh_remember(",
             "let remember = withdraw_ssh_remember(",
@@ -2184,10 +2243,26 @@ mod tests {
         ] {
             assert!(
                 code.contains(binding),
-                "`{binding}…` is gone, so a verdict is being decided by \
-                 something other than its policy: {code}"
+                "`{binding}…` is gone, so a verdict is decided by something \
+                 other than its policy: {code}"
             );
         }
+        assert!(
+            collapsed(&code_of(&method_body(source, "pub fn update_saved(")))
+                .contains("if new_locator != old_locator {"),
+            "the edit's migration gate is inverted or gone — with `==`, a \
+             moving edit strands every session secret and migrates no keyring \
+             entry, silently, because both calls inside are no-ops when the \
+             locator did not move (FRE-162 and FRE-75 at once)"
+        );
+        assert!(
+            collapsed(&code_of(&method_body(source, "fn save_server_if_open(")))
+                .contains("if is_open {"),
+            "the save gate is inverted or gone. `carry_session_secrets` \
+             justifies not migrating the parked answer by this gate holding — \
+             inverted, edits apply exactly when the connect failed, and the \
+             argument is stood on its head"
+        );
     }
 
     #[test]
