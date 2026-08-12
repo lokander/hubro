@@ -30,8 +30,76 @@ env:
   DX_VERSION: "0.7.9"
 
 jobs:
+  # The tag names the release and every download link, but nothing downstream
+  # reads it: `dx bundle` stamps the Linux and Windows artifacts from
+  # Cargo.toml, and the macOS bundle from packaging/macos/Info.plist, which dx
+  # uses *instead of* the plist it would generate. All three can disagree with
+  # the tag and still build and publish. v0.6.0 shipped that way — its tag
+  # names a commit whose Cargo.toml still said 0.5.0.
+  #
+  # tests/file_associations.rs pins the plist to Cargo.toml, but it only runs
+  # in ci.yml on a push to main; a tag cut from a stale checkout never meets
+  # it. This needs no build, so it costs seconds and gates the bundle jobs.
+  verify:
+    name: Verify version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      # The tag arrives via env rather than `${{ }}` inside the script: a
+      # workflow_dispatch input is attacker-controlled text as far as the shell
+      # is concerned, and interpolating it directly would splice it into the
+      # command.
+      - name: Tag, Cargo.toml and Info.plist agree
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 - "$TAG" <<'PY'
+          import re, sys, tomllib
+
+          tag = sys.argv[1]
+          expected = tag[1:] if tag.startswith("v") else tag
+
+          # Scan for the key and take the string after it, the way
+          # tests/file_associations.rs does. Not a plist parser: the file's
+          # header comment contains `--package-types`, and `--` inside an XML
+          # comment is malformed XML, so a strict parser (plistlib) rejects a
+          # file that macOS itself accepts.
+          def plist_string(key):
+              text = open("packaging/macos/Info.plist", encoding="utf-8").read()
+              _, marker, after = text.partition(f"<key>{key}</key>")
+              if not marker:
+                  sys.exit(f"Info.plist has no <key>{key}</key>")
+              match = re.search(r"<string>(.*?)</string>", after, re.S)
+              if not match:
+                  sys.exit(f"{key} is not followed by a string value")
+              return match.group(1).strip()
+
+          with open("Cargo.toml", "rb") as f:
+              cargo = tomllib.load(f)["package"]["version"]
+
+          found = {
+              "Cargo.toml version": cargo,
+              "Info.plist CFBundleShortVersionString": plist_string("CFBundleShortVersionString"),
+              "Info.plist CFBundleVersion": plist_string("CFBundleVersion"),
+          }
+
+          print(f"tag {tag} -> expecting version {expected}")
+          for where, value in found.items():
+              print(f"  {where}: {value}")
+
+          wrong = [w for w, v in found.items() if v != expected]
+          for where in wrong:
+              print(f"::error::{where} is {found[where]}, but tag {tag} expects {expected}")
+          sys.exit(1 if wrong else 0)
+          PY
+
   linux:
     name: Bundle Linux (deb + AppImage)
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       # On a dispatch run, build the tag named in the input rather than the
@@ -97,6 +165,7 @@ jobs:
 
   macos:
     name: Bundle macOS (dmg)
+    needs: verify
     # Apple Silicon runner → arm64-only dmg (no Intel build). Unsigned per
     # FRE-48: no Developer ID, so Gatekeeper blocks the first launch (the
     # README documents the xattr / Open Anyway workaround).
@@ -139,6 +208,7 @@ jobs:
 
   windows:
     name: Bundle Windows (msi + nsis)
+    needs: verify
     # x64-only. Unsigned per FRE-49: no Authenticode cert, so SmartScreen
     # shows an "unknown publisher" warning on first run (the README documents
     # More info → Run anyway). WiX (msi) and NSIS (setup exe) are downloaded
