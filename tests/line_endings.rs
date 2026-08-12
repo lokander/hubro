@@ -56,7 +56,7 @@ const LF_ONLY: &[(&str, &str)] = &[
     ("Dioxus.toml", "several tests re-derive values from it"),
     (
         ".github/workflows/release.yml",
-        "file_associations.rs pins DX_VERSION against it",
+        r#"file_associations.rs splits it on "\njobs:\n" to read the job graph"#,
     ),
 ];
 
