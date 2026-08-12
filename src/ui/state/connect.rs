@@ -119,12 +119,14 @@ pub(super) fn park_ssh_remember(pending: &mut HashMap<String, bool>, url: &str, 
 /// user who cleared it and then mistyped had that decision undone by the typo
 /// (FRE-162).
 ///
-/// An attempt with no choice on record — a passphrase read back from the
-/// keyring, or one typed into the connection form, which stashes it without
-/// parking anything — is one this session never asked about, so its prompt is
-/// a first prompt and offers the default. That is why the absence of an answer
-/// has to be distinguishable from an answer of "no", and why
-/// [`park_ssh_remember`] records both.
+/// An attempt with no answer on record defaults to offering the box ticked:
+/// nothing has asked this session, so its prompt is a first prompt. That is
+/// usually a passphrase read back from the keyring, or one typed into the
+/// connection form, which stashes it without parking anything — but the rule
+/// is the record, not the source. An answer left parked by an earlier attempt
+/// is honoured whatever supplied the passphrase this time. That is why the
+/// absence of an answer has to be distinguishable from an answer of "no", and
+/// why [`park_ssh_remember`] records both.
 #[must_use = "the verdict is the re-prompt's checkbox; dropping it re-ticks a box the \
               user deliberately cleared"]
 pub(super) fn withdraw_ssh_remember(pending: &mut HashMap<String, bool>, url: &str) -> bool {
@@ -2073,20 +2075,42 @@ mod tests {
         // `a_re_prompt_offers_the_choice_the_user_already_made` executes what
         // it decides.
         let rejection = &body[rejected..];
+        // The binding as written, not merely the call: `!withdraw_ssh_remember(…)`
+        // satisfies a search for the call and leaves the `remember,` field
+        // below untouched, so the answer inverts one line above everything
+        // else this test reads. That is exactly how it got through.
         assert!(
-            rejection.contains("withdraw_ssh_remember("),
-            "a rejected passphrase leaves its remember choice parked, where an \
-             unrelated later attempt can redeem it: {rejection}"
+            rejection.contains("let remember = withdraw_ssh_remember("),
+            "a rejected passphrase leaves its remember choice parked, or the \
+             withdrawn answer is negated on the way to the prompt — which \
+             re-ticks a box the user cleared and ends in a keyring write of a \
+             passphrase they declined: {rejection}"
         );
-        // The field as written, not merely mentioned: `remember: !remember,`
-        // contains `remember,` and restores the defect in *both* polarities —
-        // a ticked box lost to a typo, and an unticked one turned into a
-        // keyring write.
+        // The field as written too: `remember: !remember,` contains
+        // `remember,` and inverts the same decision one line lower.
         assert!(
             rejection.contains("\n                    remember,\n"),
             "the withdrawn choice is not reaching the re-prompt as written, so \
              the box is re-ticked after every typo, or offers the opposite of \
              what the user chose (FRE-162): {rejection}"
+        );
+        // And negation in any *other* form: a second binding
+        // (`let remember = !remember;`) inverts the same decision while
+        // leaving both the call and the field shorthand above intact. Read
+        // over code only — the prose here discusses what is deliberately not
+        // stored. Renaming the binding fails these assertions on purpose: the
+        // field is passed as shorthand, so the name is load-bearing already,
+        // and the looser match this replaced is what let the inversion past
+        // five rounds of review.
+        let rejection_code: String = rejection
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !rejection_code.contains("!remember") && !rejection_code.contains("!withdraw"),
+            "the withdrawn answer is negated before it reaches the prompt: \
+             {rejection_code}"
         );
         // And the write must sit *inside* the verdict's gate, the way
         // `open_tunnel_decides_on_the_passphrase_s_source_not_its_presence`

@@ -2119,6 +2119,23 @@ mod tests {
              answer the user gave is not the one that reaches the keyring \
              decision: {body}"
         );
+        // And the third place the same value passes through: what the rendered
+        // box displays. Rendering is not testable without a runtime, but the
+        // *binding* is text like the other two, and `checked: !remember()`
+        // shows every user the opposite of the state they are about to submit.
+        // Sliced from `rsx!` to the end of the function, so all three ends of
+        // the value — seed, display, submit — are covered by one test.
+        let rendered = &source[card + body.len()
+            ..card
+                + source[card..]
+                    .find("\n}\n")
+                    .expect("the card function must be closed")];
+        assert!(
+            rendered.contains("checked: remember(),"),
+            "the checkbox displays something other than the choice it holds, \
+             so the box the user sees and the answer the card submits can \
+             disagree: {rendered}"
+        );
     }
 
     #[test]
