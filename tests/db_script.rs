@@ -379,3 +379,92 @@ async fn postgres_script_with_vacuum_runs_sequentially_and_keeps_prior_effects()
     pool.execute("DROP TABLE script_vac").await.unwrap();
     pool.close().await;
 }
+
+/// A trigger body's inner `;` used to split the trigger into fragments that
+/// are each an error (and the trailing `END` read as a COMMIT). Now the whole
+/// trigger reaches SQLite as one statement, and the script still wraps
+/// atomically: the trigger's leading `CREATE` is not transaction control.
+#[tokio::test]
+async fn sqlite_script_creates_a_trigger_with_a_multi_statement_body() {
+    let fixture = FixtureDb::with_sql("").await;
+    let pool = fixture.open().await;
+
+    let script = "CREATE TABLE a (x INTEGER); \
+         CREATE TABLE total (n INTEGER); \
+         CREATE TABLE log (x INTEGER); \
+         INSERT INTO total VALUES (0); \
+         CREATE TRIGGER bump AFTER INSERT ON a BEGIN \
+           UPDATE total SET n = CASE WHEN new.x > 100 THEN n ELSE n + new.x END; \
+           INSERT INTO log VALUES (new.x); \
+         END; \
+         INSERT INTO a VALUES (5), (7); \
+         SELECT (SELECT n FROM total), (SELECT group_concat(x) FROM log)";
+    assert_eq!(split_statements(script, pool.dialect()).len(), 7);
+    let (results, outcome) = collect_script(&pool, script).await;
+    outcome.unwrap();
+    assert_eq!(results.len(), 7);
+    match &results[6].outcome {
+        // Both statements of the body ran for each inserted row.
+        StatementOutcome::Rows(rows) => assert_eq!(
+            rows.rows,
+            vec![vec![Value::Integer(12), Value::Text("5,7".into())]]
+        ),
+        other => panic!("expected rows from the SELECT, got {other:?}"),
+    }
+
+    // A failure after the trigger rolls it back with everything else.
+    let (_results, outcome) = collect_script(
+        &pool,
+        "CREATE TRIGGER gone AFTER INSERT ON a BEGIN SELECT 1; SELECT 2; END; \
+         SELECT * FROM missing_table",
+    )
+    .await;
+    let err = outcome.unwrap_err();
+    assert_eq!(err.statement_index, 1);
+    assert_eq!(err.rollback, Rollback::Full);
+    let triggers = pool
+        .query("SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name")
+        .await
+        .unwrap();
+    assert_eq!(triggers.rows, vec![vec![Value::Text("bump".into())]]);
+
+    pool.close().await;
+}
+
+/// Postgres 14+ SQL-standard bodies (`BEGIN ATOMIC … END`) are not
+/// dollar-quoted, so their inner `;` used to split the function apart.
+#[tokio::test]
+async fn postgres_script_creates_a_begin_atomic_function() {
+    let Some(url) = pg_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.execute("DROP PROCEDURE IF EXISTS script_atomic_fill")
+        .await
+        .unwrap();
+    pool.execute("DROP TABLE IF EXISTS script_atomic")
+        .await
+        .unwrap();
+
+    let script = "CREATE TABLE script_atomic (a integer); \
+         CREATE PROCEDURE script_atomic_fill() LANGUAGE sql BEGIN ATOMIC \
+           INSERT INTO script_atomic VALUES (1); \
+           INSERT INTO script_atomic VALUES (CASE WHEN true THEN 2 END); \
+         END; \
+         CALL script_atomic_fill(); \
+         SELECT a FROM script_atomic ORDER BY a";
+    assert_eq!(split_statements(script, pool.dialect()).len(), 4);
+    let (results, outcome) = collect_script(&pool, script).await;
+    outcome.unwrap();
+    match &results[3].outcome {
+        StatementOutcome::Rows(rows) => assert_eq!(
+            rows.rows,
+            vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+        ),
+        other => panic!("expected rows from the SELECT, got {other:?}"),
+    }
+
+    pool.execute("DROP PROCEDURE script_atomic_fill")
+        .await
+        .unwrap();
+    pool.execute("DROP TABLE script_atomic").await.unwrap();
+    pool.close().await;
+}
