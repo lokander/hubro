@@ -144,12 +144,12 @@ async fn cockroach_identifies_itself_as_its_own_engine() {
     let Some(url) = test_url() else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
 
-    // Nothing else in this file depends on this answer, and that is
+    // No introspection in this file depends on this answer, and that is
     // deliberate: every fix the CockroachDB verification landed reads a
     // catalog fact instead, so the backend behaves correctly here whether or
-    // not it recognises the engine. Detection exists to *report* who answered
-    // — and because Materialize's capabilities are declared from it, which no
-    // catalog fact supplies.
+    // not it recognises the engine. Detection exists to *report* who answered,
+    // and to declare what no catalog fact supplies: the capabilities, such as
+    // this engine's `transactional_ddl: false`.
     // `stock_postgres_is_detected_as_stock_postgres` pins the other direction.
     assert_eq!(pool.pg_flavor(), Some(PgFlavor::CockroachDB));
 

@@ -76,8 +76,7 @@ pub fn build_url(
 /// share [`PgFlavor::Postgres`], and the reimplementations, which get their
 /// own variant.
 ///
-/// **Nothing in the backend branches on this today, and that is the intended
-/// state.** Both problems found while verifying CockroachDB looked like they
+/// **Introspection never branches on this, and that is the intended state.** Both problems found while verifying CockroachDB looked like they
 /// needed the engine's identity and turned out not to: a 64-bit
 /// `ordinal_position` is fixed by pinning the width in SQL for everyone, and
 /// its reserved catalog schemas are found through `table_type`, which is the
@@ -86,7 +85,8 @@ pub fn build_url(
 /// implies, it needs no update when an engine changes behaviour between
 /// versions, and it keeps intact the rule that internal objects are found by
 /// catalog facts, never by name patterns. Reach for a flavor check only when
-/// no catalog fact answers the question.
+/// no catalog fact answers the question — which is why the backend's
+/// capabilities and how it asks for EXPLAIN do read it (`registry.rs`).
 ///
 /// It exists because one such question is already known: Materialize's
 /// capabilities are a property of the engine, not of anything in its catalog,

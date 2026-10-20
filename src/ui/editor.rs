@@ -17,8 +17,9 @@ use super::state::{
     AppState, ExportPane, ExportStatus, RunStatus, SchemaLoad, SharedStatement, SqlBuffer,
 };
 
-/// Cap on rendered result rows (per statement). The full result may still
-/// sit in memory, but the DOM must not receive a million rows.
+/// Cap on rendered result rows (per statement). The query layer keeps up to
+/// `MAX_QUERY_ROWS` (10,000) rows of a result; the DOM must not receive even
+/// that many.
 const MAX_RENDERED_ROWS: usize = 500;
 
 /// Messages the CodeMirror bundle sends over the eval channel.

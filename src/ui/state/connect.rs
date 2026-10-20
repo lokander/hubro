@@ -219,7 +219,7 @@ pub(super) fn carry_session_secrets(session: &mut HashMap<String, String>, old: 
         // keyring copy the same precedence for the same reason. Overwriting it
         // would put an unvalidated secret where the next connect reads it as
         // previously accepted — and `forget_stale_secret` then deletes the
-        // stored copy when it fails, and an unchecked secret costs a good one.
+        // stored copy when it fails, so an unchecked secret costs a good one.
         session.entry(new_key).or_insert(secret);
     }
 }
