@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use russh::client;
 #[cfg(any(unix, windows))]
 use russh::keys::agent::client::{AgentClient, AgentStream};
-use russh::keys::known_hosts::{known_host_keys_path, learn_known_hosts_path};
+use russh::keys::known_hosts::learn_known_hosts_path;
 use russh::keys::{
     load_secret_key, Algorithm, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey,
     PublicKeyOrCertificate,
@@ -23,6 +23,8 @@ use russh::Disconnect;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+
+mod known_hosts;
 
 /// SSH tunnel settings persisted with a saved connection. No secrets here:
 /// key passphrases live in the OS keyring / session memory, like database
@@ -74,6 +76,9 @@ pub enum TunnelError {
     /// The server presented a key that differs from the one recorded for this
     /// host — a possible man-in-the-middle. Never auto-trusted.
     HostKeyChanged(HostKeyInfo),
+    /// The server presented a key a known_hosts file marks `@revoked`. Refused
+    /// even when the same key is also listed as trusted, as OpenSSH does.
+    HostKeyRevoked(HostKeyInfo),
 }
 
 /// A server host key that the user must make a trust decision about, plus the
@@ -109,6 +114,12 @@ impl fmt::Display for TunnelError {
                  man-in-the-middle; refusing to connect",
                 info.host, info.port, info.key_type, info.fingerprint
             ),
+            TunnelError::HostKeyRevoked(info) => write!(
+                f,
+                "SSH tunnel: the host key for {}:{} ({} {}) is marked @revoked in \
+                 known_hosts; refusing to connect",
+                info.host, info.port, info.key_type, info.fingerprint
+            ),
         }
     }
 }
@@ -120,12 +131,12 @@ impl std::error::Error for TunnelError {}
 enum HostKeyStatus {
     /// A matching entry exists — accept silently.
     Trusted,
-    /// No readable file records this host — first contact (trust-on-first-use).
-    /// A file russh cannot parse is skipped whole, so its records are lost too
-    /// (FRE-289).
+    /// No file records a key for this host — first contact (trust-on-first-use).
     Unknown,
     /// A file records this host with a *different* key — possible MITM.
     Changed,
+    /// A file marks this very key `@revoked`.
+    Revoked,
 }
 
 /// hubro's own known_hosts store (writable): `~/.config/hubro/known_hosts`.
@@ -151,33 +162,33 @@ pub fn default_known_hosts_read() -> Vec<PathBuf> {
     files
 }
 
-/// Classifies `key` for `host:port` against every key `files` record for that
-/// host, by [`host_key_verdict`]. Unreadable or unparsable files contribute no
-/// opinion. russh fails a whole file on one undecodable line for the host, or
-/// on any byte that is not UTF-8 anywhere in it; FRE-289 is to fix that.
+/// Classifies `key` for `host:port` against what `files` record for that host
+/// ([`known_hosts::recorded_for`]), by [`host_key_verdict`].
 fn verify_host_key(host: &str, port: u16, key: &PublicKey, files: &[PathBuf]) -> HostKeyStatus {
-    let recorded: Vec<PublicKey> = files
-        .iter()
-        .filter_map(|path| known_host_keys_path(host, port, path).ok())
-        .flatten()
-        .map(|(_, recorded)| recorded)
-        .collect();
-    host_key_verdict(key, &recorded)
+    let recorded = known_hosts::recorded_for(host, port, files);
+    host_key_verdict(key, &recorded.keys, &recorded.revoked)
 }
 
-/// Trusted if any recorded key is the offered one, wherever it sits; Changed if
-/// the host is recorded at all but only under other keys; Unknown only when
-/// nothing is recorded. This is OpenSSH's core rule (`hostfile.c`), so a key of
-/// a different *type* counts as Changed; its `@revoked` markers and wildcard
-/// patterns are not replicated (FRE-289). The type case matters because russh
-/// does not check the key a server sends against the negotiated algorithm, so a
-/// server can agree to the recorded type and present another. Reading that as
-/// Unknown turned a man-in-the-middle into a trust prompt for a host the user
-/// already trusts (FRE-288, reproduced against a server that negotiated
-/// ssh-ed25519 and sent an ECDSA key).
-fn host_key_verdict(offered: &PublicKey, recorded: &[PublicKey]) -> HostKeyStatus {
+/// Revoked if any `@revoked` entry is the offered key, whatever else is
+/// recorded; then Trusted if any recorded key is the offered one, wherever it
+/// sits; Changed if the host is recorded at all but only under other keys;
+/// Unknown only when nothing is recorded. This is OpenSSH's rule (`hostfile.c`),
+/// so a key of a different *type* counts as Changed. The type case matters
+/// because russh does not check the key a server sends against the negotiated
+/// algorithm, so a server can agree to the recorded type and present another.
+/// Reading that as Unknown turned a man-in-the-middle into a trust prompt for a
+/// host the user already trusts (FRE-288, reproduced against a server that
+/// negotiated ssh-ed25519 and sent an ECDSA key).
+fn host_key_verdict(
+    offered: &PublicKey,
+    recorded: &[PublicKey],
+    revoked: &[PublicKey],
+) -> HostKeyStatus {
     // Key material only: the comment is not part of the key's identity.
-    if recorded.iter().any(|r| r.key_data() == offered.key_data()) {
+    let is_offered = |r: &PublicKey| r.key_data() == offered.key_data();
+    if revoked.iter().any(is_offered) {
+        HostKeyStatus::Revoked
+    } else if recorded.iter().any(is_offered) {
         HostKeyStatus::Trusted
     } else if recorded.is_empty() {
         HostKeyStatus::Unknown
@@ -198,14 +209,10 @@ fn host_key_verdict(offered: &PublicKey, recorded: &[PublicKey]) -> HostKeyStatu
 /// stale entry is removed.
 fn recorded_key_algorithms(host: &str, port: u16, files: &[PathBuf]) -> Vec<Algorithm> {
     let mut algorithms = Vec::new();
-    for path in files {
-        if let Ok(keys) = known_host_keys_path(host, port, path) {
-            for (_, recorded) in keys {
-                for algorithm in presenting_algorithms(recorded.algorithm()) {
-                    if !algorithms.contains(&algorithm) {
-                        algorithms.push(algorithm);
-                    }
-                }
+    for recorded in known_hosts::recorded_for(host, port, files).keys {
+        for algorithm in presenting_algorithms(recorded.algorithm()) {
+            if !algorithms.contains(&algorithm) {
+                algorithms.push(algorithm);
             }
         }
     }
@@ -376,7 +383,8 @@ impl Tunnel {
             Ok(handle) => handle,
             // If the handshake failed because we rejected the host key, turn
             // the generic connect error into a precise host-key error the UI
-            // can act on (trust prompt for Unknown, hard refusal for Changed).
+            // can act on (trust prompt for Unknown, hard refusal for Changed
+            // and Revoked).
             Err(e) => {
                 let status = verdict.lock().ok().and_then(|mut v| v.take());
                 let offered = offered_key.lock().ok().and_then(|mut k| k.take());
@@ -386,6 +394,9 @@ impl Tunnel {
                     }
                     (Some(HostKeyStatus::Changed), Some(key)) => {
                         TunnelError::HostKeyChanged(host_key_info(&config.host, config.port, &key))
+                    }
+                    (Some(HostKeyStatus::Revoked), Some(key)) => {
+                        TunnelError::HostKeyRevoked(host_key_info(&config.host, config.port, &key))
                     }
                     _ => TunnelError::Connect(format!("{}:{}: {e}", config.host, config.port)),
                 });
@@ -674,6 +685,7 @@ mod tests {
             TunnelError::Forward("bind failed".into()),
             TunnelError::HostKeyUnknown(info("host")),
             TunnelError::HostKeyChanged(info("host")),
+            TunnelError::HostKeyRevoked(info("host")),
         ];
         for err in cases {
             assert!(
@@ -691,6 +703,9 @@ mod tests {
         assert!(TunnelError::Forward("x".into())
             .to_string()
             .contains("port forwarding failed"));
+        assert!(TunnelError::HostKeyRevoked(info("host"))
+            .to_string()
+            .contains("@revoked"));
         // The MITM case shouts, and both host-key errors show the fingerprint.
         assert!(TunnelError::HostKeyChanged(info("host"))
             .to_string()
@@ -767,14 +782,17 @@ mod tests {
         for (offered, recorded, expected) in cases {
             let recorded: Vec<PublicKey> = recorded.into_iter().map(pubkey).collect();
             assert_eq!(
-                host_key_verdict(&pubkey(offered), &recorded),
+                host_key_verdict(&pubkey(offered), &recorded, &[]),
                 expected,
                 "{offered} against {recorded:?}"
             );
         }
         // The comment is not part of the key.
         let commented = pubkey(&format!("{KEY_A} someone@laptop"));
-        assert_eq!(host_key_verdict(&commented, &[a]), HostKeyStatus::Trusted);
+        assert_eq!(
+            host_key_verdict(&commented, &[a], &[]),
+            HostKeyStatus::Trusted
+        );
     }
 
     #[test]
@@ -874,24 +892,34 @@ mod tests {
     }
 
     #[test]
-    fn every_readable_file_counts_and_an_unparsable_one_erases_only_itself() {
+    fn every_readable_file_counts_and_a_bad_line_erases_only_itself() {
         let dir = tempfile::tempdir().unwrap();
         // hubro's own store comes first in `default_known_hosts_read`, so its
-        // record must count; a broken second file must not erase it. The
-        // double space makes russh read the key type as the key and fail the
-        // whole file.
+        // record must count. In the second file an undecodable line for the
+        // host must cost only itself (russh's reader failed the whole file on
+        // it, FRE-289), and an unreadable path contributes nothing.
         let first = write_known_hosts(dir.path(), "app", &[&format!("example.com {KEY_A}")]);
-        let broken = write_known_hosts(dir.path(), "user", &[&format!("example.com  {KEY_B}")]);
-        assert!(known_host_keys_path("example.com", 22, &broken).is_err());
-        let files = [first, broken];
-        assert_eq!(
-            verify_host_key("example.com", 22, &pubkey(KEY_ECDSA), &files),
-            HostKeyStatus::Changed
+        let second = write_known_hosts(
+            dir.path(),
+            "user",
+            &[
+                "example.com ssh-ed25519 AAAA!!notbase64",
+                &format!("example.com {KEY_B}"),
+            ],
         );
-        assert_eq!(
-            verify_host_key("example.com", 22, &pubkey(KEY_A), &files),
-            HostKeyStatus::Trusted
-        );
+        let unreadable = dir.path().to_path_buf(); // a directory
+        let files = [first, second, unreadable];
+        for (offered, expected) in [
+            (KEY_ECDSA, HostKeyStatus::Changed),
+            (KEY_A, HostKeyStatus::Trusted),
+            (KEY_B, HostKeyStatus::Trusted),
+        ] {
+            assert_eq!(
+                verify_host_key("example.com", 22, &pubkey(offered), &files),
+                expected,
+                "{offered}"
+            );
+        }
     }
 
     #[test]
@@ -992,6 +1020,170 @@ mod tests {
                 "{inner} key"
             );
         }
+    }
+
+    #[test]
+    fn verdicts_match_what_openssh_decides() {
+        // Each row's expected verdict is what the real OpenSSH 10.5 client
+        // decided for the same layout with StrictHostKeyChecking=yes (FRE-289;
+        // measured against [localhost]:2222, mirrored here onto port 22).
+        // KEY_A is the key the server presents; KEY_B stands for a recorded
+        // key that is not it.
+        const H: &str = "db.example.com";
+        const GARBLED: &str = "db.example.com ssh-ed25519 AAAA!!notbase64";
+        const HASHED: &str = "|1|tbLEo3oZNezhlFk5483qNgLrsh8=|l9n0k6ONOAQcZH3VHlomE0dSN2E="; // db.example.com
+        let a_b64 = KEY_A.split_once(' ').unwrap().1;
+        let rows: Vec<(&str, Vec<u8>, &str, HostKeyStatus)> = vec![
+            (
+                "garbled line beside a record of another key",
+                format!("{H} {KEY_B}\n{GARBLED}\n").into(),
+                KEY_A,
+                HostKeyStatus::Changed,
+            ),
+            (
+                "garbled line beside the key's own record",
+                format!("{H} {KEY_A}\n{GARBLED}\n").into(),
+                KEY_A,
+                HostKeyStatus::Trusted,
+            ),
+            (
+                "only a garbled line for the host",
+                format!("{GARBLED}\n").into(),
+                KEY_A,
+                HostKeyStatus::Unknown,
+            ),
+            (
+                "@revoked alone",
+                format!("@revoked {H} {KEY_A}\n").into(),
+                KEY_A,
+                HostKeyStatus::Revoked,
+            ),
+            (
+                "@revoked beside a plain listing",
+                format!("{H} {KEY_A}\n@revoked * {KEY_A}\n").into(),
+                KEY_A,
+                HostKeyStatus::Revoked,
+            ),
+            (
+                "non-UTF-8 byte elsewhere",
+                [
+                    format!("{H} {KEY_B}\nother.host {KEY_B} caf").as_bytes(),
+                    b"\xe9\n",
+                ]
+                .concat(),
+                KEY_A,
+                HostKeyStatus::Changed,
+            ),
+            (
+                "wildcard recording another key",
+                format!("*.example.com {KEY_B}\n").into(),
+                KEY_A,
+                HostKeyStatus::Changed,
+            ),
+            (
+                "wildcard recording the key",
+                format!("*.example.com {KEY_A}\n").into(),
+                KEY_A,
+                HostKeyStatus::Trusted,
+            ),
+            (
+                "wildcard negating this host",
+                format!("*.example.com,!{H} {KEY_A}\n").into(),
+                KEY_A,
+                HostKeyStatus::Unknown,
+            ),
+            (
+                "uppercase pattern",
+                format!("DB.Example.COM {KEY_A}\n").into(),
+                KEY_A,
+                HostKeyStatus::Trusted,
+            ),
+            (
+                "tab-separated fields",
+                format!("{H}\t{}\n", KEY_B.replace(' ', "\t")).into(),
+                KEY_A,
+                HostKeyStatus::Changed,
+            ),
+            (
+                "@cert-authority only",
+                format!("@cert-authority {H} {KEY_A}\n").into(),
+                KEY_A,
+                HostKeyStatus::Unknown,
+            ),
+            (
+                "hashed entry recording the key",
+                format!("{HASHED} {KEY_A}\n").into(),
+                KEY_A,
+                HostKeyStatus::Trusted,
+            ),
+            (
+                "hashed entry recording another key",
+                format!("{HASHED} {KEY_A}\n").into(),
+                KEY_B,
+                HostKeyStatus::Changed,
+            ),
+            (
+                "type field disagreeing with its key",
+                format!("{H} ssh-rsa {a_b64}\n").into(),
+                KEY_A,
+                HostKeyStatus::Unknown,
+            ),
+            (
+                "type mismatch beside a record of another key",
+                format!("{H} {KEY_B}\n{H} ssh-rsa {a_b64}\n").into(),
+                KEY_A,
+                HostKeyStatus::Changed,
+            ),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        for (i, (label, contents, offered, expected)) in rows.into_iter().enumerate() {
+            let path = dir.path().join(format!("known_hosts_{i}"));
+            std::fs::write(&path, contents).unwrap();
+            assert_eq!(
+                verify_host_key(H, 22, &pubkey(offered), &[path]),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_handler_refuses_a_revoked_key_as_revoked() {
+        use russh::client::Handler as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_known_hosts(
+            dir.path(),
+            "known_hosts",
+            &[
+                &format!("[db.internal]:2222 {KEY_A}"),
+                &format!("@revoked * {KEY_A}"),
+            ],
+        );
+        let mut verifier = HostKeyVerifier {
+            host: "db.internal".into(),
+            port: 2222,
+            files: vec![path],
+            verdict: Arc::default(),
+            offered_key: Arc::default(),
+        };
+        let offered = PublicKeyOrCertificate::from(pubkey(KEY_A));
+        assert!(!verifier.check_server_key(&offered).await.unwrap());
+        assert_eq!(
+            *verifier.verdict.lock().unwrap(),
+            Some(HostKeyStatus::Revoked)
+        );
+    }
+
+    #[test]
+    fn revoked_keys_are_not_pinned_for_negotiation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_known_hosts(
+            dir.path(),
+            "known_hosts",
+            &[&format!("@revoked example.com {KEY_RSA}")],
+        );
+        assert!(recorded_key_algorithms("example.com", 22, &[path]).is_empty());
     }
 
     #[test]

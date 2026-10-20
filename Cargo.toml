@@ -44,6 +44,10 @@ russh = "0.64"
 # Entra ID / Azure AD auth for Postgres (FRE-43): OAuth token HTTP, PKCE, browser launch.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 sha2 = "0.11"
+# HMAC-SHA1 for hashed known_hosts entries (`|1|salt|hash`, FRE-289): the
+# versions russh already uses for the same check.
+hmac = "0.13"
+sha1 = "0.11"
 base64 = "0.23"
 webbrowser = "1"
 getrandom = "0.4"
