@@ -78,8 +78,9 @@ pub enum ScriptTx<'p> {
     Sqlite(sqlx::Transaction<'p, sqlx::Sqlite>),
     Postgres(sqlx::Transaction<'p, sqlx::Postgres>),
     // Not an sqlx transaction: an owned pooled connection driving
-    // BEGIN/COMMIT as manual SQL (tiberius has no transaction API). Boxed:
-    // the checked-out client is large next to the slim sqlx handles.
+    // BEGIN/COMMIT as manual SQL (predating tiberius 0.13's transaction API,
+    // which is unused). Boxed: the checked-out client is large next to the
+    // slim sqlx handles.
     SqlServer(Box<MssqlTx>),
 }
 

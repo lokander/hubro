@@ -18,9 +18,10 @@
 //!
 //! ## Transactions
 //!
-//! tiberius has no transaction API; `BEGIN TRAN`/`COMMIT`/`ROLLBACK` run as
-//! raw batches on one checked-out connection ([`MssqlTx`]), which the server
-//! ties together via the session's transaction descriptor.
+//! `BEGIN TRAN`/`COMMIT`/`ROLLBACK` run as raw batches on one checked-out
+//! connection ([`MssqlTx`]), which the server ties together via the session's
+//! transaction descriptor. This predates tiberius 0.13's transaction API
+//! (TDS Transaction Manager requests), which nothing here uses.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -201,6 +202,12 @@ impl MssqlUrlParts {
             config.trust_cert();
         }
         config.application_name("hubro");
+        // tiberius 0.13 bounds every server round-trip at 30s by default and
+        // drops the connection when it fires, so a long user query (a big sort,
+        // `WAITFOR`, a blocked lock) would fail at 30s — measured, not assumed.
+        // Postgres and SQLite run unbounded, so SQL Server does too. The 15s
+        // handshake bound stays: it only covers prelogin, TLS and login.
+        config.command_timeout(None);
         config
     }
 }
@@ -424,6 +431,17 @@ fn friendly_connect_error(err: &TdsError) -> String {
         // database server on that host/port. The mirror of the Postgres-side
         // FRE-51 hint.
         format!("the server doesn't appear to be SQL Server — check the host and port — {msg}")
+    } else if matches!(
+        err,
+        TdsError::Io {
+            kind: std::io::ErrorKind::TimedOut,
+            ..
+        }
+    ) {
+        // Ahead of the TLS arm: tiberius's handshake-timeout message names
+        // "TLS negotiation" among the stages, which says nothing about TLS
+        // having failed.
+        format!("network error — {msg}")
     } else if matches!(err, TdsError::Tls(_)) || lower.contains("tls") || lower.contains("ssl") {
         format!("TLS error — {msg}")
     } else if lower.contains("connection refused")
@@ -1000,6 +1018,29 @@ mod tests {
         };
         let friendly = friendly_connect_error(&hangup);
         assert!(friendly.starts_with("the server doesn't appear to be SQL Server"));
+        // tiberius 0.13's handshake timeout, as it words it: a stalled server,
+        // not a TLS failure, even though the message mentions TLS.
+        let stalled = TdsError::Io {
+            kind: std::io::ErrorKind::TimedOut,
+            message: "the connection handshake (prelogin, TLS negotiation and login) did not \
+                      complete within 15s"
+                .into(),
+        };
+        assert!(friendly_connect_error(&stalled).starts_with("network error"));
+    }
+
+    #[test]
+    fn statements_are_not_bounded_by_a_command_timeout() {
+        // tiberius 0.13 defaults to a 30s bound per round-trip; a query that
+        // runs longer than that is the user's business, not a driver error.
+        let parts = || parse_mssql_url("mssql://sa@db.example.com:1433/app").unwrap();
+        let token = MssqlAuth::AadToken("t".to_string());
+        for config in [
+            parts().into_config(&MssqlAuth::Password, None),
+            parts().into_config(&token, Some("db.example.com")),
+        ] {
+            assert_eq!(config.get_command_timeout(), None);
+        }
     }
 
     #[test]
