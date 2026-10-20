@@ -365,7 +365,7 @@ pub async fn open_mssql_with(
             .map_err(|e| {
                 // A failed validation never returns the connection to the pool.
                 conn.discard();
-                DbError::Connect(friendly_connect_error(&e))
+                connect_error(&e)
             })?;
         // conn drops here and seeds the idle list.
     }
@@ -388,10 +388,10 @@ async fn connect_client(config: &Config, addr: &(String, u16)) -> Result<TdsClie
         }
         other => other,
     }
-    .map_err(|e| DbError::Connect(friendly_connect_error(&e)))?;
+    .map_err(|e| connect_error(&e))?;
     match run_batch(&mut client, SESSION_SETUP).await {
         Ok(()) => Ok(client),
-        Err(e) => Err(DbError::Connect(friendly_connect_error(&e))),
+        Err(e) => Err(connect_error(&e)),
     }
 }
 
@@ -407,15 +407,60 @@ async fn connect_once(config: Config, addr: &(String, u16)) -> Result<TdsClient,
     Client::connect(config, tcp.compat_write()).await
 }
 
+/// SQL Server's "Login failed for user '…'": the server refused the
+/// credentials. Sent for a wrong password, an unknown login, and an empty
+/// password where one is required — measured, all three — and, ahead of
+/// anything about the database, for a wrong password naming a database that
+/// would also have failed.
+const LOGIN_FAILED: u32 = 18456;
+
+/// "Cannot open database "…" requested by the login. The login failed." Sent
+/// only once the credentials were accepted, for a database that does not
+/// exist, is offline or restoring, or that this login may not open.
+const CANNOT_OPEN_DATABASE: u32 = 4060;
+
+/// Turns a failed login or session setup into the error the connect flow
+/// acts on. See [`connect_error_from`].
+fn connect_error(err: &TdsError) -> DbError {
+    connect_error_from(err.code(), friendly_connect_error(err))
+}
+
+/// The classification itself, over plain data so a test can execute it (a
+/// tiberius `TokenError` cannot be built outside tiberius).
+///
+/// Decided on the server's error code and nothing else: the connect flow
+/// deletes the stored password on [`DbError::CredentialsRejected`], and text
+/// is both localized (a login's default language sets it) and shared between
+/// codes — 4060's own message ends in "The login failed.", which is how a
+/// missing database used to delete a working password. Only 18456 qualifies.
+/// Other codes in that family — a disabled account (18470, measured) — refuse
+/// a password that is still correct, so they keep it and report.
+fn connect_error_from(code: Option<u32>, message: String) -> DbError {
+    if code == Some(LOGIN_FAILED) {
+        DbError::CredentialsRejected(message)
+    } else {
+        DbError::Connect(message)
+    }
+}
+
 /// Categorizes common failure modes so the connections screen reads well:
 /// auth, network/DNS, TLS, wrong-server.
+///
+/// Words only. Whether the password is to blame — the question that costs a
+/// stored secret — is [`connect_error_from`]'s, on the error code; nothing
+/// may decide it from this text.
 fn friendly_connect_error(err: &TdsError) -> String {
     let msg = err.to_string();
     let lower = msg.to_lowercase();
-    if lower.contains("login failed") {
+    // The database arm comes first: 4060's message contains "the login failed"
+    // as well, and it is not a password problem.
+    if err.code() == Some(CANNOT_OPEN_DATABASE) || lower.contains("cannot open database") {
+        format!(
+            "cannot open the database — it may not exist, be offline or restoring, or this \
+             login may lack access to it; the credentials were accepted — {msg}"
+        )
+    } else if lower.contains("login failed") {
         format!("authentication failed — {msg}")
-    } else if lower.contains("cannot open database") {
-        format!("unknown database — {msg}")
     } else if matches!(err, TdsError::Protocol(_))
         || matches!(
             err,
@@ -1052,6 +1097,74 @@ mod tests {
             friendly.ends_with("Connection timed out (os error 110)"),
             "{friendly}"
         );
+    }
+
+    /// Error 4060's text as SQL Server 2022 sends it, measured — and the
+    /// reason the database arm must come before the login arm.
+    const CANNOT_OPEN_TEXT: &str =
+        "Cannot open database \"no_such_db\" requested by the login. The login failed.";
+
+    #[test]
+    fn only_login_failed_rejects_the_credentials() {
+        // The connect flow deletes the stored password on CredentialsRejected,
+        // so the variant is a promise that the *password* was refused. Every
+        // code below was measured against SQL Server 2022.
+        let rejected = |code| connect_error_from(code, "m".into()).credentials_rejected();
+        assert!(
+            rejected(Some(LOGIN_FAILED)),
+            "a wrong password must raise the prompt"
+        );
+        for (code, what) in [
+            (
+                Some(CANNOT_OPEN_DATABASE),
+                "a missing, offline, restoring or forbidden database",
+            ),
+            (
+                Some(18470),
+                "a disabled login, whose password is still right",
+            ),
+            (Some(1205), "a deadlock victim"),
+            (None, "a failure with no server code at all"),
+        ] {
+            assert!(
+                !rejected(code),
+                "{what} ({code:?}) would delete a working password"
+            );
+        }
+        // The text never decides, whichever way it points: a login-failed
+        // message without the code is reported and keeps the password…
+        let text_only = TdsError::Io {
+            kind: std::io::ErrorKind::Other,
+            message: "Login failed for user 'sa'.".into(),
+        };
+        assert_eq!(
+            connect_error(&text_only),
+            DbError::Connect(friendly_connect_error(&text_only))
+        );
+        // …and the message survives the classification unchanged.
+        assert_eq!(
+            connect_error_from(Some(LOGIN_FAILED), "the words".into()),
+            DbError::CredentialsRejected("the words".into())
+        );
+    }
+
+    #[test]
+    fn a_database_that_cannot_be_opened_is_not_called_an_authentication_failure() {
+        // Words only — the decision is the code's — but words that say
+        // "authentication failed" for a missing database send the user off to
+        // fix a password that works. The arm order is what decides it, since
+        // 4060's message contains "login failed" too.
+        let err = TdsError::Io {
+            kind: std::io::ErrorKind::Other,
+            message: CANNOT_OPEN_TEXT.into(),
+        };
+        let friendly = friendly_connect_error(&err);
+        assert!(
+            friendly.starts_with("cannot open the database"),
+            "{friendly}"
+        );
+        assert!(!friendly.contains("authentication failed"), "{friendly}");
+        assert!(friendly.ends_with(CANNOT_OPEN_TEXT), "{friendly}");
     }
 
     #[test]

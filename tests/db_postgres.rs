@@ -387,13 +387,83 @@ async fn postgres_bad_password_is_an_authentication_error() {
         .await
         .err()
         .expect("wrong password must fail");
+    // CredentialsRejected is what raises the password prompt and, for a
+    // remembered password, deletes it — built from SQLSTATE 28P01.
     match err {
-        DbError::Connect(msg) => assert!(
+        DbError::CredentialsRejected(msg) => assert!(
             msg.contains("authentication failed"),
             "unexpected message: {msg}"
         ),
-        other => panic!("expected Connect error, got {other:?}"),
+        other => panic!("expected CredentialsRejected, got {other:?}"),
     }
+}
+
+/// Opens `url`, which must fail, and returns how.
+async fn connect_failure(url: &str) -> DbError {
+    DbPool::open_postgres(url)
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("{url} connected"))
+}
+
+#[tokio::test]
+async fn postgres_only_a_refused_password_is_a_credential_rejection() {
+    // A rejection deletes the stored password, so each failure here that
+    // still has a correct password must stay a plain Connect.
+    let Some(url) = test_url().await else { return };
+    let admin = DbPool::open_postgres(&url).await.unwrap();
+    let database: String = url::Url::parse(&url).unwrap().path()[1..].to_string();
+    // Roles are cluster-wide, so named per process.
+    let role = format!("hubro_outsider_{}", std::process::id());
+    const PASSWORD: &str = "outsider-pass";
+    admin
+        .query(&format!("DROP ROLE IF EXISTS {role}"))
+        .await
+        .unwrap();
+    admin
+        .query(&format!("CREATE ROLE {role} LOGIN PASSWORD '{PASSWORD}'"))
+        .await
+        .unwrap();
+    // This binary's own database, which nothing else connects to as anyone
+    // but the superuser the suite runs as — and a superuser ignores CONNECT.
+    admin
+        .query(&format!(
+            "REVOKE CONNECT ON DATABASE \"{database}\" FROM PUBLIC"
+        ))
+        .await
+        .unwrap();
+
+    let missing = common::with_database(&url, "hubro_no_such_database");
+    let mut forbidden = url::Url::parse(&url).unwrap();
+    forbidden.set_username(&role).unwrap();
+    forbidden.set_password(Some(PASSWORD)).unwrap();
+    for (what, target) in [
+        ("a database that does not exist", missing.clone()),
+        (
+            "a database this role may not connect to",
+            forbidden.to_string(),
+        ),
+    ] {
+        let err = connect_failure(&target).await;
+        assert!(
+            matches!(err, DbError::Connect(_)) && !err.credentials_rejected(),
+            "{what} must keep the password, got {err:?}"
+        );
+    }
+
+    // Authentication is checked before the database: a wrong password naming
+    // a missing database is still the password's fault, and must still prompt.
+    let err = connect_failure(&url_with_password(&missing, "definitely-wrong").unwrap()).await;
+    assert!(err.credentials_rejected(), "got {err:?}");
+
+    admin
+        .query(&format!(
+            "GRANT CONNECT ON DATABASE \"{database}\" TO PUBLIC"
+        ))
+        .await
+        .unwrap();
+    admin.query(&format!("DROP ROLE {role}")).await.unwrap();
+    admin.close().await;
 }
 
 #[tokio::test]

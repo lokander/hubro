@@ -246,6 +246,46 @@ pub(super) fn forget_connection_secrets(
     pending.remove(locator);
 }
 
+/// What a failed password connect does next, when it does anything beyond
+/// reporting the error. See [`password_retry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PasswordRetry {
+    /// Nothing was remembered — a trust-auth attempt that turned out to need a
+    /// password. Ask for one.
+    Prompt,
+    /// A remembered password was refused: delete it from session memory and
+    /// the keyring, then ask for a new one.
+    ForgetStoredAndPrompt,
+}
+
+/// Decides whether a failed server connect raises the password prompt, and
+/// whether it first deletes the remembered password.
+///
+/// Only [`DbError::CredentialsRejected`] qualifies. The backends build it from
+/// the server's error code alone (SQL Server 18456, PostgreSQL `28P01`), so
+/// nothing here reads message text. It used to: a match on "authentication
+/// failed" in the message, which SQL Server's classifier wrote for a missing
+/// or unopenable database too, since error 4060's text ends in "The login
+/// failed." — so a database name that didn't exist deleted a working stored
+/// password and then prompted for one that could not help.
+///
+/// `had_password` says whether the attempt used a remembered password, and
+/// [`AppState::connect_server`] only ever remembers passwords a connect
+/// accepted — so a rejection of one means it went stale. Without one, there
+/// is nothing to forget, and the rejection is a trust-auth guess turning out
+/// wrong.
+#[must_use = "the verdict decides whether the stored password is deleted"]
+pub(super) fn password_retry(err: &DbError, had_password: bool) -> Option<PasswordRetry> {
+    if !err.credentials_rejected() {
+        return None;
+    }
+    Some(if had_password {
+        PasswordRetry::ForgetStoredAndPrompt
+    } else {
+        PasswordRetry::Prompt
+    })
+}
+
 /// A secret to hand a server backend at connect time. Which variant a connect
 /// carries decides how the backend uses it: Postgres takes a password and an
 /// Entra token the same way — spliced into the URL — while SQL Server splices
@@ -1024,12 +1064,14 @@ impl AppState {
         let result = backend
             .open(&connect_url, credential, tls_host.as_deref())
             .await;
-        match result {
-            Err(DbError::Connect(msg)) if msg.contains("authentication failed") => {
+        // Whether to prompt, and whether to delete the remembered password
+        // first, is `password_retry`'s decision, on the structured signal the
+        // backends set from the server's error code — never on the message.
+        if let Err(err) = &result {
+            if let Some(retry) = password_retry(err, had_password) {
                 self.release_connect(&url);
-                if had_password {
-                    self.forget_stale_secret(url.clone(), format!("connection failed: {msg}"))
-                        .await;
+                if retry == PasswordRetry::ForgetStoredAndPrompt {
+                    self.forget_stale_secret(url.clone(), err.to_string()).await;
                 }
                 // live_tunnel drops here; the retry re-opens it.
                 self.password_prompt.set(Some(PasswordPrompt {
@@ -1044,12 +1086,11 @@ impl AppState {
                     // earlier answer to carry and this prompt asks fresh.
                     remember: true,
                 }));
-            }
-            result => {
-                self.finish_connect(url.clone(), name.clone(), result, live_tunnel);
-                self.save_server_if_open(backend, &url, &name, tunnel, ServerAuth::Password);
+                return;
             }
         }
+        self.finish_connect(url.clone(), name.clone(), result, live_tunnel);
+        self.save_server_if_open(backend, &url, &name, tunnel, ServerAuth::Password);
     }
 
     /// The Entra branch of the connect: try to acquire a token silently — a
@@ -3124,5 +3165,267 @@ mod tests {
         // Deleting an expanded (or unknown) group changes nothing.
         forget_collapsed(&mut collapsed, "Production");
         assert_eq!(collapsed, v(&["Archive"]));
+    }
+
+    /// One of every [`DbError`] variant. The match is the point: a new variant
+    /// does not compile here until someone says which side of the password
+    /// decision it falls on.
+    fn every_db_error(message: &str) -> Vec<DbError> {
+        let m = || message.to_string();
+        let all = vec![
+            DbError::Connect(m()),
+            DbError::Query(m()),
+            DbError::Introspect(m()),
+            DbError::RowCountMismatch(m()),
+            DbError::Unsupported(m()),
+            DbError::Transient(m()),
+            DbError::CredentialsRejected(m()),
+        ];
+        for err in &all {
+            match err {
+                DbError::Connect(_)
+                | DbError::Query(_)
+                | DbError::Introspect(_)
+                | DbError::RowCountMismatch(_)
+                | DbError::Unsupported(_)
+                | DbError::Transient(_)
+                | DbError::CredentialsRejected(_) => {}
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn only_a_credential_rejection_prompts_and_only_a_remembered_one_is_forgotten() {
+        // The exact message SQL Server's classifier used to produce for error
+        // 4060 — a database name that does not exist. A text match on it
+        // deleted the stored password; the decision must not see the words.
+        const MISSING_DATABASE: &str = "authentication failed — Token error: 'Cannot open \
+             database \"no_such_db\" requested by the login. The login failed.' on server x \
+             executing  on line 1 (code: 4060, state: 1, class: 11)";
+        for message in [MISSING_DATABASE, "anything else"] {
+            for err in every_db_error(message) {
+                let rejected = matches!(err, DbError::CredentialsRejected(_));
+                assert_eq!(
+                    password_retry(&err, true),
+                    rejected.then_some(PasswordRetry::ForgetStoredAndPrompt),
+                    "{err:?} with a remembered password"
+                );
+                // Nothing remembered, nothing to forget — but the prompt is
+                // still how a trust-auth guess learns it needed a password.
+                assert_eq!(
+                    password_retry(&err, false),
+                    rejected.then_some(PasswordRetry::Prompt),
+                    "{err:?} with no remembered password"
+                );
+            }
+        }
+    }
+
+    /// `source` without comment lines, so a test reading code cannot be
+    /// satisfied — or tripped — by prose that names what it looks for.
+    fn code_only(source: &str) -> String {
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `source` up to its `#[cfg(test)]` module: the shipped code alone.
+    fn shipped(source: &str) -> &str {
+        &source[..source.find("#[cfg(test)]").unwrap_or(source.len())]
+    }
+
+    #[test]
+    fn the_credentials_rejected_signal_survives_every_hop_to_the_keyring_delete() {
+        // Each hop between the server's error code and the keyring delete was
+        // a place the decision could be remade on text, or the signal lost.
+        // The engine suites execute the first hops against real servers
+        // (`*_only_a_refused_password_is_a_credential_rejection`), as does
+        // `real_server_failures_reach_the_decision_intact` below through
+        // `ServerBackend::open`; the decision itself is executed above. What
+        // is left needs a keyring and a Dioxus runtime to run, so it is read.
+        let whitespace = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // 1. The classifiers: every connect-time error goes through the one
+        //    function that reads the code. A second `DbError::Connect(friendly…)`
+        //    beside it would be a login failure that can never prompt — or,
+        //    written the other way round, one that always deletes.
+        for (file, source, code_read) in [
+            (
+                "sqlserver/pool.rs",
+                include_str!("../../db/sqlserver/pool.rs"),
+                "connect_error_from(err.code(), friendly_connect_error(err))",
+            ),
+            (
+                "postgres.rs",
+                include_str!("../../db/postgres.rs"),
+                "connect_error_from(sqlstate.as_deref(), friendly_connect_error(err))",
+            ),
+        ] {
+            let code = whitespace(&code_only(shipped(source)));
+            assert!(
+                code.contains(code_read),
+                "{file}: the classifier must decide on the code"
+            );
+            assert_eq!(
+                code.matches("friendly_connect_error(").count(),
+                2,
+                "{file}: friendly_connect_error is defined once and called only by \
+                 connect_error — any other caller builds a connect error the \
+                 classifier never saw"
+            );
+            // Built in exactly one place: the function that reads the code.
+            assert_eq!(
+                code.matches("DbError::CredentialsRejected(").count(),
+                1,
+                "{file}: CredentialsRejected is built somewhere other than the \
+                 code-reading classifier"
+            );
+            assert!(
+                method_body(&code, "fn connect_error_from(")
+                    .contains("DbError::CredentialsRejected("),
+                "{file}: CredentialsRejected is not built by the classifier"
+            );
+        }
+
+        // 2. The registry passes the error through untouched.
+        let registry = code_only(include_str!("../../db/registry.rs"));
+        for open in [
+            "pub async fn open_postgres(",
+            "pub async fn open_mssql(",
+            "pub async fn open_mssql_with(",
+        ] {
+            let body = method_body(&registry, open);
+            assert!(
+                !body.contains("map_err"),
+                "{open} remaps the connect error:\n{body}"
+            );
+        }
+
+        // 3. So does `ServerBackend::open`.
+        let source = code_only(shipped(include_str!("connect.rs")));
+        let open = method_body(&source, "async fn open(");
+        assert!(
+            !open.contains("map_err"),
+            "ServerBackend::open remaps the error:\n{open}"
+        );
+
+        // 4. `connect_server` asks the decision, and nothing but the decision.
+        let connect = method_body(&source, "pub async fn connect_server(");
+        assert!(
+            whitespace(&connect).contains("password_retry(err, had_password)"),
+            "connect_server must route the failure through password_retry"
+        );
+        // No consumer anywhere in the shipped code matches the words.
+        for words in ["authentication failed", "login failed", "Login failed"] {
+            assert!(
+                !source.contains(&format!("\"{words}")),
+                "connect.rs decides on the message text `{words}` again"
+            );
+        }
+
+        // 5. The keyring delete happens only behind the verdict that permits
+        //    it, and the prompt only behind a verdict at all.
+        let verdict = method_body(&connect, "if let Some(retry) = password_retry(");
+        let gate = method_body(
+            &verdict,
+            "if retry == PasswordRetry::ForgetStoredAndPrompt {",
+        );
+        assert!(
+            gate.contains("self.forget_stale_secret("),
+            "the stored password must be forgotten inside the ForgetStoredAndPrompt gate"
+        );
+        assert_eq!(
+            source.matches("self.forget_stale_secret(").count(),
+            1,
+            "a second caller of forget_stale_secret is a second, ungated delete"
+        );
+        assert!(
+            verdict.contains("PromptKind::DbPassword"),
+            "the password prompt must be raised inside the verdict"
+        );
+        assert_eq!(
+            source.matches("PromptKind::DbPassword").count(),
+            1,
+            "a second database-password prompt is a second, undecided path"
+        );
+
+        // 6. And `forget_stale_secret` is the delete — from session memory and
+        //    the keyring both, under the key it was handed.
+        let forget = method_body(&source, "async fn forget_stale_secret(");
+        assert!(forget.contains("session_passwords.write().remove(&key)"));
+        assert!(forget.contains("delete_password_async(key)"));
+    }
+
+    /// Opens through `ServerBackend::open` — the call `connect_server` makes —
+    /// and asks the decision what follows. A password stands for a remembered
+    /// one; `None` is the trust-auth attempt made when nothing is remembered.
+    async fn retry_after(
+        backend: ServerBackend,
+        url: &str,
+        password: Option<&str>,
+    ) -> Option<PasswordRetry> {
+        let credential = match password {
+            Some(password) => ServerCredential::Password(password),
+            None => ServerCredential::None,
+        };
+        let err = backend
+            .open(url, credential, None)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{url} connected"));
+        password_retry(&err, password.is_some())
+    }
+
+    #[tokio::test]
+    async fn real_server_failures_reach_the_decision_intact() {
+        // Reads the engine variables directly rather than through
+        // `tests/common`'s per-binary databases: it creates nothing, and only
+        // connects — to the URL's own database with a wrong password, and with
+        // the right one to a database that does not exist. Skips, like every
+        // engine suite, when a variable is unset.
+        let with_db = |url: &str, db: &str| {
+            let mut parsed = url::Url::parse(url).unwrap();
+            parsed.set_path(&format!("/{db}"));
+            parsed.to_string()
+        };
+        let password_of = |url: &str| {
+            let parsed = url::Url::parse(url).unwrap();
+            let raw = parsed.password().unwrap_or_default().to_string();
+            percent_encoding::percent_decode_str(&raw)
+                .decode_utf8()
+                .unwrap()
+                .into_owned()
+        };
+        for (var, backend) in [
+            ("HUBRO_MSSQL_TEST_URL", ServerBackend::SQL_SERVER),
+            ("HUBRO_PG_TEST_URL", ServerBackend::POSTGRES),
+        ] {
+            let Ok(url) = std::env::var(var) else {
+                continue;
+            };
+            assert_eq!(
+                retry_after(backend, &url, Some("definitely-wrong")).await,
+                Some(PasswordRetry::ForgetStoredAndPrompt),
+                "{var}: a refused password must be forgotten and re-asked"
+            );
+            let missing = with_db(&url, "hubro_no_such_database");
+            assert_eq!(
+                retry_after(backend, &missing, Some(&password_of(&url))).await,
+                None,
+                "{var}: a missing database must keep the password and prompt for nothing"
+            );
+            // Nothing remembered: the connect tries without a password, and
+            // the server's refusal is what raises the prompt at all.
+            let mut bare = url::Url::parse(&url).unwrap();
+            bare.set_password(None).unwrap();
+            assert_eq!(
+                retry_after(backend, bare.as_str(), None).await,
+                Some(PasswordRetry::Prompt),
+                "{var}: a server that wants a password must still be asked for one"
+            );
+        }
     }
 }
