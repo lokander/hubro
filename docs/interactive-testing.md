@@ -21,6 +21,19 @@ Driving the app directly on the desktop half-works and isn't worth it: `spectacl
 
 Gotchas: **`xdotool type` silently drops keystrokes** into the webview — seven characters arrive as five, or as none at all. Send keysyms instead (`xdotool key --clearmodifiers a b c`), which is reliable and still fast enough to land inside a 250 ms debounce window. Screenshot the field and count the characters before submitting anything that matters. Native `<select>` dropdowns are driven by click → `key Down/Up` → `key Return` (options aren't clickable elements). Xephyr runs no window manager, so nothing delivers `WindowEvent::CloseRequested` — send a synthetic `WM_DELETE_WINDOW` ClientMessage (a ~30-line Xlib/`gcc -lX11` helper) to test the window-close guard.
 
+**File dialogs escape Xephyr unless Wayland is blocked.** rfd opens its dialogs through the XDG desktop portal, over the session D-Bus, and the user's portal draws on the real desktop, interrupting whoever is at the machine. Two fixes that look sufficient are not (FRE-284, KDE portal):
+- `dbus-run-session` gives the app a private bus, but that bus D-Bus-activates its *own* portal, which inherits `WAYLAND_DISPLAY` and still draws on the real screen.
+- Unsetting `WAYLAND_DISPLAY` doesn't help either, because with `XDG_SESSION_TYPE=wayland` Qt falls back to the default `wayland-0` socket.
+
+What kept the dialog inside Xephyr (checked: the portal's only display socket was X12) was making Wayland unreachable:
+
+```bash
+env WAYLAND_DISPLAY=hubro-no-such-socket QT_QPA_PLATFORM=xcb XDG_SESSION_TYPE=x11 \
+  DISPLAY=:2 GDK_BACKEND=x11 setsid dbus-run-session -- ./path/to/hubro &
+```
+
+The dialog maps *behind* the app window, because Xephyr has no window manager. Find it with `xdotool search --onlyvisible ''` (its title is the dialog's, e.g. "Export table") and `windowraise` it. `setsid` makes the recorded PID a process-group leader, so `kill -- -$PID` also takes down the private bus and the portal it started.
+
 **"Nothing happened" is not a measurement unless the app ran.** A negative case once reported exactly the expected zero because Xephyr had never come up. Assert the display (`xdpyinfo`) and the window (`xdotool search`) before believing a null result, and show the run reached the state under test — a screenshot of the *next* screen is what makes "it didn't fire" mean something.
 
 **Build a negative control.** Nothing in the suite covers rendering, so a passing interactive check does not show the script exercises the bug. Rebuild with only the fix reverted and re-run the identical script: if it still passes, the script is testing nothing. That turned a "verified" FRE-154 run — which would have passed either way — into a real before/after.
