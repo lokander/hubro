@@ -891,6 +891,72 @@ async fn sqlserver_script_creates_modules_that_must_lead_a_batch() {
     pool.close().await;
 }
 
+/// A procedure body's inner `;` used to split it into fragments, the first an
+/// incomplete `CREATE PROCEDURE`. Measured: SQL Server takes everything to the
+/// end of the batch as the body, so only GO ends one — and a `BEGIN … END`
+/// block outside a module keeps its statements together too.
+#[tokio::test]
+async fn sqlserver_script_creates_a_procedure_with_a_multi_statement_body() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP PROCEDURE IF EXISTS dbo.script_proc_fill",
+            "DROP TABLE IF EXISTS dbo.script_proc_probe",
+        ],
+    )
+    .await;
+
+    let sql = "CREATE TABLE dbo.script_proc_probe (id int NOT NULL);\n\
+               GO\n\
+               CREATE PROCEDURE dbo.script_proc_fill AS\n\
+               BEGIN\n\
+                 SET NOCOUNT ON;\n\
+                 INSERT INTO dbo.script_proc_probe VALUES (1);\n\
+                 INSERT INTO dbo.script_proc_probe VALUES (CASE WHEN 1 = 1 THEN 2 END);\n\
+               END\n\
+               GO\n\
+               EXEC dbo.script_proc_fill;\n\
+               IF NOT EXISTS (SELECT 1 FROM dbo.script_proc_probe WHERE id = 3)\n\
+               BEGIN\n\
+                 INSERT INTO dbo.script_proc_probe VALUES (3);\n\
+                 INSERT INTO dbo.script_proc_probe VALUES (4);\n\
+               END;\n\
+               SELECT id FROM dbo.script_proc_probe ORDER BY id";
+    let statements = split_statements(sql, pool.dialect());
+    assert_eq!(statements.len(), 5, "{statements:#?}");
+
+    let mut results = Vec::new();
+    run_script(&pool, pool.backend_capabilities(), &statements, |r| {
+        results.push(r)
+    })
+    .await
+    .expect("the script should run to completion");
+    match &results[4].outcome {
+        StatementOutcome::Rows(rows) => assert_eq!(
+            rows.rows,
+            vec![
+                vec![Value::Integer(1)],
+                vec![Value::Integer(2)],
+                vec![Value::Integer(3)],
+                vec![Value::Integer(4)]
+            ]
+        ),
+        other => panic!("expected rows from the SELECT, got {other:?}"),
+    }
+
+    run_all(
+        &pool,
+        &[
+            "DROP PROCEDURE dbo.script_proc_fill",
+            "DROP TABLE dbo.script_proc_probe",
+        ],
+    )
+    .await;
+    pool.close().await;
+}
+
 #[tokio::test]
 async fn sqlserver_query_capped_stops_and_bounds_cells() {
     let Some(url) = test_url().await else { return };

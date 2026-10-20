@@ -1,14 +1,15 @@
 //! Multi-statement SQL scripts: splitting, classification, and execution.
 //!
 //! [`split_statements`] is a lexer-level splitter — it understands quotes,
-//! comments, and dollar-quoting well enough to find statement boundaries,
-//! without parsing SQL. [`run_script`] executes the statements one by one,
-//! stopping at the first error. A multi-statement script runs **atomically**
-//! in one transaction ([`wrap_atomically`]) — a mid-script failure rolls the
-//! whole thing back — unless it manages transactions itself (`BEGIN`/`COMMIT`)
-//! or contains a statement that can't run inside a transaction (e.g. `VACUUM`,
-//! Postgres `CREATE INDEX CONCURRENTLY`), in which case it falls back to
-//! sequential autocommit and earlier statements' effects persist.
+//! comments, dollar-quoting, and routine and trigger bodies well enough to
+//! find statement boundaries, without parsing SQL. [`run_script`] executes
+//! the statements one by one, stopping at the first error. A multi-statement
+//! script runs **atomically** in one transaction ([`wrap_atomically`]) — a
+//! mid-script failure rolls the whole thing back — unless it manages
+//! transactions itself (`BEGIN`/`COMMIT`) or contains a statement that can't
+//! run inside a transaction (e.g. `VACUUM`, Postgres `CREATE INDEX
+//! CONCURRENTLY`), in which case it falls back to sequential autocommit and
+//! earlier statements' effects persist.
 
 use std::ops::Range;
 
@@ -163,9 +164,13 @@ fn region_at(sql: &str, i: usize, dialect: Dialect) -> Option<(usize, RegionKind
 /// count ignored (repeating a batch is a scripting-tool feature, not
 /// something a viewer should replay). `GO` inside strings, comments, or
 /// bracketed identifiers, or sharing a line with other code, never splits.
+///
+/// A `;` inside a routine or trigger body does not split either — see
+/// [`BodyTracker`] for what counts as a body on each dialect.
 pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<String> {
     let bytes = sql.as_bytes();
     let mut statements = Vec::new();
+    let mut body = BodyTracker::new(dialect);
     let mut start = 0usize;
     // True once the current statement has any non-comment, non-whitespace
     // content — comment-only statements are skipped.
@@ -180,6 +185,7 @@ pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<String> {
         match kind {
             RegionKind::String | RegionKind::Bracket | RegionKind::DollarQuote => {
                 significant = true;
+                body.feed(BodyToken::Other);
             }
             RegionKind::Comment => {}
             RegionKind::Code => {
@@ -198,22 +204,43 @@ pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<String> {
                             start = line_end;
                             line_start = line_end;
                             significant = false;
+                            // A batch ends every body and block, balanced or
+                            // not, so a miscount cannot leak past a GO.
+                            body = BodyTracker::new(dialect);
                             i = line_end;
                             continue;
                         }
                     }
+                    if let Some((word_end, bare)) = word_at(bytes, i, range.end) {
+                        significant = true;
+                        body.feed(if bare {
+                            BodyToken::Word(&sql[i..word_end])
+                        } else {
+                            BodyToken::Other
+                        });
+                        i = word_end;
+                        continue;
+                    }
                     match bytes[i] {
                         b';' => {
-                            if significant {
-                                statements.push(sql[start..i].trim().to_string());
+                            if body.feed(BodyToken::Semicolon) {
+                                if significant {
+                                    statements.push(sql[start..i].trim().to_string());
+                                }
+                                start = i + 1;
+                                significant = false;
+                                body = BodyTracker::new(dialect);
                             }
-                            start = i + 1;
-                            significant = false;
                         }
                         b'\n' => line_start = i + 1,
                         other => {
                             if !other.is_ascii_whitespace() {
                                 significant = true;
+                                body.feed(match other {
+                                    b'(' => BodyToken::Open,
+                                    b')' => BodyToken::Close,
+                                    _ => BodyToken::Other,
+                                });
                             }
                         }
                     }
@@ -226,6 +253,248 @@ pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<String> {
         statements.push(sql[start..].trim().to_string());
     }
     statements
+}
+
+/// Whether `byte` can continue an identifier: ASCII alphanumerics, `_`, the
+/// `$`/`@`/`#` that Postgres and T-SQL allow inside names, and any non-ASCII
+/// byte (so a word never ends inside a multibyte character).
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'@' | b'#') || byte >= 0x80
+}
+
+/// If a word starts at `bytes[at]` — a letter or `_` not continuing an
+/// identifier that began earlier — returns where it ends (never past `end`,
+/// the end of its code region) and whether it is *bare*.
+///
+/// A word straight after `.`, `@`, `#` or `$` is not bare: it names a column
+/// (`t.end`, legal on Postgres), a T-SQL variable or temp table (`@begin`,
+/// `#begin`), so it can never be the keyword it is spelled like.
+fn word_at(bytes: &[u8], at: usize, end: usize) -> Option<(usize, bool)> {
+    let starts = bytes[at].is_ascii_alphabetic() || bytes[at] == b'_';
+    let previous = at.checked_sub(1).map(|p| bytes[p]);
+    if !starts || previous.is_some_and(|b| is_word_byte(b) && !matches!(b, b'@' | b'#' | b'$')) {
+        return None;
+    }
+    let mut j = at + 1;
+    while j < end && is_word_byte(bytes[j]) {
+        j += 1;
+    }
+    let bare = !matches!(previous, Some(b'.' | b'@' | b'#' | b'$'));
+    Some((j, bare))
+}
+
+/// One token of a statement, as [`BodyTracker`] sees it. Comments are not
+/// tokens at all; a string, bracketed name or dollar quote is one `Other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyToken<'a> {
+    /// A bare word (see [`word_at`]), in its original case.
+    Word(&'a str),
+    Semicolon,
+    Open,
+    Close,
+    Other,
+}
+
+/// How a statement's `;` are read, decided by its leading words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyRule {
+    /// Not decided yet: too few leading words seen.
+    Undecided,
+    /// Every `;` ends the statement.
+    Plain,
+    /// SQLite `CREATE [TEMP|TEMPORARY] TRIGGER`: the statement ends only at
+    /// `; END ;`, which is `sqlite3_complete`'s own rule. A trigger body
+    /// holds nothing but DML statements, so an `END` straight after a `;`
+    /// can only close it — a CASE's `END` always follows an expression.
+    SqliteTrigger,
+    /// SQL Server `CREATE`/`ALTER` [`OR ALTER`] `PROC`/`PROCEDURE`/
+    /// `FUNCTION`/`TRIGGER`: the body runs to the end of the batch, so no
+    /// `;` ends it — only GO does. Measured: the server stores everything
+    /// up to the batch's end as the body, with or without `BEGIN … END`.
+    WholeBatch,
+    /// `;` ends the statement only outside `BEGIN … END` blocks (and the
+    /// CASEs inside them). Postgres `CREATE [OR REPLACE] FUNCTION`/
+    /// `PROCEDURE` (a `BEGIN ATOMIC` body), and every other SQL Server
+    /// statement (`IF … BEGIN …; END`, `BEGIN TRY …; END TRY`).
+    Blocks,
+}
+
+/// Decides, token by token, whether a `;` ends the statement it is in or
+/// sits inside a routine or trigger body. Fresh per statement (and per SQL
+/// Server batch).
+///
+/// Errs toward *not* splitting only where that is the server's own unit: on
+/// SQL Server a merged statement is just more of the batch SSMS would have
+/// sent whole, and GO resets the tracker, so a miscount never crosses a
+/// batch. On SQLite and Postgres the rules are the clients' own
+/// (`sqlite3_complete`, psql), narrowed on Postgres to `BEGIN ATOMIC` —
+/// `begin` is an unreserved word there and can name a parameter.
+#[derive(Debug)]
+struct BodyTracker {
+    dialect: Dialect,
+    rule: BodyRule,
+    /// The statement's first few bare words, lowercased, until the rule is
+    /// decided.
+    leading: Vec<String>,
+    /// Open `BEGIN … END` blocks and CASEs inside them ([`BodyRule::Blocks`]).
+    depth: usize,
+    /// Parentheses open; blocks are only counted at zero, as psql does.
+    parens: usize,
+    /// A keyword whose meaning depends on the word after it.
+    pending: Option<Pending>,
+    /// [`BodyRule::SqliteTrigger`]: the last two tokens were `;` (and
+    /// then `END`).
+    after_semicolon: bool,
+    after_semicolon_end: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pending {
+    /// A `BEGIN` that opens a block unless (SQL Server) a transaction or
+    /// Service Broker word follows, or only if (Postgres) `ATOMIC` does.
+    Begin,
+    /// An `END` that closes a block unless `CONVERSATION` follows (T-SQL's
+    /// `END CONVERSATION` statement; no such statement exists elsewhere).
+    End,
+}
+
+/// Words after `BEGIN` that make it a statement of its own on SQL Server
+/// rather than the start of a block: `BEGIN TRAN[SACTION]`, `BEGIN
+/// DISTRIBUTED TRANSACTION`, `BEGIN DIALOG`, `BEGIN CONVERSATION TIMER`.
+const TSQL_BEGIN_STATEMENTS: [&str; 5] = [
+    "tran",
+    "transaction",
+    "distributed",
+    "dialog",
+    "conversation",
+];
+
+/// The [`BodyRule`] a statement opening with `leading` (its lowercased bare
+/// words, in order) gets. While `more_may_follow` and `leading` is a prefix
+/// of a body-carrying shape, the answer is [`BodyRule::Undecided`].
+fn body_rule(dialect: Dialect, leading: &[&str], more_may_follow: bool) -> BodyRule {
+    let undecided_or = |rule| {
+        if more_may_follow {
+            BodyRule::Undecided
+        } else {
+            rule
+        }
+    };
+    match dialect {
+        Dialect::Sqlite => {
+            let rest = match leading {
+                ["explain", rest @ ..] => rest,
+                rest => rest,
+            };
+            match rest {
+                ["create", "trigger", ..] | ["create", "temp" | "temporary", "trigger", ..] => {
+                    BodyRule::SqliteTrigger
+                }
+                [] | ["create"] | ["create", "temp" | "temporary"] => undecided_or(BodyRule::Plain),
+                _ => BodyRule::Plain,
+            }
+        }
+        Dialect::Postgres => match leading {
+            ["create", "function" | "procedure", ..]
+            | ["create", "or", "replace", "function" | "procedure", ..] => BodyRule::Blocks,
+            [] | ["create"] | ["create", "or"] | ["create", "or", "replace"] => {
+                undecided_or(BodyRule::Plain)
+            }
+            _ => BodyRule::Plain,
+        },
+        Dialect::SqlServer => {
+            let module = |word: &str| matches!(word, "proc" | "procedure" | "function" | "trigger");
+            match leading {
+                ["create" | "alter", object, ..] if module(object) => BodyRule::WholeBatch,
+                ["create", "or", "alter", object, ..] if module(object) => BodyRule::WholeBatch,
+                [] | ["create" | "alter"] | ["create", "or"] | ["create", "or", "alter"] => {
+                    undecided_or(BodyRule::Blocks)
+                }
+                _ => BodyRule::Blocks,
+            }
+        }
+    }
+}
+
+impl BodyTracker {
+    fn new(dialect: Dialect) -> Self {
+        Self {
+            dialect,
+            rule: BodyRule::Undecided,
+            leading: Vec::new(),
+            depth: 0,
+            parens: 0,
+            pending: None,
+            after_semicolon: false,
+            after_semicolon_end: false,
+        }
+    }
+
+    /// Takes the statement's next token; returns whether it is a `;` that
+    /// ends the statement.
+    fn feed(&mut self, token: BodyToken) -> bool {
+        if self.rule == BodyRule::Undecided {
+            // The leading words end at the first token that is not a word.
+            let word = match token {
+                BodyToken::Word(word) => Some(word.to_ascii_lowercase()),
+                _ => None,
+            };
+            let more_may_follow = word.is_some();
+            self.leading.extend(word);
+            let leading: Vec<&str> = self.leading.iter().map(String::as_str).collect();
+            self.rule = body_rule(self.dialect, &leading, more_may_follow);
+        }
+        match self.rule {
+            BodyRule::Undecided | BodyRule::Plain => token == BodyToken::Semicolon,
+            BodyRule::WholeBatch => false,
+            BodyRule::SqliteTrigger => self.sqlite_trigger(token),
+            BodyRule::Blocks => self.blocks(token),
+        }
+    }
+
+    fn sqlite_trigger(&mut self, token: BodyToken) -> bool {
+        let ends = token == BodyToken::Semicolon && self.after_semicolon_end;
+        let is_end = matches!(token, BodyToken::Word(w) if w.eq_ignore_ascii_case("end"));
+        self.after_semicolon_end = self.after_semicolon && is_end;
+        self.after_semicolon = token == BodyToken::Semicolon;
+        ends
+    }
+
+    fn blocks(&mut self, token: BodyToken) -> bool {
+        let is =
+            |keyword: &str| matches!(token, BodyToken::Word(w) if w.eq_ignore_ascii_case(keyword));
+        if let Some(pending) = self.pending.take() {
+            let opens_or_closes = match (pending, self.dialect) {
+                (Pending::Begin, Dialect::SqlServer) => {
+                    !TSQL_BEGIN_STATEMENTS.iter().any(|w| is(w))
+                }
+                (Pending::Begin, _) => is("atomic"),
+                (Pending::End, _) => !is("conversation"),
+            };
+            if opens_or_closes {
+                match pending {
+                    Pending::Begin => self.depth += 1,
+                    Pending::End => self.depth = self.depth.saturating_sub(1),
+                }
+            }
+        }
+        match token {
+            BodyToken::Open => self.parens += 1,
+            BodyToken::Close => self.parens = self.parens.saturating_sub(1),
+            BodyToken::Semicolon => return self.depth == 0,
+            BodyToken::Word(_) | BodyToken::Other => {}
+        }
+        if self.parens == 0 {
+            if is("begin") {
+                self.pending = Some(Pending::Begin);
+            } else if is("case") && self.depth > 0 {
+                self.depth += 1;
+            } else if is("end") {
+                self.pending = Some(Pending::End);
+            }
+        }
+        false
+    }
 }
 
 /// If `bytes[at]` (a `g`/`G` with only whitespace before it on its line)
@@ -398,9 +667,10 @@ pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
         // nothing by itself, and the statements it brackets are each checked
         // on their own — so it needs nothing, rather than being refused with
         // a reason that doesn't describe it. This is only reached when no
-        // write token appears anywhere in the statement, so a T-SQL
-        // `BEGIN … DELETE … END` block is still charged for its DELETE.
-        if manages_own_transaction(&stripped) {
+        // write token appears anywhere in the statement, and a T-SQL
+        // `BEGIN … END` block is not transaction control at all, so a block
+        // running `EXEC some_proc` is charged like `EXEC some_proc` alone.
+        if is_bare_transaction_control(dialect, &stripped) {
             return StatementNeeds::default();
         }
         return StatementNeeds {
@@ -969,6 +1239,33 @@ fn manages_own_transaction(stripped: &str) -> bool {
     )
 }
 
+/// Whether an already-stripped statement is transaction control and nothing
+/// else, so it needs no capability of its own.
+///
+/// Stricter than [`manages_own_transaction`], deliberately: that one decides
+/// whether to *decline wrapping*, where a false yes only costs atomicity, so
+/// any leading `BEGIN` or `END` will do. Here a false yes waves a statement
+/// past the capability gate. On SQL Server `BEGIN` opens a statement block
+/// unless `TRAN`, `TRANSACTION` or `DISTRIBUTED` follows (measured: `BEGIN;
+/// SELECT 1; END` runs as a block, and `BEGIN;` alone is a syntax error), and
+/// a block runs whatever is inside it; `END` is never transaction control
+/// there at all — alone it is a syntax error, and `END CONVERSATION` closes a
+/// Service Broker conversation.
+fn is_bare_transaction_control(dialect: Dialect, stripped: &str) -> bool {
+    if !manages_own_transaction(stripped) {
+        return false;
+    }
+    if dialect != Dialect::SqlServer {
+        return true;
+    }
+    let words = leading_words(stripped, 2);
+    match (words[0].as_str(), words.get(1).map(String::as_str)) {
+        ("end", _) => false,
+        ("begin", Some(next)) => matches!(next, "tran" | "transaction" | "distributed"),
+        _ => true,
+    }
+}
+
 /// Whether an already-stripped statement can't run (or won't take effect)
 /// inside a transaction block, so the script must run sequentially instead
 /// of wrapped. `VACUUM`
@@ -1140,6 +1437,308 @@ mod tests {
         );
         // $1 is a parameter, not a delimiter.
         assert_eq!(split("SELECT $1; SELECT $2"), ["SELECT $1", "SELECT $2"]);
+    }
+
+    #[test]
+    fn sqlite_trigger_bodies_do_not_split() {
+        let sqlite = |sql| split_statements(sql, Dialect::Sqlite);
+        assert_eq!(
+            sqlite(
+                "CREATE TABLE a (x); \
+                 CREATE TRIGGER t AFTER INSERT ON a BEGIN UPDATE b SET n = n + 1; END; \
+                 INSERT INTO a VALUES (1)"
+            ),
+            [
+                "CREATE TABLE a (x)",
+                "CREATE TRIGGER t AFTER INSERT ON a BEGIN UPDATE b SET n = n + 1; END",
+                "INSERT INTO a VALUES (1)",
+            ]
+        );
+        // SQLite's own rule (`sqlite3_complete`): only `; END ;` closes a
+        // trigger, so a CASE's `END;` inside the body does not — and neither
+        // do several body statements, comments, or lower case.
+        assert_eq!(
+            sqlite(
+                "create temp trigger t after insert on a begin \
+                 update b set n = case when n > 5 then 0 else n + 1 end; \
+                 insert into b values (1); /* ; */ end /* x */ ; select 2"
+            ),
+            [
+                "create temp trigger t after insert on a begin \
+                 update b set n = case when n > 5 then 0 else n + 1 end; \
+                 insert into b values (1); /* ; */ end /* x */",
+                "select 2",
+            ]
+        );
+        // `sqlite3_complete` also reads a trigger behind EXPLAIN.
+        assert_eq!(
+            sqlite("EXPLAIN CREATE TRIGGER t AFTER INSERT ON a BEGIN SELECT 1; END; SELECT 2"),
+            [
+                "EXPLAIN CREATE TRIGGER t AFTER INSERT ON a BEGIN SELECT 1; END",
+                "SELECT 2"
+            ]
+        );
+        // A trailing trigger without its final `;` is kept whole.
+        assert_eq!(
+            sqlite("CREATE TRIGGER IF NOT EXISTS t AFTER INSERT ON a BEGIN SELECT 1; END"),
+            ["CREATE TRIGGER IF NOT EXISTS t AFTER INSERT ON a BEGIN SELECT 1; END"]
+        );
+    }
+
+    #[test]
+    fn bare_transaction_control_still_splits() {
+        // `BEGIN` here is a transaction, not a block — it must not swallow
+        // the statements after it.
+        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+            assert_eq!(
+                split_statements("BEGIN; INSERT INTO t VALUES (1); END; SELECT 2", dialect),
+                ["BEGIN", "INSERT INTO t VALUES (1)", "END", "SELECT 2"],
+                "{dialect:?}"
+            );
+        }
+        for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
+            assert_eq!(
+                split_statements(
+                    "BEGIN TRANSACTION; UPDATE t SET a = 1; COMMIT; SELECT 2",
+                    dialect
+                ),
+                [
+                    "BEGIN TRANSACTION",
+                    "UPDATE t SET a = 1",
+                    "COMMIT",
+                    "SELECT 2"
+                ],
+                "{dialect:?}"
+            );
+        }
+        assert_eq!(
+            split_mssql("BEGIN TRAN; DELETE FROM t; ROLLBACK TRAN"),
+            ["BEGIN TRAN", "DELETE FROM t", "ROLLBACK TRAN"]
+        );
+        // T-SQL's other BEGIN statements open no block either.
+        assert_eq!(
+            split_mssql(
+                "BEGIN DISTRIBUTED TRANSACTION; BEGIN DIALOG CONVERSATION @h \
+                 FROM SERVICE s TO SERVICE 't'; BEGIN CONVERSATION TIMER (@h) TIMEOUT = 5; \
+                 SELECT 2"
+            ),
+            [
+                "BEGIN DISTRIBUTED TRANSACTION",
+                "BEGIN DIALOG CONVERSATION @h FROM SERVICE s TO SERVICE 't'",
+                "BEGIN CONVERSATION TIMER (@h) TIMEOUT = 5",
+                "SELECT 2"
+            ]
+        );
+        // A CASE outside any block is closed by its own END and leaves
+        // nothing open.
+        for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
+            assert_eq!(
+                split_statements("SELECT CASE WHEN a THEN 1 END FROM t; SELECT 2", dialect),
+                ["SELECT CASE WHEN a THEN 1 END FROM t", "SELECT 2"],
+                "{dialect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlserver_module_bodies_run_to_the_end_of_their_batch() {
+        // Measured: SQL Server takes everything up to the end of the batch as
+        // the body of a procedure, function or trigger — with or without
+        // BEGIN … END — so only GO ends one.
+        assert_eq!(
+            split_mssql("CREATE PROCEDURE p AS BEGIN SELECT 1; SELECT 2; END\nGO\nEXEC p"),
+            [
+                "CREATE PROCEDURE p AS BEGIN SELECT 1; SELECT 2; END",
+                "EXEC p"
+            ]
+        );
+        assert_eq!(
+            split_mssql("CREATE OR ALTER PROC p AS SELECT 1; SELECT 2;\nGO\nEXEC p;"),
+            ["CREATE OR ALTER PROC p AS SELECT 1; SELECT 2;", "EXEC p"]
+        );
+        assert_eq!(
+            split_mssql("ALTER TRIGGER tr ON t AFTER INSERT AS BEGIN UPDATE u SET n = n + 1; END;"),
+            ["ALTER TRIGGER tr ON t AFTER INSERT AS BEGIN UPDATE u SET n = n + 1; END;"]
+        );
+        assert_eq!(
+            split_mssql(
+                "CREATE FUNCTION f() RETURNS int AS BEGIN DECLARE @x int = 1; RETURN @x; END"
+            ),
+            ["CREATE FUNCTION f() RETURNS int AS BEGIN DECLARE @x int = 1; RETURN @x; END"]
+        );
+        // Statements before the module in the same batch still split off.
+        assert_eq!(
+            split_mssql("DROP PROCEDURE IF EXISTS p; CREATE PROCEDURE p AS SELECT 1; SELECT 2"),
+            [
+                "DROP PROCEDURE IF EXISTS p",
+                "CREATE PROCEDURE p AS SELECT 1; SELECT 2"
+            ]
+        );
+    }
+
+    #[test]
+    fn sqlserver_blocks_do_not_split_inside() {
+        assert_eq!(
+            split_mssql(
+                "IF 1 = 1 BEGIN SELECT 1; SELECT 2; END ELSE BEGIN SELECT 3; END; SELECT 4"
+            ),
+            [
+                "IF 1 = 1 BEGIN SELECT 1; SELECT 2; END ELSE BEGIN SELECT 3; END",
+                "SELECT 4"
+            ]
+        );
+        assert_eq!(
+            split_mssql(
+                "BEGIN TRY SELECT 1/0; END TRY BEGIN CATCH SELECT \
+                 CASE WHEN 1 = 1 THEN 'x' END; END CATCH; SELECT 2"
+            ),
+            [
+                "BEGIN TRY SELECT 1/0; END TRY BEGIN CATCH SELECT \
+                 CASE WHEN 1 = 1 THEN 'x' END; END CATCH",
+                "SELECT 2"
+            ]
+        );
+        // A transaction opened inside a block is not a block of its own, and
+        // `END CONVERSATION` is a statement, not the close of one.
+        assert_eq!(
+            split_mssql(
+                "BEGIN BEGIN TRAN; SELECT 1; COMMIT; END; SELECT 2; \
+                 WHILE 1 = 0 BEGIN END CONVERSATION @h; SELECT 3; END; SELECT 4"
+            ),
+            [
+                "BEGIN BEGIN TRAN; SELECT 1; COMMIT; END",
+                "SELECT 2",
+                "WHILE 1 = 0 BEGIN END CONVERSATION @h; SELECT 3; END",
+                "SELECT 4"
+            ]
+        );
+        // Variables, bracketed names and strings named like keywords count
+        // for nothing.
+        assert_eq!(
+            split_mssql("SELECT @begin, [begin], 'begin', #begin; SELECT 2"),
+            ["SELECT @begin, [begin], 'begin', #begin", "SELECT 2"]
+        );
+        // An unclosed block cannot swallow the next batch: GO ends it.
+        assert_eq!(
+            split_mssql("BEGIN SELECT 1;\nGO\nSELECT 2; SELECT 3"),
+            ["BEGIN SELECT 1;", "SELECT 2", "SELECT 3"]
+        );
+    }
+
+    #[test]
+    fn postgres_sql_standard_bodies_do_not_split() {
+        // `BEGIN ATOMIC … END` (Postgres 14+) is not dollar-quoted. psql's
+        // rule: inside CREATE [OR REPLACE] FUNCTION/PROCEDURE, at paren depth
+        // zero, BEGIN and (inside a block) CASE open, END closes.
+        assert_eq!(
+            split(
+                "CREATE OR REPLACE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC \
+                 SELECT 1; SELECT CASE WHEN true THEN 2 END; SELECT (CASE WHEN true THEN 3 END); \
+                 END; SELECT f()"
+            ),
+            [
+                "CREATE OR REPLACE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC \
+                 SELECT 1; SELECT CASE WHEN true THEN 2 END; SELECT (CASE WHEN true THEN 3 END); \
+                 END",
+                "SELECT f()"
+            ]
+        );
+        assert_eq!(
+            split(
+                "CREATE PROCEDURE p() LANGUAGE sql BEGIN ATOMIC \
+                 INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); END; CALL p()"
+            ),
+            [
+                "CREATE PROCEDURE p() LANGUAGE sql BEGIN ATOMIC \
+                 INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); END",
+                "CALL p()"
+            ]
+        );
+        // `begin` is unreserved in Postgres: a parameter or a qualified column
+        // of that name opens nothing — only `BEGIN ATOMIC` does, which is
+        // stricter than psql (it counts any BEGIN at paren depth zero, and
+        // would merge these two).
+        assert_eq!(
+            split(
+                "CREATE FUNCTION f(begin int) RETURNS int LANGUAGE sql RETURN begin + 1; \
+                 SELECT 2"
+            ),
+            [
+                "CREATE FUNCTION f(begin int) RETURNS int LANGUAGE sql RETURN begin + 1",
+                "SELECT 2"
+            ]
+        );
+        assert_eq!(
+            split(
+                "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC \
+                 SELECT t.end FROM t; SELECT 1; END; SELECT 2"
+            ),
+            [
+                "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC \
+                 SELECT t.end FROM t; SELECT 1; END",
+                "SELECT 2"
+            ]
+        );
+        // Inside parentheses nothing is counted, as in psql: `end` is a legal
+        // column label there (measured), and must not close the body.
+        assert_eq!(
+            split(
+                "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC \
+                 SELECT (SELECT 1 AS end); END; SELECT 2"
+            ),
+            [
+                "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC \
+                 SELECT (SELECT 1 AS end); END",
+                "SELECT 2"
+            ]
+        );
+        // Outside a routine, BEGIN is a transaction (see
+        // `bare_transaction_control_still_splits`) and PL/pgSQL bodies are
+        // dollar-quoted, so nothing else is tracked.
+    }
+
+    #[test]
+    fn a_tsql_block_is_charged_for_what_it_runs() {
+        // A block that opens with BEGIN is not transaction control: whatever
+        // it runs is charged, and what nothing can attribute needs both
+        // capabilities, exactly as it would on its own. Nor is a T-SQL
+        // statement opening with END, which ends a broker conversation.
+        for sql in [
+            "BEGIN EXEC sp_rename 'a', 'b'; END",
+            "BEGIN EXEC sp_rename 'a', 'b' END",
+            "BEGIN TRY EXEC do_the_thing; END TRY BEGIN CATCH END CATCH",
+            "END CONVERSATION @h",
+        ] {
+            assert_eq!(
+                statement_needs(sql, Dialect::SqlServer),
+                StatementNeeds {
+                    mutate: true,
+                    ddl: true
+                },
+                "{sql:?}"
+            );
+            assert!(
+                script_refusal(
+                    Capabilities::FULL.read_only(),
+                    &split_mssql(sql),
+                    Dialect::SqlServer
+                )
+                .is_some(),
+                "{sql:?}"
+            );
+        }
+        // Real transaction control on SQL Server still needs nothing.
+        for sql in [
+            "BEGIN TRAN",
+            "BEGIN TRANSACTION t1",
+            "BEGIN DISTRIBUTED TRANSACTION",
+        ] {
+            assert_eq!(
+                statement_needs(sql, Dialect::SqlServer),
+                StatementNeeds::default(),
+                "{sql:?}"
+            );
+        }
     }
 
     #[test]
