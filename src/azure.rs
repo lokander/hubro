@@ -575,7 +575,7 @@ fn pkce_challenge(verifier: &str) -> String {
 /// and the CSRF `state`. Both are opaque tokens, so any URL-safe encoding works.
 fn random_token(bytes: usize) -> String {
     let mut raw = vec![0u8; bytes];
-    getrandom::getrandom(&mut raw).expect("OS randomness unavailable");
+    getrandom::fill(&mut raw).expect("OS randomness unavailable");
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
 }
 

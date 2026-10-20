@@ -34,10 +34,10 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time"] }
 russh = "0.62"
 # Entra ID / Azure AD auth for Postgres (FRE-43): OAuth token HTTP, PKCE, browser launch.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-sha2 = "0.10"
-base64 = "0.22"
+sha2 = "0.11"
+base64 = "0.23"
 webbrowser = "1"
-getrandom = "0.2"
+getrandom = "0.4"
 dioxus-icons = "0.1.0"
 
 # Credential store per OS: Secret Service / KWallet on Linux, Keychain on
