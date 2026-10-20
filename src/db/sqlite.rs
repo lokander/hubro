@@ -5,15 +5,18 @@
 //! foreign keys come from the pragma table-valued functions
 //! (`pragma_table_xinfo`, `pragma_index_list`, `pragma_index_info`,
 //! `pragma_foreign_key_list`) joined against it — no per-table `PRAGMA`
-//! round-trips.
+//! round-trips. The one exception is a database holding an object SQLite
+//! cannot resolve, where columns fall back to one query per object so that
+//! object costs only itself (see `table_columns`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row as _, TypeInfo as _, ValueRef as _};
 
+use super::caps::Restriction;
 use super::ddl::{create_index_sql, terminate, Ddl, DdlObject, IndexExtras};
 use super::error::DbError;
 use super::export::ExportFormat;
@@ -359,40 +362,51 @@ pub async fn export(
 
 /// Lists tables and views with columns, indexes, and foreign keys. Four
 /// batched queries total — see the module header for the pragma
-/// table-valued-function strategy.
+/// table-valued-function strategy — unless some object's columns cannot be
+/// read, when columns alone fall back to one query per object (see
+/// [`table_columns`]).
 pub async fn introspect(pool: &SqlitePool) -> Result<Vec<TableMeta>, DbError> {
-    let entries = sqlx::query(
-        "SELECT name, type FROM sqlite_master \
-         WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' \
-         ORDER BY name",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| DbError::Introspect(e.to_string()))?;
+    let sql = format!(
+        "SELECT m.name AS name, m.type AS type, m.rootpage AS rootpage \
+         FROM sqlite_master m \
+         WHERE {MASTER_FILTER} \
+         ORDER BY m.name"
+    );
+    let rows = sqlx::query(&sql)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| DbError::Introspect(e.to_string()))?;
+    let mut entries = Vec::with_capacity(rows.len());
+    for row in rows {
+        let kind: String = get(&row, "type")?;
+        let rootpage: Option<i64> = get(&row, "rootpage")?;
+        entries.push(MasterEntry {
+            name: get(&row, "name")?,
+            virtual_table: is_virtual_table(&kind, rootpage),
+            view: kind == "view",
+        });
+    }
 
-    let mut columns = table_columns(pool).await?;
+    let (mut columns, unreadable) = table_columns(pool, &entries).await?;
     let mut indexes = table_indexes(pool).await?;
     let mut foreign_keys = table_foreign_keys(pool).await?;
 
     let mut tables = Vec::with_capacity(entries.len());
     for entry in entries {
-        let name: String = get(&entry, "name")?;
-        let kind: String = get(&entry, "type")?;
-        let kind = if kind == "view" {
-            TableKind::View
-        } else {
-            TableKind::Table
-        };
+        let restriction = restriction_for(&entry, !unreadable.contains(&entry.name));
+        let MasterEntry { name, view, .. } = entry;
         tables.push(TableMeta {
             schema: None,
             columns: columns.remove(&name).unwrap_or_default(),
             indexes: indexes.remove(&name).unwrap_or_default(),
             foreign_keys: foreign_keys.remove(&name).unwrap_or_default(),
             name,
-            kind,
-            // No per-object narrowing: kind and row identity already carry
-            // everything this backend knows about writability.
-            restriction: None,
+            kind: if view {
+                TableKind::View
+            } else {
+                TableKind::Table
+            },
+            restriction,
             // SQLite has no extension-owned schemas and no declarative
             // partitioning; its extensions contribute functions and virtual
             // tables, which are the user's to use.
@@ -403,59 +417,193 @@ pub async fn introspect(pool: &SqlitePool) -> Result<Vec<TableMeta>, DbError> {
     Ok(tables)
 }
 
-/// The `sqlite_master` filter every batched pragma join below shares; must
-/// match the object list in [`introspect`].
-const MASTER_FILTER: &str = "m.type IN ('table', 'view') AND m.name NOT LIKE 'sqlite_%'";
+/// One object the schema tree lists, as `sqlite_master` describes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MasterEntry {
+    name: String,
+    view: bool,
+    /// A `CREATE VIRTUAL TABLE` object — see [`is_virtual_table`].
+    virtual_table: bool,
+}
+
+/// Whether a `sqlite_master` row is a virtual table.
+///
+/// Decided on the catalog's own fact rather than the stored statement's text:
+/// a virtual table is a `table` row with no b-tree behind it, so its
+/// `rootpage` is 0 (the file format documents "0 or NULL" for views,
+/// triggers and virtual tables). Every ordinary table — `WITHOUT ROWID`
+/// included — owns a root page.
+fn is_virtual_table(kind: &str, rootpage: Option<i64>) -> bool {
+    kind == "table" && rootpage.unwrap_or(0) == 0
+}
+
+/// Why a virtual table whose columns SQLite could not read is not opened.
+const UNREADABLE_VIRTUAL_TABLE: &str =
+    "SQLite can't open this virtual table here — usually because its module \
+     comes from an extension (SpatiaLite, sqlean, …) that hubro doesn't load.";
+
+/// Why any other object whose columns SQLite could not read is not opened.
+const UNREADABLE_OBJECT: &str = "SQLite can't read this object — its definition refers to \
+     a table, column or virtual-table module that isn't available.";
+
+/// The restriction introspection records for one object.
+///
+/// `None` for everything SQLite could read the columns of: kind and row
+/// identity already carry everything this backend knows about writability.
+/// An object it could *not* read — a virtual table whose module hubro's
+/// SQLite lacks, a view over one, a view over a table that has since been
+/// dropped — is still listed, so one such object costs the user that object
+/// rather than the whole schema tree, but as `NoRows`: opening it can only
+/// fail the same way, so the grid states why instead of running the query.
+/// The DDL view still works on it, since that reads only `sqlite_master`.
+fn restriction_for(entry: &MasterEntry, columns_readable: bool) -> Option<Restriction> {
+    if columns_readable {
+        None
+    } else if entry.virtual_table {
+        Some(Restriction::NoRows(UNREADABLE_VIRTUAL_TABLE))
+    } else {
+        Some(Restriction::NoRows(UNREADABLE_OBJECT))
+    }
+}
+
+/// The `sqlite_master` filter the object list in [`introspect`] and every
+/// batched pragma join below share.
+///
+/// The `sqlite_` prefix is matched literally — `_` escaped, since unescaped it
+/// matches any one character and hid user tables such as `sqlitest` and
+/// `sqlite-log`. `LIKE` stays case-insensitive on purpose: SQLite reserves the
+/// prefix in any case (`CREATE TABLE SQLITE_x` is refused as "reserved for
+/// internal use"), so this hides exactly what SQLite itself owns. Nothing
+/// tests that half, and nothing can short of forging `sqlite_master`: a
+/// case-sensitive match differs only on names SQLite refuses to create.
+const MASTER_FILTER: &str =
+    "m.type IN ('table', 'view') AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'";
+
+/// Whether a failed catalog read is about one object rather than the
+/// database: SQLite's generic `SQLITE_ERROR`, which is what it raises when a
+/// virtual table's module is missing (`no such module: …`) or a view refers to
+/// something that no longer exists (`no such table: …`).
+///
+/// Decided on the result code, never the message. `BUSY`, `LOCKED`, `IOERR`,
+/// `CORRUPT` and the rest say the database cannot be read at all, and
+/// recording that as "this object is unreadable" would turn a failure the user
+/// should see into a tree of dimmed objects. sqlx reports the *extended*
+/// code, whose low byte is the primary one.
+fn is_object_scoped(extended_code: Option<&str>) -> bool {
+    const SQLITE_ERROR: i64 = 1;
+    extended_code
+        .and_then(|code| code.parse::<i64>().ok())
+        .is_some_and(|code| code & 0xff == SQLITE_ERROR)
+}
+
+/// [`is_object_scoped`] for a driver error.
+fn object_scoped_error(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db) => is_object_scoped(db.code().as_deref()),
+        _ => false,
+    }
+}
 
 /// Columns of every table and view, keyed by object name (unique per SQLite
-/// schema).
-async fn table_columns(pool: &SqlitePool) -> Result<HashMap<String, Vec<ColumnMeta>>, DbError> {
-    // `table_xinfo` (not `table_info`) so generated (`AS (…)`) columns are
-    // reported: they appear in `SELECT *`, so the grid's bounded page fetch —
-    // which builds an explicit projection from this metadata — must
-    // know about them, and they must be read-only. `table_xinfo` adds a
-    // `hidden` column: 0 = ordinary, 2 = VIRTUAL generated, 3 = STORED
-    // generated, 1 = a hidden column (virtual-table machinery) that `SELECT *`
-    // does NOT return — skip those so the projection still matches `SELECT *`.
+/// schema), plus the names of the objects whose columns SQLite could not read.
+///
+/// `table_xinfo` (not `table_info`) so generated (`AS (…)`) columns are
+/// reported: they appear in `SELECT *`, so the grid's bounded page fetch —
+/// which builds an explicit projection from this metadata — must know about
+/// them, and they must be read-only.
+///
+/// One batched query normally. But `pragma_table_xinfo` has to *resolve* each
+/// object — connect a virtual table to its module, compile a view's `SELECT` —
+/// and one object that cannot be resolved fails the whole statement, which
+/// used to empty the schema tree for a database holding a single SpatiaLite
+/// table or a view over a dropped table. So on an object-scoped failure the
+/// columns are read again one object at a time, and the objects that fail
+/// alone are reported rather than failing the rest. The index and
+/// foreign-key pragmas need no such fallback: they read the schema without
+/// resolving anything (measured — both answer an empty list for such an
+/// object), which the tests over such a database hold them to.
+async fn table_columns(
+    pool: &SqlitePool,
+    entries: &[MasterEntry],
+) -> Result<(HashMap<String, Vec<ColumnMeta>>, HashSet<String>), DbError> {
     let sql = format!(
-        "SELECT m.name AS table_name, x.name AS name, x.type AS type, \
-                x.\"notnull\" AS \"notnull\", x.dflt_value AS dflt_value, \
-                x.pk AS pk, x.hidden AS hidden \
+        "SELECT m.name AS table_name, {XINFO_COLUMNS} \
          FROM sqlite_master m JOIN pragma_table_xinfo(m.name) x \
          WHERE {MASTER_FILTER} \
          ORDER BY m.name, x.cid"
     );
-    let rows = sqlx::query(&sql)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| DbError::Introspect(e.to_string()))?;
     let mut columns: HashMap<String, Vec<ColumnMeta>> = HashMap::new();
-    for row in rows {
-        let hidden: i64 = get(&row, "hidden")?;
-        if hidden == 1 {
-            continue;
+    let mut unreadable = HashSet::new();
+    match sqlx::query(&sql).fetch_all(pool).await {
+        Ok(rows) => {
+            for row in rows {
+                let table: String = get(&row, "table_name")?;
+                if let Some(column) = column_meta(&row)? {
+                    columns.entry(table).or_default().push(column);
+                }
+            }
         }
-        let table: String = get(&row, "table_name")?;
-        let pk: i64 = get(&row, "pk")?;
-        let notnull: i64 = get(&row, "notnull")?;
-        columns.entry(table).or_default().push(ColumnMeta {
-            name: get(&row, "name")?,
-            type_name: get(&row, "type")?,
-            nullable: notnull == 0,
-            primary_key_position: (pk > 0).then_some(pk as u32),
-            default: get::<Option<String>, _>(&row, "dflt_value")?,
-            // 2/3 are VIRTUAL/STORED generated columns: database-assigned and
-            // not writable through ordinary INSERT/UPDATE.
-            generated: if hidden == 2 || hidden == 3 {
-                Generated::Always
-            } else {
-                Generated::Never
-            },
-            // SQLite has no enum or array types.
-            type_detail: TypeDetail::Plain,
-        });
+        Err(err) if object_scoped_error(&err) => {
+            let sql =
+                format!("SELECT {XINFO_COLUMNS} FROM pragma_table_xinfo(?1) x ORDER BY x.cid");
+            for entry in entries {
+                match sqlx::query(&sql).bind(&entry.name).fetch_all(pool).await {
+                    Ok(rows) => {
+                        let mut list = Vec::with_capacity(rows.len());
+                        for row in rows {
+                            list.extend(column_meta(&row)?);
+                        }
+                        columns.insert(entry.name.clone(), list);
+                    }
+                    Err(err) if object_scoped_error(&err) => {
+                        unreadable.insert(entry.name.clone());
+                    }
+                    Err(err) => return Err(DbError::Introspect(err.to_string())),
+                }
+            }
+        }
+        Err(err) => return Err(DbError::Introspect(err.to_string())),
     }
-    Ok(columns)
+    Ok((columns, unreadable))
+}
+
+/// The `pragma_table_xinfo` columns [`column_meta`] decodes, from the pragma
+/// aliased as `x` — shared by the batched and the per-object read so the two
+/// cannot decode different shapes.
+const XINFO_COLUMNS: &str = "x.name AS name, x.type AS type, \
+     x.\"notnull\" AS \"notnull\", x.dflt_value AS dflt_value, \
+     x.pk AS pk, x.hidden AS hidden";
+
+/// One `pragma_table_xinfo` row as a column, or `None` for a column `SELECT *`
+/// does not return.
+///
+/// `table_xinfo` adds a `hidden` column: 0 = ordinary, 2 = VIRTUAL generated,
+/// 3 = STORED generated, 1 = a hidden column (virtual-table machinery) that
+/// `SELECT *` does NOT return — skipped so the projection still matches
+/// `SELECT *`.
+fn column_meta(row: &SqliteRow) -> Result<Option<ColumnMeta>, DbError> {
+    let hidden: i64 = get(row, "hidden")?;
+    if hidden == 1 {
+        return Ok(None);
+    }
+    let pk: i64 = get(row, "pk")?;
+    let notnull: i64 = get(row, "notnull")?;
+    Ok(Some(ColumnMeta {
+        name: get(row, "name")?,
+        type_name: get(row, "type")?,
+        nullable: notnull == 0,
+        primary_key_position: (pk > 0).then_some(pk as u32),
+        default: get::<Option<String>, _>(row, "dflt_value")?,
+        // 2/3 are VIRTUAL/STORED generated columns: database-assigned and
+        // not writable through ordinary INSERT/UPDATE.
+        generated: if hidden == 2 || hidden == 3 {
+            Generated::Always
+        } else {
+            Generated::Never
+        },
+        // SQLite has no enum or array types.
+        type_detail: TypeDetail::Plain,
+    }))
 }
 
 /// Indexes of every table, keyed by table name. Two queries: the per-table
@@ -654,13 +802,17 @@ pub async fn fetch_ddl(
 ) -> Result<Ddl, DbError> {
     match object {
         DdlObject::Index(name) => {
-            let stored = object_sql(pool, name, &["index"]).await?;
-            match stored {
-                Some(sql) => Ok(Ddl::native(terminate(&sql))),
+            match object_sql(pool, name, &["index"]).await? {
+                Some(Some(sql)) => Ok(Ddl::native(terminate(&sql))),
+                // No such index in the database, whatever the (possibly
+                // stale) metadata says: dropped since the tree was read. Only
+                // the catalog row can tell this from the implicit index below,
+                // which also has no stored text.
+                None => Err(DbError::Introspect(format!("no index named {name}"))),
                 // An implicit constraint index. Rebuilding it as a standalone
                 // CREATE INDEX would be a different object from what is
                 // there, so the caveat says where the real definition lives.
-                None => {
+                Some(None) => {
                     let Some(index) = table.indexes.iter().find(|i| &i.name == name) else {
                         return Err(DbError::Introspect(format!("no index named {name}")));
                     };
@@ -677,7 +829,7 @@ pub async fn fetch_ddl(
             }
         }
         DdlObject::Object => {
-            let Some(sql) = object_sql(pool, &table.name, &["table", "view"]).await? else {
+            let Some(Some(sql)) = object_sql(pool, &table.name, &["table", "view"]).await? else {
                 return Err(DbError::Introspect(format!(
                     "no stored definition for {}",
                     table.name
@@ -697,14 +849,19 @@ pub async fn fetch_ddl(
     }
 }
 
-/// The stored `CREATE` text of one `sqlite_master` object, or `None` when the
-/// row exists with a NULL `sql` (an implicit index). Missing rows are `Ok(None)`
-/// too; callers distinguish by looking the object up in the metadata.
+/// The stored `CREATE` text of one `sqlite_master` object of one of `kinds`.
+///
+/// Two layers of `Option` because the two absences mean different things:
+/// `None` is no such object (never created, or dropped since the metadata was
+/// read — a row of another kind counts, since names share one namespace), and
+/// `Some(None)` is an object whose row has a NULL `sql`, which for an index
+/// means SQLite created it itself for a constraint. Flattening them once
+/// made a dropped index show up as a reconstructed constraint index.
 async fn object_sql(
     pool: &SqlitePool,
     name: &str,
     kinds: &[&str],
-) -> Result<Option<String>, DbError> {
+) -> Result<Option<Option<String>>, DbError> {
     // `type` is matched in Rust rather than through a bound IN-list: sqlx has
     // no array binding on SQLite, and the kind set is a fixed literal here.
     let row = sqlx::query("SELECT type, sql FROM sqlite_master WHERE name = ?1")
@@ -719,7 +876,7 @@ async fn object_sql(
     if !kinds.contains(&kind.as_str()) {
         return Ok(None);
     }
-    get::<Option<String>, _>(&row, "sql")
+    get::<Option<String>, _>(&row, "sql").map(Some)
 }
 
 /// The stored `CREATE INDEX` statements of every explicitly created index on
@@ -775,6 +932,58 @@ mod tests {
         assert_eq!(quote_ident("plain"), "\"plain\"");
         assert_eq!(quote_ident("we\"ird"), "\"we\"\"ird\"");
         assert_eq!(quote_ident("with space"), "\"with space\"");
+    }
+
+    #[test]
+    fn only_a_generic_error_is_charged_to_one_object() {
+        // SQLITE_ERROR: what `no such module` and `no such table` raise, and
+        // its extended forms (MISSING_COLLSEQ = 257).
+        assert!(is_object_scoped(Some("1")));
+        assert!(is_object_scoped(Some("257")));
+        // Everything that says the database itself can't be read stays a
+        // failure of the whole read: BUSY, BUSY_SNAPSHOT, LOCKED, NOMEM,
+        // IOERR_READ, CORRUPT, NOTADB.
+        for code in ["5", "517", "6", "7", "266", "11", "26"] {
+            assert!(!is_object_scoped(Some(code)), "{code}");
+        }
+        // No code, or one that isn't a number, is not evidence of anything.
+        assert!(!is_object_scoped(None));
+        assert!(!is_object_scoped(Some("HY000")));
+    }
+
+    #[test]
+    fn a_virtual_table_is_a_table_without_a_root_page() {
+        assert!(is_virtual_table("table", Some(0)));
+        assert!(is_virtual_table("table", None));
+        assert!(!is_virtual_table("table", Some(2)));
+        // Views have no root page either, and are not virtual tables.
+        assert!(!is_virtual_table("view", Some(0)));
+    }
+
+    #[test]
+    fn only_an_object_whose_columns_could_not_be_read_is_restricted() {
+        let entry = |view, virtual_table| MasterEntry {
+            name: "x".into(),
+            view,
+            virtual_table,
+        };
+        // Readable: nothing to declare, whatever the object is — a virtual
+        // table with its module present included.
+        for (view, virtual_table) in [(false, false), (true, false), (false, true)] {
+            assert_eq!(restriction_for(&entry(view, virtual_table), true), None);
+        }
+        // Unreadable: not openable, with the reason matching what it is.
+        assert_eq!(
+            restriction_for(&entry(false, true), false),
+            Some(Restriction::NoRows(UNREADABLE_VIRTUAL_TABLE))
+        );
+        for view in [true, false] {
+            assert_eq!(
+                restriction_for(&entry(view, false), false),
+                Some(Restriction::NoRows(UNREADABLE_OBJECT))
+            );
+        }
+        assert!(Restriction::NoRows(UNREADABLE_OBJECT).hides_rows());
     }
 
     #[test]

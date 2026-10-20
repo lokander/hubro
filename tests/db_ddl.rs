@@ -166,6 +166,38 @@ async fn sqlite_constraint_backed_index_says_where_its_definition_lives() {
 }
 
 #[tokio::test]
+async fn sqlite_a_dropped_index_is_missing_rather_than_a_constraint_index() {
+    // Drop an index in the SQL pane, don't refresh, ask for its DDL: the
+    // metadata still lists it, but the catalog has no row for it. It used to
+    // come back as a reconstructed CREATE INDEX captioned as SQLite's own
+    // constraint index, because a missing row and a NULL `sql` read the same.
+    let fixture =
+        FixtureDb::with_sql("CREATE TABLE t (a TEXT, b INTEGER); CREATE INDEX idx_t_a ON t(a);")
+            .await;
+    let pool = fixture.open().await;
+    let tables = pool.introspect().await.unwrap();
+    let stale = table(&tables, None, "t");
+    assert_eq!(stale.indexes[0].name, "idx_t_a");
+    pool.execute("DROP INDEX idx_t_a").await.unwrap();
+
+    let err = pool
+        .fetch_ddl(stale, &DdlObject::Index("idx_t_a".into()))
+        .await
+        .expect_err("a dropped index has no DDL");
+    assert!(err.to_string().contains("no index named idx_t_a"), "{err}");
+
+    // A name now held by an object of another kind is no index either.
+    pool.execute("CREATE TABLE idx_t_a (z INTEGER)")
+        .await
+        .unwrap();
+    let err = pool
+        .fetch_ddl(stale, &DdlObject::Index("idx_t_a".into()))
+        .await
+        .expect_err("a table is not an index");
+    assert!(err.to_string().contains("no index named idx_t_a"), "{err}");
+}
+
+#[tokio::test]
 async fn sqlite_statements_ending_in_a_line_comment_stay_runnable() {
     // `sqlite_master` stores the statement exactly as written, comment and
     // all. Appending `;` to a trailing `--` line comments the terminator out,

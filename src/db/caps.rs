@@ -110,6 +110,11 @@ pub enum Restriction {
     /// editing, *and* stops being opened. Before it existed, a sink resolved
     /// to a view — correctly unwritable, but views are browsable, so opening
     /// one ran a query the engine answered with `table or source not found`.
+    ///
+    /// SQLite also declares it for an object it can list but not read — a
+    /// virtual table whose module hubro's SQLite lacks, or a view over a table
+    /// that has since been dropped. Such an object may well have rows, but
+    /// none hubro can show, and opening it could only fail the same way.
     NoRows(&'static str),
 }
 
