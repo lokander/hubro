@@ -62,7 +62,7 @@ Docs-only changes (CLAUDE.md, README, etc.) may be committed directly to `main`;
 
 Milestones are **scoped deliverables that complete**, not categories. Three rules:
 
-- **Never add an issue to a finished milestone.** Linear computes progress from the issues, so it would drop a 100% milestone below 100% permanently — rewriting the record of what shipped when. Linear has no way to archive or un-complete a milestone, so this is not undoable.
+- **Never add an issue to a finished milestone.** Finished milestones get deleted with their issues (below), so the added issue would be deleted with them. Linear also computes progress from the issues, so it would drop a 100% milestone below 100% until then, and has no way to un-complete a milestone.
 - **Don't create catch-all milestones.** A milestone with no completion condition ("Misc polish", "Follow-ups") sits at partial progress forever. Loose work gets **no milestone** plus a `Feature`/`Bug`/`Improvement` label and lives in the project backlog. `Nice to have (future)` is the one deliberate exception — designed-but-deferred work, not a general backlog.
 - **Finished milestones and their issues get deleted** to stay under Linear's issue limit, which has blocked issue creation before. So nothing may depend on an issue surviving: the reasoning lives in the code, its comments, commit subjects and PR descriptions.
 

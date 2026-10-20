@@ -86,8 +86,8 @@ Notes:
   release — the work is inside SQLite's C core, not the Rust glue. Rust-heavy
   paths (`schema_load` building metadata) are noticeably faster in release.
 - `page_nav_deep` at ~a third of a second for a single 100-row page confirms the
-  O(offset) cost of OFFSET paging: this is the headline motivation for virtual
-  scrolling.
+  O(offset) cost of OFFSET paging. A keyset (seek) pager would remove it;
+  virtual scrolling deliberately leaves paging alone (see *Paging model*).
 
 ## Virtual scrolling
 

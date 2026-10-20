@@ -4,8 +4,9 @@
 //! The repository is public and its Linear project is not, so an issue ID (the
 //! team key, a hyphen, a number) is a dead link to every outside reader — and
 //! finished issues get deleted to stay under Linear's issue limit, so it
-//! eventually dangles for the owner too. The habit had spread to over a thousand references before the
-//! rule existed, which is why this is a test rather than a sentence.
+//! eventually dangles for the owner too. The habit had spread to over a
+//! thousand references before the rule existed, which is why this is a test
+//! rather than a sentence.
 //!
 //! Scans what git tracks (`git ls-files`), so an untracked scratch file in a
 //! checkout cannot fail it, and matches the ID loosely — any case, with `-`,
@@ -65,6 +66,7 @@ fn no_tracked_file_names_a_linear_issue() {
         .expect("git must be available to list tracked files");
     assert!(listed.status.success(), "git ls-files failed");
     let mut offenders = Vec::new();
+    let mut scanned = 0;
     for path in listed.stdout.split(|&b| b == 0).filter(|p| !p.is_empty()) {
         let path = String::from_utf8_lossy(path).into_owned();
         let full = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(&path);
@@ -72,12 +74,16 @@ fn no_tracked_file_names_a_linear_issue() {
         let Ok(text) = std::fs::read_to_string(&full) else {
             continue;
         };
+        scanned += 1;
         for (number, line) in text.lines().enumerate() {
             if names_an_issue(line) {
                 offenders.push(format!("{path}:{}: {}", number + 1, line.trim()));
             }
         }
     }
+    // Guards against passing vacuously, e.g. run from a tree git cannot see:
+    // the repository has well over a hundred text files.
+    assert!(scanned > 100, "only {scanned} tracked text files were read");
     assert!(
         offenders.is_empty(),
         "tracked files name Linear issues; state the reason instead \
