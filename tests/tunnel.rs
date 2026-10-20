@@ -331,8 +331,8 @@ async fn unknown_host_key_is_refused_then_trusted_and_connects() {
 async fn a_changed_host_key_is_refused_as_a_possible_mitm() {
     let Some(env) = ssh_env() else { return };
     // Discover the server's real key so we can confirm it offered ed25519,
-    // then pin a *different* ed25519 key — the condition that makes
-    // known_hosts report a change rather than an unknown host.
+    // then pin a *different* ed25519 key. Same type, so negotiation still
+    // succeeds and the server presents its real key, which reads as changed.
     let (kh, _kh_dir) = trusted_known_hosts(&env).await;
 
     // A second, different ed25519 key. If the server offered ed25519, pinning
