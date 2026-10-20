@@ -754,7 +754,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_host_certificate_is_refused_even_when_its_key_is_trusted() {
+    async fn a_host_certificate_is_refused_whatever_known_hosts_says_of_its_key() {
         use russh::client::Handler as _;
         use russh::keys::ssh_key::certificate::{Builder, CertType};
         use russh::keys::ssh_key::private::Ed25519Keypair;
@@ -762,8 +762,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("known_hosts");
         learn_known_hosts_path("db.internal", 22, &pubkey(KEY_A), &path).unwrap();
-        let verifier = || HostKeyVerifier {
-            host: "db.internal".into(),
+        let verifier = |host: &str| HostKeyVerifier {
+            host: host.into(),
             port: 22,
             files: vec![path.clone()],
             verdict: Arc::default(),
@@ -772,20 +772,36 @@ mod tests {
 
         // Control: the recorded key, offered bare, is trusted.
         let bare = PublicKeyOrCertificate::from(pubkey(KEY_A));
-        assert!(verifier().check_server_key(&bare).await.unwrap());
+        assert!(verifier("db.internal")
+            .check_server_key(&bare)
+            .await
+            .unwrap());
 
-        // The same key wrapped in a CA-signed host certificate is not, and
-        // leaves no verdict behind to be read as a host-key problem.
+        // A CA-signed host certificate is refused whatever known_hosts says
+        // about the key inside it, and leaves no verdict behind: an Unknown one
+        // would become a trust prompt for a key nobody vouched for.
         let ca = PrivateKey::from(Ed25519Keypair::from_seed(&[7; 32]));
-        let mut builder =
-            Builder::new([0; 16], pubkey(KEY_A).key_data().clone(), 0, u64::MAX).unwrap();
-        builder.cert_type(CertType::Host).unwrap();
-        builder.valid_principal("db.internal").unwrap();
-        let certificate = PublicKeyOrCertificate::from(builder.sign(&ca).unwrap());
-        let mut refusing = verifier();
-        assert!(!refusing.check_server_key(&certificate).await.unwrap());
-        assert_eq!(*refusing.verdict.lock().unwrap(), None);
-        assert!(refusing.offered_key.lock().unwrap().is_none());
+        for (host, key, inner) in [
+            ("db.internal", KEY_A, "trusted"),
+            ("db.internal", KEY_B, "changed"),
+            ("new.internal", KEY_A, "unknown"),
+        ] {
+            let mut builder =
+                Builder::new([0; 16], pubkey(key).key_data().clone(), 0, u64::MAX).unwrap();
+            builder.cert_type(CertType::Host).unwrap();
+            builder.valid_principal(host).unwrap();
+            let certificate = PublicKeyOrCertificate::from(builder.sign(&ca).unwrap());
+            let mut refusing = verifier(host);
+            assert!(
+                !refusing.check_server_key(&certificate).await.unwrap(),
+                "accepted a certificate wrapping a {inner} key"
+            );
+            assert_eq!(*refusing.verdict.lock().unwrap(), None, "{inner} key");
+            assert!(
+                refusing.offered_key.lock().unwrap().is_none(),
+                "{inner} key"
+            );
+        }
     }
 
     #[test]
