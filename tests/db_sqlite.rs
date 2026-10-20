@@ -101,6 +101,141 @@ async fn introspection_lists_all_tables_and_views_sorted_by_name() {
     pool.close().await;
 }
 
+/// A database holding objects SQLite cannot resolve on hubro's connection:
+/// a virtual table whose module hubro's SQLite lacks, a view over it, and a
+/// view over a table dropped after the view was created — beside ordinary
+/// objects that must come through intact, and a virtual table whose module
+/// *is* built in.
+///
+/// The missing-module table is written straight into `sqlite_master`, since
+/// no connection can `CREATE VIRTUAL TABLE` with a module it lacks. The row is
+/// the one SQLite itself writes: the same shape was produced with the
+/// `sqlite3` CLI's `zipfile` module (absent from the bundled SQLite sqlx
+/// links), and opening that file failed introspection with the same
+/// `(code: 1) no such module: zipfile` this one fails with as `nosuchmod`.
+const UNRESOLVABLE_SCHEMA: &str = "
+    CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+    CREATE INDEX idx_artists_name ON artists(name);
+    CREATE TABLE albums (id INTEGER PRIMARY KEY, artist_id INTEGER REFERENCES artists(id));
+    CREATE VIRTUAL TABLE docs USING fts5(body);
+    CREATE TABLE gone (x INTEGER);
+    CREATE VIEW over_gone AS SELECT x FROM gone;
+    DROP TABLE gone;
+    PRAGMA writable_schema = ON;
+    INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql)
+        VALUES ('table', 'shapes', 'shapes', 0, 'CREATE VIRTUAL TABLE shapes USING nosuchmod(geom)');
+    INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql)
+        VALUES ('view', 'over_shapes', 'over_shapes', 0, 'CREATE VIEW over_shapes AS SELECT geom FROM shapes');
+    PRAGMA writable_schema = OFF;
+";
+
+#[tokio::test]
+async fn an_object_sqlite_cannot_resolve_costs_only_itself() {
+    let fixture = FixtureDb::with_sql(UNRESOLVABLE_SCHEMA).await;
+    let pool = fixture.open().await;
+
+    // The whole tree used to fail with the first unresolvable object's error.
+    let tables = pool
+        .introspect()
+        .await
+        .expect("one unresolvable object must not fail introspection");
+
+    // Everything resolvable comes through whole — columns, indexes and
+    // foreign keys, i.e. every batched catalog read survived.
+    let artists = table(&tables, "artists");
+    assert_eq!(artists.columns.len(), 2);
+    assert_eq!(artists.indexes[0].name, "idx_artists_name");
+    assert_eq!(artists.restriction, None);
+    let albums = table(&tables, "albums");
+    assert_eq!(albums.foreign_keys[0].referenced_table, "artists");
+    assert_eq!(albums.restriction, None);
+    // A virtual table whose module *is* built in is an ordinary readable
+    // object: being virtual is not what makes an object unreadable.
+    let docs = table(&tables, "docs");
+    let doc_columns: Vec<&str> = docs.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(doc_columns, ["body"]);
+    assert_eq!(docs.restriction, None);
+
+    // The unresolvable ones are still listed, with no columns, and declared
+    // unreadable so the grid explains instead of running a query that can
+    // only fail the same way.
+    for name in ["shapes", "over_shapes", "over_gone"] {
+        let meta = table(&tables, name);
+        assert!(meta.columns.is_empty(), "{name}: {:?}", meta.columns);
+        assert!(
+            matches!(meta.restriction, Some(Restriction::NoRows(_))),
+            "{name}: {:?}",
+            meta.restriction
+        );
+        assert!(hubro::db::unreadable_reason(meta).is_some(), "{name}");
+    }
+    assert_eq!(table(&tables, "shapes").kind, TableKind::Table);
+    assert_eq!(table(&tables, "over_gone").kind, TableKind::View);
+    // The reason names what kind of thing went wrong.
+    assert!(
+        unreadable(&tables, "shapes").contains("virtual table"),
+        "{}",
+        unreadable(&tables, "shapes")
+    );
+    assert!(
+        !unreadable(&tables, "over_gone").contains("virtual table here"),
+        "{}",
+        unreadable(&tables, "over_gone")
+    );
+
+    // Its stored definition is still one click away, since that reads only
+    // `sqlite_master`.
+    let ddl = pool
+        .fetch_ddl(table(&tables, "shapes"), &hubro::db::DdlObject::Object)
+        .await
+        .unwrap();
+    assert_eq!(
+        ddl.sql,
+        "CREATE VIRTUAL TABLE shapes USING nosuchmod(geom);"
+    );
+
+    pool.close().await;
+}
+
+/// The message an object declares as its reason for having no rows to show.
+fn unreadable(tables: &[TableMeta], name: &str) -> &'static str {
+    hubro::db::unreadable_reason(table(tables, name))
+        .unwrap_or_else(|| panic!("{name} is not declared unreadable"))
+}
+
+#[tokio::test]
+async fn tables_whose_names_merely_resemble_sqlite_internals_are_listed() {
+    // `_` in a LIKE pattern is any one character and LIKE ignores ASCII
+    // case, so an unescaped `sqlite_%` hid all three of these user tables.
+    let fixture = FixtureDb::with_sql(
+        "CREATE TABLE sqlitest (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT);
+         CREATE TABLE \"SQLiteXData\" (x INTEGER);
+         CREATE INDEX idx_xdata ON \"SQLiteXData\"(x);
+         CREATE TABLE \"sqlite-log\" (id INTEGER REFERENCES sqlitest(id));
+         INSERT INTO sqlitest (note) VALUES ('a');
+         ANALYZE;",
+    )
+    .await;
+    let pool = fixture.open().await;
+    let tables = pool.introspect().await.unwrap();
+
+    let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+    // SQLite's own bookkeeping (`sqlite_sequence` from AUTOINCREMENT,
+    // `sqlite_stat1` from ANALYZE) stays hidden.
+    assert_eq!(names, ["SQLiteXData", "sqlite-log", "sqlitest"]);
+    // And every batched catalog read sees them too, not just the object list.
+    assert_eq!(table(&tables, "sqlitest").columns.len(), 2);
+    let index = &table(&tables, "SQLiteXData").indexes[0];
+    assert_eq!(index.name, "idx_xdata");
+    assert_eq!(index.columns, ["x"]);
+    assert_eq!(
+        table(&tables, "sqlite-log").foreign_keys[0].referenced_table,
+        "sqlitest"
+    );
+
+    pool.close().await;
+}
+
 #[tokio::test]
 async fn capabilities_are_full_on_tables_and_reduced_on_views() {
     let fixture = FixtureDb::full().await;
