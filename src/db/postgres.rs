@@ -189,7 +189,7 @@ pub async fn open_postgres(url: &str) -> Result<PgConn, DbError> {
         .max_connections(4)
         .connect(url)
         .await
-        .map_err(|e| DbError::Connect(friendly_connect_error(&e)))?;
+        .map_err(|e| connect_error(&e))?;
     // `SELECT version()` in place of the `SELECT 1` this used to run: it is
     // the same liveness check — one round trip on a connection the pool has
     // already opened — and it answers who the server is at the same time, so
@@ -197,15 +197,52 @@ pub async fn open_postgres(url: &str) -> Result<PgConn, DbError> {
     let version: String = sqlx::query_scalar("SELECT version()")
         .fetch_one(&pool)
         .await
-        .map_err(|e| DbError::Connect(friendly_connect_error(&e)))?;
+        .map_err(|e| connect_error(&e))?;
     Ok(PgConn {
         pool,
         flavor: detect_flavor(&version),
     })
 }
 
+/// SQLSTATE `invalid_password`. PostgreSQL's `auth_failed` (auth.c) raises it
+/// for a failed `password`, `md5` or `scram-sha-256` login only; every other
+/// refusal there is `28000`, which a `pg_hba.conf` reject was measured to be.
+/// Under password auth it also covers an unknown role, since the server will
+/// not say which roles exist. Measured: a wrong password, an unknown role and
+/// a missing password are all `28P01`, and a wrong password naming a database
+/// that does not exist is `28P01` rather than `3D000` — authentication is
+/// checked first.
+const INVALID_PASSWORD: &str = "28P01";
+
+/// Turns a failed connect into the error the connect flow acts on. See
+/// [`connect_error_from`].
+fn connect_error(err: &sqlx::Error) -> DbError {
+    let sqlstate = err.as_database_error().and_then(|db| db.code());
+    connect_error_from(sqlstate.as_deref(), friendly_connect_error(err))
+}
+
+/// The classification itself, over plain data so a test can execute it.
+///
+/// Decided on the SQLSTATE and nothing else, because the connect flow deletes
+/// the stored password on [`DbError::CredentialsRejected`]: server messages
+/// follow `lc_messages`, so a text match is a guess about the server's
+/// language as well as about what failed. An unknown database (`3D000`) or a
+/// missing `CONNECT` privilege (`42501`) is a [`DbError::Connect`] — the
+/// password worked, and asking for another cannot help.
+fn connect_error_from(sqlstate: Option<&str>, message: String) -> DbError {
+    if sqlstate == Some(INVALID_PASSWORD) {
+        DbError::CredentialsRejected(message)
+    } else {
+        DbError::Connect(message)
+    }
+}
+
 /// Categorizes common failure modes so the connections screen reads well:
 /// auth, network/DNS, TLS, wrong-server.
+///
+/// Words only. Whether the password is to blame — the question that costs a
+/// stored secret — is [`connect_error_from`]'s, on the SQLSTATE; nothing may
+/// decide it from this text.
 fn friendly_connect_error(err: &sqlx::Error) -> String {
     let msg = err.to_string();
     let lower = msg.to_lowercase();
@@ -2201,8 +2238,9 @@ mod tests {
         assert!(friendly_connect_error(&net).starts_with("network error"));
         let tls = sqlx::Error::Protocol("TLS handshake failed".into());
         assert!(friendly_connect_error(&tls).starts_with("TLS error"));
-        // A typo'd username is not a password problem — it must not trigger
-        // the password prompt (which keys on "authentication failed").
+        // A typo'd username is not a password problem, and must not read like
+        // one. (Whether it raises the password prompt is decided on the
+        // SQLSTATE, by `connect_error_from`, not on these words.)
         let role = sqlx::Error::Protocol("role \"nope\" does not exist".into());
         let friendly = friendly_connect_error(&role);
         assert!(friendly.starts_with("unknown role"));
@@ -2228,6 +2266,46 @@ mod tests {
         let friendly = friendly_connect_error(&v1);
         assert!(friendly.contains("X.509 v1"), "{friendly}");
         assert!(friendly.contains("sslmode=disable"), "{friendly}");
+    }
+
+    #[test]
+    fn only_invalid_password_rejects_the_credentials() {
+        // The connect flow deletes the stored password on CredentialsRejected,
+        // so the variant is a promise that the *password* was refused. The
+        // SQLSTATEs below were measured against PostgreSQL 17, except where
+        // a row says otherwise.
+        let rejected = |code| connect_error_from(code, "m".into()).credentials_rejected();
+        assert!(
+            rejected(Some(INVALID_PASSWORD)),
+            "a wrong password must raise the prompt"
+        );
+        for (code, what) in [
+            (Some("3D000"), "a database that does not exist"),
+            (Some("42501"), "a database the role may not CONNECT to"),
+            (
+                Some("28000"),
+                "a pg_hba.conf reject (and, unmeasured, LDAP/PAM/ident)",
+            ),
+            (None, "a failure with no SQLSTATE at all"),
+        ] {
+            assert!(
+                !rejected(code),
+                "{what} ({code:?}) would delete a working password"
+            );
+        }
+        // The text never decides: a password-failed message with no SQLSTATE
+        // behind it is reported, and keeps the password…
+        let text_only =
+            sqlx::Error::Protocol("password authentication failed for user \"x\"".into());
+        assert_eq!(
+            connect_error(&text_only),
+            DbError::Connect(friendly_connect_error(&text_only))
+        );
+        // …and the message survives the classification unchanged.
+        assert_eq!(
+            connect_error_from(Some(INVALID_PASSWORD), "the words".into()),
+            DbError::CredentialsRejected("the words".into())
+        );
     }
 
     #[test]

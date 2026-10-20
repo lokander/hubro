@@ -114,13 +114,100 @@ async fn sqlserver_bad_password_is_an_authentication_error() {
         .await
         .err()
         .expect("wrong password must fail");
+    // CredentialsRejected is what raises the password prompt and, for a
+    // remembered password, deletes it — built from error 18456.
     match err {
-        DbError::Connect(msg) => assert!(
+        DbError::CredentialsRejected(msg) => assert!(
             msg.contains("authentication failed"),
             "unexpected message: {msg}"
         ),
-        other => panic!("expected Connect error, got {other:?}"),
+        other => panic!("expected CredentialsRejected, got {other:?}"),
     }
+}
+
+/// `url` logging in as `user` with `password` instead of its own login.
+fn as_login(url: &str, user: &str, password: &str) -> String {
+    let mut parsed = url::Url::parse(url).unwrap();
+    parsed.set_username(user).unwrap();
+    parsed.set_password(Some(password)).unwrap();
+    parsed.to_string()
+}
+
+/// Opens `url`, which must fail, and returns how.
+async fn connect_failure(url: &str) -> DbError {
+    DbPool::open_mssql(url)
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("{url} connected"))
+}
+
+#[tokio::test]
+async fn sqlserver_only_a_refused_password_is_a_credential_rejection() {
+    // A rejection deletes the stored password, so each failure here that
+    // still has a correct password must stay a plain Connect. SQL Server
+    // answers all of the database cases with error 4060, whose message ends
+    // "The login failed." — the text that once classified them as a wrong
+    // password.
+    let Some(url) = test_url().await else { return };
+    let admin = DbPool::open_mssql(&url).await.unwrap();
+    // Server-level logins, so named per process: two binaries against one
+    // server would otherwise drop each other's.
+    let pid = std::process::id();
+    let outsider = format!("hubro_outsider_{pid}");
+    let disabled = format!("hubro_disabled_{pid}");
+    const PASSWORD: &str = "Outs1der!Passw0rd";
+    for login in [&outsider, &disabled] {
+        admin
+            .query(&format!(
+                "IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+                 CREATE LOGIN [{login}] WITH PASSWORD = '{PASSWORD}', CHECK_POLICY = OFF"
+            ))
+            .await
+            .unwrap();
+    }
+    admin
+        .query(&format!("ALTER LOGIN [{disabled}] DISABLE"))
+        .await
+        .unwrap();
+
+    let missing = common::with_database(&url, "hubro_no_such_database");
+    // The login exists and its password is right, but it has no user in this
+    // binary's database (and `guest` is off in a user database).
+    let forbidden = as_login(&url, &outsider, PASSWORD);
+    let disabled_login = as_login(&common::with_database(&url, "master"), &disabled, PASSWORD);
+    // The last flag: whether the words may say "authentication failed". A
+    // disabled account's refusal is one, truthfully, and carries its reason;
+    // a database that cannot be opened is not, whatever 4060's text says.
+    for (what, target, words_may_blame_the_login) in [
+        ("a database that does not exist", missing.clone(), false),
+        ("a database this login may not open", forbidden, false),
+        (
+            "a disabled login with its correct password",
+            disabled_login,
+            true,
+        ),
+    ] {
+        let err = connect_failure(&target).await;
+        assert!(
+            matches!(err, DbError::Connect(_)) && !err.credentials_rejected(),
+            "{what} must keep the password, got {err:?}"
+        );
+        assert!(
+            words_may_blame_the_login || !err.message().contains("authentication failed"),
+            "{what} is described as a password problem: {err}"
+        );
+    }
+
+    // Authentication is checked before the database: a wrong password naming
+    // a missing database is still the password's fault, and must still prompt.
+    let err =
+        connect_failure(&mssql_url_with_password(&missing, "definitely-wrong").unwrap()).await;
+    assert!(err.credentials_rejected(), "got {err:?}");
+
+    for login in [&outsider, &disabled] {
+        admin.query(&format!("DROP LOGIN [{login}]")).await.unwrap();
+    }
+    admin.close().await;
 }
 
 #[tokio::test]

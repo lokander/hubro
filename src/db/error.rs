@@ -29,6 +29,27 @@ pub enum DbError {
     /// [`DbPool`](super::DbPool) retry once, every other path reports it like
     /// any other failure.
     Transient(String),
+    /// The server refused the *credentials* — the password, or the user it
+    /// was offered for — and said so with a code: SQL Server error 18456,
+    /// PostgreSQL SQLSTATE `28P01`. Only ever built from that code, never
+    /// from message text, for the same reason as [`DbError::Transient`].
+    ///
+    /// This is the one connect failure that may cost a stored secret: the
+    /// connect flow reads it as "the remembered password has gone stale",
+    /// deletes that password from the keyring and asks for a new one. So
+    /// everything else the server can refuse at login stays a
+    /// [`DbError::Connect`], including failures whose text mentions a failed
+    /// login. SQL Server's error 4060 ("Cannot open database … requested by
+    /// the login. The login failed.") is the case that made this a variant:
+    /// it is sent for a database that does not exist, is offline or
+    /// restoring, or that this login may not open — measured, all four — and
+    /// only *after* the password was accepted. A wrong password together with
+    /// any of those is 18456. Deleting the password there destroys a working
+    /// credential and then asks for one that cannot help.
+    ///
+    /// Displays exactly as [`DbError::Connect`] does: what the user reads is
+    /// not the decision, and the message carries the classifier's own words.
+    CredentialsRejected(String),
 }
 
 impl DbError {
@@ -49,7 +70,8 @@ impl DbError {
             | DbError::Introspect(m)
             | DbError::RowCountMismatch(m)
             | DbError::Unsupported(m)
-            | DbError::Transient(m) => m,
+            | DbError::Transient(m)
+            | DbError::CredentialsRejected(m) => m,
         }
     }
 
@@ -57,12 +79,21 @@ impl DbError {
     pub fn is_transient(&self) -> bool {
         matches!(self, DbError::Transient(_))
     }
+
+    /// Whether the server refused the credentials themselves (see
+    /// [`DbError::CredentialsRejected`]) — the only failure on which a
+    /// stored password may be treated as stale.
+    pub fn credentials_rejected(&self) -> bool {
+        matches!(self, DbError::CredentialsRejected(_))
+    }
 }
 
 impl fmt::Display for DbError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DbError::Connect(m) => write!(f, "connection failed: {m}"),
+            DbError::Connect(m) | DbError::CredentialsRejected(m) => {
+                write!(f, "connection failed: {m}")
+            }
             DbError::Query(m) => write!(f, "query failed: {m}"),
             DbError::Introspect(m) => write!(f, "schema introspection failed: {m}"),
             DbError::RowCountMismatch(m) => write!(f, "write aborted: {m}"),
