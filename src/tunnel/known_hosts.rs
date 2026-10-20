@@ -5,8 +5,9 @@
 //! the host or on any byte that was not UTF-8, ignored `@revoked`, split only
 //! on spaces, and matched host patterns literally. Each of those turned a host
 //! the user had recorded into Unknown, which is a trust prompt. This follows
-//! OpenSSH's `hostfile.c` instead, and every rule below was checked against the
-//! real OpenSSH 10.5 client with `StrictHostKeyChecking=yes`:
+//! OpenSSH's `hostfile.c` instead. Each rule below was checked against the real
+//! OpenSSH 10.5 client with `StrictHostKeyChecking=yes`, and the measured
+//! layouts are pinned by `verdicts_match_what_openssh_decides`:
 //!
 //! - An unparsable line is skipped by itself and records nothing, even when it
 //!   names the host. A host recorded *only* by such lines is Unknown.
@@ -14,12 +15,22 @@
 //!   are refused even when the same key is also listed plainly.
 //! - `@cert-authority` lines vouch only for certificates, which hubro refuses,
 //!   so they record nothing. Lines with an unknown marker are skipped.
-//! - Fields are separated by any run of spaces or tabs.
+//! - The type field must agree with the key; for RSA, `rsa-sha2-256` and
+//!   `rsa-sha2-512` are accepted beside `ssh-rsa`.
+//! - Fields are separated by any run of ASCII whitespace. OpenSSH splits on
+//!   spaces and tabs only, so a stray `\r` (CRLF files) or form feed is read
+//!   more leniently here; neither can make a line say more than it was
+//!   written to.
 //! - A file that cannot be read contributes nothing; OpenSSH likewise reads an
 //!   unreadable known_hosts as recording no keys.
 //! - Host patterns are comma-separated globs (`*`, `?`), compared without
 //!   regard to case; a matching `!` pattern excludes the host even when another
-//!   pattern matches. A hashed entry (`|1|salt|hash`) is HMAC-SHA1 of the host.
+//!   pattern matches. A hashed entry (`|1|salt|hash`) is HMAC-SHA1 of the host,
+//!   or of `[host]:port` off port 22.
+//!
+//! Not replicated: OpenSSH's limits on line and pattern length, and keys
+//! ssh-key cannot decode (DSA), whose lines are skipped like any other
+//! undecodable line.
 
 use std::path::PathBuf;
 
@@ -74,7 +85,12 @@ pub(super) fn parse(contents: &[u8], host: &str, port: u16) -> Recorded {
         if !hosts_match(hosts, &target) {
             continue;
         }
-        // The type field must agree with the key it names, as in OpenSSH.
+        // The type field must agree with the key it names, as in OpenSSH,
+        // which also accepts an RSA key's signature names there.
+        let key_type = match key_type {
+            "rsa-sha2-256" | "rsa-sha2-512" => "ssh-rsa",
+            other => other,
+        };
         let Ok(key) = PublicKey::from_openssh(&format!("{key_type} {key}")) else {
             continue;
         };
