@@ -17,7 +17,7 @@ use russh::keys::agent::client::{AgentClient, AgentStream};
 use russh::keys::known_hosts::{known_host_keys_path, learn_known_hosts_path};
 use russh::keys::{
     check_known_hosts_path, load_secret_key, Algorithm, HashAlg, PrivateKey, PrivateKeyWithHashAlg,
-    PublicKey,
+    PublicKey, PublicKeyOrCertificate,
 };
 use russh::Disconnect;
 use serde::{Deserialize, Serialize};
@@ -242,11 +242,20 @@ impl client::Handler for HostKeyVerifier {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &PublicKey,
+        offered: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        let status = verify_host_key(&self.host, self.port, server_public_key, &self.files);
+        // A host certificate is refused, not checked by the key inside it:
+        // trusting one means trusting the CA that signed it, and known_hosts
+        // here records keys, never authorities. The connect then fails with no
+        // verdict, as a generic error. russh only negotiates certificates when
+        // `preferred.host_key_certificates` names algorithms, and `open` leaves
+        // it empty, so this is the fail-closed answer rather than a live path.
+        let PublicKeyOrCertificate::PublicKey { key, .. } = offered else {
+            return Ok(false);
+        };
+        let status = verify_host_key(&self.host, self.port, key, &self.files);
         if let Ok(mut offered) = self.offered_key.lock() {
-            *offered = Some(server_public_key.clone());
+            *offered = Some(key.clone());
         }
         if let Ok(mut verdict) = self.verdict.lock() {
             *verdict = Some(status);
@@ -742,6 +751,41 @@ mod tests {
             verify_host_key("db.internal", 2222, &pubkey(KEY_A), &[path]),
             HostKeyStatus::Trusted
         );
+    }
+
+    #[tokio::test]
+    async fn a_host_certificate_is_refused_even_when_its_key_is_trusted() {
+        use russh::client::Handler as _;
+        use russh::keys::ssh_key::certificate::{Builder, CertType};
+        use russh::keys::ssh_key::private::Ed25519Keypair;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        learn_known_hosts_path("db.internal", 22, &pubkey(KEY_A), &path).unwrap();
+        let verifier = || HostKeyVerifier {
+            host: "db.internal".into(),
+            port: 22,
+            files: vec![path.clone()],
+            verdict: Arc::default(),
+            offered_key: Arc::default(),
+        };
+
+        // Control: the recorded key, offered bare, is trusted.
+        let bare = PublicKeyOrCertificate::from(pubkey(KEY_A));
+        assert!(verifier().check_server_key(&bare).await.unwrap());
+
+        // The same key wrapped in a CA-signed host certificate is not, and
+        // leaves no verdict behind to be read as a host-key problem.
+        let ca = PrivateKey::from(Ed25519Keypair::from_seed(&[7; 32]));
+        let mut builder =
+            Builder::new([0; 16], pubkey(KEY_A).key_data().clone(), 0, u64::MAX).unwrap();
+        builder.cert_type(CertType::Host).unwrap();
+        builder.valid_principal("db.internal").unwrap();
+        let certificate = PublicKeyOrCertificate::from(builder.sign(&ca).unwrap());
+        let mut refusing = verifier();
+        assert!(!refusing.check_server_key(&certificate).await.unwrap());
+        assert_eq!(*refusing.verdict.lock().unwrap(), None);
+        assert!(refusing.offered_key.lock().unwrap().is_none());
     }
 
     #[test]
