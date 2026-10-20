@@ -461,7 +461,7 @@ enum ConnectForm {
 ///   from the fields to this container instead.
 ///
 /// Note that the same Escape still reaches `GLOBAL_KEYS_JS`:
-/// `dioxus-desktop` 0.7.9 serializes only `preventDefault` back to the
+/// `dioxus-desktop` 0.7.9 (unchanged in 0.7.10) serializes only `preventDefault` back to the
 /// interpreter, so `stop_propagation` on a synthetic event does not stop the
 /// real one. Harmless here — the only global Escape action is
 /// `close_cheatsheet`, which no-ops unless the cheatsheet is open — and the

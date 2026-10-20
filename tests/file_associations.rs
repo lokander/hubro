@@ -410,7 +410,7 @@ fn the_info_plist_declares_exactly_the_keys_dx_would_have_written() {
     // asserted outright, in the order the file declares it.
     //
     // Taken from `create_macos_info_plist` in dioxus-cli/src/bundler/macos.rs
-    // (dx 0.7.9, byte-identical in 0.7.10) — the generator behind `dx bundle
+    // (dx 0.7.10, byte-identical in 0.7.9) — the generator behind `dx bundle
     // --package-types macos`. dioxus-cli's other plist generators (widget
     // extensions, frameworks, iOS) emit different keys, including
     // CFBundleSupportedPlatforms; none of them runs for this bundle.

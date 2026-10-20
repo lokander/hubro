@@ -26,8 +26,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   # Match the dx CLI version to the `dioxus` version Cargo.lock resolves to
-  # (Cargo.toml requests ^0.7.1; the lockfile pins 0.7.9).
-  DX_VERSION: "0.7.9"
+  # (Cargo.toml requests ^0.7.1; the lockfile pins 0.7.10).
+  DX_VERSION: "0.7.10"
 
 jobs:
   # The tag names the release and every download link, but nothing downstream
