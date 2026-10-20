@@ -328,6 +328,25 @@ async fn unknown_host_key_is_refused_then_trusted_and_connects() {
 }
 
 #[tokio::test]
+async fn a_revoked_host_key_is_refused_even_when_also_trusted() {
+    let Some(env) = ssh_env() else { return };
+    // The server's real key, trusted the normal way, then also marked
+    // `@revoked`: OpenSSH refuses that, and so must the tunnel (FRE-289).
+    let (kh, _kh_dir) = trusted_known_hosts(&env).await;
+    let trusted = std::fs::read_to_string(&kh[0]).unwrap();
+    let line = trusted.lines().find(|l| !l.trim().is_empty()).unwrap();
+    let key = line.split_once(' ').unwrap().1;
+    std::fs::write(&kh[0], format!("{trusted}@revoked * {key}\n")).unwrap();
+    let err = Tunnel::open(env.config(), None, env.db_host.clone(), env.db_port, &kh)
+        .await
+        .expect_err("a revoked key must not connect");
+    assert!(
+        matches!(err, TunnelError::HostKeyRevoked(_)),
+        "expected HostKeyRevoked, got {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_changed_host_key_is_refused_as_a_possible_mitm() {
     let Some(env) = ssh_env() else { return };
     // Discover the server's real key so we can confirm it offered ed25519,
