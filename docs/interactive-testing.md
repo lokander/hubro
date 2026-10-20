@@ -25,14 +25,17 @@ Gotchas: **`xdotool type` silently drops keystrokes** into the webview — seven
 - `dbus-run-session` gives the app a private bus, but that bus D-Bus-activates its *own* portal, which inherits `WAYLAND_DISPLAY` and still draws on the real screen.
 - Unsetting `WAYLAND_DISPLAY` doesn't help either, because with `XDG_SESSION_TYPE=wayland` Qt falls back to the default `wayland-0` socket.
 
-What kept the dialog inside Xephyr (checked: the portal's only display socket was X12) was making Wayland unreachable:
+What kept the dialog inside Xephyr was making Wayland unreachable. The private portal's only display socket was then the nested X server's. Keep the config isolation from the top of this page; `HUBRO_DISABLE_KEYRING=1` matters even more here, because the real Secret Service is not on the private bus:
 
 ```bash
 env WAYLAND_DISPLAY=hubro-no-such-socket QT_QPA_PLATFORM=xcb XDG_SESSION_TYPE=x11 \
-  DISPLAY=:2 GDK_BACKEND=x11 setsid dbus-run-session -- ./path/to/hubro &
+  DISPLAY=:2 GDK_BACKEND=x11 \
+  XDG_CONFIG_HOME="$SCRATCH/config" XDG_DATA_HOME="$SCRATCH/data" HUBRO_DISABLE_KEYRING=1 \
+  setsid dbus-run-session -- ./path/to/hubro &
+APP_PID=$!
 ```
 
-The dialog maps *behind* the app window, because Xephyr has no window manager. Find it with `xdotool search --onlyvisible ''` (its title is the dialog's, e.g. "Export table") and `windowraise` it. `setsid` makes the recorded PID a process-group leader, so `kill -- -$PID` also takes down the private bus and the portal it started.
+The dialog maps *behind* the app window, because Xephyr has no window manager. Find it with `xdotool search --onlyvisible ''` (its title is the dialog's, e.g. "Export table") and `windowraise` it. Run from a script, so there is no job control: `setsid` then makes `$APP_PID` a process-group leader, and `kill -- -$APP_PID` also takes down the private bus and the portal it started. An interactive shell puts the job in its own group first, so `setsid` forks and `$!` no longer names the group.
 
 **"Nothing happened" is not a measurement unless the app ran.** A negative case once reported exactly the expected zero because Xephyr had never come up. Assert the display (`xdpyinfo`) and the window (`xdotool search`) before believing a null result, and show the run reached the state under test — a screenshot of the *next* screen is what makes "it didn't fire" mean something.
 
