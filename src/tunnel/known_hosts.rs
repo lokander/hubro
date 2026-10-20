@@ -31,8 +31,7 @@
 //! Not replicated: OpenSSH's limits on line and pattern length. And OpenSSH 10
 //! dropped DSA, so it skips `ssh-dss` lines, while ssh-key still decodes them:
 //! a host recorded only under DSA reads Changed here, not Unknown. That fails
-//! closed, and negotiation finds no algorithm in common with such a host
-//! anyway.
+//! closed.
 
 use std::path::PathBuf;
 
