@@ -153,8 +153,8 @@ pub fn default_known_hosts_read() -> Vec<PathBuf> {
 
 /// Classifies `key` for `host:port` against every key `files` record for that
 /// host, by [`host_key_verdict`]. Unreadable or unparsable files contribute no
-/// opinion: russh fails a whole file on one undecodable line for the host,
-/// which FRE-289 is to fix.
+/// opinion. russh fails a whole file on one undecodable line for the host, or
+/// on any byte that is not UTF-8 anywhere in it; FRE-289 is to fix that.
 fn verify_host_key(host: &str, port: u16, key: &PublicKey, files: &[PathBuf]) -> HostKeyStatus {
     let recorded: Vec<PublicKey> = files
         .iter()
@@ -170,11 +170,11 @@ fn verify_host_key(host: &str, port: u16, key: &PublicKey, files: &[PathBuf]) ->
 /// nothing is recorded. This is OpenSSH's core rule (`hostfile.c`), so a key of
 /// a different *type* counts as Changed; its `@revoked` markers and wildcard
 /// patterns are not replicated (FRE-289). The type case matters because russh
-/// does not check the key a server sends
-/// against the negotiated algorithm, so a server can agree to the recorded type
-/// and present another. Reading that as Unknown turned a man-in-the-middle into
-/// a trust prompt for a host the user already trusts (FRE-288, reproduced
-/// against a server that negotiated ssh-ed25519 and sent an ECDSA key).
+/// does not check the key a server sends against the negotiated algorithm, so a
+/// server can agree to the recorded type and present another. Reading that as
+/// Unknown turned a man-in-the-middle into a trust prompt for a host the user
+/// already trusts (FRE-288, reproduced against a server that negotiated
+/// ssh-ed25519 and sent an ECDSA key).
 fn host_key_verdict(offered: &PublicKey, recorded: &[PublicKey]) -> HostKeyStatus {
     // Key material only: the comment is not part of the key's identity.
     if recorded.iter().any(|r| r.key_data() == offered.key_data()) {
