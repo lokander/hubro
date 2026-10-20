@@ -15,6 +15,8 @@
 //! - `@cert-authority` lines vouch only for certificates, which hubro refuses,
 //!   so they record nothing. Lines with an unknown marker are skipped.
 //! - Fields are separated by any run of spaces or tabs.
+//! - A file that cannot be read contributes nothing; OpenSSH likewise reads an
+//!   unreadable known_hosts as recording no keys.
 //! - Host patterns are comma-separated globs (`*`, `?`), compared without
 //!   regard to case; a matching `!` pattern excludes the host even when another
 //!   pattern matches. A hashed entry (`|1|salt|hash`) is HMAC-SHA1 of the host.
@@ -139,14 +141,35 @@ fn pattern_list_match(list: &str, target: &str) -> bool {
     matched
 }
 
-/// `*` matches any run of bytes and `?` exactly one.
+/// `*` matches any run of bytes and `?` exactly one. Iterative, backtracking
+/// only to the most recent `*`: O(pattern × text) with no recursion, so a
+/// hostile line in a synced known_hosts cannot hang or overflow the stack.
 fn glob(pattern: &[u8], text: &[u8]) -> bool {
-    match pattern.split_first() {
-        None => text.is_empty(),
-        Some((b'*', rest)) => (0..=text.len()).any(|skip| glob(rest, &text[skip..])),
-        Some((b'?', rest)) => !text.is_empty() && glob(rest, &text[1..]),
-        Some((c, rest)) => text.first() == Some(c) && glob(rest, &text[1..]),
+    let (mut p, mut t) = (0, 0);
+    // The last `*` seen, and where in `text` it currently starts matching.
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        match pattern.get(p) {
+            Some(b'*') => {
+                star = Some((p, t));
+                p += 1;
+            }
+            Some(&c) if c == b'?' || c == text[t] => {
+                p += 1;
+                t += 1;
+            }
+            _ => match star {
+                // Let the last `*` swallow one more byte and retry after it.
+                Some((star_p, star_t)) => {
+                    star = Some((star_p, star_t + 1));
+                    p = star_p + 1;
+                    t = star_t + 1;
+                }
+                None => return false,
+            },
+        }
     }
+    pattern[p..].iter().all(|&c| c == b'*')
 }
 
 #[cfg(test)]
@@ -173,6 +196,16 @@ mod tests {
                 "{pattern} vs {text}"
             );
         }
+    }
+
+    #[test]
+    fn a_hostile_pattern_neither_hangs_nor_overflows() {
+        // Exponential for a backtracking matcher, and one stack frame per `*`
+        // for a recursive one.
+        let many = format!("{}b", "*a".repeat(2_000));
+        assert!(!glob(many.as_bytes(), "a".repeat(4_000).as_bytes()));
+        let stars = "*".repeat(100_000);
+        assert!(glob(stars.as_bytes(), b"db.example.com"));
     }
 
     #[test]
