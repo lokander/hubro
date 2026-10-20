@@ -16,8 +16,8 @@ use russh::client;
 use russh::keys::agent::client::{AgentClient, AgentStream};
 use russh::keys::known_hosts::{known_host_keys_path, learn_known_hosts_path};
 use russh::keys::{
-    check_known_hosts_path, load_secret_key, Algorithm, HashAlg, PrivateKey, PrivateKeyWithHashAlg,
-    PublicKey, PublicKeyOrCertificate,
+    load_secret_key, Algorithm, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey,
+    PublicKeyOrCertificate,
 };
 use russh::Disconnect;
 use serde::{Deserialize, Serialize};
@@ -149,53 +149,98 @@ pub fn default_known_hosts_read() -> Vec<PathBuf> {
     files
 }
 
-/// Classifies `key` for `host:port` against `files`. A file whose matching
-/// entry comes before any conflicting one reports Trusted, and that wins over a
-/// mismatch in another file. Otherwise, if any file records the host with a
-/// different key of the same type it is Changed (russh short-circuits a file to
-/// `KeyChanged` on the first conflicting line, so a stale line *before* a good
-/// one in the same file also reads as Changed — fail-closed); if no file
-/// mentions the host it is Unknown. Unreadable or unparsable files contribute
-/// no opinion.
+/// Classifies `key` for `host:port` against every key `files` record for that
+/// host, by [`host_key_verdict`]. Unreadable or unparsable files contribute no
+/// opinion.
 fn verify_host_key(host: &str, port: u16, key: &PublicKey, files: &[PathBuf]) -> HostKeyStatus {
-    let mut changed = false;
-    for path in files {
-        match check_known_hosts_path(host, port, key, path) {
-            Ok(true) => return HostKeyStatus::Trusted,
-            Ok(false) => {}
-            Err(russh::keys::Error::KeyChanged { .. }) => changed = true,
-            Err(_) => {}
-        }
-    }
-    if changed {
-        HostKeyStatus::Changed
-    } else {
+    let recorded: Vec<PublicKey> = files
+        .iter()
+        .filter_map(|path| known_host_keys_path(host, port, path).ok())
+        .flatten()
+        .map(|(_, recorded)| recorded)
+        .collect();
+    host_key_verdict(key, &recorded)
+}
+
+/// Trusted if any recorded key is the offered one, wherever it sits; Changed if
+/// the host is recorded at all but only under other keys; Unknown only when
+/// nothing is recorded. As in OpenSSH, a key of a different *type* counts as
+/// Changed. That matters because russh does not check the key a server sends
+/// against the negotiated algorithm, so a server can agree to the recorded type
+/// and present another. Reading that as Unknown turned a man-in-the-middle into
+/// a trust prompt for a host the user already trusts (FRE-288, reproduced
+/// against a server that negotiated ssh-ed25519 and sent an ECDSA key).
+fn host_key_verdict(offered: &PublicKey, recorded: &[PublicKey]) -> HostKeyStatus {
+    // Key material only: the comment is not part of the key's identity.
+    if recorded.iter().any(|r| r.key_data() == offered.key_data()) {
+        HostKeyStatus::Trusted
+    } else if recorded.is_empty() {
         HostKeyStatus::Unknown
+    } else {
+        HostKeyStatus::Changed
     }
 }
 
-/// The distinct algorithms of every key recorded for `host:port` across
-/// `files`. When non-empty, [`Tunnel::open`] pins SSH host-key negotiation to
-/// exactly these, so an honest server returns the recorded key type (which then
-/// verifies) while a substituted *different* type cannot silently downgrade a
-/// would-be [`HostKeyStatus::Changed`] into an [`HostKeyStatus::Unknown`] trust
-/// prompt. This is stricter than OpenSSH, which merely *orders* known types
-/// first and still falls back to others: a server that legitimately rotates to
-/// a brand-new key type here fails negotiation with a generic connect error
-/// until the stale known_hosts entry is removed — a fail-closed trade-off.
+/// The host-key algorithms [`Tunnel::open`] negotiates for `host:port`: those
+/// that present a key recorded for it in `files`, so an honest server holding
+/// several keys shows the recorded one rather than another, which would read as
+/// [`HostKeyStatus::Changed`]. Empty when nothing is recorded, which leaves
+/// russh's defaults. This steers an honest server and guards nothing: a server
+/// can agree to these and send another type anyway, which is why
+/// [`host_key_verdict`] decides on the key actually sent. It is stricter than
+/// OpenSSH, which only orders known types first, so a server that rotates to a
+/// brand-new key type fails negotiation with a generic connect error until the
+/// stale entry is removed.
 fn recorded_key_algorithms(host: &str, port: u16, files: &[PathBuf]) -> Vec<Algorithm> {
     let mut algorithms = Vec::new();
     for path in files {
         if let Ok(keys) = known_host_keys_path(host, port, path) {
             for (_, recorded) in keys {
-                let algorithm = recorded.algorithm();
-                if !algorithms.contains(&algorithm) {
-                    algorithms.push(algorithm);
+                for algorithm in presenting_algorithms(recorded.algorithm()) {
+                    if !algorithms.contains(&algorithm) {
+                        algorithms.push(algorithm);
+                    }
                 }
             }
         }
     }
     algorithms
+}
+
+/// The russh client config for `host:port`: defaults, except that host-key
+/// negotiation asks for the recorded key's type ([`recorded_key_algorithms`]),
+/// so an honest server holding several keys presents the one we trust. The
+/// check that a different type is Changed rather than Unknown is
+/// [`host_key_verdict`]'s, since negotiation is not enforced on the key a
+/// server sends. Nothing recorded → russh's defaults.
+fn client_config(host: &str, port: u16, known_hosts_read: &[PathBuf]) -> client::Config {
+    let mut ssh_config = client::Config::default();
+    let pinned = recorded_key_algorithms(host, port, known_hosts_read);
+    if !pinned.is_empty() {
+        ssh_config.preferred.key = Cow::Owned(pinned);
+    }
+    ssh_config
+}
+
+/// The algorithms a server can present a key of this format under. known_hosts
+/// records an RSA key as `ssh-rsa`, its format, but servers sign with it as
+/// rsa-sha2-512 or rsa-sha2-256, and OpenSSH 8.8+ refuses SHA-1 `ssh-rsa`
+/// outright. Pinning `ssh-rsa` alone made every reconnect to an RSA-only
+/// OpenSSH server fail (FRE-288, measured against 10.3), so RSA gets all three,
+/// in russh's default order.
+fn presenting_algorithms(format: Algorithm) -> Vec<Algorithm> {
+    match format {
+        Algorithm::Rsa { .. } => vec![
+            Algorithm::Rsa {
+                hash: Some(HashAlg::Sha512),
+            },
+            Algorithm::Rsa {
+                hash: Some(HashAlg::Sha256),
+            },
+            Algorithm::Rsa { hash: None },
+        ],
+        other => vec![other],
+    }
 }
 
 /// Builds the display/persistence info for the key the server offered.
@@ -311,16 +356,7 @@ impl Tunnel {
             TunnelAuth::Agent => None,
         };
 
-        // Pin host-key negotiation to the algorithms we already trust for this
-        // host, so a MITM cannot present a *different* key type to sidestep the
-        // changed-key hard-fail (it would otherwise read as an unknown host and
-        // only raise a trust prompt). No recorded keys → offer the defaults.
-        let mut ssh_config = client::Config::default();
-        let pinned = recorded_key_algorithms(&config.host, config.port, known_hosts_read);
-        if !pinned.is_empty() {
-            ssh_config.preferred.key = Cow::Owned(pinned);
-        }
-        let ssh_config = Arc::new(ssh_config);
+        let ssh_config = Arc::new(client_config(&config.host, config.port, known_hosts_read));
         let address = (config.host.as_str(), config.port);
         let verdict = Arc::new(Mutex::new(None));
         let offered_key = Arc::new(Mutex::new(None));
@@ -606,6 +642,9 @@ mod tests {
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
     const KEY_B: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA6rWI3G1sz07DnfFlrouTcysQlj2P+jpNSOEWD9OJ3X";
+    // Keys of two other types, for a host recorded under ed25519.
+    const KEY_ECDSA: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBCt0yDppBirhQ+3NGimeGgyET84m3sS5pae0/OTdHoborlN0wMG6LJ+jPgmO4EGBUVMGR3RZckSgUOGQOeitvgE=";
+    const KEY_RSA: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCqBoV58WdupNiprCHYGyuv2uVZPMZdP5V7D5aQIJ+jwsF7IPkov1+cfQSz0QUMl3c+DhvCJglpU/Z58Oe5I48Xp1/IJLv8zCG3eySQalqFZumylVLEDlBOpnM4E04Oq8kJXkesca3eTQW2mfSRL0tlNQd8hAfSwjELjld0yXnPH2r0v4bILgxVfmpxQuicF6wVwvDQl7VqS8AOcKwhQqZWAE18ANVCCt+VMX3oVwtnkh027DurjDI5yVCZxt7NE35gqbk6Odr7yDu9zTSWf200rTcyDAQdOp36/Nny/1n35K9e11wiqOzxMoDbn2+HX+UIWqVevSaT111509AgXAtH";
 
     fn pubkey(s: &str) -> PublicKey {
         PublicKey::from_openssh(s).unwrap()
@@ -704,6 +743,118 @@ mod tests {
         assert_eq!(
             verify_host_key("example.com", 22, &pubkey(KEY_B), &[path]),
             HostKeyStatus::Changed
+        );
+    }
+
+    #[test]
+    fn the_verdict_reads_a_key_of_any_other_type_as_changed() {
+        let a = pubkey(KEY_A);
+        let cases = [
+            (KEY_A, vec![], HostKeyStatus::Unknown),
+            (KEY_A, vec![KEY_A], HostKeyStatus::Trusted),
+            (KEY_B, vec![KEY_A], HostKeyStatus::Changed),
+            // FRE-288: a different type is not a different host.
+            (KEY_ECDSA, vec![KEY_A], HostKeyStatus::Changed),
+            (KEY_RSA, vec![KEY_A], HostKeyStatus::Changed),
+            // A host may hold several keys; any match is enough.
+            (KEY_ECDSA, vec![KEY_A, KEY_ECDSA], HostKeyStatus::Trusted),
+        ];
+        for (offered, recorded, expected) in cases {
+            let recorded: Vec<PublicKey> = recorded.into_iter().map(pubkey).collect();
+            assert_eq!(
+                host_key_verdict(&pubkey(offered), &recorded),
+                expected,
+                "{offered} against {recorded:?}"
+            );
+        }
+        // The comment is not part of the key.
+        let commented = pubkey(&format!("{KEY_A} someone@laptop"));
+        assert_eq!(host_key_verdict(&commented, &[a]), HostKeyStatus::Trusted);
+    }
+
+    #[test]
+    fn changed_when_a_file_records_the_host_under_another_key_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_known_hosts(
+            dir.path(),
+            "known_hosts",
+            &[&format!("[db.internal]:2222 {KEY_A}")],
+        );
+        assert_eq!(
+            verify_host_key("db.internal", 2222, &pubkey(KEY_ECDSA), &[path]),
+            HostKeyStatus::Changed
+        );
+    }
+
+    #[test]
+    fn a_stale_line_before_the_matching_one_does_not_hide_it() {
+        // russh's own check stopped at the first conflicting line, so a host
+        // with an old and a new key in one file read as Changed. Any recorded
+        // match now trusts, as in OpenSSH.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_known_hosts(
+            dir.path(),
+            "known_hosts",
+            &[
+                &format!("example.com {KEY_B}"),
+                &format!("example.com {KEY_A}"),
+            ],
+        );
+        assert_eq!(
+            verify_host_key("example.com", 22, &pubkey(KEY_A), &[path]),
+            HostKeyStatus::Trusted
+        );
+    }
+
+    #[tokio::test]
+    async fn the_handler_refuses_a_substituted_key_type_as_changed() {
+        use russh::client::Handler as _;
+
+        // The wire from the key russh hands over to the verdict `open` maps to
+        // HostKeyChanged: a server recorded under ed25519 that presents ECDSA.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_known_hosts(
+            dir.path(),
+            "known_hosts",
+            &[&format!("[db.internal]:2222 {KEY_A}")],
+        );
+        let mut verifier = HostKeyVerifier {
+            host: "db.internal".into(),
+            port: 2222,
+            files: vec![path],
+            verdict: Arc::default(),
+            offered_key: Arc::default(),
+        };
+        let offered = PublicKeyOrCertificate::from(pubkey(KEY_ECDSA));
+        assert!(!verifier.check_server_key(&offered).await.unwrap());
+        assert_eq!(
+            *verifier.verdict.lock().unwrap(),
+            Some(HostKeyStatus::Changed)
+        );
+        assert_eq!(
+            verifier.offered_key.lock().unwrap().as_ref(),
+            Some(&pubkey(KEY_ECDSA))
+        );
+    }
+
+    #[test]
+    fn a_recorded_rsa_key_pins_every_algorithm_it_can_be_presented_under() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_known_hosts(
+            dir.path(),
+            "known_hosts",
+            &[&format!("example.com {KEY_RSA}")],
+        );
+        // What `open` hands russh, not just what the helper computes.
+        let config = client_config("example.com", 22, &[path]);
+        let names: Vec<&str> = config.preferred.key.iter().map(|a| a.as_str()).collect();
+        // OpenSSH 8.8+ offers only the first two; `ssh-rsa` alone never matched.
+        assert_eq!(names, ["rsa-sha2-512", "rsa-sha2-256", "ssh-rsa"]);
+        // Nothing recorded leaves russh's defaults alone.
+        let defaults = client::Config::default().preferred.key;
+        assert_eq!(
+            client_config("absent.example", 22, &[]).preferred.key,
+            defaults
         );
     }
 
