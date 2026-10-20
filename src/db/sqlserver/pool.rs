@@ -205,8 +205,8 @@ impl MssqlUrlParts {
         // tiberius 0.13 bounds every server round-trip at 30s by default and
         // drops the connection when it fires, so a long user query (a big sort,
         // `WAITFOR`, a blocked lock) would fail at 30s — measured, not assumed.
-        // Postgres and SQLite run unbounded, so SQL Server does too. The 15s
-        // handshake bound stays: it only covers prelogin, TLS and login.
+        // Postgres sets no statement timeout either. The 15s handshake bound
+        // stays: it only covers prelogin, TLS and login.
         config.command_timeout(None);
         config
     }
@@ -439,9 +439,16 @@ fn friendly_connect_error(err: &TdsError) -> String {
         }
     ) {
         // Ahead of the TLS arm: tiberius's handshake-timeout message names
-        // "TLS negotiation" among the stages, which says nothing about TLS
-        // having failed.
-        format!("network error — {msg}")
+        // "TLS negotiation" among its stages without TLS having failed, and
+        // ends in advice for whoever configures the driver, so it gets our own
+        // words. A TCP connect timeout lands here too, and keeps the OS's text.
+        if lower.contains("handshake") {
+            "network error — the server accepted the connection but did not finish \
+             the SQL Server login handshake in time"
+                .to_string()
+        } else {
+            format!("network error — {msg}")
+        }
     } else if matches!(err, TdsError::Tls(_)) || lower.contains("tls") || lower.contains("ssl") {
         format!("TLS error — {msg}")
     } else if lower.contains("connection refused")
@@ -1018,15 +1025,33 @@ mod tests {
         };
         let friendly = friendly_connect_error(&hangup);
         assert!(friendly.starts_with("the server doesn't appear to be SQL Server"));
-        // tiberius 0.13's handshake timeout, as it words it: a stalled server,
-        // not a TLS failure, even though the message mentions TLS.
+        // tiberius 0.13's handshake timeout, verbatim: a stalled server, not a
+        // TLS failure, and none of the driver-configuration advice reaches
+        // the user.
         let stalled = TdsError::Io {
             kind: std::io::ErrorKind::TimedOut,
             message: "the connection handshake (prelogin, TLS negotiation and login) did not \
-                      complete within 15s"
+                      complete within 15s; the server accepted the TCP connection but did not \
+                      finish the handshake in time (it may have stalled, or be responding too \
+                      slowly for the configured bound). Enable `tracing` at DEBUG to see which \
+                      stage was last reached, or change the bound with \
+                      `Config::handshake_timeout`."
                 .into(),
         };
-        assert!(friendly_connect_error(&stalled).starts_with("network error"));
+        let friendly = friendly_connect_error(&stalled);
+        assert!(friendly.starts_with("network error"), "{friendly}");
+        assert!(!friendly.contains("tracing") && !friendly.contains("Config::"));
+        // A TCP-level timeout keeps the OS's wording.
+        let tcp = TdsError::Io {
+            kind: std::io::ErrorKind::TimedOut,
+            message: "Connection timed out (os error 110)".into(),
+        };
+        let friendly = friendly_connect_error(&tcp);
+        assert!(friendly.starts_with("network error"), "{friendly}");
+        assert!(
+            friendly.ends_with("Connection timed out (os error 110)"),
+            "{friendly}"
+        );
     }
 
     #[test]

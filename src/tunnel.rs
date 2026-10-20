@@ -781,11 +781,14 @@ mod tests {
         // about the key inside it, and leaves no verdict behind: an Unknown one
         // would become a trust prompt for a key nobody vouched for.
         let ca = PrivateKey::from(Ed25519Keypair::from_seed(&[7; 32]));
-        for (host, key, inner) in [
-            ("db.internal", KEY_A, "trusted"),
-            ("db.internal", KEY_B, "changed"),
-            ("new.internal", KEY_A, "unknown"),
+        for (host, key, inner, status) in [
+            ("db.internal", KEY_A, "trusted", HostKeyStatus::Trusted),
+            ("db.internal", KEY_B, "changed", HostKeyStatus::Changed),
+            ("new.internal", KEY_A, "unknown", HostKeyStatus::Unknown),
         ] {
+            // The row really is what it says, offered bare.
+            let files = std::slice::from_ref(&path);
+            assert_eq!(verify_host_key(host, 22, &pubkey(key), files), status);
             let mut builder =
                 Builder::new([0; 16], pubkey(key).key_data().clone(), 0, u64::MAX).unwrap();
             builder.cert_type(CertType::Host).unwrap();

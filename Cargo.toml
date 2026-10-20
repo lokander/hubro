@@ -15,9 +15,10 @@ sqlx = { version = "0.8", default-features = false, features = ["sqlite", "postg
 # Windows auth; `rustls` keeps TLS on the same rustls 0.23 sqlx uses, with no
 # OpenSSL. It does turn on rustls's aws-lc-rs provider beside sqlx's ring, and
 # with two providers compiled in rustls cannot pick one implicitly: a
-# `ClientConfig::builder()` that names no provider panics. sqlx (ring), reqwest
-# and tiberius (aws-lc-rs, unless a process default is installed) each name
-# theirs. `tds73` enables date/time2/datetimeoffset (SQL Server 2008+);
+# `ClientConfig::builder()` that names no provider panics. None of today's
+# callers relies on that: sqlx always uses ring; reqwest uses an installed
+# process default, else ring; tiberius uses an installed process default, else
+# aws-lc-rs. `tds73` enables date/time2/datetimeoffset (SQL Server 2008+);
 # `chrono` decodes them into the chrono types the rest of the app already uses.
 tiberius = { version = "0.13", default-features = false, features = ["rustls", "tds73", "chrono"] }
 # Adapts tokio's TcpStream to the futures-io traits tiberius expects.
@@ -28,9 +29,11 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "7"
-# Exactly the features dioxus-desktop enables on its own rfd, so the two share
-# one copy. That also ties Linux to the portal backend: rfd refuses `gtk3`
-# alongside `xdg-portal`.
+# dioxus-desktop depends on rfd 0.17 too, so cargo builds one copy with the
+# union of both feature sets. Default features off drops `wayland`, which rfd
+# only uses for `set_parent`, never called here. Linux is on the portal
+# backend whatever this line says: dioxus-desktop enables `xdg-portal` on that
+# shared copy, and rfd refuses `gtk3` alongside it.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 url = "2"
 serde_json = "1"
