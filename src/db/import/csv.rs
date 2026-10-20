@@ -5,9 +5,10 @@
 //! delimiter/quote override and a non-UTF-8 [`Encoding`].
 //!
 //! [`CsvReader`] pulls **one record at a time** from any [`BufRead`], so peak
-//! memory is one record — bounded by [`MAX_FIELD_BYTES`] and
-//! [`MAX_RECORD_BYTES`] even when the file is malformed — regardless of file
-//! size, mirroring how the export streams one row at a time.
+//! memory is one record — bounded by [`MAX_FIELD_BYTES`],
+//! [`MAX_RECORD_BYTES`] and [`MAX_RECORD_FIELDS`] even when the file is
+//! malformed — regardless of file size, mirroring how the export streams one
+//! row at a time.
 //!
 //! Parsing follows RFC-4180 with the tolerances real files need:
 //!
@@ -35,17 +36,10 @@
 //! Field text is decoded per [`Encoding`], so a Latin-1 file (which is not
 //! valid UTF-8 and would otherwise fail outright) imports by choosing it.
 
-use std::io::{self, BufRead};
+use std::io::BufRead;
 
+use super::cursor::ByteCursor;
 use super::{decode_bytes, Encoding, ReadError, Record, RecordSource};
-
-/// Wraps an I/O failure while reading the file, naming the line reached.
-fn io_read_error(line: u64, err: io::Error) -> ReadError {
-    ReadError {
-        line: Some(line),
-        message: format!("reading the file failed: {err}"),
-    }
-}
 
 /// The error for a quoted field that runs past the end of the file.
 fn unclosed_quote(line: u64) -> ReadError {
@@ -74,6 +68,18 @@ fn oversized(line: u64, in_quotes: bool, what: &str, limit: usize) -> ReadError 
     }
 }
 
+/// The error for a record with more fields than [`MAX_RECORD_FIELDS`]. Fields
+/// are only split outside quotes, so the delimiter is the suspect.
+fn too_many_fields(line: u64) -> ReadError {
+    ReadError {
+        line: Some(line),
+        message: format!(
+            "this record has more than {MAX_RECORD_FIELDS} fields — check the delimiter, or \
+             that this is really a CSV file"
+        ),
+    }
+}
+
 /// Delimiters [`sniff_dialect`] considers, in preference order — comma first
 /// so a file with no evidence either way stays plain CSV.
 pub const DELIMITERS: [u8; 4] = *b",;\t|";
@@ -96,8 +102,22 @@ pub const SNIFF_BYTES: usize = 64 * 1024;
 pub const MAX_FIELD_BYTES: usize = 8 * 1024 * 1024;
 
 /// Largest single record, so a file with no line terminator at all (one line,
-/// many small fields) is bounded too.
+/// many small fields) is bounded too. Counts every byte of field content,
+/// however it was spelled — a doubled quote inside a quoted field included.
 pub const MAX_RECORD_BYTES: usize = 32 * 1024 * 1024;
+
+/// Most fields one record may have.
+///
+/// The byte bounds cannot cover this on their own: an *empty* field holds no
+/// bytes but still costs its `Vec` header (24 bytes) twice over — once raw,
+/// once decoded — so a line of nothing but delimiters grew without limit
+/// while [`MAX_RECORD_BYTES`] saw nothing. Counting the delimiters as bytes
+/// would not have been enough either: 32 Mi empty fields is still 1.5 GB of
+/// headers. The cap is far past any table a record could be imported into —
+/// measured, Postgres refuses a 1601st column, SQL Server a 1025th and SQLite
+/// (default build) a 2001st; SQL Server's sparse "wide" tables are documented
+/// at 30,000 — so a record past it is a wrong delimiter or not CSV at all.
+pub const MAX_RECORD_FIELDS: usize = 65_536;
 
 /// The CSV shape: what separates fields, what quotes them, and whether the
 /// first record names the columns. Detected by [`sniff_dialect`] and freely
@@ -121,12 +141,10 @@ impl Default for CsvDialect {
 
 /// Pulls records one at a time out of a CSV byte stream.
 pub struct CsvReader<R: BufRead> {
-    input: R,
+    cursor: ByteCursor<R>,
     delimiter: u8,
     quote: u8,
     encoding: Encoding,
-    /// 1-based physical line the next byte belongs to.
-    line: u64,
     /// Header names, once the header record has been read (`None` when the
     /// file is headerless — fields are then addressed by position).
     header: Option<Vec<String>>,
@@ -151,11 +169,10 @@ impl<R: BufRead> CsvReader<R> {
     /// than here, so constructing a reader never fails.
     pub fn new(input: R, dialect: CsvDialect, encoding: Encoding) -> Self {
         CsvReader {
-            input,
+            cursor: ByteCursor::new(input),
             delimiter: dialect.delimiter,
             quote: dialect.quote,
             encoding,
-            line: 1,
             header: dialect.has_header.then(Vec::new),
             primed: false,
             finished: false,
@@ -175,7 +192,6 @@ impl<R: BufRead> CsvReader<R> {
             return Ok(());
         }
         self.primed = true;
-        self.strip_bom()?;
         if self.header.is_some() {
             // A file that holds nothing but a header (or nothing at all)
             // leaves the names empty; the mapping step then has nothing to
@@ -189,29 +205,6 @@ impl<R: BufRead> CsvReader<R> {
         Ok(())
     }
 
-    /// Consumes a UTF-8 byte-order mark, which Excel writes and which would
-    /// otherwise become part of the first header name.
-    fn strip_bom(&mut self) -> Result<(), ReadError> {
-        let line = self.line;
-        let buf = self.input.fill_buf().map_err(|e| io_read_error(line, e))?;
-        if buf.starts_with(&[0xEF, 0xBB, 0xBF]) {
-            self.input.consume(3);
-        }
-        Ok(())
-    }
-
-    fn next_byte(&mut self) -> Result<Option<u8>, ReadError> {
-        let line = self.line;
-        let buf = self.input.fill_buf().map_err(|e| io_read_error(line, e))?;
-        match buf.first().copied() {
-            Some(byte) => {
-                self.input.consume(1);
-                Ok(Some(byte))
-            }
-            None => Ok(None),
-        }
-    }
-
     /// Reads one record, returning the physical line it started on and its
     /// decoded fields. Blank lines are skipped; `None` means end of file.
     fn read_record(&mut self) -> Result<Option<(u64, Vec<String>)>, ReadError> {
@@ -219,7 +212,7 @@ impl<R: BufRead> CsvReader<R> {
             if self.finished {
                 return Ok(None);
             }
-            let start_line = self.line;
+            let start_line = self.cursor.line();
             let mut fields: Vec<Vec<u8>> = Vec::new();
             let mut field: Vec<u8> = Vec::new();
             let mut state = State::FieldStart;
@@ -229,11 +222,14 @@ impl<R: BufRead> CsvReader<R> {
             // set this, or every blank line in a Windows file becomes a
             // record of one empty field.
             let mut structural = false;
-            // Bytes held for this record, so a malformed file (see
-            // [`MAX_FIELD_BYTES`]) is refused rather than accumulated.
+            // Content bytes of this record's *finished* fields; the field
+            // being read adds its own length at the bound check below. Summed
+            // from the fields themselves rather than counted per push, so no
+            // way of appending a byte can slip past it — a doubled quote once
+            // did.
             let mut record_bytes = 0usize;
             loop {
-                let Some(byte) = self.next_byte()? else {
+                let Some(byte) = self.cursor.next_byte()? else {
                     self.finished = true;
                     if state == State::Quoted {
                         return Err(unclosed_quote(start_line));
@@ -251,11 +247,11 @@ impl<R: BufRead> CsvReader<R> {
                             state = State::Quoted;
                             structural = true;
                         } else if byte == self.delimiter {
+                            record_bytes += field.len();
                             fields.push(std::mem::take(&mut field));
                             state = State::FieldStart;
                             structural = true;
                         } else if byte == b'\n' {
-                            self.line += 1;
                             // CRLF: the CR belongs to the terminator.
                             if field.last() == Some(&b'\r') {
                                 field.pop();
@@ -264,7 +260,6 @@ impl<R: BufRead> CsvReader<R> {
                             break;
                         } else {
                             field.push(byte);
-                            record_bytes += 1;
                             state = State::Unquoted;
                             // A CR is provisionally part of a terminator: it
                             // is stripped again by the LF (or by end of file)
@@ -277,11 +272,7 @@ impl<R: BufRead> CsvReader<R> {
                         if byte == self.quote {
                             state = State::QuoteClosed;
                         } else {
-                            if byte == b'\n' {
-                                self.line += 1;
-                            }
                             field.push(byte);
-                            record_bytes += 1;
                         }
                     }
                     State::QuoteClosed => {
@@ -290,10 +281,10 @@ impl<R: BufRead> CsvReader<R> {
                             field.push(self.quote);
                             state = State::Quoted;
                         } else if byte == self.delimiter {
+                            record_bytes += field.len();
                             fields.push(std::mem::take(&mut field));
                             state = State::FieldStart;
                         } else if byte == b'\n' {
-                            self.line += 1;
                             fields.push(std::mem::take(&mut field));
                             break;
                         } else if byte == b'\r' {
@@ -302,7 +293,6 @@ impl<R: BufRead> CsvReader<R> {
                             // Text after the closing quote: keep it rather
                             // than reject the file.
                             field.push(byte);
-                            record_bytes += 1;
                             state = State::Unquoted;
                             structural = true;
                         }
@@ -319,13 +309,16 @@ impl<R: BufRead> CsvReader<R> {
                         MAX_FIELD_BYTES,
                     ));
                 }
-                if record_bytes > MAX_RECORD_BYTES {
+                if record_bytes + field.len() > MAX_RECORD_BYTES {
                     return Err(oversized(
                         start_line,
                         state == State::Quoted,
                         "record",
                         MAX_RECORD_BYTES,
                     ));
+                }
+                if fields.len() >= MAX_RECORD_FIELDS {
+                    return Err(too_many_fields(start_line));
                 }
             }
             // A line with no delimiter, no quote and no content is blank.
@@ -626,6 +619,62 @@ mod tests {
             err.message
         );
         assert!(err.message.contains("delimiter"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_line_of_nothing_but_delimiters_is_bounded_by_its_field_count() {
+        // Empty fields hold no bytes, so the byte bounds never saw this line
+        // grow: a gigabyte of commas became a billion `Vec` headers. The
+        // record is refused at the field cap instead — long before even
+        // counting each delimiter as a byte would have stopped it.
+        let commas = ",".repeat(MAX_RECORD_FIELDS);
+        assert!(commas.len() < MAX_RECORD_BYTES / 64);
+        let mut reader = CsvReader::new(commas.as_bytes(), headerless(), Encoding::Utf8);
+        let err = reader.next_record().unwrap_err();
+        assert_eq!(err.line, Some(1));
+        assert!(
+            err.message
+                .contains(&format!("more than {MAX_RECORD_FIELDS} fields")),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("delimiter"), "{}", err.message);
+
+        // Exactly at the cap is still a record.
+        let at_cap = ",".repeat(MAX_RECORD_FIELDS - 1);
+        let mut reader = CsvReader::new(at_cap.as_bytes(), headerless(), Encoding::Utf8);
+        let record = reader.next_record().unwrap().unwrap();
+        assert_eq!(record.present_fields().len(), MAX_RECORD_FIELDS);
+    }
+
+    #[test]
+    fn a_doubled_quote_counts_toward_the_record_bound() {
+        // A quoted field of nothing but doubled quotes, then plain fields
+        // that fill the record bound exactly on their own. The doubled quotes
+        // used to be pushed without being counted, so the record grew past
+        // the bound unseen. The quoted field comes first so that it is *finished* —
+        // both ways a field ends (after a closing quote, and unquoted) have
+        // to carry its bytes into the record's total.
+        assert_eq!(MAX_RECORD_BYTES % MAX_FIELD_BYTES, 0);
+        let mut text = String::from("\"");
+        text.push_str(&"\"\"".repeat(1024));
+        text.push('"');
+        let plain = "x".repeat(MAX_FIELD_BYTES);
+        for _ in 0..MAX_RECORD_BYTES / MAX_FIELD_BYTES {
+            text.push(',');
+            text.push_str(&plain);
+        }
+        // No delimiter after the last field: the bound has to count the field
+        // still being read, not only the finished ones, or the record gets a
+        // whole field past it before anything notices.
+        text.push('\n');
+        let mut reader = CsvReader::new(text.as_bytes(), headerless(), Encoding::Utf8);
+        let err = reader.next_record().unwrap_err();
+        assert!(
+            err.message.contains("record is larger than 32 MiB"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
