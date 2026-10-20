@@ -1022,6 +1022,33 @@ fn is_non_transactional(dialect: Dialect, stripped: &str) -> bool {
     false
 }
 
+/// Whether SQL Server accepts `sql` only as the first statement of a batch —
+/// `CREATE`/`ALTER`/`CREATE OR ALTER` of a procedure, function, trigger or
+/// view, and `CREATE SCHEMA`/`DEFAULT`/`RULE`.
+///
+/// The SQL Server backend asks so it can send such a statement as a plain
+/// batch. Its usual vehicle is the driver's `sp_executesql` RPC, which always
+/// passes a `@params` argument (empty when there are none), and measured
+/// against SQL Server 2022, every statement in this family fails there with
+/// error 156, "Incorrect syntax near the keyword" — `PROCEDURE`, `VIEW` and
+/// so on — however simple it is. `CREATE TYPE`, `CREATE TABLE` and the rest
+/// run there fine, so they keep their affected-row counts.
+pub(crate) fn tsql_leads_own_batch(sql: &str) -> bool {
+    let stripped = strip_strings_and_comments(sql, Dialect::SqlServer);
+    let words = leading_words(&stripped, 4);
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let object = match words.as_slice() {
+        ["create", "or", "alter", object, ..] => object,
+        ["create" | "alter", object, ..] => object,
+        _ => return false,
+    };
+    match *object {
+        "proc" | "procedure" | "function" | "trigger" | "view" => true,
+        "schema" | "default" | "rule" => words[0] == "create",
+        _ => false,
+    }
+}
+
 /// The first `n` word tokens of an already-stripped statement (lowercased).
 /// Working on [`strip_strings_and_comments`] output means a leading comment
 /// or quoted text can't masquerade as a keyword.
@@ -2364,6 +2391,40 @@ mod tests {
             Dialect::Sqlite,
             &stmts(&["PRAGMA user_version", "INSERT INTO t VALUES (1)"])
         ));
+    }
+
+    #[test]
+    fn sqlserver_statements_that_must_lead_a_batch_are_recognized() {
+        for sql in [
+            "CREATE PROCEDURE p AS SELECT 1",
+            "create proc dbo.p as begin select 1; end",
+            "CREATE OR ALTER PROCEDURE p AS SELECT 1",
+            "ALTER PROCEDURE p AS SELECT 1",
+            "CREATE FUNCTION f() RETURNS int AS BEGIN RETURN 1 END",
+            "CREATE TRIGGER tr ON t AFTER INSERT AS SELECT 1",
+            "CREATE OR ALTER VIEW v AS SELECT 1 AS a",
+            "ALTER VIEW v AS SELECT 1 AS a",
+            "CREATE SCHEMA s",
+            "CREATE DEFAULT d AS 0",
+            "CREATE RULE r AS @x > 0",
+            "-- leading comment\n/* and another */ CREATE VIEW v AS SELECT 1 AS a",
+        ] {
+            assert!(tsql_leads_own_batch(sql), "{sql:?}");
+        }
+        for sql in [
+            "CREATE TABLE t (a int)",
+            "CREATE TYPE ty FROM int",
+            "CREATE INDEX ix ON t (a)",
+            "ALTER TABLE t ADD b int",
+            "ALTER SCHEMA s TRANSFER dbo.t",
+            "DROP PROCEDURE p",
+            "EXEC('CREATE VIEW v AS SELECT 1 AS a')",
+            "SELECT 'CREATE VIEW v'",
+            "-- CREATE VIEW v\nSELECT 1",
+            "",
+        ] {
+            assert!(!tsql_leads_own_batch(sql), "{sql:?}");
+        }
     }
 
     #[test]

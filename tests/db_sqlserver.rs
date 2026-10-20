@@ -828,6 +828,69 @@ async fn sqlserver_script_errors_roll_the_whole_script_back() {
     pool.close().await;
 }
 
+/// Procedures, functions, triggers and views must each lead their own batch,
+/// which the driver's `sp_executesql` path cannot give them: every one of
+/// these used to fail with "Incorrect syntax near the keyword …" from the
+/// script tab, however simple. Covers both script paths — a lone statement
+/// runs on the pool, several run in the script transaction.
+#[tokio::test]
+async fn sqlserver_script_creates_modules_that_must_lead_a_batch() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP VIEW IF EXISTS dbo.script_lead_view",
+            "DROP PROCEDURE IF EXISTS dbo.script_lead_proc",
+            "DROP TABLE IF EXISTS dbo.script_lead_probe",
+        ],
+    )
+    .await;
+
+    // One statement: not wrapped, so it runs on a pooled connection.
+    let statements = split_statements(
+        "CREATE VIEW dbo.script_lead_view AS SELECT 1 AS one",
+        pool.dialect(),
+    );
+    run_script(&pool, pool.backend_capabilities(), &statements, |_| {})
+        .await
+        .expect("a lone CREATE VIEW should run");
+
+    // Several: wrapped in the script transaction.
+    let sql = "CREATE TABLE dbo.script_lead_probe (id int NOT NULL)\n\
+               GO\n\
+               CREATE PROCEDURE dbo.script_lead_proc AS \
+                 INSERT INTO dbo.script_lead_probe SELECT one FROM dbo.script_lead_view\n\
+               GO\n\
+               EXEC dbo.script_lead_proc\n\
+               GO\n\
+               SELECT id FROM dbo.script_lead_probe";
+    let statements = split_statements(sql, pool.dialect());
+    assert_eq!(statements.len(), 4);
+    let mut results = Vec::new();
+    run_script(&pool, pool.backend_capabilities(), &statements, |r| {
+        results.push(r)
+    })
+    .await
+    .expect("the script should run to completion");
+    assert_eq!(results[1].outcome, StatementOutcome::Affected(0));
+    match &results[3].outcome {
+        StatementOutcome::Rows(rows) => assert_eq!(rows.rows, vec![vec![Value::Integer(1)]]),
+        other => panic!("expected rows from the SELECT, got {other:?}"),
+    }
+
+    run_all(
+        &pool,
+        &[
+            "DROP PROCEDURE dbo.script_lead_proc",
+            "DROP VIEW dbo.script_lead_view",
+            "DROP TABLE dbo.script_lead_probe",
+        ],
+    )
+    .await;
+    pool.close().await;
+}
+
 #[tokio::test]
 async fn sqlserver_query_capped_stops_and_bounds_cells() {
     let Some(url) = test_url().await else { return };

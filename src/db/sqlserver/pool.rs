@@ -37,6 +37,7 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt as _};
 use super::{column_infos, decode_row};
 use crate::db::error::DbError;
 use crate::db::export::{export_io_err, ExportFormat, ExportSink};
+use crate::db::script::tsql_leads_own_batch;
 use crate::db::staged::CheckedStatement;
 use crate::db::value::{cap_value, QueryResult, Value};
 
@@ -611,6 +612,19 @@ async fn run_execute(client: &mut TdsClient, sql: &str, params: &[Value]) -> Res
     Ok(result.total())
 }
 
+/// Runs one script statement that returns no rows, reporting its affected
+/// rows. A statement SQL Server only accepts at the head of a batch
+/// ([`tsql_leads_own_batch`]) cannot go through `sp_executesql`, so it runs as
+/// a plain batch instead; nothing it does counts as an affected row, so it
+/// reports 0.
+async fn run_statement(client: &mut TdsClient, sql: &str) -> Result<u64, TdsError> {
+    if tsql_leads_own_batch(sql) {
+        run_batch(client, sql).await.map(|()| 0)
+    } else {
+        run_execute(client, sql, &[]).await
+    }
+}
+
 /// Runs a raw SQL batch (no parameters, results discarded) — the vehicle for
 /// `BEGIN TRAN`/`COMMIT`/`ROLLBACK` and session `SET` options, which must run
 /// as plain batches rather than through `sp_executesql`.
@@ -640,7 +654,7 @@ pub async fn query_with(
 /// affected-row count.
 pub async fn execute(pool: &MssqlPool, sql: &str) -> Result<u64, DbError> {
     let mut conn = pool.acquire().await?;
-    let result = run_execute(conn.client(), sql, &[]).await;
+    let result = run_statement(conn.client(), sql).await;
     settle(&mut conn, result, sql)
 }
 
@@ -835,7 +849,7 @@ pub async fn execute_conn(tx: &mut MssqlTx, sql: &str) -> Result<u64, DbError> {
     if tx.conn.is_discarded() {
         return Err(lost_connection());
     }
-    let result = run_execute(tx.conn.client(), sql, &[]).await;
+    let result = run_statement(tx.conn.client(), sql).await;
     settle(&mut tx.conn, result, sql)
 }
 
