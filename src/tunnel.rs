@@ -681,6 +681,8 @@ mod tests {
     // Keys of two other types, for a host recorded under ed25519.
     const KEY_ECDSA: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBCt0yDppBirhQ+3NGimeGgyET84m3sS5pae0/OTdHoborlN0wMG6LJ+jPgmO4EGBUVMGR3RZckSgUOGQOeitvgE=";
     const KEY_RSA: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCqBoV58WdupNiprCHYGyuv2uVZPMZdP5V7D5aQIJ+jwsF7IPkov1+cfQSz0QUMl3c+DhvCJglpU/Z58Oe5I48Xp1/IJLv8zCG3eySQalqFZumylVLEDlBOpnM4E04Oq8kJXkesca3eTQW2mfSRL0tlNQd8hAfSwjELjld0yXnPH2r0v4bILgxVfmpxQuicF6wVwvDQl7VqS8AOcKwhQqZWAE18ANVCCt+VMX3oVwtnkh027DurjDI5yVCZxt7NE35gqbk6Odr7yDu9zTSWf200rTcyDAQdOp36/Nny/1n35K9e11wiqOzxMoDbn2+HX+UIWqVevSaT111509AgXAtH";
+    // ssh-key's own 1024-bit DSA test key (OpenSSH 10 can no longer make one).
+    const KEY_DSA: &str = "ssh-dss AAAAB3NzaC1kc3MAAACBANw9iSUO2UYhFMssjUgW46URqv8bBrDgHeF8HLBOWBvKuXF2Rx2J/XyhgX48SOLMuv0hcPaejlyLarabnF9F2V4dkpPpZSJ+7luHmxEjNxwhsdtg8UteXAWkeCzrQ6MvRJZHcDBjYh56KGvslbFnJsGLXlI4PQCyl6awNImwYGilAAAAFQCJGBU3hZf+QtP9Jh/nbfNlhFu7hwAAAIBHObOQioQVRm3HsVb7mOy3FVKhcLoLO3qoG9gTkd4KeuehtFAC3+rckiX7xSCnE/5BBKdL7VP9WRXac2Nlr9Pwl3e7zPut96wrCHt/TZX6vkfXKkbpUIj5zSqfvyNrWKaYJkfzwAQwrXNS1Hol676Ud/DDEn2oatdEhkS3beWHXAAAAIBgQqaz/YYTRMshzMzYcZ4lqgvgmA55y6v0h39e8HH2A5dwNS6sPUw2jyna+le0dceNRJifFld1J+WYM0vmquSr11DDavgEidOSaXwfMvPPPJqLmbzdtT16N+Gij9U9STQTHPQcQ3xnNNHgQAStzZJbhLOVbDDDo5BO7LMUALDfSA==";
 
     fn pubkey(s: &str) -> PublicKey {
         PublicKey::from_openssh(s).unwrap()
@@ -1051,8 +1053,9 @@ mod tests {
         // key that is not it.
         const H: &str = "db.example.com";
         const GARBLED: &str = "db.example.com ssh-ed25519 AAAA!!notbase64";
-        const HASHED: &str = "|1|tbLEo3oZNezhlFk5483qNgLrsh8=|l9n0k6ONOAQcZH3VHlomE0dSN2E="; // db.example.com
-                                                                                             // `ssh-keygen -H` over a `[db.example.com]:2222` line.
+        // `ssh-keygen -H` over a `db.example.com` line.
+        const HASHED: &str = "|1|tbLEo3oZNezhlFk5483qNgLrsh8=|l9n0k6ONOAQcZH3VHlomE0dSN2E=";
+        // `ssh-keygen -H` over a `[db.example.com]:2222` line.
         const HASHED_2222: &str = "|1|WwCpWp49FwaNIJF7d1cKy5eQxGk=|2rA7XH6xTom2guhR5+kXEWIE87U=";
         let a_b64 = KEY_A.split_once(' ').unwrap().1;
         let rsa_b64 = KEY_RSA.split_once(' ').unwrap().1;
@@ -1228,6 +1231,14 @@ mod tests {
                 22,
                 KEY_A,
                 HostKeyStatus::Unknown,
+            ),
+            // hubro's choice, not a measurement: OpenSSH 10 has no DSA and reads Unknown.
+            (
+                "DSA-only record, another key",
+                format!("{H} {KEY_DSA}\n").into(),
+                22,
+                KEY_A,
+                HostKeyStatus::Changed,
             ),
         ];
         let dir = tempfile::tempdir().unwrap();
