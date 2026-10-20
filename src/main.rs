@@ -6,7 +6,7 @@ use hubro::config::{default_settings_path, load_settings};
 use hubro::ui::App;
 
 fn main() {
-    // Arguments are answered before anything else happens (FRE-114): `--help`
+    // Arguments are answered before anything else happens: `--help`
     // and `--version` print and exit, and a bad command line reports on stderr
     // — none of the three should cost the user a window.
     let target = match cli::parse(std::env::args_os().skip(1)) {
@@ -33,7 +33,7 @@ fn main() {
         }
     }
 
-    // Restore the last window geometry (FRE-30), falling back to the historical
+    // Restore the last window geometry, falling back to the historical
     // 1200x800 default when nothing is saved. `sanitized` clamps a corrupt
     // size/position so a bad settings file can't produce an unusable window.
     let geometry = default_settings_path()

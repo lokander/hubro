@@ -1,6 +1,6 @@
 //! Running SQL and getting results out: the editor buffers, the script run
 //! with its write-confirmation gate and cancellation, query-history
-//! recording, saved queries (FRE-113), and the CSV/JSON exports.
+//! recording, saved queries, and the CSV/JSON exports.
 //!
 //! Split out of [`super`] for the same reason as [`super::connect`]: it is
 //! procedural orchestration over [`AppState`]'s signals — spawn a task, track
@@ -9,7 +9,7 @@
 use super::*;
 
 impl AppState {
-    /// One tab's SQL buffers in tab order (FRE-113). A tab that has never
+    /// One tab's SQL buffers in tab order. A tab that has never
     /// been to its SQL pane has no entry yet; it reads as the one scratch
     /// buffer such a pane shows, rather than as a write from a render path.
     pub fn sql_buffers(&self, id: ConnectionId) -> Vec<SqlBuffer> {
@@ -21,7 +21,7 @@ impl AppState {
 
     // There is deliberately no `active_sql_buffer`. Its only caller was the
     // editor's message handler, asking which buffer was active in order to
-    // file text the editor had just sent — and since FRE-154 those are
+    // file text the editor had just sent — and those are now
     // different buffers exactly when it matters, because the editor flushes on
     // the way *out* of one. Every message now names its own buffer. Leaving
     // the accessor behind would leave the wrong answer one call away.
@@ -113,7 +113,7 @@ impl AppState {
     }
 
     /// Shows `text` in the SQL pane without losing what is already being
-    /// written (FRE-113): a new buffer, unless the active one is an untitled
+    /// written: a new buffer, unless the active one is an untitled
     /// blank. Returns the buffer now active.
     pub fn open_sql_buffer(mut self, id: ConnectionId, title: Option<String>, text: String) -> u64 {
         self.tab_ui
@@ -169,7 +169,7 @@ impl AppState {
     /// are not executed yet: they are stashed in [`Self::pending_sql`] and
     /// the editor shows a confirmation banner.
     ///
-    /// A statement the connection's capabilities forbid (FRE-87) is refused
+    /// A statement the connection's capabilities forbid is refused
     /// here, *before* the confirmation banner — being asked to confirm a
     /// write that can never run is a prompt with no right answer.
     pub fn run_sql(self, id: ConnectionId, buffer: u64, sql: String) {
@@ -180,7 +180,7 @@ impl AppState {
         self.start_sql(id, buffer, sql, statements, false);
     }
 
-    /// Explains one query tab's buffer (FRE-119): every statement in it gets
+    /// Explains one query tab's buffer: every statement in it gets
     /// its connection's `EXPLAIN` prefix, and the result renders as a query
     /// plan instead of a grid.
     ///
@@ -198,7 +198,7 @@ impl AppState {
     /// from the editor, which the bundle sends on a 250 ms trailing timer —
     /// the same small staleness the saved-query and history paths already
     /// live with. Pressing the button blurs the editor, which flushes that
-    /// timer early (FRE-154), but the flush and the click reach Rust over
+    /// timer early, but the flush and the click reach Rust over
     /// different channels, so this is narrowed rather than closed.
     pub fn run_explain(self, id: ConnectionId, buffer: u64) {
         let backend = self.registry.read().get(id).and_then(|connection| {
@@ -235,7 +235,7 @@ impl AppState {
     ) {
         self.pending_sql.write().remove(&(id, buffer));
         // Effective capabilities: the backend's, narrowed by the user's
-        // marking (FRE-111). Reading `pool.backend_capabilities()` here instead would
+        // marking. Reading `pool.backend_capabilities()` here instead would
         // let a script write to a connection marked read-only.
         let (dialect, caps) = match self.registry.read().get(id) {
             Some(connection) => (connection.pool.dialect(), connection.capabilities()),
@@ -385,7 +385,7 @@ impl AppState {
             // the script did execute. Cancelled runs never reach this point
             // (the future is dropped), so they are not recorded. Recorded
             // fire-and-forget: a wedged history.db must never delay the
-            // status update below (FRE-72).
+            // status update below.
             let error_text = result.as_ref().err().map(|e| e.error.to_string());
             let success = result.is_ok();
             spawn_forever(async move {
@@ -495,7 +495,7 @@ impl AppState {
             .map(|(_, locator)| locator.clone())
     }
 
-    /// Saves editor text under a name (FRE-113), scoped to this connection or
+    /// Saves editor text under a name, scoped to this connection or
     /// global. Best-effort and off the UI path like the history writes; the
     /// outcome — including a failure — lands in [`Self::saved_status`], and a
     /// success bumps [`Self::saved_nonce`] so open panels re-query.

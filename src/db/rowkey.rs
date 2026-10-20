@@ -26,7 +26,7 @@ pub enum RowIdentity {
     ///
     /// Caveat: a rowid is not a stable handle. VACUUM can renumber rowids,
     /// and a concurrent writer can delete a row and have its rowid reused
-    /// by a new INSERT. Editing (FRE-24) must fresh-read the row (rowid
+    /// by a new INSERT. Editing must fresh-read the row (rowid
     /// included) right before building the guarded write, not reuse a
     /// rowid captured earlier.
     Rowid { column: String },

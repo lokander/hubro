@@ -150,7 +150,7 @@ mod tests {
     fn real_store_round_trip() {
         let _guard = TEST_LOCK.lock().unwrap();
         std::env::remove_var("HUBRO_DISABLE_KEYRING");
-        let url = "postgres://hubro-test@localhost:5432/fre45-real-store";
+        let url = "postgres://hubro-test@localhost:5432/hubro-real-store-test";
         delete_password(url).unwrap();
         assert_eq!(get_password(url).unwrap(), None);
         store_password(url, "s3cret-real").unwrap();

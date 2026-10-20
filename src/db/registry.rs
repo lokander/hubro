@@ -23,7 +23,7 @@ use super::value::{QueryResult, Value};
 /// Hard cap on rows the free-form query path fetches into memory, independent
 /// of the editor's 500-row *render* cap. A `SELECT` returning more is
 /// truncated to this many rows with a "showing first N" indicator, so a query
-/// against a multi-GB table can never buffer the whole result (FRE-33).
+/// against a multi-GB table can never buffer the whole result.
 pub const MAX_QUERY_ROWS: u64 = 10_000;
 
 /// Per-cell byte cap applied while streaming the free-form query path, so a
@@ -66,8 +66,8 @@ pub enum DbPool {
     SqlServer(MssqlPool),
 }
 
-/// A backend-neutral transaction handle for atomically running a script
-/// (FRE-38): every statement runs on the one held connection, so they share a
+/// A backend-neutral transaction handle for atomically running a script:
+/// every statement runs on the one held connection, so they share a
 /// transaction that [`Self::commit`] or [`Self::rollback`] resolves as a unit.
 ///
 /// Each method body is pure per-variant dispatch into that backend's module
@@ -100,9 +100,9 @@ impl ScriptTx<'_> {
     ///
     /// The parameterized counterpart to [`Self::execute`], for writes whose
     /// values must not be interpolated into the SQL and whose atomicity spans
-    /// several statements: a file import (FRE-112) sends one batch of rows per
+    /// several statements: a file import sends one batch of rows per
     /// call and commits (or rolls back) all of them together. Scripts
-    /// (FRE-38) are raw text and use [`Self::execute`].
+    /// are raw text and use [`Self::execute`].
     pub async fn execute_with(&mut self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
         // `tx` deref-coerces to the `&mut Connection` these helpers take.
         match self {
@@ -194,7 +194,7 @@ impl DbPool {
         }
     }
 
-    /// Which engine answered on a Postgres-wire connection (FRE-90), or `None`
+    /// Which engine answered on a Postgres-wire connection, or `None`
     /// on a backend where the question doesn't arise.
     ///
     /// Deliberately not a branching point for callers: what varies by flavor
@@ -210,7 +210,7 @@ impl DbPool {
         }
     }
 
-    /// How this connection produces a query plan (FRE-119), or `None` when it
+    /// How this connection produces a query plan, or `None` when it
     /// has no `EXPLAIN` statement to produce one with — see
     /// [`NO_EXPLAIN`](super::plan::NO_EXPLAIN) for why SQL Server is that
     /// case.
@@ -234,7 +234,7 @@ impl DbPool {
         }
     }
 
-    /// This connection's default capabilities (FRE-87). The three drivers are
+    /// This connection's default capabilities. The three drivers are
     /// full-featured OLTP engines — they query, write, run DDL, hold
     /// transactions and page by `LIMIT`/`OFFSET` — so each declares
     /// [`Capabilities::FULL`]. Objects that are nonetheless not writable
@@ -245,14 +245,14 @@ impl DbPool {
     /// which is what the Postgres arm is for: RisingWave speaks the Postgres
     /// wire protocol and has real editable tables, but no read-write
     /// transactions at all — `BEGIN` raises a notice saying none was started
-    /// and `ROLLBACK` does nothing (FRE-93). Declaring that here is what makes
+    /// and `ROLLBACK` does nothing. Declaring that here is what makes
     /// the script tab stop wrapping batches
     /// ([`wrap_atomically`](super::script::wrap_atomically)) and editing
     /// refuse rather than run unguarded
     /// ([`NO_GUARDED_WRITE`](super::caps::NO_GUARDED_WRITE)).
     ///
     /// **This is what the engine can do, not what this connection may do.**
-    /// It knows nothing about the user's write protection (FRE-111), so a
+    /// It knows nothing about the user's write protection, so a
     /// gate that consults it lets a write through on a connection marked
     /// read-only. Gates want
     /// [`Connection::capabilities`] — hence the `backend_` prefix on both of
@@ -264,12 +264,12 @@ impl DbPool {
                 postgres::PgFlavor::RisingWave => Capabilities {
                     transactions: false,
                     // Nothing rolls back here at all, so schema changes
-                    // certainly don't (FRE-146).
+                    // certainly don't.
                     transactional_ddl: false,
                     ..Capabilities::FULL
                 },
                 // Real transactions that cover DML, and schema changes that
-                // escape them anyway (FRE-146). CockroachDB commits the open
+                // escape them anyway. CockroachDB commits the open
                 // transaction *before* each DDL statement
                 // (`autocommit_before_ddl`, on by default), so the schema
                 // change and everything written before it survive a rollback;
@@ -284,7 +284,7 @@ impl DbPool {
                 },
                 // Stock Postgres and Materialize roll back everything they
                 // are given, schema changes included (Materialize's rollback
-                // is genuine — FRE-92).
+                // is genuine; `tests/db_materialize.rs` exercises it).
                 postgres::PgFlavor::Postgres | postgres::PgFlavor::Materialize => {
                     Capabilities::FULL
                 }
@@ -301,7 +301,7 @@ impl DbPool {
     /// what the user is permitted to do with it. Exposing just this lets the
     /// two legitimate callers stop reaching for a full [`TableAccess`] they
     /// would then be tempted to read `can_mutate` off — which is how a gate
-    /// ends up silently ignoring the user's marking (FRE-111).
+    /// ends up silently ignoring the user's marking.
     pub fn backend_row_identity(&self, table: &TableMeta) -> Option<RowIdentity> {
         detect_row_identity(table, self.dialect())
     }
@@ -314,13 +314,14 @@ impl DbPool {
     /// row wants [`Self::backend_row_identity`]. It stays `pub` solely so the
     /// integration tests in `tests/` can build an unmarked [`TableAccess`] to
     /// drive the write paths with; if a use appears in `src/`, it is almost
-    /// certainly the FRE-111 bug this prefix exists to make visible.
+    /// certainly a gate ignoring the user's read-only marking — the bug this
+    /// prefix exists to make visible.
     pub fn backend_access(&self, table: &TableMeta) -> TableAccess {
         TableAccess::resolve(self.backend_capabilities(), table, self.dialect())
     }
 
     /// Runs a free-form read query, buffered. A zero-row result still carries
-    /// its column headers (FRE-138) — this is a user-facing result set, unlike
+    /// its column headers — this is a user-facing result set, unlike
     /// the projection-built reads behind [`Self::query_with`].
     pub async fn query(&self, sql: &str) -> Result<QueryResult, DbError> {
         match self {
@@ -342,8 +343,8 @@ impl DbPool {
         }
     }
 
-    /// Opens a transaction for atomically running a multi-statement script
-    /// (FRE-38). The returned [`ScriptTx`] runs statements on one connection so
+    /// Opens a transaction for atomically running a multi-statement script.
+    /// The returned [`ScriptTx`] runs statements on one connection so
     /// they share a transaction, then commits or rolls back as a unit.
     pub async fn begin_script_tx(&self) -> Result<ScriptTx<'_>, DbError> {
         match self {
@@ -391,7 +392,7 @@ impl DbPool {
     /// each affected exactly its expected row count. Any failure rolls the
     /// whole batch back; the error names the failing statement by index
     /// (`None` when opening or committing the transaction itself failed).
-    /// Staged edits (FRE-14) apply through this so a batch either lands
+    /// Staged edits apply through this so a batch either lands
     /// completely or not at all.
     pub async fn execute_all_checked(
         &self,
@@ -420,7 +421,7 @@ impl DbPool {
     }
 
     /// One page of a table with **bounded previews** of large columns (long
-    /// text / json / blobs): the grid's read path (FRE-33). `columns` are the
+    /// text / json / blobs): the grid's read path. `columns` are the
     /// table's visible columns (introspection order); `no_preview` names
     /// columns that must be fetched whole — the row-identity key columns and
     /// foreign-key columns, whose truncation would misaddress rows or
@@ -441,7 +442,7 @@ impl DbPool {
     }
 
     /// Streams an arbitrary read query, retaining at most `max_rows` rows and
-    /// capping each cell to [`QUERY_CELL_CAP`] bytes (FRE-33). Returns the
+    /// capping each cell to [`QUERY_CELL_CAP`] bytes. Returns the
     /// bounded result plus whether rows were dropped past the cap, so the SQL
     /// editor can show a "showing first N" indicator. Pulls rows one at a time
     /// (`fetch` + `try_next`) — the same streaming primitive as [`Self::export`].
@@ -465,7 +466,7 @@ impl DbPool {
     }
 
     /// Loads one cell's full value on demand — the lazy counterpart to the
-    /// grid's bounded page fetch (FRE-33). Builds a targeted
+    /// grid's bounded page fetch. Builds a targeted
     /// `SELECT <col> FROM <table> WHERE <full key> = …` from the row's
     /// [`RowLocator`], previewing at [`FETCH_CELL_MAX_BYTES`] so even a
     /// multi-GB cell returns a bounded prefix (flagged [`CellFetch::capped`])
@@ -530,7 +531,7 @@ impl DbPool {
         self.count_query(&sql, &params).await
     }
 
-    /// Exactly how many rows `table` holds, by running `COUNT(*)` (FRE-118).
+    /// Exactly how many rows `table` holds, by running `COUNT(*)`.
     ///
     /// **Only ever because the user asked.** This is the expensive half of the
     /// pair — a full scan on most engines — and the reason the schema pane's
@@ -561,7 +562,7 @@ impl DbPool {
     }
 
     /// Cheap storage statistics for one object: an estimated row count and its
-    /// on-disk size, read from statistics the server already keeps (FRE-118).
+    /// on-disk size, read from statistics the server already keeps.
     ///
     /// **Never scans.** Each backend answers from one catalog query, so this is
     /// safe to run whenever a table is merely looked at — which is the whole
@@ -600,7 +601,7 @@ impl DbPool {
     }
 
     /// DDL for one of `table`'s objects — the table/view itself, or one of
-    /// its indexes (FRE-108). Prefers the server's own definition and only
+    /// its indexes. Prefers the server's own definition and only
     /// reconstructs where the backend has no generator; the returned [`Ddl`]
     /// says which, and [`Ddl::text`] labels a reconstruction.
     pub async fn fetch_ddl(&self, table: &TableMeta, object: &DdlObject) -> Result<Ddl, DbError> {
@@ -635,7 +636,7 @@ impl DbPool {
 }
 
 /// Runs a catalog read, running it a second time if the server called the
-/// first failure transient ([`DbError::Transient`], FRE-147).
+/// first failure transient ([`DbError::Transient`]).
 ///
 /// The three operations wrapped in this are the multi-statement reads.
 /// [`DbPool::introspect`] is the one this exists for: its catalog queries each
@@ -673,7 +674,7 @@ where
     }
 }
 
-/// Refuses the grid's paged reads when `caps` can't express them (FRE-87).
+/// Refuses the grid's paged reads when `caps` can't express them.
 ///
 /// A connection that can't query at all has nothing to page; and both paged
 /// selects append a `LIMIT`/`OFFSET` tail unconditionally, so a backend that
@@ -695,7 +696,7 @@ pub struct Connection {
     pub id: ConnectionId,
     pub name: String,
     pub pool: DbPool,
-    /// The user's write protection for this connection (FRE-111), copied from
+    /// The user's write protection for this connection, copied from
     /// the [`SavedConnection`](crate::config::SavedConnection) it was opened
     /// from. It lives here rather than beside the pool because every gated
     /// path already has the connection in hand — making it hard to resolve
@@ -708,8 +709,8 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// This connection's **effective** capabilities: what the backend declares
-    /// (FRE-87), narrowed by the user's write protection (FRE-111).
+    /// This connection's **effective** capabilities: what the backend declares,
+    /// narrowed by the user's write protection.
     ///
     /// Every capability gate should read this rather than
     /// [`DbPool::capabilities`], which reports only what the engine can do.
@@ -762,8 +763,8 @@ impl ConnectionRegistry {
         id
     }
 
-    /// Re-marks an open connection after the user edits its saved entry
-    /// (FRE-111), so a tab that is already open starts obeying the new
+    /// Re-marks an open connection after the user edits its saved entry,
+    /// so a tab that is already open starts obeying the new
     /// protection without being reconnected.
     pub fn set_protection(&mut self, id: ConnectionId, protection: WriteProtection) {
         if let Some(connection) = self.connections.iter_mut().find(|c| c.id == id) {

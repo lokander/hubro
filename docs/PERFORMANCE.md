@@ -1,9 +1,9 @@
-# Performance budgets and baseline (FRE-34)
+# Performance budgets and baseline
 
 This document records the performance **budgets** Hubro commits to and the
 **baseline** measured on the dev machine. The budgets are the contract that
-FRE-32 (virtual scrolling) and FRE-33 (bounded memory / streaming) must keep
-meeting — they turn "feels fast" into a number a test can fail on.
+virtual scrolling and bounded memory / streaming must keep meeting — they turn
+"feels fast" into a number a test can fail on.
 
 ## How to measure
 
@@ -53,9 +53,9 @@ flaking, yet still fail on an order-of-magnitude regression.
 | `time_to_first_rows` | `count_rows` + `fetch_page(LIMIT 100)` on table open | 900 ms | The user-visible "table opened" latency; dominated by the COUNT(\*) scan. |
 | `count_rows` | `COUNT(*)` full scan of 1M rows | 800 ms | The grid's row-count indicator. A regression that decodes every row instead of counting the rowid b-tree blows past this. |
 | `page_nav_shallow` | `fetch_page(LIMIT 100, OFFSET 0)` | 100 ms | Normal page-to-page navigation should feel instant. |
-| `page_nav_deep` | `fetch_page(LIMIT 100)` near row 1,000,000 | 3000 ms | OFFSET paging is O(offset) in SQLite; this is the loosest budget on purpose and is exactly what keyset pagination (FRE-32) should collapse. |
+| `page_nav_deep` | `fetch_page(LIMIT 100)` near row 1,000,000 | 3000 ms | OFFSET paging is O(offset) in SQLite; this is the loosest budget on purpose and is exactly what keyset pagination should collapse. |
 | `schema_load` | `introspect()` on 300 tables | 1500 ms | The schema sidebar on a large database. |
-| `big_value_page` | `fetch_page(LIMIT 100)` over 4× (4 MiB TEXT + 4 MiB BLOB) rows | 500 ms | Fetching fat rows must not stall; the budget for FRE-33 to keep meeting while it bounds memory. |
+| `big_value_page` | `fetch_page(LIMIT 100)` over 4× (4 MiB TEXT + 4 MiB BLOB) rows | 500 ms | Fetching fat rows must not stall; the budget for bounded-memory paging to keep meeting. |
 
 Postgres is **parity-only**: SQLite is the deterministic, no-dependency budget.
 An optional `budget_postgres_parity` test (gated on `HUBRO_PG_TEST_URL`,
@@ -86,11 +86,12 @@ Notes:
   release — the work is inside SQLite's C core, not the Rust glue. Rust-heavy
   paths (`schema_load` building metadata) are noticeably faster in release.
 - `page_nav_deep` at ~a third of a second for a single 100-row page confirms the
-  O(offset) cost of OFFSET paging: this is the headline motivation for FRE-32.
+  O(offset) cost of OFFSET paging: this is the headline motivation for virtual
+  scrolling.
 
-## Virtual scrolling (FRE-32)
+## Virtual scrolling
 
-The budgets above are db-layer numbers. FRE-32 addresses the *other* half of a
+The budgets above are db-layer numbers. Virtual scrolling addresses the *other* half of a
 "table opened" — how long WebKitGTK spends laying out and painting a page's
 worth of rows, and how smoothly it scrolls — which the db harness can't see.
 
@@ -139,7 +140,7 @@ implemented true windowing instead.
   (amber) and pending-delete (red) tints, truncated-preview expand, and FK ↗
   jumps all survive a row scrolling out and back (their state lives in signals
   keyed by row key, re-read when the row re-enters the window). The keyboard
-  focus ring (FRE-15) still works: arrowing to an offscreen row scrolls it into
+  focus ring still works: arrowing to an offscreen row scrolls it into
   view (by its computed offset, since row height is fixed), which brings it into
   the window and keeps the ring.
 - One edge with inline editing: if an *open* cell editor is scrolled entirely
@@ -153,7 +154,7 @@ implemented true windowing instead.
 Unchanged, deliberately: the grid still pages at LIMIT `PAGE_SIZE` = 100 with
 Prev/Next, and windowing applies **within** the current page. Scrolling across a
 page boundary still uses the pager. This is the low-risk choice — it keeps
-per-page memory bounded (FRE-33) and leaves the fetch/count path alone. A larger
+per-page memory bounded and leaves the fetch/count path alone. A larger
 page or infinite-scroll-within-a-window would be a separate, bigger change.
 
 ### In-budget counts
@@ -166,12 +167,12 @@ page or infinite-scroll-within-a-window would be a separate, bigger change.
   far higher, revisit with the same measurement.
 - **Rows per page:** the whole page (100) is safe; the DOM footprint is bounded
   by the viewport (~24–44 rows) regardless of page height, so raising
-  `PAGE_SIZE` later stays render-safe (re-check the FRE-34 memory budget first).
+  `PAGE_SIZE` later stays render-safe (re-check the memory budget first).
 
 ### Reproducing the measurement
 
 The webview render numbers are gathered manually (there is no automated webview
-timing harness — the FRE-34 budgets cover the db layer). Build a wide fixture
+timing harness — the budgets above cover the db layer). Build a wide fixture
 (e.g. `common::FixtureDb::wide(5000, 120)` dumped to a file, or any 100+‑column
 table), open it in the app, and in a `document::eval` probe count
 `#dv-grid tbody tr` / `td` and time a forced relayout

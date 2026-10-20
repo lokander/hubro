@@ -1,4 +1,4 @@
-//! Integration tests for "Show DDL" (FRE-108).
+//! Integration tests for "Show DDL".
 //!
 //! The SQLite half always runs. The Postgres and SQL Server halves need a
 //! server (Docker only, per CLAUDE.md) and skip unless `HUBRO_PG_TEST_URL` /

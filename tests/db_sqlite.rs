@@ -23,8 +23,7 @@ async fn open_missing_file_is_a_connect_error() {
         .expect("opening a missing file must fail");
     assert!(matches!(err, DbError::Connect(_)));
     // hubro's wording, naming the path — not the driver's "(code: 14) unable
-    // to open database file", which says neither what went wrong nor where
-    // (FRE-114).
+    // to open database file", which says neither what went wrong nor where.
     assert!(
         err.to_string()
             .contains("no such file: /nonexistent/nope.db"),
@@ -58,7 +57,7 @@ async fn open_a_directory_is_a_connect_error() {
 
 #[tokio::test]
 async fn open_empty_file_succeeds_like_sqlite_itself() {
-    // The pre-flight header check (FRE-114) lets a zero-length file through on
+    // The pre-flight header check lets a zero-length file through on
     // the claim that SQLite treats one as a valid empty database. This holds
     // the driver to that claim: were it to stop being true, the check would be
     // accepting a file the app then fails to open.
@@ -380,7 +379,7 @@ async fn query_with_no_rows_yields_empty_result_with_its_headers() {
     let fixture = FixtureDb::full().await;
     let pool = fixture.open().await;
 
-    // A zero-row result still names its columns (FRE-138): the grid shows the
+    // A zero-row result still names its columns: the grid shows the
     // shape of what was asked for rather than a blank pane, which is also what
     // the SQL Server backend has always done (TDS sends result-set metadata
     // even for zero rows). The sqlx backends have no row to read the names
@@ -510,7 +509,7 @@ async fn sqlite_explains_a_query_as_raw_output() {
     let fixture = FixtureDb::full().await;
     let pool = fixture.open().await;
 
-    // SQLite gets the degrade path (FRE-119): a dialect-appropriate EXPLAIN,
+    // SQLite gets the degrade path: a dialect-appropriate EXPLAIN,
     // shown verbatim. Only PostgreSQL's JSON is parsed into a tree, and
     // claiming otherwise here would render a plan hubro invented.
     let support = pool

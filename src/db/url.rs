@@ -128,7 +128,7 @@ impl UrlScheme {
         }
         match parsed.port() {
             // 0 is not a usable port; reject it here so a pasted URL is held
-            // to the same rule as the connection form (FRE-42).
+            // to the same rule as the connection form.
             Some(0) => return Err(DbError::Connect("port must be between 1 and 65535".into())),
             // Both engines use non-special schemes, so the url crate always
             // serializes an explicit port — the bare and `:<default>` forms
@@ -289,8 +289,7 @@ mod tests {
 
     #[test]
     fn normalize_rejects_a_zero_port() {
-        // The pasted-URL path is held to the same rule as the form fields
-        // (FRE-42).
+        // The pasted-URL path is held to the same rule as the form fields.
         assert!(POSTGRES.normalize("postgres://user@host:0/db").is_err());
         assert!(POSTGRES.normalize("postgres://user@host:5432/db").is_ok());
         assert!(MSSQL.normalize("mssql://user@host:0/db").is_err());
@@ -354,7 +353,7 @@ mod tests {
     #[test]
     fn build_rejects_a_zero_port_and_empty_host() {
         for scheme in [&POSTGRES, &MSSQL] {
-            // 0 parses as a valid u16 but is not a usable port (FRE-42).
+            // 0 parses as a valid u16 but is not a usable port.
             assert!(scheme.build("host", "0", "db", "user", "").is_err());
             assert!(scheme.build("host", "70000", "db", "user", "").is_err());
             let err = scheme.build("  ", "5432", "db", "u", "").unwrap_err();

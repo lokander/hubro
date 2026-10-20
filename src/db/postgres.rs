@@ -2,7 +2,7 @@
 //! and export paths), script transactions, DDL retrieval, and full
 //! multi-schema introspection — every user schema's tables and views with
 //! columns, primary keys, indexes, and foreign keys, with extension
-//! bookkeeping and child partitions marked internal (FRE-88).
+//! bookkeeping and child partitions marked internal.
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -69,7 +69,7 @@ pub fn build_url(
     super::url::POSTGRES.build(host, port, database, user, sslmode)
 }
 
-/// Which engine answered the Postgres wire handshake (FRE-90).
+/// Which engine answered the Postgres wire handshake.
 ///
 /// hubro speaks one protocol to a family of servers: stock PostgreSQL, the
 /// extensions layered on it (TimescaleDB, Citus) which are the same engine and
@@ -77,21 +77,22 @@ pub fn build_url(
 /// own variant.
 ///
 /// **Nothing in the backend branches on this today, and that is the intended
-/// state.** Both problems FRE-90 found on CockroachDB looked like they needed
-/// the engine's identity and turned out not to: a 64-bit `ordinal_position` is
-/// fixed by pinning the width in SQL for everyone, and its reserved catalog
-/// schemas are found through `table_type`, which is the server's own
-/// classification. A catalog fact beats knowing the name every time — it
-/// reports what this server actually does rather than what its name implies,
-/// it needs no update when an engine changes behaviour between versions, and
-/// it keeps the FRE-88 rule against name-matching intact. Reach for a flavor
-/// check only when no catalog fact answers the question.
+/// state.** Both problems found while verifying CockroachDB looked like they
+/// needed the engine's identity and turned out not to: a 64-bit
+/// `ordinal_position` is fixed by pinning the width in SQL for everyone, and
+/// its reserved catalog schemas are found through `table_type`, which is the
+/// server's own classification. A catalog fact beats knowing the name every
+/// time — it reports what this server actually does rather than what its name
+/// implies, it needs no update when an engine changes behaviour between
+/// versions, and it keeps intact the rule that internal objects are found by
+/// catalog facts, never by name patterns. Reach for a flavor check only when
+/// no catalog fact answers the question.
 ///
 /// It exists because one such question is already known: Materialize's
-/// capabilities (FRE-92) are a property of the engine, not of anything in its
-/// catalog, and [`Capabilities`](super::caps::Capabilities) must be declared
-/// at connect. It is carried from FRE-90 rather than added there because the
-/// `version()` call that answers it is the liveness check the connect path
+/// capabilities are a property of the engine, not of anything in its catalog,
+/// and [`Capabilities`](super::caps::Capabilities) must be declared at
+/// connect. It was added with the CockroachDB work rather than later because
+/// the `version()` call that answers it is the liveness check the connect path
 /// already made, so having the answer costs nothing — and because the finding
 /// that most of these engines *don't* need it is worth recording in code
 /// rather than losing.
@@ -109,16 +110,14 @@ pub enum PgFlavor {
     /// the hosted providers.
     Postgres,
     /// CockroachDB — a reimplementation of the wire protocol and SQL layer
-    /// over its own storage (FRE-90).
+    /// over its own storage.
     CockroachDB,
-    /// YugabyteDB — the real PostgreSQL query layer over its own storage
-    /// (FRE-91).
+    /// YugabyteDB — the real PostgreSQL query layer over its own storage.
     Yugabyte,
-    /// Materialize — a streaming engine speaking the Postgres wire protocol
-    /// (FRE-92).
+    /// Materialize — a streaming engine speaking the Postgres wire protocol.
     Materialize,
     /// RisingWave — a streaming engine with real, editable tables, but no
-    /// read-write transactions (FRE-93).
+    /// read-write transactions.
     RisingWave,
 }
 
@@ -180,8 +179,8 @@ impl PgConn {
 ///
 /// Note for anyone reaching for `after_connect` to set a per-engine session
 /// default here: CockroachDB's `autocommit_before_ddl` is the obvious
-/// candidate, since leaving it on costs a script its atomicity (FRE-146).
-/// Turning it off was tried in FRE-90 and reverted — it makes every
+/// candidate, since leaving it on costs a script its atomicity. Turning it off
+/// was tried during CockroachDB verification and reverted — it makes every
 /// `ALTER TABLE`/`CREATE INDEX` fail against a schema-locked table, which is
 /// how CockroachDB creates tables by default, so it breaks a common operation
 /// to fix a rarer one. `tests/db_cockroach.rs` pins the resulting behaviour.
@@ -194,7 +193,7 @@ pub async fn open_postgres(url: &str) -> Result<PgConn, DbError> {
     // `SELECT version()` in place of the `SELECT 1` this used to run: it is
     // the same liveness check — one round trip on a connection the pool has
     // already opened — and it answers who the server is at the same time, so
-    // knowing the flavor costs nothing (FRE-90).
+    // knowing the flavor costs nothing.
     let version: String = sqlx::query_scalar("SELECT version()")
         .fetch_one(&pool)
         .await
@@ -224,7 +223,7 @@ fn friendly_connect_error(err: &sqlx::Error) -> String {
         // which reads as "encrypt if you can" but cannot fall back once the
         // TLS handshake has begun. libpq connects to such servers happily, so
         // without this the failure looks like hubro being broken rather than
-        // the certificate being two decades out of date (FRE-89).
+        // the certificate being two decades out of date.
         //
         // Not exotic: the official `citusdata/citus` image generates exactly
         // such a certificate on first boot. Verified that a *valid* v3
@@ -273,7 +272,7 @@ fn bind_params<'q>(mut query: PgQuery<'q>, params: &[Value]) -> PgQuery<'q> {
 
 /// Runs an arbitrary query, decoding every cell into the backend-neutral
 /// [`Value`] model. Free-form SQL whose result is shown to the user, so a
-/// zero-row result recovers its headers (FRE-138).
+/// zero-row result recovers its headers.
 pub async fn query(pool: &PgPool, sql: &str) -> Result<QueryResult, DbError> {
     let mut result = query_with(pool, sql, &[]).await?;
     sqlx_common::fill_headers(&mut result, pool, sql).await;
@@ -297,8 +296,8 @@ pub async fn query_with(
 
 /// Streams `sql` one row at a time (`fetch`, not `fetch_all`), decoding and
 /// retaining at most `max_rows` rows and capping each cell to `cell_cap`
-/// bytes, so the free-form query path never scales with table or value size
-/// (FRE-33). Returns the (bounded) result and whether more rows existed
+/// bytes, so the free-form query path never scales with table or value size.
+/// Returns the (bounded) result and whether more rows existed
 /// beyond the cap.
 pub async fn query_capped(
     pool: &PgPool,
@@ -319,7 +318,7 @@ pub async fn query_capped(
 
 /// [`query_capped`] against a single connection (e.g. one borrowed from a
 /// transaction) rather than the pool — the read path for statements inside an
-/// atomically-wrapped script (FRE-38). No bound params: scripts are raw text.
+/// atomically-wrapped script. No bound params: scripts are raw text.
 pub async fn query_capped_conn(
     conn: &mut sqlx::postgres::PgConnection,
     sql: &str,
@@ -338,7 +337,7 @@ pub async fn query_capped_conn(
 
 /// Runs a non-row statement on a single connection (e.g. one borrowed from a
 /// transaction) rather than the pool, returning affected rows — the write
-/// path for statements inside an atomically-wrapped script (FRE-38).
+/// path for statements inside an atomically-wrapped script.
 pub async fn execute_conn(
     conn: &mut sqlx::postgres::PgConnection,
     sql: &str,
@@ -347,7 +346,7 @@ pub async fn execute_conn(
 }
 
 /// [`execute_conn`] with bound parameters — the write path for a batch of
-/// imported rows (FRE-112), which must run inside the caller's transaction
+/// imported rows, which must run inside the caller's transaction
 /// and must not interpolate its values into the SQL.
 pub async fn execute_with_conn(
     conn: &mut sqlx::postgres::PgConnection,
@@ -402,7 +401,7 @@ pub async fn execute(pool: &PgPool, sql: &str) -> Result<u64, DbError> {
 /// index of the failing statement (`None` for begin/commit failures, which
 /// belong to no statement). This is the safety net for row edits: a WHERE
 /// clause that unexpectedly matches more (or fewer) rows than the one being
-/// edited must never commit — and with staged edits (FRE-14), neither may
+/// edited must never commit — and with staged edits, neither may
 /// any sibling change in the same batch.
 pub async fn execute_all_checked(
     pool: &PgPool,
@@ -463,7 +462,7 @@ fn query_error(err: sqlx::Error, sql: &str) -> DbError {
 }
 
 /// SQLSTATE `40001` — `serialization_failure`, the standard code for "this
-/// failed against a concurrent change; run it again" (FRE-147).
+/// failed against a concurrent change; run it again".
 ///
 /// The code, never the message. Two of the engines in this family raise it for
 /// reasons whose *text* shares nothing: YugabyteDB's catalog snapshot going
@@ -517,8 +516,8 @@ fn line_col(sql: &str, position: usize) -> Option<(usize, usize)> {
 
 /// Why a streaming engine's source is not editable.
 ///
-/// Worded for the object rather than the engine: both Materialize (FRE-92) and
-/// RisingWave (FRE-93) report `SOURCE`, and naming one of them in a message the
+/// Worded for the object rather than the engine: both Materialize and
+/// RisingWave report `SOURCE`, and naming one of them in a message the
 /// other also shows would be worse than saying nothing.
 const STREAMING_SOURCE: &str =
     "A source is written by the engine from an external system, not by hand.";
@@ -528,22 +527,22 @@ const STREAMING_SOURCE: &str =
 /// A sink is the only object here with no rows *at all* — it writes outward, to
 /// Kafka or another database. Without this it fell through to an ordinary
 /// table, which offered editing on nothing and failed on open with the
-/// engine's own "table or source not found" (FRE-93).
+/// engine's own "table or source not found".
 ///
 /// Carried by [`Restriction::NoRows`] rather than `Declared`, so the sentence
 /// below is what the *grid* shows in place of that failure, not only what the
-/// editing affordance shows (FRE-148).
+/// editing affordance shows.
 const STREAMING_SINK: &str =
     "A sink writes to an external system; it has no rows of its own to show.";
 
-/// Which optional catalog columns a server actually has (FRE-92).
+/// Which optional catalog columns a server actually has.
 ///
 /// Every Postgres-wire engine claims an `information_schema`, and they do not
 /// agree on what is in it: Materialize's `columns` view has eleven columns to
 /// stock Postgres's forty-four, and `pg_index.indnkeyatts` only exists where
 /// there are INCLUDE columns to exclude. Selecting a column the server does not
 /// have fails the whole statement, which empties the schema tree exactly as
-/// CockroachDB's `pk_position` width did (FRE-90).
+/// CockroachDB's `pk_position` width did.
 struct CatalogShape {
     column_query: ColumnQuery,
     /// Whether the index query may bound its key columns with `indnkeyatts`.
@@ -557,7 +556,7 @@ struct CatalogShape {
 /// happened to fail", and the two want opposite handling: the first should
 /// degrade, the second must not. A transient failure — YugabyteDB's
 /// `MISMATCHED_SCHEMA` fires during introspection on roughly half of that
-/// engine's test runs (FRE-147) — would otherwise be swallowed by a retry in
+/// engine's test runs — would otherwise be swallowed by a retry in
 /// the portable shape that *succeeds with wrong answers*: identity columns
 /// reported as ordinary, enums stripped of their variants, arrays of their
 /// structure. Silently, on an engine that has all three. A real error now
@@ -627,21 +626,21 @@ enum ColumnQuery {
 
 /// Columns for every relation, with primary-key positions resolved in SQL.
 ///
-/// Identity and generated columns carry a NULL `column_default` even though the
-/// database supplies their value, so `is_identity`/`identity_generation`/
+/// Identity and generated columns carry a NULL `column_default` even though
+/// the database supplies their value, so `is_identity`/`identity_generation`/
 /// `is_generated` are surfaced separately and mapped into
-/// [`ColumnMeta::generated`] (FRE-25 required-column detection and read-only
-/// gating). Materialized-view columns are not in `information_schema.columns`
-/// at all, so they come from `pg_attribute` via a UNION (FRE-41) — matviews
-/// have no PK, identity or generated columns, so those are constant in that
-/// half, and `format_type` yields the type name with its modifiers (e.g.
-/// `character varying(255)`). `ord` orders columns within a relation across
-/// both halves.
+/// [`ColumnMeta::generated`] (required-column detection on row insert, and
+/// read-only gating). Materialized-view columns are not in
+/// `information_schema.columns` at all, so they come from `pg_attribute` via a
+/// UNION — matviews have no PK, identity or generated columns, so those are
+/// constant in that half, and `format_type` yields the type name with its
+/// modifiers (e.g. `character varying(255)`). `ord` orders columns within a
+/// relation across both halves.
 ///
 /// `pk_position` is cast to `int8` rather than taken as it comes: the SQL
 /// standard leaves `information_schema` positions as an implementation-defined
 /// exact numeric, and CockroachDB makes `key_column_usage.ordinal_position`
-/// 64-bit where stock Postgres makes it 32-bit (FRE-90). Decoding is exact by
+/// 64-bit where stock Postgres makes it 32-bit. Decoding is exact by
 /// wire type, so the mismatch failed the *whole* introspection. Pinning the
 /// width costs nothing on Postgres and makes the decode independent of what any
 /// engine chose.
@@ -717,14 +716,14 @@ fn column_query(shape: ColumnQuery) -> String {
 pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     let pool = conn.pool();
     // A serialization failure keeps its own variant so the caller can retry
-    // it (FRE-147); anything else is an introspection failure like any other.
+    // it; anything else is an introspection failure like any other.
     let map_err = |e: sqlx::Error| match is_transient(&e) {
         true => DbError::Transient(e.to_string()),
         false => DbError::Introspect(e.to_string()),
     };
 
     // Objects that are the database's own bookkeeping rather than the user's
-    // data (FRE-88), from the three sources Postgres has. All three are
+    // data, from the three sources Postgres has. All three are
     // catalog facts, never name patterns — a user table genuinely called
     // `spatial_ref_sys` is the user's.
     //
@@ -745,8 +744,8 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     // The placeholder is `NULL::text` rather than the `name` that would match
     // its sibling columns: `name` is a PostgreSQL-internal type, and an engine
     // reimplementing the catalog need not have it — RisingWave does not, and
-    // failed to bind the cast at all, taking the whole introspection with it
-    // (FRE-93). Text unions with `name` on every engine that has both, and the
+    // failed to bind the cast at all, taking the whole introspection with it.
+    // Text unions with `name` on every engine that has both, and the
     // value is decoded as a string either way.
     //
     // `deptype = 'e'` on the first two: that is the code for "member of the
@@ -820,7 +819,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     };
     let (has_citus, has_timescale) = (has_extension("citus"), has_extension("timescaledb"));
 
-    // Citus shard tables (FRE-89). Citus normally keeps these out of
+    // Citus shard tables. Citus normally keeps these out of
     // `pg_class` for client queries itself, so introspection never sees them
     // and this finds nothing — but that hiding is a *setting*
     // (`citus.show_shards_for_app_name_prefixes`), and with it widened a
@@ -888,7 +887,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     }
 
     // Timescale's own vocabulary for objects that are otherwise ordinary
-    // tables and views (FRE-88), so a hypertable reads as one instead of
+    // tables and views, so a hypertable reads as one instead of
     // looking like a table that mysteriously has chunks. Best-effort: these
     // information views are stable across Timescale 2.x, but a badge is not
     // worth failing a whole introspection over if a future version moves
@@ -919,7 +918,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
         }
     }
 
-    // Schemas Materialize reserves for its own catalog (FRE-92). It exposes
+    // Schemas Materialize reserves for its own catalog. It exposes
     // five beyond the two excluded above — `mz_catalog`, `mz_internal`,
     // `mz_introspection`, `mz_unsafe`, `mz_catalog_unstable` — holding 265
     // objects between them, which would otherwise be the overwhelming majority
@@ -956,7 +955,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
         }
     }
 
-    // RisingWave's own catalog (FRE-93). `rw_catalog` holds 74 objects and is
+    // RisingWave's own catalog. `rw_catalog` holds 74 objects and is
     // listed like any user schema, so without this it is most of the schema
     // tree.
     //
@@ -977,12 +976,12 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
 
     // Tables and views across all non-system schemas. Materialized views
     // (relkind 'm') are not in stock Postgres's information_schema, so they
-    // come from a pg_catalog UNION (FRE-41).
+    // come from a pg_catalog UNION.
     //
     // "Not in information_schema" is a PostgreSQL choice, not a rule: Materialize
     // lists its materialized views there *and* reports `relkind = 'm'`, so both
     // halves of the UNION claim them and every such object arrived twice —
-    // once whole, once as a duplicate that later grouping left empty (FRE-92).
+    // once whole, once as a duplicate that later grouping left empty.
     // The second half therefore takes only what the first did not, which is a
     // no-op on any server that behaves like stock Postgres.
     let table_rows = sqlx::query(
@@ -1009,10 +1008,10 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     // constraint), one row per column. Identity and generated columns have a
     // NULL column_default even though the database supplies their value, so
     // `is_identity`/`identity_generation`/`is_generated` are surfaced
-    // separately and mapped into `ColumnMeta.generated` (FRE-25 required-
-    // column detection and read-only gating).
+    // separately and mapped into `ColumnMeta.generated` (required-column
+    // detection on row insert, and read-only gating).
     // Materialized-view columns aren't in information_schema.columns either, so
-    // they come from pg_catalog (pg_attribute) via a UNION (FRE-41). Matviews
+    // they come from pg_catalog (pg_attribute) via a UNION. Matviews
     // have no PK, identity, or generated columns, so those are constant here;
     // `format_type` yields the type name (with modifiers, e.g.
     // `character varying(255)`). `ord` orders columns within a relation across
@@ -1022,12 +1021,12 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     // standard leaves `information_schema` positions as an implementation-
     // defined exact numeric, and CockroachDB makes
     // `key_column_usage.ordinal_position` a 64-bit integer where stock
-    // Postgres makes it 32-bit (FRE-90). Decoding is exact by wire type, so
+    // Postgres makes it 32-bit. Decoding is exact by wire type, so
     // the mismatch failed the *whole* introspection — one column's width
     // taking down the entire schema tree. Pinning the width in SQL costs
     // nothing on Postgres and makes the decode independent of what any
     // Postgres-wire engine chose here.
-    // Which of the optional catalog columns this server actually has (FRE-92).
+    // Which of the optional catalog columns this server actually has.
     // Asked once, before anything depends on the answer.
     let shape = catalog_shape(pool).await;
 
@@ -1036,8 +1035,8 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
         .await
         .map_err(map_err)?;
 
-    // Enum variants for every enum type in the database, keyed by type OID
-    // (FRE-71). One query rather than per-column: enum types are few and a
+    // Enum variants for every enum type in the database, keyed by type OID.
+    // One query rather than per-column: enum types are few and a
     // type is typically shared by several columns. `enumsortorder` is
     // declaration order, which is the order the editor's dropdown offers.
     let enum_rows = sqlx::query(
@@ -1064,11 +1063,11 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     // for a set-returning function in FROM, so the keyword adds nothing there,
     // and RisingWave's parser rejects it outright — it wants a subquery after
     // `LATERAL` and fails to prepare the statement, taking introspection with
-    // it (FRE-93). Verified equivalent on every engine in this milestone.
+    // it. Verified equivalent on every engine in this milestone.
     //
     // `indnkeyatts` separates an index's key columns from its INCLUDE payload,
     // and is absent on engines that have no INCLUDE to separate — Materialize
-    // among them (FRE-92). Dropped from the query on those servers rather than
+    // among them. Dropped from the query on those servers rather than
     // failing it. On an engine without INCLUDE that changes nothing; there is
     // no engine with INCLUDE that hides the count, and if one appeared its
     // payload columns would read as key columns.
@@ -1136,7 +1135,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
         let name: String = get(row, "table_name")?;
         let key = (schema.clone(), name.clone());
         // `SYSTEM VIEW` is the engine's own catalog, in a schema it reserves
-        // beyond the two excluded above (FRE-90). CockroachDB reports 119 such
+        // beyond the two excluded above. CockroachDB reports 119 such
         // objects — `crdb_internal` and `pg_extension` — and lists them here
         // exactly as it lists the user's tables, so without this the schema
         // tree is mostly Cockroach's bookkeeping, and most of it does not even
@@ -1144,14 +1143,15 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
         // `allow_unsafe_internals`).
         //
         // Taken from `table_type` rather than from a list of schema names,
-        // which is what FRE-88 rules out: this is the server's own
+        // which the catalog-facts-not-names rule for internal objects rules
+        // out: this is the server's own
         // classification of the object, in a query already being run. Stock
         // PostgreSQL never emits the value — it has nothing left to classify
         // once `pg_catalog` and `information_schema` are excluded — so the
         // rule needs no engine check and costs nothing to carry.
         let system = matches!(table_type.as_str(), "SYSTEM VIEW" | "SYSTEM TABLE");
-        // A streaming engine's edges, on both Materialize (FRE-92) and
-        // RisingWave (FRE-93). A source is continuously written by the engine
+        // A streaming engine's edges, on both Materialize and
+        // RisingWave. A source is continuously written by the engine
         // from somewhere else — Kafka, Postgres replication, a load generator
         // — so it is readable and never writable by hand, which is a view's
         // contract rather than a table's. A sink is the mirror image: it
@@ -1168,9 +1168,9 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
             .or_else(|| internal_schemas.get(&schema).cloned());
         let kind_label = kind_labels.get(&key).cloned().or_else(|| {
             // Materialize's own vocabulary for the object kind that has no
-            // Postgres equivalent (FRE-92), so a source reads as one instead of
+            // Postgres equivalent, so a source reads as one instead of
             // as a mysteriously unwritable view. Same treatment `hypertable`
-            // and `continuous aggregate` get on Timescale (FRE-88): the label
+            // and `continuous aggregate` get on Timescale: the label
             // refines the kind rather than replacing it.
             if source {
                 Some("source".to_string())
@@ -1199,7 +1199,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             // Per-object narrowing only where the driver knows something the
-            // resolver cannot derive (FRE-87). Kind and row identity carry the
+            // resolver cannot derive. Kind and row identity carry the
             // rest, so this is `None` for everything but a streaming engine's
             // two edges. A *source* resolves to a view and would otherwise be
             // refused with "Views are read-only", a sentence that sends the
@@ -1209,8 +1209,8 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
                 Some(Restriction::Declared(STREAMING_SOURCE))
             } else if sink {
                 // `NoRows`, not `Declared`: a sink stores nothing, so this one
-                // declaration has to stop it being *opened* as well as edited
-                // (FRE-148). Not gated on the flavor — `table_type = 'SINK'`
+                // declaration has to stop it being *opened* as well as edited.
+                // Not gated on the flavor — `table_type = 'SINK'`
                 // is the server's own classification, so any engine reporting
                 // it inherits this.
                 Some(Restriction::NoRows(STREAMING_SINK))
@@ -1223,7 +1223,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     }
     // (schema, table) → index into `tables`, built once so grouping the
     // column/index/FK rows below is a hash lookup per row instead of a linear
-    // scan over every table (FRE-133).
+    // scan over every table.
     let mut table_index: HashMap<(String, String), usize> = HashMap::with_capacity(tables.len());
     for (idx, table) in tables.iter().enumerate() {
         if let Some(schema) = &table.schema {
@@ -1259,7 +1259,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
             Generated::Never
         };
         // `data_type` is opaque for these two ('USER-DEFINED', 'ARRAY'), so
-        // the editor's structure comes from pg_type instead (FRE-71).
+        // the editor's structure comes from pg_type instead.
         let typtype: Option<String> = get(row, "typtype")?;
         let typcategory: Option<String> = get(row, "typcategory")?;
         let type_oid: Option<i64> = get(row, "type_oid")?;
@@ -1332,7 +1332,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     Ok(tables)
 }
 
-/// DDL for one object (FRE-108).
+/// DDL for one object.
 ///
 /// Postgres renders view and index definitions itself (`pg_get_viewdef`,
 /// `pg_get_indexdef`), and those come back verbatim. It has no `CREATE TABLE`
@@ -1421,7 +1421,7 @@ pub async fn fetch_ddl(
     Ok(create_table_sql(Dialect::Postgres, table, &extras))
 }
 
-/// Which storage statistics this server can be asked for (FRE-118).
+/// Which storage statistics this server can be asked for.
 ///
 /// The same probe-don't-guess discipline as [`catalog_shape`], for the same
 /// reason: `pg_class` is the one catalog every Postgres-wire engine claims to
@@ -1456,7 +1456,7 @@ impl StatsShape {
 ///
 /// Asked of `pg_attribute`/`pg_proc` rather than by running the real query and
 /// catching the failure, so "this server has no such column" stays
-/// distinguishable from "that query happened to fail" (FRE-92).
+/// distinguishable from "that query happened to fail".
 async fn stats_shape(pool: &PgPool) -> Result<StatsShape, DbError> {
     let (columns, size_fn) = sqlx::query_as::<_, (i64, i64)>(
         "SELECT \
@@ -1482,7 +1482,7 @@ async fn stats_shape(pool: &PgPool) -> Result<StatsShape, DbError> {
 }
 
 /// Row count and on-disk size for one table, from statistics the server already
-/// keeps (FRE-118). Never scans: the row half is the planner's estimate, and an
+/// keeps. Never scans: the row half is the planner's estimate, and an
 /// exact number is a separate, explicit `COUNT(*)`.
 ///
 /// Anything the server does not keep comes back as `None` rather than as a
@@ -1800,7 +1800,7 @@ fn decode_typed(row: &PgRow, idx: usize, raw: &PgValueRef) -> Option<Value> {
         )),
         "UUID" => Some(Value::Text(row.try_get::<Uuid, _>(idx).ok()?.to_string())),
         // Bit strings, as the `0`/`1` text the server prints and the editor
-        // accepts back (FRE-159). sqlx has no built-in decode for these
+        // accepts back. sqlx has no built-in decode for these
         // without the `bit-vec` feature, so without this arm they degraded to
         // the `<bit>` marker — which is not merely a display gap: that marker
         // becomes the row locator for a `bit(n)` primary key, so the save it
@@ -2104,7 +2104,7 @@ mod tests {
     fn each_engine_is_identified_from_the_version_string_it_really_sends() {
         // Verbatim `version()` output from the containers the engine tests run
         // against, so this stays a test of real strings rather than of strings
-        // written to match the parser (FRE-90/91/92).
+        // written to match the parser.
         for (version, expected) in [
             (
                 "PostgreSQL 17.10 on x86_64-pc-linux-musl, compiled by gcc \
@@ -2216,7 +2216,7 @@ mod tests {
         let friendly = friendly_connect_error(&not_pg);
         assert!(friendly.starts_with("the server doesn't appear to be Postgres"));
         assert!(!friendly.starts_with("TLS error"));
-        // An X.509 v1 server certificate (FRE-89). rustls's own wording names
+        // An X.509 v1 server certificate. rustls's own wording names
         // neither "tls" nor "ssl", so without its own arm this would fall
         // through to the uncategorized branch and reach the user as
         // `UnsupportedCertVersion` — true, and useless.

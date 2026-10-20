@@ -1,6 +1,6 @@
-//! The staged-edit layer (FRE-14/24/25): staging cell edits, inserts and
+//! The staged-edit layer: staging cell edits, inserts and
 //! deletes, the dirty/saving predicates the UI gates on, and the save path
-//! with its write-protection confirmation (FRE-111).
+//! with its write-protection confirmation.
 //!
 //! Staged changes never reach the database until [`AppState::save_staged`]
 //! sends them, so this module is the whole boundary between an edit the user
@@ -9,10 +9,10 @@
 use super::*;
 
 impl AppState {
-    /// Stages a cell edit (FRE-24 pushes edits in through this). Edits
-    /// coalesce per `(row, column)` — the last staged value wins. Staging
-    /// is allowed even while a save is in flight; see [`Self::save_staged`]
-    /// for the concurrency contract.
+    /// Stages a cell edit (the grid's cell editor pushes edits in through
+    /// this). Edits coalesce per `(row, column)` — the last staged value wins.
+    /// Staging is allowed even while a save is in flight; see
+    /// [`Self::save_staged`] for the concurrency contract.
     pub fn stage_cell_edit(
         mut self,
         id: ConnectionId,
@@ -31,8 +31,8 @@ impl AppState {
             .set_cell_edit(locator, column, value);
     }
 
-    /// Stages a new all-default pending insert — the "+ New row" affordance
-    /// (FRE-25). Columns get concrete values via [`Self::stage_insert_value`].
+    /// Stages a new all-default pending insert — the "+ New row" affordance.
+    /// Columns get concrete values via [`Self::stage_insert_value`].
     pub fn stage_insert_row(mut self, id: ConnectionId, table: &TableRef) {
         self.nav_guard.set(None);
         self.staged
@@ -106,7 +106,7 @@ impl AppState {
         }
     }
 
-    /// Stages a row delete (FRE-25 pushes deletes in through this).
+    /// Stages a row delete (the grid's row delete comes in through this).
     pub fn stage_delete(mut self, id: ConnectionId, table: &TableRef, locator: RowLocator) {
         self.nav_guard.set(None);
         self.staged
@@ -144,7 +144,7 @@ impl AppState {
             staged.remove(&id);
         }
         drop(staged);
-        // A confirmation parked over changes that no longer exist (FRE-111)
+        // A confirmation parked over changes that no longer exist
         // would otherwise sit there offering to apply nothing.
         self.pending_saves.write().remove(&(id, table.key()));
         self.nav_guard.set(None);
@@ -177,7 +177,7 @@ impl AppState {
     }
 
     /// Whether *any* open connection has pending staged edits anywhere. The
-    /// window-close guard (FRE-37) uses this: unlike the per-connection
+    /// window-close guard uses this: unlike the per-connection
     /// navigation guards, closing the OS window isn't scoped to one connection.
     pub fn any_dirty(&self) -> bool {
         staged_has_dirty(&self.staged.read())
@@ -221,13 +221,13 @@ impl AppState {
     /// the user can fix or discard) and the Save bar shows which change
     /// failed.
     ///
-    /// Concurrency contract (FRE-24/25 rely on this): staging MORE changes
-    /// while a save is in flight is allowed — the save snapshots the change
-    /// list up front and, on success, removes exactly that snapshot from
-    /// the stage ([`TableStage::remove_applied`]), so later edits survive
-    /// and keep the Save bar visible. Only a second save and discard are
-    /// blocked while `saving` is set.
-    /// On a connection marked [`WriteProtection::Confirm`] (FRE-111) the
+    /// Concurrency contract (cell editing and row insert/delete rely on
+    /// this): staging MORE changes while a save is in flight is allowed — the
+    /// save snapshots the change list up front and, on success, removes
+    /// exactly that snapshot from the stage ([`TableStage::remove_applied`]),
+    /// so later edits survive and keep the Save bar visible. Only a second
+    /// save and discard are blocked while `saving` is set.
+    /// On a connection marked [`WriteProtection::Confirm`] the
     /// first call parks the intent in [`Self::pending_saves`] and returns —
     /// the grid then shows a confirmation naming the connection, and
     /// [`Self::confirm_pending_save`] calls back in to do the work. Nothing
@@ -254,7 +254,7 @@ impl AppState {
         }
     }
 
-    /// Confirms the FRE-111 save banner: applies the staged changes.
+    /// Confirms the write-protection save banner: applies the staged changes.
     ///
     /// Routed through [`Self::save_staged`] rather than applying directly, so
     /// the staleness check runs here too — the Confirm button and a second
@@ -263,12 +263,12 @@ impl AppState {
         self.save_staged(id, table);
     }
 
-    /// Dismisses the FRE-111 save banner, leaving the staged changes alone.
+    /// Dismisses the write-protection save banner; the staged changes stay.
     pub fn dismiss_pending_save(mut self, id: ConnectionId, table: &TableRef) {
         self.pending_saves.write().remove(&(id, table.key()));
     }
 
-    /// Whether this table's save is waiting on the FRE-111 confirmation.
+    /// Whether this table's save is waiting on the write-protection prompt.
     pub fn save_awaiting_confirmation(&self, id: ConnectionId, table_key: &str) -> bool {
         self.pending_saves
             .read()
@@ -312,10 +312,10 @@ impl AppState {
             );
             return;
         };
-        // The same resolution the grid gated its editors on (FRE-87, and the
-        // user's marking from FRE-111); if a stage exists here anyway, the
-        // failure states the resolver's reason rather than a second,
-        // differently-worded one.
+        // The same resolution the grid gated its editors on (the backend's
+        // capabilities plus the user's write-protection marking); if a stage
+        // exists here anyway, the failure states the resolver's reason rather
+        // than a second, differently-worded one.
         let Some(access) = self.table_access(id, &meta) else {
             self.fail_save(id, &table_key, "connection no longer available".into());
             return;
@@ -399,7 +399,7 @@ fn staged_has_dirty(staged: &HashMap<ConnectionId, HashMap<String, TableStage>>)
         .any(|tables| tables.values().any(|stage| !stage.is_empty()))
 }
 
-/// What a Save click should do on a write-protected connection (FRE-111).
+/// What a Save click should do on a write-protected connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SaveAction {
     /// Send the changes now.
@@ -416,8 +416,8 @@ enum SaveAction {
 /// Confirming authorizes a *specific* set of changes, so editing, discarding
 /// or staging more after the prompt appears has to send the user back through
 /// it — otherwise the prompt would launder whatever the stage happened to
-/// contain by the time they clicked, which is exactly the accident FRE-111
-/// exists to prevent.
+/// contain by the time they clicked, which is exactly the accident the
+/// confirmation exists to prevent.
 ///
 /// `ReadOnly` returns `Apply` rather than a third variant: there is nothing to
 /// confirm, and the write is refused underneath by the capability resolution
@@ -538,7 +538,7 @@ mod tests {
         assert_eq!(
             save_action(WriteProtection::Open, None, &changes),
             SaveAction::Apply,
-            "Open must behave exactly as it did before FRE-111"
+            "Open must behave exactly as it did before write protection existed"
         );
     }
 

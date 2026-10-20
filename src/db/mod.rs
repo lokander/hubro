@@ -6,7 +6,7 @@
 //! `DbPool` futures inside `use_resource`/spawned tasks and store the
 //! resulting values in signals — never hold a signal borrow across an await.
 //!
-//! Result contract, identical on every backend (FRE-138): a *user-facing*
+//! Result contract, identical on every backend: a *user-facing*
 //! query that returns no rows still returns its columns, so an empty `SELECT`
 //! shows its headers instead of a blank pane. SQL Server gets them from TDS
 //! metadata; the sqlx backends have no row to read them off and describe the
@@ -55,7 +55,7 @@ pub use caps::{
 pub use clipboard::{raw_cell_text, render_copy, CopyBlock, CopyFormat};
 pub use coerce::{bool_checked, bool_value, classify_type, TypeClass};
 // The cell editor validates numbers with the import's rules rather than its
-// own copy of them (FRE-112); nothing outside the crate needs this.
+// own copy of them; nothing outside the crate needs this.
 pub(crate) use coerce::{is_bit_string, parse_numeric_text, validate_bit_literal};
 pub use ddl::{Ddl, DdlObject, DdlSource};
 pub use error::DbError;

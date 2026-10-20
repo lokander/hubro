@@ -17,18 +17,18 @@ use super::state::{
     AppState, ExportPane, ExportStatus, RunStatus, SchemaLoad, SharedStatement, SqlBuffer,
 };
 
-/// Cap on rendered result rows (per statement). The full result still sits
-/// in memory until FRE-33 introduces streaming/limits at the query layer,
-/// but the DOM must not receive a million rows.
+/// Cap on rendered result rows (per statement). The full result may still
+/// sit in memory, but the DOM must not receive a million rows.
 const MAX_RENDERED_ROWS: usize = 500;
 
 /// Messages the CodeMirror bundle sends over the eval channel.
 ///
 /// The two that carry text name the **buffer** they belong to, rather than
 /// leaving the handler to ask which buffer is active when the message lands.
-/// Those stopped being the same question in FRE-154: the editor now flushes
-/// its pending text on the way *out* of a buffer, so a message describing the
-/// outgoing one arrives, by design, after the switch. `Doc` carries the
+/// Those stopped being the same question once a tab switch stopped losing
+/// the last keystrokes: the editor now flushes its pending text on the way
+/// *out* of a buffer, so a message describing the outgoing one arrives, by
+/// design, after the switch. `Doc` carries the
 /// document generation for the same reason — see
 /// [`SqlBuffers::set_text`](super::state::SqlBuffers::set_text).
 #[derive(Debug, Deserialize)]
@@ -100,8 +100,9 @@ const EDITOR_UNAVAILABLE: &str = "The SQL editor failed to load. Reopening this 
 /// What it says when the bundle *did* arrive and `create` threw. A separate
 /// message because [`EDITOR_UNAVAILABLE`] names a cause that is provably not
 /// this one — the bundle loaded — and a status line that states something
-/// untrue is worse than a vaguer one (the FRE-146 precedent). The thrown
-/// error is appended, since that is where the real information is.
+/// untrue is worse than a vaguer one (the same reasoning that qualifies the
+/// "rolled back" line in [`RunStatusLine`]). The thrown error is appended,
+/// since that is where the real information is.
 const EDITOR_CREATE_FAILED: &str =
     "The SQL editor could not start. Reopening this tab will try again.";
 
@@ -112,7 +113,7 @@ const EDITOR_CREATE_FAILED: &str =
 /// session restores straight into the SQL pane on a slow machine. Calling
 /// `DVEditor.create` regardless threw a `ReferenceError` into a channel nobody
 /// reads, and the pane then stayed **blank until it was remounted**, which
-/// reads as "no query here" rather than "the editor didn't load" (FRE-155).
+/// reads as "no query here" rather than "the editor didn't load".
 ///
 /// So the create is gated on the global actually being there, and every way
 /// this can still fail reports itself over the same channel instead of leaving
@@ -134,8 +135,8 @@ const EDITOR_CREATE_FAILED: &str =
 ///
 /// `__dvRun`/`__dvDoc` are single globals, reassigned by whichever editor
 /// mounted last, so both check that the message is for **this** element before
-/// sending. That check earns its keep as of FRE-154: teardown now *flushes*
-/// where it used to only cancel, so a closing editor can emit — and one whose
+/// sending. That check earns its keep now that teardown *flushes* where it
+/// used to only cancel, so a closing editor can emit — and one whose
 /// connection tab is gone would otherwise be filed against the connection
 /// whose channel the global currently points at. Buffer ids and generations
 /// both start small and are per connection, so such a message would plausibly
@@ -247,7 +248,7 @@ fn editor_element_id(id: ConnectionId) -> String {
 }
 
 /// The name on a query tab: the saved query it was opened from, or its
-/// position for a scratch buffer (FRE-113). Position rather than "Untitled"
+/// position for a scratch buffer. Position rather than "Untitled"
 /// so several scratch buffers stay tellable apart.
 fn buffer_label(buffer: &SqlBuffer, index: usize) -> String {
     match &buffer.title {
@@ -269,7 +270,7 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
         .map(|c| c.pool.dialect())
         .unwrap_or(Dialect::Sqlite);
     // Whether this connection can produce a plan at all, and whether that
-    // plan will be structured (FRE-119). `None` disables the Explain button
+    // plan will be structured. `None` disables the Explain button
     // rather than hiding it: "SQL Server has no EXPLAIN" is worth saying once
     // more than it is worth leaving the user to wonder.
     let explain_support = state
@@ -279,10 +280,10 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
         .and_then(|c| c.pool.explain_support());
     let structured_plans = explain_support.is_some_and(|support| support.structured);
     let editor_element = editor_element_id(id);
-    // The query tabs and which one is showing (FRE-113). Both are memos: they
+    // The query tabs and which one is showing. Both are memos: they
     // read `tab_ui`, which changes on every keystroke, and a memo's PartialEq
     // gate is what keeps the pane from re-rendering for text nobody's tab
-    // strip can see (FRE-129).
+    // strip can see.
     let tabs = use_memo(move || {
         state
             .sql_buffers(id)
@@ -305,7 +306,7 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
     //
     // The target goes to the bundle as well as the text: `setDoc` flushes
     // whatever the outgoing document still owed under its *old* token before
-    // taking the new one (FRE-154), which is what keeps the last 250 ms of
+    // taking the new one, which is what keeps the last 250 ms of
     // typing from vanishing into the buffer being switched away from.
     let element_for_switch = editor_element.clone();
     use_effect(move || {
@@ -323,18 +324,18 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
 
     // Cheap despite running every render: the statements are Arc-shared
     // [`SharedStatement`]s, so this clones pointers and the small status —
-    // never the result rows (FRE-134).
+    // never the result rows.
     //
     // Filtered to the active buffer: one connection still runs one script at
     // a time, but its results belong to the buffer that ran them.
     let run = state.sql_runs.read().get(&(id, active)).cloned();
     let running = matches!(run.as_ref().map(|r| &r.status), Some(RunStatus::Running));
-    // What this connection won't run, stated before the user writes it
-    // (FRE-87). `run_sql` refuses the same cases, so the note explains a
-    // refusal that would otherwise arrive only after pressing Ctrl+Enter.
+    // What this connection won't run, stated before the user writes it.
+    // `run_sql` refuses the same cases, so the note explains a refusal that
+    // would otherwise arrive only after pressing Ctrl+Enter.
     //
     // Effective capabilities, so a connection the user marked read-only
-    // (FRE-111) says so here rather than only when the run is refused.
+    // says so here rather than only when the run is refused.
     let capability_note: Option<&'static str> = match state.connection_caps(id) {
         Some(caps) if !caps.read_query => Some(NO_QUERY),
         Some(caps) if !caps.mutate => Some(if state.marked_read_only(id) {
@@ -352,7 +353,7 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
             .filter(|s| needs_confirmation(s, dialect))
             .count()
     });
-    // Under Confirm (FRE-111) the banner names the connection: the whole
+    // Under Confirm the banner names the connection: the whole
     // point of the state is to make you read *which* database you are about
     // to change, which "Run anyway?" alone never made you do.
     let confirm_target: Option<String> = state
@@ -408,7 +409,7 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
                 }
             }
             // The query tabs. Opening a saved query adds one here instead of
-            // replacing what is in the editor (FRE-113).
+            // replacing what is in the editor.
             div { class: "flex items-center gap-1 overflow-x-auto border-b border-slate-200 dark:border-slate-800 px-2 py-1",
                 for (buffer_id, label) in tabs().into_iter() {
                     div {
@@ -548,7 +549,7 @@ fn PanelButton(panel: Signal<EditorPanel>, target: EditorPanel, label: String) -
 fn EditorSurface(id: ConnectionId, dialect: Dialect) -> Element {
     let state = use_context::<AppState>();
     let element = editor_element_id(id);
-    // Set only if the bundle never arrives (FRE-155). CodeMirror owns this
+    // Set only if the bundle never arrives. CodeMirror owns this
     // element's contents in every other case, so this stays `None` and the
     // host div renders no children of its own.
     let mut load_failure = use_signal(|| None::<String>);
@@ -584,7 +585,7 @@ fn EditorSurface(id: ConnectionId, dialect: Dialect) -> Element {
                     // Both text-carrying messages are filed under the buffer
                     // the *editor* names, not under whichever is active when
                     // they arrive. The editor flushes on the way out of a
-                    // buffer (FRE-154), so those differ exactly when it
+                    // buffer, so those differ exactly when it
                     // matters: asking here would file the outgoing buffer's
                     // tail — or its Ctrl+Enter — under the incoming one.
                     Ok(EditorMessage::Run { sql, buffer }) => {
@@ -696,7 +697,7 @@ fn completion_schema(tables: &[TableMeta], dialect: Dialect) -> serde_json::Valu
             .collect();
         // Internal objects stay completable — the SQL tab is exactly where you
         // go to poke at a chunk — but demoted, so a database with a thousand
-        // of them doesn't bury the user's own tables in the ranking (FRE-88).
+        // of them doesn't bury the user's own tables in the ranking.
         //
         // This bites hardest for internal objects in the *default* schema —
         // partition children, PostGIS's `spatial_ref_sys` — because lang-sql
@@ -796,7 +797,7 @@ fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
                     Rollback::None => format!(
                         "Script stopped after {elapsed_ms} ms; earlier statements were not rolled back.",
                     ),
-                    // The claim this exists to stop hubro making (FRE-146):
+                    // The claim this exists to stop hubro making:
                     // the rollback was real, but it did not reach the schema
                     // changes, so "no changes were applied" would be false in
                     // the one direction that matters.
@@ -869,7 +870,7 @@ fn StatementErrorBlock(
 ///
 /// Takes the Arc-shared [`SharedStatement`], whose pointer-identity
 /// `PartialEq` lets prop diffing skip this whole subtree while the statement
-/// is unchanged — which is always, since results are write-once (FRE-134).
+/// is unchanged — which is always, since results are write-once.
 #[component]
 fn StatementSection(id: ConnectionId, index: usize, result: SharedStatement) -> Element {
     let state = use_context::<AppState>();
@@ -985,7 +986,7 @@ fn spawn_result_export(
 /// Takes the shared statement rather than the [`QueryResult`] inside it: an
 /// `Arc` cannot lend out a piece of itself, so passing the rows alone would
 /// mean cloning them, and the pointer-eq `PartialEq` gating re-renders would
-/// be lost with them (FRE-134).
+/// be lost with them.
 #[component]
 fn ResultTable(statement: SharedStatement) -> Element {
     let StatementOutcome::Rows(result) = &statement.outcome else {
@@ -1014,7 +1015,7 @@ fn ResultTable(statement: SharedStatement) -> Element {
                         // Cells are a plain function, not a `#[component]`:
                         // a component instance per cell — each cloning its
                         // Value into an owned prop — was most of the render
-                        // cost of a wide result (FRE-134).
+                        // cost of a wide result.
                         for value in row.iter() {
                             {result_cell(value)}
                         }
@@ -1041,7 +1042,7 @@ fn result_cell(value: &Value) -> Element {
     }
 }
 
-/// One explained statement (FRE-119): the same header line a result section
+/// One explained statement: the same header line a result section
 /// has, and below it the plan — a tree for stock PostgreSQL's JSON, the
 /// server's own output verbatim for every other backend (and for PostgreSQL
 /// output that isn't the JSON we asked for, e.g. a user-written `EXPLAIN
@@ -1237,7 +1238,7 @@ mod tests {
 
     #[test]
     fn the_editor_is_told_which_document_it_is_holding() {
-        // FRE-154. The editor stamps every message with this pair, and the
+        // The editor stamps every message with this pair, and the
         // handler files the text by it rather than by whichever buffer is
         // active when the message lands. Without it reaching `create`, the
         // first flush after a mount is stamped `undefined` and the message
@@ -1295,7 +1296,7 @@ mod tests {
     #[test]
     fn a_closing_editor_cannot_send_down_another_connections_channel() {
         // `__dvRun`/`__dvDoc` are single globals that the last mount owns. A
-        // teardown flush (new in FRE-154 — teardown used to only cancel) can
+        // teardown flush (teardown used to only cancel, losing the tail) can
         // therefore run against a channel belonging to a *different*
         // connection, and buffer ids and generations are per connection and
         // both start small, so the message would plausibly match a real buffer
@@ -1328,9 +1329,10 @@ mod tests {
 
     #[test]
     fn every_way_out_of_the_editor_flushes_rather_than_cancels() {
-        // The whole of FRE-154, checked against the source that is readable
-        // enough to check it in. Three exits, and the two orderings that make
-        // two of them correct rather than merely present.
+        // The whole tab-switch fix (a switch used to drop the last 250 ms of
+        // typing), checked against the source that is readable enough to
+        // check it in. Three exits, and the two orderings that make two of
+        // them correct rather than merely present.
         let set_doc = entry_fn("setDoc");
         let flush = set_doc
             .find("flush(id)")
@@ -1393,10 +1395,10 @@ mod tests {
 
         // And teardown must not cancel *at all*. `flush` takes the timer
         // whenever there is one, so a `clearTimeout` here could only ever be a
-        // no-op — but "cancel on the way out" is the pre-FRE-154 behaviour
-        // exactly, and one placed above the flush rather than below it is the
-        // whole bug back. Excluding it outright is cheaper to hold than an
-        // ordering, and gives up nothing.
+        // no-op — but "cancel on the way out" is exactly the behaviour that
+        // lost the tail, and one placed above the flush rather than below it
+        // is the whole bug back. Excluding it outright is cheaper to hold than
+        // an ordering, and gives up nothing.
         assert!(
             !destroy.contains("clearTimeout"),
             "teardown cancels the pending send rather than leaving it to \
@@ -1422,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn the_committed_bundle_is_not_a_pre_fre_154_build() {
+    fn the_committed_bundle_is_not_a_build_from_before_flush_on_exit() {
         // `assets/codemirror.js` is a committed build artifact, rebuilt by
         // hand (see `assets/codemirror-README.md`), so an edit to the entry
         // file that lands without the rebuild changes nothing the app runs —
@@ -1432,11 +1434,12 @@ mod tests {
         // The name is the exact limit of the claim. What this pins is
         // narrower than "the bundle is a build of the entry file", which
         // nothing short of running esbuild can establish: it catches a bundle
-        // reverted or never rebuilt *at all*, by requiring the FRE-154 wire
+        // reverted or never rebuilt *at all*, by requiring the stamped wire
         // format and the blur handler to be present in it. An entry-file edit
-        // confined to the `setDoc`/`destroy` flushes would still slip past. Matched on object-literal keys and a
-        // DOM event name — the things a minifier cannot rename — so the
-        // mangled locals around them stay free to change with esbuild.
+        // confined to the `setDoc`/`destroy` flushes would still slip past.
+        // Matched on object-literal keys and a DOM event name — the things a
+        // minifier cannot rename — so the mangled locals around them stay
+        // free to change with esbuild.
         assert!(
             BUNDLE.contains("blur:") && BUNDLE.contains("domEventHandlers"),
             "the shipped bundle has no blur handler — rebuild it from \
@@ -1470,7 +1473,7 @@ mod tests {
         // The property that matters is an ordering, not a presence: `create`
         // has to sit *after* the guard. Asserting only that the guard exists
         // would stay green if a stray `DVEditor.create` were left above it,
-        // which is the bug (FRE-155) exactly.
+        // which is the bug exactly.
         let guard = js
             .find("typeof DVEditor.create !== \"function\"")
             .expect("the mount must test for the bundle's global");
@@ -1787,9 +1790,9 @@ mod tests {
     #[test]
     fn internal_tables_complete_but_rank_below_the_users_own() {
         // Still completable — the SQL tab is where you go to poke at a chunk
-        // — but demoted, so a thousand of them don't bury `readings`
-        // (FRE-88). The user's own tables keep the plain array form, which is
-        // what lets lang-sql quote-apply them for us.
+        // — but demoted, so a thousand of them don't bury `readings`. The
+        // user's own tables keep the plain array form, which is what lets
+        // lang-sql quote-apply them for us.
         let tables = [
             table(Some("public"), "readings", &["time"]),
             internal_table(Some("_timescaledb_internal"), "_hyper_1_1_chunk", &["time"]),

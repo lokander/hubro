@@ -1,4 +1,4 @@
-//! Streaming CSV reading for imports (FRE-112) — the inverse of the CSV
+//! Streaming CSV reading for imports — the inverse of the CSV
 //! writing in [`export`](crate::db::export), and hand-rolled for the same
 //! reason: the writer is, the rules are RFC-4180's, and the reader needs two
 //! things a general-purpose crate would not give it for free — a manual

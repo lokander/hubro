@@ -11,7 +11,7 @@ const sqlCompartments = new Map();
 // Which buffer each editor's document belongs to, and which generation of that
 // buffer's text it was built from. Sent back with every message, so the host
 // never has to infer from *when* a message arrived which query tab the text in
-// it was typed into (FRE-154).
+// it was typed into.
 const tokens = new Map();
 
 // Marks the dispatches made on the host's behalf (setDoc), so the sync
@@ -45,8 +45,8 @@ function sqlSupport(dialectName, schema) {
 // Sends the document to the host now, if a debounced send is waiting.
 //
 // Every exit from the editor calls this: losing focus, having the document
-// replaced, and teardown. Before FRE-154 each of those *cancelled* the pending
-// timer instead, silently dropping whatever had been typed in the last
+// replaced, and teardown. Each of those used to *cancel* the pending timer
+// instead, silently dropping whatever had been typed in the last
 // SYNC_DELAY_MS — on a tab switch, the tail of the outgoing buffer.
 //
 // The text is read from the view rather than captured when the timer was
@@ -105,7 +105,7 @@ export function create(id, parentId, dialectName, initialDoc, schema, buffer, ge
   });
   // Losing focus is the earliest point at which a switch away from this editor
   // is visible here: it precedes the click that causes the switch, so the tail
-  // is on its way to the host before anything acts on that click (FRE-154).
+  // is on its way to the host before anything acts on that click.
   const flushOnBlur = EditorView.domEventHandlers({
     blur: () => {
       flush(id);
@@ -179,8 +179,8 @@ export function destroy(id) {
   tokens.delete(id);
   // Teardown deliberately cancels nothing: flush() above takes the pending
   // timer whenever there is one, so a cancel down here could only ever be a
-  // no-op — and cancelling on the way out is the pre-FRE-154 behaviour that
-  // lost the tail, so keeping one for symmetry would leave the bug one edit
-  // away. (`every_way_out_of_the_editor_flushes_rather_than_cancels` reads
+  // no-op — and cancelling on the way out is the old behaviour that lost the
+  // tail, so keeping one for symmetry would leave the bug one edit away.
+  // (`every_way_out_of_the_editor_flushes_rather_than_cancels` reads
   // this function and enforces it.)
 }

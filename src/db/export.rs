@@ -16,7 +16,7 @@
 //! a CR/LF, and embedded quotes are doubled. Values render as `NULL` → empty
 //! field, integers/reals → their plain decimal form, text verbatim, blobs →
 //! a `\x`-prefixed hex string — each streamed straight from the borrowed
-//! value, never materialized as a per-cell `String` (FRE-132; on a 1M×10
+//! value, never materialized as a per-cell `String` (on a 1M×10
 //! export the old pipeline made ~10M transient allocations). Because `NULL`
 //! and the empty string both render to an empty field, CSV cannot
 //! distinguish them — a documented, standard CSV limitation. Text values
@@ -185,12 +185,12 @@ fn write_quote_doubled(field: &str, out: &mut impl Write) -> io::Result<()> {
     out.write_all(rest.as_bytes())
 }
 
-/// Streams one cell as a CSV field, allocation-free (FRE-132): numbers and
+/// Streams one cell as a CSV field, allocation-free: numbers and
 /// blob hex go straight through the formatter — neither can contain a
 /// character on the RFC-4180 quoting list, so they never need quoting — and
 /// text is written borrowed by [`write_csv_text`].
 ///
-/// The clipboard's delimited formats (FRE-110) mirror this arm for arm except
+/// The clipboard's delimited formats mirror this arm for arm except
 /// for NULL, which they must keep distinct from the empty string — see
 /// [`super::clipboard`].
 fn write_csv_value(value: &Value, out: &mut impl Write) -> io::Result<()> {
@@ -232,7 +232,7 @@ fn write_csv_text(text: &str, out: &mut impl Write) -> io::Result<()> {
     }
 }
 
-/// Whether a text value triggers CSV formula injection (FRE-73): Excel and
+/// Whether a text value triggers CSV formula injection: Excel and
 /// LibreOffice execute cells starting with `=` `+` `-` `@` (or a tab, per
 /// OWASP's list) as live formulas on open, so such a value gets the standard
 /// leading-apostrophe prefix. Text only — numbers render bare (`-7` must
@@ -246,8 +246,8 @@ fn needs_formula_hardening(text: &str) -> bool {
     text.starts_with(['=', '+', '-', '@', '\t'])
 }
 
-/// Owned-string form of the formula hardening, for the clipboard formats
-/// (FRE-110), which build each cell as a `String` anyway: pasting text into a
+/// Owned-string form of the formula hardening, for the clipboard formats,
+/// which build each cell as a `String` anyway: pasting text into a
 /// spreadsheet runs the same formulas that opening a file does. The streaming
 /// CSV export applies the identical rule without allocating — see
 /// [`write_csv_text`].
@@ -303,7 +303,7 @@ fn write_json_value(value: &Value, out: &mut impl Write) -> io::Result<()> {
 }
 
 /// Postgres-style `\x…` hex rendering of a blob, shared by both formats — and
-/// by the clipboard ones (FRE-110) — so a round-trip is unambiguous.
+/// by the clipboard ones — so a round-trip is unambiguous.
 pub(crate) fn hex_literal(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(2 + bytes.len() * 2);
     s.push_str("\\x");

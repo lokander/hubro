@@ -1,4 +1,4 @@
-//! The grid's rectangular cell selection (FRE-110).
+//! The grid's rectangular cell selection.
 //!
 //! A selection is two corners — an `anchor` (where it started) and a `focus`
 //! (where it currently ends, which is also the cell wearing the keyboard focus

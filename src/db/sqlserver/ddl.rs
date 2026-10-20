@@ -1,4 +1,4 @@
-//! DDL for SQL Server objects (FRE-108): the stored module text for views,
+//! DDL for SQL Server objects: the stored module text for views,
 //! and — since SQL Server ships no server-side generator for tables and
 //! indexes (SSMS scripts those client-side through SMO) — a reconstruction
 //! from the sys catalog, rendered by the shared writers in [`crate::db::ddl`].
@@ -13,7 +13,7 @@ use crate::db::schema::{IndexMeta, TableKind, TableMeta};
 use crate::db::sql::{quote_ident, Dialect};
 use crate::db::value::{row_flag, row_opt_int, row_opt_text, row_text, Value};
 
-/// DDL for one object (FRE-108).
+/// DDL for one object.
 ///
 /// SQL Server keeps the *original text* of every module in `sys.sql_modules`,
 /// so a view's definition is reproduced exactly as it was written —

@@ -1,4 +1,4 @@
-//! Citus verification (FRE-89). Citus is a sharding extension on stock
+//! Citus verification. Citus is a sharding extension on stock
 //! PostgreSQL, so the Postgres backend drives it unchanged — these tests pin
 //! the parts that are *not* stock: distributed tables (one logical table
 //! spread over many shard tables), reference tables, and the constraints
@@ -154,7 +154,8 @@ async fn citus_own_views_in_public_are_marked_internal() {
 
     // Citus installs `citus_tables`/`citus_schemas` into `public` rather than
     // a schema of its own. This is exactly the case a schema-level rule alone
-    // would miss, and why FRE-88 attributes objects as well as schemas.
+    // would miss, and why internal marking attributes objects as well as
+    // schemas.
     let tables = pool.introspect().await.unwrap();
     for name in ["citus_tables", "citus_schemas"] {
         assert_eq!(
@@ -467,7 +468,7 @@ async fn v1_certificate_failure_says_what_to_do() {
     // rustls will not parse — so this fails at every sslmode except
     // `disable`, including `prefer`. rustls's own words are
     // "UnsupportedCertVersion", which tells a user nothing; this pins the
-    // translation (FRE-89).
+    // translation.
     //
     // Skipped rather than failed if the server has a modern certificate, so
     // the suite still passes against a Citus someone has re-certified.
@@ -605,7 +606,8 @@ async fn shards_are_marked_internal_when_citus_stops_hiding_them() {
     // `citus.show_shards_for_app_name_prefixes` is a documented knob, and
     // widening it puts every shard table in front of the client: a 26-table
     // database reports 290. Shards are not extension members and not
-    // partitions, so none of FRE-88's three rules catch them — hence the
+    // partitions, so none of the three internal-object rules (extension
+    // schemas, extension members, partitions) catch them — hence the
     // `pg_dist_shard` pass this pins.
     //
     // The setting is per-database, so this test needs one of its own rather

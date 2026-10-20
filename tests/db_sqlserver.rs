@@ -17,7 +17,7 @@
 //! this binary. Isolation from the other SQL Server suites — which use the
 //! same fixture names against the same server — comes from
 //! [`common::mssql_test_url`], which puts this process in a database of its
-//! own (FRE-127).
+//! own.
 
 mod common;
 
@@ -292,7 +292,7 @@ async fn sqlserver_introspection_covers_indexes_fks_and_views() {
         "a filtered unique index must not address rows"
     );
 
-    // Capabilities (FRE-87): full at the connection level, resolved per
+    // Capabilities: full at the connection level, resolved per
     // object, with each narrowing carrying its own reason.
     assert_eq!(pool.backend_capabilities(), Capabilities::FULL);
     let children_access = pool.backend_access(&children);
@@ -778,7 +778,7 @@ async fn sqlserver_query_capped_stops_and_bounds_cells() {
     pool.close().await;
 }
 
-/// A zero-row result still carries its column headers (FRE-138). This backend
+/// A zero-row result still carries its column headers. This backend
 /// has always done so — TDS sends result-set metadata even for zero rows — and
 /// is the reference the sqlx backends were brought in line with, so pinning it
 /// here keeps the contract from drifting back apart.
@@ -964,7 +964,7 @@ async fn sqlserver_bounded_page_previews_large_text_and_binary() {
 
 #[tokio::test]
 async fn sqlserver_trailing_spaces_still_count_toward_the_preview_length() {
-    // Regression (FRE-110): the bounded reader's length probe has to count the
+    // Regression: the bounded reader's length probe has to count the
     // same units `SUBSTRING` slices by, or a truncated prefix is recorded as a
     // complete value. `LEN()` ignores trailing spaces and `SUBSTRING` does
     // not, so a value that is over the cap only *because* of its padding used
@@ -1213,7 +1213,7 @@ async fn sqlserver_offers_no_plan_view_rather_than_a_dangerous_one() {
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
 
-    // T-SQL has no `EXPLAIN` statement (FRE-119). Its estimated plan comes
+    // T-SQL has no `EXPLAIN` statement. Its estimated plan comes
     // from `SET SHOWPLAN_XML ON`, a session setting that must stand alone in
     // its batch and makes the *next* batch return a plan instead of running
     // it — and hubro's script path hands each statement to the pool

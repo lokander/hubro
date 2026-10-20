@@ -1,4 +1,4 @@
-//! Streaming JSON reading for imports (FRE-112): a top-level array of
+//! Streaming JSON reading for imports: a top-level array of
 //! objects, and newline-delimited JSON.
 //!
 //! Both shapes are read by the same scanner, because they differ only in what

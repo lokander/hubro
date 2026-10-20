@@ -1,4 +1,4 @@
-//! The schema-edit dialog (FRE-122): fill in one operation, read the SQL it
+//! The schema-edit dialog: fill in one operation, read the SQL it
 //! generates, and run it.
 //!
 //! The statement is **shown before it runs and is editable** — the same
@@ -16,7 +16,7 @@
 //! - operations that destroy data ([`SchemaOp::destroys_data`]) require the
 //!   table's name to be typed — the point being to make you read *which* table
 //!   is about to be emptied;
-//! - a connection marked *confirm writes* (FRE-111) adds its own press, naming
+//! - a connection marked *confirm writes* adds its own press, naming
 //!   the connection, on top of either — because the question that state asks is
 //!   which database you are pointed at, and that is a different question from
 //!   which table.
@@ -114,7 +114,7 @@ pub(super) struct Press<'a> {
     pub sql: &'a str,
 }
 
-/// What the last schema edit on this connection did, or is doing (FRE-122).
+/// What the last schema edit on this connection did, or is doing.
 ///
 /// Rendered above the pane body rather than inside it. The dialog closes the
 /// moment its statement succeeds, so the report has to outlive it — and a drop
@@ -164,7 +164,8 @@ pub fn SchemaEditDialog(
     /// Drop arrives with its index name, a per-column Rename with its column.
     op: SchemaOp,
     dialect: ReadSignal<Dialect>,
-    /// The connection's effective capabilities (FRE-87/111).
+    /// The connection's effective capabilities: the backend's, narrowed by
+    /// the connection's write protection.
     caps: ReadSignal<Capabilities>,
     /// The connection's name when it is marked *confirm writes*, `None`
     /// otherwise.

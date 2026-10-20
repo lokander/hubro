@@ -1,6 +1,6 @@
 //! Integration tests for script execution: `DbPool::execute` affected-row
 //! counts, atomic multi-statement runs (a mid-script failure rolls the whole
-//! batch back — FRE-38), and Postgres error position enrichment.
+//! batch back), and Postgres error position enrichment.
 //!
 //! Postgres tests need a running server (Docker only, per CLAUDE.md) and are
 //! skipped unless `HUBRO_PG_TEST_URL` is set — see tests/db_postgres.rs.

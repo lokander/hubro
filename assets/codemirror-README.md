@@ -12,8 +12,8 @@ npx esbuild codemirror-entry.js --bundle --format=iife \
   --global-name=DVEditor --minify --outfile=codemirror.js
 ```
 
-`editor.rs`'s `the_committed_bundle_is_not_a_pre_fre_154_build` is a partial
-backstop for skipping that step: it reads `codemirror.js` and fails if the wire
+`editor.rs`'s `the_committed_bundle_is_not_a_build_from_before_flush_on_exit`
+is a partial backstop for skipping that step: it reads `codemirror.js` and fails if the wire
 format or the blur handler is missing from it, which catches a bundle that was
 reverted or never rebuilt at all. It cannot catch an
 entry-file edit whose effect is confined to code it doesn't name — only
@@ -42,7 +42,7 @@ The bundle exposes:
 It calls `window.__dvRun` / `window.__dvDoc` (installed by src/ui/editor.rs
 through the dioxus eval channel).
 
-## Document sync (FRE-154)
+## Document sync
 
 Typing is pushed to Rust on a 250 ms trailing timer, and **every way out of
 the editor flushes that timer rather than cancelling it**: losing focus,

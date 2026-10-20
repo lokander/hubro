@@ -1,4 +1,4 @@
-//! Integration tests for bounded-memory reads (FRE-33) on SQLite:
+//! Integration tests for bounded-memory reads on SQLite:
 //! `fetch_page_bounded` (truncated previews of large columns),
 //! `fetch_cell` (lazy full-value load), and `query_capped` (row cap +
 //! per-cell cap on the free-form query path).
@@ -118,7 +118,7 @@ async fn fetch_page_bounded_previews_large_columns_and_stays_small() {
 #[tokio::test]
 async fn bounded_page_keeps_generated_columns() {
     // SQLite `SELECT *` includes generated columns; the bounded projection is
-    // built from metadata, so introspection must report them (FRE-33) — or
+    // built from metadata, so introspection must report them — or
     // they would silently vanish from the grid.
     let sql = "CREATE TABLE gen (
                     a INTEGER PRIMARY KEY,
@@ -183,7 +183,7 @@ async fn fetch_cell_loads_the_full_value() {
         panic!("expected full text");
     }
 
-    // Safety anchor for edit correctness (FRE-33): the grid's page value for
+    // Safety anchor for edit correctness: the grid's page value for
     // this cell is a PREVIEW, strictly shorter than the full value — so the
     // editor must reload via fetch_cell before staging, never stage the page
     // value. Prove the two differ in length.

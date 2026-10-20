@@ -1,4 +1,4 @@
-# Line endings are LF everywhere, including on Windows checkouts (FRE-160).
+# Line endings are LF everywhere, including on Windows checkouts.
 #
 # Without this, git's default `core.autocrlf=true` on Windows rewrites every
 # text file to CRLF on checkout, which breaks three things at once:

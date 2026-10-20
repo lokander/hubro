@@ -202,18 +202,18 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             // No per-object narrowing: kind and row identity already carry
-            // everything this backend knows about writability (FRE-87).
+            // everything this backend knows about writability.
             restriction: None,
             // SQL Server's system objects live in `sys`, which introspection
             // already skips; its partitioned tables are one object with
-            // partitions underneath rather than child tables (FRE-88).
+            // partitions underneath rather than child tables.
             internal: None,
             kind_label: None,
         });
     }
     // (schema, table) → index into `tables`, built once so grouping the
     // column/index/FK rows below is a hash lookup per row instead of a linear
-    // scan over every table (FRE-133).
+    // scan over every table.
     let mut table_index: HashMap<(String, String), usize> = HashMap::with_capacity(tables.len());
     for (idx, table) in tables.iter().enumerate() {
         if let Some(schema) = &table.schema {
@@ -310,7 +310,7 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
     Ok(tables)
 }
 
-/// Row count and on-disk size for one object (FRE-118), from
+/// Row count and on-disk size for one object, from
 /// `sys.dm_db_partition_stats` — the same accounting `sp_spaceused` reports
 /// and the cheapest answer SQL Server has: it is maintained as rows are
 /// written, so nothing is scanned to read it.

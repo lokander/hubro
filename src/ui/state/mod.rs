@@ -1,7 +1,7 @@
 //! The app's shared reactive state: [`AppState`], the signals it holds, and
 //! the view/selection model the UI renders from.
 //!
-//! Split by concern (FRE-142). This file is the state layer proper — the
+//! Split by concern. This file is the state layer proper — the
 //! struct, its constructor, the view/navigation/schema accessors, and the
 //! plain data types every part of the UI names. The procedural workflows that
 //! merely *drive* those signals live beside it:
@@ -120,7 +120,7 @@ pub struct FocusTarget {
 }
 
 /// A saved-connection edit that has been submitted but not yet confirmed by
-/// a successful connect (FRE-75). Matched on `new_locator` so an abandoned
+/// a successful connect. Matched on `new_locator` so an abandoned
 /// edit can never rewrite an unrelated connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingEdit {
@@ -134,12 +134,12 @@ pub enum Pane {
     #[default]
     Browser,
     Sql,
-    /// The selected table's structure — columns and indexes (FRE-69).
+    /// The selected table's structure — columns and indexes.
     Schema,
 }
 
 impl Pane {
-    /// The serializable form used in the persisted session (FRE-30).
+    /// The serializable form used in the persisted session.
     fn to_session(self) -> SessionPane {
         match self {
             Pane::Browser => SessionPane::Browser,
@@ -203,7 +203,7 @@ pub enum NavAction {
 }
 
 /// One buffer ("query tab") in a connection's SQL pane. A saved query opens
-/// into a new one (FRE-113), which is what keeps it from overwriting whatever
+/// into a new one, which is what keeps it from overwriting whatever
 /// was in the editor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SqlBuffer {
@@ -238,7 +238,7 @@ pub struct SqlBuffer {
     /// - It is handed to the editor and comes back on every message from it,
     ///   which is what lets [`SqlBuffers::set_text`] tell a reply describing
     ///   the current document from one describing a document that has since
-    ///   been replaced (FRE-154).
+    ///   been replaced.
     ///
     /// Text arriving *from* the editor deliberately does not move it: pushing
     /// a keystroke back into CodeMirror would fight the caret.
@@ -341,7 +341,7 @@ impl SqlBuffers {
     ///   since — a saved query opened into it, a history entry loaded — so the
     ///   message describes text that is no longer on screen, and applying it
     ///   would silently undo the load. This matters because the editor now
-    ///   *flushes* its pending text on the way out (FRE-154) instead of
+    ///   *flushes* its pending text on the way out instead of
     ///   dropping it, so such a message is a message in flight rather than a
     ///   hypothetical.
     ///
@@ -401,8 +401,8 @@ impl SqlBuffers {
         self.issued
     }
 
-    /// Puts `text` in front of the user without losing what is already there
-    /// (FRE-113): a new buffer, unless the active one is an untitled blank,
+    /// Puts `text` in front of the user without losing what is already there:
+    /// a new buffer, unless the active one is an untitled blank,
     /// in which case that one is reused. Makes it active and returns its id.
     pub fn open(&mut self, title: Option<String>, text: String) -> u64 {
         let active = self.active;
@@ -459,10 +459,10 @@ pub struct TabUi {
     pub selected_table: Option<TableRef>,
     /// Data browser, SQL editor, or schema.
     pub pane: Pane,
-    /// The SQL pane's buffers ("query tabs", FRE-113) and which is showing.
+    /// The SQL pane's buffers ("query tabs") and which is showing.
     pub sql: SqlBuffers,
-    /// Whether the row detail panel is docked open beside the grid
-    /// (FRE-109). Per tab rather than per table, so it stays open while
+    /// Whether the row detail panel is docked open beside the grid.
+    /// Per tab rather than per table, so it stays open while
     /// browsing from table to table; persisted in the session.
     pub row_detail: bool,
     /// The row detail panel's dragged width in CSS pixels, or `None` for the
@@ -488,7 +488,7 @@ pub enum RunStatus {
     /// atomic run (the whole script), a run that undid nothing (the sequential
     /// path, where earlier statements persisted, or a failure before the
     /// transaction opened), or an atomic run on an engine whose rollback
-    /// doesn't reach schema changes (FRE-146).
+    /// doesn't reach schema changes.
     Failed {
         error: String,
         statement_index: usize,
@@ -497,7 +497,7 @@ pub enum RunStatus {
         rollback: Rollback,
     },
     /// The connection's capabilities forbid the statement at
-    /// `statement_index` (FRE-87), so **nothing was sent**. Distinct from
+    /// `statement_index`, so **nothing was sent**. Distinct from
     /// [`Self::Failed`]: there is no partial state to explain and no timing
     /// to report, because no statement ran.
     Refused {
@@ -513,7 +513,7 @@ pub enum RunStatus {
 
 /// One finished statement's result, shared rather than owned: a result can
 /// hold thousands of rows, and the editor re-reads the run on every render,
-/// so cloning it must cost an `Arc` bump, not a row-by-row copy (FRE-134).
+/// so cloning it must cost an `Arc` bump, not a row-by-row copy.
 ///
 /// `PartialEq` is pointer identity, not a deep compare. That is sound because
 /// results are write-once — pushed into [`SqlRun::statements`] and never
@@ -557,7 +557,7 @@ pub struct SqlRun {
     /// Outcomes of the statements that finished, in script order.
     pub statements: Vec<SharedStatement>,
     pub status: RunStatus,
-    /// Whether Explain started this run (FRE-119), so its results render as
+    /// Whether Explain started this run, so its results render as
     /// query plans instead of result grids.
     ///
     /// A property of the run rather than of the buffer: the same query tab
@@ -568,7 +568,7 @@ pub struct SqlRun {
 
 /// Which pane an export belongs to. Statuses are keyed per connection AND
 /// per pane so a grid export and a SQL-result export never overwrite each
-/// other's toolbar line (FRE-73).
+/// other's toolbar line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExportPane {
     Grid,
@@ -616,11 +616,11 @@ pub struct PendingSql {
     pub script: String,
     pub statements: Vec<String>,
     /// Carried across the confirmation so the run the user confirms is still
-    /// the Explain they asked for (FRE-119).
+    /// the Explain they asked for.
     pub explain: bool,
 }
 
-/// The outcome of the most recent saved-query write (FRE-113), shown as one
+/// The outcome of the most recent saved-query write, shown as one
 /// line in the saved-queries panel until the next one replaces it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SavedStatus {
@@ -680,7 +680,7 @@ pub struct PasswordPrompt {
     /// What the card's "remember in the keyring" box offers. A first prompt
     /// asks with it ticked; a re-prompt after a rejected SSH passphrase offers
     /// the answer the user already gave, so a mistyped passphrase cannot
-    /// silently restore a decision to store one they had cleared (FRE-162).
+    /// silently restore a decision to store one they had cleared.
     pub remember: bool,
 }
 
@@ -703,7 +703,7 @@ pub struct HostKeyPrompt {
 
 /// A pending interactive Microsoft Entra sign-in for a Postgres or SQL Server
 /// connection: the connect needs a browser sign-in (no cached refresh token),
-/// so it's parked here until the user starts the sign-in or cancels (FRE-44).
+/// so it's parked here until the user starts the sign-in or cancels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntraPrompt {
     pub url: String,
@@ -711,7 +711,7 @@ pub struct EntraPrompt {
     pub tunnel: Option<TunnelConfig>,
     pub entra: EntraAuth,
     /// Which backend the sign-in retry must reconnect with (routes the token's
-    /// OAuth resource and the driver, FRE-58).
+    /// OAuth resource and the driver).
     pub backend: BackendKind,
 }
 
@@ -813,20 +813,20 @@ pub struct AppState {
     /// SSH host key before the tunneled connect proceeds (trust-on-first-use).
     pub host_key_prompt: Signal<Option<HostKeyPrompt>>,
     /// When set, the connections screen offers to start an interactive Entra
-    /// browser sign-in for a Postgres connect that needs one (FRE-44).
+    /// browser sign-in for a Postgres connect that needs one.
     pub entra_prompt: Signal<Option<EntraPrompt>>,
     /// Set when the user tries to close the window with unsaved staged edits:
-    /// the close is vetoed and a discard-and-quit confirmation is shown
-    /// (FRE-37). Cleared on cancel or once the user discards and quits.
+    /// the close is vetoed and a discard-and-quit confirmation is shown.
+    /// Cleared on cancel or once the user discards and quits.
     pub confirm_quit: Signal<bool>,
     /// Live SSH tunnels, one per tunneled open connection. Removing an entry
     /// drops the [`Tunnel`], which shuts the forward down.
     pub tunnels: Signal<HashMap<ConnectionId, Tunnel>>,
     /// Locators whose SSH key passphrase the user asked to remember, waiting
-    /// for a tunnel open to accept it (FRE-161).
+    /// for a tunnel open to accept it.
     ///
     /// The choice is made at the passphrase prompt but cannot be acted on
-    /// there: FRE-151 established that only a passphrase a tunnel open has
+    /// there: only a passphrase a tunnel open has
     /// **accepted** may reach the keyring, because `open_tunnel` reads a
     /// keyring hit as "previously validated" and deletes it when the server
     /// rejects it. So the choice is parked here and redeemed at the one place
@@ -847,14 +847,14 @@ pub struct AppState {
     /// user said no" stays distinct from "nobody asked" — the re-prompt after
     /// a rejected passphrase offers a ticked box only in the second case, and
     /// the connection form reaches `open_tunnel` with a passphrase and no
-    /// parked answer at all (FRE-162).
+    /// parked answer at all.
     pub ssh_remember: Signal<HashMap<String, bool>>,
     /// Introspected schema per open connection.
     pub schemas: Signal<HashMap<ConnectionId, SchemaLoad>>,
     /// Sidebar/grid UI state per open connection.
     pub tab_ui: Signal<HashMap<ConnectionId, TabUi>>,
     /// Staged (unsaved) edits per connection, keyed by [`TableRef::key`].
-    /// FRE-24/25 push changes in via [`Self::stage_cell_edit`], the
+    /// The grid's editors push changes in via [`Self::stage_cell_edit`], the
     /// `stage_insert_*` family, and [`Self::stage_delete`];
     /// [`Self::save_staged`] applies a table's stage in one transaction.
     pub staged: Signal<HashMap<ConnectionId, HashMap<String, TableStage>>>,
@@ -864,7 +864,7 @@ pub struct AppState {
     /// (Signal subscription is per-signal, so any write here wakes every
     /// mounted grid's readers — the grid therefore reads its own entry
     /// through a PartialEq-gated memo, and only the bumped table's grid
-    /// actually resets/refetches; FRE-129.)
+    /// actually resets/refetches.)
     pub grid_refresh: Signal<HashMap<(ConnectionId, String), u64>>,
     /// Two-step unsaved-changes guard. Navigating away from staged edits
     /// (selecting another table, switching panes, closing the tab) does not
@@ -878,16 +878,16 @@ pub struct AppState {
     /// running transaction.
     ///
     /// Closing the OS window with staged edits is guarded separately by
-    /// [`Self::any_dirty`] + [`Self::confirm_quit`] (FRE-37), which raises a
+    /// [`Self::any_dirty`] + [`Self::confirm_quit`], which raises a
     /// discard-and-quit confirmation rather than losing the edits silently.
     pub nav_guard: Signal<Option<PendingNav>>,
-    /// Latest free-form SQL result per query tab (FRE-113).
+    /// Latest free-form SQL result per query tab.
     pub sql_runs: Signal<HashMap<(ConnectionId, u64), SqlRun>>,
     /// Scripts containing writes, held here until the user confirms (or
     /// dismisses) the write-confirmation banner, per query tab.
     pub pending_sql: Signal<HashMap<(ConnectionId, u64), PendingSql>>,
-    /// Staged saves waiting on the FRE-111 confirmation, one per table, each
-    /// holding the exact change list the prompt named.
+    /// Staged saves waiting on the write-protection confirmation, one per
+    /// table, each holding the exact change list the prompt named.
     ///
     /// Only populated for connections marked [`WriteProtection::Confirm`];
     /// an unmarked connection saves straight through as before. The staged
@@ -895,7 +895,7 @@ pub struct AppState {
     /// so dismissing loses nothing, and the copy is what makes a confirmation
     /// stale once the stage moves on (see `take_pending_save`).
     pub pending_saves: Signal<HashMap<(ConnectionId, String), Vec<StagedChange>>>,
-    /// Per-connection accent colour (FRE-111), seeded from the saved entry at
+    /// Per-connection accent colour, seeded from the saved entry at
     /// connect time.
     ///
     /// Kept beside the registry rather than inside it because a colour warns
@@ -919,7 +919,7 @@ pub struct AppState {
     pub history: Signal<Option<HistoryStore>>,
     /// Why the history store is unavailable, shown in the history panel.
     pub history_error: Signal<Option<String>>,
-    /// A failed history write for an otherwise-successful run (FRE-72).
+    /// A failed history write for an otherwise-successful run.
     /// Shown as a dismissible banner above the (still readable) history
     /// list; cleared by the next record attempt that reaches the store.
     pub history_record_error: Signal<Option<String>>,
@@ -928,13 +928,13 @@ pub struct AppState {
     pub history_nonce: Signal<u64>,
     /// UI mirror of the store's persisted recording flag.
     pub history_recording: Signal<bool>,
-    /// Bumped whenever a saved query is written or deleted (FRE-113), so open
+    /// Bumped whenever a saved query is written or deleted, so open
     /// saved-query panels re-query. Separate from [`Self::history_nonce`]:
     /// running a script must not make every open panel refetch a list that
     /// cannot have changed.
     pub saved_nonce: Signal<u64>,
     /// Outcome of the most recent saved-query write, per connection. Keyed
-    /// like [`Self::export_status`] (FRE-73): one connection's "Saved" line
+    /// like [`Self::export_status`]: one connection's "Saved" line
     /// has no business appearing in another connection's panel.
     pub saved_status: Signal<HashMap<ConnectionId, SavedStatus>>,
     /// The persisted theme choice (System / Light / Dark). The toggle cycles
@@ -945,18 +945,18 @@ pub struct AppState {
     /// preference; written from the startup detection task.
     pub dark: Signal<bool>,
     /// Whether the schema sidebar lists the objects a backend declared
-    /// internal (FRE-88). Persisted by
+    /// internal. Persisted by
     /// [`Self::set_show_internal_objects`]; global rather than
     /// per-connection, since it expresses what the user wants to look at
     /// rather than anything about one database.
     pub show_internal_objects: Signal<bool>,
-    /// Connection groups the user has collapsed in the connections list
-    /// (FRE-120), by name. Seeded from session.toml at restore and written
+    /// Connection groups the user has collapsed in the connections list,
+    /// by name. Seeded from session.toml at restore and written
     /// back with the rest of the session: a fold is view state, not
     /// connection data (see [`Session::collapsed_groups`]).
     pub collapsed_groups: Signal<Vec<String>>,
-    /// A saved-connection edit awaiting the connect that confirms it
-    /// (FRE-75). The Entra sign-in card resolves it from a background task
+    /// A saved-connection edit awaiting the connect that confirms it.
+    /// The Entra sign-in card resolves it from a background task
     /// after the form has closed.
     pub pending_edit: Signal<Option<PendingEdit>>,
     /// Latest export progress per connection and pane. Written from the
@@ -964,19 +964,19 @@ pub struct AppState {
     pub export_status: Signal<HashMap<(ConnectionId, ExportPane), ExportStatus>>,
     /// Monotonic id per export slot; a finishing task only records its
     /// outcome while it is still the slot's latest export, so a slow export
-    /// can't overwrite the status of one started after it (FRE-73).
+    /// can't overwrite the status of one started after it.
     pub export_generations: Signal<HashMap<(ConnectionId, ExportPane), u64>>,
-    /// Pending foreign-key focus per connection (FRE-29): a target table plus
+    /// Pending foreign-key focus per connection: a target table plus
     /// the filter to seed. Set by [`Self::navigate_fk`] / [`Self::navigate_back`]
     /// right before the target grid is selected; the grid consumes the entry
     /// matching its table (on mount, or live for a same-table jump) and clears
     /// it. At most one is pending per connection.
     pub pending_focus: Signal<HashMap<ConnectionId, FocusTarget>>,
-    /// Back stack per connection (FRE-29): the views left behind by forward
+    /// Back stack per connection: the views left behind by forward
     /// foreign-key jumps, most recent last. [`Self::navigate_back`] pops one;
     /// a manual table selection clears the stack.
     pub nav_history: Signal<HashMap<ConnectionId, Vec<FocusTarget>>>,
-    /// Latest import progress per connection (FRE-112). Written from the
+    /// Latest import progress per connection. Written from the
     /// `spawn_forever` import task. Keyed per connection only — an
     /// import is always started from the grid, so there is no second pane to
     /// tell apart.
@@ -989,7 +989,7 @@ pub struct AppState {
     /// can cancel it rather than leaving it to commit into a pool that is
     /// being torn down. Held for the same reason [`Self::sql_tasks`] is.
     pub import_tasks: Signal<HashMap<ConnectionId, Task>>,
-    /// Latest schema-edit progress per connection (FRE-122). Written from the
+    /// Latest schema-edit progress per connection. Written from the
     /// `spawn_forever` task in [`schema_edit`]. Per connection rather than per
     /// table: one dialog is open at a time, and the line it leaves behind
     /// belongs to the tab.
@@ -1001,7 +1001,7 @@ pub struct AppState {
     /// connection drops it rather than leaving a statement running against a
     /// pool being torn down.
     pub schema_edit_tasks: Signal<HashMap<ConnectionId, Task>>,
-    /// Whether the keyboard-shortcut cheatsheet overlay is showing (FRE-15).
+    /// Whether the keyboard-shortcut cheatsheet overlay is showing.
     /// App-global (one overlay for the whole window), toggled by `?` and
     /// dismissed by Escape / a backdrop click / `?` again.
     pub show_cheatsheet: Signal<bool>,
@@ -1060,7 +1060,7 @@ impl AppState {
         // These were scoped field by field, and that judgement does not
         // survive contact with the code. Six previously component-scoped
         // fields are named *directly* inside a `spawn_forever` body, and only
-        // three of those had been noticed (FRE-156) — but a task that calls a
+        // three of those had been noticed — but a task that calls a
         // method that touches a signal reaches it just as surely, and nothing
         // at the call site shows it. Following those calls, 18 of the 27 were
         // reachable. One connect handler alone reaches twelve.
@@ -1175,7 +1175,7 @@ impl AppState {
     }
 
     /// This connection's *effective* capabilities resolved for one object —
-    /// the backend's (FRE-87) narrowed by the user's marking (FRE-111).
+    /// the backend's narrowed by the user's marking.
     /// `None` when the connection is gone.
     ///
     /// Every UI gate reads through here so the disabled button, the refused
@@ -1189,8 +1189,8 @@ impl AppState {
         self.registry.read().get(id).map(Connection::capabilities)
     }
 
-    /// Whether writes through this connection must be confirmed first
-    /// (FRE-111). False for a connection that is gone.
+    /// Whether writes through this connection must be confirmed first.
+    /// False for a connection that is gone.
     pub fn confirms_writes(&self, id: ConnectionId) -> bool {
         self.registry
             .read()
@@ -1199,7 +1199,7 @@ impl AppState {
     }
 
     /// Whether the *user's marking* — rather than the backend — is what makes
-    /// this connection unwritable (FRE-111), so the UI can name the right
+    /// this connection unwritable, so the UI can name the right
     /// culprit. False when the engine refuses writes on its own: then the
     /// marking changed nothing and mustn't claim the credit.
     pub fn marked_read_only(&self, id: ConnectionId) -> bool {
@@ -1209,7 +1209,7 @@ impl AppState {
         })
     }
 
-    /// This connection's accent colour, if the user set one (FRE-111).
+    /// This connection's accent colour, if the user set one.
     pub fn connection_color(&self, id: ConnectionId) -> Option<ConnectionColor> {
         self.connection_colors.read().get(&id).copied()
     }
@@ -1273,8 +1273,8 @@ impl AppState {
     }
 
     /// Cycles the currently active connection tab through Data → SQL →
-    /// Schema (FRE-15's `Ctrl+E` shortcut, extended for the third pane in
-    /// FRE-69). A no-op on the connections screen. Routed through
+    /// Schema (the `Ctrl+E` shortcut, extended when Schema became the third
+    /// pane). A no-op on the connections screen. Routed through
     /// [`Self::set_pane`], so the unsaved-changes guard still applies when
     /// leaving the browser with staged edits.
     pub fn toggle_active_pane(self) {
@@ -1287,7 +1287,7 @@ impl AppState {
             .get(&id)
             .map(|ui| ui.pane)
             .unwrap_or_default();
-        // Cycles rather than toggles now that there are three panes (FRE-69).
+        // Cycles rather than toggles now that there are three panes.
         let target = match current {
             Pane::Browser => Pane::Sql,
             Pane::Sql => Pane::Schema,
@@ -1296,7 +1296,7 @@ impl AppState {
         self.set_pane(id, target);
     }
 
-    /// Whether one tab has the row detail panel docked open (FRE-109).
+    /// Whether one tab has the row detail panel docked open.
     pub fn row_detail_open(&self, id: ConnectionId) -> bool {
         self.tab_ui.read().get(&id).is_some_and(|ui| ui.row_detail)
     }
@@ -1308,8 +1308,8 @@ impl AppState {
         self.tab_ui.write().entry(id).or_default().row_detail = open;
     }
 
-    /// Toggles the active tab's row detail panel (FRE-109's shortcut). A no-op
-    /// on the connections screen.
+    /// Toggles the active tab's row detail panel, for its keyboard shortcut.
+    /// A no-op on the connections screen.
     pub fn toggle_row_detail(self) {
         let ActiveView::Connection(id) = *self.active.read() else {
             return;
@@ -1318,7 +1318,7 @@ impl AppState {
     }
 
     /// The row detail panel's remembered width for one tab, or `None` for the
-    /// default (FRE-109).
+    /// default.
     pub fn row_detail_width(&self, id: ConnectionId) -> Option<f64> {
         self.tab_ui
             .read()
@@ -1332,13 +1332,13 @@ impl AppState {
         self.tab_ui.write().entry(id).or_default().row_detail_width = Some(width);
     }
 
-    /// Flips the shortcut cheatsheet overlay (FRE-15, the `?` shortcut).
+    /// Flips the shortcut cheatsheet overlay (the `?` shortcut).
     pub fn toggle_cheatsheet(mut self) {
         let showing = *self.show_cheatsheet.read();
         self.show_cheatsheet.set(!showing);
     }
 
-    /// Closes the shortcut cheatsheet if it is open (FRE-15, Escape). Kept
+    /// Closes the shortcut cheatsheet if it is open (Escape). Kept
     /// idempotent so a stray Escape never churns the signal.
     pub fn close_cheatsheet(mut self) {
         if *self.show_cheatsheet.read() {
@@ -1367,7 +1367,7 @@ impl AppState {
         }
         // Persist off the UI path; no signal borrow is held across the write.
         // `save_theme` merges into the existing file so the window geometry
-        // (FRE-30, same settings.toml) isn't clobbered.
+        // (persisted in the same settings.toml) isn't clobbered.
         let Some(path) = default_settings_path() else {
             return;
         };
@@ -1377,7 +1377,7 @@ impl AppState {
     }
 
     /// Shows or hides the database's own internal objects in the sidebar
-    /// (FRE-88) and persists the choice, best-effort like
+    /// and persists the choice, best-effort like
     /// [`Self::set_theme`].
     pub fn set_show_internal_objects(mut self, show: bool) {
         self.show_internal_objects.set(show);
@@ -1445,7 +1445,7 @@ impl AppState {
             .is_some_and(|stack| !stack.is_empty())
     }
 
-    /// Follows a foreign key from `origin` to the row it references (FRE-29):
+    /// Follows a foreign key from `origin` to the row it references:
     /// resolves the target table, builds the multi-equality filter that pins
     /// the referenced row from `source_row`, records the origin view on the
     /// Back stack, and selects the target (seeding its filter through
@@ -1501,7 +1501,7 @@ impl AppState {
         }
     }
 
-    /// Returns to the most recent view on the FK Back stack (FRE-29),
+    /// Returns to the most recent view on the FK Back stack,
     /// restoring its table and filter. A no-op when the stack is empty. The
     /// entry is only popped once the return actually happens, so a staged-edit
     /// guard parking the switch keeps it for the confirming click.
@@ -1532,7 +1532,7 @@ impl AppState {
     }
 
     /// Loads one cell's full value on demand — the grid's expand and
-    /// truncated-cell editing path (FRE-33). Clones the pool and this table's
+    /// truncated-cell editing path. Clones the pool and this table's
     /// metadata out of the signals before the await (no borrow spans it), then
     /// targets the row through its [`RowLocator`]. Returns a user-facing error
     /// string on any failure. Never `spawn`ed itself — callers drive it from a
@@ -1552,7 +1552,7 @@ impl AppState {
         // A read path: it only needs the row to be addressable, so it asks
         // for the identity alone rather than a full access it has no business
         // reading a write capability off — a read-only connection, whether by
-        // engine (FRE-87) or by marking (FRE-111), still expands cells.
+        // engine or by marking, still expands cells.
         let Some(identity) = pool.backend_row_identity(&meta) else {
             return Err("this table has no usable row identity".into());
         };
@@ -1561,7 +1561,7 @@ impl AppState {
             .map_err(|e| e.to_string())
     }
 
-    /// DDL for one of a table's objects (FRE-108): the table/view itself, or
+    /// DDL for one of a table's objects: the table/view itself, or
     /// one of its indexes. Same shape as [`Self::load_cell`] — the pool and
     /// metadata are cloned out of the signals before the await. No capability
     /// gate: reading a definition is a pure read, so a read-only connection
@@ -1582,7 +1582,7 @@ impl AppState {
             .map_err(|e| e.to_string())
     }
 
-    /// One table's cheap storage statistics (FRE-118), loaded when the schema
+    /// One table's cheap storage statistics, loaded when the schema
     /// pane opens it. Same shape as [`Self::load_ddl`]: pool and metadata are
     /// cloned out of the signals before the await, and no capability gate —
     /// reading the catalog's own accounting is a pure read.
@@ -1605,7 +1605,7 @@ impl AppState {
             .map_err(|e| e.to_string())
     }
 
-    /// Exactly how many rows a table holds, by running `COUNT(*)` (FRE-118).
+    /// Exactly how many rows a table holds, by running `COUNT(*)`.
     ///
     /// Only ever from an explicit "count exactly" action — see
     /// [`DbPool::count_table_rows`], which is where the reason lives.
@@ -1654,7 +1654,7 @@ impl AppState {
     /// so when another pane or tab is in front the first click can look
     /// inert; the second click still closes. A deliberate simplification,
     /// kept until a global toast/dialog exists. (Closing the OS window is
-    /// guarded separately by the discard-and-quit confirmation, FRE-37.)
+    /// guarded separately by the discard-and-quit confirmation.)
     pub fn close_connection(mut self, id: ConnectionId) {
         if self.any_stage_dirty(id) {
             if self.any_stage_saving(id) {
@@ -1785,7 +1785,7 @@ mod tests {
 
     #[test]
     fn every_app_state_signal_is_root_scoped() {
-        // FRE-156. A component-scoped field touched from a `spawn_forever`
+        // A component-scoped field touched from a `spawn_forever`
         // task warns at runtime and can fail once the creating scope drops —
         // and *nothing else in this suite can see it*, because the warning
         // only exists while the app is running. Five were being logged on
@@ -1895,8 +1895,8 @@ mod tests {
 
     #[test]
     fn opening_a_query_never_overwrites_unsaved_editor_text() {
-        // The property the whole "open in a new tab" rule exists for
-        // (FRE-113): whatever was being written is still there afterwards,
+        // The property the whole "open in a new tab" rule exists for:
+        // whatever was being written is still there afterwards,
         // and the opened query is what the pane switches to.
         let mut buffers = buffers(&["SELECT half_typed"]);
         let opened = buffers.open(Some("Daily counts".into()), "SELECT count(*)".into());
@@ -1985,8 +1985,9 @@ mod tests {
 
     #[test]
     fn the_tail_of_typing_lands_in_the_buffer_it_was_typed_in() {
-        // FRE-154. The editor flushes what it still owes on the way *out* of a
-        // buffer, so that message arrives after the switch by design. It has
+        // Switching buffers used to drop the last 250 ms of typing. The editor
+        // now flushes what it still owes on the way *out* of a buffer, so that
+        // message arrives after the switch by design. It has
         // to be filed under the buffer named in it: filing it under whichever
         // buffer is active on arrival would paste the outgoing tab's tail into
         // the incoming one, which is worse than the loss it replaced.

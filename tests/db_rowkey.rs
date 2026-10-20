@@ -1,5 +1,5 @@
-//! End-to-end tests for row-identity detection and guarded writes
-//! (FRE-26): detection runs on real introspection output, and the write path
+//! End-to-end tests for row-identity detection and guarded writes:
+//! detection runs on real introspection output, and the write path
 //! commits only when the affected-row count matches.
 //!
 //! The write cases drive `apply_staged` — the real production path, which

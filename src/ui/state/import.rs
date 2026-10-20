@@ -1,4 +1,4 @@
-//! Running a file import in the background (FRE-112) — the write-side twin
+//! Running a file import in the background — the write-side twin
 //! of the export task in [`sql`](super::sql).
 //!
 //! Same shape as an export, deliberately: the work runs in a `spawn_forever`
@@ -98,7 +98,7 @@ impl AppState {
     /// outcome lands in [`Self::import_status`]; the UI never blocks.
     ///
     /// Capabilities are resolved *here*, from the live connection — so the
-    /// user's read-only marking (FRE-111) is read at the moment the import
+    /// user's read-only marking is read at the moment the import
     /// starts rather than whenever the dialog happened to open — and passed
     /// to [`run_import`], which refuses on the same resolved answer.
     pub fn start_import(mut self, id: ConnectionId, request: ImportRequest) {

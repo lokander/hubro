@@ -1,7 +1,7 @@
 //! The dialect toolkit shared by every SQL builder: placeholder and cast
 //! rendering, identifier quoting and schema qualification, the "filters
 //! compare as text" comparison strategy, and the bounded-preview
-//! `(value, length)` expression pairs (FRE-33/FRE-110).
+//! `(value, length)` expression pairs.
 //!
 //! Identifier names come from introspection (still quoted defensively);
 //! values are always bound parameters, never interpolated. Everything here is
@@ -130,8 +130,8 @@ fn equality_text(value: &Value) -> String {
     }
 }
 
-/// Length of a SQL Server text value in the units `SUBSTRING` slices by
-/// (FRE-110). `cast` must already be an `nvarchar(max)` expression.
+/// Length of a SQL Server text value in the units `SUBSTRING` slices by.
+/// `cast` must already be an `nvarchar(max)` expression.
 ///
 /// **Not `LEN()`.** A bounded read is only safe while the length probe and
 /// the slice count the same thing, because "was this truncated?" is decided
@@ -162,8 +162,8 @@ pub(crate) fn mssql_text_len(cast: &str) -> String {
     format!("DATALENGTH({cast}) / 2")
 }
 
-/// The bounded-preview `(value_expr, length_expr)` pair for one column
-/// (FRE-33): the value expression fetches at most `cap` characters (text) or
+/// The bounded-preview `(value_expr, length_expr)` pair for one column:
+/// the value expression fetches at most `cap` characters (text) or
 /// bytes (binary) of `q` (an already-quoted column identifier), and the
 /// length expression probes the full stored length in the *same units the
 /// slice counts* — the invariant that decides "was this truncated?"

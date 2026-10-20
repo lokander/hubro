@@ -1,8 +1,8 @@
-//! Staged-edit model for one table view (FRE-14): pending cell edits, row
+//! Staged-edit model for one table view: pending cell edits, row
 //! inserts, and row deletes accumulate here until the user saves (all in one
 //! transaction, via [`apply_staged`](crate::db::apply_staged)) or discards.
 //!
-//! FRE-24/25 (cell editors, insert/delete affordances) only push changes in
+//! The cell editors and insert/delete affordances only push changes in
 //! through [`AppState::stage_cell_edit`](super::state::AppState::stage_cell_edit)
 //! / the `stage_insert_*` / `stage_delete` family; everything downstream —
 //! dirty rendering, the Save/Discard bar, the transactional apply — already

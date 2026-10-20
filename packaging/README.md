@@ -1,6 +1,6 @@
 # Packaging: file associations
 
-These files make a double-clicked database open in hubro (FRE-114). They are
+These files make a double-clicked database open in hubro. They are
 read by `dx bundle`, wired up in `Dioxus.toml`, and checked by
 `tests/file_associations.rs` — which is the only thing that runs them, since
 none of them is exercised by a normal build.
@@ -86,7 +86,7 @@ something they can pick.
 The fragment is inert unless the installed feature references its component
 group, which is why `Dioxus.toml` carries both `fragment_paths` and
 `component_group_refs`. The NSIS `setup.exe` registers nothing — a deliberate
-limit of FRE-114, not an oversight.
+limit of the file-association work, not an oversight.
 
 ## What is unverified
 

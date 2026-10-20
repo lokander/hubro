@@ -1,4 +1,4 @@
-//! The import dialog (FRE-112): pick how to read the file, see what that
+//! The import dialog: pick how to read the file, see what that
 //! produces, map its fields onto the table's columns, and start the import.
 //!
 //! Everything here is a *choice with a visible consequence*. Detection
@@ -62,11 +62,12 @@ pub fn ImportDialog(
     /// supplies the types every value is coerced to.
     table: TableMeta,
     path: PathBuf,
-    /// Why importing into this object is refused, when it is (FRE-87/111).
+    /// Why importing into this object is refused, when it is (by the
+    /// backend's capability or the connection's write protection).
     /// Present means the dialog explains and offers nothing to press: the
     /// same sentence the disabled Save button shows.
     refusal: Option<String>,
-    /// The connection's name when it is marked *confirm writes* (FRE-111),
+    /// The connection's name when it is marked *confirm writes*,
     /// `None` otherwise — see [`import_action`]. Bulk-inserting a file is the
     /// write that most wants "read which database you are about to change",
     /// and it was the one write in the app that skipped the prompt a single
@@ -119,8 +120,8 @@ pub fn ImportDialog(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string());
     let is_csv = matches!(format(), SourceFormat::Csv(_));
-    // The import a previous press confirmed, on a connection that asks
-    // (FRE-111). Holding the whole request rather than a flag is what makes
+    // The import a previous press confirmed, on a connection that asks.
+    // Holding the whole request rather than a flag is what makes
     // the confirmation about *this* import: change a mapping or the error
     // mode afterwards and it no longer matches, so the prompt returns.
     let mut confirmed = use_signal(|| Option::<ImportRequest>::None);
@@ -405,7 +406,7 @@ pub fn ImportDialog(
                         Banner { kind: BannerKind::Warning, message: problem }
                     }
 
-                    // The FRE-111 confirmation, naming the connection —
+                    // The write-protection confirmation, naming the connection —
                     // the whole point is to make you read which database you
                     // are about to write a file into.
                     if armed {
@@ -441,7 +442,7 @@ pub fn ImportDialog(
     }
 }
 
-/// What pressing Import should do on a write-protected connection (FRE-111).
+/// What pressing Import should do on a write-protected connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImportAction {
     /// Run it now.
@@ -461,7 +462,7 @@ enum ImportAction {
 /// how the file is read after the prompt appears sends the user back through
 /// it. Otherwise the prompt would launder whatever the dialog happened to
 /// hold by the time they pressed again — with a file behind it, which is
-/// exactly the accident FRE-111 exists to prevent.
+/// exactly the accident write protection exists to prevent.
 ///
 /// `ReadOnly` never reaches here: it narrows `mutate`, so the import is
 /// refused by [`import_refusal`](crate::db::import_refusal) and the button is

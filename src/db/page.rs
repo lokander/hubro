@@ -7,7 +7,7 @@
 //! - [`PageRequest::select_sql`] fetches every column in full (`SELECT *`).
 //! - [`PageRequest::select_bounded_sql`] fetches a bounded *preview* of large
 //!   columns (long text / json / blobs) instead of their full contents, so a
-//!   page of multi-MB values never buffers megabytes per row (FRE-33). Small
+//!   page of multi-MB values never buffers megabytes per row. Small
 //!   columns and identity/foreign-key columns are always fetched whole so row
 //!   addressing and navigation stay exact.
 
@@ -298,7 +298,7 @@ pub enum FilterOp {
 /// - [`Filter::Column`] is the manual filter bar — one column compared with
 ///   `contains`/`equals` against a text value the user typed.
 /// - [`Filter::Equalities`] is a conjunction of `column = value` equalities,
-///   installed by foreign-key navigation (FRE-29) to pin the referenced row
+///   installed by foreign-key navigation to pin the referenced row
 ///   across one or more columns. Values come from the source row, so they are
 ///   already typed [`Value`]s rather than user text.
 ///
@@ -406,7 +406,7 @@ impl PageRequest {
 
     /// SELECT for this page that fetches a bounded preview of large columns
     /// (long text / json / blobs) instead of their full contents, so peak
-    /// memory does not scale with value size (FRE-33). Returns the SQL, its
+    /// memory does not scale with value size. Returns the SQL, its
     /// bound parameters, and the [`BoundedPlan`] the decoder needs to strip
     /// the trailing `length` helper columns and rebuild the visible result.
     ///
@@ -863,7 +863,7 @@ mod tests {
         assert!(params.is_empty());
     }
 
-    // ---- Bounded previews (FRE-33) ------------------------------------
+    // ---- Bounded previews ------------------------------------
 
     use crate::db::schema::Generated;
     use crate::db::value::{ColumnInfo, QueryResult};
@@ -936,7 +936,7 @@ mod tests {
         }
         // SQL Server sql_variant and CLR UDT columns MUST stay Text (the
         // unknown-type fallback): selecting them raw panics inside the
-        // tiberius codec (FRE-55/FRE-56), while the Text class routes them
+        // tiberius codec, while the Text class routes them
         // through the `CAST(… AS nvarchar(max))` preview, which SQL Server
         // accepts for all of them (CLR UDTs stringify via their ToString).
         for t in ["sql_variant", "hierarchyid", "geography", "geometry"] {

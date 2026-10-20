@@ -123,15 +123,16 @@ impl WindowGeometry {
 pub struct Settings {
     #[serde(default)]
     pub theme: Theme,
-    /// Last window size/position (FRE-30). `None` until the window is first
+    /// Last window size/position. `None` until the window is first
     /// resized/moved; on launch a missing value means "use the default size".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<WindowGeometry>,
     /// Whether the schema sidebar lists the objects a backend declared
-    /// internal — extension schemas and tables, child partitions (FRE-88).
+    /// internal — extension schemas and tables, child partitions.
     /// Off by default: on a Timescale database they outnumber the user's
     /// tables roughly twenty to one. `default` + `skip_serializing_if` keep
-    /// pre-FRE-88 settings files deserializing and unchanged on rewrite.
+    /// settings files from before this flag existed deserializing and
+    /// unchanged on rewrite.
     #[serde(default, skip_serializing_if = "is_false")]
     pub show_internal_objects: bool,
 }
@@ -178,7 +179,7 @@ pub fn save_theme(path: &Path, theme: Theme) -> Result<(), ConfigError> {
     update_settings(path, |settings| settings.theme = theme)
 }
 
-/// Persists just the internal-object visibility (FRE-88), preserving the
+/// Persists just the internal-object visibility, preserving the
 /// rest (see [`update_settings`] for why the file is re-read first).
 pub fn save_show_internal_objects(path: &Path, show: bool) -> Result<(), ConfigError> {
     update_settings(path, |settings| settings.show_internal_objects = show)
@@ -279,7 +280,7 @@ mod tests {
     fn missing_window_geometry_loads_as_none() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.toml");
-        // A theme-only file (as written before FRE-30).
+        // A theme-only file (as written before window state was persisted).
         std::fs::write(&path, "theme = \"light\"\n").unwrap();
         let loaded = load_settings(&path);
         assert_eq!(loaded.theme, Theme::Light);
@@ -291,8 +292,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.toml");
 
-        // A pre-FRE-88 file loads with the flag off and, rewritten, gains no
-        // key for it — an unaffected setting serializes unchanged.
+        // A file from before the flag loads with it off and, rewritten, gains
+        // no key for it — an unaffected setting serializes unchanged.
         std::fs::write(&path, "theme = \"light\"\n").unwrap();
         assert!(!load_settings(&path).show_internal_objects);
         save_theme(&path, Theme::Dark).unwrap();

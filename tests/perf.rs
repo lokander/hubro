@@ -1,4 +1,4 @@
-//! Performance fixtures and budgets (FRE-34).
+//! Performance fixtures and budgets.
 //!
 //! This file has two layers:
 //!
@@ -208,7 +208,7 @@ async fn budget_big_value_page() {
     pool.close().await;
 }
 
-/// The bounded page path (FRE-33) must keep peak memory independent of value
+/// The bounded page path must keep peak memory independent of value
 /// size. This asserts a **memory bound** — the whole decoded page is far
 /// smaller than even one full 4 MB value — as the observable proxy for bounded
 /// memory, then times it against the same `big_value_page` budget.

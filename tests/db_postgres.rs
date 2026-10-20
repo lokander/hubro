@@ -7,8 +7,8 @@
 //! HUBRO_PG_TEST_URL=postgres://tester:testpass@localhost:5433/demo cargo test
 //! ```
 //!
-//! The suite runs in a database of its own, created by `common::pg_test_url`
-//! (FRE-127): the Postgres suites all use the same fixture names, so any two
+//! The suite runs in a database of its own, created by `common::pg_test_url`:
+//! the Postgres suites all use the same fixture names, so any two
 //! running at once against one database dropped each other's tables. Cargo
 //! runs test targets sequentially, so the trigger is two concurrent `cargo
 //! test` invocations rather than one.
@@ -56,7 +56,7 @@ async fn stock_postgres_is_detected_as_stock_postgres() {
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
 
-    // The safety claim behind flavor detection (FRE-90), asserted from the
+    // The safety claim behind flavor detection, asserted from the
     // side CI can actually reach: an engine-specific branch must never fire
     // against real PostgreSQL. `tests/db_cockroach.rs` pins the other
     // direction, but that binary needs a Cockroach container and CI has none —
@@ -426,7 +426,7 @@ async fn postgres_multi_schema_introspection_has_parity_metadata() {
         "INSERT INTO warehouse.locations VALUES ('eu', 1, 'shelf A')",
         "INSERT INTO warehouse.stock (region, slot, note) VALUES ('eu', 1, 'first')",
         // Materialized view created after the insert so it snapshots the row;
-        // a unique index on it must NOT make it look editable (FRE-41).
+        // a unique index on it must NOT make it look editable.
         "CREATE MATERIALIZED VIEW warehouse.stock_mv AS \
          SELECT id, note FROM warehouse.stock",
         "CREATE UNIQUE INDEX stock_mv_id ON warehouse.stock_mv (id)",
@@ -495,7 +495,7 @@ async fn postgres_multi_schema_introspection_has_parity_metadata() {
         .unwrap();
     assert_eq!(view.kind, TableKind::View);
 
-    // Materialized view (FRE-41): introspected with its own kind and columns
+    // Materialized view: introspected with its own kind and columns
     // (from pg_catalog, since information_schema omits matviews), and read-only
     // — its unique index must not yield a row identity.
     // Exactly once: the pg_catalog UNION must not double-list it alongside an
@@ -519,7 +519,7 @@ async fn postgres_multi_schema_introspection_has_parity_metadata() {
         "a matview must be read-only even with a unique index"
     );
 
-    // Capabilities (FRE-87). Postgres declares the full set at the
+    // Capabilities. Postgres declares the full set at the
     // connection level; the per-object resolution is what differs, and each
     // narrowing states its own reason.
     assert_eq!(pool.backend_capabilities(), Capabilities::FULL);
@@ -605,7 +605,7 @@ async fn finite_datetimes_beyond_chrono_range_degrade_to_markers() {
     pool.close().await;
 }
 
-// ---- Bounded-memory reads (FRE-33) ---------------------------------------
+// ---- Bounded-memory reads ---------------------------------------
 
 #[tokio::test]
 async fn postgres_bounded_page_previews_large_text_and_bytea() {
@@ -732,7 +732,7 @@ async fn postgres_query_capped_stops_and_bounds_cells() {
     pool.close().await;
 }
 
-/// A zero-row result still carries its column headers (FRE-138) — the same
+/// A zero-row result still carries its column headers — the same
 /// contract the SQLite and SQL Server backends hold to.
 #[tokio::test]
 async fn postgres_empty_results_keep_their_column_headers() {
@@ -772,7 +772,7 @@ async fn postgres_empty_results_keep_their_column_headers() {
 
 /// Enum and array columns are reported by information_schema as the opaque
 /// `USER-DEFINED` / `ARRAY`, so introspection resolves the real structure
-/// from pg_catalog for the type-aware editors (FRE-71).
+/// from pg_catalog for the type-aware editors.
 #[tokio::test]
 async fn postgres_introspection_resolves_enum_variants_and_array_columns() {
     let Some(url) = test_url().await else { return };
@@ -837,7 +837,7 @@ async fn postgres_introspection_resolves_enum_variants_and_array_columns() {
 
 /// A case-sensitive (quoted) enum type in its own schema: the staged cast
 /// must be quoted per identifier, or it resolves to a lowercased name that
-/// doesn't exist. Regression test for the FRE-71 review.
+/// doesn't exist. Regression test for a bug found reviewing the enum editor.
 #[tokio::test]
 async fn postgres_quoted_camelcase_enum_saves_through_the_staged_cast() {
     let Some(url) = test_url().await else { return };
@@ -902,7 +902,7 @@ async fn postgres_quoted_camelcase_enum_saves_through_the_staged_cast() {
     pool.close().await;
 }
 
-/// A `bit(n)` / `bit varying` column can actually be written (FRE-159).
+/// A `bit(n)` / `bit varying` column can actually be written.
 ///
 /// The unit tests pin the SQL that is generated; only a live server can say
 /// whether Postgres accepts it. That distinction is the whole reason this bug
@@ -1076,7 +1076,7 @@ async fn partition_children_are_internal_but_their_parent_is_not() {
 
     // The parent is the table you browse, so it stays visible; the children
     // are the flooding problem, and are hidden by the same rule that hides
-    // an extension's objects (FRE-88). Nothing here involves an extension.
+    // an extension's objects. Nothing here involves an extension.
     assert_eq!(find("parted_intro").internal, None);
     assert_eq!(
         find("parted_intro_2026_01").internal,
@@ -1087,8 +1087,7 @@ async fn partition_children_are_internal_but_their_parent_is_not() {
     pool.close().await;
 }
 
-/// Whether this server accounts for an object's size as soon as it is written
-/// (FRE-118).
+/// Whether this server accounts for an object's size as soon as it is written.
 ///
 /// This binary is pointed at TimescaleDB, Citus and YugabyteDB as well as
 /// stock Postgres, and the last of those answers `pg_total_relation_size` with
@@ -1122,8 +1121,9 @@ async fn table_stats_estimate_rows_only_once_something_has_measured_them() {
     let meta = meta_of(&pool, "stats_intro").await;
 
     // Nothing has analyzed the table yet, so `pg_class.reltuples` is -1. The
-    // whole point of FRE-118's absent case: a viewer that reported this as
-    // "0 rows" would be stating something false about a table with four.
+    // whole point of rendering absent stats as absent: a viewer that reported
+    // this as "0 rows" would be stating something false about a table with
+    // four.
     let before = pool.fetch_table_stats(&meta).await.unwrap();
     assert_eq!(
         before.rows, None,
@@ -1308,7 +1308,7 @@ async fn postgres_explains_a_query_as_a_structured_plan() {
     let pool = DbPool::open_postgres(&url).await.unwrap();
     fresh_fixture(&pool, "fruits_plan").await;
 
-    // Stock PostgreSQL is the one flavor that gets the JSON form (FRE-119).
+    // Stock PostgreSQL is the one flavor that gets the JSON form.
     let support = pool.explain_support().expect("postgres has EXPLAIN");
     assert!(support.structured);
 

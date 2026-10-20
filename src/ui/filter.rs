@@ -1,4 +1,4 @@
-//! Matching and ranking for the schema sidebar's filter box (FRE-107).
+//! Matching and ranking for the schema sidebar's filter box.
 //!
 //! Deliberately free of Dioxus types: everything here is a pure function over
 //! the already-introspected [`TableMeta`] list, so the sidebar's behaviour is
@@ -35,7 +35,7 @@ const MIN_SUBSEQUENCE_LEN: usize = 3;
 
 /// What the one filter input is searching. Both modes share the same matcher;
 /// the mode only changes what gets scored and how the hits are grouped for
-/// rendering (FRE-107).
+/// rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterMode {
     /// The default: table and view names only.
@@ -343,7 +343,7 @@ pub struct TableHit {
 /// sidebar renders its unfiltered tree through exactly the same code path.
 ///
 /// Unless `show_internal`, objects the backend declared internal
-/// ([`TableMeta::internal`]) are dropped before matching (FRE-88) — the
+/// ([`TableMeta::internal`]) are dropped before matching — the
 /// filter is the one gate, so a hidden object stays hidden whether the user
 /// is browsing or searching. Dropping them up front also keeps them out of
 /// the per-keystroke matching cost, which on a Timescale database or a
@@ -435,7 +435,7 @@ pub fn filter_tables(tables: &[TableMeta], query: &Query, show_internal: bool) -
     hits.into_iter().map(|(_, hit)| hit).collect()
 }
 
-/// How many introspected objects the backend declared internal (FRE-88).
+/// How many introspected objects the backend declared internal.
 ///
 /// Counted over the whole schema rather than over the current filter results,
 /// so the sidebar's "N hidden" note describes the database — a stable fact —
@@ -445,7 +445,7 @@ pub fn count_internal_tables(tables: &[TableMeta]) -> usize {
 }
 
 /// Regroups ranked hits under their schemas for rendering, so the result
-/// stays a tree instead of collapsing into a flat list (FRE-107).
+/// stays a tree instead of collapsing into a flat list.
 ///
 /// Groups appear in the order their first (i.e. best-ranked) hit does, which
 /// puts the schema holding the strongest match at the top. A schema with no
@@ -509,7 +509,7 @@ mod tests {
             .collect()
     }
 
-    /// As [`ranked`], but with extension-owned schemas visible (FRE-88).
+    /// As [`ranked`], but with extension-owned schemas visible.
     fn ranked_with_system(tables: &[TableMeta], raw: &str) -> Vec<String> {
         filter_tables(tables, &parse_query(raw), true)
             .iter()
@@ -950,7 +950,7 @@ mod tests {
     #[test]
     fn partition_children_hide_by_the_same_rule_as_extension_objects() {
         // Nothing about the hiding is extension-specific: the backend says
-        // an object is internal and the filter believes it (FRE-88).
+        // an object is internal and the filter believes it.
         let tables = vec![
             table(Some("public"), "orders", &["id"]),
             partition("public", "orders_2026_01"),
@@ -967,7 +967,7 @@ mod tests {
     #[test]
     fn hidden_schemas_stay_hidden_when_searching() {
         // The sidebar hides these, so a search must not resurrect them —
-        // otherwise typing would contradict the toggle (FRE-88).
+        // otherwise typing would contradict the toggle.
         let tables = vec![
             table(Some("public"), "readings", &["time"]),
             ext_table("_timescaledb_internal", "_hyper_1_1_chunk", "timescaledb"),

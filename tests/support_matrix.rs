@@ -1,4 +1,4 @@
-//! Guards the README's "Supported databases" matrix (FRE-96) against the code
+//! Guards the README's "Supported databases" matrix against the code
 //! it describes.
 //!
 //! The matrix is prose, and prose rots. What rots first is coverage: an engine

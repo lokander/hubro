@@ -1,5 +1,5 @@
 //! Microsoft Entra ID (Azure AD) token acquisition for Azure Database for
-//! PostgreSQL (FRE-43).
+//! PostgreSQL.
 //!
 //! Azure Postgres can be configured for Entra-only login: instead of a
 //! password you pass a short-lived **access token** (for the resource
@@ -31,7 +31,7 @@ use tokio::net::TcpListener;
 /// its `/.default` scope.
 pub const OSSRDBMS_RESOURCE: &str = "https://ossrdbms-aad.database.windows.net";
 
-/// The Azure SQL Database OAuth resource (FRE-58); tokens for SQL Server are
+/// The Azure SQL Database OAuth resource; tokens for SQL Server are
 /// requested for its `/.default` scope.
 pub const SQLDB_RESOURCE: &str = "https://database.windows.net";
 

@@ -15,7 +15,7 @@ pub(super) struct CellView {
     pub(super) column: String,
     /// The fetched value. For a truncated large cell (`preview` is `Some`)
     /// this is only a bounded PREVIEW — never stage it as an edit; the full
-    /// value is loaded on demand (FRE-33).
+    /// value is loaded on demand.
     pub(super) value: Value,
     pub(super) dirty: bool,
     /// Full-value metadata when this cell is a truncated preview; `None` for a
@@ -40,7 +40,7 @@ pub(super) struct RowView {
     pub(super) cells: Vec<CellView>,
 }
 
-/// The fetched page reduced to exactly what the grid renders (FRE-130).
+/// The fetched page reduced to exactly what the grid renders.
 ///
 /// Built once per page/stage change by a memo and read by both the render and
 /// the keyboard-navigation model, so the page is never re-derived by a focus
@@ -70,12 +70,12 @@ pub(super) fn selectable_rows(rows: &[RowView]) -> Vec<(String, RowLocator)> {
         .collect()
 }
 
-/// The `[start, end)` slice of the page to put in the DOM (FRE-32), each row
+/// The `[start, end)` slice of the page to put in the DOM, each row
 /// paired with its index on the **whole page** — not its position in the
 /// window. Those indices are what the focus ring, the selection rectangle and
 /// the click handler address rows by, so they must survive the slicing.
 ///
-/// Only these rows are cloned out of the [`PageView`] memo (FRE-130); the rest
+/// Only these rows are cloned out of the [`PageView`] memo; the rest
 /// of the page is never copied per render.
 ///
 /// `start..end` must be a valid range into `rows`. It is: it comes from
@@ -100,7 +100,7 @@ pub(super) fn window_rows(rows: &[RowView], start: usize, end: usize) -> Vec<(us
 }
 
 /// Everything the grid's rows render against that comes from introspection
-/// rather than from the fetched page (FRE-130).
+/// rather than from the fetched page.
 ///
 /// Bundled into one value so it can be shared by pointer: as separate props
 /// each of the ~30 windowed rows deep-cloned a `HashMap` and a `Vec` per
@@ -116,7 +116,7 @@ pub(super) struct TableRenderMeta {
     pub(super) columns: Vec<ColumnMeta>,
     /// Per-column editor kind + nullability (see [`column_kinds_of`]).
     pub(super) column_kinds: HashMap<String, (EditorKind, bool)>,
-    /// Foreign keys of this table, indexed by `col_to_fk` (FRE-29).
+    /// Foreign keys of this table, indexed by `col_to_fk`.
     pub(super) foreign_keys: Vec<ForeignKeyMeta>,
     /// Referencing column → index into `foreign_keys`; a column in several FKs
     /// takes the first (documented v1 limit).
@@ -130,8 +130,8 @@ pub(super) struct TableRenderMeta {
 impl TableRenderMeta {
     /// Reduces one table's introspected metadata to what rendering needs.
     /// `dialect` feeds the required-column rules and the one editor kind that
-    /// a type name alone cannot decide — Postgres `bit` versus SQL Server's
-    /// (FRE-159). Without a live connection neither applies, and there is
+    /// a type name alone cannot decide — Postgres `bit` versus SQL Server's.
+    /// Without a live connection neither applies, and there is
     /// nothing to save through either. Empty when the schema isn't loaded yet.
     pub(super) fn build(meta: Option<&TableMeta>, dialect: Option<Dialect>) -> Self {
         let Some(meta) = meta else {
@@ -161,7 +161,7 @@ impl TableRenderMeta {
     }
 
     /// One column's declared type, as the Schema pane spells it — the string
-    /// the rich viewers classify on (FRE-115). Empty for a column the loaded
+    /// the rich viewers classify on. Empty for a column the loaded
     /// schema doesn't name (a schema still loading, a result whose columns
     /// aren't the table's), which
     /// [`classify_column`](crate::db::classify_column) already reads as
@@ -175,7 +175,7 @@ impl TableRenderMeta {
     }
 
     /// The foreign key this column belongs to, when following it leads
-    /// somewhere: a NULL key references nothing (FRE-29).
+    /// somewhere: a NULL key references nothing.
     pub(super) fn fk_of(&self, column: &str, value: &Value) -> Option<&ForeignKeyMeta> {
         if value.is_null() {
             return None;
@@ -192,7 +192,7 @@ impl TableRenderMeta {
 /// whose key columns are missing from the result (transient schema/result
 /// mismatch) render clean and read-only — they can't be addressed.
 ///
-/// `can_mutate` is the table's resolved write capability (FRE-87). Locators
+/// `can_mutate` is the table's resolved write capability. Locators
 /// are still built when it is false: addressing a row is a read concern too
 /// (cell expand fetches a single value through the same key), so a read-only
 /// connection keeps working — only `editable` turns off.
@@ -328,7 +328,7 @@ pub(super) fn cell_editable(
 }
 
 /// [`cell_editable`] for a cell whose column kind has already been resolved —
-/// the row renderer looks each column up once and asks this (FRE-130), rather
+/// the row renderer looks each column up once and asks this, rather
 /// than repeating the lookup per question.
 pub(super) fn editable_for_kind(cell: &CellView, kind: &EditorKind) -> bool {
     cell.editable && !kind.is_read_only()
@@ -384,7 +384,7 @@ pub(super) type EditCallbacks = (
 ///
 /// The draft guard is why this is shared rather than repeated: it is
 /// load-bearing for the one-editor invariant, not just for focus. Input that
-/// doesn't parse is stashed rather than dropped (FRE-74), and `use_drop`
+/// doesn't parse is stashed rather than dropped, and `use_drop`
 /// fires *after* whatever closed this editor has already chosen the next one
 /// — so an unguarded stash resurrects the invalid editor and hijacks the
 /// switch. Double-clicking another panel field reopened the old one, and
@@ -443,7 +443,7 @@ pub(super) fn GridHeader(
     name: String,
     sort: Option<(String, SortDir)>,
     on_sort: EventHandler<String>,
-    /// Shift-click: select this whole column instead of sorting (FRE-110).
+    /// Shift-click: select this whole column instead of sorting.
     on_select_column: EventHandler<()>,
 ) -> Element {
     let marker = match &sort {
@@ -480,16 +480,16 @@ pub(super) fn GridRow(
     table: TableRef,
     row: RowView,
     /// The table's introspected render metadata, shared by pointer with every
-    /// other row rather than deep-cloned into each of them (FRE-130).
+    /// other row rather than deep-cloned into each of them.
     meta: Shared<TableRenderMeta>,
     dialect: Dialect,
     editing: Signal<Option<ActiveEdit>>,
-    /// The keyboard-focused column in this row (FRE-15), or `None` when the
+    /// The keyboard-focused column in this row, or `None` when the
     /// focus ring is on another row.
     focused_col: Option<usize>,
     /// This row's index on the page, so a clicked cell can address itself.
     row_index: usize,
-    /// The inclusive span of selected columns in this row (FRE-110), or
+    /// The inclusive span of selected columns in this row, or
     /// `None` when the selection rectangle doesn't cover this row.
     selected_cols: Option<(usize, usize)>,
     /// A click on a cell: `(row, column, shift held)`.
@@ -500,7 +500,7 @@ pub(super) fn GridRow(
     /// row's column → value map (the source of the jump's equality filter).
     on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>)>,
 ) -> Element {
-    // Every cell resolved against the table metadata exactly once (FRE-130):
+    // Every cell resolved against the table metadata exactly once:
     // the editor kind and nullability, whether the cell may open an editor,
     // and the foreign key it can jump through. The slot below used to redo
     // three hash lookups per cell for the same three answers.
@@ -548,7 +548,7 @@ pub(super) fn GridRow(
             } else {
                 "border-t border-slate-200 dark:border-slate-800/60 hover:bg-slate-100 dark:hover:bg-slate-800/30"
             },
-            // Uniform row height (FRE-32): the windowed renderer positions rows
+            // Uniform row height: the windowed renderer positions rows
             // by `ROW_HEIGHT`, so pin it here — this also stops an open inline
             // editor from making its row taller and drifting the offsets.
             style: "height:{ROW_HEIGHT}px;",
@@ -602,7 +602,7 @@ pub(super) fn GridRow(
 }
 
 /// One cell of a rendered row, resolved against [`TableRenderMeta`] once
-/// (FRE-130) instead of looked up again for each of the three answers a
+/// instead of looked up again for each of the three answers a
 /// [`GridCellSlot`] needs.
 pub(super) struct RowCell {
     pub(super) cell: CellView,
@@ -629,9 +629,9 @@ pub(super) fn GridCellSlot(
     kind: EditorKind,
     nullable: bool,
     editable: bool,
-    /// Whether this cell holds the grid's keyboard focus ring (FRE-15).
+    /// Whether this cell holds the grid's keyboard focus ring.
     focused: bool,
-    /// Whether this cell is inside the selection rectangle (FRE-110).
+    /// Whether this cell is inside the selection rectangle.
     selected: bool,
     /// This cell's page coordinates, for the click-to-select handler.
     row_index: usize,
@@ -641,7 +641,7 @@ pub(super) fn GridCellSlot(
     editable_columns: Shared<Vec<String>>,
     mut editing: Signal<Option<ActiveEdit>>,
     /// `Some((fk, row_values))` when this cell belongs to a foreign key and
-    /// has a non-NULL value — renders a ↗ jump link (FRE-29). Editing the
+    /// has a non-NULL value — renders a ↗ jump link. Editing the
     /// cell value stays on double-click/Enter, so navigation and editing never
     /// contend for the same gesture.
     fk_jump: Option<(ForeignKeyMeta, Shared<HashMap<String, Value>>)>,
@@ -660,7 +660,7 @@ pub(super) fn GridCellSlot(
         let column = cell.column.clone();
         // A truncated cell holds only a preview — the editor must load the
         // full current value first, so a preview can never be staged as the
-        // new value and silently truncate the stored data (FRE-33).
+        // new value and silently truncate the stored data.
         if cell.preview.is_some() {
             return rsx! {
                 TruncatedCellEditor {
@@ -728,7 +728,7 @@ pub(super) fn GridCellSlot(
             Value::Blob(_) => "font-mono text-xs text-violet-700 dark:text-violet-400",
             _ => "font-mono text-xs text-slate-900 dark:text-slate-200",
         };
-        // The keyboard focus ring (FRE-15). Theme-aware; inset so it reads
+        // The keyboard focus ring. Theme-aware; inset so it reads
         // over the cell borders. The focused cell carries `dv-focused-cell`
         // so the grid can scroll it into view.
         let ring = if focused {
@@ -737,7 +737,7 @@ pub(super) fn GridCellSlot(
             ""
         };
         // One background per cell — Tailwind classes can't be layered, so the
-        // four combinations of dirty × selected (FRE-110) are spelled out. A
+        // four combinations of dirty × selected are spelled out. A
         // dirty cell keeps its amber, deepened while selected, so staged edits
         // never disappear under the selection tint.
         let background = match (cell.dirty, selected) {
@@ -752,13 +752,13 @@ pub(super) fn GridCellSlot(
                 class,
                 id: if focused { "dv-focused-cell" },
                 // A click moves the focus ring here; Shift extends the
-                // selection to it (FRE-110).
+                // selection to it.
                 onclick: move |evt: MouseEvent| {
                     on_select_cell.call((row_index, col_index, evt.modifiers().shift()));
                 },
                 // Double-click opens the editor with the mouse; keyboard
                 // activation (Enter) is handled centrally by the grid
-                // container via the focus ring (FRE-15).
+                // container via the focus ring.
                 ondoubleclick: move |_| {
                     if editable {
                         activate();
@@ -795,7 +795,7 @@ pub(super) fn InsertRow(
     id: ConnectionId,
     table: TableRef,
     insert: PendingInsert,
-    /// The visible columns, shared with the grid's header row (FRE-130).
+    /// The visible columns, shared with the grid's header row.
     headers: Shared<Vec<String>>,
     /// The table's introspected render metadata — the editor kinds and the
     /// required-column set, shared by pointer with every other row.
@@ -810,7 +810,7 @@ pub(super) fn InsertRow(
     let insert_id = insert.id();
     let row_key = insert.row_key();
     // Each column resolved against the metadata once, like a fetched row's
-    // cells (FRE-130).
+    // cells.
     let columns: Vec<(String, EditorKind, bool)> = headers
         .iter()
         .map(|column| {
@@ -992,7 +992,7 @@ pub(super) fn InsertCellSlot(
     }
 }
 
-/// The in-place editor for a TRUNCATED cell (FRE-33): loads the full current
+/// The in-place editor for a TRUNCATED cell: loads the full current
 /// value via [`AppState::load_cell`] first, then hands it to the shared
 /// [`CellEditor`] so the edit starts from the complete value — a preview is
 /// NEVER staged as the new value (which would silently truncate the stored
@@ -1093,9 +1093,9 @@ pub(super) fn TruncatedCellEditor(
     }
 }
 
-/// The full-value body of the expand popup for a truncated cell (FRE-33):
+/// The full-value body of the expand popup for a truncated cell:
 /// loads the value via [`AppState::load_cell`] and hands it to [`CellViewer`]
-/// (FRE-115) — a JSON tree, a picture, a hex dump or a text pane. A value over
+/// — a JSON tree, a picture, a hex dump or a text pane. A value over
 /// the fetch cap arrives as a prefix, and the viewer is told so, which is what
 /// keeps it from decoding half a document or half an image as a whole one.
 #[component]
@@ -1130,7 +1130,7 @@ pub(super) fn ExpandedValue(
             let capped = fetch.capped;
             // A capped fetch holds a prefix, so Copy raw is withdrawn rather
             // than handed a truncated value — the same refusal `plan_copy`
-            // makes for this cell, worded identically (FRE-110). What is on
+            // makes for this cell, worded identically. What is on
             // screen is the viewer's to describe; this says only what was
             // loaded and what that costs.
             let capped_note = capped.then(|| {
@@ -1165,7 +1165,7 @@ pub(super) fn ExpandedValue(
     }
 }
 
-/// A right-aligned "Copy raw" action for the expand popup (FRE-77): always
+/// A right-aligned "Copy raw" action for the expand popup: always
 /// copies the raw cell value — the pane may be showing an image, a hex dump or
 /// a JSON tree, which are for reading, not round-tripping.
 ///
@@ -1302,7 +1302,7 @@ mod tests {
 
         // Without the write capability nothing is editable either, even
         // though the rows stay addressable — a read-only connection can
-        // still expand a cell, which needs the locator (FRE-87).
+        // still expand a cell, which needs the locator.
         let rows = view_rows(&result, &[], 0, Some(&pk_identity()), None, false);
         assert!(rows[0].locator.is_some());
         assert!(rows.iter().all(|r| r.cells.iter().all(|c| !c.editable)));
@@ -1448,7 +1448,7 @@ mod tests {
         // This is the only wiring that hands `editor_kind` a dialect in the
         // running app, and `editor_kind` is total without it — so dropping it
         // silently reverts every Postgres bit column to a plain text editor
-        // with nothing else failing (FRE-159). Hence a test at this level and
+        // with nothing else failing. Hence a test at this level and
         // not only on `editor_kind` itself.
         let mut table = detail_table_meta();
         table.columns.push(ColumnMeta {

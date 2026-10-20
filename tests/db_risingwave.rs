@@ -1,4 +1,4 @@
-//! RisingWave verification (FRE-93). Like Materialize (`tests/db_materialize.rs`)
+//! RisingWave verification. Like Materialize (`tests/db_materialize.rs`)
 //! it is a streaming engine speaking the Postgres wire protocol — but a more
 //! capable one in every respect except the one that matters most for writing:
 //! its tables take primary keys and ordinary DML, and it has no transactions at
@@ -33,8 +33,8 @@
 //! multi-statement script died on a sentence about connection status that names
 //! nothing they can act on, after they had staged the work. RisingWave is
 //! therefore the first backend to declare something other than
-//! `Capabilities::FULL` — `transactions: false` — which is what FRE-87 built
-//! the model for. Two things follow automatically and are pinned below:
+//! `Capabilities::FULL` — `transactions: false` — which is what the capability
+//! model was built for. Two things follow automatically and are pinned below:
 //! `wrap_atomically` stops wrapping multi-statement scripts, so they run
 //! sequentially and report honestly; and every object resolves to read-only
 //! with [`NO_GUARDED_WRITE`] as the reason, up front rather than at save time.
@@ -97,7 +97,7 @@
 //! `SOURCE` too and was previously naming itself in a message RisingWave also
 //! showed.
 //!
-//! **A sink is no longer offered for opening** (FRE-148). It has no rows at
+//! **A sink is no longer offered for opening**. It has no rows at
 //! all, so `fetch_page` used to return the engine's own `table or source not
 //! found`: being a view stopped it offering editing, but views are browsable
 //! and nothing said "this object has no rows to browse". Suppressing the open
@@ -110,7 +110,7 @@
 //! carries its reason as a tooltip, and selecting it states that reason in
 //! place of the grid instead of running a query that cannot work.
 //!
-//! FRE-148 asked whether Materialize shares the shape. It does not arise
+//! Whether Materialize shares the shape was checked. It does not arise
 //! there: `tests/db_materialize.rs` records that Materialize's sinks stay out
 //! of the schema tree entirely, and its `information_schema.tables` reported
 //! no `SINK` rows when checked — though that container has no sinks to report,
@@ -282,7 +282,7 @@ async fn risingwave_declares_itself_non_transactional() {
     // pages by LIMIT/OFFSET like any other; overstating the loss would disable
     // the SQL editor's write paths, which work.
     //
-    // `transactional_ddl` goes with it (FRE-146) rather than being a second,
+    // `transactional_ddl` goes with it rather than being a second,
     // independent loss: that flag asks what a *rollback* covers, and nothing
     // here rolls back at all. Unlike CockroachDB and YugabyteDB — which have
     // real transactions and lose only the schema half — the two are not
@@ -556,10 +556,10 @@ async fn risingwave_source_and_sink_are_read_only_and_say_which_they_are() {
         .unwrap()
         .contains("no rows of its own"));
 
-    // The half FRE-148 added: it is not browsable either, and says why. A
-    // source sitting next to it stays browsable, which is what keeps the gate
-    // from being "streaming objects are hidden" — a source really does have
-    // rows to read.
+    // The half the per-object read gate added: it is not browsable either,
+    // and says why. A source sitting next to it stays browsable, which is what
+    // keeps the gate from being "streaming objects are hidden" — a source
+    // really does have rows to read.
     assert!(
         !sink_access.can_read(),
         "a sink has no rows, so it must not be offered for opening"
@@ -605,7 +605,7 @@ async fn risingwave_has_no_pg_class_statistics_so_none_are_invented() {
     // relation-size function, so the shape probe finds nothing to ask for and
     // no statistics query is sent at all. The point of the probe: a server
     // missing a column must produce an empty answer, not a failed statement
-    // that would put an error where a number goes (FRE-92/FRE-118).
+    // that would put an error where a number goes.
     for name in [&readings, &matview] {
         let stats = pool.fetch_table_stats(find(&tables, name)).await.unwrap();
         assert!(

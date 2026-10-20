@@ -1,4 +1,4 @@
-//! Rich cell viewers (FRE-115): one value rendered as what it *is* — a JSON
+//! Rich cell viewers: one value rendered as what it *is* — a JSON
 //! tree, an image, a hex dump, or a scrollable text pane — instead of as a
 //! wall of escaped text or a `<blob 12 KB>` placeholder.
 //!
@@ -50,10 +50,11 @@ use crate::db::{classify_column, ColumnClass};
 /// dump and says why.
 ///
 /// This gate fires for a **complete** blob between here and
-/// [`FETCH_CELL_MAX_BYTES`], and only there. A genuinely huge blob — the 200 MB
-/// case of FRE-115 — never reaches it: `fetch_cell` caps at
-/// [`FETCH_CELL_MAX_BYTES`], so it arrives as a prefix and the truncation gate
-/// in [`blob_view`] refuses it first. Two gates, two reasons, both reachable.
+/// [`FETCH_CELL_MAX_BYTES`], and only there. A genuinely huge blob — a 200 MB
+/// one, which must be declined rather than hang the UI — never reaches it:
+/// `fetch_cell` caps at [`FETCH_CELL_MAX_BYTES`], so it arrives as a prefix
+/// and the truncation gate in [`blob_view`] refuses it first. Two gates, two
+/// reasons, both reachable.
 pub(super) const IMAGE_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 /// Largest text a viewer will *attempt* to parse as JSON. Past it the text is
@@ -255,7 +256,7 @@ impl CellView {
     }
 }
 
-/// Picks the viewer for one cell (FRE-115).
+/// Picks the viewer for one cell.
 ///
 /// `type_name` is the column's declared type as the panel shows it, or empty
 /// when [`TableRenderMeta::type_of`] could not name the column — a schema still
@@ -386,7 +387,7 @@ fn text_view(text: &str, type_name: &str, truncated: Option<u64>) -> CellView {
     CellView::plain(ViewBody::Json(parsed))
 }
 
-/// One cell rendered by whichever viewer [`choose_view`] picked (FRE-115).
+/// One cell rendered by whichever viewer [`choose_view`] picked.
 ///
 /// Read-only: this is the value as it is, not a second way to write it.
 #[component]

@@ -1,4 +1,4 @@
-//! Reading OpenSSH known_hosts files for host-key verification (FRE-289).
+//! Reading OpenSSH known_hosts files for host-key verification.
 //!
 //! Replaces russh's `known_host_keys_path` for reading; russh still appends
 //! trusted keys. russh's reader failed a whole file on one undecodable line for

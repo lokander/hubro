@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 #
-# Starts, stops and addresses the engine containers the integration tests need
-# (FRE-150).
+# Starts, stops and addresses the engine containers the integration tests need.
 #
 # Everything is keyed on a SET number. Set 0 is exactly the layout the test
 # headers document, so nothing that already exists has to change; sets 1, 2, …
@@ -26,8 +25,8 @@
 # document what each engine needs and why; this script is the convenience, not
 # the source of truth. If they disagree, the header is right and this is stale.
 #
-# QuestDB is absent on purpose: it has no suite (FRE-94 concluded it needs its
-# own backend, FRE-149). So is the SSH-tunnel stack in tests/tunnel.rs, which
+# QuestDB is absent on purpose: it has no suite (verifying it concluded it
+# needs a backend of its own). So is the SSH-tunnel stack in tests/tunnel.rs, which
 # needs a docker network and generated keys.
 
 set -euo pipefail
@@ -112,7 +111,7 @@ url_for() {
     mssql) echo "mssql://sa:Str0ng!Passw0rd@localhost:${port}/master?encrypt=on&trustServerCertificate=true" ;;
     timescale) echo "postgres://postgres:hubro@localhost:${port}/demo" ;;
     # sslmode=disable: the image's X.509 v1 certificate is one rustls refuses
-    # to parse (FRE-89), so every other sslmode fails to connect at all.
+    # to parse, so every other sslmode fails to connect at all.
     citus) echo "postgres://postgres:hubro@localhost:${port}/demo?sslmode=disable" ;;
     # sslmode=disable: --insecure serves no TLS. A secure cluster is ordinary.
     crdb) echo "postgres://root@localhost:${port}/demo?sslmode=disable" ;;
@@ -244,7 +243,7 @@ probe() {
         docker exec "$name" psql -U postgres -c 'CREATE DATABASE demo' >/dev/null 2>&1
       # The coordinator must be allowed to hold shards, or create_distributed_table
       # fails with "replication_factor (1) exceeds number of worker nodes (0)"
-      # on a single-node cluster (FRE-89).
+      # on a single-node cluster.
       docker exec "$name" psql -U postgres -d demo \
         -c 'CREATE EXTENSION IF NOT EXISTS citus' \
         -c "SELECT citus_set_coordinator_host('localhost', 5432)" \

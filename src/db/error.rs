@@ -20,7 +20,7 @@ pub enum DbError {
     /// same sentence the disabled affordance would have shown.
     Unsupported(String),
     /// The *server* called this failure retryable — SQLSTATE `40001`,
-    /// serialization failure (FRE-147). Not hubro's judgement: this variant is
+    /// serialization failure. Not hubro's judgement: this variant is
     /// only ever built from a code the server sent.
     ///
     /// It is a distinct variant rather than a flag on the others because the

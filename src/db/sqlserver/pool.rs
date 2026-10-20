@@ -61,12 +61,12 @@ const SESSION_SETUP: &str = "SET QUOTED_IDENTIFIER ON; \
 
 type TdsClient = Client<Compat<TcpStream>>;
 
-/// How a SQL Server connect authenticates (FRE-58). [`open_mssql`] always uses
+/// How a SQL Server connect authenticates. [`open_mssql`] always uses
 /// `Password`; the Entra flow passes `AadToken` to [`open_mssql_with`].
 #[derive(Clone)]
 pub enum MssqlAuth {
     /// SQL Server authentication with the URL's user and (possibly spliced-in)
-    /// password — the FRE-57 behavior.
+    /// password.
     Password,
     /// Microsoft Entra ID: log in with this AAD access token; the URL's
     /// user/password are ignored.
@@ -343,8 +343,8 @@ pub async fn open_mssql(url: &str) -> Result<MssqlPool, DbError> {
     open_mssql_with(url, &MssqlAuth::Password, None).await
 }
 
-/// [`open_mssql`] with explicit auth and an optional TLS host override
-/// (FRE-58). `tls_host` is the server's logical hostname for an SSH-tunneled
+/// [`open_mssql`] with explicit auth and an optional TLS host override.
+/// `tls_host` is the server's logical hostname for an SSH-tunneled
 /// connect whose URL was rewritten to `127.0.0.1:<forwarded>`: the socket
 /// dials the URL's host/port, while TLS (SNI + certificate validation) uses
 /// `tls_host` — so `encrypt=on` keeps validating the real certificate through
@@ -429,7 +429,7 @@ fn friendly_connect_error(err: &TdsError) -> String {
         // server hung up on the prelogin (Postgres does — observed as an
         // UnexpectedEof "failed to fill whole buffer") — usually a different
         // database server on that host/port. The mirror of the Postgres-side
-        // FRE-51 hint.
+        // "doesn't appear to be Postgres" hint.
         format!("the server doesn't appear to be SQL Server — check the host and port — {msg}")
     } else if matches!(
         err,
@@ -589,7 +589,7 @@ pub async fn execute(pool: &MssqlPool, sql: &str) -> Result<u64, DbError> {
 
 /// Streams `sql`, decoding and retaining at most `max_rows` rows and capping
 /// each cell to `cell_cap` bytes, so the free-form query path never scales
-/// with table or value size (FRE-33). Returns the (bounded) result and
+/// with table or value size. Returns the (bounded) result and
 /// whether more rows existed beyond the cap.
 ///
 /// A truncated read (or an abandoned second result set) leaves the rest of
@@ -614,7 +614,7 @@ pub async fn query_capped(
 }
 
 /// [`query_capped`] against the connection held by a script transaction — the
-/// read path for statements inside an atomically-wrapped script (FRE-38). No
+/// read path for statements inside an atomically-wrapped script. No
 /// bound params: scripts are raw text. Unlike the pool path, a truncated read
 /// keeps the connection (discarding it would kill the open transaction); the
 /// deferred drain of the abandoned rows is the price of atomicity.
@@ -742,7 +742,7 @@ async fn rollback_on(conn: &mut PooledConn, already_fatal: bool) {
     }
 }
 
-/// A script transaction (FRE-38): one connection checked out of the pool for
+/// A script transaction: one connection checked out of the pool for
 /// the whole script, its statements tied together by a manual `BEGIN TRAN`.
 /// Must be resolved via [`commit_tx`] or [`rollback_tx`]; a transaction
 /// dropped unresolved discards its connection (never returning one with an
@@ -783,7 +783,7 @@ pub async fn execute_conn(tx: &mut MssqlTx, sql: &str) -> Result<u64, DbError> {
 }
 
 /// [`execute_conn`] with bound parameters — the write path for a batch of
-/// imported rows (FRE-112), which must run inside the script transaction and
+/// imported rows, which must run inside the script transaction and
 /// must not interpolate its values into the SQL.
 pub async fn execute_with_conn(
     tx: &mut MssqlTx,
@@ -1011,7 +1011,7 @@ mod tests {
         assert!(friendly_connect_error(&tls).starts_with("TLS error"));
         // A non-SQL-Server server answering the TDS handshake (e.g. Postgres
         // on 5432) fails packet parsing — a wrong-server problem, not a
-        // protocol bug. The reverse of the FRE-51 Postgres-side hint.
+        // protocol bug. The reverse of the Postgres-side wrong-server hint.
         let not_tds = TdsError::Protocol("header: invalid packet type: 69".into());
         let friendly = friendly_connect_error(&not_tds);
         assert!(friendly.starts_with("the server doesn't appear to be SQL Server"));

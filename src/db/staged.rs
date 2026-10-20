@@ -1,4 +1,4 @@
-//! Staged edits (FRE-14): pending cell updates, row inserts, and row
+//! Staged edits: pending cell updates, row inserts, and row
 //! deletes, applied together in ONE transaction.
 //!
 //! The UI accumulates [`StagedChange`]s per table view (`ui::stage`) and
@@ -8,7 +8,7 @@
 //! [`DbPool::execute_all_checked`]. Any failure (SQL error or row-count
 //! mismatch) rolls the whole batch back and reports *which* change failed.
 //!
-//! Row addressing builds on the FRE-26 row-identity model
+//! Row addressing builds on the row-identity model
 //! ([`RowIdentity`](super::rowkey::RowIdentity)); the SQL builders here are
 //! value-aware — they must know the values (not just the columns) so NULLs
 //! can be rendered inline (see [`ParamSql::value_sql`]). They are the only
@@ -190,13 +190,13 @@ pub struct CheckedStatement {
 ///   then inserts, then deletes — see `ui::stage::TableStage::changes`),
 ///   but any order works; grouping is by row key, not adjacency.
 /// - Every UPDATE and DELETE is guarded: affecting anything other than
-///   exactly one row aborts and rolls back the whole batch (the FRE-26
+///   exactly one row aborts and rolls back the whole batch (the no-PK
 ///   safety net, batch-wide).
 /// - NULL values are rendered inline as literal `NULL` (never as bound
 ///   parameters) in SET lists and INSERT values — see [`ParamSql::value_sql`].
 ///
-/// `access` — the connection's capabilities resolved for `table` (FRE-87),
-/// including the user's own write protection (FRE-111) — is checked first:
+/// `access` — the connection's capabilities resolved for `table`,
+/// including the user's own write protection — is checked first:
 /// without `mutate`, nothing is built or sent and the returned
 /// [`StagedError`] carries the same sentence the UI shows on the disabled
 /// Save button. The UI never offers staging on such a table, so reaching
@@ -231,7 +231,7 @@ pub async fn apply_staged(
     // Statements and their metadata come back as parallel-by-index vecs so
     // the statements — which carry every staged cell value — go to
     // `execute_all_checked` as-is instead of being cloned out of a combined
-    // struct (FRE-131); the metadata is only consulted on failure.
+    // struct; the metadata is only consulted on failure.
     let (statements, metas) = build_statements(table, identity, pool.dialect(), changes)?;
     pool.execute_all_checked(&statements)
         .await
@@ -264,7 +264,7 @@ enum StatementKind {
 /// failure message (for grouped updates: the row and ALL its columns, not
 /// just the first). Kept apart from [`CheckedStatement`] so the statements
 /// — which carry every staged value — need never be cloned out of a
-/// combined struct just to reach the executor (FRE-131).
+/// combined struct just to reach the executor.
 #[derive(Debug)]
 struct StatementMeta {
     change_index: usize,
@@ -316,7 +316,7 @@ fn build_statements(
     // Row key → index into `slots` of the row's UpdateGroup. The Vec keeps
     // first-occurrence order; the map makes the group lookup O(1) instead
     // of a linear scan over every prior slot, which made large staged
-    // batches quadratic in string compares (FRE-131). Grouping is by the
+    // batches quadratic in string compares. Grouping is by the
     // row KEY ([`RowLocator::key`] — bit-exact, the identity the UI stage
     // coalesced under), unchanged: PartialEq would merge 0.0/-0.0 locators
     // (a duplicate-SET error at best, the wrong row at worst) and never
@@ -418,7 +418,7 @@ fn update_summary(locator: &RowLocator, sets: &[(String, Value)]) -> String {
 
 /// Accumulates bound parameters while rendering value positions into SQL.
 ///
-/// Visible to the rest of `db/` so the file import (FRE-112) renders its
+/// Visible to the rest of `db/` so the file import renders its
 /// multi-row INSERTs through the identical logic — an imported value and a
 /// hand-edited one must reach the same column the same way, NULL literals and
 /// Postgres casts included.
@@ -450,7 +450,7 @@ impl ParamSql {
     ///
     /// On Postgres a non-NULL placeholder carries the column's cast when
     /// one is known (`$1::integer` — see [`cast_target`]), so text-staged
-    /// values (the editor stages rich Postgres types as text, FRE-24)
+    /// values (the editor stages rich Postgres types as text)
     /// coerce to the column type instead of failing the bind-type check.
     ///
     /// The same rendering applies in WHERE key clauses: `col = NULL` is
@@ -475,7 +475,7 @@ impl ParamSql {
 /// Cast targets for every castable column of `table`, keyed by column
 /// name — computed ONCE per [`build_statements`] call so rendering a value
 /// looks its column up in O(1) instead of re-scanning `table.columns` per
-/// SET/key value (FRE-131). A column absent from the map (not castable, not
+/// SET/key value. A column absent from the map (not castable, not
 /// introspected at all, or any non-Postgres dialect — SQLite's type
 /// affinity coerces on its own) binds its placeholder uncast, exactly as
 /// before.
@@ -495,7 +495,7 @@ pub(super) fn cast_targets(table: &TableMeta, dialect: Dialect) -> HashMap<&str,
 ///
 /// Why: sqlx binds [`Value::Text`] as a *text-typed* parameter, and
 /// Postgres refuses `SET int_col = $1` for it (documented on
-/// `postgres::bind_params`). The editor (FRE-24) stages every rich
+/// `postgres::bind_params`). The editor stages every rich
 /// Postgres value — timestamps, numerics, json, booleans — as text, so
 /// without a cast none of them could be saved. `information_schema`
 /// `data_type` strings ("integer", "timestamp without time zone", "jsonb",
@@ -511,7 +511,7 @@ pub(super) fn cast_targets(table: &TableMeta, dialect: Dialect) -> HashMap<&str,
 /// arbitrary identifiers — `CREATE TYPE "Mood"` is case-sensitive — and
 /// schema-qualified because a user enum lives in its own schema while
 /// built-in array types live in `pg_catalog`, so neither is guaranteed to
-/// resolve through `search_path` (FRE-71).
+/// resolve through `search_path`.
 ///
 /// Skipped (`None`) — the placeholder then binds as before (unknown columns
 /// and non-Postgres dialects never reach here; [`cast_targets`] leaves them
@@ -534,8 +534,8 @@ pub(super) fn cast_targets(table: &TableMeta, dialect: Dialect) -> HashMap<&str,
 ///   text → char(n) with the column's true modifier (verified against
 ///   Postgres 17 — an uncast text parameter assigns to `character(3)`).
 ///
-/// `bit` is the one bare name that is **rewritten rather than skipped**
-/// (FRE-159). It has the same restrictive default — `::bit` means `bit(1)`
+/// `bit` is the one bare name that is **rewritten rather than skipped**.
+/// It has the same restrictive default — `::bit` means `bit(1)`
 /// — but unlike `character` it has no assignment coercion from text, so
 /// skipping the cast made `bit(n)` columns unwritable outright: the server
 /// answers *"column is of type bit but expression is of type text"*. It
@@ -545,7 +545,7 @@ pub(super) fn cast_targets(table: &TableMeta, dialect: Dialect) -> HashMap<&str,
 /// name and passes through verbatim.
 fn cast_target(column: &ColumnMeta) -> Option<String> {
     // An enum/array column casts to its real type name, which `data_type`
-    // doesn't carry (FRE-71). Both halves are arbitrary identifiers — a
+    // doesn't carry. Both halves are arbitrary identifiers — a
     // `CREATE TYPE "Mood"` is case-sensitive and would not resolve
     // lowercased — so they are quoted rather than run through the
     // lowercase/charset gate that the `data_type` vocabulary below needs.
@@ -559,7 +559,7 @@ fn cast_target(column: &ColumnMeta) -> Option<String> {
     let lowered = column.type_name.trim().to_ascii_lowercase();
     // Bare `bit` is `bit(n)`, whose modifier `data_type` dropped. `::bit`
     // would mean `bit(1)`, so it casts to the unbounded member of the family
-    // and lets the column's own modifier apply on assignment (FRE-159).
+    // and lets the column's own modifier apply on assignment.
     if lowered == "bit" {
         return Some("bit varying".to_string());
     }
@@ -958,7 +958,7 @@ mod tests {
         // cast is not the answer either: unlike `character`, a bit-string has
         // no assignment coercion from text, so an uncast parameter is refused
         // outright ("column is of type bit but expression is of type text")
-        // and the column is unwritable — FRE-159. `bit varying` is unbounded,
+        // and the column is unwritable. `bit varying` is unbounded,
         // so it accepts the value and the column's own modifier applies.
         let mut table = typed_pg_table();
         table.columns.push(ColumnMeta {
@@ -1094,7 +1094,7 @@ mod tests {
     #[test]
     fn enum_and_array_columns_cast_to_their_qualified_type_name() {
         // `data_type` is USER-DEFINED/ARRAY for these, so the cast comes
-        // from the introspected TypeDetail instead (FRE-71). Without it
+        // from the introspected TypeDetail instead. Without it
         // Postgres rejects the text-bound parameter outright.
         let mut table = typed_pg_table();
         for column in &mut table.columns {
@@ -1169,7 +1169,7 @@ mod tests {
         // is verified against a live server in tests/db_postgres.rs.
         // "character varying" is unbounded when bare and keeps its cast.
         // "bit" is the exception that is rewritten rather than skipped
-        // (FRE-159) — see the test below.
+        // — see the test below.
         let (statements, _) = build_statements(
             &typed_pg_table(),
             &identity(),

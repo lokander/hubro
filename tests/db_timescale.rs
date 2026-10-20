@@ -1,4 +1,4 @@
-//! TimescaleDB verification (FRE-88). Timescale is an extension on stock
+//! TimescaleDB verification. Timescale is an extension on stock
 //! PostgreSQL, so the Postgres backend drives it unchanged — these tests pin
 //! the parts that are *not* stock: hypertables (one logical table spread over
 //! many chunk tables), continuous aggregates, and the extension's own schemas.
@@ -146,8 +146,7 @@ async fn timescale_internal_objects_are_attributed_to_the_extension() {
 
     let tables = pool.introspect().await.unwrap();
 
-    // Every chunk is attributed, which is what lets the sidebar hide them
-    // (FRE-88).
+    // Every chunk is attributed, which is what lets the sidebar hide them.
     let chunks: Vec<&TableMeta> = tables
         .iter()
         .filter(|t| t.schema.as_deref() == Some("_timescaledb_internal"))
@@ -477,8 +476,7 @@ async fn an_extensions_table_in_an_ordinary_schema_is_still_internal() {
 
     // The case the schema-level rule alone would miss: `pg_buffercache`
     // installs its view into `public`, exactly as PostGIS does with
-    // `spatial_ref_sys`. Attribution is per object as well as per schema
-    // (FRE-88).
+    // `spatial_ref_sys`. Attribution is per object as well as per schema.
     pool.query("CREATE EXTENSION IF NOT EXISTS pg_buffercache")
         .await
         .unwrap();

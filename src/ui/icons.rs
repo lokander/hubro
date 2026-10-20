@@ -1,6 +1,6 @@
-//! Vendored per-backend brand marks (FRE-70).
+//! Vendored per-backend brand marks.
 //!
-//! Lucide (via `dioxus-icons`, FRE-66) carries no brand marks by policy, so
+//! Lucide (via `dioxus-icons`) carries no brand marks by policy, so
 //! the three engine logos are inlined here as single-path SVG components
 //! rather than pulled in as a dependency. Each renders monochrome with
 //! `currentColor` — brand colors are deliberately not used, since the Add

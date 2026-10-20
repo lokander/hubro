@@ -11,7 +11,7 @@ repository = "https://github.com/lokander/hubro"
 [dependencies]
 dioxus = { version = "0.7.1", features = [] }
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "postgres", "runtime-tokio", "tls-rustls-ring", "macros", "chrono", "uuid", "json", "rust_decimal"] }
-# SQL Server driver (FRE-55). Default features are off to drop native-tls and
+# SQL Server driver. Default features are off to drop native-tls and
 # Windows auth; `rustls` keeps TLS on the same rustls 0.23 sqlx uses, with no
 # OpenSSL. It does turn on rustls's aws-lc-rs provider beside sqlx's ring, and
 # with two providers compiled in rustls cannot pick one implicitly: a
@@ -41,10 +41,10 @@ futures-util = { version = "0.3", default-features = false }
 percent-encoding = "2"
 tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time"] }
 russh = "0.64"
-# Entra ID / Azure AD auth for Postgres (FRE-43): OAuth token HTTP, PKCE, browser launch.
+# Entra ID / Azure AD auth for Postgres: OAuth token HTTP, PKCE, browser launch.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 sha2 = "0.11"
-# HMAC-SHA1 for hashed known_hosts entries (`|1|salt|hash`, FRE-289): the
+# HMAC-SHA1 for hashed known_hosts entries (`|1|salt|hash`): the
 # versions russh already uses for the same check.
 hmac = "0.13"
 sha1 = "0.11"
@@ -67,7 +67,7 @@ keyring = { version = "3", features = ["windows-native"] }
 
 [dev-dependencies]
 # `sync` is for the OnceCell the Postgres and SQL Server suites use to build
-# their per-process database exactly once (FRE-127).
+# their per-process database exactly once.
 tokio = { version = "1", features = ["rt", "macros", "time", "io-util", "net", "sync"] }
 tempfile = "3"
 

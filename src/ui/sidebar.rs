@@ -21,7 +21,7 @@ fn focus_filter_input() {
 /// What the sidebar's body should show. Derived from [`SchemaLoad`] so the
 /// render body never has to clone the table list just to find out which
 /// branch it is in — on a 300-table schema that clone alone cost ~1 ms per
-/// render (FRE-107). The list itself comes from the memo below.
+/// render. The list itself comes from the memo below.
 #[derive(Clone, PartialEq)]
 enum ListState {
     Loading,
@@ -35,7 +35,7 @@ enum ListState {
 /// itself stays in `state.schemas` and is looked up by `index` inside
 /// [`TableNode`], so neither the memo nor a render ever clones a `TableMeta`
 /// — on a 300-table schema that clone-per-keystroke was most of the filter's
-/// cost (FRE-134).
+/// cost.
 #[derive(Clone, PartialEq)]
 struct RowHit {
     /// Index into the connection's `SchemaLoad::Ready` table list.
@@ -54,10 +54,9 @@ type FilteredGroups = Vec<(Option<String>, Vec<RowHit>)>;
 
 /// Sidebar for one connection: a flat list of the introspected tables and
 /// views, grouped by schema. Clicking a name selects it for the data grid
-/// and the Schema pane, which is where its columns and indexes live
-/// (FRE-69).
+/// and the Schema pane, which is where its columns and indexes live.
 ///
-/// A filter box sits above the list (FRE-107). It is purely client-side over
+/// A filter box sits above the list. It is purely client-side over
 /// the schema already in `AppState` — no query is ever issued — and it stays
 /// in this component's local state rather than `TabUi`, so it is not
 /// persisted to the session and a tab reopened later starts unfiltered.
@@ -156,7 +155,7 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
                         }
                         input {
                             // `dv-schema-filter` is the target of the Ctrl+F
-                            // focus shortcut (FRE-107); the grid's own filter
+                            // focus shortcut; the grid's own filter
                             // keeps `/` and `dv-filter`.
                             id: "dv-schema-filter",
                             class: "min-w-0 flex-1 bg-transparent font-mono text-xs text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600 focus:outline-none",
@@ -233,7 +232,7 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
                                 // With nothing typed the list can still come
                                 // up empty, when every object the database has
                                 // belongs to an extension and hiding is on
-                                // (FRE-88) — "nothing matches ''" would be a
+                                // — "nothing matches ''" would be a
                                 // nonsense way to say that.
                                 if query.needle.is_empty() {
                                     "Everything in this database is an internal object."
@@ -245,7 +244,7 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
                         }
                         // Iterating the borrow, not `groups()`: cloning the
                         // memo's value here would re-copy every group and key
-                        // on each unrelated re-render (FRE-134).
+                        // on each unrelated re-render.
                         for (schema , group) in groups.read().iter() {
                             if show_headers {
                                 p { class: "px-2 pt-2 pb-0.5 text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-600",
@@ -269,7 +268,7 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
             // Only ever rendered by a database that actually has internal
             // objects, so the ordinary case carries no extra chrome. It says
             // the count rather than just offering a toggle: the point is that
-            // the sidebar is not claiming to list everything (FRE-88).
+            // the sidebar is not claiming to list everything.
             if ready && internal_count > 0 {
                 div { class: "flex items-center justify-between gap-2 border-t border-slate-200 dark:border-slate-800 px-2 py-1.5 text-xs text-slate-500 dark:text-slate-400",
                     span {
@@ -293,13 +292,13 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
 }
 
 /// One table/view in the list: its name plus a kind badge. Structure lives
-/// in the Schema pane now (FRE-69), so there is nothing to expand — except in
+/// in the Schema pane now, so there is nothing to expand — except in
 /// the filter's column mode, where `columns` carries the matching columns to
-/// list underneath (FRE-107).
+/// list underneath.
 ///
 /// Receives the table as an index into the connection's schema rather than an
 /// owned `TableMeta`, so the list the memo hands the render never carries a
-/// copy of every table's columns, indexes and foreign keys (FRE-134). Reading
+/// copy of every table's columns, indexes and foreign keys. Reading
 /// `state.schemas` here subscribes each row to schema reloads, but a reload
 /// recomputes the memo (and thus remounts the rows) anyway.
 #[component]
@@ -340,10 +339,9 @@ fn TableNode(
             table.name.clone(),
             table.kind,
             // The engine's own word for what this is, when it has one —
-            // "hypertable" rather than a table that inexplicably has chunks
-            // (FRE-88).
+            // "hypertable" rather than a table that inexplicably has chunks.
             table.kind_label.clone(),
-            // Why this object has no rows to open, when it has none (FRE-148).
+            // Why this object has no rows to open, when it has none.
             // The same derivation `TableAccess::resolve` uses, called rather
             // than repeated, so the sidebar and the grid cannot disagree about
             // which objects are openable. Resolving the full access here would
@@ -376,7 +374,7 @@ fn TableNode(
                 },
                 button {
                     // `dv-table-btn` + `data-selected` drive the keyboard
-                    // sidebar navigation (FRE-15): the global key listener
+                    // sidebar navigation: the global key listener
                     // focuses these buttons (Ctrl+B) and moves focus between
                     // them with ↑/↓; a focused button opens its table on
                     // Enter/Space natively via this onclick. It reads the DOM,
@@ -384,7 +382,7 @@ fn TableNode(
                     class: "dv-table-btn flex min-w-0 flex-1 items-center gap-2 text-left",
                     "data-selected": selected,
                     // An object with no rows is dimmed and carries its reason
-                    // as a tooltip, so it does not read as openable (FRE-148).
+                    // as a tooltip, so it does not read as openable.
                     // Still a button, deliberately: disabling it would drop the
                     // row out of the Ctrl+B/↑↓ walk above (which focuses
                     // `.dv-table-btn` elements, and focusing a disabled button

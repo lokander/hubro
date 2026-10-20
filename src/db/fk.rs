@@ -1,4 +1,4 @@
-//! Foreign-key navigation helpers (FRE-29): turning a source row plus one
+//! Foreign-key navigation helpers: turning a source row plus one
 //! [`ForeignKeyMeta`] into the [`Filter`] that pins the referenced row in the
 //! target table. Pure functions so the SQL-free logic is unit-testable
 //! without the Dioxus runtime.

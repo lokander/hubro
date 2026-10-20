@@ -20,7 +20,7 @@ pub enum SessionPane {
     #[default]
     Browser,
     Sql,
-    /// The schema pane (FRE-69).
+    /// The schema pane.
     Schema,
 }
 
@@ -56,18 +56,18 @@ pub struct SessionTab {
     /// enum variant as a hard error, and [`load_session`] discards the whole
     /// session on any parse failure — so a build that predates a new pane
     /// would silently drop every restored tab, not just the pane. Unknown
-    /// values fall back to the default instead (FRE-69).
+    /// values fall back to the default instead.
     #[serde(default, deserialize_with = "pane_or_default")]
     pub pane: SessionPane,
-    /// Whether the row detail panel was docked open beside the grid
-    /// (FRE-109). `default` + `skip_serializing_if` keep sessions written
-    /// before it existed loading, and leave a tab that never opened it
-    /// serializing exactly as before.
+    /// Whether the row detail panel was docked open beside the grid.
+    /// `default` + `skip_serializing_if` keep sessions written before it
+    /// existed loading, and leave a tab that never opened it serializing
+    /// exactly as before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub row_detail: bool,
 }
 
-/// The last session (FRE-30): open tabs in order, plus which one was active.
+/// The last session: open tabs in order, plus which one was active.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Session {
     #[serde(default)]
@@ -75,8 +75,8 @@ pub struct Session {
     /// Locator of the active tab, or `None` for the connections screen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<String>,
-    /// Connection groups the user has collapsed in the connections list
-    /// (FRE-120), by name.
+    /// Connection groups the user has collapsed in the connections list,
+    /// by name.
     ///
     /// **View state, so it lives here and not in connections.toml.** The two
     /// files differ in what losing them costs: connections.toml is the user's
@@ -215,8 +215,8 @@ mod tests {
 
     #[test]
     fn collapsed_groups_stay_out_of_a_session_that_has_none() {
-        // The unaffected-entries-serialize-unchanged half of the convention
-        // (FRE-120): a session with nothing collapsed writes no key, and a
+        // The unaffected-entries-serialize-unchanged half of the convention:
+        // a session with nothing collapsed writes no key, and a
         // session written before groups existed still loads.
         let expanded = Session {
             tabs: vec![SessionTab {
@@ -235,7 +235,8 @@ mod tests {
         let text = toml::to_string_pretty(&collapsed).unwrap();
         assert_eq!(toml::from_str::<Session>(&text).unwrap(), collapsed);
 
-        // …and a pre-FRE-120 file loads with everything expanded.
+        // …and a file from before connection groups loads with everything
+        // expanded.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.toml");
         std::fs::write(
@@ -265,7 +266,7 @@ mod tests {
 
     #[test]
     fn a_session_without_the_row_detail_key_loads_with_the_panel_closed() {
-        // Files written before the row detail panel existed (FRE-109): the
+        // Files written before the row detail panel existed: the
         // tab must still load, with the panel simply closed.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.toml");
@@ -285,7 +286,7 @@ mod tests {
     fn a_closed_row_detail_panel_writes_no_key_at_all() {
         // The unaffected-entries-serialize-unchanged half of the convention:
         // a tab that never opened the panel round-trips byte-identically to
-        // what a pre-FRE-109 build wrote.
+        // what a build from before the row detail panel wrote.
         let closed = Session {
             tabs: vec![SessionTab {
                 locator: "/data/music.db".into(),

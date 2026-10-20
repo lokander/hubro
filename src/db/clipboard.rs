@@ -1,4 +1,4 @@
-//! Clipboard rendering of a rectangular grid selection (FRE-110).
+//! Clipboard rendering of a rectangular grid selection.
 //!
 //! The grid lifts the selected cells into a [`CopyBlock`] — column names plus
 //! FULL values, never the grid's bounded previews — and [`render_copy`] turns
@@ -11,7 +11,7 @@
 //! not** — deliberately, and each in one specific way:
 //!
 //! - **TSV and CSV** neutralize spreadsheet formula injection (see
-//!   [`harden_csv_text`], FRE-73): a text cell holding `-1` copies as `'-1`,
+//!   [`harden_csv_text`]): a text cell holding `-1` copies as `'-1`,
 //!   and likewise for a leading `=`, `+`, `@` or tab. The destination decides
 //!   this — these two formats exist to be pasted into a spreadsheet, and a
 //!   spreadsheet executes such a cell **on paste**, not only on file open, so
@@ -162,12 +162,12 @@ pub fn render_copy(
 }
 
 /// The text a *single-cell* copy puts on the clipboard: the raw value alone,
-/// with no delimiters, quoting, or header (FRE-110 keeps the pre-existing
-/// single-cell behaviour). NULL copies as nothing — the point of this path is
-/// "give me this value to paste", and pasting the word `NULL` into a form
-/// field would be wrong; the delimited formats above are where NULL has to
-/// stay distinguishable. Blobs copy as the same `\x…` hex the other formats
-/// use rather than the grid's `<blob 2.0 KB>` placeholder.
+/// with no delimiters, quoting, or header (multi-cell copy left the
+/// pre-existing single-cell behaviour alone). NULL copies as nothing — the
+/// point of this path is "give me this value to paste", and pasting the word
+/// `NULL` into a form field would be wrong; the delimited formats above are
+/// where NULL has to stay distinguishable. Blobs copy as the same `\x…` hex
+/// the other formats use rather than the grid's `<blob 2.0 KB>` placeholder.
 ///
 /// **Faithful**, and deliberately *not* formula-hardened even though the
 /// plain shortcut routes here: this path produces one bare value with no
@@ -214,7 +214,7 @@ fn render_delimited(block: &CopyBlock, delimiter: char, header: bool) -> String 
 /// The bare text of one cell for TSV/CSV, or `None` for NULL (which renders
 /// as an unquoted empty field — see the module docs). Every other arm matches
 /// [`super::export`]'s CSV cell rendering exactly, reusing its helpers:
-/// spreadsheet formula prefixes are neutralized (FRE-73 — a clipboard paste
+/// spreadsheet formula prefixes are neutralized (a clipboard paste
 /// into Excel executes them just like an opened file does) and blobs render
 /// as `\x…` hex.
 fn delimited_cell(value: &Value) -> Option<String> {
@@ -260,7 +260,7 @@ fn push_delimited_field(out: &mut String, field: Option<&str>, delimiter: char) 
 /// what is wanted here, so there is one JSON renderer in the codebase, not
 /// two. The sink takes each row by reference, so only the column names are
 /// cloned — the old `QueryResult` detour cloned every row in the selection
-/// just to wrap them (FRE-132).
+/// just to wrap them.
 fn render_json(block: &CopyBlock) -> String {
     let mut sink = ExportSink::new(ExportFormat::Json, block.columns.clone());
     let mut buf = Vec::new();
@@ -586,7 +586,8 @@ mod tests {
             ]],
         );
         // A clipboard paste into Excel runs formulas exactly like an opened
-        // file does, so FRE-73's apostrophe applies here too.
+        // file does, so export's formula-hardening apostrophe applies here
+        // too.
         assert_eq!(tsv(&b), "'=1+1\t\\x00ff\n");
     }
 
