@@ -1525,31 +1525,29 @@ impl AppState {
                 }));
                 None
             }
-            // First contact: park the connect behind a trust-on-first-use
-            // prompt instead of failing. Trusting persists the key and retries.
-            Err(TunnelError::HostKeyUnknown(info)) => {
-                self.release_connect(url);
-                self.host_key_prompt.set(Some(HostKeyPrompt {
-                    url: url.to_string(),
-                    name: name.to_string(),
-                    tunnel: config.clone(),
-                    info,
-                    auth: auth.clone(),
-                    backend: backend.kind,
-                }));
-                None
-            }
-            // A changed key is a possible MITM: refuse hard, never offer to
-            // trust it. The user must resolve it out-of-band (remove the stale
-            // known_hosts entry) before reconnecting.
-            Err(err @ TunnelError::HostKeyChanged(_)) => {
-                self.fail_connect(url, err.to_string());
-                None
-            }
-            Err(err) => {
-                self.fail_connect(url, err.to_string());
-                None
-            }
+            // First contact parks the connect behind a trust-on-first-use
+            // prompt; trusting persists the key and retries. Everything else,
+            // a changed (possible MITM) or revoked host key included, is a
+            // hard refusal the user resolves out-of-band. Which is which is
+            // `into_trust_prompt`'s decision, not this match's (FRE-289).
+            Err(err) => match err.into_trust_prompt() {
+                Ok(info) => {
+                    self.release_connect(url);
+                    self.host_key_prompt.set(Some(HostKeyPrompt {
+                        url: url.to_string(),
+                        name: name.to_string(),
+                        tunnel: config.clone(),
+                        info,
+                        auth: auth.clone(),
+                        backend: backend.kind,
+                    }));
+                    None
+                }
+                Err(err) => {
+                    self.fail_connect(url, err.to_string());
+                    None
+                }
+            },
         }
     }
 
@@ -1835,6 +1833,27 @@ mod tests {
     /// was a routing mistake visible right here.
     fn open_tunnel_body() -> String {
         method_body(include_str!("connect.rs"), "async fn open_tunnel(")
+    }
+
+    #[test]
+    fn the_host_key_prompt_is_raised_only_through_into_trust_prompt() {
+        // Which tunnel errors may be trusted is `TunnelError::into_trust_prompt`'s
+        // decision, executed by `only_a_first_contact_key_can_be_offered_for_trust`.
+        // This pins that the UI asks it: one place raises the prompt, inside
+        // its Ok arm, and no arm names a host-key variant to bypass it
+        // (FRE-289). Comments stripped, since they name the variants.
+        let code: String = open_tunnel_body()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!code.contains("TunnelError::HostKey"), "{code}");
+        assert_eq!(code.matches("host_key_prompt.set(").count(), 1, "{code}");
+        let ask = code.find(".into_trust_prompt()").expect("the UI must ask");
+        let ok = code[ask..].find("Ok(info)").expect("...and prompt on Ok") + ask;
+        let raise = code.find("host_key_prompt.set(").unwrap();
+        let refuse = code[ok..].find("Err(err)").expect("...and refuse on Err") + ok;
+        assert!(ask < ok && ok < raise && raise < refuse, "{code}");
     }
 
     /// A saved Postgres entry with an SSH tunnel and interactive Entra auth —

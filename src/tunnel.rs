@@ -126,6 +126,25 @@ impl fmt::Display for TunnelError {
 
 impl std::error::Error for TunnelError {}
 
+impl TunnelError {
+    /// The key to offer a trust-on-first-use prompt for, or the error back to
+    /// show as a refusal. Only a first-contact key may be trusted from the UI;
+    /// a changed key is a possible man-in-the-middle and a revoked one is
+    /// refused outright (FRE-289). Every variant is named, so a new one has to
+    /// decide.
+    pub fn into_trust_prompt(self) -> Result<HostKeyInfo, TunnelError> {
+        match self {
+            TunnelError::HostKeyUnknown(info) => Ok(info),
+            err @ (TunnelError::Connect(_)
+            | TunnelError::Auth(_)
+            | TunnelError::NeedsPassphrase(_)
+            | TunnelError::Forward(_)
+            | TunnelError::HostKeyChanged(_)
+            | TunnelError::HostKeyRevoked(_)) => Err(err),
+        }
+    }
+}
+
 /// Trust status of a server host key relative to the known_hosts files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HostKeyStatus {
@@ -352,8 +371,9 @@ impl Tunnel {
     ///
     /// The server's host key is verified against `known_hosts_read` (the UI
     /// passes [`default_known_hosts_read`]): an unrecognized key yields
-    /// [`TunnelError::HostKeyUnknown`] and a changed one
-    /// [`TunnelError::HostKeyChanged`], both before authentication.
+    /// [`TunnelError::HostKeyUnknown`], a changed one
+    /// [`TunnelError::HostKeyChanged`] and a revoked one
+    /// [`TunnelError::HostKeyRevoked`], all before authentication.
     pub async fn open(
         config: TunnelConfig,
         passphrase: Option<String>,
@@ -1032,35 +1052,43 @@ mod tests {
         const H: &str = "db.example.com";
         const GARBLED: &str = "db.example.com ssh-ed25519 AAAA!!notbase64";
         const HASHED: &str = "|1|tbLEo3oZNezhlFk5483qNgLrsh8=|l9n0k6ONOAQcZH3VHlomE0dSN2E="; // db.example.com
+                                                                                             // `ssh-keygen -H` over a `[db.example.com]:2222` line.
+        const HASHED_2222: &str = "|1|WwCpWp49FwaNIJF7d1cKy5eQxGk=|2rA7XH6xTom2guhR5+kXEWIE87U=";
         let a_b64 = KEY_A.split_once(' ').unwrap().1;
-        let rows: Vec<(&str, Vec<u8>, &str, HostKeyStatus)> = vec![
+        let rsa_b64 = KEY_RSA.split_once(' ').unwrap().1;
+        let rows: Vec<(&str, Vec<u8>, u16, &str, HostKeyStatus)> = vec![
             (
                 "garbled line beside a record of another key",
                 format!("{H} {KEY_B}\n{GARBLED}\n").into(),
+                22,
                 KEY_A,
                 HostKeyStatus::Changed,
             ),
             (
                 "garbled line beside the key's own record",
                 format!("{H} {KEY_A}\n{GARBLED}\n").into(),
+                22,
                 KEY_A,
                 HostKeyStatus::Trusted,
             ),
             (
                 "only a garbled line for the host",
                 format!("{GARBLED}\n").into(),
+                22,
                 KEY_A,
                 HostKeyStatus::Unknown,
             ),
             (
                 "@revoked alone",
                 format!("@revoked {H} {KEY_A}\n").into(),
+                22,
                 KEY_A,
                 HostKeyStatus::Revoked,
             ),
             (
                 "@revoked beside a plain listing",
                 format!("{H} {KEY_A}\n@revoked * {KEY_A}\n").into(),
+                22,
                 KEY_A,
                 HostKeyStatus::Revoked,
             ),
@@ -1071,79 +1099,179 @@ mod tests {
                     b"\xe9\n",
                 ]
                 .concat(),
+                22,
                 KEY_A,
                 HostKeyStatus::Changed,
             ),
             (
                 "wildcard recording another key",
                 format!("*.example.com {KEY_B}\n").into(),
+                22,
                 KEY_A,
                 HostKeyStatus::Changed,
             ),
             (
                 "wildcard recording the key",
                 format!("*.example.com {KEY_A}\n").into(),
+                22,
                 KEY_A,
                 HostKeyStatus::Trusted,
             ),
             (
                 "wildcard negating this host",
                 format!("*.example.com,!{H} {KEY_A}\n").into(),
+                22,
                 KEY_A,
                 HostKeyStatus::Unknown,
             ),
             (
                 "uppercase pattern",
                 format!("DB.Example.COM {KEY_A}\n").into(),
+                22,
                 KEY_A,
                 HostKeyStatus::Trusted,
             ),
             (
                 "tab-separated fields",
                 format!("{H}\t{}\n", KEY_B.replace(' ', "\t")).into(),
+                22,
                 KEY_A,
                 HostKeyStatus::Changed,
             ),
             (
                 "@cert-authority only",
                 format!("@cert-authority {H} {KEY_A}\n").into(),
+                22,
                 KEY_A,
                 HostKeyStatus::Unknown,
             ),
             (
                 "hashed entry recording the key",
                 format!("{HASHED} {KEY_A}\n").into(),
+                22,
                 KEY_A,
                 HostKeyStatus::Trusted,
             ),
             (
                 "hashed entry recording another key",
                 format!("{HASHED} {KEY_A}\n").into(),
+                22,
                 KEY_B,
                 HostKeyStatus::Changed,
             ),
             (
                 "type field disagreeing with its key",
                 format!("{H} ssh-rsa {a_b64}\n").into(),
+                22,
                 KEY_A,
                 HostKeyStatus::Unknown,
             ),
             (
                 "type mismatch beside a record of another key",
                 format!("{H} {KEY_B}\n{H} ssh-rsa {a_b64}\n").into(),
+                22,
                 KEY_A,
                 HostKeyStatus::Changed,
             ),
+            (
+                "hashed entry off port 22",
+                format!("{HASHED_2222} {KEY_A}\n").into(),
+                2222,
+                KEY_A,
+                HostKeyStatus::Trusted,
+            ),
+            (
+                "hashed entry off port 22, another key",
+                format!("{HASHED_2222} {KEY_A}\n").into(),
+                2222,
+                KEY_B,
+                HostKeyStatus::Changed,
+            ),
+            (
+                "plain entry for port 22 looked up off it",
+                format!("{H} {KEY_A}\n").into(),
+                2222,
+                KEY_A,
+                HostKeyStatus::Unknown,
+            ),
+            (
+                "RSA line typed rsa-sha2-256",
+                format!("{H} rsa-sha2-256 {rsa_b64}\n").into(),
+                22,
+                KEY_RSA,
+                HostKeyStatus::Trusted,
+            ),
+            (
+                "RSA line typed rsa-sha2-512, another key",
+                format!("{H} rsa-sha2-512 {rsa_b64}\n").into(),
+                22,
+                KEY_A,
+                HostKeyStatus::Changed,
+            ),
+            (
+                "? glob",
+                format!("db.example.co? {KEY_A}\n").into(),
+                22,
+                KEY_A,
+                HostKeyStatus::Trusted,
+            ),
+            (
+                "comma list",
+                format!("other.host,{H} {KEY_A}\n").into(),
+                22,
+                KEY_A,
+                HostKeyStatus::Trusted,
+            ),
+            (
+                "unknown marker",
+                format!("@foo {H} {KEY_A}\n").into(),
+                22,
+                KEY_A,
+                HostKeyStatus::Unknown,
+            ),
         ];
         let dir = tempfile::tempdir().unwrap();
-        for (i, (label, contents, offered, expected)) in rows.into_iter().enumerate() {
+        for (i, (label, contents, port, offered, expected)) in rows.into_iter().enumerate() {
             let path = dir.path().join(format!("known_hosts_{i}"));
             std::fs::write(&path, contents).unwrap();
             assert_eq!(
-                verify_host_key(H, 22, &pubkey(offered), &[path]),
+                verify_host_key(H, port, &pubkey(offered), &[path]),
                 expected,
                 "{label}"
             );
+        }
+        // The host as the user typed it is folded too, hashed entries included.
+        let path = dir.path().join("known_hosts_upper");
+        std::fs::write(&path, format!("{HASHED} {KEY_A}\n")).unwrap();
+        assert_eq!(
+            verify_host_key("DB.Example.COM", 22, &pubkey(KEY_A), &[path]),
+            HostKeyStatus::Trusted
+        );
+    }
+
+    #[test]
+    fn only_a_first_contact_key_can_be_offered_for_trust() {
+        let cases = [
+            (TunnelError::Connect("x".into()), false),
+            (TunnelError::Auth("x".into()), false),
+            (TunnelError::NeedsPassphrase("x".into()), false),
+            (TunnelError::Forward("x".into()), false),
+            (TunnelError::HostKeyUnknown(info("host")), true),
+            (TunnelError::HostKeyChanged(info("host")), false),
+            (TunnelError::HostKeyRevoked(info("host")), false),
+        ];
+        for (err, prompts) in cases {
+            let shown = err.to_string();
+            match err.into_trust_prompt() {
+                Ok(got) => {
+                    assert!(prompts, "offered trust for: {shown}");
+                    assert_eq!(got, info("host"));
+                }
+                Err(back) => {
+                    assert!(!prompts, "refused a first contact: {shown}");
+                    assert_eq!(back.to_string(), shown, "the refusal changed");
+                }
+            }
         }
     }
 
