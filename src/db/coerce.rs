@@ -281,9 +281,10 @@ pub fn bool_checked(value: &Value) -> bool {
 /// The rules, in the order they apply:
 ///
 /// - a **missing** field (a JSON object without that key) is NULL. The column
-///   is still listed in the INSERT, so a NOT NULL column without a default is
-///   rejected by [`super::import`] before the statement is built rather than
-///   by the server mid-transaction;
+///   is still listed in the INSERT, so what that NULL becomes in a NOT NULL
+///   column — the column's default, or a refusal before the statement is
+///   built rather than by the server mid-transaction — is decided by
+///   [`super::import`];
 /// - a **JSON null** is NULL — JSON says so outright;
 /// - an **empty CSV field** is whatever [`EmptyField`] says, because CSV
 ///   cannot tell an empty string from a missing value (the export writes both

@@ -36,7 +36,7 @@ dirs = "7"
 # shared copy, and rfd refuses `gtk3` alongside it.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 url = "2"
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 futures-util = { version = "0.3", default-features = false }
 percent-encoding = "2"
 tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time"] }

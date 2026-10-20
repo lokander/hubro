@@ -33,6 +33,17 @@
 //! [`coerce_field`](super::coerce::coerce_field) for what it can and cannot
 //! catch.
 //!
+//! # A NULL where the column cannot hold one
+//!
+//! An empty field (under [`EmptyField::Null`]), a JSON `null` and an absent
+//! JSON key all coerce to NULL. Where the target column is NOT NULL that
+//! NULL cannot be stored, and [`null_cell`] decides what happens instead: a
+//! column the database fills in itself (a `DEFAULT`, a `serial`, an identity)
+//! gets that value, and any other row is refused during coercion, where skip
+//! mode can skip it. Sending the NULL anyway is never an option — Postgres,
+//! SQL Server and SQLite all reject it, and a rejection by the server is the
+//! one failure skip mode cannot skip.
+//!
 //! # No transaction, no import
 //!
 //! [`import_refusal`] refuses an import wherever editing is refused, and
@@ -57,6 +68,7 @@ use super::staged::{cast_targets, ParamSql};
 use super::value::Value;
 
 pub mod csv;
+mod cursor;
 pub mod json;
 
 pub use csv::{sniff_dialect, CsvDialect, CsvReader, SNIFF_BYTES};
@@ -218,7 +230,10 @@ impl Record {
         }
     }
 
-    /// The fields this record actually carries, in order.
+    /// The fields this record actually carries, in the order the file has
+    /// them — JSON keys included, which is what serde_json's
+    /// `preserve_order` feature is enabled for (without it a `Map` is a
+    /// `BTreeMap`, and the preview listed every JSON file alphabetically).
     pub fn present_fields(&self) -> Vec<SourceField> {
         match &self.fields {
             RecordFields::Positional(values) => (0..values.len()).map(SourceField::Index).collect(),
@@ -468,33 +483,14 @@ pub fn is_importable(column: &ColumnMeta) -> bool {
 /// A headerless CSV has no names to match on, so its fields bind positionally
 /// to the table's importable columns instead.
 pub fn default_mapping(table: &TableMeta, fields: &[SourceField]) -> Vec<ColumnBinding> {
-    let importable: Vec<&ColumnMeta> = table.columns.iter().filter(|c| is_importable(c)).collect();
-    let mut bindings = Vec::new();
-    let mut taken: Vec<&str> = Vec::new();
-    for source in fields {
-        // A positional field takes the importable column at its own index; a
-        // named one matches by name. Either way a column is bound at most
-        // once, so two fields spelled alike do not produce an INSERT that
-        // names the same column twice.
-        let matched = match source {
-            SourceField::Key(key) => importable
-                .iter()
-                .find(|c| c.name.eq_ignore_ascii_case(key))
-                .map(|c| c.name.as_str()),
-            SourceField::Index(index) => importable.get(*index).map(|c| c.name.as_str()),
-        };
-        if let Some(name) = matched {
-            if taken.contains(&name) {
-                continue;
-            }
-            taken.push(name);
-            bindings.push(ColumnBinding {
-                source: source.clone(),
-                column: name.to_string(),
-            });
-        }
-    }
-    bindings
+    let named: Vec<(SourceField, Option<&str>)> = fields
+        .iter()
+        .map(|source| match source {
+            SourceField::Key(key) => (source.clone(), Some(key.as_str())),
+            SourceField::Index(_) => (source.clone(), None),
+        })
+        .collect();
+    bind_by_name(table, &named)
 }
 
 /// Named field mapping for a CSV file *with* a header: the header names are
@@ -507,24 +503,48 @@ pub fn header_fields(names: &[String]) -> Vec<SourceField> {
 /// a file whose columns are in a different order than the table still lands
 /// correctly.
 pub fn mapping_from_header(table: &TableMeta, names: &[String]) -> Vec<ColumnBinding> {
+    let named: Vec<(SourceField, Option<&str>)> = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (SourceField::Index(index), Some(name.as_str())))
+        .collect();
+    bind_by_name(table, &named)
+}
+
+/// The one matching rule behind [`default_mapping`] and
+/// [`mapping_from_header`], so a CSV header and a JSON key spelled alike bind
+/// alike — they used to be two copies, and only the CSV one trimmed.
+///
+/// A field with a name binds to the importable column of that name, compared
+/// case-insensitively and ignoring surrounding whitespace (`" id "` is `id`:
+/// spreadsheets pad headers, and no real column name begins or ends with a
+/// space). A field without one binds to the importable column at its own
+/// position. Either way a column is bound at most once, first field first, so
+/// two fields spelled alike do not produce an INSERT that names the same
+/// column twice.
+fn bind_by_name(table: &TableMeta, fields: &[(SourceField, Option<&str>)]) -> Vec<ColumnBinding> {
     let importable: Vec<&ColumnMeta> = table.columns.iter().filter(|c| is_importable(c)).collect();
     let mut bindings = Vec::new();
     let mut taken: Vec<&str> = Vec::new();
-    for (index, name) in names.iter().enumerate() {
-        let matched = importable
-            .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(name.trim()))
-            .map(|c| c.name.as_str());
-        if let Some(column) = matched {
-            if taken.contains(&column) {
-                continue;
-            }
-            taken.push(column);
-            bindings.push(ColumnBinding {
-                source: SourceField::Index(index),
-                column: column.to_string(),
-            });
+    for (source, name) in fields {
+        let matched = match (name, source) {
+            (Some(name), _) => importable
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(name.trim())),
+            (None, SourceField::Index(index)) => importable.get(*index),
+            (None, SourceField::Key(_)) => None,
+        };
+        let Some(column) = matched.map(|c| c.name.as_str()) else {
+            continue;
+        };
+        if taken.contains(&column) {
+            continue;
         }
+        taken.push(column);
+        bindings.push(ColumnBinding {
+            source: source.clone(),
+            column: column.to_string(),
+        });
     }
     bindings
 }
@@ -652,7 +672,88 @@ fn batch_rows(dialect: Dialect, columns: usize) -> usize {
     (max_params(dialect) / columns.max(1)).clamp(1, 500)
 }
 
-/// Builds one multi-row `INSERT INTO t (cols) VALUES (…),(…)`.
+/// One value position of a row bound for the INSERT.
+#[derive(Debug, Clone, PartialEq)]
+enum Cell {
+    Value(Value),
+    /// The column's own default — what [`null_cell`] sends where a NULL
+    /// cannot be stored but the column says what to store instead.
+    Default,
+}
+
+/// What a NULL headed for `column` is sent as, or why the row cannot be.
+///
+/// - A **nullable** column takes the NULL. Its default, if it has one, does
+///   not apply: the file said "no value", and the column can hold exactly
+///   that.
+/// - A **NOT NULL column the database fills in** — a `DEFAULT`, a `serial`'s
+///   `nextval(…)`, `GENERATED BY DEFAULT AS IDENTITY` — gets that value. A
+///   NULL could not be stored there, so sending one only fails the statement
+///   (measured on Postgres, SQL Server and SQLite alike), and a server-side
+///   failure aborts the import in skip mode too. The default is what the
+///   column itself says an absent value becomes.
+/// - Any **other NOT NULL column** refuses the row here rather than at the
+///   server, so skip mode can actually skip it — the most common thing wrong
+///   with a messy export.
+fn null_cell(column: &ColumnMeta) -> Result<Cell, String> {
+    if column.nullable {
+        Ok(Cell::Value(Value::Null))
+    } else if column.is_auto_assigned() {
+        Ok(Cell::Default)
+    } else {
+        Err(format!(
+            "column \"{}\" can't be empty (it is NOT NULL and has no default)",
+            column.name
+        ))
+    }
+}
+
+/// Whether `INSERT … VALUES (…)` takes the `DEFAULT` keyword in a value
+/// position. Postgres and SQL Server do, in multi-row lists too; SQLite does
+/// not (a syntax error), so there a defaulted column is left out of the
+/// statement instead — see [`statement_runs`].
+fn has_default_keyword(dialect: Dialect) -> bool {
+    match dialect {
+        Dialect::Postgres | Dialect::SqlServer => true,
+        Dialect::Sqlite => false,
+    }
+}
+
+/// Splits one batch into the row ranges that are each sent as one INSERT.
+///
+/// Where the dialect has a `DEFAULT` keyword the whole batch is one
+/// statement. On SQLite a defaulted cell can only be expressed by leaving its
+/// column out, and a column list is per statement, so a new statement starts
+/// wherever the set of defaulted columns changes; a row with *every* column
+/// defaulted is a statement of its own, since `DEFAULT VALUES` inserts
+/// exactly one row. That costs a statement per change, which is cheap only
+/// because SQLite has no round trip to pay for — the reason the servers get
+/// the keyword instead.
+fn statement_runs(dialect: Dialect, rows: &[Vec<Cell>]) -> Vec<std::ops::Range<usize>> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    if has_default_keyword(dialect) {
+        return std::iter::once(0..rows.len()).collect();
+    }
+    let defaulted =
+        |row: &[Cell]| -> Vec<bool> { row.iter().map(|cell| *cell == Cell::Default).collect() };
+    let mut runs = Vec::new();
+    let mut start = 0;
+    for index in 1..rows.len() {
+        let previous = defaulted(&rows[index - 1]);
+        let all_default = previous.iter().all(|d| *d);
+        if all_default || previous != defaulted(&rows[index]) {
+            runs.push(start..index);
+            start = index;
+        }
+    }
+    runs.push(start..rows.len());
+    runs
+}
+
+/// Builds one multi-row `INSERT INTO t (cols) VALUES (…),(…)` for rows that
+/// [`statement_runs`] grouped together.
 ///
 /// Values render exactly as a staged insert's do — through
 /// [`ParamSql`](super::staged::ParamSql), so NULLs are the inline literal
@@ -660,61 +761,73 @@ fn batch_rows(dialect: Dialect, columns: usize) -> usize {
 /// every other parameter carries its column's Postgres cast. One renderer, so
 /// an imported value and a hand-edited one reach the same column the same
 /// way.
+///
+/// A [`Cell::Default`] is the `DEFAULT` keyword where the dialect has one. On
+/// SQLite its column is left out of the statement — the rows agree on which
+/// columns those are — and a statement left with no columns at all is
+/// `DEFAULT VALUES`.
 fn insert_sql(
     table: &TableMeta,
     dialect: Dialect,
     planned: &[PlannedColumn<'_>],
-    rows: &[Vec<Value>],
+    rows: &[Vec<Cell>],
 ) -> (String, Vec<Value>) {
+    let target = qualified(table.schema.as_deref(), &table.name);
+    let named: Vec<usize> = (0..planned.len())
+        .filter(|&index| {
+            has_default_keyword(dialect)
+                || rows.first().is_none_or(|row| row[index] != Cell::Default)
+        })
+        .collect();
+    if named.is_empty() {
+        debug_assert_eq!(rows.len(), 1, "DEFAULT VALUES inserts exactly one row");
+        return (format!("INSERT INTO {target} DEFAULT VALUES"), Vec::new());
+    }
     let casts = cast_targets(table, dialect);
     let mut params = ParamSql::new(dialect);
-    let names: Vec<String> = planned
+    let names: Vec<String> = named
         .iter()
-        .map(|p| quote_ident(&p.column.name))
+        .map(|&index| quote_ident(&planned[index].column.name))
         .collect();
     let mut tuples = Vec::with_capacity(rows.len());
     for row in rows {
-        let rendered: Vec<String> = row
+        let rendered: Vec<String> = named
             .iter()
-            .zip(planned)
-            .map(|(value, planned)| {
-                let cast = casts.get(planned.column.name.as_str()).map(String::as_str);
-                params.value_sql(value, cast)
+            .map(|&index| match &row[index] {
+                Cell::Default => "DEFAULT".to_string(),
+                Cell::Value(value) => {
+                    let column = planned[index].column.name.as_str();
+                    params.value_sql(value, casts.get(column).map(String::as_str))
+                }
             })
             .collect();
         tuples.push(format!("({})", rendered.join(", ")));
     }
     let sql = format!(
-        "INSERT INTO {} ({}) VALUES {}",
-        qualified(table.schema.as_deref(), &table.name),
+        "INSERT INTO {target} ({}) VALUES {}",
         names.join(", "),
         tuples.join(", ")
     );
     (sql, params.into_values())
 }
 
-/// Coerces one record into the values for the planned columns, or reports the
+/// Coerces one record into the cells for the planned columns, or reports the
 /// first reason it cannot.
 fn coerce_row(
     planned: &[PlannedColumn<'_>],
     dialect: Dialect,
     record: &Record,
     empty: EmptyField,
-) -> Result<Vec<Value>, String> {
+) -> Result<Vec<Cell>, String> {
     let mut row = Vec::with_capacity(planned.len());
     for slot in planned {
         let field = record.field(&slot.source);
         let value = coerce_field(slot.column, dialect, &field, empty)?;
-        // A NULL heading for a column that forbids one is caught here rather
-        // than by the server, so skip mode can actually skip it — the most
-        // common thing wrong with a messy export.
-        if value.is_null() && !slot.column.nullable && !slot.column.is_auto_assigned() {
-            return Err(format!(
-                "column \"{}\" can't be empty (it is NOT NULL and has no default)",
-                slot.column.name
-            ));
-        }
-        row.push(value);
+        row.push(if value.is_null() {
+            null_cell(slot.column)?
+        } else {
+            Cell::Value(value)
+        });
     }
     Ok(row)
 }
@@ -752,7 +865,7 @@ pub async fn run_import(
         .await
         .map_err(|e| ImportError::at(None, e.to_string()))?;
     let mut report = ImportReport::default();
-    let mut batch: Vec<Vec<Value>> = Vec::with_capacity(per_batch);
+    let mut batch: Vec<Vec<Cell>> = Vec::with_capacity(per_batch);
 
     loop {
         // Reading is fallible too, and a malformed file is not a row that can
@@ -805,31 +918,43 @@ pub async fn run_import(
     Ok(report)
 }
 
-/// Sends one batch, holding it to the row count it should have affected —
-/// the same guard every staged write runs under
+/// Sends one batch, holding every statement to the row count it should have
+/// affected — the same guard every staged write runs under
 /// ([`execute_all_checked`](DbPool::execute_all_checked)): a statement that
 /// affected a different number of rows than it had values for has done
 /// something nobody asked for, and must not be committed.
+///
+/// A batch is one statement except on SQLite, where [`statement_runs`] may
+/// split it.
 async fn flush(
     tx: &mut ScriptTx<'_>,
     table: &TableMeta,
     dialect: Dialect,
     planned: &[PlannedColumn<'_>],
-    rows: &[Vec<Value>],
+    rows: &[Vec<Cell>],
 ) -> Result<(), (DbError, u64)> {
-    let (sql, params) = insert_sql(table, dialect, planned, rows);
     // The error carries how many rows of THIS batch had landed, so
-    // [`ImportError::undone_rows`] counts everything the rollback undid. The
-    // row-count mismatch is the one case where that is not zero — and it was
-    // the case the count used to miss, which is precisely the case the guard
-    // exists for.
-    let affected = tx
-        .execute_with(&sql, &params)
-        .await
-        .map_err(|err| (err, 0))?;
-    let expected = rows.len() as u64;
-    if affected != expected {
-        return Err((DbError::row_count_mismatch(affected, expected), affected));
+    // [`ImportError::undone_rows`] counts everything the rollback undid —
+    // earlier statements of the batch included. The row-count mismatch is
+    // the one case where the failing statement's own share is not zero — and
+    // it was the case the count used to miss, which is precisely the case the
+    // guard exists for.
+    let mut applied = 0u64;
+    for run in statement_runs(dialect, rows) {
+        let rows = &rows[run];
+        let (sql, params) = insert_sql(table, dialect, planned, rows);
+        let affected = tx
+            .execute_with(&sql, &params)
+            .await
+            .map_err(|err| (err, applied))?;
+        let expected = rows.len() as u64;
+        if affected != expected {
+            return Err((
+                DbError::row_count_mismatch(affected, expected),
+                applied + affected,
+            ));
+        }
+        applied += affected;
     }
     Ok(())
 }
@@ -1000,6 +1125,46 @@ mod tests {
     }
 
     #[test]
+    fn a_json_key_and_a_csv_header_spelled_alike_bind_alike() {
+        // One rule for both: case-insensitive, surrounding whitespace
+        // ignored. Only the CSV path used to trim, so a padded JSON key
+        // silently bound nothing.
+        let people = people();
+        let spellings = [" id ", "NAME\t", "Age"];
+        let header: Vec<String> = spellings.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            mapping_from_header(&people, &header),
+            vec![bind(0, "id"), bind(1, "name"), bind(2, "age")]
+        );
+        let keys: Vec<SourceField> = spellings
+            .iter()
+            .map(|s| SourceField::Key(s.to_string()))
+            .collect();
+        let by_key = default_mapping(&people, &keys);
+        assert_eq!(
+            by_key
+                .iter()
+                .map(|b| (b.source.clone(), b.column.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (keys[0].clone(), "id"),
+                (keys[1].clone(), "name"),
+                (keys[2].clone(), "age")
+            ]
+        );
+        // And both bind a column once, first spelling first.
+        let twice = vec![
+            SourceField::Key("name".into()),
+            SourceField::Key(" Name".into()),
+        ];
+        assert_eq!(default_mapping(&people, &twice).len(), 1);
+        assert_eq!(
+            mapping_from_header(&people, &["name".to_string(), " Name".into()]),
+            vec![bind(0, "name")]
+        );
+    }
+
+    #[test]
     fn a_headerless_file_binds_positionally() {
         let people = people();
         let fields = vec![SourceField::Index(0), SourceField::Index(1)];
@@ -1030,9 +1195,9 @@ mod tests {
         assert_eq!(
             coerce_row(&planned, Dialect::Postgres, &record, EmptyField::Null).unwrap(),
             vec![
-                Value::Integer(1),
-                Value::Text("ada".into()),
-                Value::Integer(36)
+                Cell::Value(Value::Integer(1)),
+                Cell::Value(Value::Text("ada".into())),
+                Cell::Value(Value::Integer(36))
             ]
         );
 
@@ -1053,7 +1218,7 @@ mod tests {
             EmptyField::EmptyText,
         )
         .unwrap();
-        assert_eq!(row[1], Value::Text(String::new()));
+        assert_eq!(row[1], Cell::Value(Value::Text(String::new())));
 
         // But an empty field for a *number* is refused under that setting
         // rather than quietly becoming NULL anyway — the option would
@@ -1071,8 +1236,158 @@ mod tests {
         let record = Record::positional(3, vec!["1".into()]);
         assert_eq!(
             coerce_row(&planned, Dialect::Postgres, &record, EmptyField::Null).unwrap(),
-            vec![Value::Integer(1), Value::Null]
+            vec![Cell::Value(Value::Integer(1)), Cell::Value(Value::Null)]
         );
+    }
+
+    /// `people` plus the three kinds of column a NULL can head for besides a
+    /// plain nullable one.
+    fn with_defaults() -> TableMeta {
+        let mut people = people();
+        let mut qty = col("qty", "integer", false);
+        qty.default = Some("7".into());
+        let mut seq = col("seq", "integer", false);
+        seq.generated = Generated::ByDefault;
+        let mut note = col("note", "text", true);
+        note.default = Some("'none'".into());
+        people.columns.extend([qty, seq, note]);
+        people
+    }
+
+    fn column<'t>(table: &'t TableMeta, name: &str) -> &'t ColumnMeta {
+        table.columns.iter().find(|c| c.name == name).unwrap()
+    }
+
+    #[test]
+    fn a_null_becomes_the_default_only_where_null_cannot_be_stored() {
+        let table = with_defaults();
+        // NOT NULL with a default, and NOT NULL filled by an identity: the
+        // column's own value, never a NULL the server refuses.
+        assert_eq!(null_cell(column(&table, "qty")), Ok(Cell::Default));
+        assert_eq!(null_cell(column(&table, "seq")), Ok(Cell::Default));
+        // Nullable, with or without a default: the NULL the file said.
+        assert_eq!(
+            null_cell(column(&table, "age")),
+            Ok(Cell::Value(Value::Null))
+        );
+        assert_eq!(
+            null_cell(column(&table, "note")),
+            Ok(Cell::Value(Value::Null))
+        );
+        // NOT NULL with nothing to fill it: refused by hubro, so skippable.
+        let err = null_cell(column(&table, "name")).unwrap_err();
+        assert!(err.contains("\"name\""), "{err}");
+        assert!(err.contains("no default"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_or_missing_field_for_a_defaulted_not_null_column_is_sent_as_default() {
+        // The wire from the file to the cell: an empty CSV field and an
+        // absent JSON key both reach `null_cell` and come out as the default.
+        let table = with_defaults();
+        let planned = plan(&table, &[bind(0, "id"), bind(1, "qty"), bind(2, "seq")]).unwrap();
+        let blank = Record::positional(4, vec!["1".into(), "".into(), "".into()]);
+        assert_eq!(
+            coerce_row(&planned, Dialect::Postgres, &blank, EmptyField::Null).unwrap(),
+            vec![Cell::Value(Value::Integer(1)), Cell::Default, Cell::Default]
+        );
+
+        let keyed = plan(
+            &table,
+            &[
+                ColumnBinding {
+                    source: SourceField::Key("id".into()),
+                    column: "id".into(),
+                },
+                ColumnBinding {
+                    source: SourceField::Key("qty".into()),
+                    column: "qty".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let mut map = serde_json::Map::new();
+        map.insert("id".into(), serde_json::json!(2));
+        let missing = Record::keyed(5, map);
+        assert_eq!(
+            coerce_row(&keyed, Dialect::Postgres, &missing, EmptyField::Null).unwrap(),
+            vec![Cell::Value(Value::Integer(2)), Cell::Default]
+        );
+    }
+
+    #[test]
+    fn a_defaulted_cell_is_the_default_keyword_on_the_servers() {
+        let table = with_defaults();
+        let planned = plan(&table, &[bind(0, "id"), bind(1, "qty")]).unwrap();
+        let rows = vec![
+            vec![Cell::Value(Value::Integer(1)), Cell::Default],
+            vec![
+                Cell::Value(Value::Integer(2)),
+                Cell::Value(Value::Integer(3)),
+            ],
+        ];
+        assert_eq!(statement_runs(Dialect::Postgres, &rows), vec![0..2]);
+        assert_eq!(statement_runs(Dialect::SqlServer, &rows), vec![0..2]);
+        let (sql, params) = insert_sql(&table, Dialect::Postgres, &planned, &rows);
+        assert_eq!(
+            sql,
+            "INSERT INTO \"public\".\"people\" (\"id\", \"qty\") \
+             VALUES ($1::integer, DEFAULT), ($2::integer, $3::integer)"
+        );
+        assert_eq!(
+            params,
+            vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)]
+        );
+        let (mssql, _) = insert_sql(&table, Dialect::SqlServer, &planned, &rows);
+        assert!(
+            mssql.ends_with("VALUES (@P1, DEFAULT), (@P2, @P3)"),
+            "{mssql}"
+        );
+    }
+
+    #[test]
+    fn sqlite_leaves_a_defaulted_column_out_of_its_statement() {
+        let table = with_defaults();
+        let planned = plan(&table, &[bind(0, "id"), bind(1, "qty")]).unwrap();
+        let int = |n| Cell::Value(Value::Integer(n));
+        let rows = vec![
+            vec![int(1), Cell::Default],
+            vec![int(2), Cell::Default],
+            vec![int(3), int(30)],
+            vec![Cell::Default, Cell::Default],
+            vec![Cell::Default, Cell::Default],
+            vec![int(6), Cell::Default],
+        ];
+        // A statement per change of defaulted columns, and an all-default
+        // row on its own: `DEFAULT VALUES` inserts exactly one row.
+        let runs = statement_runs(Dialect::Sqlite, &rows);
+        assert_eq!(runs, vec![0..2, 2..3, 3..4, 4..5, 5..6]);
+
+        let sql =
+            |run: std::ops::Range<usize>| insert_sql(&table, Dialect::Sqlite, &planned, &rows[run]);
+        assert_eq!(
+            sql(0..2),
+            (
+                "INSERT INTO \"public\".\"people\" (\"id\") VALUES (?), (?)".to_string(),
+                vec![Value::Integer(1), Value::Integer(2)]
+            )
+        );
+        assert!(sql(2..3).0.ends_with("(\"id\", \"qty\") VALUES (?, ?)"));
+        assert_eq!(
+            sql(3..4),
+            (
+                "INSERT INTO \"public\".\"people\" DEFAULT VALUES".to_string(),
+                vec![]
+            )
+        );
+        // Never the keyword, which SQLite rejects as a syntax error.
+        for run in runs {
+            let (text, _) = sql(run);
+            assert!(
+                text.ends_with("DEFAULT VALUES") || !text.contains("DEFAULT"),
+                "{text}"
+            );
+        }
     }
 
     #[test]
@@ -1080,8 +1395,11 @@ mod tests {
         let people = people();
         let planned = plan(&people, &[bind(0, "id"), bind(1, "name")]).unwrap();
         let rows = vec![
-            vec![Value::Integer(1), Value::Text("ada".into())],
-            vec![Value::Integer(2), Value::Null],
+            vec![
+                Cell::Value(Value::Integer(1)),
+                Cell::Value(Value::Text("ada".into())),
+            ],
+            vec![Cell::Value(Value::Integer(2)), Cell::Value(Value::Null)],
         ];
         let (sql, params) = insert_sql(&people, Dialect::Postgres, &planned, &rows);
         assert_eq!(
@@ -1158,6 +1476,20 @@ mod tests {
         // A record without a key shows an empty cell there.
         assert_eq!(preview.rows[0], vec!["1".to_string(), "".into()]);
         assert_eq!(preview.rows[1], vec!["".to_string(), "2".into()]);
+    }
+
+    #[test]
+    fn a_json_preview_lists_keys_in_the_order_the_file_has_them() {
+        // `serde_json::Map` is a BTreeMap unless `preserve_order` is on, and
+        // nothing else in the build turns it on — so the preview used to list
+        // every JSON file's columns alphabetically.
+        let mut source = JsonReader::new(
+            r#"[{"zeta":1,"alpha":2,"mid":3},{"beta":4}]"#.as_bytes(),
+            JsonShape::Array,
+            Encoding::Utf8,
+        );
+        let preview = preview(&mut source, 10).unwrap();
+        assert_eq!(preview.labels, vec!["zeta", "alpha", "mid", "beta"]);
     }
 
     #[test]

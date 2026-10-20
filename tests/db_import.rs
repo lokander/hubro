@@ -939,3 +939,278 @@ async fn mssql_a_bit_column_takes_the_boolean_spellings_people_export() {
     pool.execute("DROP TABLE dbo.import_bit").await.unwrap();
     pool.close().await;
 }
+
+/// A file whose empty fields land in NOT NULL columns that declare a
+/// default, in a different combination on each line — so on SQLite, which
+/// has no `DEFAULT` keyword and leaves such a column out of the statement
+/// instead, consecutive rows disagree about which columns to name. Line 6
+/// leaves a NOT NULL column with *no* default empty, which is still the
+/// error skip mode exists for.
+const DEFAULTS_CSV: &str = "id,qty,status,note,label\n\
+                            1,,,,a\n\
+                            2,3,open,x,b\n\
+                            3,,open,,c\n\
+                            4,5,,y,d\n\
+                            5,6,done,z,\n\
+                            6,,,,f\n";
+
+/// Imports [`DEFAULTS_CSV`] into `import_defaults` (already created by the
+/// caller with `qty … NOT NULL DEFAULT 7`, `status … NOT NULL DEFAULT 'new'`,
+/// a nullable `note` and a defaultless NOT NULL `label`) and checks that an
+/// empty field there became the column's default rather than a NULL the
+/// server refuses.
+///
+/// Before, the NOT NULL check exempted any column with a default but the
+/// INSERT still named it and sent `NULL`, which every engine rejects — on a
+/// server-side error the whole import aborts in both modes, so a single
+/// blank `created_at` threw away the file with no skipped-row line.
+async fn assert_empty_fields_take_the_column_default(pool: &DbPool) {
+    let tables = pool.introspect().await.unwrap();
+    let table = find(&tables, "import_defaults");
+    let report = import(
+        pool,
+        table,
+        &options(
+            vec![
+                bind(0, "id"),
+                bind(1, "qty"),
+                bind(2, "status"),
+                bind(3, "note"),
+                bind(4, "label"),
+            ],
+            ErrorMode::Skip,
+        ),
+        csv(DEFAULTS_CSV).as_mut(),
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{:?}: {err}", pool.dialect()));
+
+    assert_eq!(report.inserted_rows, 5, "{:?}", pool.dialect());
+    assert_eq!(
+        report.skipped.iter().map(|s| s.line).collect::<Vec<_>>(),
+        vec![6],
+        "{:?}: only the defaultless NOT NULL column's blank is refused",
+        pool.dialect()
+    );
+    assert!(
+        report.skipped[0].reason.contains("\"label\""),
+        "{:?}",
+        report.skipped[0]
+    );
+    let row = |cells: [&str; 5]| cells.map(str::to_string).to_vec();
+    assert_eq!(
+        snapshot(pool, table, "id").await,
+        vec![
+            row(["1", "7", "new", "NULL", "a"]),
+            row(["2", "3", "open", "x", "b"]),
+            row(["3", "7", "open", "NULL", "c"]),
+            row(["4", "5", "new", "y", "d"]),
+            row(["6", "7", "new", "NULL", "f"]),
+        ],
+        "{:?}: a blank in a NOT NULL column with a default takes the default; \
+         a blank in a nullable one stays NULL",
+        pool.dialect()
+    );
+
+    // A row whose every mapped column is defaulted: SQLite has nothing left
+    // to name, so it is sent as `DEFAULT VALUES` — one row per statement,
+    // which two such rows in a row have to respect.
+    let tables = pool.introspect().await.unwrap();
+    let table = find(&tables, "import_all_default");
+    let report = import(
+        pool,
+        table,
+        &options(vec![bind(0, "qty")], ErrorMode::Abort),
+        csv("qty\n\"\"\n\"\"\n4\n\"\"\n").as_mut(),
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{:?}: {err}", pool.dialect()));
+    assert_eq!(report.inserted_rows, 4, "{:?}", pool.dialect());
+    let qty: Vec<String> = snapshot(pool, table, "id")
+        .await
+        .into_iter()
+        .map(|row| row[1].clone())
+        .collect();
+    assert_eq!(qty, vec!["7", "7", "4", "7"], "{:?}", pool.dialect());
+}
+
+#[tokio::test]
+async fn sqlite_an_empty_field_in_a_not_null_column_takes_its_default() {
+    let fixture = FixtureDb::with_sql("").await;
+    let pool = fixture.open().await;
+    pool.execute(
+        "CREATE TABLE import_defaults (
+            id INTEGER PRIMARY KEY,
+            qty INTEGER NOT NULL DEFAULT 7,
+            status TEXT NOT NULL DEFAULT 'new',
+            note TEXT,
+            label TEXT NOT NULL
+        )",
+    )
+    .await
+    .unwrap();
+    pool.execute(
+        "CREATE TABLE import_all_default (id INTEGER PRIMARY KEY, qty INTEGER NOT NULL DEFAULT 7)",
+    )
+    .await
+    .unwrap();
+    assert_empty_fields_take_the_column_default(&pool).await;
+}
+
+#[tokio::test]
+async fn sqlite_a_batch_split_into_statements_counts_every_row_it_undid() {
+    // SQLite sends a batch as several statements when rows disagree about
+    // which columns are defaulted. A failure in a later one must still count
+    // the rows the earlier ones had landed, or `undone_rows` under-reports
+    // exactly what the rollback undid.
+    let fixture = FixtureDb::with_sql("").await;
+    let pool = fixture.open().await;
+    pool.execute("CREATE TABLE split (id INTEGER PRIMARY KEY, qty INTEGER NOT NULL DEFAULT 7)")
+        .await
+        .unwrap();
+    pool.execute("INSERT INTO split VALUES (9, 1)")
+        .await
+        .unwrap();
+    let tables = pool.introspect().await.unwrap();
+    let table = find(&tables, "split");
+    // Rows 1-2 default `qty` (one statement), row 3 names it and collides
+    // with the existing key (the next statement).
+    let err = import(
+        &pool,
+        table,
+        &options(vec![bind(0, "id"), bind(1, "qty")], ErrorMode::Abort),
+        csv("id,qty\n1,\n2,\n9,3\n").as_mut(),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.message.contains("UNIQUE"), "{}", err.message);
+    assert_eq!(err.undone_rows, 2);
+    assert_eq!(pool.count_table_rows(table).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn postgres_an_empty_field_in_a_not_null_column_takes_its_default() {
+    let Some(url) = pg_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.execute("DROP TABLE IF EXISTS import_defaults, import_all_default")
+        .await
+        .unwrap();
+    pool.execute(
+        "CREATE TABLE import_defaults (
+            id integer PRIMARY KEY,
+            qty integer NOT NULL DEFAULT 7,
+            status text NOT NULL DEFAULT 'new',
+            note text,
+            label text NOT NULL
+        )",
+    )
+    .await
+    .unwrap();
+    pool.execute(
+        "CREATE TABLE import_all_default (id serial PRIMARY KEY, qty integer NOT NULL DEFAULT 7)",
+    )
+    .await
+    .unwrap();
+    assert_empty_fields_take_the_column_default(&pool).await;
+
+    // The issue's own shape: a serial key and a `now()` timestamp, both left
+    // empty, plus an identity column — each of which the server fills in.
+    pool.execute("DROP TABLE IF EXISTS import_events")
+        .await
+        .unwrap();
+    pool.execute(
+        "CREATE TABLE import_events (
+            id serial PRIMARY KEY,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            seq integer GENERATED BY DEFAULT AS IDENTITY,
+            note text
+        )",
+    )
+    .await
+    .unwrap();
+    let tables = pool.introspect().await.unwrap();
+    let table = find(&tables, "import_events");
+    let report = import(
+        &pool,
+        table,
+        &options(
+            vec![
+                bind(0, "id"),
+                bind(1, "created_at"),
+                bind(2, "seq"),
+                bind(3, "note"),
+            ],
+            ErrorMode::Skip,
+        ),
+        csv("id,created_at,seq,note\n,,,first\n,2024-01-01 00:00:00+00,,second\n").as_mut(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.inserted_rows, 2);
+    assert_eq!(report.skipped_rows, 0);
+    let stored = pool
+        .query(
+            "SELECT id, seq, created_at IS NOT NULL, created_at = '2024-01-01 00:00:00+00' \
+             FROM import_events ORDER BY id",
+        )
+        .await
+        .unwrap();
+    let rows: Vec<Vec<String>> = stored
+        .rows
+        .iter()
+        .map(|row| row.iter().map(Value::display).collect())
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1".to_string(), "1".into(), "true".into(), "false".into()],
+            vec!["2".to_string(), "2".into(), "true".into(), "true".into()],
+        ]
+    );
+
+    pool.execute("DROP TABLE import_defaults, import_all_default, import_events")
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn mssql_an_empty_field_in_a_not_null_column_takes_its_default() {
+    let Some(url) = mssql_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    pool.execute(
+        "IF OBJECT_ID('dbo.import_defaults', 'U') IS NOT NULL DROP TABLE dbo.import_defaults",
+    )
+    .await
+    .unwrap();
+    pool.execute(
+        "IF OBJECT_ID('dbo.import_all_default', 'U') IS NOT NULL DROP TABLE dbo.import_all_default",
+    )
+    .await
+    .unwrap();
+    pool.execute(
+        "CREATE TABLE dbo.import_defaults (
+            id int PRIMARY KEY,
+            qty int NOT NULL DEFAULT 7,
+            status nvarchar(20) NOT NULL DEFAULT N'new',
+            note nvarchar(20) NULL,
+            label nvarchar(20) NOT NULL
+        )",
+    )
+    .await
+    .unwrap();
+    pool.execute(
+        "CREATE TABLE dbo.import_all_default (
+            id int IDENTITY PRIMARY KEY,
+            qty int NOT NULL DEFAULT 7
+        )",
+    )
+    .await
+    .unwrap();
+    assert_empty_fields_take_the_column_default(&pool).await;
+
+    pool.execute("DROP TABLE dbo.import_defaults, dbo.import_all_default")
+        .await
+        .unwrap();
+    pool.close().await;
+}

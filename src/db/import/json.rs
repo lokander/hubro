@@ -19,22 +19,19 @@
 //! level up:
 //!
 //! - an array whose closing `]` never arrives (a half-downloaded export);
-//! - anything but whitespace after that `]`.
+//! - anything but whitespace after that `]`;
+//! - a closer or comma where a record should start — `[{"a":1}}`, or two
+//!   NDJSON objects joined by a comma. The scanner used to read an empty
+//!   value there and take it for the end of the file, importing the records
+//!   before it as though they were all of it.
 //!
 //! And one JSON value is bounded by [`MAX_VALUE_BYTES`], so a malformed file
 //! cannot be accumulated whole while looking for a close that never comes.
 
-use std::io::{self, BufRead};
+use std::io::BufRead;
 
+use super::cursor::ByteCursor;
 use super::{decode_bytes, Encoding, ReadError, Record, RecordSource};
-
-/// Wraps an I/O failure while reading the file, naming the line reached.
-fn io_read_error(line: u64, err: io::Error) -> ReadError {
-    ReadError {
-        line: Some(line),
-        message: format!("reading the file failed: {err}"),
-    }
-}
 
 /// Which JSON layout a file uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -65,59 +62,35 @@ pub const MAX_VALUE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Pulls JSON records one at a time out of a byte stream.
 pub struct JsonReader<R: BufRead> {
-    input: R,
+    cursor: ByteCursor<R>,
     shape: JsonShape,
     encoding: Encoding,
-    /// 1-based physical line the next byte belongs to.
-    line: u64,
     /// Array mode: whether the opening `[` has been consumed.
     opened: bool,
-    /// Whether the byte-order mark has been looked for.
-    primed: bool,
     finished: bool,
 }
 
 impl<R: BufRead> JsonReader<R> {
     pub fn new(input: R, shape: JsonShape, encoding: Encoding) -> Self {
         JsonReader {
-            input,
+            cursor: ByteCursor::new(input),
             shape,
             encoding,
-            line: 1,
             opened: false,
-            primed: false,
             finished: false,
         }
     }
 
-    /// Consumes a UTF-8 byte-order mark. PowerShell's `Out-File` and several
-    /// Windows exporters write one, and without this the file is refused with
-    /// a message about starting with `ï` — naming the symptom and not the
-    /// cause. The CSV reader has always stripped it; this one had not.
-    fn strip_bom(&mut self) -> Result<(), ReadError> {
-        if self.primed {
-            return Ok(());
-        }
-        self.primed = true;
-        let line = self.line;
-        let buf = self.input.fill_buf().map_err(|e| io_read_error(line, e))?;
-        if buf.starts_with(&[0xEF, 0xBB, 0xBF]) {
-            self.input.consume(3);
-        }
-        Ok(())
-    }
-
     fn peek(&mut self) -> Result<Option<u8>, ReadError> {
-        let line = self.line;
-        let buf = self.input.fill_buf().map_err(|e| io_read_error(line, e))?;
-        Ok(buf.first().copied())
+        self.cursor.peek()
     }
 
     fn bump(&mut self, byte: u8) {
-        if byte == b'\n' {
-            self.line += 1;
-        }
-        self.input.consume(1);
+        self.cursor.bump(byte);
+    }
+
+    fn line(&self) -> u64 {
+        self.cursor.line()
     }
 
     /// Consumes whitespace, returning the next significant byte without
@@ -149,7 +122,7 @@ impl<R: BufRead> JsonReader<R> {
             let Some(byte) = self.peek()? else {
                 if depth > 0 || in_string {
                     return Err(ReadError {
-                        line: Some(self.line),
+                        line: Some(self.line()),
                         message: "the file ends in the middle of a JSON value".to_string(),
                     });
                 }
@@ -157,7 +130,7 @@ impl<R: BufRead> JsonReader<R> {
             };
             if raw.len() > MAX_VALUE_BYTES {
                 return Err(ReadError {
-                    line: Some(self.line),
+                    line: Some(self.line()),
                     message: format!(
                         "this JSON value is larger than {} MiB — check that the file is really \
                          JSON, and that a string or bracket is not left open",
@@ -222,7 +195,6 @@ impl<R: BufRead> JsonReader<R> {
         if self.finished {
             return Ok(None);
         }
-        self.strip_bom()?;
         if self.shape == JsonShape::Array && !self.opened {
             match self.skip_whitespace()? {
                 Some(b'[') => {
@@ -231,7 +203,7 @@ impl<R: BufRead> JsonReader<R> {
                 }
                 Some(other) => {
                     return Err(ReadError {
-                        line: Some(self.line),
+                        line: Some(self.line()),
                         message: format!(
                             "expected a JSON array, but the file starts with {:?}",
                             other as char
@@ -256,7 +228,7 @@ impl<R: BufRead> JsonReader<R> {
                     // half-downloaded export is exactly this shape.
                     if self.shape == JsonShape::Array {
                         return Err(ReadError {
-                            line: Some(self.line),
+                            line: Some(self.line()),
                             message: "the file ends before the array is closed — it looks \
                                       truncated, so importing it would import only part of it"
                                 .to_string(),
@@ -273,7 +245,7 @@ impl<R: BufRead> JsonReader<R> {
                     // exports, or a truncation that landed mid-document.
                     if let Some(trailing) = self.skip_whitespace()? {
                         return Err(ReadError {
-                            line: Some(self.line),
+                            line: Some(self.line()),
                             message: format!(
                                 "the array ends here, but the file continues with {:?}",
                                 trailing as char
@@ -285,11 +257,20 @@ impl<R: BufRead> JsonReader<R> {
                 Some(_) => break,
             }
         }
-        let start_line = self.line;
+        let start_line = self.line();
         let raw = self.scan_value()?;
         if raw.is_empty() {
-            self.finished = true;
-            return Ok(None);
+            // `scan_value` stops without consuming at a closer or a comma
+            // that cannot belong to the value it was asked for — so nothing
+            // was read, and `skip_whitespace` already ruled out the end of
+            // the file. What is left is a stray `}`, a `]` outside an array,
+            // or a comma between NDJSON records: malformed, and the records
+            // after it would be lost if this were taken for the end.
+            let unexpected = self.peek()?.map_or('?', char::from);
+            return Err(ReadError {
+                line: Some(start_line),
+                message: format!("unexpected {unexpected:?} where a record should start"),
+            });
         }
         let text = decode_bytes(&raw, self.encoding).map_err(|message| ReadError {
             line: Some(start_line),
@@ -451,6 +432,33 @@ mod tests {
         );
         clean.next_record().unwrap();
         assert_eq!(clean.next_record().unwrap(), None);
+    }
+
+    #[test]
+    fn a_stray_closer_or_comma_is_an_error_not_the_end_of_the_file() {
+        // The scanner read an empty value at each of these and took it for
+        // the end of the file, so the import reported success with the
+        // records before it and silently dropped everything after.
+        for (text, shape, records_before, unexpected, line) in [
+            ("[{\"a\":1}}", JsonShape::Array, 1, "'}'", 1),
+            ("[{\"a\":1},\n}, {\"a\":2}]", JsonShape::Array, 1, "'}'", 2),
+            ("{\"a\":1}\n}\n{\"a\":2}\n", JsonShape::Lines, 1, "'}'", 2),
+            ("{\"a\":1}\n]\n", JsonShape::Lines, 1, "']'", 2),
+            ("{\"a\":1},\n{\"a\":2}\n", JsonShape::Lines, 1, "','", 1),
+            ("}", JsonShape::Lines, 0, "'}'", 1),
+        ] {
+            let mut reader = JsonReader::new(text.as_bytes(), shape, Encoding::Utf8);
+            for _ in 0..records_before {
+                assert!(reader.next_record().unwrap().is_some(), "{text:?}");
+            }
+            let err = reader.next_record().unwrap_err();
+            assert!(
+                err.message.contains(&format!("unexpected {unexpected}")),
+                "{text:?}: {}",
+                err.message
+            );
+            assert_eq!(err.line, Some(line), "{text:?}");
+        }
     }
 
     #[test]
