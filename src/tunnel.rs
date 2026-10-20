@@ -120,7 +120,9 @@ impl std::error::Error for TunnelError {}
 enum HostKeyStatus {
     /// A matching entry exists — accept silently.
     Trusted,
-    /// No file mentions this host — first contact (trust-on-first-use).
+    /// No readable file records this host — first contact (trust-on-first-use).
+    /// A file russh cannot parse is skipped whole, so its records are lost too
+    /// (FRE-289).
     Unknown,
     /// A file records this host with a *different* key — possible MITM.
     Changed,
@@ -151,7 +153,8 @@ pub fn default_known_hosts_read() -> Vec<PathBuf> {
 
 /// Classifies `key` for `host:port` against every key `files` record for that
 /// host, by [`host_key_verdict`]. Unreadable or unparsable files contribute no
-/// opinion.
+/// opinion: russh fails a whole file on one undecodable line for the host,
+/// which FRE-289 is to fix.
 fn verify_host_key(host: &str, port: u16, key: &PublicKey, files: &[PathBuf]) -> HostKeyStatus {
     let recorded: Vec<PublicKey> = files
         .iter()
@@ -164,8 +167,10 @@ fn verify_host_key(host: &str, port: u16, key: &PublicKey, files: &[PathBuf]) ->
 
 /// Trusted if any recorded key is the offered one, wherever it sits; Changed if
 /// the host is recorded at all but only under other keys; Unknown only when
-/// nothing is recorded. As in OpenSSH, a key of a different *type* counts as
-/// Changed. That matters because russh does not check the key a server sends
+/// nothing is recorded. This is OpenSSH's core rule (`hostfile.c`), so a key of
+/// a different *type* counts as Changed; its `@revoked` markers and wildcard
+/// patterns are not replicated (FRE-289). The type case matters because russh
+/// does not check the key a server sends
 /// against the negotiated algorithm, so a server can agree to the recorded type
 /// and present another. Reading that as Unknown turned a man-in-the-middle into
 /// a trust prompt for a host the user already trusts (FRE-288, reproduced
@@ -224,8 +229,8 @@ fn client_config(host: &str, port: u16, known_hosts_read: &[PathBuf]) -> client:
 
 /// The algorithms a server can present a key of this format under. known_hosts
 /// records an RSA key as `ssh-rsa`, its format, but servers sign with it as
-/// rsa-sha2-512 or rsa-sha2-256, and OpenSSH 8.8+ refuses SHA-1 `ssh-rsa`
-/// outright. Pinning `ssh-rsa` alone made every reconnect to an RSA-only
+/// rsa-sha2-512 or rsa-sha2-256, and OpenSSH 8.8+ disables SHA-1 `ssh-rsa` by
+/// default. Pinning `ssh-rsa` alone made every reconnect to an RSA-only
 /// OpenSSH server fail (FRE-288, measured against 10.3), so RSA gets all three,
 /// in russh's default order.
 fn presenting_algorithms(format: Algorithm) -> Vec<Algorithm> {
@@ -835,6 +840,15 @@ mod tests {
             verifier.offered_key.lock().unwrap().as_ref(),
             Some(&pubkey(KEY_ECDSA))
         );
+
+        // A host with no record is refused too, as Unknown: the trust prompt,
+        // never a silent accept.
+        verifier.host = "new.internal".into();
+        assert!(!verifier.check_server_key(&offered).await.unwrap());
+        assert_eq!(
+            *verifier.verdict.lock().unwrap(),
+            Some(HostKeyStatus::Unknown)
+        );
     }
 
     #[test]
@@ -848,13 +862,35 @@ mod tests {
         // What `open` hands russh, not just what the helper computes.
         let config = client_config("example.com", 22, &[path]);
         let names: Vec<&str> = config.preferred.key.iter().map(|a| a.as_str()).collect();
-        // OpenSSH 8.8+ offers only the first two; `ssh-rsa` alone never matched.
+        // OpenSSH 8.8+ offers only the first two by default; `ssh-rsa` alone
+        // never matched.
         assert_eq!(names, ["rsa-sha2-512", "rsa-sha2-256", "ssh-rsa"]);
         // Nothing recorded leaves russh's defaults alone.
         let defaults = client::Config::default().preferred.key;
         assert_eq!(
             client_config("absent.example", 22, &[]).preferred.key,
             defaults
+        );
+    }
+
+    #[test]
+    fn every_readable_file_counts_and_an_unparsable_one_erases_only_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        // hubro's own store comes first in `default_known_hosts_read`, so its
+        // record must count; a broken second file must not erase it. The
+        // double space makes russh read the key type as the key and fail the
+        // whole file.
+        let first = write_known_hosts(dir.path(), "app", &[&format!("example.com {KEY_A}")]);
+        let broken = write_known_hosts(dir.path(), "user", &[&format!("example.com  {KEY_B}")]);
+        assert!(known_host_keys_path("example.com", 22, &broken).is_err());
+        let files = [first, broken];
+        assert_eq!(
+            verify_host_key("example.com", 22, &pubkey(KEY_ECDSA), &files),
+            HostKeyStatus::Changed
+        );
+        assert_eq!(
+            verify_host_key("example.com", 22, &pubkey(KEY_A), &files),
+            HostKeyStatus::Trusted
         );
     }
 
