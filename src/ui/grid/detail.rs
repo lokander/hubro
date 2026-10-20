@@ -1,4 +1,4 @@
-//! The row detail panel (FRE-109): one row of the grid as a vertical
+//! The row detail panel: one row of the grid as a vertical
 //! column/value form, docked beside it.
 //!
 //! Its model is derived from the grid's focused cell rather than stored, so
@@ -9,7 +9,7 @@
 use super::*;
 
 /// Default width of the row detail panel in CSS pixels, and the range a drag
-/// may take it to (FRE-109). The floor keeps a name/type header legible; the
+/// may take it to. The floor keeps a name/type header legible; the
 /// ceiling keeps the grid — which the panel accompanies rather than replaces
 /// — from being squeezed away.
 pub(super) const DETAIL_WIDTH: f64 = 360.0;
@@ -26,7 +26,7 @@ pub(super) fn clamp_detail_width(width: f64) -> f64 {
     width.clamp(DETAIL_MIN_WIDTH, DETAIL_MAX_WIDTH)
 }
 
-/// One field of the row detail panel (FRE-109): a column of the focused row,
+/// One field of the row detail panel: a column of the focused row,
 /// with everything the panel needs to show it, edit it, and follow it.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct DetailField {
@@ -36,18 +36,18 @@ pub(super) struct DetailField {
     /// is (a Postgres enum reads as its type, not `USER-DEFINED`).
     pub(super) type_name: String,
     /// The cell as the grid holds it: for a previewed cell only the bounded
-    /// prefix, which the panel replaces with the full value (FRE-33).
+    /// prefix, which the panel replaces with the full value.
     pub(super) value: Value,
     pub(super) preview: Option<PreviewInfo>,
     pub(super) dirty: bool,
     pub(super) kind: EditorKind,
     pub(super) nullable: bool,
     /// The grid's own answer (`GridNavCell::editable`), which already folds in
-    /// the resolved capability and the user's marking (FRE-87/FRE-111) — not
+    /// the backend's capability and the connection's write protection — not
     /// a second resolution that could disagree with the cell beside it.
     pub(super) editable: bool,
     /// The foreign key this column belongs to, when following it leads
-    /// somewhere: a NULL key references nothing (FRE-29).
+    /// somewhere: a NULL key references nothing.
     pub(super) fk: Option<ForeignKeyMeta>,
 }
 
@@ -98,12 +98,12 @@ pub(super) struct RowDetail {
     pub(super) locator: Option<RowLocator>,
     pub(super) fields: Vec<DetailField>,
     /// The whole row by column — the source of an FK jump's equality filter.
-    /// [`Shared`] because every field of the panel carries it (FRE-130).
+    /// [`Shared`] because every field of the panel carries it.
     pub(super) row_values: Shared<HashMap<String, Value>>,
     pub(super) position: DetailPosition,
 }
 
-/// Reduces the focused row of `nav` to the panel's model (FRE-109).
+/// Reduces the focused row of `nav` to the panel's model.
 ///
 /// The row is taken from the grid's focus (the selection model's focus
 /// corner), not from any row the panel remembers for itself — and the panel's
@@ -173,7 +173,7 @@ impl RowStep {
     }
 }
 
-/// The row detail panel's drag-to-resize listener (FRE-109). Same shape as
+/// The row detail panel's drag-to-resize listener. Same shape as
 /// [`GRID_SCROLL_JS`]: the drag is handled entirely in JS, which moves the
 /// node itself and reports the resting width back once, on release — so a
 /// drag costs no re-renders and the width still ends up in Rust, where it
@@ -214,7 +214,7 @@ pub(super) fn detail_resize_js() -> String {
     )
 }
 
-/// The row detail panel (FRE-109): the focused row as a vertical
+/// The row detail panel: the focused row as a vertical
 /// column → value form, docked to the right of the rows.
 ///
 /// It is a companion to browsing rather than a mode: it stays open while the
@@ -230,18 +230,18 @@ pub(super) fn RowDetailPanel(
     table: TableRef,
     /// The focused row, or `None` when the page has no rows. [`Shared`] so
     /// this prop stays pointer-comparable while the grid re-renders around it
-    /// (FRE-130) — the panel only rebuilds when the focused row changes.
+    /// — the panel only rebuilds when the focused row changes.
     detail: Option<Shared<RowDetail>>,
     width: f64,
     dialect: Dialect,
-    /// Why editing is unavailable (FRE-87/FRE-111) — the grid's sentence,
-    /// from the grid's resolution, stated once instead of per field.
+    /// Why editing is unavailable — the grid's sentence, from the grid's
+    /// resolution, stated once instead of per field.
     read_only_notice: Option<String>,
     /// The grid's in-place editor, closed when a field here opens one: only
     /// one cell editor can hold the keyboard at a time.
     grid_editing: Signal<Option<ActiveEdit>>,
     /// The panel's open editor, owned above this component so it survives the
-    /// keyed remount of `RowDetailFields` (FRE-109).
+    /// keyed remount of `RowDetailFields`.
     editing: Signal<Option<ActiveEdit>>,
     on_step: EventHandler<RowStep>,
     on_close: EventHandler<()>,
@@ -369,7 +369,7 @@ pub(super) fn RowDetailFields(
     // fetch resolves, which is the same answer `CellFetch::capped` gives after.
     //
     // Shared, so each field carries a pointer to the list rather than its own
-    // copy of it (FRE-130).
+    // copy of it.
     let editable_columns = Shared::new(
         fields
             .iter()
@@ -400,7 +400,7 @@ pub(super) fn RowDetailFields(
 }
 
 /// One column of the focused row: its name and type, an FK jump when it has
-/// one, and its value — the full value, not the grid's preview (FRE-109).
+/// one, and its value — the full value, not the grid's preview.
 #[component]
 pub(super) fn RowDetailRow(
     id: ConnectionId,
@@ -450,7 +450,7 @@ pub(super) fn RowDetailRow(
             dd {
                 match (&field.preview, &locator) {
                     // A truncated cell whose row can be addressed: load the
-                    // whole value through the shared cell-fetch path (FRE-33).
+                    // whole value through the shared cell-fetch path.
                     (Some(_), Some(locator)) => rsx! {
                         RowDetailFullValue {
                             id,
@@ -473,7 +473,7 @@ pub(super) fn RowDetailRow(
                             message: CopyRefusal::Unaddressable { column: field.column.clone() }.message(),
                         }
                         // The viewer is told the value is a prefix and how
-                        // long the stored one is (FRE-115) — the page already
+                        // long the stored one is — the page already
                         // reports that length, so nothing here re-derives a
                         // size from bytes known to be truncated, the trap the
                         // SQL Server length probe fix closed on main.
@@ -508,7 +508,7 @@ pub(super) fn RowDetailRow(
 
 /// A field whose grid cell holds only a bounded preview: loads the full value
 /// through [`AppState::load_cell`] — the same path the expand popup and the
-/// clipboard use (FRE-33) — and then renders and edits it like any other
+/// clipboard use — and then renders and edits it like any other
 /// field. A value over [`FETCH_CELL_MAX_BYTES`] cannot be loaded whole, so it
 /// is shown as its first chunk and never opened for editing: staging the
 /// prefix would silently truncate what is stored.
@@ -592,7 +592,7 @@ pub(super) fn RowDetailValue(
     table: TableRef,
     field: DetailField,
     /// The complete value: fetched for a previewed cell, `field.value`
-    /// otherwise. The editor must never start from a preview (FRE-33).
+    /// otherwise. The editor must never start from a preview.
     value: Value,
     locator: Option<RowLocator>,
     dialect: Dialect,
@@ -638,8 +638,8 @@ pub(super) fn RowDetailValue(
                 draft,
                 on_commit,
                 on_cancel: move |_| editing.set(None),
-                // Input that doesn't parse is stashed rather than dropped
-                // (FRE-74). The grid needs this because scrolling unmounts a
+                // Input that doesn't parse is stashed rather than dropped.
+                // The grid needs this because scrolling unmounts a
                 // row mid-typing; the panel needs it because `RowDetailFields`
                 // is keyed by row, so *every* row move — Prev/Next, an arrow
                 // key, a click, the post-save refetch — remounts every field.
@@ -683,7 +683,7 @@ pub(super) fn RowDetailValue(
                     }
                 },
                 // The whole value is in hand here — the previewed path fetched
-                // it — so the viewer may decode it (FRE-115). Read-only: the
+                // it — so the viewer may decode it. Read-only: the
                 // editor below still opens on the raw value, never on a
                 // rendering of it.
                 CellViewer {
@@ -747,7 +747,7 @@ mod tests {
         );
     }
 
-    // ---- Row detail panel (FRE-109) --------------------------------------
+    // ---- Row detail panel --------------------------------------
 
     /// The metadata [`row_detail`] needs beside a [`GridNav`], for a
     /// two-column page (`id` int PK, `title` text) with a foreign key on
@@ -839,7 +839,7 @@ mod tests {
 
     #[test]
     fn a_read_only_table_offers_no_editors_in_the_panel_either() {
-        // `can_mutate = false` is how a read-only marking (FRE-111) reaches
+        // `can_mutate = false` is how a read-only marking reaches
         // the grid; the panel must inherit it rather than resolve its own.
         let fixture = detail_fixture();
         let result = two_column_result();

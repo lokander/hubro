@@ -22,7 +22,7 @@ use super::schema_edit::SchemaEditLine;
 use super::sidebar::SchemaSidebar;
 use super::state::{ActiveView, AppState};
 
-/// The window-level keyboard listener (FRE-15). Installed once as a plain
+/// The window-level keyboard listener. Installed once as a plain
 /// `keydown` handler on `window` — a webview-robust way to capture app-global
 /// shortcuts regardless of which element holds focus (a focusable Dioxus
 /// wrapper would only see keys while it, and not the sidebar/grid/buttons,
@@ -64,7 +64,7 @@ const GLOBAL_KEYS_JS: &str = r#"
       if (f) { e.preventDefault(); f.focus(); }
       return;
     }
-    // Ctrl+F focuses the schema sidebar's filter (FRE-107) and selects what
+    // Ctrl+F focuses the schema sidebar's filter and selects what
     // is already there, so a second search replaces the first by typing.
     // preventDefault also suppresses the webview's own find-in-page.
     if (e.ctrlKey && (e.key === 'f' || e.key === 'F')) {
@@ -73,7 +73,7 @@ const GLOBAL_KEYS_JS: &str = r#"
       return;
     }
     if (e.ctrlKey && (e.key === 'e' || e.key === 'E')) { e.preventDefault(); dioxus.send('pane'); return; }
-    // Ctrl+D docks/undocks the row detail panel beside the grid (FRE-109).
+    // Ctrl+D docks/undocks the row detail panel beside the grid.
     if (e.ctrlKey && (e.key === 'd' || e.key === 'D')) { e.preventDefault(); dioxus.send('rowdetail'); return; }
     if (e.ctrlKey && (e.key === 'b' || e.key === 'B')) {
       e.preventDefault();
@@ -117,10 +117,10 @@ pub fn Shell() -> Element {
     // rather than a root `spawn_forever` in AppState::new: restore drives the
     // normal connect flow, so it belongs beside the manual connect path it
     // mirrors. (It used to be justified by signal scope as well; that reason
-    // went away when every AppState signal became root-scoped — FRE-156.)
+    // went away when every AppState signal became root-scoped.)
     //
-    // The same task then opens every database hubro was *told* to open
-    // (FRE-114): the command-line target, then the ones the OS hands over
+    // The same task then opens every database hubro was *told* to open:
+    // the command-line target, then the ones the OS hands over
     // (on macOS a double-clicked file arrives as an `open` Apple Event rather
     // than in argv; the queue is unbounded, so one delivered before the first
     // render is opened rather than dropped).
@@ -144,7 +144,7 @@ pub fn Shell() -> Element {
         });
     });
 
-    // Session persistence (FRE-30): re-snapshot whenever the open tabs, their
+    // Session persistence: re-snapshot whenever the open tabs, their
     // selected table/pane, or the active view change, and write session.toml
     // only when the snapshot actually differs. `current_session` reads
     // `open_locators`, `tab_ui`, and `active`, so this effect re-runs on any
@@ -193,7 +193,7 @@ pub fn Shell() -> Element {
 }
 
 /// Confirmation shown when the user tries to close the window with unsaved
-/// staged edits (FRE-37). The close was vetoed (the window switched to
+/// staged edits. The close was vetoed (the window switched to
 /// hide-on-close); here the user either discards and quits for real or cancels
 /// back into the app to save.
 #[component]
@@ -269,7 +269,7 @@ fn update_geometry(latest: &mut Signal<WindowGeometry>, window: &DesktopService)
     }
 }
 
-/// Captures window size/position and persists it to settings.toml (FRE-30) so
+/// Captures window size/position and persists it to settings.toml so
 /// the next launch restores it. Renders nothing.
 ///
 /// Mechanism: a `use_wry_event_handler` updates an in-memory geometry on every
@@ -287,7 +287,7 @@ fn WindowPersistence() -> Element {
     // as part of the requested client area while `inner_size()` reports the
     // content area below it, so the geometry restored by main.rs reads back
     // one menu-height short — and every launch/close cycle would shrink the
-    // window by that much (FRE-62). The runtime `set_inner_size` is
+    // window by that much. The runtime `set_inner_size` is
     // menu-exclusive like `inner_size()` (verified empirically), so
     // re-applying the requested size once at startup makes the read-back
     // match what was saved. Only fires when a shortfall is actually measured:
@@ -404,7 +404,7 @@ fn ShortcutGroup(title: &'static str, children: Element) -> Element {
     }
 }
 
-/// The `?` shortcut cheatsheet (FRE-15): a modal overlay grouping every
+/// The `?` shortcut cheatsheet: a modal overlay grouping every
 /// keybinding, dismissed by Escape (handled by the global listener), a click
 /// on the backdrop, or `?` again. Kept in sync by hand with the actual
 /// bindings in [`GLOBAL_KEYS_JS`] and the grid's key handler.
@@ -480,7 +480,7 @@ struct TabEntry {
     id: ConnectionId,
     name: String,
     dialect: Dialect,
-    /// Accent colour and write protection (FRE-111).
+    /// Accent colour and write protection.
     color: Option<ConnectionColor>,
     protection: WriteProtection,
 }
@@ -525,7 +525,7 @@ fn TabBar() -> Element {
                     } else {
                         "flex items-center gap-1 rounded-t px-3 py-1.5 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100"
                     },
-                    // The accent rides the tab's top edge (FRE-111) so it
+                    // The accent rides the tab's top edge so it
                     // stays visible on the inactive tabs too, where a
                     // background tint would be lost against the bar.
                     border_top: if let Some(color) = tab.color { "2px solid {color.css()}" },
@@ -624,9 +624,9 @@ fn ConnectionView(id: ConnectionId) -> Element {
                         SqlEditor { key: "sql-{id:?}", id }
                     },
                     // Same selected-table semantics as Data, so the two panes
-                    // always describe the same table (FRE-69).
+                    // always describe the same table.
                     super::state::Pane::Schema => rsx! {
-                        // Above the pane body rather than inside it (FRE-122):
+                        // Above the pane body rather than inside it:
                         // a drop deselects the table it dropped, so a line
                         // living in the body would take the report of the most
                         // consequential operation down with the object it

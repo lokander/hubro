@@ -4,8 +4,7 @@
 //! a cell is decoded, and how a driver error is mapped (SQLite has no error
 //! position to enrich with; Postgres appends line/column) — so everything
 //! between "the driver handed us a row stream" and "the caller gets a
-//! [`QueryResult`]" is written once here and parameterized on those three
-//! (FRE-138).
+//! [`QueryResult`]" is written once here and parameterized on those three.
 //!
 //! Generic functions rather than a macro: the backend modules stay ordinary
 //! Rust that a reader can follow and a compiler error can point into, and the
@@ -61,7 +60,7 @@ where
 /// Executes a statement without decoding rows, returning the driver's
 /// affected-row count. Takes any sqlx executor, so this is both the pool path
 /// and the single-connection path (a statement inside an atomically-wrapped
-/// script, FRE-38).
+/// script).
 ///
 /// Goes through `sqlx::query` rather than handing the executor the bare `&str`
 /// on purpose: the former is a prepared statement, the latter would be the
@@ -140,7 +139,7 @@ where
 
 /// Drains a row stream into a bounded [`QueryResult`], keeping at most
 /// `max_rows` rows and capping each cell to `cell_cap` bytes; the bool is
-/// whether rows existed past the cap (FRE-33).
+/// whether rows existed past the cap.
 pub(super) async fn collect_capped<S, R>(
     mut stream: S,
     max_rows: u64,
@@ -252,8 +251,8 @@ where
         .collect())
 }
 
-/// Gives a result that streamed no rows the headers it would have had
-/// (FRE-138): an empty `SELECT` shows its column names rather than nothing,
+/// Gives a result that streamed no rows the headers it would have had:
+/// an empty `SELECT` shows its column names rather than nothing,
 /// matching the SQL Server backend, which gets them from TDS metadata for
 /// free. Called after the row stream is dropped, since the stream holds the
 /// borrow of the executor this needs.

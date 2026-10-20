@@ -1,4 +1,4 @@
-//! Integration tests for schema editing (FRE-122), against every engine hubro
+//! Integration tests for schema editing, against every engine hubro
 //! supports — nine of them: SQLite plus the eight behind a `HUBRO_*_TEST_URL`.
 //!
 //! The unit tests in `src/db/schema_edit.rs` pin what the generator *emits*.
@@ -36,8 +36,9 @@
 //!
 //! **Those gaps are deliberately not modelled as capabilities.** `ddl` is one
 //! flag, and both engines genuinely have DDL; carving it into per-operation
-//! flags is the kind of widening FRE-122 exists to avoid, and it would have to
-//! be re-derived for every engine added afterwards. What matters is the failure
+//! flags is the kind of widening that narrowing schema editing to
+//! low-divergence operations exists to avoid, and it would have to be
+//! re-derived for every engine added afterwards. What matters is the failure
 //! *mode*, which [`assert_supported_except`] pins: every refusal is a message
 //! the dialog shows, and no operation is ever accepted while changing nothing.
 //! An engine that silently ignored a statement would be the one outcome this

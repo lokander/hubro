@@ -1,4 +1,4 @@
-//! The back-compat half of the config convention, made checkable (FRE-120).
+//! The back-compat half of the config convention, made checkable.
 //!
 //! Every new field on a config type is declared `#[serde(default,
 //! skip_serializing_if = ...)]` so **older config files still deserialize and
@@ -7,16 +7,16 @@
 //! field that starts serializing an implicit default rewrites every user's
 //! file on the next save.
 //!
-//! `tests/fixtures/connections_pre_fre_120.toml` is a real connections.toml
+//! `tests/fixtures/connections_before_groups.toml` is a real connections.toml
 //! written by the code as it stood *before* groups existed — SQLite, Postgres
-//! with an SSH tunnel, SQL Server with Entra, and FRE-111 markings. Loading it
-//! and saving it back must reproduce it byte for byte.
+//! with an SSH tunnel, SQL Server with Entra, and write-protection and colour
+//! markings. Loading it and saving it back must reproduce it byte for byte.
 
 use std::path::Path;
 
 use hubro::config::{load_connections, save_connections, SavedList};
 
-const FIXTURE: &str = "tests/fixtures/connections_pre_fre_120.toml";
+const FIXTURE: &str = "tests/fixtures/connections_before_groups.toml";
 
 /// The fixture, copied into a temp dir so the test writes over its own copy
 /// and never the checked-in one.
@@ -34,13 +34,13 @@ fn a_pre_group_connections_file_round_trips_byte_for_byte() {
     let before = std::fs::read_to_string(&path).unwrap();
 
     // The plain serde route: load the entries, write them back.
-    let entries = load_connections(&path).expect("a pre-FRE-120 file still loads");
+    let entries = load_connections(&path).expect("a pre-groups file still loads");
     assert_eq!(entries.len(), 5, "every entry survived the load");
     save_connections(&path, &entries).unwrap();
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
         before,
-        "an untouched pre-FRE-120 file must be rewritten unchanged"
+        "an untouched pre-groups file must be rewritten unchanged"
     );
 
     // And the route the app actually takes, which additionally normalizes

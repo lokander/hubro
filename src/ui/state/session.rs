@@ -1,4 +1,4 @@
-//! Session persistence (FRE-30): snapshotting the open tabs to
+//! Session persistence: snapshotting the open tabs to
 //! `session.toml` and restoring them on the next launch.
 //!
 //! Restore deliberately drives the ordinary connect flow rather than a
@@ -8,7 +8,7 @@
 use super::*;
 
 impl AppState {
-    /// Snapshots the current session (FRE-30): the open tabs in tab order,
+    /// Snapshots the current session: the open tabs in tab order,
     /// each with its selected table and pane, plus the active tab's locator.
     /// Cheap and pure — the SQL editor buffer is deliberately not included, so
     /// per-keystroke `tab_ui` changes produce an identical snapshot and the
@@ -47,7 +47,7 @@ impl AppState {
             active,
             // Read (not peeked) on purpose: the persistence effect re-runs on
             // the signals this function reads, so collapsing a group is what
-            // schedules the write that remembers it (FRE-120).
+            // schedules the write that remembers it.
             collapsed_groups: self.collapsed_groups.read().clone(),
         }
     }
@@ -64,7 +64,7 @@ impl AppState {
         });
     }
 
-    /// Reopens the previous session's tabs (FRE-30). Runs once at startup.
+    /// Reopens the previous session's tabs. Runs once at startup.
     ///
     /// Only connections still in the saved list are reopened (ad-hoc ones are
     /// not resurrected). SQLite reconnects silently; Postgres reconnects only
@@ -79,7 +79,7 @@ impl AppState {
         };
         let session = load_session(&path);
         // Before the early return: which groups were folded is remembered
-        // whether or not any tab was open (FRE-120).
+        // whether or not any tab was open.
         if !session.collapsed_groups.is_empty() {
             self.collapsed_groups.set(session.collapsed_groups.clone());
         }
@@ -175,7 +175,7 @@ impl AppState {
                     ..
                 } => self.connect_server(backend, url, name, tunnel, auth).await,
             }
-            // Apply the remembered table, pane, and row detail panel (FRE-109)
+            // Apply the remembered table, pane, and row detail panel
             // to the freshly opened tab.
             let id = self
                 .open_locators

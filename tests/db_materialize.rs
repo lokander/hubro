@@ -1,9 +1,9 @@
-//! Materialize verification (FRE-92). Materialize speaks the Postgres wire
+//! Materialize verification. Materialize speaks the Postgres wire
 //! protocol over a streaming engine: its objects are sources, views and
 //! materialized views maintained by the engine rather than tables written by
 //! hand. It has the slimmest catalog of any engine in this milestone, which is
 //! what makes it the useful test — of the Postgres path's tolerance, and of the
-//! capability model (FRE-87).
+//! capability model.
 //!
 //! Needs a running server (Docker only, per CLAUDE.md) and is skipped unless
 //! `HUBRO_MATERIALIZE_TEST_URL` is set, e.g.:
@@ -25,7 +25,7 @@
 //!     forty-four — no `udt_schema`/`udt_name`, and none of the
 //!     identity/generated flags. Selecting an absent column fails the whole
 //!     statement, so the schema tree died exactly as it did on CockroachDB's
-//!     `pk_position` (FRE-90). The query now falls back to a portable shape
+//!     `pk_position`. The query now falls back to a portable shape
 //!     that selects the missing pieces as the constants they would decode to.
 //!  2. **The index query asked for `indnkeyatts`**, which only exists on
 //!     engines that have INCLUDE columns to exclude. Same fallback treatment.
@@ -40,9 +40,9 @@
 //! `NULL` for `column_default` where Postgres returns SQL NULL, so every column
 //! reads as having a default. Two consumers see it, and it is harmless to both
 //! — a column with no default really does default to NULL. Insert
-//! required-column detection (FRE-25) treats every column as auto-assigned,
+//! required-column detection treats every column as auto-assigned,
 //! which no Materialize object reaches anyway because none are editable; and
-//! Show DDL (FRE-108) emits an explicit `DEFAULT NULL` on every column, which
+//! Show DDL emits an explicit `DEFAULT NULL` on every column, which
 //! is redundant but true and re-runnable.
 //!
 //! And 265 objects across five reserved schemas would have buried the user's
@@ -60,18 +60,18 @@
 //!
 //! ## What the schema tree deliberately does not show
 //!
-//! FRE-92 asked how much of Materialize's object model to surface. Clusters,
-//! sinks and indexes are first-class there and have no Postgres equivalent, and
-//! they stay unrepresented: hubro's tree is relations you can read rows from,
-//! and none of the three is one. A sink writes *out* to Kafka, a cluster is
-//! compute, an index is already carried as [`TableMeta::indexes`] where it
-//! applies. Sources are the exception, and are included, because a source *is*
-//! readable — `SELECT` works on it, which is the whole test.
+//! The open question was how much of Materialize's object model to surface.
+//! Clusters, sinks and indexes are first-class there and have no Postgres
+//! equivalent, and they stay unrepresented: hubro's tree is relations you can
+//! read rows from, and none of the three is one. A sink writes *out* to Kafka,
+//! a cluster is compute, an index is already carried as [`TableMeta::indexes`]
+//! where it applies. Sources are the exception, and are included, because a
+//! source *is* readable — `SELECT` works on it, which is the whole test.
 //!
 //! ## What the capability model concluded, and why it is not what was expected
 //!
-//! FRE-92 assumed Materialize would land as a read-only connection. It does
-//! not, and declaring it so would have been wrong twice over: `INSERT`,
+//! The expectation was that Materialize would land as a read-only connection.
+//! It does not, and declaring it so would have been wrong twice over: `INSERT`,
 //! `UPDATE`, `DELETE`, `CREATE TABLE` and real transactional rollback all work
 //! here — better than CockroachDB or YugabyteDB, both of which let DDL escape a
 //! rolled-back script. So the connection declares [`Capabilities::FULL`], and
@@ -89,9 +89,9 @@
 //!   they carry a declared restriction saying that, rather than the "Views are
 //!   read-only" that their [`TableKind`] would otherwise produce.
 //!
-//! This is the end-to-end test FRE-87 was built for, with the outcome inverted:
-//! the connection is fully capable and every *object* narrows, rather than the
-//! connection being clamped shut.
+//! This is the end-to-end test the capability model was built for, with the
+//! outcome inverted: the connection is fully capable and every *object*
+//! narrows, rather than the connection being clamped shut.
 
 use hubro::db::{
     detect_row_identity, Capabilities, DbPool, Filter, Generated, Internal, PageRequest, PgFlavor,
@@ -195,7 +195,7 @@ async fn materialize_introspects_despite_its_slim_catalog() {
     // every column reads as having a default and therefore as auto-assigned.
     // It is harmless here — a column with no default really does default to
     // NULL, and the only consumer of `is_auto_assigned` is insert
-    // required-column detection (FRE-25), which no Materialize object ever
+    // required-column detection, which no Materialize object ever
     // reaches because none of them are editable. If an engine ever pairs this
     // spelling with working inserts, this is the assertion that will say so.
     assert!(table
@@ -408,8 +408,8 @@ async fn materialize_is_a_fully_capable_connection_despite_editing_nothing() {
     let Some(url) = test_url() else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
 
-    // The conclusion FRE-92 expected to be the opposite. Every object above is
-    // read-only, but the *connection* is not: declaring it read-only would
+    // The conclusion that was expected to be the opposite. Every object above
+    // is read-only, but the *connection* is not: declaring it read-only would
     // wrongly disable the SQL editor's write paths, which work.
     assert_eq!(pool.backend_capabilities(), Capabilities::FULL);
 
@@ -452,8 +452,8 @@ async fn materialize_rolls_back_a_transaction_including_its_ddl() {
 
     // Worth pinning because the other two engines in this milestone both fail
     // it: on CockroachDB and YugabyteDB a schema change escapes the
-    // transaction it was issued in, so a rolled-back script leaves it standing
-    // (FRE-146). Materialize does not — which is why that gap has to be a
+    // transaction it was issued in, so a rolled-back script leaves it standing.
+    // Materialize does not — which is why that gap has to be a
     // per-engine capability rather than something assumed of Postgres-wire
     // engines generally.
     let table = "mz_tx_probe";
@@ -495,12 +495,13 @@ async fn materialize_reports_no_statistics_rather_than_a_row_of_zeroes() {
     // claimed. There is no `pg_total_relation_size` at all, so the size half
     // says no outright. Every object — table, view and materialized view
     // alike — therefore reports nothing rather than the zeroes a credulous
-    // query would have produced (FRE-118).
+    // query would have produced.
     //
     // Worth pinning precisely because the sentinel is now the *only* thing
-    // suppressing these: a measured zero is reported as zero since the review
-    // of FRE-118, so if this engine ever answered 0 instead of -1 the pane
-    // would start claiming every object is empty. This test would fail first.
+    // suppressing these: a measured zero is reported as zero since the
+    // table-stats review, so if this engine ever answered 0 instead of -1 the
+    // pane would start claiming every object is empty. This test would fail
+    // first.
     for name in [&readings, &view, &matview] {
         let stats = pool.fetch_table_stats(find(&tables, name)).await.unwrap();
         assert!(

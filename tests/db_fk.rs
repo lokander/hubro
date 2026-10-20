@@ -1,4 +1,4 @@
-//! Integration tests for foreign-key navigation (FRE-29): introspect a
+//! Integration tests for foreign-key navigation: introspect a
 //! parent/child schema, build the FK-jump filter from a real child row with
 //! [`build_fk_filter`], and run it through `fetch_page` to prove it selects
 //! exactly the referenced parent row(s). Covers a single-column FK, an

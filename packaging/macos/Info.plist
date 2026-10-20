@@ -2,7 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   Info.plist for the macOS .app bundle (Dioxus.toml: [bundle.macos]
-  info_plist_path), added for the file association in FRE-114.
+  info_plist_path), added for the file associations.
 
   READ THIS BEFORE EDITING. dx does not merge: pointing `info_plist_path` at a
   file makes dx copy it verbatim *instead of* generating one, so every key it

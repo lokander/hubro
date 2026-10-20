@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  WiX fragment adding hubro's file associations to the MSI (FRE-114).
+  WiX fragment adding hubro's file associations to the MSI.
 
   Wired up in Dioxus.toml as [bundle.windows.wix] fragment_paths plus
   component_group_refs = ["HubroFileAssociations"] — the fragment defines the

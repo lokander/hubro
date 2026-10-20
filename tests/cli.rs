@@ -1,5 +1,4 @@
-//! The command line's observable contract, checked by running the real binary
-//! (FRE-114).
+//! The command line's observable contract, checked by running the real binary.
 //!
 //! `cli`'s unit tests cover the parsing; this covers what `main` does with the
 //! result, which is the part a user sees and the part no unit test reaches:

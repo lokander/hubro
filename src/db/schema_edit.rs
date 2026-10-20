@@ -1,4 +1,4 @@
-//! Schema edits for the operations dialects agree on (FRE-122).
+//! Schema edits for the operations dialects agree on.
 //!
 //! Deliberately narrow. DDL is where engines diverge most, and the divergence
 //! is not cosmetic: SQLite cannot change a column's type at all, every backend
@@ -176,7 +176,7 @@ pub fn op_problem(op: &SchemaOp) -> Option<&'static str> {
 /// when it is.
 ///
 /// `caps` must be the connection's **effective** capabilities — the backend's
-/// narrowed by the user's write protection (FRE-111), i.e.
+/// narrowed by the user's write protection, i.e.
 /// [`Connection::capabilities`](super::registry::Connection::capabilities).
 /// Reading the backend's own answer here would offer schema edits on a
 /// connection the user marked read-only.
@@ -738,7 +738,8 @@ mod tests {
 
     #[test]
     fn a_connection_marked_read_only_is_offered_nothing() {
-        // What FRE-111 promises, over the resolution FRE-87 built: marking a
+        // What per-connection write protection promises, over the capability
+        // resolution: marking a
         // connection read-only narrows both capabilities, so every operation
         // here — schema-only ones included — is refused.
         let caps = WriteProtection::ReadOnly.apply(Capabilities::FULL);

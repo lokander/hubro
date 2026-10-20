@@ -1,4 +1,4 @@
-//! CockroachDB verification (FRE-90). Cockroach reimplements the Postgres wire
+//! CockroachDB verification. Cockroach reimplements the Postgres wire
 //! protocol and SQL layer over its own storage rather than extending Postgres,
 //! so this is the first test of how much hubro's Postgres backend assumes about
 //! being talked to by actual PostgreSQL. These tests pin what is *not* stock.
@@ -46,13 +46,13 @@
 //!     `cockroach_script_dml_rolls_back_but_its_ddl_does_not`, which pins the
 //!     behaviour so the trade stays a decision rather than a surprise.
 //!
-//!     hubro no longer misreports it (FRE-146). This connection declares
+//!     hubro no longer misreports it. This connection declares
 //!     `transactional_ddl: false`, so a failing script that changed the schema
 //!     says the rollback did not reach it instead of claiming no changes were
 //!     applied. Behind a `Capabilities` flag rather than a check against this
-//!     one engine, since YugabyteDB does the same thing for its own reasons
-//!     (FRE-91). Note what it is *not*: `transactions` stays true, because DML
-//!     in a script really does roll back here.
+//!     one engine, since YugabyteDB does the same thing for its own reasons.
+//!     Note what it is *not*: `transactions` stays true, because DML in a
+//!     script really does roll back here.
 //!
 //! And two are engine behaviour hubro should follow rather than fight:
 //!
@@ -145,10 +145,11 @@ async fn cockroach_identifies_itself_as_its_own_engine() {
     let pool = DbPool::open_postgres(&url).await.unwrap();
 
     // Nothing else in this file depends on this answer, and that is
-    // deliberate: every fix FRE-90 landed reads a catalog fact instead, so the
-    // backend behaves correctly here whether or not it recognises the engine.
-    // Detection exists to *report* who answered — and because FRE-92 needs it
-    // to declare Materialize's capabilities, which no catalog fact supplies.
+    // deliberate: every fix the CockroachDB verification landed reads a
+    // catalog fact instead, so the backend behaves correctly here whether or
+    // not it recognises the engine. Detection exists to *report* who answered
+    // — and because Materialize's capabilities are declared from it, which no
+    // catalog fact supplies.
     // `stock_postgres_is_detected_as_stock_postgres` pins the other direction.
     assert_eq!(pool.pg_flavor(), Some(PgFlavor::CockroachDB));
 
@@ -478,8 +479,8 @@ async fn cockroach_script_dml_rolls_back_but_its_ddl_does_not() {
     //
     // hubro no longer claims otherwise: this connection declares
     // `transactional_ddl: false`, so a script containing DDL reports
-    // `Rollback::ExceptSchemaChanges` rather than a flat "rolled back"
-    // (FRE-146). What survives below is unchanged — the fix was to the claim,
+    // `Rollback::ExceptSchemaChanges` rather than a flat "rolled back".
+    // What survives below is unchanged — the fix was to the claim,
     // not to the engine.
     //
     // Setting `autocommit_before_ddl = false` fixes exactly this and was
@@ -560,8 +561,8 @@ async fn cockroach_reports_a_full_rollback_when_the_script_never_reached_its_ddl
     // *ran*, not on whether the script contains one. Here the failure comes
     // first, so the CREATE TABLE never reaches the server and the transaction
     // rolls back completely — a warning about surviving schema changes would
-    // describe a table that does not exist, which is the same false claim
-    // FRE-146 removed, pointing the other way.
+    // describe a table that does not exist, which is the same false claim as
+    // calling a committed schema change rolled back, pointing the other way.
     pool.query("DROP TABLE IF EXISTS crdb_unreached_ddl CASCADE")
         .await
         .unwrap();
@@ -628,8 +629,8 @@ async fn cockroach_counts_a_failing_ddl_as_having_escaped_the_rollback() {
     // it survives even though the schema change never happened.
     //
     // Resolving over the statements strictly before the failure would report
-    // "no changes were applied" for exactly this shape, which is the FRE-146
-    // bug returning by a narrower route.
+    // "no changes were applied" for exactly this shape, which is the old bug
+    // of reporting committed DDL as rolled back, returning by a narrower route.
     pool.query("DROP TABLE IF EXISTS crdb_boundary_dup CASCADE")
         .await
         .unwrap();
@@ -743,7 +744,7 @@ async fn cockroach_keeps_no_statistics_this_can_read_so_the_pane_stays_empty() {
     //
     // What this pins is that the absence stays an absence: the shape probe
     // must return `Ok` with nothing in it rather than erroring the pane, and
-    // nothing may substitute a zero for the missing numbers (FRE-118).
+    // nothing may substitute a zero for the missing numbers.
     let stats = pool.fetch_table_stats(meta).await.unwrap();
     assert!(
         stats.is_empty(),

@@ -5,7 +5,7 @@
 //! with a timestamp and their overall success/failure. The store keeps the
 //! newest [`HISTORY_CAP`] entries per locator and a persisted opt-out flag.
 //!
-//! Named queries the user chose to keep (FRE-113) live in a second table in
+//! Named queries the user chose to keep live in a second table in
 //! the same file, so there is one app-owned database rather than two. They
 //! are *not* history: the recording opt-out does not gate them, the
 //! [`HISTORY_CAP`] pruning never reaches them, and clearing a connection's
@@ -39,7 +39,7 @@ pub struct HistoryEntry {
     pub error: Option<String>,
 }
 
-/// One saved query (FRE-113): editor contents the user named and kept.
+/// One saved query: editor contents the user named and kept.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SavedQuery {
     pub id: i64,
@@ -137,7 +137,7 @@ impl HistoryStore {
              )",
             "CREATE INDEX IF NOT EXISTS entries_by_locator ON entries(locator, id)",
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-            // Saved queries (FRE-113). `locator` is the scope: the connection
+            // Saved queries. `locator` is the scope: the connection
             // the query belongs to, or GLOBAL_SCOPE for one offered
             // everywhere.
             "CREATE TABLE IF NOT EXISTS saved_queries (\
@@ -285,7 +285,7 @@ impl HistoryStore {
         Ok(())
     }
 
-    /// Saves editor contents under `name` (FRE-113), scoped to `locator` or
+    /// Saves editor contents under `name`, scoped to `locator` or
     /// global when that is `None`. Re-saving an existing name *in the same
     /// scope* overwrites it and reports [`SaveOutcome::Replaced`]; the same
     /// name under a different scope is a different query.

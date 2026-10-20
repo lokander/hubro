@@ -1,4 +1,4 @@
-//! YugabyteDB verification (FRE-91). Yugabyte runs the *real* PostgreSQL query
+//! YugabyteDB verification. Yugabyte runs the *real* PostgreSQL query
 //! layer on top of its own distributed storage, so unlike CockroachDB
 //! (`tests/db_cockroach.rs`) it is not a reimplementation — `pg_catalog` is
 //! genuine, and introspection needed no changes to read it correctly. These
@@ -51,7 +51,7 @@
 //!     plain statement error carrying the engine's own explanation, with the
 //!     winner fully applied. This file serialises its own fixture DDL through
 //!     [`ddl_lock`] so it stays honest under the default threaded runner.
-//!  2. **Introspection can fail transiently — since fixed (FRE-147).**
+//!  2. **Introspection can fail transiently — since fixed.**
 //!     `MISMATCHED_SCHEMA` — "the catalog snapshot used for this transaction
 //!     has been invalidated" — surfaces when a schema change lands between the
 //!     six queries introspection runs. It is a *read* failing, which is the
@@ -71,7 +71,7 @@
 //!     CockroachDB's retryable conflicts, and no engine-internal string has to
 //!     be matched.
 //!  3. **A failing script does not roll back its DDL — since reported
-//!     honestly (FRE-146).** The same behaviour CockroachDB has, for a
+//!     honestly.** The same behaviour CockroachDB has, for a
 //!     different reason: Yugabyte commits each schema change as it executes.
 //!     DML in the same transaction rolls back correctly, so the fix narrowed
 //!     what hubro *claims* rather than disabling transactions — this
@@ -104,7 +104,7 @@
 //! Indexes are LSM rather than B-tree and carry sharding attributes, but
 //! `pg_index` is byte-identical to stock Postgres — the extra detail lives in
 //! `pg_get_indexdef` (`USING lsm (id HASH, sensor_id ASC)`), so it reaches Show
-//! DDL (FRE-108) and leaves the browsable metadata untouched. Neither the
+//! DDL and leaves the browsable metadata untouched. Neither the
 //! access method nor the distribution is anything hubro records, so nothing
 //! had to change to accommodate them.
 //!
@@ -112,7 +112,7 @@
 //! `ctid`, and no implicit `rowid` of the kind CockroachDB adds — so it is
 //! read-only, exactly as on stock Postgres.
 //!
-//! Storage statistics (FRE-118) are half stock and half not, which is why they
+//! Storage statistics are half stock and half not, which is why they
 //! get a test of their own here. `ANALYZE` writes `pg_class.reltuples` exactly
 //! as PostgreSQL does, so the row estimate needs no allowance. But
 //! `pg_total_relation_size` answers 0 for a table that has just been written —
@@ -228,8 +228,8 @@ async fn yugabyte_is_not_mistaken_for_stock_postgres() {
     // Yugabyte's `version()` *leads* with `PostgreSQL 15.12-…`, because the
     // query layer genuinely is PostgreSQL 15 — so a detector that matched the
     // claimed Postgres version before looking for the engine's own name would
-    // file this as stock. Nothing branches on the answer today (FRE-90), but
-    // FRE-92 will, and this is the input most likely to break it.
+    // file this as stock. Capabilities branch on the answer: filed as stock,
+    // Yugabyte would claim its schema changes roll back, which they do not.
     assert_eq!(pool.pg_flavor(), Some(PgFlavor::Yugabyte));
 
     pool.close().await;
@@ -275,11 +275,12 @@ async fn yugabyte_introspects_with_full_postgres_parity() {
         table.indexes
     );
 
-    // The sharding attributes FRE-91 asked about do exist — they just live in
-    // the DDL rather than in `pg_index`, which is byte-identical to stock
-    // Postgres here. `pg_get_indexdef` renders them, so Show DDL (FRE-108)
-    // reports the distribution the user actually has instead of a B-tree that
-    // was never created. Native output, so this is the server's own text.
+    // The sharding attributes Yugabyte's indexes were expected to carry do
+    // exist — they just live in the DDL rather than in `pg_index`, which is
+    // byte-identical to stock Postgres here. `pg_get_indexdef` renders them,
+    // so Show DDL reports the distribution the user actually has instead of a
+    // B-tree that was never created. Native output, so this is the server's own
+    // text.
     let ddl = pool
         .fetch_ddl(table, &DdlObject::Index(format!("{readings}_pkey")))
         .await
@@ -459,7 +460,7 @@ async fn yugabyte_materialized_view_browses_but_refuses_writes() {
     let view = format!("{readings}_daily");
 
     // Yugabyte has real materialized views, which CockroachDB does not — so
-    // the `relkind = 'm'` half of introspection (FRE-41) is exercised here and
+    // the `relkind = 'm'` half of introspection is exercised here and
     // nowhere else in this milestone.
     with_ddl(
         &pool,
@@ -510,7 +511,7 @@ async fn yugabyte_extension_objects_are_attributed_like_any_postgres() {
     let Some(url) = test_url() else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
 
-    // The FRE-88 machinery runs off `pg_depend`, which is real here — unlike
+    // Internal-object marking runs off `pg_depend`, which is real here — unlike
     // CockroachDB, where it is empty and the equivalent objects had to be found
     // another way. `pg_buffercache` installs a view into `public`, which is the
     // per-object case (as opposed to the per-schema one), and is the same
@@ -581,9 +582,9 @@ async fn yugabyte_script_dml_rolls_back_but_its_ddl_does_not() {
     // The same gap CockroachDB has, reached differently: Yugabyte commits each
     // schema change as it executes rather than auto-committing the transaction
     // around it. Pinned here as well as there because it is what makes this a
-    // *capability* rather than one engine's quirk — FRE-146 narrows what hubro
-    // claims, and must not simply declare `transactions: false`, since the DML
-    // half below demonstrably still works.
+    // *capability* rather than one engine's quirk — the warning that DDL
+    // escaped a rollback narrows what hubro claims, and must not simply declare
+    // `transactions: false`, since the DML half below demonstrably still works.
     with_ddl(
         &pool,
         &[
@@ -688,7 +689,7 @@ async fn yugabyte_refuses_concurrent_ddl_without_corrupting_anything() {
     // faster machine. What must hold either way is that a loser fails
     // *cleanly*, which is the part hubro's behaviour actually rests on.
     //
-    // The loser is also where hubro's transient classification (FRE-147) is
+    // The loser is also where hubro's transient classification is
     // pinned against a *real* server-sent SQLSTATE rather than a hand-built
     // error: this is the one place in the suite that reliably makes a live
     // engine raise `40001`. The retry that classification feeds is on the
@@ -760,7 +761,7 @@ async fn yugabyte_row_estimate_arrives_but_its_size_accounting_lags() {
     // a table it was handed rows a moment ago — its storage accounting is
     // populated out of band and arrives later. A viewer that rendered that
     // literally would show "0 B" beside sixteen rows, so a zero size is
-    // dropped as unaccounted rather than reported (FRE-118). That is what is
+    // dropped as unaccounted rather than reported. That is what is
     // pinned here: never a zero, whichever side of the lag this run lands on.
     assert_ne!(
         stats.bytes,

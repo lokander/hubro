@@ -175,8 +175,8 @@ jobs:
   macos:
     name: Bundle macOS (dmg)
     needs: verify
-    # Apple Silicon runner → arm64-only dmg (no Intel build). Unsigned per
-    # FRE-48: no Developer ID, so Gatekeeper blocks the first launch (the
+    # Apple Silicon runner → arm64-only dmg (no Intel build). Unsigned: no
+    # Developer ID, so Gatekeeper blocks the first launch (the
     # README documents the xattr / Open Anyway workaround).
     runs-on: macos-latest
     steps:
@@ -218,7 +218,7 @@ jobs:
   windows:
     name: Bundle Windows (msi + nsis)
     needs: verify
-    # x64-only. Unsigned per FRE-49: no Authenticode cert, so SmartScreen
+    # x64-only. Unsigned: no Authenticode cert, so SmartScreen
     # shows an "unknown publisher" warning on first run (the README documents
     # More info → Run anyway). WiX (msi) and NSIS (setup exe) are downloaded
     # by the bundler on demand; NASM (needed by aws-lc-sys) is preinstalled

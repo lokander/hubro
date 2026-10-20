@@ -1,5 +1,5 @@
 //! The paged data grid: the [`DataGrid`] orchestrator and the subsystems it
-//! drives, split by concern (FRE-141).
+//! drives, split by concern.
 //!
 //! - [`rows`] — the per-row/per-cell view model and the components that draw
 //!   it;
@@ -61,19 +61,19 @@ use super::state::{find_table_meta, AppState, ExportPane, ExportStatus, ImportSt
 
 const PAGE_SIZE: u32 = 100;
 
-/// Fixed data-row height in CSS pixels (FRE-32). Rows render one truncated
+/// Fixed data-row height in CSS pixels. Rows render one truncated
 /// line at `text-xs` + `py-1`, so their height is uniform; pinning it lets the
 /// windowed renderer compute exact scroll offsets and spacer heights. Measured
 /// in the WebKitGTK webview (rows sit on a 33px pitch). The GridRow `<tr>` is
 /// held to this height so an open inline editor can't shift the offsets.
 const ROW_HEIGHT: f64 = 33.0;
 
-/// Rows rendered above and below the viewport (FRE-32). A margin so a fast
+/// Rows rendered above and below the viewport. A margin so a fast
 /// flick rarely reveals a blank spacer before the range updates, and so small
 /// errors from the sticky header offset never uncover an unrendered row.
 const ROW_OVERSCAN: usize = 12;
 
-/// Scroll/resize listener installed on `#dv-grid` (FRE-32). rAF-coalesces
+/// Scroll/resize listener installed on `#dv-grid`. rAF-coalesces
 /// bursts and reports `[scrollTop, clientHeight]` back over the eval channel so
 /// the component can derive the visible row range. Installed once per mount.
 const GRID_SCROLL_JS: &str = r#"
@@ -105,7 +105,7 @@ const GRID_SCROLL_JS: &str = r#"
 "#;
 
 /// Render data shared by many components, cloned by refcount rather than
-/// deep-copied into every one of them (FRE-130).
+/// deep-copied into every one of them.
 ///
 /// The grid hands the same per-table metadata to ~30 windowed rows (and the
 /// same row values to every cell of a row) on every render. As plain
@@ -171,8 +171,8 @@ struct ActiveEdit {
     row_key: String,
     column: String,
     /// Uncommitted editor text stashed when the open editor's row was
-    /// scrolled out of the virtual window while its input didn't parse
-    /// (FRE-74); the remounting editor seeds from it instead of the cell
+    /// scrolled out of the virtual window while its input didn't parse;
+    /// the remounting editor seeds from it instead of the cell
     /// value.
     draft: Option<String>,
 }
@@ -180,7 +180,7 @@ struct ActiveEdit {
 impl ActiveEdit {
     /// Whether this open editor is the one for `column` of `row_key`.
     ///
-    /// The row half matters for the detail panel (FRE-109): its editor is
+    /// The row half matters for the detail panel: its editor is
     /// owned above the row-keyed field list so a draft survives a row move,
     /// which means an editor left open on one row would otherwise reappear on
     /// a same-named field of the next one, seeded with the wrong row's text.
@@ -191,14 +191,14 @@ impl ActiveEdit {
 
 /// What the value-expand popup shows: a short value already in hand, or a
 /// truncated cell whose full value is loaded lazily via
-/// [`AppState::load_cell`] (FRE-33).
+/// [`AppState::load_cell`].
 #[derive(Debug, Clone, PartialEq)]
 enum ExpandView {
     /// A value already fully in the page — rendered directly, and safe to
     /// copy.
     ///
     /// Carries the [`Value`], not its display string: the popup renders it
-    /// through [`CellViewer`] (FRE-115), and "Copy raw" has to put the same
+    /// through [`CellViewer`], and "Copy raw" has to put the same
     /// text on the clipboard as a Ctrl+C over that cell —
     /// [`raw_cell_text`], i.e. the blob's hex and nothing at all for NULL.
     /// Holding only the display string copied the placeholder.
@@ -209,7 +209,7 @@ enum ExpandView {
     /// A truncated cell whose row can't be addressed (a view, a keyless
     /// table), so the full value can never be loaded. The popup shows the
     /// preview for reading but refuses to copy it — the same call
-    /// [`plan_copy`] makes for this cell (FRE-110). Copying here would put a
+    /// [`plan_copy`] makes for this cell. Copying here would put a
     /// prefix plus a literal `…` on the clipboard.
     Truncated { display: String, column: String },
     /// A truncated cell: fetch and show its full value.
@@ -217,7 +217,7 @@ enum ExpandView {
 }
 
 /// What Enter on a non-editable focused cell expands to: the value already in
-/// hand, or — for a truncated preview — a fetch of the full value (FRE-33),
+/// hand, or — for a truncated preview — a fetch of the full value,
 /// which needs the row to be addressable.
 fn expand_view(cell: &GridNavCell, locator: Option<RowLocator>) -> ExpandView {
     match (cell.truncated(), locator) {
@@ -240,13 +240,13 @@ fn expand_view(cell: &GridNavCell, locator: Option<RowLocator>) -> ExpandView {
 
 /// Paged grid for one table: sortable headers, per-column contains/equals
 /// filter, page navigation, row-count indicator, refresh — plus staged-edit
-/// rendering (FRE-14): dirty cells and deletes are tinted, pending inserts
+/// rendering: dirty cells and deletes are tinted, pending inserts
 /// show as phantom rows, and a Save/Discard bar appears while the table's
 /// stage is non-empty. Cells of editable rows open a type-aware in-place
-/// editor (FRE-24, see [`CellEditor`]) on double-click or Enter; commits
+/// editor (see [`CellEditor`]) on double-click or Enter; commits
 /// only ever stage (never write through).
 ///
-/// Row-level staging (FRE-25), all gated on the table being editable (a
+/// Row-level staging, all gated on the table being editable (a
 /// usable row identity exists):
 /// - "+ New row" under the grid appends a phantom [`InsertRow`] whose cells
 ///   all start as "database default" and open the same [`CellEditor`];
@@ -268,10 +268,10 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let mut page = use_signal(|| 0u64);
     // Which cell's editor is open (by row key + column).
     let mut editing = use_signal(|| Option::<ActiveEdit>::None);
-    // The row detail panel's open editor (FRE-109). Lives here, above the
+    // The row detail panel's open editor. Lives here, above the
     // panel, because `RowDetailFields` is keyed by row: anything held inside
     // it is destroyed by every row move, which silently discarded whatever
-    // the user had typed. Hoisting it is what lets the FRE-74 draft survive.
+    // the user had typed. Hoisting it is what lets a half-typed draft survive.
     let mut detail_editing = use_signal(|| Option::<ActiveEdit>::None);
     // One editor open anywhere, enforced in one place rather than at each of
     // the grid's six activation sites. Both editors render the same element
@@ -292,25 +292,25 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         }
     });
     // Keyboard focus ring in the grid (row, col into the visible page's
-    // rows × columns), and the value-expand popup (FRE-15).
+    // rows × columns), and the value-expand popup.
     let mut focused_cell = use_signal(|| Option::<(usize, usize)>::None);
-    // The other corner of a rectangular cell selection (FRE-110); the focus
+    // The other corner of a rectangular cell selection; the focus
     // ring is the near corner. `None` means the selection is exactly the
     // focused cell — the common case, and why this is a separate signal
     // rather than a rewrite of `focused_cell`: every existing focus behaviour
     // (clamping, scroll-into-view, Enter) keeps working untouched.
     let mut selection_anchor = use_signal(|| Option::<(usize, usize)>::None);
     // Outcome of the most recent copy, shown in the toolbar until the next
-    // copy or a page/selection reset. Also carries a refusal (FRE-110).
+    // copy or a page/selection reset. Also carries a refusal.
     let mut copy_status = use_signal(|| Option::<CopyStatus>::None);
     // Whether the copy-as menu is open.
     let mut copy_menu = use_signal(|| false);
-    // The value-expand popup (FRE-15): either an already-known short value
+    // The value-expand popup: either an already-known short value
     // rendered inline, or a truncated cell whose full value is fetched on
-    // demand (FRE-33).
+    // demand.
     let mut expanded = use_signal(|| Option::<ExpandView>::None);
     let mut sort = use_signal(|| Option::<(String, SortDir)>::None);
-    // Windowed rendering (FRE-32): the grid's live scroll offset and viewport
+    // Windowed rendering: the grid's live scroll offset and viewport
     // height, fed by a scroll/resize listener installed on `#dv-grid`. The
     // visible row range is derived from these; only rows in that range (plus
     // overscan) are put in the DOM. `viewport_h` seeds non-zero so the first
@@ -349,8 +349,8 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let filter_column = use_signal(String::new);
     let filter_op = use_signal(|| FilterOp::Contains);
     let filter_text = use_signal(String::new);
-    // Seed the filter from a pending foreign-key focus targeting this table
-    // (FRE-29), so a jump paints the referenced row with no unfiltered flash.
+    // Seed the filter from a pending foreign-key focus targeting this table,
+    // so a jump paints the referenced row with no unfiltered flash.
     // The consuming effect below clears the focus (and handles a same-table
     // jump, where the grid stays mounted and only the filter changes).
     let seed_table = table.clone();
@@ -386,8 +386,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // a save bumping another table's nonce, or `close_connection` pruning a
     // closed tab's entries. The memo re-runs on those writes too, but its
     // PartialEq gate stops the propagation there: the reset effect and the
-    // resources below only re-run when THIS grid's nonce actually changed
-    // (FRE-129).
+    // resources below only re-run when THIS grid's nonce actually changed.
     let nonce_table_key = table.key();
     let refresh_nonce = use_memo(move || {
         state
@@ -412,13 +411,13 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         // Re-seed the focus ring at the first cell and drop any expand popup;
         // the clamp effect below trims it to None for an empty page.
         focused_cell.set(Some((0, 0)));
-        // …and collapse the cell selection to it (FRE-110): the rows under a
+        // …and collapse the cell selection to it: the rows under a
         // rectangle spanning the old page are not the rows the user picked.
         selection_anchor.set(None);
         copy_status.set(None);
         copy_menu.set(false);
         expanded.set(None);
-        // Reset the windowed scroll position too (FRE-32) so a new page/sort/
+        // Reset the windowed scroll position too so a new page/sort/
         // filter starts at the top, both the tracked offset and the container.
         scroll_top.set(0.0);
         document::eval(
@@ -439,13 +438,13 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // The bounded fetch also needs the table's columns (to preview large
     // ones) and the columns that must NOT be previewed: identity keys and
     // foreign-key columns, whose truncation would misaddress rows or
-    // misdirect a jump (FRE-33).
+    // misdirect a jump.
     //
     // Derived through a memo because `registry` and `schemas` are whole-map
     // signals: a raw read in the resource would re-issue this grid's SQL
     // fetch on any other connection's open/close or schema load. The memo's
     // PartialEq gate lets the fetch re-run only when this table's own inputs
-    // change (FRE-129).
+    // change.
     let meta_table = table.clone();
     let fetch_meta = use_memo(move || {
         let registry = state.registry.read();
@@ -474,7 +473,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         }
     });
 
-    // Whether this object has any rows to list at all (FRE-148), so that a
+    // Whether this object has any rows to list at all, so that a
     // declared-unbrowsable object never reaches the server: the query it would
     // otherwise run is one the engine answers with an error about an object
     // that stores nothing. A RisingWave sink is the case — it writes outward
@@ -483,7 +482,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // Resolved through a memo for the reason `fetch_meta` above is: `registry`
     // and `schemas` are whole-map signals, so a raw read would make every
     // other connection's open, close or protection change re-run this grid's
-    // page fetch and its `COUNT(*)` (FRE-129). `Option<Option<_>>` because
+    // page fetch and its `COUNT(*)`. `Option<Option<_>>` because
     // "unknown" and "browsable" are different answers — a reload sets
     // `SchemaLoad::Loading`, which empties the table list, so the outer `None`
     // is the ordinary state during a sidebar Refresh rather than an edge case.
@@ -562,7 +561,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     });
 
     // Row count, fetched separately from the page so it is NOT re-run on every
-    // page flip or sort change (FRE-40): `COUNT(*)` depends only on the table
+    // page flip or sort change: `COUNT(*)` depends only on the table
     // and filter. It re-runs when the filter changes or a write bumps
     // `grid_refresh`; between those, Dioxus keeps the resolved value, so
     // flipping pages reuses the cached count with no extra query.
@@ -600,7 +599,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // Clamp the page if the row count shrank below the current offset — e.g. a
     // delete or an external write (via Refresh) leaves the table with fewer
     // pages than the one being viewed. Without this the footer reads
-    // "rows 301–300 of 250" and the page sits empty (FRE-42). Only acts on a
+    // "rows 301–300 of 250" and the page sits empty. Only acts on a
     // resolved count; setting the page re-runs this once with a now-valid page,
     // so it settles without looping. (Reactive; verified live, not by unit test.)
     use_effect(move || {
@@ -617,15 +616,16 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         }
     });
 
-    // The introspected metadata every row of this table renders against
-    // (FRE-130), built once here and handed to the row components as a single
+    // The introspected metadata every row of this table renders against,
+    // built once here and handed to the row components as a single
     // pointer-compared prop instead of a `HashMap`/`Vec` deep-cloned into each
     // of the ~30 windowed rows on every render.
     //
     // A memo because `schemas` and `registry` are whole-map signals: a raw
     // read would rebuild — and re-render every row — on any other connection's
     // schema load. The memo re-runs then too, but its PartialEq gate stops the
-    // propagation there (FRE-129's pattern).
+    // propagation there (the same gate that keeps another tab's writes from
+    // resetting this grid).
     let render_table = table.clone();
     let render_meta = use_memo(move || {
         let schemas = state.schemas.read();
@@ -636,7 +636,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         ))
     });
 
-    // The fetched page reduced to what the grid renders (FRE-130): headers,
+    // The fetched page reduced to what the grid renders: headers,
     // the rows with the stage applied, and the rows "select all on this page"
     // ticks.
     //
@@ -662,7 +662,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         };
         let result = &page.result;
         // Same resolution the render uses, so keyboard navigation offers
-        // exactly the editors the grid shows — the user's marking (FRE-111)
+        // exactly the editors the grid shows — the user's marking
         // included. Resolving the *backend's* answer here instead would let
         // Enter open an editor on a cell the mouse correctly refuses.
         let access = find_table_meta(state.schemas.read().get(&id), &page_table)
@@ -698,7 +698,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         }
     });
 
-    // Keyboard-navigation model of the visible page (FRE-15): read by the grid
+    // Keyboard-navigation model of the visible page: read by the grid
     // container's key handler for focus movement and Enter. Built from the
     // same `page_view` the render consumes — one row derivation, two readers —
     // but owning its data so the `'static` key closure can read it off-render.
@@ -711,7 +711,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // Keep the focus ring inside the current page and seed it once data
     // arrives, so it is visible and never indexes out of range after a page or
     // filter change shrinks the grid.
-    // The selection's far corner is clamped alongside the focus (FRE-110): a
+    // The selection's far corner is clamped alongside the focus: a
     // rectangle reaching past a page that just shrank would address rows the
     // grid no longer has.
     use_effect(move || {
@@ -748,7 +748,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         }
     });
 
-    // The live cell selection (FRE-110): the focus ring's cell plus the
+    // The live cell selection: the focus ring's cell plus the
     // anchor, when one is pinned. `None` only for a page with nothing to
     // select. Derived rather than stored so the two corners can never drift
     // apart from the focus the rest of the grid navigates by.
@@ -758,9 +758,9 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         Some(Selection { anchor, focus })
     });
 
-    // Scroll the focused cell into view as it moves (FRE-15 + FRE-32). With
-    // windowed rows an offscreen focused row may not be in the DOM yet, so we
-    // can't rely on its node: instead scroll the container to the focused
+    // Scroll the focused cell into view as it moves. With windowed rows an
+    // offscreen focused row may not be in the DOM yet, so we can't rely on
+    // its node: instead scroll the container to the focused
     // row's computed offset (rows are `ROW_HEIGHT` tall), which also updates
     // the visible range so the row renders. A second frame then nudges the
     // now-rendered cell into view horizontally (column offsets aren't fixed).
@@ -789,7 +789,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
 
     // Install a scroll/resize listener on the grid container once per mount and
     // pump the offset/height it reports into `scroll_top`/`viewport_h`, which
-    // drive the visible-row range (FRE-32). rAF-coalesced so a scroll burst
+    // drive the visible-row range. rAF-coalesced so a scroll burst
     // yields at most one update per frame. The channel stays open for the
     // component's life; it reads no signals, so it installs exactly once.
     use_effect(move || {
@@ -807,7 +807,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         });
     });
 
-    // The rows to actually put in the DOM (FRE-32): a contiguous window around
+    // The rows to actually put in the DOM: a contiguous window around
     // the viewport. Arrow-keying to an offscreen row is handled by the
     // focus-scroll effect below, which scrolls that row into view (updating
     // `scroll_top`, so this window then includes it) rather than widening the
@@ -824,7 +824,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // mouse click. Only fires on an editing → None transition, so it never
     // steals focus from the filter box or sidebar while the grid is idle.
     //
-    // Both editors count (FRE-109): watching only the grid's left the arrow
+    // Both editors count: watching only the grid's left the arrow
     // keys dead after a commit in the panel, because focus stayed on the
     // closed panel editor's input and nothing handed it back.
     use_effect(move || {
@@ -833,11 +833,11 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         }
     });
 
-    // The row detail panel's model (FRE-109). The panel's row is derived from
+    // The row detail panel's model. The panel's row is derived from
     // the selection's focus, never stored: it cannot drift from the cell the
     // grid has focused.
     //
-    // Memoized (FRE-130): it clones the focused row's every value, and the
+    // Memoized: it clones the focused row's every value, and the
     // render body below re-runs on every copy, tick and selection change.
     // Reading `focused_cell` here is
     // deliberate — the panel follows the grid's focus — but the memo's
@@ -854,16 +854,16 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
 
     // Introspected metadata for this table (see [`TableRenderMeta`]): column
     // names feed the filter dropdown and the header fallback (so headers exist
-    // even for zero-row results), foreign keys drive the clickable FK cells
-    // (FRE-29), and the editor kinds decide what each cell may open.
+    // even for zero-row results), foreign keys drive the clickable FK cells,
+    // and the editor kinds decide what each cell may open.
     let meta = render_meta();
     // Row-identity detection decides the read-only notice and how staged rows
     // are addressed.
     let table_meta: Option<TableMeta> = state.table_meta(id, &table);
 
     let dialect: Option<Dialect> = state.registry.read().get(id).map(|c| c.pool.dialect());
-    // The connection's capabilities resolved for this table (FRE-87, narrowed
-    // by the user's marking from FRE-111): one answer for whether editing is
+    // The connection's capabilities resolved for this table, narrowed by the
+    // connection's write protection: one answer for whether editing is
     // possible, how rows are addressed, and — when it isn't possible — which
     // sentence explains it. Every editing affordance below gates on this
     // rather than re-deriving the rules.
@@ -875,17 +875,17 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // missing.
     let read_only_notice: Option<&'static str> =
         access.as_ref().and_then(TableAccess::read_only_notice);
-    // Whether this object has rows to list at all (FRE-148). Absent access
+    // Whether this object has rows to list at all. Absent access
     // means the schema has not loaded yet, which is not a refusal.
     let can_read = access.as_ref().is_none_or(TableAccess::can_read);
-    // Why importing a file into this object is refused, when it is (FRE-112).
+    // Why importing a file into this object is refused, when it is.
     // Resolved from the same `access` as every other write affordance, so an
     // import is offered exactly where editing is.
     let import_refused: Option<String> =
         access.as_ref().and_then(import_refusal).map(str::to_string);
     // The file the user picked, if the import dialog is open over this grid.
     let import_file = use_signal(|| Option::<std::path::PathBuf>::None);
-    // The connection's name when it is marked confirm-writes (FRE-111), so
+    // The connection's name when it is marked confirm-writes, so
     // the dialog can name it in the confirmation an import has to pass.
     let confirm_connection: Option<String> = state
         .registry
@@ -917,7 +917,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let sort_value = sort();
     let row_table = table.clone();
     let detail_table = table.clone();
-    // The row detail panel (FRE-109). Open/closed and width live on the tab,
+    // The row detail panel. Open/closed and width live on the tab,
     // not here, so they survive a table switch (which remounts this grid) —
     // and the open flag rides the persisted session.
     let detail_open = state.row_detail_open(id);
@@ -938,8 +938,8 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             copy_status.set(None);
         }
     };
-    // Everything a clipboard copy needs besides the selection itself
-    // (FRE-110). Cloned per event handler; all of it is cheap.
+    // Everything a clipboard copy needs besides the selection itself.
+    // Cloned per event handler; all of it is cheap.
     let copy_ctx = CopyContext {
         state,
         id,
@@ -949,7 +949,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     };
 
     // Moves the focus ring to a clicked cell, extending the selection instead
-    // of collapsing it when Shift is held (FRE-110). A run of shift-clicks all
+    // of collapsing it when Shift is held. A run of shift-clicks all
     // extend from the same corner, because the anchor never moves.
     let on_select_cell = move |(row, col, shift): (usize, usize, bool)| {
         let focus = focused_cell.peek().unwrap_or((row, col));
@@ -967,11 +967,11 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         copy_status.set(None);
     };
 
-    // Grid keyboard navigation (FRE-15). Attached to the focusable scroll
+    // Grid keyboard navigation. Attached to the focusable scroll
     // container, so it also receives keydowns bubbling from focused children;
     // it no-ops while an editor is open (whose own keys bubble here). Movement
     // and Enter act on `grid_nav`/`focused_cell`; PageUp/PageDown flip pages.
-    // Selection and copy (FRE-110) ride on the same model: Shift extends
+    // Selection and copy ride on the same model: Shift extends
     // instead of collapsing, Ctrl+A / Shift+Space / Ctrl+Space select the
     // page / row / column, and Ctrl+C copies.
     let key_copy_ctx = copy_ctx.clone();
@@ -1005,7 +1005,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             anchor: selection_anchor.peek().unwrap_or(pos),
             focus: pos,
         };
-        // Copy (FRE-110): the plain shortcut, so `None` — a single cell
+        // Copy: the plain shortcut, so `None` — a single cell
         // copies its raw value, a block copies TSV.
         if ctrl && code == Code::KeyC {
             evt.prevent_default();
@@ -1034,8 +1034,8 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             let (r, c) = (pos.0.min(rows - 1), pos.1.min(cols - 1));
             if let Some(cell) = nav.rows.get(r).and_then(|row| row.cells.get(c)) {
                 // Editable cell → open the in-place editor; otherwise expand
-                // the value. A truncated cell fetches its full value on demand
-                // (FRE-33); a complete one shows the in-hand text.
+                // the value. A truncated cell fetches its full value on demand;
+                // a complete one shows the in-hand text.
                 match (cell.editable, nav.rows[r].key.clone()) {
                     (true, Some(key)) => editing.set(Some(ActiveEdit {
                         row_key: key,
@@ -1087,7 +1087,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
 
     rsx! {
         div { class: "flex h-full min-h-0 flex-col",
-            // Filter bar (FRE-141: its own component so a copy or export
+            // Filter bar (its own component so a copy or export
             // finishing repaints the bar, not the grid body).
             GridToolbar {
                 id,
@@ -1128,23 +1128,23 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             // object with no rows at all: its restriction explains both why it
             // cannot be edited and why it cannot be opened, and the grid below
             // is already showing that same sentence — twice on one screen
-            // reads as two problems (FRE-148).
+            // reads as two problems.
             if let Some(notice) = read_only_notice.filter(|_| can_read) {
                 div { class: "px-3 pt-2",
                     Banner { kind: BannerKind::Info, message: notice.to_string() }
                 }
             }
-            // The rows and, docked to their right, the row detail panel
-            // (FRE-109). The toolbar and footer above and below span both:
+            // The rows and, docked to their right, the row detail panel.
+            // The toolbar and footer above and below span both:
             // they describe the table, while the panel describes one row.
             div { class: "flex min-h-0 flex-1",
                 // Grid — a single focusable region (tabindex 0) so arrow-key cell
-                // navigation works without per-cell tab stops (FRE-15). Focused on
+                // navigation works without per-cell tab stops. Focused on
                 // mount so the ring responds immediately; `outline-none` since the
                 // ring itself signals focus.
                 div {
                     id: "dv-grid",
-                    // `select-none` (FRE-110): shift-click extends the *cell*
+                    // `select-none`: shift-click extends the *cell*
                     // selection, and without this the webview drags its own text
                     // highlight across the rows at the same time, striping the
                     // grid. The expand popup renders outside this container, so
@@ -1156,7 +1156,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                         None => rsx! {
                             DelayedLoading { label: "Loading…" }
                         },
-                        // An object the backend declares has no rows (FRE-148)
+                        // An object the backend declares has no rows
                         // is not a failure to report in red: nothing went
                         // wrong, and there is simply nothing to list. A
                         // RisingWave sink is the case — it writes outward to
@@ -1195,7 +1195,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                         },
                         Some(Ok(_)) => {
                             // Rows, headers and the selectable set all come from
-                            // the `page_view` memo (FRE-130) — this arm no longer
+                            // the `page_view` memo — this arm no longer
                             // re-derives them from the resource, so a focus move
                             // or a copy costs nothing here.
                             let view = page_view.read();
@@ -1215,7 +1215,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                 view.rows.is_empty() && pending_inserts.is_empty(),
                                 applied_filter.read().is_some(),
                             );
-                            // Windowed rendering (FRE-32): only rows in the visible
+                            // Windowed rendering: only rows in the visible
                             // range go in the DOM; a top and bottom spacer row of
                             // the elided rows' total height keeps the scrollbar and
                             // offsets correct. `total_cols` sizes the spacers'
@@ -1227,7 +1227,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                             let top_spacer = win_start as f64 * ROW_HEIGHT;
                             let bottom_spacer = (total_rows - win_end) as f64 * ROW_HEIGHT;
                             // Only the window's rows are cloned out of the memo;
-                            // the rest of the page stays in it (FRE-130).
+                            // the rest of the page stays in it.
                             let windowed_rows = window_rows(&view.rows, win_start, win_end);
                             drop(view);
                             rsx! {
@@ -1297,7 +1297,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                                             sort.set(next);
                                                             page.set(0);
                                                         },
-                                                        // Shift-click selects the whole column (FRE-110);
+                                                        // Shift-click selects the whole column;
                                                         // a plain click keeps sorting.
                                                         on_select_column: move |_| {
                                                             let rows = grid_nav.peek().rows.len();
@@ -1313,7 +1313,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                         }
                                         tbody {
                                             // Top spacer: the height of the rows
-                                            // elided above the window (FRE-32).
+                                            // elided above the window.
                                             if top_spacer > 0.0 {
                                                 tr {
                                                     td {
@@ -1331,16 +1331,15 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                                     meta: meta.clone(),
                                                     dialect: dialect.unwrap_or(Dialect::Sqlite),
                                                     editing,
-                                                    // The focused column in this row (FRE-15), else None; only the
+                                                    // The focused column in this row, else None; only the
                                                     // two rows whose focus changed re-render on a move.
                                                     focused_col: match focused_cell() {
                                                         Some((r, c)) if r == index => Some(c),
                                                         _ => None,
                                                     },
                                                     row_index: index,
-                                                    // The inclusive span of selected columns in this row
-                                                    // (FRE-110), or None when the row is outside the
-                                                    // rectangle — so only rows whose span changed re-render.
+                                                    // The inclusive span of selected columns in this row, or None
+                                                    // outside the rectangle — so only rows whose span changed re-render.
                                                     selected_cols: selection().and_then(|sel| sel.columns_in(index)),
                                                     on_select_cell,
                                                     select_enabled,
@@ -1354,7 +1353,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                                 }
                                             }
                                             // Bottom spacer: the height of the rows
-                                            // elided below the window (FRE-32).
+                                            // elided below the window.
                                             if bottom_spacer > 0.0 {
                                                 tr {
                                                     td {
@@ -1420,9 +1419,9 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             }
             // Footer: paging + counts
             GridFooter { rows_resource, count_resource, page, selection, grid_nav, copy_status }
-            // Value-expand popup (FRE-15): Enter on a read-only / non-editable
+            // Value-expand popup: Enter on a read-only / non-editable
             // focused cell shows its full value — fetched on demand for a
-            // truncated cell (FRE-33). Dismissed by a backdrop click, the ✕,
+            // truncated cell. Dismissed by a backdrop click, the ✕,
             // or Escape (handled by the grid container).
             if let Some(view) = expanded.read().clone() {
                 div {
@@ -1445,7 +1444,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                         match view {
                             // A short value already in hand is always the full
                             // value, so the rich viewers may decode it: JSON
-                            // as a tree, an image as a picture (FRE-77/FRE-115).
+                            // as a tree, an image as a picture.
                             ExpandView::Text { value, column } => {
                                 let type_name = meta.type_of(&column);
                                 rsx! {
@@ -1454,8 +1453,8 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                 }
                             },
                             // Preview of an unloadable value: readable, but no
-                            // Copy raw — it would put a prefix on the clipboard
-                            // (FRE-110). Not pretty-printed either; the text is
+                            // Copy raw — it would put a prefix on the clipboard.
+                            // Not pretty-printed either; the text is
                             // cut mid-document.
                             ExpandView::Truncated { display, column } => rsx! {
                                 Banner {
@@ -1476,7 +1475,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     }
                 }
             }
-            // The import dialog (FRE-112), open once a file has been picked.
+            // The import dialog, open once a file has been picked.
             // Mounted here rather than in the toolbar because it needs the
             // table's columns, which this scope already has.
             if let (Some(path), Some(meta)) = (import_file(), table_meta.clone()) {
@@ -1540,8 +1539,8 @@ fn import_skipped(status: &ImportStatus) -> Option<String> {
 /// The grid's toolbar: FK Back, the column/op/value filter, the copy-as menu,
 /// the export buttons, the row-detail toggle and Refresh.
 ///
-/// Its own component so a copy or export finishing repaints this bar alone
-/// (FRE-141). `copy_status`, the export status and the selection's shape are
+/// Its own component so a copy or export finishing repaints this bar alone.
+/// `copy_status`, the export status and the selection's shape are
 /// read *here* rather than in [`DataGrid`] — read up there, every copy would
 /// re-render the whole grid body.
 #[component]
@@ -1551,7 +1550,7 @@ fn GridToolbar(
     /// `None` until the connection reports one; gates the INSERT copy format
     /// and the export buttons, which both need to know the dialect.
     dialect: Option<Dialect>,
-    /// Whether this object has rows to read (FRE-148). False hides the export
+    /// Whether this object has rows to read. False hides the export
     /// affordances: an export is the same query the grid is refusing, so
     /// offering it would hand back the failure the gate just prevented.
     can_read: bool,
@@ -1559,7 +1558,7 @@ fn GridToolbar(
     /// loaded, since the dialog maps fields onto the table's columns and has
     /// none to show without it.
     can_import: bool,
-    /// Why an import is refused, when it is (FRE-112) — the same sentence the
+    /// Why an import is refused, when it is — the same sentence the
     /// disabled Save button shows. `Some` leaves the button visible but
     /// disabled and explained, rather than silently absent.
     import_refused: Option<String>,
@@ -1593,8 +1592,8 @@ fn GridToolbar(
     let import_status: Option<ImportStatus> = state.import_status.read().get(&id).cloned();
     let export_table = table.clone();
     let refresh_table = table.clone();
-    // Everything a clipboard copy needs besides the selection itself
-    // (FRE-110). Cloned per event handler; all of it is cheap.
+    // Everything a clipboard copy needs besides the selection itself.
+    // Cloned per event handler; all of it is cheap.
     let copy_ctx = CopyContext {
         state,
         id,
@@ -1640,7 +1639,7 @@ fn GridToolbar(
             }
         }
         div { class: "flex items-center gap-2 px-3 py-2 text-sm",
-            // Back: return to the view a foreign-key jump came from (FRE-29).
+            // Back: return to the view a foreign-key jump came from.
             if can_back {
                 button {
                     class: "rounded px-2 py-1 text-xs text-cyan-700 dark:text-cyan-300 hover:bg-cyan-100 dark:hover:bg-cyan-950/40",
@@ -1670,7 +1669,7 @@ fn GridToolbar(
                 option { value: "equals", "equals" }
             }
             input {
-                // `dv-filter` is the target of the `/` focus shortcut (FRE-15).
+                // `dv-filter` is the target of the `/` focus shortcut.
                 id: "dv-filter",
                 class: "w-48 rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 font-mono text-xs text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600",
                 placeholder: "filter value",
@@ -1688,7 +1687,7 @@ fn GridToolbar(
                 "Apply"
             }
             // An FK jump installs an equality filter the single-column
-            // inputs can't show; a chip spells out what's pinned (FRE-29).
+            // inputs can't show; a chip spells out what's pinned.
             if let Some(description) = equality_filter_label(applied_filter.read().as_ref()) {
                 span {
                     class: "rounded bg-cyan-100 dark:bg-cyan-950/50 px-2 py-1 font-mono text-xs text-cyan-700 dark:text-cyan-300",
@@ -1717,7 +1716,7 @@ fn GridToolbar(
                     rsx! { span { class: "truncate text-xs {class}", title: "{text}", "{text}" } }
                 }
             }
-            // Copy-as menu (FRE-110). Copies the selected cells only —
+            // Copy-as menu. Copies the selected cells only —
             // the Export buttons beside it cover the whole view.
             if let Some((sel_rows, sel_cols, sel_cells)) = selection_summary {
                 div { class: "relative shrink-0",
@@ -1796,7 +1795,7 @@ fn GridToolbar(
                     "Import…"
                 }
             }
-            // Row detail (FRE-109): the same toggle as Ctrl+D, here so the
+            // Row detail: the same toggle as Ctrl+D, here so the
             // panel is discoverable without knowing the shortcut.
             button {
                 class: if detail_open {
@@ -1822,7 +1821,7 @@ fn GridToolbar(
 }
 
 /// The grid's footer: which rows this page covers, of how many, the aggregate
-/// readout for the cell selection (FRE-117), and the page stepper.
+/// readout for the cell selection, and the page stepper.
 ///
 /// Reads the two resources itself rather than taking their values: the row
 /// range and the Next button's bound are derived from both at once, and the
@@ -1846,7 +1845,7 @@ fn GridFooter(
 ) -> Element {
     let current = rows_resource.read();
     // Cells already in memory only: `SelectionStats::compute` is a pure
-    // function of the page snapshot and the selection rectangle (FRE-117).
+    // function of the page snapshot and the selection rectangle.
     let selection_stats = use_memo(move || {
         let selection = selection()?;
         SelectionStats::for_readout(&grid_nav.read(), selection)
@@ -1856,7 +1855,7 @@ fn GridFooter(
             match current.as_ref() {
                 Some(Ok((page_data, _))) => {
                     let result = &page_data.result;
-                    // The count comes from its own resource (FRE-40); it
+                    // The count comes from its own resource; it
                     // stays resolved across page flips, so flipping reuses
                     // it. While it is *re-running* (a filter change or a
                     // write bump — `use_resource` keeps the old value but
@@ -1889,7 +1888,7 @@ fn GridFooter(
                                 Some(total) => rsx! { span { class: "shrink-0 whitespace-nowrap", "rows {first}–{last} of {total}" } },
                                 None => rsx! { span { class: "shrink-0 whitespace-nowrap", "rows {first}–{last} of …" } },
                             }
-                            // Aggregate readout for the selected cells (FRE-117).
+                            // Aggregate readout for the selected cells.
                             // It sits beside the row range deliberately: the range
                             // says what the *page* holds, this says what the
                             // *selection* holds, and the two must never be
@@ -1980,7 +1979,7 @@ fn GridFooter(
 }
 
 /// The bars between the toolbar and the rows: pending changes with
-/// Save/Discard, the write-protection confirmation (FRE-111), and the
+/// Save/Discard, the write-protection confirmation, and the
 /// selection's Delete bar.
 ///
 /// Its own component so the three signals only this chrome reads — the
@@ -2010,9 +2009,9 @@ fn GridBars(
     let state = use_context::<AppState>();
     // Read here, not in `DataGrid`: these three are what this chrome is for.
     //
-    // A save parked on the FRE-111 confirmation, and the connection name it
-    // has to state. Named rather than just "Are you sure?" — the state exists
-    // to make you read which database you are about to change.
+    // A save parked on the write-protection confirmation, and the connection
+    // name it has to state. Named rather than just "Are you sure?" — the state
+    // exists to make you read which database you are about to change.
     let awaiting_confirm = state.save_awaiting_confirmation(id, &table.key());
     let connection_name: String = state
         .registry
@@ -2097,7 +2096,7 @@ fn GridBars(
                 }
             }
         }
-        // Write-protection confirmation (FRE-111): the connection is
+        // Write-protection confirmation: the connection is
         // marked Confirm, so the apply waits here until the user has read
         // which database it targets. The changes stay staged meanwhile —
         // dismissing costs nothing.
@@ -2180,7 +2179,7 @@ fn empty_state(no_visible_rows: bool, has_filter: bool) -> Option<GridEmpty> {
 
 /// Save is blocked while a save is in flight, while any pending insert still
 /// lacks a required column, or when the table's resolved capabilities forbid
-/// writing (FRE-87). The last case shouldn't arise — changes can only be
+/// writing. The last case shouldn't arise — changes can only be
 /// staged where cells are editable — but a Save button that can only fail is
 /// worse than a disabled one carrying the reason.
 fn save_disabled(saving: bool, missing_required: usize, can_mutate: bool) -> bool {
@@ -2385,7 +2384,7 @@ mod fixtures {
     }
 
     /// A one-row page whose `body` cell is a truncated preview of `full_len`
-    /// (FRE-110 copy planning); `identity` decides whether its row can be
+    /// (for copy planning); `identity` decides whether its row can be
     /// addressed to load the full value.
     pub(super) fn previewed_nav(full_len: u64, identity: Option<&RowIdentity>) -> GridNav {
         let result = QueryResult {
@@ -2525,7 +2524,7 @@ mod tests {
         };
         assert_eq!(raw_cell_text(&value), "\\xdead");
         // The column travels with the value so the popup can classify it on
-        // the declared type, like the detail panel (FRE-115).
+        // the declared type, like the detail panel.
         assert_eq!(column, "cover");
         // Same for NULL: the popup reads "NULL", a copy yields nothing —
         // exactly as `plan_copy` + `raw_cell_text` do for the same cell.

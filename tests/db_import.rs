@@ -1,4 +1,4 @@
-//! End-to-end tests for CSV/JSON import (FRE-112): `run_import` streams a
+//! End-to-end tests for CSV/JSON import: `run_import` streams a
 //! file into an existing table inside ONE transaction, aborting and rolling
 //! everything back on the first row it cannot coerce — unless skip mode was
 //! chosen up front, in which case the bad rows are reported by line and the

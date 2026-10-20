@@ -22,7 +22,7 @@ use super::value::QueryResult;
 /// that understands quote/comment/bracket/dollar-quote state — the statement
 /// splitter, the string/comment stripper, and the first-keyword scanner are
 /// all thin consumers of it, so a lexing edge case fixed here is fixed in
-/// all three at once (FRE-136).
+/// all three at once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegionKind {
     /// Plain SQL: keywords, identifiers, operators, whitespace.
@@ -375,7 +375,7 @@ pub struct StatementNeeds {
 /// dispatch, but nothing here knows they are *only* writes.
 pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
     // Stripped once here; every scan below works on the stripped form.
-    // Before FRE-136 each helper re-stripped the same statement, up to ~6
+    // Each helper used to re-strip the same statement, up to ~6
     // times per capability check.
     let stripped = strip_strings_and_comments(sql, dialect);
     if !confirmation_needed(sql, &stripped) {
@@ -431,7 +431,7 @@ pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
 ///   write form appears, so `EXPLAIN CALL do_the_thing()` — a statement whose
 ///   effect nothing here can name, and which `CALL do_the_thing()` alone is
 ///   charged both capabilities for — read as a plain query the moment three
-///   characters were typed in front of it. The plan view (FRE-119) builds
+///   characters were typed in front of it. The plan view builds
 ///   exactly such a prefix, so this is what stops it laundering a statement's
 ///   classification; `explaining_never_loosens_the_gate` pins that as a
 ///   property rather than a promise.
@@ -555,7 +555,7 @@ fn explain_body(stripped: &str) -> &str {
     &stripped[i..]
 }
 
-/// Whether `sql` is written as an `EXPLAIN`. The plan view (FRE-119) asks so
+/// Whether `sql` is written as an `EXPLAIN`. The plan view asks so
 /// it can leave such a statement alone instead of prefixing a second
 /// `EXPLAIN` onto it.
 pub fn is_explain(sql: &str) -> bool {
@@ -675,13 +675,13 @@ pub struct StatementResult {
     pub preview: String,
     pub outcome: StatementOutcome,
     /// True when a read hit the [`MAX_QUERY_ROWS`] fetch cap and its result
-    /// holds only the first N rows (FRE-33) — the editor shows a "showing
+    /// holds only the first N rows — the editor shows a "showing
     /// first N" indicator. Always false for writes.
     pub truncated: bool,
 }
 
 /// What a failed script's rollback actually undid — the state the editor
-/// reports so the user knows what is in the database (FRE-146).
+/// reports so the user knows what is in the database.
 ///
 /// Three states rather than a bool because there are three, and the one a
 /// bool used to hide is the one that misleads: a rollback that covered the
@@ -727,15 +727,15 @@ pub struct ScriptError {
 /// non-transactional statement, or a connection without the `transactions`
 /// capability) — then they run sequentially in autocommit, as before.
 ///
-/// Every statement is checked against `caps` *before* any of them runs
-/// (FRE-87), so a script that the UI should have gated fails with a clear
+/// Every statement is checked against `caps` *before* any of them runs,
+/// so a script that the UI should have gated fails with a clear
 /// [`DbError::Unsupported`] and an untouched database, rather than part-way
 /// through. The UI disables the run affordance for these cases; this is the
 /// backstop for reaching the path anyway.
 ///
 /// `caps` is passed in rather than read from `pool` because the connection's
 /// *effective* capabilities are the backend's narrowed by the user's write
-/// protection (FRE-111) — see
+/// protection — see
 /// [`Connection::capabilities`](super::registry::Connection::capabilities).
 /// Taking it as an argument means a caller cannot accidentally consult the
 /// engine's own answer and skip the marking.
@@ -755,7 +755,7 @@ pub async fn run_script(
     }
 }
 
-/// What a rollback covered, given the statements that actually *ran* (FRE-146).
+/// What a rollback covered, given the statements that actually *ran*.
 ///
 /// [`Rollback::ExceptSchemaChanges`] needs both halves: an engine whose
 /// rollback lets DDL escape, *and* a schema change among the statements that
@@ -872,8 +872,8 @@ async fn run_script_sequential(
 /// The atomic path: all statements run in one transaction, committed only if
 /// every statement succeeds. Any failure (including a failed commit) rolls the
 /// script back, and reports what that rollback covered via [`rollback_cover`]
-/// — [`Rollback::Full`] unless the engine lets schema changes escape it
-/// (FRE-146). Resolved per failure rather than once up front, since it depends
+/// — [`Rollback::Full`] unless the engine lets schema changes escape it.
+/// Resolved per failure rather than once up front, since it depends
 /// on which statements actually ran.
 async fn run_script_atomic(
     pool: &DbPool,
@@ -953,7 +953,7 @@ pub fn wrap_atomically(caps: Capabilities, dialect: Dialect, statements: &[Strin
         && statements.len() > 1
         && !statements.iter().any(|s| {
             // Stripped once per statement: both checks only need the
-            // stripped form (FRE-136).
+            // stripped form.
             let stripped = strip_strings_and_comments(s, dialect);
             manages_own_transaction(&stripped) || is_non_transactional(dialect, &stripped)
         })
@@ -1551,7 +1551,7 @@ mod tests {
     ];
 
     /// **The plan view cannot run a write the Run button would have prompted
-    /// for** (FRE-119), as a property rather than a list of cases.
+    /// for**, as a property rather than a list of cases.
     ///
     /// The Explain action's whole rewrite is prefixing `EXPLAIN …`
     /// ([`explain_statement`](super::super::plan::explain_statement)), and it
@@ -1917,7 +1917,7 @@ mod tests {
     fn bracketed_identifiers_are_lexed_for_confirmation_on_sqlserver() {
         // A quote inside a bracketed identifier must not invert string
         // tracking: the INTO after it is real, and skipping the prompt here
-        // was the fail-unsafe bug this covers (FRE-61).
+        // was the fail-unsafe bug this covers.
         assert!(needs_confirmation(
             "SELECT [o'brien] * INTO t2 FROM t",
             Dialect::SqlServer

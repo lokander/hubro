@@ -155,7 +155,7 @@ async fn entries_survive_reopening_the_store() {
     assert_eq!(entries[0].sql, "SELECT 42");
 }
 
-// --- Saved queries (FRE-113) -------------------------------------------
+// --- Saved queries -------------------------------------------
 
 use hubro::history::SaveOutcome;
 
@@ -400,11 +400,11 @@ async fn history_pruning_never_reaches_saved_queries() {
 
 #[tokio::test]
 async fn opening_a_pre_saved_query_database_upgrades_it_in_place() {
-    // A history.db written before FRE-113: `entries`, its index and `meta`,
-    // with real content. Opening it must add the saved-query table without
-    // disturbing what is already there — the upgrade path every existing
-    // install takes, and one no other test reaches, since every other test
-    // starts from a file this build created.
+    // A history.db written before saved queries existed: `entries`, its index
+    // and `meta`, with real content. Opening it must add the saved-query table
+    // without disturbing what is already there — the upgrade path every
+    // existing install takes, and one no other test reaches, since every other
+    // test starts from a file this build created.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("history.db");
     {

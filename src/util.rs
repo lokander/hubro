@@ -24,8 +24,7 @@ pub fn human_bytes(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
-/// Formats a count with thousands grouping, e.g. row counts in the schema pane
-/// (FRE-118).
+/// Formats a count with thousands grouping, e.g. row counts in the schema pane.
 ///
 /// Grouped because the number's *magnitude* is the message — "is this table
 /// thousands of rows or millions?" is unanswerable at a glance from

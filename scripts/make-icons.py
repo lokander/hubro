@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate every icon artifact from the master bitmap (FRE-65).
+"""Regenerate every icon artifact from the master bitmap.
 
 Run from the repo root, after editing `assets/hubro.xcf` and re-exporting
 `assets/hubro_transparent.png`:

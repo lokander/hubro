@@ -1,4 +1,4 @@
-//! Round-trip tests for the clipboard's `INSERT` generation (FRE-110).
+//! Round-trip tests for the clipboard's `INSERT` generation.
 //!
 //! The unit tests in `db::clipboard` pin the exact text of every format. These
 //! go one step further for the format that can corrupt data silently: they

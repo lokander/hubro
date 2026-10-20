@@ -5,7 +5,7 @@
 //! foreign keys come from the pragma table-valued functions
 //! (`pragma_table_xinfo`, `pragma_index_list`, `pragma_index_info`,
 //! `pragma_foreign_key_list`) joined against it — no per-table `PRAGMA`
-//! round-trips (FRE-133).
+//! round-trips.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -30,7 +30,7 @@ use super::value::{QueryResult, Value};
 /// terminating NUL (the SQLite file format, section 1.3).
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 
-/// Why a path can't be opened as a SQLite database (FRE-114).
+/// Why a path can't be opened as a SQLite database.
 ///
 /// Exists so "you pointed hubro at a JPEG" is answered by hubro rather than
 /// relayed from the driver: sqlx collapses a missing file, a directory and a
@@ -93,7 +93,7 @@ impl std::error::Error for SqliteFileError {}
 /// it start with [`SQLITE_HEADER`] — rather than on the driver's error text,
 /// which is one message for four different problems. That is also what lets
 /// one answer serve two places: the command line reports it before a window
-/// opens (FRE-114), and [`open_sqlite`] turns it into the connect error the
+/// opens, and [`open_sqlite`] turns it into the connect error the
 /// connections screen shows for the file picker, the saved list, and a session
 /// restore.
 ///
@@ -167,7 +167,7 @@ pub async fn open_sqlite(path: &Path) -> Result<SqlitePool, DbError> {
 
 /// Runs an arbitrary query, decoding every cell into the backend-neutral
 /// [`Value`] model. Free-form SQL whose result is shown to the user, so a
-/// zero-row result recovers its headers (FRE-138).
+/// zero-row result recovers its headers.
 pub async fn query(pool: &SqlitePool, sql: &str) -> Result<QueryResult, DbError> {
     let mut result = query_with(pool, sql, &[]).await?;
     sqlx_common::fill_headers(&mut result, pool, sql).await;
@@ -195,7 +195,7 @@ pub async fn execute(pool: &SqlitePool, sql: &str) -> Result<u64, DbError> {
 /// index of the failing statement (`None` for begin/commit failures, which
 /// belong to no statement). This is the safety net for row edits: a WHERE
 /// clause that unexpectedly matches more (or fewer) rows than the one being
-/// edited must never commit — and with staged edits (FRE-14), neither may
+/// edited must never commit — and with staged edits, neither may
 /// any sibling change in the same batch.
 pub async fn execute_all_checked(
     pool: &SqlitePool,
@@ -272,7 +272,7 @@ pub async fn query_with(
 /// Streams `sql` one row at a time (`fetch`, not `fetch_all`), decoding and
 /// retaining at most `max_rows` rows and capping each cell to `cell_cap`
 /// bytes, so neither the row count nor a pathologically large cell can make
-/// the free-form query path scale with table or value size (FRE-33). Returns
+/// the free-form query path scale with table or value size. Returns
 /// the (bounded) result and whether more rows existed beyond the cap.
 pub async fn query_capped(
     pool: &SqlitePool,
@@ -290,7 +290,7 @@ pub async fn query_capped(
 
 /// [`query_capped`] against a single connection (e.g. one borrowed from a
 /// transaction) rather than the pool — the read path for statements inside an
-/// atomically-wrapped script (FRE-38). No bound params: scripts are raw text.
+/// atomically-wrapped script. No bound params: scripts are raw text.
 pub async fn query_capped_conn(
     conn: &mut sqlx::sqlite::SqliteConnection,
     sql: &str,
@@ -306,7 +306,7 @@ pub async fn query_capped_conn(
 
 /// Runs a non-row statement on a single connection (e.g. one borrowed from a
 /// transaction) rather than the pool, returning affected rows — the write
-/// path for statements inside an atomically-wrapped script (FRE-38).
+/// path for statements inside an atomically-wrapped script.
 pub async fn execute_conn(
     conn: &mut sqlx::sqlite::SqliteConnection,
     sql: &str,
@@ -315,7 +315,7 @@ pub async fn execute_conn(
 }
 
 /// [`execute_conn`] with bound parameters — the write path for a batch of
-/// imported rows (FRE-112), which must run inside the caller's transaction
+/// imported rows, which must run inside the caller's transaction
 /// and must not interpolate its values into the SQL.
 pub async fn execute_with_conn(
     conn: &mut sqlx::sqlite::SqliteConnection,
@@ -359,7 +359,7 @@ pub async fn export(
 
 /// Lists tables and views with columns, indexes, and foreign keys. Four
 /// batched queries total — see the module header for the pragma
-/// table-valued-function strategy (FRE-133).
+/// table-valued-function strategy.
 pub async fn introspect(pool: &SqlitePool) -> Result<Vec<TableMeta>, DbError> {
     let entries = sqlx::query(
         "SELECT name, type FROM sqlite_master \
@@ -391,11 +391,11 @@ pub async fn introspect(pool: &SqlitePool) -> Result<Vec<TableMeta>, DbError> {
             name,
             kind,
             // No per-object narrowing: kind and row identity already carry
-            // everything this backend knows about writability (FRE-87).
+            // everything this backend knows about writability.
             restriction: None,
             // SQLite has no extension-owned schemas and no declarative
             // partitioning; its extensions contribute functions and virtual
-            // tables, which are the user's to use (FRE-88).
+            // tables, which are the user's to use.
             internal: None,
             kind_label: None,
         });
@@ -412,7 +412,7 @@ const MASTER_FILTER: &str = "m.type IN ('table', 'view') AND m.name NOT LIKE 'sq
 async fn table_columns(pool: &SqlitePool) -> Result<HashMap<String, Vec<ColumnMeta>>, DbError> {
     // `table_xinfo` (not `table_info`) so generated (`AS (…)`) columns are
     // reported: they appear in `SELECT *`, so the grid's bounded page fetch —
-    // which builds an explicit projection from this metadata (FRE-33) — must
+    // which builds an explicit projection from this metadata — must
     // know about them, and they must be read-only. `table_xinfo` adds a
     // `hidden` column: 0 = ordinary, 2 = VIRTUAL generated, 3 = STORED
     // generated, 1 = a hidden column (virtual-table machinery) that `SELECT *`
@@ -575,7 +575,7 @@ async fn table_foreign_keys(
     Ok(foreign_keys)
 }
 
-/// Row count and on-disk size for one table (FRE-118) — of which SQLite can
+/// Row count and on-disk size for one table — of which SQLite can
 /// cheaply answer only the first, and only sometimes.
 ///
 /// **Rows** come from `sqlite_stat1`, the table `ANALYZE` writes: the first
@@ -640,7 +640,7 @@ fn sqlite_stat_rows(stat: &str) -> Option<u64> {
     stat.split_whitespace().next()?.parse().ok()
 }
 
-/// DDL for one object (FRE-108). SQLite stores the original `CREATE`
+/// DDL for one object. SQLite stores the original `CREATE`
 /// statement text in `sqlite_master`, so tables, views, and explicitly
 /// created indexes all come back exactly as they were written — no
 /// reconstruction, no header. The one exception is an index SQLite created

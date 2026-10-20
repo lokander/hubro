@@ -1,4 +1,4 @@
-//! Aggregate statistics for a cell selection (FRE-117): count, non-null count
+//! Aggregate statistics for a cell selection: count, non-null count
 //! and distinct count for anything, plus sum/avg/min/max over the numeric
 //! cells.
 //!
@@ -229,7 +229,7 @@ pub(super) struct SelectionStats {
     /// Distinct non-null values.
     pub(super) distinct: usize,
     /// Whether `distinct` is only a lower bound because some selected cell is
-    /// a truncated preview (FRE-33): two values sharing a prefix collapse into
+    /// a truncated preview: two values sharing a prefix collapse into
     /// one key, so the true count can only be higher.
     pub(super) distinct_is_lower_bound: bool,
     /// `None` when no numeric cell was summable (none at all, or all NaN).
@@ -452,7 +452,7 @@ impl SelectionStats {
 }
 
 /// The CSS shrink factor for the counts span, and for the aggregate span
-/// beside it (FRE-117). The footer renders both with `truncate`, and the pair
+/// beside it. The footer renders both with `truncate`, and the pair
 /// decides which one gives up its width first when the readout is wider than
 /// the footer.
 ///
@@ -837,8 +837,8 @@ mod tests {
     fn the_readout_counts_the_selection_and_never_the_page() {
         // A thousand-row page with a 2×2 selection: the numbers describe four
         // cells. If this ever reported the page, `cells` would be 2000 and the
-        // sum would be enormous — which is the whole failure mode FRE-117
-        // guards against.
+        // sum would be enormous — the readout passing for an aggregate over
+        // more than the selection is the whole failure mode it guards against.
         let values: Vec<Vec<Value>> = (0..1000)
             .map(|i| vec![Value::Integer(i), Value::Integer(1)])
             .collect();
@@ -1042,8 +1042,8 @@ mod tests {
     #[test]
     fn the_copied_text_carries_the_scope_with_the_numbers() {
         // A pasted number outlives the tooltip that qualified it, so the
-        // clipboard gets the caveat too — FRE-117's "describes the selection,
-        // not the table" has to survive leaving the app.
+        // clipboard gets the caveat too — "describes the selection, not the
+        // table" has to survive leaving the app.
         let s = stats(
             vec![vec![Value::Integer(1), Value::Integer(2)]],
             Selection::all(1, 2).unwrap(),
@@ -1056,8 +1056,8 @@ mod tests {
 
     #[test]
     fn the_readout_cannot_reach_the_database() {
-        // FRE-117 is explicit that the statistics come from cells already in
-        // memory: no query, no full-table scan. `compute` takes only a
+        // The statistics come only from cells already in memory, by design:
+        // no query, no full-table scan. `compute` takes only a
         // `&GridNav` and a `Selection`, and this pins that nothing in the
         // module's code can await, spawn, or touch a pool — a claim in a doc
         // comment would not survive the first person who added a fetch.

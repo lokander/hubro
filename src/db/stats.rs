@@ -1,5 +1,4 @@
-//! What a table costs: how many rows it holds and how much disk it occupies
-//! (FRE-118).
+//! What a table costs: how many rows it holds and how much disk it occupies.
 //!
 //! "How big is this table?" is one of the first questions asked of an
 //! unfamiliar database, and the answer is only cheap if it comes from
@@ -23,7 +22,7 @@
 //! yet, a view with no storage of its own. `None` must render as *nothing*, and
 //! never as a zero — "0 rows" is a claim, and it would be the wrong one.
 
-/// A table's storage statistics, as far as the server will say (FRE-118).
+/// A table's storage statistics, as far as the server will say.
 ///
 /// The two fields are independent, and every combination really occurs: SQLite
 /// answers rows and not size, a never-analyzed Postgres table answers size and

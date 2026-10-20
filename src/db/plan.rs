@@ -1,4 +1,4 @@
-//! Query plans (FRE-119): the `EXPLAIN` statement a connection understands,
+//! Query plans: the `EXPLAIN` statement a connection understands,
 //! and PostgreSQL's `EXPLAIN (FORMAT JSON)` output parsed into a tree.
 //!
 //! Two halves, deliberately separated:
@@ -30,7 +30,7 @@ use super::value::QueryResult;
 /// land on different connections — and the failure mode of getting that wrong
 /// is executing a statement the user asked to have explained. Offering
 /// nothing is the honest answer until a backend can hold one connection for
-/// the pair, which is FRE-158.
+/// the pair.
 pub const NO_EXPLAIN: &str = "This connection has no EXPLAIN statement.";
 
 /// How a connection produces a query plan.

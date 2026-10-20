@@ -1,4 +1,4 @@
-//! What a connection — and each object on it — can actually do (FRE-87).
+//! What a connection — and each object on it — can actually do.
 //!
 //! Not every engine is editable, transactional and offset-pageable, and not
 //! every object on an editable engine is writable. [`Capabilities`] states a
@@ -10,7 +10,7 @@
 //! the connection default, so a backend declaring `mutate: false` can't have
 //! an object argue its way back into being writable.
 //!
-//! Per-connection write protection ([`WriteProtection`], FRE-111) is user
+//! Per-connection write protection ([`WriteProtection`]) is user
 //! intent layered onto this same resolution: it narrows the [`Capabilities`]
 //! passed to [`TableAccess::resolve`] and supplies its own [`Restriction`],
 //! rather than becoming a second, parallel way to disable editing.
@@ -36,7 +36,7 @@ pub struct Capabilities {
     /// Multi-statement atomicity: a real
     /// [`ScriptTx`](super::registry::ScriptTx) rather than autocommit-only.
     pub transactions: bool,
-    /// Whether a rollback also undoes *schema* changes (FRE-146).
+    /// Whether a rollback also undoes *schema* changes.
     ///
     /// Its own flag rather than a narrowing of [`Self::transactions`], which
     /// would be the worse lie: CockroachDB and YugabyteDB roll DML back
@@ -71,7 +71,7 @@ impl Capabilities {
     };
 
     /// Queryable but not writable: the shape a read-only backend declares,
-    /// and what per-connection write protection (FRE-111) will narrow to.
+    /// and what per-connection write protection will narrow to.
     pub const fn read_only(self) -> Capabilities {
         Capabilities {
             mutate: false,
@@ -98,11 +98,11 @@ pub enum Restriction {
     /// The backend or the connection itself refuses writes, with its own
     /// explanation — a read-only engine, an object kind the driver knows is
     /// not writable (a DuckDB view over a Parquet file, a StarRocks
-    /// duplicate-key table), or the user's own read-only marking (FRE-111).
+    /// duplicate-key table), or the user's own read-only marking.
     Declared(&'static str),
     /// The object has no rows *at all*, so it is neither writable nor
     /// browsable — a RisingWave sink, which writes outward to Kafka or another
-    /// database and stores nothing of its own (FRE-148).
+    /// database and stores nothing of its own.
     ///
     /// The one restriction that also narrows reading. It is a distinct variant
     /// rather than a flag beside [`Self::Declared`] because a backend declares
@@ -155,7 +155,7 @@ pub const NO_OFFSET_PAGING: &str = "This connection can't page through rows with
 /// guard would report the damage instead of preventing it.
 ///
 /// So a non-transactional backend is not offered unguarded editing. RisingWave
-/// is the first (FRE-93): `BEGIN` there raises a notice saying no transaction
+/// is the first: `BEGIN` there raises a notice saying no transaction
 /// was started, and `ROLLBACK` silently does nothing.
 ///
 /// Reported *last* among the reasons an object is unwritable — see
@@ -181,7 +181,7 @@ pub const MARKED_READ_ONLY: &str = "You marked this connection read-only.";
 /// the backend — is what forbids the write.
 pub const USER_READ_ONLY: Restriction = Restriction::Declared(MARKED_READ_ONLY);
 
-/// How much the user wants this connection to resist writes (FRE-111).
+/// How much the user wants this connection to resist writes.
 ///
 /// Three states rather than a boolean, because a boolean forces a production
 /// connection to be either unprotected or unusable for writes — and people
@@ -271,7 +271,7 @@ pub struct TableAccess {
     /// fetch) and for writes. `None` when no such addressing exists.
     pub identity: Option<RowIdentity>,
     pub restriction: Option<Restriction>,
-    /// Why this object has no rows to show, when it has none (FRE-148) — the
+    /// Why this object has no rows to show, when it has none — the
     /// read mirror of [`Self::restriction`], and `None` for everything that
     /// can be browsed.
     ///
@@ -282,7 +282,7 @@ pub struct TableAccess {
     pub unreadable: Option<&'static str>,
 }
 
-/// Why `table` has no rows to show, when it has none (FRE-148).
+/// Why `table` has no rows to show, when it has none.
 ///
 /// The single derivation behind both [`TableAccess::unreadable`] and the
 /// sidebar's dimming of such an object. It exists so those two cannot drift
@@ -348,7 +348,7 @@ impl TableAccess {
     }
 
     /// [`Self::resolve`] with the user's own write protection folded in
-    /// (FRE-111) — the entry point every gated path should use, so protection
+    /// — the entry point every gated path should use, so protection
     /// and backend capability produce one effective answer instead of two
     /// checks that can disagree.
     ///
@@ -396,7 +396,7 @@ impl TableAccess {
         self.restriction.map(Restriction::message)
     }
 
-    /// Whether this object's rows can be listed at all (FRE-148).
+    /// Whether this object's rows can be listed at all.
     ///
     /// False for an object that stores none, and — since this is the resolved
     /// capability rather than the object's own fact — also on a connection
@@ -584,7 +584,7 @@ mod tests {
 
     #[test]
     fn a_backend_without_transactions_refuses_editing_and_says_why() {
-        // RisingWave's shape (FRE-93): it writes, runs DDL and pages fine, but
+        // RisingWave's shape: it writes, runs DDL and pages fine, but
         // holds no transaction — so the row-count guard behind every staged
         // write can only report damage, never prevent it.
         let defaults = Capabilities {
@@ -766,7 +766,7 @@ mod tests {
         assert_eq!(WriteProtection::default(), WriteProtection::Open);
         assert!(WriteProtection::Open.is_open());
         assert!(!WriteProtection::Confirm.is_open());
-        // The on-disk spelling is part of the config format (FRE-111).
+        // The on-disk spelling is part of the config format.
         let round_trip = |p: WriteProtection| {
             let text = toml::to_string(&Wrapper { protection: p }).unwrap();
             let back: Wrapper = toml::from_str(&text).unwrap();

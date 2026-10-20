@@ -28,7 +28,7 @@
 //!     chmod 700 /home/tunnel/.ssh && chmod 600 /home/tunnel/.ssh/authorized_keys &&
 //!     exec /usr/sbin/sshd -D -e"
 //!
-//! # Optional SQL Server target for the mssql-through-tunnel test (FRE-58);
+//! # Optional SQL Server target for the mssql-through-tunnel test;
 //! # skipped unless HUBRO_SSH_TEST_MSSQL_PASSWORD is also set:
 //! docker run -d --name hubro-mssql-test --network hubro-test-net \
 //!   -e ACCEPT_EULA=Y -e "MSSQL_SA_PASSWORD=Str0ng!Passw0rd" \
@@ -143,7 +143,7 @@ async fn postgres_connects_end_to_end_through_the_tunnel() {
     pool.close().await;
 }
 
-/// The SQL Server mirror of the end-to-end test above (FRE-58), exercising the
+/// The SQL Server mirror of the end-to-end test above, exercising the
 /// exact glue `AppState::connect_server` uses on SQL Server: the logical URL
 /// is rewritten through the forwarded local port, and the driver gets the
 /// original hostname as its TLS server name while dialing 127.0.0.1. Needs the
@@ -331,7 +331,7 @@ async fn unknown_host_key_is_refused_then_trusted_and_connects() {
 async fn a_revoked_host_key_is_refused_even_when_also_trusted() {
     let Some(env) = ssh_env() else { return };
     // The server's real key, trusted the normal way, then also marked
-    // `@revoked`: OpenSSH refuses that, and so must the tunnel (FRE-289).
+    // `@revoked`: OpenSSH refuses that, and so must the tunnel.
     let (kh, _kh_dir) = trusted_known_hosts(&env).await;
     let trusted = std::fs::read_to_string(&kh[0]).unwrap();
     let line = trusted.lines().find(|l| !l.trim().is_empty()).unwrap();

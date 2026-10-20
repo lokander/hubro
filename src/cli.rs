@@ -1,4 +1,4 @@
-//! Command-line arguments and OS "open this" requests (FRE-114).
+//! Command-line arguments and OS "open this" requests.
 //!
 //! `hubro <file>` opens a SQLite file and `hubro <url>` opens a server
 //! connection, which is also how a file manager or the shell hands hubro a
@@ -664,7 +664,7 @@ mod tests {
         // drive letter and rejects a Unix-style absolute path. That rejection
         // is the right answer rather than a gap — `file:///var/lib/app.db`
         // names nothing a Windows process can open, so hubro's own "not a
-        // local file URL" is what the user should see (FRE-160).
+        // local file URL" is what the user should see.
         #[cfg(windows)]
         let (url, path) = ("file:///C:/data/app.db", PathBuf::from(r"C:\data\app.db"));
         #[cfg(not(windows))]

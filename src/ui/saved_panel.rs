@@ -1,4 +1,4 @@
-//! The SQL editor's saved-queries panel (FRE-113): naming and keeping the
+//! The SQL editor's saved-queries panel: naming and keeping the
 //! current buffer, browsing and searching what was kept, opening one into a
 //! new query tab, and deleting.
 //!
@@ -37,8 +37,8 @@ pub(super) fn SavedQueriesPanel(
     let mut showing_form = use_signal(|| false);
     let store_ready = state.history.read().is_some();
     let history_error = state.history_error.read().clone();
-    // Per connection (like the export status, FRE-73): another connection's
-    // "Saved" line has no business showing up in this panel.
+    // Per connection, like the export status: another connection's "Saved"
+    // line has no business showing up in this panel.
     let status = state.saved_status.read().get(&id).cloned();
     // Empty buffers are not worth naming, and the store refuses them anyway;
     // saying so on the button beats a red line after the fact.

@@ -15,7 +15,7 @@ use crate::azure::EntraAuth;
 use crate::db::{Dialect, WriteProtection};
 use crate::tunnel::TunnelConfig;
 
-/// A connection's accent colour (FRE-111): a warning you can see from across
+/// A connection's accent colour: a warning you can see from across
 /// the room, on the tab, the sidebar and the connections list.
 ///
 /// Deliberately a fixed palette rather than a free-form colour string. The
@@ -73,10 +73,10 @@ impl ConnectionColor {
     }
 }
 
-/// How a server connection (Postgres, FRE-43; SQL Server, FRE-58)
-/// authenticates. `Password` (the default) resolves a password from session
-/// memory / the keyring / a prompt; `Entra` acquires a Microsoft Entra ID
-/// access token and uses it in place of the password.
+/// How a server connection (Postgres or SQL Server) authenticates.
+/// `Password` (the default) resolves a password from session memory / the
+/// keyring / a prompt; `Entra` acquires a Microsoft Entra ID access token and
+/// uses it in place of the password.
 ///
 /// Serialized by contents (the `kind = "entra"` tag), so the type's Rust
 /// name never reaches the TOML — renaming it from `PgAuth` (the backend it
@@ -100,7 +100,7 @@ impl ServerAuth {
 /// One entry in the saved-connections list. Internally tagged on `kind`, so
 /// existing `kind = "sqlite"` + `path` TOML entries keep deserializing.
 ///
-/// The `protection` and `color` fields (FRE-111) and `group` (FRE-120) repeat
+/// The `protection` and `color` fields and `group` repeat
 /// on every variant rather than being hoisted into a shared struct: an
 /// internally-tagged enum can't `#[serde(flatten)]` one in without changing
 /// the on-disk shape, and all three serialize as plain strings, so they stay
@@ -113,18 +113,20 @@ pub enum SavedConnection {
     Sqlite {
         name: String,
         path: PathBuf,
-        /// How much this connection resists writes (FRE-111). `default` +
-        /// `skip_serializing_if` keep pre-FRE-111 config files deserializing
-        /// and unprotected entries' TOML unchanged; a missing key is `Open`.
+        /// How much this connection resists writes. `default` +
+        /// `skip_serializing_if` keep config files from before write
+        /// protection existed deserializing and unprotected entries' TOML
+        /// unchanged; a missing key is `Open`.
         #[serde(default, skip_serializing_if = "WriteProtection::is_open")]
         protection: WriteProtection,
-        /// Accent colour (FRE-111), stored exactly like `protection`.
+        /// Accent colour, stored exactly like `protection`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         color: Option<ConnectionColor>,
-        /// The group this connection is filed under (FRE-120), by name, or
+        /// The group this connection is filed under, by name, or
         /// `None` for ungrouped. One name, not a list: a connection belongs
-        /// to at most one group. Stored exactly like `color`, so pre-FRE-120
-        /// files load and ungrouped entries' TOML is unchanged.
+        /// to at most one group. Stored exactly like `color`, so files from
+        /// before groups existed load and ungrouped entries' TOML is
+        /// unchanged.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group: Option<String>,
     },
@@ -132,51 +134,52 @@ pub enum SavedConnection {
         name: String,
         /// Connection URL **without** a password — credentials never live in
         /// the config file; passwords are stored in the OS keyring. Canonical
-        /// form (FRE-39), so it doubles as the keyring account key.
+        /// form, so it doubles as the keyring account key.
         url: String,
         /// Optional SSH tunnel to reach the server through. `default` +
         /// `skip_serializing_if` keep pre-tunnel config files (and files
         /// written for tunnel-less connections) unchanged.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tunnel: Option<TunnelConfig>,
-        /// Authentication mode (FRE-43). `default` + `skip_serializing_if` keep
+        /// Authentication mode. `default` + `skip_serializing_if` keep
         /// ordinary password connections' TOML unchanged, and pre-Entra config
         /// files (no `auth` key) deserialize as `Password`.
         #[serde(default, skip_serializing_if = "ServerAuth::is_password")]
         auth: ServerAuth,
-        /// Write protection (FRE-111); see the `Sqlite` variant.
+        /// Write protection; see the `Sqlite` variant.
         #[serde(default, skip_serializing_if = "WriteProtection::is_open")]
         protection: WriteProtection,
-        /// Accent colour (FRE-111); see the `Sqlite` variant.
+        /// Accent colour; see the `Sqlite` variant.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         color: Option<ConnectionColor>,
-        /// Group membership (FRE-120); see the `Sqlite` variant.
+        /// Group membership; see the `Sqlite` variant.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group: Option<String>,
     },
-    /// SQL Server (FRE-57), serialized with `kind = "sqlserver"`. Like
+    /// SQL Server, serialized with `kind = "sqlserver"`. Like
     /// Postgres, the URL is stored **without** a password in the canonical
     /// form (see [`crate::db::normalize_mssql_url`]) and doubles as the
     /// keyring account key.
     SqlServer {
         name: String,
         url: String,
-        /// Optional SSH tunnel (FRE-58), stored exactly like the Postgres
-        /// one. `default` + `skip_serializing_if` keep FRE-57-era files (and
-        /// tunnel-less entries) deserializing and serializing unchanged.
+        /// Optional SSH tunnel, stored exactly like the Postgres
+        /// one. `default` + `skip_serializing_if` keep files from before
+        /// SQL Server tunnels (and tunnel-less entries) deserializing and
+        /// serializing unchanged.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tunnel: Option<TunnelConfig>,
-        /// Authentication mode (FRE-58), stored exactly like the Postgres
+        /// Authentication mode, stored exactly like the Postgres
         /// one; a missing `auth` key deserializes as `Password`.
         #[serde(default, skip_serializing_if = "ServerAuth::is_password")]
         auth: ServerAuth,
-        /// Write protection (FRE-111); see the `Sqlite` variant.
+        /// Write protection; see the `Sqlite` variant.
         #[serde(default, skip_serializing_if = "WriteProtection::is_open")]
         protection: WriteProtection,
-        /// Accent colour (FRE-111); see the `Sqlite` variant.
+        /// Accent colour; see the `Sqlite` variant.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         color: Option<ConnectionColor>,
-        /// Group membership (FRE-120); see the `Sqlite` variant.
+        /// Group membership; see the `Sqlite` variant.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group: Option<String>,
     },
@@ -195,7 +198,7 @@ pub enum BackendKind {
 impl From<BackendKind> for Dialect {
     /// A saved connection's backend and an open connection's SQL dialect name
     /// the same three engines, so converting lets both address one per-engine
-    /// lookup (e.g. the brand marks, FRE-70).
+    /// lookup (e.g. the brand marks).
     fn from(kind: BackendKind) -> Self {
         match kind {
             BackendKind::Sqlite => Dialect::Sqlite,
@@ -222,7 +225,7 @@ impl SavedConnection {
         }
     }
 
-    /// How much this connection resists writes (FRE-111).
+    /// How much this connection resists writes.
     pub fn protection(&self) -> WriteProtection {
         match self {
             SavedConnection::Sqlite { protection, .. }
@@ -231,7 +234,7 @@ impl SavedConnection {
         }
     }
 
-    /// This connection's accent colour (FRE-111), if the user set one.
+    /// This connection's accent colour, if the user set one.
     pub fn color(&self) -> Option<ConnectionColor> {
         match self {
             SavedConnection::Sqlite { color, .. }
@@ -240,7 +243,7 @@ impl SavedConnection {
         }
     }
 
-    /// The group this connection is filed under (FRE-120), or `None` when it
+    /// The group this connection is filed under, or `None` when it
     /// is ungrouped.
     pub fn group(&self) -> Option<&str> {
         match self {
@@ -250,7 +253,7 @@ impl SavedConnection {
         }
     }
 
-    /// Files this connection under `group` (FRE-120), or ungroups it with
+    /// Files this connection under `group`, or ungroups it with
     /// `None`. Assigning replaces rather than adds: the field holds one name,
     /// which is what makes "at most one group" a property of the type instead
     /// of a rule every caller has to remember.
@@ -299,7 +302,7 @@ impl SavedConnection {
     }
 
     /// Replaces the protection and colour, leaving everything else alone —
-    /// the one write path for FRE-111's two fields, so no caller has to
+    /// the one write path for those two fields, so no caller has to
     /// reconstruct a variant just to re-mark it.
     pub fn set_marking(
         &mut self,
@@ -334,10 +337,10 @@ impl SavedConnection {
     }
 }
 
-/// A saved connection's URL split back into the form's individual fields
-/// (FRE-75). Both backends share the `scheme://user@host:port/db?opt=…`
-/// shape, so one splitter serves both; `option_key` names the query
-/// parameter the form's own dropdown owns (`sslmode` / `encrypt`).
+/// A saved connection's URL split back into the form's individual fields.
+/// Both backends share the `scheme://user@host:port/db?opt=…` shape, so one
+/// splitter serves both; `option_key` names the query parameter the form's
+/// own dropdown owns (`sslmode` / `encrypt`).
 struct UrlFields {
     host: String,
     port: String,
@@ -382,10 +385,10 @@ fn percent_decode(raw: &str) -> String {
         .unwrap_or_else(|_| raw.to_string())
 }
 
-/// A saved entry decomposed into the connection forms' field values
-/// (FRE-75). Secrets are deliberately absent: the password and SSH
-/// passphrase fields always start empty, and an empty field on save means
-/// "keep whatever is in the keyring".
+/// A saved entry decomposed into the connection forms' field values.
+/// Secrets are deliberately absent: the password and SSH passphrase fields
+/// always start empty, and an empty field on save means "keep whatever is in
+/// the keyring".
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct EditPrefill {
     pub name: String,
@@ -505,7 +508,7 @@ impl EditPrefill {
     }
 }
 
-/// The whole connections file: the group list (FRE-120) and the entries.
+/// The whole connections file: the group list and the entries.
 ///
 /// `groups` is declared first because TOML has to emit a plain array before
 /// the `[[connections]]` tables, and it exists at all — rather than being
@@ -515,9 +518,9 @@ impl EditPrefill {
 /// vanish the moment it was written.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ConnectionsFile {
-    /// Group names in display order (FRE-120). `default` +
-    /// `skip_serializing_if` keep pre-FRE-120 files loading, and a file with
-    /// no groups is written exactly as before.
+    /// Group names in display order. `default` +
+    /// `skip_serializing_if` keep files from before groups existed loading,
+    /// and a file with no groups is written exactly as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<String>,
     #[serde(default)]
@@ -555,8 +558,8 @@ pub fn load_connections(path: &Path) -> Result<Vec<SavedConnection>, ConfigError
     Ok(load_connections_file(path)?.connections)
 }
 
-/// Saves a group-less list — the shape of the file before FRE-120, and what
-/// a caller holding only entries can write.
+/// Saves a group-less list — the shape of the file before groups existed,
+/// and what a caller holding only entries can write.
 pub fn save_connections(path: &Path, connections: &[SavedConnection]) -> Result<(), ConfigError> {
     save_connections_file(
         path,
@@ -567,7 +570,7 @@ pub fn save_connections(path: &Path, connections: &[SavedConnection]) -> Result<
     )
 }
 
-/// Why a group name was refused (FRE-120). Both cases are user input from
+/// Why a group name was refused. Both cases are user input from
 /// the connections screen, so each carries the sentence shown there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupError {
@@ -588,7 +591,7 @@ impl fmt::Display for GroupError {
 
 impl std::error::Error for GroupError {}
 
-/// One section of the connections list as it is rendered (FRE-120): a group
+/// One section of the connections list as it is rendered: a group
 /// and the connections filed under it, or — with `name` as `None` — the
 /// ungrouped ones.
 #[derive(Debug, Clone, PartialEq)]
@@ -597,7 +600,7 @@ pub struct GroupSection {
     pub entries: Vec<SavedConnection>,
 }
 
-/// Whether a connection's name matches a search box's contents (FRE-120):
+/// Whether a connection's name matches a search box's contents:
 /// case-insensitive substring, with an empty (or whitespace-only) query
 /// matching everything so the unfiltered list renders through the same path.
 ///
@@ -612,7 +615,7 @@ pub fn name_matches(name: &str, query: &str) -> bool {
     name.to_lowercase().contains(&query.to_lowercase())
 }
 
-/// Whether two group names are the same name (FRE-120): case-insensitively,
+/// Whether two group names are the same name: case-insensitively,
 /// so "Prod" and "prod" are one group.
 ///
 /// Applied in three places, and it has to be all three or the rule leaks:
@@ -631,19 +634,19 @@ fn same_group_name(a: &str, b: &str) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SavedList {
     entries: Vec<SavedConnection>,
-    /// Group names in display order (FRE-120).
+    /// Group names in display order.
     groups: Vec<String>,
     load_failed: bool,
 }
 
-/// Canonicalizes Postgres (FRE-39) and SQL Server URLs and drops entries that
+/// Canonicalizes Postgres and SQL Server URLs and drops entries that
 /// collapse to an already-present locator — upgrading a list saved before
 /// normalization existed (e.g. `postgresql://` or a portless URL) and
 /// de-duplicating it. The first entry for each locator wins, so its name is
 /// kept.
 ///
 /// A dropped duplicate's **marking survives** into the entry that absorbs it
-/// ([`SavedConnection::merge_marking_from`], FRE-111). This dedup compares
+/// ([`SavedConnection::merge_marking_from`]). This dedup compares
 /// *normalized* URLs while `SavedList::update` compares the stored locator
 /// string, so two entries can coexist all session and only collapse at the
 /// next launch — discarding the loser's marking outright would silently
@@ -679,7 +682,7 @@ fn normalize_and_dedup(entries: Vec<SavedConnection>) -> Vec<SavedConnection> {
     out
 }
 
-/// Reconciles the entries' group names with the group list (FRE-120), so the
+/// Reconciles the entries' group names with the group list, so the
 /// two invariants the rest of this module relies on hold however the file was
 /// written:
 ///
@@ -761,7 +764,7 @@ impl SavedList {
         &self.entries
     }
 
-    /// The groups (FRE-120) in display order.
+    /// The groups in display order.
     pub fn groups(&self) -> &[String] {
         &self.groups
     }
@@ -853,7 +856,7 @@ impl SavedList {
         true
     }
 
-    /// Files the connection at `locator` under `group` (FRE-120), or
+    /// Files the connection at `locator` under `group`, or
     /// ungroups it with `None`. Assigning replaces any previous group, so a
     /// connection is never in two.
     ///
@@ -877,7 +880,7 @@ impl SavedList {
         true
     }
 
-    /// The list arranged for display (FRE-120): every group in order with the
+    /// The list arranged for display: every group in order with the
     /// connections filed under it, then the ungrouped ones last, narrowed to
     /// the connections whose name matches `query` ([`name_matches`]).
     ///
@@ -930,12 +933,12 @@ impl SavedList {
     /// its name) but adopts a changed tunnel config or auth mode, so
     /// reconnecting with different tunnel/auth settings persists them.
     ///
-    /// **"Adopts" runs in both directions, and that is sharp** (FRE-114): a
+    /// **"Adopts" runs in both directions, and that is sharp**: a
     /// `None` tunnel replaces a saved one, and `ServerAuth::Password` replaces
     /// a saved Entra mode — erasing configuration the user entered, from a
     /// call that reads as though it only ever adds. The write protection and
     /// colour are the deliberate opposite, never touched here, because a
-    /// connect must not undo a marking (FRE-111).
+    /// connect must not undo a marking.
     ///
     /// So a caller has to pass the settings the connection is *actually* saved
     /// with, not defaults it happens to have on hand. The command-line path
@@ -984,13 +987,13 @@ impl SavedList {
     }
 
     /// Replaces the entry at `old_locator` with `connection`, keeping its
-    /// position in the list (FRE-75). Unlike [`Self::add`], this overwrites
+    /// position in the list. Unlike [`Self::add`], this overwrites
     /// every field — including the display name — which is the whole point
     /// of an edit. When the edit moves the entry onto another entry's
     /// locator, that duplicate is dropped so the list stays keyed one-to-one.
     /// Returns false when `old_locator` names no entry.
     ///
-    /// **The write protection and colour (FRE-111) and the group (FRE-120)
+    /// **The write protection and colour and the group
     /// survive the overwrite.** None of them are part of what the edit form
     /// collects, so `connection` always carries the defaults for them —
     /// taking those literally would silently unprotect a connection, and
@@ -1035,7 +1038,7 @@ impl SavedList {
         true
     }
 
-    /// Re-marks one entry's write protection and accent colour (FRE-111).
+    /// Re-marks one entry's write protection and accent colour.
     ///
     /// Separate from [`Self::update`] because marking is not an edit of the
     /// connection: it touches neither the locator nor anything that could
@@ -1271,7 +1274,8 @@ mod tests {
     fn a_group_survives_an_edit_of_its_connection() {
         // The edit form collects no group, so it always supplies `None`.
         // Taking that literally would unfile a connection the moment its name
-        // was changed — the FRE-111 failure, one field over.
+        // was changed — the edit-unprotects-a-connection failure (see
+        // `editing_a_connection_keeps_its_marking`), one field over.
         let mut list = list_of(&[saved_pg("prod", "postgres://u@h:5432/d")]);
         list.create_group("Production").unwrap();
         assert!(list.assign_group("postgres://u@h:5432/d", Some("Production")));
@@ -1341,9 +1345,10 @@ mod tests {
     }
 
     #[test]
-    fn a_pre_fre_120_config_file_loads_ungrouped() {
-        // The back-compat contract: a file written before FRE-120 has neither
-        // key, and must load as an ungrouped list rather than failing.
+    fn a_config_file_from_before_groups_loads_ungrouped() {
+        // The back-compat contract: a file written before connection groups
+        // existed has neither key, and must load as an ungrouped list rather
+        // than failing.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connections.toml");
         std::fs::write(
@@ -1586,7 +1591,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connections.toml");
         // An unmarked entry must serialize byte-for-byte as it did before
-        // FRE-111: no protection key, no color key.
+        // marking existed: no protection key, no color key.
         save_connections(&path, &[saved("plain", "/tmp/a.db")]).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("protection"), "{text}");
@@ -1602,10 +1607,10 @@ mod tests {
     }
 
     #[test]
-    fn a_pre_fre_111_config_file_loads_as_unprotected() {
-        // The back-compat contract: a config file written before FRE-111 has
-        // neither key, and must come back as Open with no colour rather than
-        // failing to parse.
+    fn a_config_file_from_before_write_protection_loads_as_unprotected() {
+        // The back-compat contract: a config file written before write
+        // protection and colour existed has neither key, and must come back
+        // as Open with no colour rather than failing to parse.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connections.toml");
         std::fs::write(
@@ -1824,13 +1829,14 @@ mod tests {
     fn sqlserver_tunnel_and_entra_round_trip_and_stay_optional() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connections.toml");
-        // A password-only entry still writes no tunnel/auth keys (FRE-57
-        // files stay byte-compatible)…
+        // A password-only entry still writes no tunnel/auth keys (files from
+        // before SQL Server tunnels and Entra stay byte-compatible)…
         save_connections(&path, &[saved_ms("plain", "mssql://sa@h:1433/db")]).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("tunnel"));
         assert!(!text.contains("auth"));
-        // …and an FRE-57-era minimal file (no tunnel/auth keys) deserializes.
+        // …and a minimal file from that era (no tunnel/auth keys)
+        // deserializes.
         std::fs::write(
             &path,
             "[[connections]]\nkind = \"sqlserver\"\nname = \"ms\"\nurl = \"mssql://sa@h:1433/db\"\n",
@@ -1997,7 +2003,7 @@ mod tests {
 
     #[test]
     fn server_auth_serialized_form_is_pinned_across_the_rename() {
-        // `ServerAuth` was `PgAuth` until FRE-144. It serializes by contents
+        // `ServerAuth` was once named `PgAuth`. It serializes by contents
         // (the `kind` tag), so the Rust name never reaches the TOML — this
         // pins that shape so a future rename or attribute change can't move
         // the on-disk format.
@@ -2123,13 +2129,14 @@ mod tests {
 
     #[test]
     fn add_also_clears_a_tunnel_and_downgrades_auth_which_is_the_sharp_edge() {
-        // The other direction of "adopts", which had no test and cost FRE-114 a
-        // bug: re-adding the same locator with `None`/`Password` *erases* a
-        // saved tunnel and a saved Entra sign-in. Pinned rather than changed —
-        // the connection form legitimately re-adds a URL with settings the user
-        // has just chosen, so refusing the downgrade here would need its own
-        // judgement about that path. What must not happen is a caller reaching
-        // it by accident, and that is the caller's job (see the doc on `add`).
+        // The other direction of "adopts", which had no test and cost the
+        // command-line open path a bug: re-adding the same locator with
+        // `None`/`Password` *erases* a saved tunnel and a saved Entra sign-in.
+        // Pinned rather than changed — the connection form legitimately
+        // re-adds a URL with settings the user has just chosen, so refusing
+        // the downgrade here would need its own judgement about that path.
+        // What must not happen is a caller reaching it by accident, and that
+        // is the caller's job (see the doc on `add`).
         let dir = tempfile::tempdir().unwrap();
         let (mut list, _) = SavedList::load(&dir.path().join("connections.toml"));
         let url = "postgres://u@h:5432/db";
@@ -2165,8 +2172,7 @@ mod tests {
                 assert!(tunnel.is_none(), "the saved tunnel is gone");
                 assert!(matches!(auth, ServerAuth::Password), "Entra was downgraded");
                 // …while these three are never touched by `add`: the name is
-                // the entry's own, and a connect must not undo a marking
-                // (FRE-111).
+                // the entry's own, and a connect must not undo a marking.
                 assert_eq!(name, "prod");
                 assert_eq!(*protection, WriteProtection::ReadOnly);
                 assert_eq!(*color, Some(ConnectionColor::Red));

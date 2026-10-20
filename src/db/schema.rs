@@ -8,13 +8,13 @@ pub enum TableKind {
     Table,
     View,
     /// A Postgres materialized view (`pg_class.relkind = 'm'`): browsable like a
-    /// table but read-only — no editing, no row-identity writes (FRE-41).
+    /// table but read-only — no editing, no row-identity writes.
     MaterializedView,
 }
 
 /// Whether the database assigns a column's value itself, and whether the
 /// user may override it. Drives insert required-column detection and
-/// editor read-only gating (FRE-25).
+/// editor read-only gating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Generated {
     /// An ordinary column the user writes directly.
@@ -42,7 +42,7 @@ pub struct TypeRef {
 }
 
 /// Type structure that the declared type name alone doesn't convey, used to
-/// pick a richer editor (FRE-71). Postgres reports both of these as opaque
+/// pick a richer editor. Postgres reports both of these as opaque
 /// `information_schema` strings (`USER-DEFINED`, `ARRAY`), so the detail is
 /// resolved during introspection; backends without these types report
 /// [`TypeDetail::Plain`].
@@ -136,7 +136,7 @@ pub struct TableMeta {
     pub indexes: Vec<IndexMeta>,
     pub foreign_keys: Vec<ForeignKeyMeta>,
     /// Per-object narrowing of the connection's capabilities, resolved during
-    /// introspection (FRE-87) — `None` when the object follows its
+    /// introspection — `None` when the object follows its
     /// connection's defaults.
     ///
     /// Only for limits the driver knows and the resolver cannot derive on its
@@ -149,18 +149,18 @@ pub struct TableMeta {
     /// [`TableAccess::resolve`]: super::caps::TableAccess::resolve
     pub restriction: Option<Restriction>,
     /// Why this object is the database's own bookkeeping rather than the
-    /// user's data, when it is — see [`Internal`] (FRE-88). `None` for
+    /// user's data, when it is — see [`Internal`]. `None` for
     /// ordinary objects.
     pub internal: Option<Internal>,
     /// Engine-specific refinement of [`TableKind`], rendered as a badge next
-    /// to the name: `hypertable` and `continuous aggregate` on TimescaleDB
-    /// (FRE-88). A free string rather than an enum because the vocabulary is
+    /// to the name: `hypertable` and `continuous aggregate` on TimescaleDB.
+    /// A free string rather than an enum because the vocabulary is
     /// per-engine and open-ended — MergeTree engines, distributed tables,
     /// external tables — and nothing branches on it.
     pub kind_label: Option<String>,
 }
 
-/// Why an object is infrastructure rather than the user's data (FRE-88).
+/// Why an object is infrastructure rather than the user's data.
 ///
 /// Backends declare this during introspection; nothing here is inferred from
 /// name patterns, which would be both leaky and wrong the moment a user names
@@ -189,7 +189,7 @@ pub enum Internal {
     /// Stock Postgres keeps all of this in `pg_catalog` and
     /// `information_schema`, which introspection excludes outright, so this
     /// arises only on a reimplementation that reserves *more* schemas —
-    /// CockroachDB's `crdb_internal` and `pg_extension` (FRE-90). Recorded
+    /// CockroachDB's `crdb_internal` and `pg_extension`. Recorded
     /// rather than excluded for the same reason as everything else here: the
     /// objects are real, and hiding them by default is the sidebar's call
     /// rather than introspection's.

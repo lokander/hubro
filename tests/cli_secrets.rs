@@ -1,5 +1,5 @@
 //! Holds the command line to its promise that a password never gets copied
-//! anywhere (FRE-114).
+//! anywhere.
 //!
 //! A connection URL may carry a password, and one typed on a command line is
 //! already exposed — it is in the shell's history file and readable from the

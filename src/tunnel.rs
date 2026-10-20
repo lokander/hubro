@@ -130,7 +130,7 @@ impl TunnelError {
     /// The key to offer a trust-on-first-use prompt for, or the error back to
     /// show as a refusal. Only a first-contact key may be trusted from the UI;
     /// a changed key is a possible man-in-the-middle and a revoked one is
-    /// refused outright (FRE-289). Every variant is named, so a new one has to
+    /// refused outright. Every variant is named, so a new one has to
     /// decide.
     pub fn into_trust_prompt(self) -> Result<HostKeyInfo, TunnelError> {
         match self {
@@ -196,8 +196,8 @@ fn verify_host_key(host: &str, port: u16, key: &PublicKey, files: &[PathBuf]) ->
 /// because russh does not check the key a server sends against the negotiated
 /// algorithm, so a server can agree to the recorded type and present another.
 /// Reading that as Unknown turned a man-in-the-middle into a trust prompt for a
-/// host the user already trusts (FRE-288, reproduced against a server that
-/// negotiated ssh-ed25519 and sent an ECDSA key).
+/// host the user already trusts (reproduced against a server that negotiated
+/// ssh-ed25519 and sent an ECDSA key).
 fn host_key_verdict(
     offered: &PublicKey,
     recorded: &[PublicKey],
@@ -257,7 +257,7 @@ fn client_config(host: &str, port: u16, known_hosts_read: &[PathBuf]) -> client:
 /// records an RSA key as `ssh-rsa`, its format, but servers sign with it as
 /// rsa-sha2-512 or rsa-sha2-256, and OpenSSH 8.8+ disables SHA-1 `ssh-rsa` by
 /// default. Pinning `ssh-rsa` alone made every reconnect to an RSA-only
-/// OpenSSH server fail (FRE-288, measured against 10.3), so RSA gets all three,
+/// OpenSSH server fail (measured against OpenSSH 10.3), so RSA gets all three,
 /// in russh's default order.
 fn presenting_algorithms(format: Algorithm) -> Vec<Algorithm> {
     match format {
@@ -795,7 +795,8 @@ mod tests {
             (KEY_A, vec![], HostKeyStatus::Unknown),
             (KEY_A, vec![KEY_A], HostKeyStatus::Trusted),
             (KEY_B, vec![KEY_A], HostKeyStatus::Changed),
-            // FRE-288: a different type is not a different host.
+            // A different type is not a different host: a server can
+            // negotiate the recorded type and present another.
             (KEY_ECDSA, vec![KEY_A], HostKeyStatus::Changed),
             (KEY_RSA, vec![KEY_A], HostKeyStatus::Changed),
             // A host may hold several keys; any match is enough.
@@ -919,7 +920,8 @@ mod tests {
         // hubro's own store comes first in `default_known_hosts_read`, so its
         // record must count. In the second file an undecodable line for the
         // host must cost only itself (russh's reader failed the whole file on
-        // it, FRE-289), and an unreadable path contributes nothing.
+        // it, dropping every other key recorded there), and an unreadable path
+        // contributes nothing.
         let first = write_known_hosts(dir.path(), "app", &[&format!("example.com {KEY_A}")]);
         let second = write_known_hosts(
             dir.path(),
@@ -1047,8 +1049,8 @@ mod tests {
     #[test]
     fn verdicts_match_what_openssh_decides() {
         // Each row's expected verdict is what the real OpenSSH 10.5 client
-        // decided for the same layout with StrictHostKeyChecking=yes (FRE-289;
-        // measured against [localhost]:2222, mirrored here onto port 22).
+        // decided for the same layout with StrictHostKeyChecking=yes (measured
+        // against a test sshd on [localhost]:2222, mirrored here onto port 22).
         // KEY_A is the key the server presents; KEY_B stands for a recorded
         // key that is not it.
         const H: &str = "db.example.com";

@@ -170,7 +170,7 @@ impl FixtureDb {
 }
 
 // ---------------------------------------------------------------------------
-// Performance fixtures and budgets (FRE-34)
+// Performance fixtures and budgets
 //
 // The generators below build the large databases the perf harness in
 // `tests/perf.rs` measures against. They are parameterizable so ordinary tests
@@ -198,8 +198,8 @@ pub mod perf_scale {
     pub const BIG_VALUE_ROWS: u64 = 4;
 }
 
-/// Performance budgets — the contract FRE-32 (virtual scrolling) and FRE-33
-/// (bounded memory / streaming) must keep meeting. Thresholds are p50 targets
+/// Performance budgets — the contract virtual scrolling and bounded-memory
+/// streaming must keep meeting. Thresholds are p50 targets
 /// measured on the dev machine and set generously (roughly 3x the observed
 /// baseline) so they catch real regressions without being flaky on slower CI
 /// hardware. See `docs/PERFORMANCE.md` for the recorded baseline and rationale.
@@ -221,7 +221,7 @@ pub mod budgets {
     pub const PAGE_NAV_SHALLOW: Duration = Duration::from_millis(100);
     /// `fetch_page(LIMIT 100)` near the end of the 1M-row table. OFFSET paging
     /// is O(offset) in SQLite, so this is deliberately the loosest budget; it
-    /// is exactly what keyset pagination (FRE-32) should later collapse.
+    /// is exactly what keyset pagination should later collapse.
     pub const PAGE_NAV_DEEP: Duration = Duration::from_millis(3000);
     /// `introspect()` on the 300-table database.
     pub const SCHEMA_LOAD: Duration = Duration::from_millis(1500);
@@ -528,7 +528,7 @@ impl Timings {
 }
 
 // ---------------------------------------------------------------------------
-// A database per test binary (FRE-127)
+// A database per test binary
 // ---------------------------------------------------------------------------
 
 /// The SQL Server URL this test binary should use: `HUBRO_MSSQL_TEST_URL` with

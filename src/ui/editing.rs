@@ -1,9 +1,9 @@
-//! Inline cell editing (FRE-24): type-aware editor kinds, input validation,
+//! Inline cell editing: type-aware editor kinds, input validation,
 //! and the in-place `CellEditor` component the grid mounts over a cell.
 //!
 //! Editor kinds derive from the introspected column type. A column whose
 //! [`TypeDetail`](crate::db::TypeDetail) resolved to an enum or an array
-//! takes that editor directly (FRE-71) — Postgres names those columns
+//! takes that editor directly — Postgres names those columns
 //! `USER-DEFINED` and `ARRAY`, which say nothing about the type:
 //!
 //! - enum → a dropdown of the type's variants, in declaration order;
@@ -12,7 +12,7 @@
 //!   before staging (element types are left to the database)
 //!
 //! Every other column is classified by [`classify_type`], the declared-type
-//! vocabulary this shares with the file import (FRE-112) so the two cannot
+//! vocabulary this shares with the file import so the two cannot
 //! disagree about what a column holds. It matches the type name
 //! case-insensitively, so both SQLite declared types ("INTEGER",
 //! "VARCHAR(40)", possibly empty) and Postgres `data_type` strings
@@ -45,8 +45,8 @@
 //! `bit` is its boolean type, and the word alone cannot tell them apart. So
 //! the derivation also takes the connection's dialect and asks
 //! [`is_bit_string`](crate::db::is_bit_string), the same predicate the import
-//! uses, rather than a second name-based rule that could drift from it
-//! (FRE-159). Without a connection there is no dialect — and nothing to save
+//! uses, rather than a second name-based rule that could drift from it.
+//! Without a connection there is no dialect — and nothing to save
 //! through either — so the name-based classification stands.
 //!
 //! Values committed here are only ever **staged** (via
@@ -87,13 +87,13 @@ pub enum EditorKind {
     /// writable through ordinary SQL, so read-only in the editor.
     Generated,
     /// A Postgres enum column: a dropdown of the type's variants, in
-    /// declaration order (FRE-71).
+    /// declaration order.
     Enum { variants: Vec<String> },
     /// A Postgres array column: the array literal as text, validated for
-    /// well-formedness before staging (FRE-71).
+    /// well-formedness before staging.
     Array,
     /// A Postgres `bit`/`bit varying` column: the literal as text, checked for
-    /// `0`s and `1`s before staging (FRE-159). Not a checkbox — a bit string
+    /// `0`s and `1`s before staging. Not a checkbox — a bit string
     /// is a *string*, and `1010` is one value, not four booleans.
     BitString,
 }
@@ -136,7 +136,7 @@ pub fn editor_kind(type_name: &str, detail: &TypeDetail, dialect: Option<Dialect
         _ => {}
     }
     // `bit` names two unrelated types, so this one rule needs the dialect
-    // (FRE-159) — and it is [`is_bit_string`], the same one the import uses,
+    // — and it is [`is_bit_string`], the same one the import uses,
     // rather than a second name-based rule that could drift from it. Without a
     // connection there is no dialect and nothing to save through either, so
     // the name-based classification stands.
@@ -217,7 +217,7 @@ fn parse_numeric(text: &str, kind: NumericKind) -> Result<Value, String> {
 }
 
 /// Validates a Postgres array literal well enough to keep a malformed one
-/// from reaching the database (FRE-71). This is a structural check, not a
+/// from reaching the database. This is a structural check, not a
 /// full parser: it verifies the value is brace-delimited, that braces nest
 /// and close, that double-quoted elements are terminated (with `\` escapes
 /// honoured inside them), and that no content trails the closing brace.
@@ -295,7 +295,7 @@ pub enum EditNav {
 /// cell; `initial` is the staged value when one exists, else the fetched
 /// value.
 ///
-/// Interaction model (FRE-24):
+/// Interaction model:
 /// - Enter commits (stages) and closes; in the JSON editor Shift+Enter
 ///   inserts a newline instead.
 /// - Escape cancels without staging.
@@ -311,8 +311,8 @@ pub enum EditNav {
 /// - The ∅ NULL button stages an explicit NULL — distinct from committing
 ///   an empty string. Hidden on NOT NULL columns.
 /// - The ↺ default button (only rendered when `on_default` is wired — i.e.
-///   in pending-insert phantom rows, FRE-25) reverts the cell to "database
-///   default": the column is then omitted from the INSERT entirely.
+///   in pending-insert phantom rows) reverts the cell to "database default":
+///   the column is then omitted from the INSERT entirely.
 /// - Validation failures (numeric, JSON) show inline and keep the editor
 ///   open; nothing is staged.
 /// - Checkbox (boolean) and enum-dropdown editors stage-and-close
@@ -324,21 +324,21 @@ pub fn CellEditor(
     nullable: bool,
     initial: Value,
     /// Uncommitted text restored from a previous mount whose row was
-    /// scrolled out of the virtual window while the input didn't parse
-    /// (FRE-74); seeds the input instead of `initial` and counts as
+    /// scrolled out of the virtual window while the input didn't parse;
+    /// seeds the input instead of `initial` and counts as
     /// modified.
     draft: Option<String>,
     on_commit: EventHandler<(Option<Value>, EditNav)>,
     on_cancel: EventHandler<()>,
     /// Receives the raw text when the editor unmounts with input that does
-    /// not parse (FRE-74) — the grid stashes it on the active edit so a
+    /// not parse — the grid stashes it on the active edit so a
     /// remount can restore it.
     on_draft: Option<EventHandler<String>>,
     /// Revert-to-database-default action. Existing rows have no default to
     /// revert to, so the grid only wires this for pending-insert cells.
     on_default: Option<EventHandler<()>>,
     /// Wrap the editor in a plain `div` instead of a `td`. The grid mounts it
-    /// as the active cell of a `<table>` row; the row detail panel (FRE-109)
+    /// as the active cell of a `<table>` row; the row detail panel
     /// mounts the same editor in a vertical form, where a stray table cell
     /// would drag in an anonymous table box around it.
     #[props(default)]
@@ -363,7 +363,7 @@ pub fn CellEditor(
     // closing (the input unmounts / loses focus) cannot double-commit.
     let mut finished = use_signal(|| false);
 
-    // Scroll-out unmount (FRE-74): windowed rendering dropping this row must
+    // Scroll-out unmount: windowed rendering dropping this row must
     // not silently discard typed input. Treat it like blur: stage the parsed
     // value; input that doesn't parse is handed to `on_draft` instead so the
     // remount can restore it. Any committed/cancelled editor already set
@@ -673,8 +673,8 @@ mod tests {
     #[test]
     fn a_postgres_bit_column_edits_as_a_bit_string_and_a_sql_server_one_as_a_bool() {
         // The cell editor and the import must agree about what `bit` is, and
-        // the name alone cannot say — so this one kind depends on the dialect
-        // (FRE-159). A checkbox here would be actively wrong: "1010" is a
+        // the name alone cannot say — so this one kind depends on the
+        // dialect. A checkbox here would be actively wrong: "1010" is a
         // single value, and a checkbox has nowhere to put it.
         assert_eq!(
             editor_kind("bit", &TypeDetail::Plain, Some(Dialect::Postgres)),
@@ -690,9 +690,10 @@ mod tests {
         //
         // Note the asymmetry, which is **pre-existing and deliberately left
         // alone**: the *import* reads this column as a boolean
-        // (`effective_class`, FRE-112) while the cell editor reads it as text,
-        // because `editor_kind` applies only the bit-string refinement. Making
-        // the editor offer a checkbox too is a behaviour change beyond FRE-159.
+        // (`effective_class`) while the cell editor reads it as text, because
+        // `editor_kind` applies only the bit-string refinement. Making the
+        // editor offer a checkbox too is a behaviour change, beyond making
+        // Postgres `bit` columns writable.
         let sqlserver_bit = editor_kind("bit", &TypeDetail::Plain, Some(Dialect::SqlServer));
         assert_ne!(sqlserver_bit, EditorKind::BitString);
         assert_eq!(sqlserver_bit, EditorKind::Text);

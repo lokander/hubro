@@ -1,5 +1,5 @@
 //! Shared presentation primitives for the app's notices, empty states, and
-//! loading indicators (FRE-18). These replace the ad-hoc red `<p>`s, plain
+//! loading indicators. These replace the ad-hoc red `<p>`s, plain
 //! "empty" sentences, and bare "Loading…" text that accumulated across
 //! earlier milestones, so every error, empty view, and slow-query wait looks
 //! the same everywhere.
@@ -26,7 +26,7 @@ pub enum BannerKind {
 }
 
 impl BannerKind {
-    /// The leading icon for this kind (Lucide, FRE-66). Sized to match the
+    /// The leading icon for this kind (Lucide). Sized to match the
     /// banner's `text-sm` line height so the icon and first text line align.
     pub fn icon(self) -> Element {
         match self {
@@ -93,7 +93,7 @@ pub fn Banner(
 /// "no filter matches" views so each is distinct but consistent.
 #[component]
 pub fn EmptyState(
-    /// A large icon shown above the title (a Lucide component, FRE-66).
+    /// A large icon shown above the title (a Lucide component).
     icon: Element,
     /// The bold one-line summary.
     title: String,

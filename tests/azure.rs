@@ -1,4 +1,4 @@
-//! Entra token-acquisition flows (FRE-43) driven end to end against a local
+//! Entra token-acquisition flows driven end to end against a local
 //! fake HTTP server and a fake "browser" — no real Azure. Covers the
 //! interactive authorization-code exchange, silent refresh-token redemption,
 //! managed-identity (IMDS), and OAuth error surfacing.

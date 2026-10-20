@@ -1,6 +1,6 @@
-//! Keyboard navigation and windowed rendering for the data grid (FRE-15,
-//! FRE-32): the move model, the focus arithmetic, and the per-page snapshot
-//! the focusable container's key handler reads.
+//! Keyboard navigation and windowed rendering for the data grid: the move
+//! model, the focus arithmetic, and the per-page snapshot the focusable
+//! container's key handler reads.
 //!
 //! Deliberately free of rendering: everything here is a pure function or a
 //! plain value, so the whole navigation model is pinned by unit tests rather
@@ -8,7 +8,7 @@
 
 use super::*;
 
-/// A move requested by a grid-navigation key (FRE-15), resolved by
+/// A move requested by a grid-navigation key, resolved by
 /// [`apply_grid_move`] into a new focused cell or a page change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum GridMove {
@@ -79,8 +79,8 @@ pub(super) fn apply_grid_move(
     }
 }
 
-/// The half-open range of row indices to render for a scroll position
-/// (FRE-32): windowed rendering keeps only these rows in the DOM. `first` is
+/// The half-open range of row indices to render for a scroll position:
+/// windowed rendering keeps only these rows in the DOM. `first` is
 /// the row at the top of the viewport (`scroll_top / row_height`); the window
 /// spans the viewport's worth of rows plus `overscan` on each side, clamped to
 /// `[0, total]`. A zero `total` or non-positive `row_height` yields an empty
@@ -111,7 +111,7 @@ pub(super) fn compute_visible_range(
     (start, end)
 }
 
-/// Keyboard-navigation snapshot of the visible page (FRE-15): enough per-cell
+/// Keyboard-navigation snapshot of the visible page: enough per-cell
 /// data (row key, column, editability, display text) for the focusable grid
 /// container's key handler to move the focus ring and open the editor without
 /// threading render-time borrows into the `'static` closure. Built by a memo
@@ -128,7 +128,7 @@ pub(super) struct GridNavRow {
     /// editor; `None` rows can only have their value expanded.
     pub(super) key: Option<String>,
     /// The row's locator, used to fetch a truncated cell's full value on
-    /// expand (FRE-33).
+    /// expand.
     pub(super) locator: Option<RowLocator>,
     pub(super) cells: Vec<GridNavCell>,
 }
@@ -138,22 +138,22 @@ pub(super) struct GridNavCell {
     pub(super) column: String,
     pub(super) editable: bool,
     /// Whether the stage holds an edit for this cell — the row detail panel
-    /// (FRE-109) tints its fields from the same snapshot the grid tints its
+    /// tints its fields from the same snapshot the grid tints its
     /// cells from, so the two can't disagree about what is staged.
     pub(super) dirty: bool,
     pub(super) display: String,
     /// The cell's value as fetched. For a cell carrying `preview` this is only
-    /// the bounded prefix — a copy must fetch the full value (FRE-110).
+    /// the bounded prefix — a copy must fetch the full value.
     pub(super) value: Value,
     /// Full-value metadata when this cell is a truncated preview; drives both
-    /// the expand-on-Enter fetch (FRE-33) and the copy's fetch/refusal
-    /// decision (FRE-110).
+    /// the expand-on-Enter fetch and the copy's fetch/refusal
+    /// decision.
     pub(super) preview: Option<PreviewInfo>,
 }
 
 impl GridNavCell {
     /// Whether this cell is a truncated preview — Enter expands it by fetching
-    /// the full value rather than showing the in-hand preview (FRE-33).
+    /// the full value rather than showing the in-hand preview.
     pub(super) fn truncated(&self) -> bool {
         self.preview.is_some()
     }

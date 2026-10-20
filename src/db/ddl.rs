@@ -1,4 +1,4 @@
-//! DDL text for one schema object (FRE-108).
+//! DDL text for one schema object.
 //!
 //! Two sources, and telling them apart is the point. SQLite stores the
 //! original `CREATE` statement in `sqlite_master`, Postgres renders view and
@@ -194,7 +194,7 @@ pub struct IndexExtras {
 /// line comment — `sqlite_master` happily stores `CREATE INDEX … -- note`, and
 /// appending `;` to that line comments the terminator out. One unterminated
 /// statement then swallows the next one, and the whole output stops being
-/// runnable (FRE-108).
+/// runnable.
 pub fn terminate(sql: &str) -> String {
     let trimmed = sql.trim_end();
     if trimmed.ends_with(';') {
@@ -551,7 +551,7 @@ mod tests {
         id.primary_key_position = Some(1);
         let note = column("note", "nvarchar(50)", true);
         // Persisted and NOT NULL: T-SQL accepts the nullability here and the
-        // column is a different column without it (FRE-108 review).
+        // column is a different column without it.
         let total = column("total", "int", false);
         let loose = column("loose", "int", false);
         let meta = table(Some("dbo"), "orders", vec![id, note, total, loose]);

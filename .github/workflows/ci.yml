@@ -66,8 +66,8 @@ jobs:
     #   - process spawning, signals, or the keyring.
     #
     # The `cfg` bullet alone used to be the whole rule and was too narrow:
-    # FRE-160 was three Windows failures across two merged PRs, none of which
-    # had a `cfg` block — a path, a `file://` URL, and two byte-exact
+    # one batch of three Windows failures across two merged PRs had no `cfg`
+    # block at all — a path, a `file://` URL, and two byte-exact
     # comparisons.
     # fail-fast off: when one leg fails, the others still report, so
     # platform-specific breakage is diagnosed in a single run.

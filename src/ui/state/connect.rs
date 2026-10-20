@@ -10,7 +10,7 @@
 
 use super::*;
 
-/// Moves one keyring secret from `old` to `new` (FRE-75). Best-effort: a
+/// Moves one keyring secret from `old` to `new`. Best-effort: a
 /// missing secret, or a keyring that refuses, just means nothing to carry.
 /// An existing secret under `new` is left alone — it came from the connect
 /// that just succeeded and is therefore the more current one.
@@ -54,7 +54,7 @@ pub(super) fn ssh_secret_key(url: &str) -> String {
 
 /// Where a tunnel passphrase came from. The two sources differ in what a
 /// rejection means, which is why this is an enum rather than the "did we have
-/// one" bool it replaced (FRE-151).
+/// one" bool it replaced.
 ///
 /// A **keyring** passphrase is one a tunnel open has already accepted, so a
 /// rejection means the stored copy went stale and should go. A **session**
@@ -90,7 +90,7 @@ pub(super) fn forget_failed_ssh_passphrase(
 
 /// Records the user's "remember this passphrase" answer for `url` — ticked or
 /// cleared — to be redeemed by [`redeem_ssh_remember`] once a tunnel open
-/// accepts it (FRE-161).
+/// accepts it.
 ///
 /// Withdrawing matters as much as parking: the intent is keyed by locator and
 /// outlives the attempt that parked it whenever that attempt *pauses* — on a
@@ -116,8 +116,7 @@ pub(super) fn park_ssh_remember(pending: &mut HashMap<String, bool>, url: &str, 
 /// made about the secret that just failed, so leaving it parked would let some
 /// later attempt redeem it. Reporting what it *was* is what keeps the
 /// re-prompt honest — the box used to be re-ticked on every re-prompt, so a
-/// user who cleared it and then mistyped had that decision undone by the typo
-/// (FRE-162).
+/// user who cleared it and then mistyped had that decision undone by the typo.
 ///
 /// An attempt with no answer on record defaults to offering the box ticked:
 /// nothing has asked this session, so its prompt is a first prompt. That is
@@ -181,7 +180,7 @@ pub(super) fn secret_keys(locator: &str) -> [String; 3] {
 }
 
 /// Carries a connection's in-memory secrets, and its parked "remember the
-/// passphrase" choice, across an edit that moved the locator (FRE-162).
+/// passphrase" choice, across an edit that moved the locator.
 ///
 /// [`AppState::update_saved`] migrates the keyring entries for a reason that
 /// applies just as much here: the locator is the key, so an edit that changes
@@ -191,7 +190,7 @@ pub(super) fn secret_keys(locator: &str) -> [String; 3] {
 /// is still holding.
 ///
 /// **The parked "remember" choice deliberately does not move**, though it is
-/// keyed by locator too, and FRE-162 was filed saying it should. An edit lands
+/// keyed by locator too, and an earlier report said it should. An edit lands
 /// only while the *new* locator is open ([`AppState::save_or_apply_edit`] is
 /// reached through [`AppState::save_server_if_open`], which no-ops otherwise),
 /// so a connect to it has already succeeded — in this call, or in an earlier
@@ -220,12 +219,12 @@ pub(super) fn carry_session_secrets(session: &mut HashMap<String, String>, old: 
         // keyring copy the same precedence for the same reason. Overwriting it
         // would put an unvalidated secret where the next connect reads it as
         // previously accepted — and `forget_stale_secret` then deletes the
-        // stored copy when it fails, which is FRE-151 reached through an edit.
+        // stored copy when it fails, and an unchecked secret costs a good one.
         session.entry(new_key).or_insert(secret);
     }
 }
 
-/// Drops what a removed connection leaves behind in memory (FRE-162).
+/// Drops what a removed connection leaves behind in memory.
 ///
 /// The keyring entries go with the entry itself; these are their session-lived
 /// counterparts, and leaving them is not merely untidy. A parked intent
@@ -293,7 +292,7 @@ struct ServerLogin {
 ///
 /// Postgres and SQL Server connect through the same sequence — reserve, open
 /// the tunnel, find a credential, open the pool, prompt or save — and used to
-/// carry two line-for-line copies of it (FRE-139). They differ only in engine
+/// carry two line-for-line copies of it. They differ only in engine
 /// *data*: which URL helpers apply, which OAuth resource Entra tokens are
 /// minted for, whether a tunneled connect needs a TLS host override, and which
 /// [`SavedConnection`] variant a success persists. That data lives here and the
@@ -547,7 +546,7 @@ fn open_browser(auth_url: &str) -> Result<(), azure::AzureError> {
         .map_err(|e| azure::AzureError::Browser(e.to_string()))
 }
 
-/// Carries a renamed group's fold across the rename (FRE-120).
+/// Carries a renamed group's fold across the rename.
 ///
 /// The fold is remembered by name, in a *different file* from the group
 /// itself: the group lives in connections.toml, the fold in session.toml. So
@@ -581,7 +580,7 @@ fn collapsed_needs_rename(collapsed: &[String], old: &str) -> bool {
     collapsed.iter().any(|name| name == old)
 }
 
-/// Drops a deleted group's fold (FRE-120). A name nothing can expand again
+/// Drops a deleted group's fold. A name nothing can expand again
 /// would sit in session.toml forever, and would silently re-collapse a group
 /// later created with the same name.
 fn forget_collapsed(collapsed: &mut Vec<String>, name: &str) {
@@ -605,8 +604,8 @@ impl AppState {
         }
     }
 
-    /// Marks a saved connection's write protection and accent colour
-    /// (FRE-111), persists the list, and re-marks any tab already open on it
+    /// Marks a saved connection's write protection and accent colour,
+    /// persists the list, and re-marks any tab already open on it
     /// so the change takes effect now rather than on the next reconnect.
     ///
     /// Marking lives on the connections-list row rather than in the connect
@@ -647,7 +646,7 @@ impl AppState {
         }
     }
 
-    /// Creates a connection group (FRE-120) and persists the list. The error
+    /// Creates a connection group and persists the list. The error
     /// is handed back for the connections screen to show next to the field
     /// the name was typed into.
     pub fn create_saved_group(mut self, name: &str) -> Result<String, GroupError> {
@@ -694,7 +693,7 @@ impl AppState {
         }
     }
 
-    /// Files a saved connection under a group (FRE-120), or ungroups it with
+    /// Files a saved connection under a group, or ungroups it with
     /// `None`. A connection is in at most one group, so this replaces rather
     /// than adds.
     ///
@@ -722,7 +721,7 @@ impl AppState {
     }
 
     /// Records that the next successful connect to `new_locator` is an edit
-    /// of `old_locator` rather than a new connection (FRE-75). Consumed by
+    /// of `old_locator` rather than a new connection. Consumed by
     /// [`Self::save_server_if_open`], the one place every connect path saves
     /// through — including the Entra sign-in card, which completes long after
     /// the form has closed.
@@ -764,7 +763,7 @@ impl AppState {
         }
     }
 
-    /// Applies an edit to a saved connection (FRE-75): overwrites the entry
+    /// Applies an edit to a saved connection: overwrites the entry
     /// at `old_locator` — name included, which [`Self::save_server_if_open`]
     /// deliberately never does — and persists.
     ///
@@ -807,7 +806,7 @@ impl AppState {
     /// entries also drop their keyring credentials (database password, SSH key
     /// passphrase, and cached Entra refresh token; deleting a missing entry is
     /// a no-op), and every entry drops the same keys from session memory along
-    /// with any parked "remember the passphrase" choice (FRE-162).
+    /// with any parked "remember the passphrase" choice.
     ///
     /// An open tab on the removed connection keeps working — nothing here
     /// touches the live connection — but it no longer has a remembered secret
@@ -818,7 +817,7 @@ impl AppState {
         if let Some(entry) = removed {
             // The in-memory stores are keyed by locator whatever the backend
             // is, and clearing them is not I/O, so it happens for every entry
-            // and before the keyring work is spawned (FRE-162).
+            // and before the keyring work is spawned.
             forget_connection_secrets(
                 &mut self.session_passwords.write(),
                 &mut self.ssh_remember.write(),
@@ -852,7 +851,7 @@ impl AppState {
     }
 
     /// Opens a database named on the command line or handed over by the OS
-    /// (FRE-114) — one entry point for `hubro <file>`, `hubro <url>`, and a
+    /// — one entry point for `hubro <file>`, `hubro <url>`, and a
     /// file association on all three platforms.
     ///
     /// Drives the ordinary connect flows rather than a shortcut of its own,
@@ -949,7 +948,7 @@ impl AppState {
     }
 
     /// Opens a saved server connection — Postgres or SQL Server, per
-    /// `backend` (FRE-139). With a tunnel configured, the tunnel opens first
+    /// `backend`. With a tunnel configured, the tunnel opens first
     /// (its failures surface as "SSH tunnel: …", distinct from database
     /// errors) and the database connects through the forwarded port; for SQL
     /// Server, TLS keeps validating the server's real hostname (see
@@ -970,7 +969,7 @@ impl AppState {
         if self.focus_or_reserve(&url) {
             // Already open (or reserved): no connect runs, so the save below
             // never fires. An edit still has to land — save_server_if_open
-            // no-ops unless the locator is genuinely open (FRE-75).
+            // no-ops unless the locator is genuinely open.
             self.save_server_if_open(backend, &url, &name, tunnel.clone(), auth.clone());
             return;
         }
@@ -1214,8 +1213,7 @@ impl AppState {
         if self.focus_or_reserve(&url) {
             // Already open (or reserved): no connect runs, so the save
             // below never fires. An edit still has to land —
-            // save_server_if_open no-ops unless the locator is genuinely open
-            // (FRE-75).
+            // save_server_if_open no-ops unless the locator is genuinely open.
             self.save_server_if_open(backend, &url, &name, tunnel.clone(), ServerAuth::Password);
             return;
         }
@@ -1260,9 +1258,10 @@ impl AppState {
     ///
     /// Keyring persistence does **not** happen here. The "remember" choice is
     /// parked for [`Self::open_tunnel`] to redeem at the moment a tunnel open
-    /// accepts the passphrase, which is both the FRE-151 condition and — since
-    /// the connect frequently resumes elsewhere, via a host-key or password
-    /// prompt — the only point that reliably happens (FRE-161).
+    /// accepts the passphrase. That moment is both the condition for storing
+    /// it (only an accepted passphrase may reach the keyring) and — since the
+    /// connect frequently resumes elsewhere, via a host-key or password
+    /// prompt — the only point that reliably happens.
     ///
     /// Takes the whole prompt rather than its parts because that is what it
     /// completes — and an SSH-passphrase prompt always carries the tunnel
@@ -1284,7 +1283,7 @@ impl AppState {
         let Some(tunnel) = tunnel else { return };
         self.stash_ssh_passphrase(&url, passphrase);
         // Park the choice for [`Self::open_tunnel`] to redeem once a tunnel
-        // open has actually accepted this passphrase (FRE-161).
+        // open has actually accepted this passphrase.
         //
         // It used to be acted on right here, once the connect returned, gated
         // on the connection being open. That gate is wrong in both directions:
@@ -1436,7 +1435,7 @@ impl AppState {
         // Value and source travel as one: which of the two supplied it decides
         // what a rejection below means, and two separate `Option`s kept in step
         // by hand would let a passphrase with no recorded source silently skip
-        // that decision (FRE-151).
+        // that decision.
         let mut stored: Option<(String, PassphraseSource)> = None;
         if matches!(config.auth, TunnelAuth::KeyFile { .. }) {
             // Read into a local first: the guard is a statement temporary, so
@@ -1467,10 +1466,9 @@ impl AppState {
                 // session it authenticated came up. Note what that is *not* —
                 // the server never sees this passphrase (it decrypts a local
                 // key file), and for an unencrypted key it was ignored
-                // outright. It is the condition FRE-151
-                // places on writing it to the keyring, and the reason the
-                // write lives here rather than wherever the connect eventually
-                // ends (FRE-161).
+                // outright. It is the condition placed on writing it to the
+                // keyring, and the reason the write lives here rather than
+                // wherever the connect eventually ends.
                 //
                 // Only for a session-sourced one: a keyring-sourced passphrase
                 // is already stored, and re-storing it would be a write whose
@@ -1496,13 +1494,13 @@ impl AppState {
                 // parked would let some later attempt redeem a choice the user
                 // made about a different secret. What it *was* becomes the
                 // re-prompt's default, so a typo cannot re-tick a box the user
-                // cleared (FRE-162) — one call, because reading the answer
+                // cleared — one call, because reading the answer
                 // after withdrawing it would always read the default.
                 let remember = withdraw_ssh_remember(&mut self.ssh_remember.write(), url);
                 if let Some(source) = source {
                     // Something was tried and rejected. It leaves session
                     // memory either way; only a keyring-sourced one is stale
-                    // enough to delete (FRE-151). The write guard is a
+                    // enough to delete. The write guard is a
                     // statement temporary — nothing is held across the await.
                     let drop_stored = forget_failed_ssh_passphrase(
                         &mut self.session_passwords.write(),
@@ -1529,7 +1527,7 @@ impl AppState {
             // prompt; trusting persists the key and retries. Everything else,
             // a changed (possible MITM) or revoked host key included, is a
             // hard refusal the user resolves out-of-band. Which is which is
-            // `into_trust_prompt`'s decision, not this match's (FRE-289).
+            // `into_trust_prompt`'s decision, not this match's.
             Err(err) => match err.into_trust_prompt() {
                 Ok(info) => {
                     self.release_connect(url);
@@ -1715,7 +1713,7 @@ impl AppState {
         let focus = self.release_connect(&locator);
         match result {
             Ok(pool) => {
-                // The marking (FRE-111) is read here rather than threaded
+                // The marking is read here rather than threaded
                 // through each connect_* signature: every path — first
                 // connect, reconnect, session restore — funnels through this
                 // one place, so a new connect path cannot forget it.
@@ -1742,7 +1740,7 @@ impl AppState {
         }
     }
 
-    /// The write protection and accent colour saved for `locator` (FRE-111),
+    /// The write protection and accent colour saved for `locator`,
     /// or the defaults when the connection was opened ad hoc rather than from
     /// the saved list.
     fn saved_marking(&self, locator: &str) -> (WriteProtection, Option<ConnectionColor>) {
@@ -1755,8 +1753,8 @@ impl AppState {
             .unwrap_or_default()
     }
 
-    /// Re-marks every open tab on `locator` after its saved entry is edited
-    /// (FRE-111), so an open connection starts obeying a new protection
+    /// Re-marks every open tab on `locator` after its saved entry is edited,
+    /// so an open connection starts obeying a new protection
     /// immediately instead of on the next reconnect — the opposite would
     /// leave the tab you just protected still writable.
     fn remark_open_connections(&mut self, locator: &str) {
@@ -1840,8 +1838,8 @@ mod tests {
         // Which tunnel errors may be trusted is `TunnelError::into_trust_prompt`'s
         // decision, executed by `only_a_first_contact_key_can_be_offered_for_trust`.
         // This pins that the UI asks it: one place raises the prompt, inside
-        // its Ok arm, and no arm names a host-key variant to bypass it
-        // (FRE-289). Comments stripped, since they name the variants.
+        // its Ok arm, and no arm names a host-key variant to bypass it.
+        // Comments stripped, since they name the variants.
         let code: String = open_tunnel_body()
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
@@ -2016,16 +2014,16 @@ mod tests {
 
     #[test]
     fn the_remember_choice_is_redeemed_where_the_passphrase_is_accepted() {
-        // FRE-161. The choice is made at the prompt, but FRE-151 permits the
-        // keyring write only once a tunnel open has *accepted* the passphrase.
-        // Those are different moments — and, the part that was wrong here,
-        // frequently different connects: an untrusted host key, a database
-        // password prompt or an Entra sign-in each park the attempt and finish
-        // it from somewhere else.
+        // Trusting a host key used to drop this choice silently. It is made at
+        // the prompt, but the keyring write is permitted only once a tunnel
+        // open has *accepted* the passphrase. Those are different moments —
+        // and, the part that was wrong here, frequently different connects: an
+        // untrusted host key, a database password prompt or an Entra sign-in
+        // each park the attempt and finish it from somewhere else.
         //
         // So the prompt parks an intent and `open_tunnel` redeems it. Putting
-        // the write back at the prompt re-breaks FRE-151; gating it on the
-        // *connection* being open re-breaks FRE-161.
+        // the write back at the prompt stores passphrases nothing validated;
+        // gating it on the *connection* being open drops the choice again.
         let body = ssh_passphrase_body();
         assert!(
             body.contains("set_ssh_remember(&url, remember)"),
@@ -2036,13 +2034,13 @@ mod tests {
             !body.contains("persist_ssh_passphrase"),
             "the prompt writes the passphrase itself, so one the server never \
              accepted can reach the keyring — which `open_tunnel` then reads \
-             as previously validated and deletes on rejection (FRE-151): {body}"
+             as previously validated and deletes on rejection: {body}"
         );
         assert!(
             !body.contains("open_locators"),
             "the prompt is gating on the connection being open again. A \
              connect parked on a host key or a password prompt has not opened \
-             yet, which is exactly how the choice went missing (FRE-161): \
+             yet, which is exactly how the choice went missing: \
              {body}"
         );
 
@@ -2089,8 +2087,8 @@ mod tests {
              {redemption_code}"
         );
         // And a rejected passphrase takes the choice with it — while handing
-        // it to the re-prompt, which is FRE-162. Both halves are one call, so
-        // this pins the call and
+        // it to the re-prompt, so a typo cannot re-tick a cleared box. Both
+        // halves are one call, so this pins the call and
         // `a_re_prompt_offers_the_choice_the_user_already_made` executes what
         // it decides.
         let rejection = &body[rejected..];
@@ -2112,13 +2110,14 @@ mod tests {
         // `remember,` and inverts the same decision one line lower.
         //
         // Matched a line at a time, not against a literal containing `\n`:
-        // that is the FRE-160 trap, and `tests/line_endings.rs` records that
-        // this file does not depend on the checkout's line endings.
+        // that has failed on Windows checkouts before, and
+        // `tests/line_endings.rs` records that this file does not depend on
+        // the checkout's line endings.
         assert!(
             rejection.lines().any(|line| line.trim() == "remember,"),
             "the withdrawn choice is not reaching the re-prompt as written, so \
              the box is re-ticked after every typo, or offers the opposite of \
-             what the user chose (FRE-162): {rejection}"
+             what the user chose: {rejection}"
         );
         // Negation in any *other* form — a second binding, a `!` on the call,
         // or an inversion one hop away in another function — is covered for
@@ -2137,8 +2136,8 @@ mod tests {
         assert!(
             gate.contains("persist_ssh_passphrase(url)"),
             "the keyring write is not conditional on the redeemed choice, so \
-             the consent this whole mechanism exists to carry decides nothing \
-             (FRE-161): {gate}"
+             the consent this whole mechanism exists to carry decides nothing: \
+             {gate}"
         );
         assert_eq!(
             body.matches("persist_ssh_passphrase").count(),
@@ -2207,12 +2206,12 @@ mod tests {
         // trips it:
         //
         // - `redeem` — the passphrase reaches the keyring exactly when the
-        //   user declined it, and never when they asked (FRE-161 inverted).
+        //   user declined it, and never when they asked.
         // - `remember` / `remember_choice` / `offered` — the box, the submit
         //   and the re-prompt disagree about the answer the user gave, so a
-        //   typo restores a decision they had cleared (FRE-162).
+        //   typo restores a decision they had cleared.
         // - `drop_stored` — a mistyped passphrase deletes the saved one, and
-        //   a genuinely stale one is kept forever (FRE-151 verbatim).
+        //   a genuinely stale one is kept forever.
         // - `is_open` — edits apply exactly when the connect *failed*, which
         //   is the premise `carry_session_secrets` rests its whole
         //   don't-migrate-the-answer argument on.
@@ -2272,7 +2271,7 @@ mod tests {
             "the edit's migration gate is inverted or gone — with `==`, a \
              moving edit strands every session secret and migrates no keyring \
              entry, silently, because both calls inside are no-ops when the \
-             locator did not move (FRE-162 and FRE-75 at once)"
+             locator did not move"
         );
         assert!(
             collapsed(&code_of(&method_body(source, "fn save_server_if_open(")))
@@ -2291,8 +2290,8 @@ mod tests {
         // the half that can be inverted without moving a single call.
         //
         // Both polarities are defects, and the second is the worse one: losing
-        // the choice is FRE-161 again, but storing a secret the user declined
-        // is a privacy failure the app never mentions.
+        // the choice is a bug this has had before, but storing a secret the
+        // user declined is a privacy failure the app never mentions.
         let url = "postgres://u@h:5432/db";
         let mut pending = HashMap::new();
 
@@ -2399,7 +2398,7 @@ mod tests {
 
     #[test]
     fn an_edited_locator_carries_its_session_secrets_with_it() {
-        // FRE-162. The keyring entries already move — `update_saved` migrates
+        // The keyring entries already move — `update_saved` migrates
         // all three — but the session copies keyed by the same locator did
         // not, so the edited connection re-prompted for secrets the app was
         // still holding and the old ones sat under a locator naming nothing.
@@ -2446,7 +2445,7 @@ mod tests {
         // the old value over the top of it would replace a secret the server
         // accepted with one it never saw — and the next connect reads a
         // session hit as good, fails, and `forget_stale_secret` deletes the
-        // keyring copy: FRE-151, reached through an edit.
+        // keyring copy, so a stored secret is lost to one nobody validated.
         //
         // `migrate_secret` gives the keyring copy the same precedence, in so
         // many words, so this is also the two stores agreeing rather than
@@ -2529,7 +2528,7 @@ mod tests {
 
     #[test]
     fn a_removed_connection_leaves_nothing_behind_in_memory() {
-        // FRE-162. `remove_saved` deletes the three keyring entries; their
+        // `remove_saved` deletes the three keyring entries; their
         // session-lived counterparts stayed. The parked intent is again the
         // sharp edge — recreating the same URL in the same session would
         // redeem it and write back the passphrase the deletion just removed.
@@ -2583,8 +2582,8 @@ mod tests {
     #[test]
     fn connection_management_routes_every_locator_keyed_store_through_the_policy() {
         // The tests above execute what the policy decides; this pins that the
-        // two paths still consult it. They are separable in the way that made
-        // FRE-162 possible in the first place: `update_saved` and
+        // two paths still consult it. They are separable, which is how secrets
+        // came to be stranded in the first place: `update_saved` and
         // `remove_saved` handled the keyring keys correctly for a year while
         // walking straight past the two in-memory stores keyed by the same
         // locator, and a policy nobody calls stays green forever.
@@ -2599,7 +2598,7 @@ mod tests {
         assert!(
             update.contains("carry_session_secrets("),
             "an edit migrates the keyring entries but strands the session \
-             passphrase and password under the old locator (FRE-162): {update}"
+             passphrase and password under the old locator: {update}"
         );
         assert!(
             update.contains("session_passwords"),
@@ -2648,7 +2647,8 @@ mod tests {
         // silent way: zipping a locator with itself makes `migrate_secret` a
         // no-op on every key, so the stored password stays under the old
         // locator and the edited connection loses it at the next restart —
-        // FRE-75's original bug, restored without moving a call.
+        // the very loss re-keying on edit exists to prevent, restored without
+        // moving a call.
         let migration = &update[spawn_at..];
         let from = migration
             .find("secret_keys(&old_locator)")
@@ -2670,7 +2670,7 @@ mod tests {
             remove.contains("forget_connection_secrets("),
             "a deleted connection keeps its session passphrase and its parked \
              remember choice, so recreating the URL in the same session \
-             re-stores what the deletion removed (FRE-162): {remove}"
+             re-stores what the deletion removed: {remove}"
         );
         // The keyring deletion is what makes the leftovers dangerous rather
         // than merely stale, so it must still happen.
@@ -2694,7 +2694,7 @@ mod tests {
                 format!("{URL}#entra")
             ],
             "the database password must stay under the bare locator — the \
-             keyring account every pre-FRE-162 connect already reads"
+             keyring account every earlier version already reads"
         );
         let distinct: HashSet<String> = secret_keys(URL).into_iter().collect();
         assert_eq!(
@@ -2723,7 +2723,7 @@ mod tests {
 
     #[test]
     fn a_re_prompt_offers_the_choice_the_user_already_made() {
-        // FRE-162. `remember` was `use_signal(|| true)`, so every re-prompt
+        // `remember` was `use_signal(|| true)`, so every re-prompt
         // arrived freshly ticked: unticking the box and then mistyping the
         // passphrase silently restored the decision to store it.
         const URL: &str = "postgres://u@h:5432/db";
@@ -2777,7 +2777,7 @@ mod tests {
 
         // Typed at the prompt and rejected: the keyring copy is somebody
         // else's — the *saved* passphrase, which this attempt says nothing
-        // about. Deleting it here is the bug (FRE-151).
+        // about. Deleting it here is the bug.
         let mut session = HashMap::from([(KEY.to_string(), "typ0".to_string())]);
         assert!(
             !forget_failed_ssh_passphrase(&mut session, KEY, PassphraseSource::Session),
@@ -2820,10 +2820,9 @@ mod tests {
         let body = open_tunnel_body();
         assert!(
             !body.contains("forget_stale_secret"),
-            "open_tunnel is deleting the keyring entry unconditionally again — \
-             that is the FRE-151 bug: `stash_ssh_passphrase` puts the user's \
-             *unvalidated* typing in session memory, so one typo destroys the \
-             saved passphrase"
+            "open_tunnel is deleting the keyring entry unconditionally again, \
+             but `stash_ssh_passphrase` puts the user's *unvalidated* typing \
+             in session memory, so one typo destroys the saved passphrase"
         );
         assert!(
             body.contains("forget_failed_ssh_passphrase("),
@@ -2859,7 +2858,7 @@ mod tests {
                 && !session_read.contains("PassphraseSource::Keyring"),
             "the session read is not labelled Session — with the labels traded, \
              a passphrase typed at the prompt is read as a stale stored secret, \
-             which is the FRE-151 bug verbatim"
+             so one typo deletes the saved passphrase"
         );
         assert!(
             keyring_read.contains("PassphraseSource::Keyring")
@@ -2893,7 +2892,7 @@ mod tests {
 
     #[test]
     fn a_backend_descriptor_carries_its_engine_s_data() {
-        // The whole point of the descriptor (FRE-139): every per-engine
+        // The whole point of the descriptor: every per-engine
         // difference the connect flows used to branch on is one lookup here,
         // so a wrong pairing is visible in one place.
         let pg = ServerBackend::POSTGRES;
@@ -2953,7 +2952,7 @@ mod tests {
         let pg = ServerBackend::POSTGRES;
         let ms = ServerBackend::SQL_SERVER;
         // Through a tunnel the connect URL points at 127.0.0.1, so TLS has to
-        // be told the server's real hostname (FRE-58).
+        // be told the server's real hostname.
         assert_eq!(
             ms.tls_host("mssql://sa@db.example.com:1433/app", true),
             Some("db.example.com".to_string())
@@ -3063,7 +3062,7 @@ mod tests {
         assert_eq!(pg.name(), "prod");
         assert_eq!(pg.locator(), "postgres://u@h:5432/db");
         // A fresh entry is unmarked; markings are set from the connections
-        // list, never inferred by a connect (FRE-111).
+        // list, never inferred by a connect.
         assert_eq!(pg.protection(), WriteProtection::Open);
         assert_eq!(pg.color(), None);
 

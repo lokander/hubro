@@ -1,4 +1,4 @@
-//! Guards the file-association packaging (FRE-114) against the code and the
+//! Guards the file-association packaging against the code and the
 //! build config it claims to agree with.
 //!
 //! Three files in `packaging/` say which databases hubro opens — a `.desktop`
@@ -24,7 +24,7 @@
 //! generated plist has not grown a key since this copy was taken. Those need
 //! the platform. This checks everything that does not.
 //!
-//! One more, added with the release gate (FRE-166) and worth stating plainly
+//! One more, added with the release gate and worth stating plainly
 //! because it is the kind of gap that reads as covered: the tests below pin
 //! that `verify` **runs** — that every release job waits for it and that
 //! nothing can run past it having failed — but not **what it checks**.
@@ -32,8 +32,8 @@
 //! comparison is Python embedded in YAML, which `cargo test` cannot execute,
 //! and re-implementing it here would pin a copy rather than the original. It
 //! is verified by running the script extracted from the workflow against
-//! mutated fixtures, and by the throwaway tag pushed in FRE-166 (a tag that
-//! could not match, which failed `verify` and skipped every bundle and the
+//! mutated fixtures, and by a throwaway tag pushed when the gate landed (a tag
+//! that could not match, which failed `verify` and skipped every bundle and the
 //! publish).
 
 use hubro::cli::DATABASE_EXTENSIONS;
@@ -502,7 +502,7 @@ fn no_release_job_runs_without_the_version_check_passing() {
     // assertion is the only thing standing between that mutation and green.
     assert!(
         jobs.iter().any(|(id, _)| id == "verify"),
-        "release.yml has no `verify` job (FRE-166)"
+        "release.yml has no `verify` job"
     );
     assert!(
         jobs.len() > 1,
@@ -518,7 +518,7 @@ fn no_release_job_runs_without_the_version_check_passing() {
             needs_verify_transitively(&jobs, id),
             "release.yml's `{id}` job does not wait for `verify`, directly or \
              through a job it needs, so a tag whose version disagrees with \
-             Cargo.toml or Info.plist would build and publish anyway (FRE-166)"
+             Cargo.toml or Info.plist would build and publish anyway"
         );
     }
 }
@@ -561,7 +561,7 @@ fn no_release_job_can_run_past_a_failed_dependency() {
         panic!(
             "release.yml line {} declares `{escape}:`, which can let a job run \
              or report success despite `verify` having failed — the `needs:` \
-             edges then gate nothing (FRE-166)",
+             edges then gate nothing",
             number + 1
         );
     }
@@ -622,7 +622,7 @@ fn the_plist_is_the_only_packaging_file_that_authors_a_version() {
             "{name} now carries what looks like a version ({versions:?}). If \
              the packaging really does author a version here, release.yml's \
              `verify` job has to check it against the tag too — it checks \
-             Cargo.toml and Info.plist only (FRE-166)."
+             Cargo.toml and Info.plist only."
         );
     }
 }

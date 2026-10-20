@@ -1,8 +1,8 @@
-//! End-to-end tests for staged edits (FRE-14): `apply_staged` runs a whole
+//! End-to-end tests for staged edits: `apply_staged` runs a whole
 //! change list — updates, inserts, deletes — in ONE transaction on both
 //! backends, rolling everything back when any change fails and naming the
-//! failing change by index. The FRE-25 cases drive the same path through
-//! `TableStage` (per-column insert overrides, multi-delete with an edit
+//! failing change by index. The row insert/delete cases drive the same path
+//! through `TableStage` (per-column insert overrides, multi-delete with an edit
 //! alongside) the way the grid stages them.
 //!
 //! Postgres cases need a running server (Docker only, per CLAUDE.md) and are
@@ -494,8 +494,8 @@ async fn sqlite_bool_checkbox_stages_integers_end_to_end() {
     pool.close().await;
 }
 
-/// The FRE-24 coercion path: the editor stages every rich Postgres value as
-/// text (that's how FRE-12 renders them), and the staged SQL builder casts
+/// The cell-editing coercion path: the editor stages every rich Postgres value
+/// as text (that's how the grid renders them), and the staged SQL builder casts
 /// each bound parameter to its column's introspected type
 /// (`SET "col" = $n::integer`). Without the casts every one of these
 /// updates fails the bind-type check (documented on postgres::bind_params).
@@ -652,7 +652,7 @@ async fn postgres_char_n_columns_round_trip_uncast() {
     pool.close().await;
 }
 
-/// bit(n) columns are writable (FRE-159), and a bad value still rolls back.
+/// bit(n) columns are writable, and a bad value still rolls back.
 ///
 /// This previously asserted the opposite — that the save *always* failed — and
 /// called it a documented limitation. Its own reasoning was right ("text → bit
@@ -738,8 +738,8 @@ async fn postgres_bit_n_edits_save_and_a_wrong_length_still_rolls_back() {
     pool.close().await;
 }
 
-/// INSERT values coerce through the same casts (FRE-25 will stage inserts
-/// with text values from the same editors).
+/// INSERT values coerce through the same casts (the grid stages inserts with
+/// text values from the same editors).
 #[tokio::test]
 async fn postgres_staged_text_insert_coerces_to_column_types() {
     let Some(url) = test_url().await else { return };
@@ -831,7 +831,7 @@ async fn postgres_set_null_on_integer_column_works_via_literal_null() {
     pool.close().await;
 }
 
-/// FRE-25 sqlite insert flow, staged the way the grid does it (per-column
+/// The sqlite insert flow, staged the way the grid does it (per-column
 /// overrides on a `TableStage`): only overridden columns reach the INSERT,
 /// the INTEGER PRIMARY KEY (rowid alias — exempt from the required set) and
 /// the defaulted column get their values from the database, and a fully
@@ -923,7 +923,7 @@ async fn sqlite_staged_insert_leaves_defaults_to_the_database() {
     pool.close().await;
 }
 
-/// FRE-25 postgres insert flow: serial, identity, and stored generated
+/// The postgres insert flow: serial, identity, and stored generated
 /// columns are all exempt from the required set (nextval default,
 /// `Generated::ByDefault`/`Always`), stay out of the INSERT when not
 /// overridden, and get database-assigned values — verified by re-query. The
@@ -1019,7 +1019,7 @@ async fn postgres_staged_insert_gets_serial_and_identity_values() {
     pool.close().await;
 }
 
-/// FRE-25 multi-delete: two selected rows staged for deletion plus an edit,
+/// Multi-delete: two selected rows staged for deletion plus an edit,
 /// all in ONE transaction; the exact delete count the confirmation showed is
 /// what lands.
 #[tokio::test]
@@ -1073,9 +1073,10 @@ async fn sqlite_staged_multi_delete_with_edit_applies_exact_counts() {
     pool.close().await;
 }
 
-/// FRE-111: the marking is enforced in `db/`, not only in the UI. These drive
-/// the real write paths against a real database with a `ReadOnly`-resolved
-/// access, so a UI gate that someone later removes cannot let a write land.
+/// Write protection: the marking is enforced in `db/`, not only in the UI.
+/// These drive the real write paths against a real database with a
+/// `ReadOnly`-resolved access, so a UI gate that someone later removes cannot
+/// let a write land.
 #[tokio::test]
 async fn a_read_only_marking_refuses_a_staged_write_and_leaves_the_row_untouched() {
     let fixture = FixtureDb::full().await;

@@ -1,4 +1,4 @@
-//! The SQL editor's query-history panel (FRE-23): search over the
+//! The SQL editor's query-history panel: search over the
 //! connection's persisted history, per-entry Load / Run / Copy, clearing it,
 //! and the recording opt-out.
 //!
@@ -22,7 +22,7 @@ use super::state::AppState;
 
 /// Cap on entries the history panel fetches per query. Matches the store's
 /// retention cap so every persisted entry is reachable by scrolling, not only
-/// via search (FRE-42).
+/// via search.
 const HISTORY_PANEL_LIMIT: i64 = HISTORY_CAP;
 
 /// Right-side panel listing the current connection's persisted query
@@ -86,7 +86,7 @@ pub(super) fn HistoryPanel(id: ConnectionId, buffer: u64) -> Element {
             }
             div { class: "min-h-0 flex-1 overflow-y-auto",
                 // A failed write for a completed run: warn without hiding
-                // the still-readable list (FRE-72).
+                // the still-readable list.
                 if let Some(err) = record_error {
                     div { class: "p-2",
                         Banner {
@@ -106,7 +106,7 @@ pub(super) fn HistoryPanel(id: ConnectionId, buffer: u64) -> Element {
                     // Matched on the borrow, not a clone: up to HISTORY_CAP
                     // entries would otherwise be deep-copied on every render
                     // (each search keystroke). Only the rendered rows clone,
-                    // because HistoryRow needs owned props (FRE-134).
+                    // because HistoryRow needs owned props.
                     match &*entries.read() {
                         None => rsx! {
                             LoadingLine { label: "Loading…" }
@@ -223,7 +223,7 @@ fn HistoryRow(
                 button {
                     class: "rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-cyan-700 dark:text-cyan-300 hover:bg-slate-200 dark:hover:bg-slate-800",
                     // Load into the editor buffer first so a write-confirm
-                    // banner is confirmed against the text on screen (FRE-72).
+                    // banner is confirmed against the text on screen.
                     onclick: move |_| {
                         state.load_sql_text(id, buffer, sql_for_run.clone());
                         state.run_sql(id, buffer, sql_for_run.clone());

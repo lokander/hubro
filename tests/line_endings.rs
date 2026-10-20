@@ -1,4 +1,4 @@
-//! The `.gitattributes` LF rule, made checkable (FRE-160).
+//! The `.gitattributes` LF rule, made checkable.
 //!
 //! Several tests read a checked-in file and compare it byte for byte, or match
 //! it against a literal containing `\n`. That only works while git delivers the
@@ -30,14 +30,14 @@
 /// `method_body` matches braces, and `connections.rs` slices its prompt card
 /// by lines; none compares a `\n`.
 ///
-/// That last one is a rule the source tests have to keep choosing (FRE-162):
+/// That last one is a rule the source tests have to keep choosing:
 /// the natural way to pin a line of code is a literal like `"\n    field,\n"`,
 /// which reads as precise and fails on a CRLF checkout for a reason that has
 /// nothing to do with the code under test. `lines()` plus `trim` says the same
 /// thing and costs nothing.
 const LF_ONLY: &[(&str, &str)] = &[
     (
-        "tests/fixtures/connections_pre_fre_120.toml",
+        "tests/fixtures/connections_before_groups.toml",
         "config_back_compat.rs compares the round trip byte for byte",
     ),
     (

@@ -1,5 +1,5 @@
 //! Turning text into a [`Value`] for a typed column — the one vocabulary
-//! shared by the inline cell editor (FRE-24) and the file import (FRE-112).
+//! shared by the inline cell editor and the file import.
 //!
 //! Both answer the same question from opposite ends: the editor asks "may I
 //! stage what was typed into this cell?", the import asks "may I insert what
@@ -51,7 +51,7 @@ pub enum TypeClass {
     /// blob/bytea/binary/varbinary/image.
     Binary,
     /// Postgres `bit`/`bit varying`: a string of `0`/`1`, not a number and
-    /// not a boolean (FRE-159). Only ever produced by [`effective_class`],
+    /// not a boolean. Only ever produced by [`effective_class`],
     /// never by [`classify_type`] — see there for why the distinction cannot
     /// be made from the type name alone.
     BitString,
@@ -128,7 +128,7 @@ pub fn classify_type(type_name: &str) -> TypeClass {
 ///   *unskippably*, since only rows hubro rejects itself can be skipped.
 /// - **Postgres `bit`/`bit varying` are bit-strings**, where `1010` is a value
 ///   and `yes` is not. They get [`TypeClass::BitString`], whose check is that
-///   the text is `0`s and `1`s (FRE-159).
+///   the text is `0`s and `1`s.
 ///
 /// `classify_type` — shared with the cell editor, and only ever handed a name
 /// — keeps calling both of them text, so neither refinement can leak into a
@@ -159,8 +159,8 @@ fn effective_class(column: &ColumnMeta, dialect: Dialect) -> TypeClass {
 ///
 /// The one definition of that rule: [`effective_class`] uses it for the
 /// import, and the cell editor's `editor_kind` uses it directly, so the two
-/// entry points cannot drift into disagreeing about what a `bit` column is
-/// (FRE-159). Dialect-gated rather than name-only, because SQL Server's `bit`
+/// entry points cannot drift into disagreeing about what a `bit` column is.
+/// Dialect-gated rather than name-only, because SQL Server's `bit`
 /// is a boolean and must never reach here — see [`effective_class`].
 pub(crate) fn is_bit_string(type_name: &str, dialect: Dialect) -> bool {
     dialect == Dialect::Postgres
@@ -273,8 +273,8 @@ pub fn bool_checked(value: &Value) -> bool {
     }
 }
 
-/// Coerces one source field into the [`Value`] to insert into `column`
-/// (FRE-112), or reports why it cannot — the message names the column and the
+/// Coerces one source field into the [`Value`] to insert into `column`,
+/// or reports why it cannot — the message names the column and the
 /// offending value, since that is all the user has to go on when a row is
 /// skipped or an import aborts.
 ///
@@ -514,8 +514,8 @@ mod tests {
 
     #[test]
     fn bit_means_two_different_things_and_the_dialect_decides_which() {
-        // The distinction FRE-112 introduced this function for, now carrying a
-        // second case (FRE-159). Conflating them is not a cosmetic error:
+        // The distinction this function exists for, now carrying a
+        // second case. Conflating them is not a cosmetic error:
         // reading a Postgres bit-string as a boolean would turn "1010" into
         // `true`, and reading SQL Server's bit as a bit-string would reject
         // every "yes"/"no" the boolean vocabulary exists to accept.

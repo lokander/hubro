@@ -1,4 +1,4 @@
-//! Importing a CSV or JSON file into an **existing** table (FRE-112) — the
+//! Importing a CSV or JSON file into an **existing** table — the
 //! inverse of [`export`](super::export), and built the same way: records are
 //! pulled from the file ONE AT A TIME and written in batches, so peak memory
 //! is one batch regardless of file size.
@@ -6,8 +6,8 @@
 //! # What it will not do
 //!
 //! Create a table. The target's [`ColumnMeta`] is what supplies the types, so
-//! there is nothing to infer and nothing to guess; inferring a schema from a
-//! file is FRE-122's problem.
+//! there is nothing to infer and nothing to guess. Inferring a schema from a
+//! file is deliberately not import's job.
 //!
 //! # Abort by default, skip on request
 //!
@@ -432,11 +432,11 @@ impl std::error::Error for ImportError {}
 /// Why this object cannot be imported into, or `None` when it can.
 ///
 /// One place, so the disabled button, the dialog's explanation and the
-/// backstop inside [`run_import`] all say the same sentence — the FRE-87
-/// pattern. Two reasons, in order:
+/// backstop inside [`run_import`] all say the same sentence — the pattern
+/// capability gating uses. Two reasons, in order:
 ///
 /// 1. anything that makes the object unwritable, including the user's own
-///    read-only marking (FRE-111) — an import is a write, and is refused
+///    read-only marking — an import is a write, and is refused
 ///    wherever editing is;
 /// 2. a connection that cannot hold a transaction, because then the abort
 ///    guarantee this whole feature is built on would be a lie. Unreachable
@@ -726,8 +726,8 @@ fn coerce_row(
 /// was not skipped is committed; on failure nothing is, and
 /// [`ImportError::undone_rows`] reports how much was rolled back.
 ///
-/// `access` is the connection's capabilities resolved for `table` (FRE-87)
-/// *including* the user's write protection (FRE-111), and is checked before
+/// `access` is the connection's capabilities resolved for `table`
+/// *including* the user's write protection, and is checked before
 /// anything is read — it is passed in rather than re-derived so this backstop
 /// and the UI's gate cannot answer differently.
 pub async fn run_import(

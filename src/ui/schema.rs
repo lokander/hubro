@@ -1,4 +1,4 @@
-//! The Schema pane (FRE-69): the selected table's structure, alongside Data
+//! The Schema pane: the selected table's structure, alongside Data
 //! and SQL.
 //!
 //! Everything here comes from the introspection the sidebar already
@@ -22,10 +22,10 @@ use super::schema_edit::SchemaEditDialog;
 use super::state::{AppState, SchemaLoad, TableRef};
 
 /// What the pane should show, derived from [`SchemaLoad`] inside one `read()`
-/// scope. Cloning the whole `Ready(Vec<TableMeta>)` per render just to render
-/// *one* table was the schema-pane half of FRE-134 — this carries only the
-/// selected table's metadata out of the borrow (same shape as the sidebar's
-/// `ListState`).
+/// scope. Cloning the whole `Ready(Vec<TableMeta>)` per render just to show
+/// *one* table deep-copied every table's columns, indexes and foreign keys —
+/// this carries only the selected table's metadata out of the borrow (same
+/// shape as the sidebar's `ListState`).
 enum PaneState {
     Loading,
     Failed(String),
@@ -94,10 +94,10 @@ fn SchemaBody(id: ConnectionId, meta: TableMeta) -> Element {
         schema: meta.schema.clone(),
         name: meta.name.clone(),
     };
-    // Which object's DDL the overlay is showing, if any (FRE-108). Local to
+    // Which object's DDL the overlay is showing, if any. Local to
     // the pane: closing it or switching table drops the request with it.
     let mut showing_ddl = use_signal(|| Option::<DdlObject>::None);
-    // The schema edit being set up, if any (FRE-122) — likewise local, so
+    // The schema edit being set up, if any — likewise local, so
     // switching table abandons a half-filled form rather than carrying it to
     // an object it was never about.
     let mut editing = use_signal(|| Option::<SchemaOp>::None);
@@ -138,7 +138,7 @@ fn SchemaBody(id: ConnectionId, meta: TableMeta) -> Element {
             div { class: "mb-3 flex items-baseline gap-2",
                 h2 { class: "font-mono text-sm text-slate-900 dark:text-slate-200", "{qualified}" }
                 KindBadge { kind: meta.kind }
-                // The object's own definition (FRE-108). Sits with the name
+                // The object's own definition. Sits with the name
                 // it describes rather than in a toolbar, so it is obvious
                 // *what* the DDL will be for.
                 button {
@@ -147,7 +147,7 @@ fn SchemaBody(id: ConnectionId, meta: TableMeta) -> Element {
                     "Show DDL"
                 }
             }
-            // Schema editing (FRE-122). Offered on tables only — every
+            // Schema editing. Offered on tables only — every
             // operation here is refused on a view, and four disabled buttons
             // on every view would be noise where the kind badge above already
             // says why. On a table they stay visible and are disabled with
@@ -167,10 +167,10 @@ fn SchemaBody(id: ConnectionId, meta: TableMeta) -> Element {
                     }
                 }
             }
-            // How big the thing is (FRE-118) — under the name it describes and
+            // How big the thing is — under the name it describes and
             // above the columns, since it is read far more often than any one
             // column. Withheld from objects with no rows at all (a RisingWave
-            // sink, FRE-148): their emptiness is already stated by the grid,
+            // sink): their emptiness is already stated by the grid,
             // and offering to count them would be offering a failure.
             if unreadable_reason(&meta).is_none() {
                 TableStatsLine { id, table: table.clone() }
@@ -352,7 +352,7 @@ fn exact_for(
     (counted_table == current).then(|| result.clone())
 }
 
-/// How big this table is (FRE-118): an estimated row count, its size on disk,
+/// How big this table is: an estimated row count, its size on disk,
 /// and the one action that turns the estimate into a real number.
 ///
 /// The estimate loads on its own because it costs one catalog query; the exact
@@ -479,7 +479,7 @@ fn TableStatsLine(id: ConnectionId, table: ReadSignal<TableRef>) -> Element {
     }
 }
 
-/// The DDL overlay (FRE-108): one object's definition, read-only, with a copy
+/// The DDL overlay: one object's definition, read-only, with a copy
 /// action. Dismissed by the ✕, a backdrop click, or Escape — handled here
 /// rather than by the window listener, which ignores keys while the `<pre>`
 /// container has focus.
@@ -585,7 +585,7 @@ fn CopyDdlButton(text: String) -> Element {
 }
 
 /// Whether a column row offers to rename the column, and why it does not when
-/// it is offered but unavailable (FRE-122).
+/// it is offered but unavailable.
 ///
 /// [`Hidden`](Self::Hidden) is for objects where the operation makes no sense
 /// at all — a view — so the column list keeps its shape instead of growing a
@@ -659,10 +659,10 @@ fn ColumnRow(column: ColumnMeta, editing: Signal<Option<SchemaOp>>, rename: Rena
 
 /// The type to show for a column. Postgres reports enum and array columns as
 /// the opaque `USER-DEFINED` / `ARRAY`, so the real name introspected for the
-/// editors (FRE-71) is shown instead — this pane is where a reader most wants
+/// editors is shown instead — this pane is where a reader most wants
 /// it.
 ///
-/// Shared with the grid's row detail panel (FRE-109), which names each field's
+/// Shared with the grid's row detail panel, which names each field's
 /// type beside it: the two views must not disagree about what a column is.
 pub(super) fn display_type(column: &ColumnMeta) -> String {
     match &column.type_detail {

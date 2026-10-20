@@ -1,4 +1,4 @@
-//! The connections screen (FRE-67/FRE-75): the saved-connections list, the
+//! The connections screen: the saved-connections list, the
 //! add/edit connection forms behind their modal, and the cards that take over
 //! when a connect parks on a prompt (password, SSH host key, Entra sign-in).
 //!
@@ -22,8 +22,8 @@ use super::notice::{Banner, BannerKind, EmptyState, Spinner};
 use super::state::{ActiveView, AppState, ConnectStep, ServerBackend};
 
 /// One saved connection's per-row settings, edited inline under its row in
-/// the connections list: which group it is filed under (FRE-120), and its
-/// write protection and accent colour (FRE-111).
+/// the connections list: which group it is filed under, and its
+/// write protection and accent colour.
 ///
 /// Every change writes straight through to the saved list — there is no OK
 /// button. These are small settings with an immediately visible effect (the
@@ -194,16 +194,16 @@ struct SavedRow {
     /// Whether that connect can be cancelled — true when it was started from
     /// this list rather than by submitting a form.
     cancellable: bool,
-    /// The row's write protection and accent colour (FRE-111).
+    /// The row's write protection and accent colour.
     protection: WriteProtection,
     color: Option<ConnectionColor>,
-    /// The group this connection is filed under (FRE-120), if any.
+    /// The group this connection is filed under, if any.
     group: Option<String>,
     tunnel: Option<crate::tunnel::TunnelConfig>,
     auth: ServerAuth,
 }
 
-/// One section of the connections list as it renders (FRE-120): a group and
+/// One section of the connections list as it renders: a group and
 /// its rows, or — with `name` as `None` — the ungrouped ones.
 ///
 /// `first`/`last` are about the group's place in the *configured* order
@@ -218,7 +218,7 @@ struct SectionView {
     last: bool,
 }
 
-/// Whether a section renders folded (FRE-120).
+/// Whether a section renders folded.
 ///
 /// **A search overrides the fold.** [`SavedList::arrange`] has already dropped
 /// every section that matched nothing, so the ones left are hits; leaving one
@@ -255,7 +255,7 @@ fn submit_new_group(
 }
 
 /// One group's header: the fold control, its name and size, and the actions
-/// that only make sense on a group — rename, reorder, delete (FRE-120).
+/// that only make sense on a group — rename, reorder, delete.
 ///
 /// Reordering is a pair of one-step buttons rather than drag-and-drop: a drag
 /// implementation worth using is a dependency, and the thing being ordered is
@@ -432,13 +432,13 @@ fn GroupHeader(
     }
 }
 
-/// Which connection form the modal is showing (FRE-67). SQLite has no
+/// Which connection form the modal is showing. SQLite has no
 /// form — it goes straight to the native file picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ConnectForm {
     Postgres,
     SqlServer,
-    /// Editing an existing saved entry, prefilled from it (FRE-75). Carries
+    /// Editing an existing saved entry, prefilled from it. Carries
     /// the entry itself so the form knows which locator to replace — the
     /// edit may move it.
     ///
@@ -448,7 +448,7 @@ enum ConnectForm {
     Edit(Box<SavedConnection>),
 }
 
-/// Modal shell for the add-connection forms (FRE-67). Follows the app's
+/// Modal shell for the add-connection forms. Follows the app's
 /// overlay pattern (`fixed inset-0 z-50`, dimmed backdrop, centered panel)
 /// with two deliberate differences from the stateless overlays (cheatsheet,
 /// cell viewer):
@@ -520,7 +520,7 @@ fn ConnectFormModal(
 }
 
 /// One saved connection's row. Lifted out of [`ConnectionsScreen`] when
-/// grouping (FRE-120) put a second loop around it: the screen now walks
+/// grouping put a second loop around it: the screen now walks
 /// sections of rows, and 200 lines of row markup inside that walk would have
 /// buried it.
 ///
@@ -549,7 +549,7 @@ fn SavedConnectionRow(
         // the li: as li padding it was dead space that lit up on
         // hover but swallowed the click.
         li { class: "flex flex-wrap items-stretch first:rounded-t last:rounded-b hover:bg-slate-200 dark:hover:bg-slate-800/60",
-            // Accent stripe (FRE-111): the colour warns, and
+            // Accent stripe: the colour warns, and
             // it reads before any text does.
             if let Some(color) = row.color {
                 div {
@@ -620,7 +620,7 @@ fn SavedConnectionRow(
                             "open"
                         }
                     }
-                    // Protection is never silent (FRE-111):
+                    // Protection is never silent:
                     // the user should never wonder why a save
                     // button is disabled or a prompt appeared.
                     if let Some(badge) = row.protection.badge() {
@@ -755,7 +755,7 @@ fn SavedConnectionRow(
                     }
                 }
             }
-            // The settings editor (FRE-111, FRE-120), expanded
+            // The settings editor, expanded
             // inline below its row — the row is already a
             // full-width click target, so a floating popover
             // would have to be dismissed before the row could
@@ -778,24 +778,24 @@ fn SavedConnectionRow(
 pub(super) fn ConnectionsScreen() -> Element {
     let state = use_context::<AppState>();
     // One open form at a time (they were a mutually-exclusive bool pair
-    // before FRE-67); `None` means no modal is up.
+    // before the forms moved into a modal); `None` means no modal is up.
     let mut open_form = use_signal(|| Option::<ConnectForm>::None);
     // Locator of the row whose Remove is armed, if any. Removing is instant
     // and unrecoverable (a server entry takes its keyring password with it),
     // so the trash icon only arms the confirmation — one row at a time, since
     // arming another replaces this.
     let confirm_remove = use_signal(|| Option::<String>::None);
-    // Which row's settings editor is expanded: group (FRE-120), write
-    // protection and colour (FRE-111).
+    // Which row's settings editor is expanded: group, write
+    // protection and colour.
     let settings_open = use_signal(|| Option::<String>::None);
-    // The connections search (FRE-120). Local to this screen, like the
+    // The connections search. Local to this screen, like the
     // sidebar's filter: it narrows a view rather than changing anything, so
     // it is not persisted and the screen opens unfiltered.
     let mut search = use_signal(String::new);
     // The "New group" field, shown only while it is being typed into.
     let mut naming_group = use_signal(|| false);
     let mut new_group = use_signal(String::new);
-    // Which group's name is being edited, and the draft (FRE-120).
+    // Which group's name is being edited, and the draft.
     let renaming_group = use_signal(|| Option::<String>::None);
     let rename_draft = use_signal(String::new);
     // Which group's Delete is armed — same one-at-a-time arming as a row's.
@@ -830,7 +830,7 @@ pub(super) fn ConnectionsScreen() -> Element {
     // Whether anything is saved at all — the empty state's condition, which
     // a search that matches nothing must not trigger.
     let has_saved = !state.saved.read().entries().is_empty();
-    // The list as it renders (FRE-120): each group in its configured order
+    // The list as it renders: each group in its configured order
     // with the connections filed under it, then the ungrouped ones, narrowed
     // by the search box. `arrange` owns those two rules so the render body
     // stays a straight walk over what it returned.
@@ -915,7 +915,7 @@ pub(super) fn ConnectionsScreen() -> Element {
                     hint: "Add a SQLite file, Postgres server, or SQL Server to get started.",
                 }
             }
-            // Search and group creation (FRE-120). Both only appear once
+            // Search and group creation. Both only appear once
             // there is a list to organise — on an empty screen they would be
             // two controls with nothing to act on.
             if has_saved {
@@ -1146,7 +1146,7 @@ pub(super) fn ConnectionsScreen() -> Element {
 
 /// Cancel for the three connect prompt cards (password/passphrase, host-key
 /// trust, Entra sign-in): clears the card, and with it any saved-connection
-/// edit still waiting for the parked connect to confirm it (FRE-75) — an
+/// edit still waiting for the parked connect to confirm it — an
 /// abandoned connect must never rewrite the entry it started from.
 fn cancel_prompt<T: 'static>(state: AppState, mut prompt: Signal<Option<T>>) {
     state.clear_pending_edit();
@@ -1164,7 +1164,7 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
     let state = use_context::<AppState>();
     let mut password = use_signal(String::new);
     // Seeded from the prompt, not from `true`: a re-prompt after a rejected
-    // passphrase carries the answer the user already gave (FRE-162).
+    // passphrase carries the answer the user already gave.
     //
     // The seed only decides the box when this card was actually unmounted in
     // between — its `key:` is url + kind, which a re-prompt for the same
@@ -1184,7 +1184,7 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
         // its next await, silently abandoning the connect.
         dioxus::core::spawn_forever(async move {
             // The prompt carries the backend the parked connect was for, so
-            // the retry resumes on the same engine (FRE-139).
+            // the retry resumes on the same engine.
             match prompt.kind {
                 PromptKind::DbPassword => {
                     state
@@ -1301,7 +1301,7 @@ fn HostKeyPromptCard(prompt: super::state::HostKeyPrompt) -> Element {
     }
 }
 
-/// Interactive Entra sign-in prompt (FRE-44). A Postgres or SQL Server connect
+/// Interactive Entra sign-in prompt. A Postgres or SQL Server connect
 /// needs a Microsoft browser sign-in (no cached refresh token); the button
 /// opens the browser and completes the connect, Cancel abandons it.
 #[component]
@@ -1355,8 +1355,7 @@ fn EntraSignInCard(prompt: super::state::EntraPrompt) -> Element {
 #[derive(Clone, Copy)]
 struct ServerFormState {
     name: Signal<String>,
-    /// Never prefilled; empty means "keep whatever the keyring holds"
-    /// (FRE-75).
+    /// Never prefilled; empty means "keep whatever the keyring holds".
     password: Signal<String>,
     remember: Signal<bool>,
     use_url: Signal<bool>,
@@ -1374,7 +1373,7 @@ struct ServerFormState {
     form_error: Signal<Option<String>>,
 }
 
-/// The submit pipeline both connection forms run (FRE-139): validate the
+/// The submit pipeline both connection forms run: validate the
 /// tunnel fields, take the SSH passphrase and any password embedded in a
 /// pasted URL, settle the display name and auth mode, register the pending
 /// edit, carry a moved secret across, then dispatch the connect and close (and
@@ -1436,7 +1435,7 @@ fn submit_server_form(
         }
     };
     let display_name = display_name_for(&form.name.peek(), &url);
-    // Authentication mode from the selector (FRE-44/FRE-58). Entra takes the
+    // Authentication mode from the selector. Entra takes the
     // `user` field as the Entra principal; a token replaces the password.
     let auth: ServerAuth = match auth_from_form(
         &form.auth_mode.peek(),
@@ -1470,15 +1469,14 @@ fn submit_server_form(
     dioxus::core::spawn_forever(async move {
         // An edit is saved by whichever path confirms the connect — including
         // the Entra sign-in card, which resolves after this form has closed —
-        // so the intent is registered up front rather than applied here
-        // (FRE-75).
+        // so the intent is registered up front rather than applied here.
         if let Some(old) = &old_locator {
             state.set_pending_edit(old.clone(), url.clone());
         }
         // "Leave the password empty to keep the existing one" has to keep
         // working when the edit moves the locator: the stored secret is still
         // filed under the OLD one, and the connect below looks up the new.
-        // Carry it over first (FRE-75).
+        // Carry it over first.
         if entered_password.is_empty() {
             if let Some(old) = old_locator.as_ref().filter(|old| **old != url) {
                 if let Ok(Some(stored)) = crate::secrets::get_password_async(old.clone()).await {
@@ -1593,7 +1591,7 @@ fn display_name_for(entered: &str, url: &str) -> String {
 /// SSH tunnel.
 #[component]
 fn PostgresForm(
-    /// The saved entry being edited (FRE-75); `None` is the add flow. Its
+    /// The saved entry being edited; `None` is the add flow. Its
     /// locator is the key to replace on save — the edit may move it.
     edit: Option<SavedConnection>,
     on_done: EventHandler<()>,
@@ -1611,7 +1609,7 @@ fn PostgresForm(
     let form = ServerFormState {
         name: use_signal(|| seed.name.clone()),
         // Never prefilled: the stored secret isn't shown, and an empty field
-        // on save means "keep the existing keyring entry" (FRE-75).
+        // on save means "keep the existing keyring entry".
         password: use_signal(String::new),
         remember: use_signal(|| true),
         use_url: use_signal(|| false),
@@ -1652,7 +1650,7 @@ fn PostgresForm(
 
     let submit = move || {
         // The URL is this form's own step; everything else is the shared
-        // pipeline (FRE-139).
+        // pipeline.
         let built = if *use_url.peek() {
             crate::db::normalize_pg_url(&pasted_url.peek())
         } else {
@@ -1747,7 +1745,7 @@ fn PostgresForm(
                         }
                     }
                 }
-                // Authentication mode (FRE-44). Entra uses the user field as the
+                // Authentication mode. Entra uses the user field as the
                 // principal and a token instead of a password.
                 AuthModeFields { auth_mode, entra_tenant, entra_client_id }
                 if auth_mode() == "password" {
@@ -1801,16 +1799,16 @@ fn PostgresForm(
     }
 }
 
-/// Add-SQL-Server panel (FRE-57): individual fields or a pasted `mssql://`
-/// URL, plus the Auth dropdown (password / Entra ID) and optional SSH tunnel
-/// (both FRE-58). Deliberately close to [`PostgresForm`] but kept separate —
+/// Add-SQL-Server panel: individual fields or a pasted `mssql://`
+/// URL, plus the Auth dropdown (password / Entra ID) and optional SSH tunnel.
+/// Deliberately close to [`PostgresForm`] but kept separate —
 /// the two share the field styling, the auth/tunnel fieldsets
 /// ([`AuthModeFields`] / [`SshTunnelFields`] and their validation helpers),
 /// and the display-name fallback, while the option sets (encrypt vs sslmode,
 /// trust-server-cert) differ enough that one shared form wasn't worth it.
 #[component]
 fn SqlServerForm(
-    /// The saved entry being edited (FRE-75); `None` is the add flow.
+    /// The saved entry being edited; `None` is the add flow.
     edit: Option<SavedConnection>,
     on_done: EventHandler<()>,
 ) -> Element {
@@ -1874,7 +1872,7 @@ fn SqlServerForm(
     let submit = move || {
         // The URL is this form's own step — the encrypt option and the
         // trust-server-certificate flag are SQL Server's alone; everything
-        // else is the shared pipeline (FRE-139).
+        // else is the shared pipeline.
         let built = if *use_url.peek() {
             crate::db::normalize_mssql_url(&pasted_url.peek())
         } else {
@@ -1993,7 +1991,7 @@ fn SqlServerForm(
                         "Trust the server certificate (self-signed / dev servers)"
                     }
                 }
-                // Authentication mode (FRE-58). Entra uses the user field as
+                // Authentication mode. Entra uses the user field as
                 // the principal and a token instead of a password.
                 AuthModeFields { auth_mode, entra_tenant, entra_client_id }
                 if auth_mode() == "password" {
@@ -2077,9 +2075,10 @@ mod tests {
 
     #[test]
     fn the_prompt_card_offers_the_choice_the_prompt_carries() {
-        // The last hop of FRE-162, and the one that can silently undo all of
-        // it: `withdraw_ssh_remember` can compute the right answer and
-        // `PasswordPrompt` can carry it faithfully while the card initialises
+        // The last hop of the "remember passphrase" wire, and the one that
+        // can silently undo all of it: `withdraw_ssh_remember` can compute
+        // the right answer and `PasswordPrompt` can carry it faithfully while
+        // the card initialises
         // its checkbox from a literal `true` — which is exactly the code this
         // replaced. Every state-side test stays green through that.
         //
@@ -2088,8 +2087,8 @@ mod tests {
         // line of it.
         // Read a line at a time rather than by byte offsets into literals
         // containing `\n`: a `"\n}\n"` search for the end of the function
-        // would fail on a CRLF checkout, which is the FRE-160 trap that
-        // `tests/line_endings.rs` keeps this file clear of.
+        // would fail on a CRLF checkout — the trap that once turned Windows
+        // CI red, and that `tests/line_endings.rs` keeps this file clear of.
         let source = include_str!("connections.rs");
         let card: Vec<&str> = source
             .lines()
@@ -2107,7 +2106,7 @@ mod tests {
             !body.contains("use_signal(|| true)"),
             "the card re-ticks the remember box on every prompt, so unticking \
              it and then mistyping the passphrase silently restores the \
-             decision to store it (FRE-162): {body}"
+             decision to store it: {body}"
         );
         // Polarity, not merely the mention: `let offered = !prompt.remember;`
         // reads as correctly wired up while offering every user the opposite
@@ -2118,10 +2117,11 @@ mod tests {
             "the card ignores the choice the prompt carries, or inverts it: {body}"
         );
         // The other end of the same value, which this slice already covers:
-        // what the box holds when the card submits. Older than FRE-162 and
-        // unchanged by it, but it is the same one-line inversion at the same
-        // seam — and `!*remember.peek()` would send every user the opposite of
-        // the box they ticked, on the read this test is already looking at.
+        // what the box holds when the card submits. This read predates the
+        // fix that built the rest of the wire and was unchanged by it, but it
+        // is the same one-line inversion at the same seam — and
+        // `!*remember.peek()` would send every user the opposite of the box
+        // they ticked, on the read this test is already looking at.
         assert!(
             body.contains("let remember_choice = *remember.peek();"),
             "the card submits something other than the box as ticked, so the \
@@ -2266,8 +2266,8 @@ fn tunnel_from_form(
 }
 
 /// Builds the auth mode from the form's Auth selector ("password",
-/// "entra-interactive", or "entra-mi") and Entra fields — the FRE-44/FRE-49
-/// validation shared by both server forms.
+/// "entra-interactive", or "entra-mi") and Entra fields — the validation
+/// shared by both server forms.
 fn auth_from_form(mode: &str, tenant: &str, client_id: &str) -> Result<ServerAuth, String> {
     use crate::azure::EntraAuth;
     let client = client_id.trim().to_string();
@@ -2289,7 +2289,7 @@ fn auth_from_form(mode: &str, tenant: &str, client_id: &str) -> Result<ServerAut
     }
 }
 
-/// FRE-49 validation shared by both server forms: Entra needs the URL's
+/// Validation shared by both server forms: Entra needs the URL's
 /// username as the principal — an empty one would fail later at the server
 /// with an opaque error.
 fn entra_principal_missing(url: &str) -> bool {

@@ -1,4 +1,4 @@
-//! Copying a cell selection to the clipboard (FRE-110): planning what the
+//! Copying a cell selection to the clipboard: planning what the
 //! selection covers, refusing what cannot be copied faithfully, fetching any
 //! truncated cells first, and writing the result out.
 //!
@@ -8,7 +8,7 @@
 
 use super::*;
 
-/// The clipboard formats in copy-as menu order (FRE-110). TSV leads: it is
+/// The clipboard formats in copy-as menu order. TSV leads: it is
 /// what the plain shortcut produces and what spreadsheets want.
 pub(super) const COPY_FORMATS: [CopyFormat; 6] = [
     CopyFormat::Tsv { header: false },
@@ -19,7 +19,7 @@ pub(super) const COPY_FORMATS: [CopyFormat; 6] = [
     CopyFormat::Markdown,
 ];
 
-/// Outcome of the most recent copy, shown as a toolbar line (FRE-110). It
+/// Outcome of the most recent copy, shown as a toolbar line. It
 /// stays until the next copy or a selection/page change, mirroring how the
 /// export status behaves.
 #[derive(Debug, Clone, PartialEq)]
@@ -62,9 +62,9 @@ pub(super) struct CopyContext {
 }
 
 /// One cell of a planned copy: a value already held in full, or a ticket to
-/// load one the grid holds only a bounded preview of (FRE-33). Copying a
-/// preview would put silently truncated data on the clipboard, which is the
-/// one thing FRE-110 must not do.
+/// load one the grid holds only a bounded preview of. Copying a
+/// preview would put silently truncated data on the clipboard, which copying
+/// must never do: a truncated INSERT is still valid SQL, and would run.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum CopyCell {
     Ready(Value),
@@ -79,7 +79,7 @@ pub(super) struct CopyPlan {
     pub(super) rows: Vec<Vec<CopyCell>>,
 }
 
-/// Why a copy was refused outright (FRE-110). Refusing beats truncating: a
+/// Why a copy was refused outright. Refusing beats truncating: a
 /// truncated INSERT is still valid SQL and will run, writing wrong data with
 /// no error anywhere.
 #[derive(Debug, Clone, PartialEq)]
@@ -116,8 +116,8 @@ impl CopyRefusal {
     }
 }
 
-/// Reduces a selection over the visible page to a [`CopyPlan`], or refuses it
-/// (FRE-110). Pure — the async value loading happens in [`start_copy`].
+/// Reduces a selection over the visible page to a [`CopyPlan`], or refuses it.
+/// Pure — the async value loading happens in [`start_copy`].
 ///
 /// Cells outside the page (a selection racing a shrinking page) are skipped
 /// rather than erroring; the clamp effect normally prevents that.
@@ -176,7 +176,7 @@ pub(super) fn plan_copy(nav: &GridNav, selection: Selection) -> Result<CopyPlan,
 
 /// Copies `selection` to the clipboard in `format` — or, for `None` (the
 /// plain Ctrl+C shortcut), as the raw value of a single cell and TSV for a
-/// block (FRE-110).
+/// block.
 ///
 /// Plans synchronously so an oversize selection is refused before anything
 /// runs, then resolves any previewed cells to their full values in a spawned
@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn copy_plan_tickets_previewed_cells_for_a_fetch() {
         // A truncated cell must never be copied from the page: the plan asks
-        // for the full value through the row's locator (FRE-110).
+        // for the full value through the row's locator.
         let nav = previewed_nav(PREVIEW_BYTES as u64 * 4, Some(&pk_identity()));
         let plan = plan_copy(&nav, Selection::all(1, 2).unwrap()).unwrap();
         assert_eq!(

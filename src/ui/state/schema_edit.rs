@@ -1,4 +1,4 @@
-//! Running one schema edit in the background (FRE-122).
+//! Running one schema edit in the background.
 //!
 //! The same shape as the import task next door: `spawn_forever` so a pane
 //! switch cannot cancel a statement mid-flight, a per-connection status signal,
