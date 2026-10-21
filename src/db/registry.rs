@@ -213,9 +213,7 @@ impl ReadOnlyRun {
                 let mut tx = postgres::begin_read_only(conn, begin).await?;
                 let result =
                     postgres::query_capped_conn(&mut tx, sql, max_rows, QUERY_CELL_CAP).await;
-                let ended = postgres::end_read_only(tx).await;
-                ended_read_only(conn, ended)?;
-                result
+                read_only_outcome(result, postgres::end_read_only(tx).await)
             }
         }
     }
@@ -229,9 +227,7 @@ impl ReadOnlyRun {
             ReadOnlyRun::Postgres { conn, begin } => {
                 let mut tx = postgres::begin_read_only(conn, begin).await?;
                 let result = postgres::execute_conn(&mut tx, sql).await;
-                let ended = postgres::end_read_only(tx).await;
-                ended_read_only(conn, ended)?;
-                result
+                read_only_outcome(result, postgres::end_read_only(tx).await)
             }
         }
     }
@@ -247,17 +243,25 @@ impl ReadOnlyRun {
     }
 }
 
-/// Passes on how a read-only statement's rollback went, closing the
-/// connection rather than returning it to the pool when it failed — its
-/// transaction state is no longer known.
-fn ended_read_only(
-    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+/// A read-only statement's outcome, given how its rollback went: the
+/// statement's own error first — it is the one that says what happened, where
+/// a failed rollback after it usually only says the connection is gone (a
+/// statement that ran `pg_terminate_backend(pg_backend_pid())`, say) — then
+/// the rollback's, so a statement is never reported as done when its
+/// transaction may still be open.
+///
+/// Nothing else is needed for the connection: a failed rollback leaves sqlx's
+/// `Transaction` open, its drop queues another `ROLLBACK`, and the pool pings
+/// a connection on release, which sends that rollback or discards a dead
+/// connection. `a_marked_connection_recovers_from_a_statement_that_kills_it`
+/// pins the result.
+fn read_only_outcome<T>(
+    result: Result<T, DbError>,
     ended: Result<(), DbError>,
-) -> Result<(), DbError> {
-    if ended.is_err() {
-        conn.close_on_drop();
-    }
-    ended
+) -> Result<T, DbError> {
+    let value = result?;
+    ended?;
+    Ok(value)
 }
 
 /// Whether this dialect's engine has a read-only mode a marked connection's
@@ -954,6 +958,22 @@ impl ConnectionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_read_only_statement_reports_its_own_error_before_its_rollbacks() {
+        let statement = || DbError::Query("terminating connection".into());
+        let rollback = || DbError::Query("connection closed".into());
+        assert_eq!(
+            read_only_outcome(Err::<(), _>(statement()), Err(rollback())),
+            Err(statement())
+        );
+        assert_eq!(read_only_outcome(Ok(7), Err(rollback())), Err(rollback()));
+        assert_eq!(
+            read_only_outcome(Err::<(), _>(statement()), Ok(())),
+            Err(statement())
+        );
+        assert_eq!(read_only_outcome(Ok(7), Ok(())), Ok(7));
+    }
 
     #[test]
     fn paged_reads_are_refused_without_querying_or_offset_paging() {

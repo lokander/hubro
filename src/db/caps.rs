@@ -236,12 +236,27 @@ pub enum WriteProtection {
     /// against mistakes, and a login without write permissions is what stops a
     /// determined user.
     ///
-    /// On Postgres the engine's read-only mode is about *this database*: it
-    /// does not stop a function that acts elsewhere — `dblink_exec` writing
-    /// through a connection of its own, `pg_terminate_backend`, advisory
-    /// locks, `pg_notify` — nor, on SQLite, `VACUUM INTO` writing a copy to a new
-    /// file (measured to run on a read-only connection). The classification
-    /// refuses `VACUUM` and `COPY`; the functions it cannot see.
+    /// **What the engine refuses is a write inside this backend's own
+    /// transaction**, and nothing else. An effect that leaves that
+    /// transaction — through another connection, the WAL, the filesystem or
+    /// another process — is beyond it, whatever the marking says. Known
+    /// instances, each needing a login allowed to call it: `dblink_exec`;
+    /// Citus's `run_command_on_*`, which writes even
+    /// to this database through a connection of Citus's own
+    /// (`tests/db_read_only.rs` pins that); `pg_terminate_backend`;
+    /// session-level advisory locks; `pg_logical_emit_message` (a
+    /// non-transactional WAL record); `lo_export` (a file on the server);
+    /// `pg_create_physical_replication_slot` (a slot that outlives the
+    /// rollback and holds WAL until someone drops it); and SQLite's `VACUUM
+    /// INTO`, which writes a copy to a new file (measured to run on a
+    /// read-only connection). The classification refuses the statements
+    /// among these (`VACUUM`, `COPY`); the functions it cannot see.
+    ///
+    /// Not on that list: `pg_notify`, which the engine allows in a read-only
+    /// transaction but which is delivered only on commit — the always-rollback
+    /// is what stops it (measured: a listener received nothing). Nor is a
+    /// `postgres_fdw` foreign table, loopback or not: the `INSERT` into it is
+    /// refused here, in this transaction (measured).
     ReadOnly,
 }
 
