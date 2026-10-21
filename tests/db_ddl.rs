@@ -216,11 +216,24 @@ async fn sqlite_a_dropped_index_is_missing_rather_than_a_constraint_index() {
 async fn sqlite_statements_ending_in_a_line_comment_stay_runnable() {
     // `sqlite_master` stores the statement exactly as written, comment and
     // all. Appending `;` to a trailing `--` line comments the terminator out,
-    // and the two indexes then arrive as one unparseable statement.
+    // and the indexes then arrive as one unparseable statement.
+    //
+    // Only the *last* comment decides: a closed one earlier in the text says
+    // nothing about the end (the table, `ix2`), and a `;` at the end of a
+    // comment is not a terminator (`ix3`). Where a comment ends is SQLite's
+    // rule, not another engine's: a bare `\r` ends one on Postgres and SQL
+    // Server but not here, so `ix4`'s comment runs to the end.
+    //
+    // SQLite keeps a trailing comment only when a `;` follows it on a later
+    // line — at the very end of the input it stores the text up to the last
+    // token — so each statement here is written that way.
     let fixture = FixtureDb::with_sql(
-        "CREATE TABLE t (a INTEGER, b INTEGER);\n\
+        "CREATE TABLE t ( -- columns\n a INTEGER, b INTEGER) -- trailing\n;\n\
          CREATE INDEX ix1 ON t(a) -- first\n;\n\
-         CREATE INDEX ix2 ON t(b) -- second\n;",
+         CREATE INDEX ix2 ON t(a, b) -- by date\n  WHERE b IS NOT NULL -- partial\n;\n\
+         CREATE INDEX ix3 ON t(b, a) -- note;\n;\n\
+         CREATE INDEX ix4 ON t(b, a) -- not partial\rWHERE a > 0\n;\n\
+         CREATE INDEX ix5 ON t(b) -- last\n;",
     )
     .await;
     let pool = fixture.open().await;
@@ -231,7 +244,7 @@ async fn sqlite_statements_ending_in_a_line_comment_stay_runnable() {
         .unwrap();
     assert!(ddl.sql.contains("-- first\n;"), "{}", ddl.sql);
 
-    // The real assertion: the emitted text runs, and rebuilds both indexes.
+    // The real assertion: the emitted text runs, and rebuilds every index.
     let target = FixtureDb::with_sql("").await;
     let target_pool = target.open().await;
     run_ddl(&target_pool, &ddl.sql).await;
@@ -242,7 +255,7 @@ async fn sqlite_statements_ending_in_a_line_comment_stay_runnable() {
         .map(|i| i.name.as_str())
         .collect();
     names.sort_unstable();
-    assert_eq!(names, ["ix1", "ix2"]);
+    assert_eq!(names, ["ix1", "ix2", "ix3", "ix4", "ix5"]);
 }
 
 #[tokio::test]

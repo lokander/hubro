@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 
 use super::schema::{IndexMeta, TableKind, TableMeta};
+use super::script;
 use super::sql::{qualified, quote_ident, Dialect};
 
 /// Which of a table's objects to render DDL for.
@@ -194,55 +195,28 @@ pub struct IndexExtras {
 /// line comment — `sqlite_master` happily stores `CREATE INDEX … -- note`, and
 /// appending `;` to that line comments the terminator out. One unterminated
 /// statement then swallows the next one, and the whole output stops being
-/// runnable.
-pub fn terminate(sql: &str) -> String {
+/// runnable. Likewise a `;` that ends a comment (`-- note;`) is not a
+/// terminator, and still gets one.
+///
+/// Where comments, strings and quoted names start and end is read by the
+/// script lexer for `dialect` — the same reading the script tab splits on
+/// when the text is run back — rather than by a second scanner of its own.
+pub fn terminate(sql: &str, dialect: Dialect) -> String {
     let trimmed = sql.trim_end();
-    if trimmed.ends_with(';') {
+    if script::ends_with_terminator(trimmed, dialect) {
         return trimmed.to_string();
     }
-    if ends_inside_line_comment(trimmed) {
+    if script::ends_in_line_comment(trimmed, dialect) {
         format!("{trimmed}\n;")
     } else {
         format!("{trimmed};")
     }
 }
 
-/// Whether `sql` ends while a `--` line comment is still open. Scans string
-/// literals, quoted identifiers, and block comments so a `--` inside any of
-/// them doesn't count.
-fn ends_inside_line_comment(sql: &str) -> bool {
-    let bytes = sql.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                // A line comment runs to the newline; reaching the end without
-                // one means the statement ends inside it.
-                return !sql[i..].contains('\n');
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => match sql[i + 2..].find("*/") {
-                Some(end) => i += 2 + end + 2,
-                // Unterminated block comment: nothing can close it, so the
-                // terminator has to go on its own line either way.
-                None => return true,
-            },
-            quote @ (b'\'' | b'"' | b'`') => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != quote {
-                    i += 1;
-                }
-                i += 1;
-            }
-            _ => i += 1,
-        }
-    }
-    false
-}
-
 /// Wraps a native view body (`pg_get_viewdef`) in the `CREATE VIEW` header
 /// the server does not return. Only Postgres needs this: SQLite and SQL
 /// Server both store the complete original statement.
-pub fn create_view_sql(table: &TableMeta, body: &str) -> String {
+pub fn create_view_sql(dialect: Dialect, table: &TableMeta, body: &str) -> String {
     let keyword = match table.kind {
         TableKind::MaterializedView => "CREATE MATERIALIZED VIEW",
         _ => "CREATE VIEW",
@@ -250,7 +224,7 @@ pub fn create_view_sql(table: &TableMeta, body: &str) -> String {
     let name = qualified(table.schema.as_deref(), &table.name);
     // pg_get_viewdef(…, true) pretty-prints and terminates with a semicolon
     // already; anything else gets one so the statement is runnable.
-    format!("{keyword} {name} AS\n{}", terminate(body))
+    format!("{keyword} {name} AS\n{}", terminate(body, dialect))
 }
 
 /// Renders `CREATE TABLE` from `table` plus whatever `extras` the backend
@@ -274,7 +248,7 @@ pub fn create_table_sql(dialect: Dialect, table: &TableMeta, extras: &TableExtra
     );
     for index in &extras.indexes {
         sql.push_str("\n\n");
-        sql.push_str(&terminate(index));
+        sql.push_str(&terminate(index, dialect));
     }
 
     let mut caveats = extras.caveats.clone();
@@ -639,44 +613,77 @@ mod tests {
 
     #[test]
     fn terminate_keeps_a_trailing_line_comment_from_eating_the_semicolon() {
-        assert_eq!(
-            terminate("CREATE INDEX i ON t(a)"),
-            "CREATE INDEX i ON t(a);"
-        );
-        assert_eq!(
-            terminate("CREATE INDEX i ON t(a);\n"),
-            "CREATE INDEX i ON t(a);"
-        );
+        let lite = |sql| terminate(sql, Dialect::Sqlite);
+        assert_eq!(lite("CREATE INDEX i ON t(a)"), "CREATE INDEX i ON t(a);");
+        assert_eq!(lite("CREATE INDEX i ON t(a);\n"), "CREATE INDEX i ON t(a);");
         // `sqlite_master` stores the statement as written, comment and all;
         // appending `;` to that last line would comment the terminator out and
         // silently swallow whatever statement follows.
         assert_eq!(
-            terminate("CREATE INDEX i ON t(a) -- note"),
+            lite("CREATE INDEX i ON t(a) -- note"),
             "CREATE INDEX i ON t(a) -- note\n;"
+        );
+        // Only the last comment decides: one closed earlier says nothing
+        // about whether another is open at the end.
+        for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
+            assert_eq!(
+                terminate(
+                    "CREATE INDEX i ON t(a) -- by date\n  WHERE b IS NOT NULL -- partial",
+                    dialect
+                ),
+                "CREATE INDEX i ON t(a) -- by date\n  WHERE b IS NOT NULL -- partial\n;"
+            );
+        }
+        // A `;` that ends a comment is not a terminator.
+        assert_eq!(
+            lite("CREATE INDEX i ON t(a) -- note;"),
+            "CREATE INDEX i ON t(a) -- note;\n;"
         );
         // A closed comment, or one inside a literal/identifier, is not open at
         // the end and needs no special treatment.
         assert_eq!(
-            terminate("CREATE INDEX i -- note\n ON t(a)"),
+            lite("CREATE INDEX i -- note\n ON t(a)"),
             "CREATE INDEX i -- note\n ON t(a);"
         );
         assert_eq!(
-            terminate("CREATE TABLE t (a TEXT DEFAULT '-- not a comment')"),
+            lite("CREATE TABLE t (a TEXT DEFAULT '-- not a comment')"),
             "CREATE TABLE t (a TEXT DEFAULT '-- not a comment');"
         );
         assert_eq!(
-            terminate("CREATE TABLE t (\"a -- b\" TEXT)"),
+            lite("CREATE TABLE t (\"a -- b\" TEXT)"),
             "CREATE TABLE t (\"a -- b\" TEXT);"
         );
         // Doubled quotes inside a literal keep the scanner in step.
         assert_eq!(
-            terminate("CREATE TABLE t (a TEXT DEFAULT 'O''Brien') /* tail */"),
+            lite("CREATE TABLE t (a TEXT DEFAULT 'O''Brien') /* tail */"),
             "CREATE TABLE t (a TEXT DEFAULT 'O''Brien') /* tail */;"
         );
-        assert_eq!(
-            terminate("CREATE TABLE t (a) /* unclosed"),
-            "CREATE TABLE t (a) /* unclosed\n;"
-        );
+    }
+
+    #[test]
+    fn terminate_reads_comments_as_its_dialect_does() {
+        // Each pair is one text the engines disagree about, so the answer
+        // has to come from the dialect rather than from one fixed scanner.
+        //
+        // `[…]` is a quoted name on SQLite and an array subscript on Postgres.
+        let sql = "CREATE TABLE t ([a -- b] TEXT)";
+        assert_eq!(terminate(sql, Dialect::Sqlite), format!("{sql};"));
+        assert_eq!(terminate(sql, Dialect::Postgres), format!("{sql}\n;"));
+        // A bare `\r` ends a line comment on Postgres and SQL Server, and not
+        // on SQLite.
+        let sql = "CREATE INDEX i ON t(a) -- note\rWHERE a > 0";
+        assert_eq!(terminate(sql, Dialect::Postgres), format!("{sql};"));
+        assert_eq!(terminate(sql, Dialect::SqlServer), format!("{sql};"));
+        assert_eq!(terminate(sql, Dialect::Sqlite), format!("{sql}\n;"));
+        // Block comments nest on Postgres, so the `--` is still inside one;
+        // SQLite closes the comment at the first `*/` and opens a line
+        // comment after it.
+        let sql = "CREATE INDEX i ON t(a) /* x /* y */ -- z */";
+        assert_eq!(terminate(sql, Dialect::Postgres), format!("{sql};"));
+        assert_eq!(terminate(sql, Dialect::Sqlite), format!("{sql}\n;"));
+        // A `--` inside a dollar quote is the function's text.
+        let sql = "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 -- one $$";
+        assert_eq!(terminate(sql, Dialect::Postgres), format!("{sql};"));
     }
 
     #[test]
@@ -813,16 +820,16 @@ mod tests {
         let mut meta = table(Some("public"), "v", vec![]);
         meta.kind = TableKind::View;
         assert_eq!(
-            create_view_sql(&meta, " SELECT 1;\n"),
+            create_view_sql(Dialect::Postgres, &meta, " SELECT 1;\n"),
             "CREATE VIEW \"public\".\"v\" AS\n SELECT 1;"
         );
         // A body without the server's semicolon still gets one.
         assert_eq!(
-            create_view_sql(&meta, "SELECT 1"),
+            create_view_sql(Dialect::Postgres, &meta, "SELECT 1"),
             "CREATE VIEW \"public\".\"v\" AS\nSELECT 1;"
         );
         meta.kind = TableKind::MaterializedView;
-        assert!(create_view_sql(&meta, "SELECT 1")
+        assert!(create_view_sql(Dialect::Postgres, &meta, "SELECT 1")
             .starts_with("CREATE MATERIALIZED VIEW \"public\".\"v\" AS"));
     }
 }
