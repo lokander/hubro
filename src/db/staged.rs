@@ -446,10 +446,12 @@ impl ParamSql {
     /// column gives it one, so `SET int_col = NULL` and
     /// `INSERT … VALUES (NULL, …)` just work on both backends.
     ///
-    /// On Postgres a non-NULL placeholder carries the column's cast when
-    /// one is known (`$1::integer` — see [`cast_target`]), so text-staged
-    /// values (the editor stages rich Postgres types as text)
-    /// coerce to the column type instead of failing the bind-type check.
+    /// A non-NULL placeholder carries the column's cast when [`column_cast`]
+    /// gives one: on Postgres every plain type (`$1::integer` — see
+    /// [`cast_target`]), so text-staged values (the editor stages rich
+    /// Postgres types as text) coerce to the column type instead of failing
+    /// the bind-type check; on SQL Server only a `real`
+    /// (`CAST(@P1 AS real)`), bound typed.
     ///
     /// **On Postgres, under a cast every value binds as text**
     /// ([`cast_text`]), whatever [`Value`] it is, and the cast parses it. sqlx caches a prepared
@@ -596,8 +598,7 @@ pub(super) fn column_cast(column: &ColumnMeta, dialect: Dialect) -> Option<Strin
 /// resolve through `search_path`.
 ///
 /// Skipped (`None`) — the placeholder then binds as before (unknown columns
-/// and non-Postgres dialects never reach here; [`cast_targets`] leaves them
-/// out of the map):
+/// and other dialects never reach here; [`column_cast`] answers for them):
 /// - when the column's type name is empty;
 /// - for `data_type` strings that are not usable/plain type names:
 ///   `ARRAY` and `USER-DEFINED` whose real name didn't resolve, or anything
@@ -1306,6 +1307,41 @@ mod tests {
         let (clause, params) = row_where(&table, &identity, Dialect::SqlServer, &locator).unwrap();
         assert_eq!(clause, " WHERE \"c0\" = CAST(@P1 AS real) AND \"c2\" = @P2");
         assert_eq!(params, vec![Value::Real(0.1), Value::Real(0.1)]);
+
+        // A foreign-key jump into the column binds the same way…
+        let jump = [KeyEquality {
+            column: "c0".into(),
+            value: Value::Real(0.1),
+            target: Some(table.columns[0].clone()),
+        }];
+        assert_eq!(
+            equalities_where(&jump, Dialect::SqlServer),
+            (
+                " WHERE \"c0\" = CAST(@P1 AS real)".to_string(),
+                vec![Value::Real(0.1)]
+            )
+        );
+        // …and so does a SET, all typed: the text bind is Postgres's rule.
+        let (statements, _) = build_statements(
+            &table,
+            &identity,
+            Dialect::SqlServer,
+            &[StagedChange::Update {
+                locator,
+                column: "c1".into(),
+                value: Value::Real(0.25),
+            }],
+        )
+        .unwrap();
+        assert!(
+            statements[0].sql.contains("SET \"c1\" = CAST(@P1 AS real)"),
+            "{}",
+            statements[0].sql
+        );
+        assert_eq!(
+            statements[0].params,
+            [Value::Real(0.25), Value::Real(0.1), Value::Real(0.1)]
+        );
     }
 
     #[test]
@@ -1469,8 +1505,10 @@ mod tests {
                 text("1.0000000149011612e-1")
             ]
         );
-        // And no other dialect casts, so none respells.
-        let (_, params) = row_where(&floats, &both, Dialect::SqlServer, &key(0.5)).unwrap();
+        // No other dialect respells: SQL Server casts a `real` key instead,
+        // and binds it typed.
+        let (clause, params) = row_where(&floats, &both, Dialect::SqlServer, &key(0.5)).unwrap();
+        assert_eq!(clause, " WHERE \"r\" = CAST(@P1 AS real) AND \"d\" = @P2");
         assert_eq!(params, key(0.5).identity_values);
     }
 
