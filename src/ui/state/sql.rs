@@ -329,6 +329,17 @@ impl AppState {
     /// Per buffer, so re-running in one query tab no longer cancels or
     /// discards a run another tab has going.
     fn claim_run_slot(&mut self, id: ConnectionId, buffer: u64) -> u64 {
+        // A new run replaces the results on screen, so a finished export of
+        // one of them has been reported already and its line goes with them
+        // (see `run_retires_sql_export`).
+        if run_retires_sql_export(
+            &self.export_status.peek(),
+            &self.sql_export_sources.peek(),
+            id,
+            buffer,
+        ) {
+            self.sql_export_sources.write().remove(&id);
+        }
         let previous = self.sql_tasks.write().remove(&(id, buffer));
         if let Some(previous) = previous {
             previous.cancel();
@@ -614,29 +625,33 @@ impl AppState {
         // or tab switch) — a plain spawn would cancel it mid-write.
         spawn_forever(async move {
             let runtime = tokio::runtime::Handle::current();
-            let outcome = off_the_ui_thread(move || {
-                use std::io::Write as _;
-                // Stream into a temp file and rename on success, so a
-                // mid-stream failure can't clobber an existing file at `path`.
-                let tmp = export_temp_path(&path);
-                let outcome = runtime.block_on(async {
-                    let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-                    let mut writer = std::io::BufWriter::new(file);
-                    let rows = pool
-                        .export(&sql, &params, format, &mut writer)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    writer.flush().map_err(|e| e.to_string())?;
-                    drop(writer);
-                    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-                    Ok::<u64, String>(rows)
-                });
-                if outcome.is_err() {
-                    let _ = std::fs::remove_file(&tmp);
+            // Stream into a temp file and rename on success, so a mid-stream
+            // failure can't clobber an existing file at `path`.
+            let tmp = export_temp_path(&path);
+            let outcome = off_the_ui_thread({
+                let tmp = tmp.clone();
+                move || {
+                    use std::io::Write as _;
+                    runtime.block_on(async {
+                        let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+                        let mut writer = std::io::BufWriter::new(file);
+                        let rows = pool
+                            .export(&sql, &params, format, &mut writer)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        writer.flush().map_err(|e| e.to_string())?;
+                        drop(writer);
+                        std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+                        Ok::<u64, String>(rows)
+                    })
                 }
-                outcome
             })
             .await;
+            // Out here rather than in the closure, so a panic in the export
+            // (reported as a failed join) does not leave the temp file behind.
+            if outcome.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
             self.finish_export(slot, generation, outcome);
         });
     }
@@ -648,43 +663,53 @@ impl AppState {
     /// Takes the shared statement rather than its rows: the export borrows
     /// them through the `Arc` instead of copying every row on the UI thread
     /// first, and the statement is recorded as the export's source in
-    /// [`Self::sql_export_sources`], so the status line lands on that result
-    /// alone ([`sql_export_status`]).
+    /// [`Self::sql_export_sources`] with the query tab it came from, so the
+    /// status line lands on that result alone ([`sql_export_status`]) — or
+    /// under that tab's run, if the result has been replaced by the time the
+    /// export starts ([`orphaned_sql_export_status`]).
     pub fn export_result(
         mut self,
         id: ConnectionId,
+        buffer: u64,
         statement: SharedStatement,
         format: ExportFormat,
         path: PathBuf,
     ) {
         let slot = (id, ExportPane::Sql);
-        self.sql_export_sources
-            .write()
-            .insert(id, statement.downgrade());
+        self.sql_export_sources.write().insert(
+            id,
+            SqlExportSource {
+                buffer,
+                statement: statement.downgrade(),
+            },
+        );
         let generation = self.begin_export(slot);
         spawn_forever(async move {
-            let outcome = off_the_ui_thread(move || {
-                use std::io::Write as _;
-                let StatementOutcome::Rows(result) = &statement.outcome else {
-                    return Err("this statement returned no rows".to_string());
-                };
-                let tmp = export_temp_path(&path);
-                let outcome = (|| {
-                    let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-                    let mut writer = std::io::BufWriter::new(file);
-                    let rows =
-                        write_result(result, format, &mut writer).map_err(|e| e.to_string())?;
-                    writer.flush().map_err(|e| e.to_string())?;
-                    drop(writer);
-                    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-                    Ok::<u64, String>(rows)
-                })();
-                if outcome.is_err() {
-                    let _ = std::fs::remove_file(&tmp);
+            let tmp = export_temp_path(&path);
+            let outcome = off_the_ui_thread({
+                let tmp = tmp.clone();
+                move || {
+                    use std::io::Write as _;
+                    let StatementOutcome::Rows(result) = &statement.outcome else {
+                        return Err("this statement returned no rows".to_string());
+                    };
+                    (|| {
+                        let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+                        let mut writer = std::io::BufWriter::new(file);
+                        let rows =
+                            write_result(result, format, &mut writer).map_err(|e| e.to_string())?;
+                        writer.flush().map_err(|e| e.to_string())?;
+                        drop(writer);
+                        std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+                        Ok::<u64, String>(rows)
+                    })()
                 }
-                outcome
             })
             .await;
+            // Out here so a panic in the write cleans up too (see above).
+            if outcome.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
             self.finish_export(slot, generation, outcome);
         });
     }
@@ -761,5 +786,16 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(caller, worker);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_export_reports_a_failure() {
+        // The callers remove the temp file on any error, so a panic must come
+        // back as one rather than unwind past them.
+        let outcome = off_the_ui_thread(|| -> Result<(), String> { panic!("boom") }).await;
+        assert!(
+            matches!(&outcome, Err(e) if e.starts_with("export task failed")),
+            "{outcome:?}"
+        );
     }
 }

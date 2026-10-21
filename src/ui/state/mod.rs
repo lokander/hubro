@@ -611,6 +611,14 @@ pub enum ExportStatus {
     Failed(String),
 }
 
+/// What a connection's latest SQL-pane export was taken from: the query tab
+/// it was started in, and the result it wrote.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SqlExportSource {
+    pub buffer: u64,
+    pub statement: StatementRef,
+}
+
 /// The export line one SQL result section shows: the connection's latest
 /// SQL-pane export, on the section of the result it was taken from and on no
 /// other.
@@ -620,18 +628,67 @@ pub enum ExportStatus {
 /// used to draw it: export the first of two `SELECT`s and both claimed
 /// "Exported … rows". Matching the section's own result by identity also
 /// keeps the line off another query tab's results and off the results of a
-/// later run, which the export did not write.
+/// later run, which the export did not write. When that result is no longer
+/// shown at all, [`orphaned_sql_export_status`] puts the line under the run
+/// instead.
 pub fn sql_export_status(
     statuses: &HashMap<(ConnectionId, ExportPane), ExportStatus>,
-    sources: &HashMap<ConnectionId, StatementRef>,
+    sources: &HashMap<ConnectionId, SqlExportSource>,
     id: ConnectionId,
     statement: &SharedStatement,
 ) -> Option<ExportStatus> {
     let source = sources.get(&id)?;
-    if !statement.is(source) {
+    if !statement.is(&source.statement) {
         return None;
     }
     statuses.get(&(id, ExportPane::Sql)).cloned()
+}
+
+/// The export line for a query tab whose exported result is no longer on
+/// screen: `Some` when the latest SQL export was started in `buffer` and
+/// none of the results `shown` there is the one it wrote.
+///
+/// The save dialog is asynchronous, so a script can be rerun while it is
+/// open; the export then writes a result that has already been replaced, and
+/// with the line drawn only beside that result, nothing would report the
+/// outcome — not even a failed write. This is where it goes instead: under
+/// the run in the tab the export was started from.
+pub fn orphaned_sql_export_status(
+    statuses: &HashMap<(ConnectionId, ExportPane), ExportStatus>,
+    sources: &HashMap<ConnectionId, SqlExportSource>,
+    id: ConnectionId,
+    buffer: u64,
+    shown: &[SharedStatement],
+) -> Option<ExportStatus> {
+    let source = sources.get(&id)?;
+    if source.buffer != buffer || shown.iter().any(|s| s.is(&source.statement)) {
+        return None;
+    }
+    statuses.get(&(id, ExportPane::Sql)).cloned()
+}
+
+/// Whether a run starting in `buffer` retires the connection's SQL export
+/// line: the export was taken from this tab and has finished.
+///
+/// A finished export was reported beside its result, and that result is
+/// about to be replaced; keeping the source would move the line to the run
+/// footer ([`orphaned_sql_export_status`]) after every later run, long after
+/// anyone needed it. An export still running is kept, so its outcome —
+/// success or a failed write — lands under the new run instead of nowhere.
+/// So is one from another query tab, whose results this run does not touch.
+pub fn run_retires_sql_export(
+    statuses: &HashMap<(ConnectionId, ExportPane), ExportStatus>,
+    sources: &HashMap<ConnectionId, SqlExportSource>,
+    id: ConnectionId,
+    buffer: u64,
+) -> bool {
+    sources
+        .get(&id)
+        .is_some_and(|source| source.buffer == buffer)
+        && !matches!(
+            statuses.get(&(id, ExportPane::Sql)),
+            Some(ExportStatus::Running)
+        )
 }
 
 impl ExportStatus {
@@ -1023,7 +1080,7 @@ pub struct AppState {
     /// The result each connection's latest SQL-pane export was taken from,
     /// so only that result's section shows the status
     /// ([`sql_export_status`]).
-    pub sql_export_sources: Signal<HashMap<ConnectionId, StatementRef>>,
+    pub sql_export_sources: Signal<HashMap<ConnectionId, SqlExportSource>>,
     /// Monotonic id per export slot; a finishing task only records its
     /// outcome while it is still the slot's latest export, so a slow export
     /// can't overwrite the status of one started after it.
@@ -1970,11 +2027,17 @@ mod tests {
         // A grid export on the same connection is the grid's line, not this.
         statuses.insert((id, ExportPane::Grid), ExportStatus::Running);
         let mut sources = HashMap::new();
-        sources.insert(id, first.downgrade());
+        sources.insert(
+            id,
+            SqlExportSource {
+                buffer: 3,
+                statement: first.downgrade(),
+            },
+        );
 
         assert_eq!(
             sql_export_status(&statuses, &sources, id, &first),
-            Some(done)
+            Some(done.clone())
         );
         assert_eq!(sql_export_status(&statuses, &sources, id, &second), None);
         // A clone of the exported result is the same result.
@@ -1989,6 +2052,40 @@ mod tests {
             sql_export_status(&statuses, &HashMap::new(), id, &first),
             None
         );
+
+        // The run-level line is the other half: it shows exactly when the
+        // exported result is not on screen in the tab it came from — a rerun
+        // while the save dialog was open — so the outcome is never unshown.
+        let orphaned = |buffer, shown: &[SharedStatement]| {
+            orphaned_sql_export_status(&statuses, &sources, id, buffer, shown)
+        };
+        assert_eq!(orphaned(3, &[first.clone(), second.clone()]), None);
+        assert_eq!(
+            orphaned(3, std::slice::from_ref(&rerun)),
+            Some(done.clone())
+        );
+        assert_eq!(orphaned(3, &[]), Some(done.clone()));
+        // Another query tab, or another connection, is not where it was asked.
+        assert_eq!(orphaned(4, std::slice::from_ref(&rerun)), None);
+        assert_eq!(
+            orphaned_sql_export_status(&statuses, &sources, other, 3, &[rerun]),
+            None
+        );
+
+        // A rerun in the export's tab retires a finished export's line, so
+        // it does not follow every later run around; another tab's run
+        // leaves it, and so does any run while the export is still writing —
+        // that outcome has not been shown anywhere yet.
+        assert!(run_retires_sql_export(&statuses, &sources, id, 3));
+        assert!(!run_retires_sql_export(&statuses, &sources, id, 4));
+        assert!(!run_retires_sql_export(&statuses, &sources, other, 3));
+        let failed = HashMap::from([(
+            (id, ExportPane::Sql),
+            ExportStatus::Failed("disk full".into()),
+        )]);
+        assert!(run_retires_sql_export(&failed, &sources, id, 3));
+        let running = HashMap::from([((id, ExportPane::Sql), ExportStatus::Running)]);
+        assert!(!run_retires_sql_export(&running, &sources, id, 3));
     }
 
     #[test]
