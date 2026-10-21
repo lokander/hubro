@@ -121,6 +121,25 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
         _ => 0,
     });
     let internal_count = internal_count();
+    // Which row is highlighted, as an index into the schema's table list.
+    // Derived here, once, rather than by each row: `tab_ui` is one map for
+    // every tab and the SQL editor writes its buffer text into it on every
+    // flush, so a row reading it re-rendered on every keystroke's flush —
+    // 300 of them on a 300-table schema. Behind this memo's equality gate a
+    // flush that leaves the selection alone reaches no row at all, and a
+    // selection change reaches the two rows whose `selected` prop flipped.
+    let selected_index = use_memo(move || {
+        let tab_ui = state.tab_ui.read();
+        let selected = tab_ui.get(&id)?.selected_table.as_ref()?;
+        let schemas = state.schemas.read();
+        let Some(SchemaLoad::Ready(tables)) = schemas.get(&id) else {
+            return None;
+        };
+        tables
+            .iter()
+            .position(|t| t.schema == selected.schema && t.name == selected.name)
+    });
+    let selected_index = selected_index();
     // A schema that contributed no hit contributes no header either, which is
     // what keeps the result reading as a narrowed tree rather than a flat list
     // of names. Read, not cloned — the render below only ever borrows the
@@ -257,6 +276,7 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
                                         key: "{hit.key}",
                                         id,
                                         index: hit.index,
+                                        selected: selected_index == Some(hit.index),
                                         columns: hit.columns.clone(),
                                     }
                                 }
@@ -306,6 +326,9 @@ fn TableNode(
     id: ConnectionId,
     /// Index into the connection's `SchemaLoad::Ready` table list.
     index: usize,
+    /// Whether this is the tab's selected table. A prop rather than a read of
+    /// `tab_ui` here — see `selected_index` in [`SchemaSidebar`].
+    selected: bool,
     /// Positions in the table's `columns` that matched a column-mode filter,
     /// in declaration order. Empty in the default mode.
     #[props(default)]
@@ -356,12 +379,6 @@ fn TableNode(
         schema,
         name: name.clone(),
     };
-    let selected = state
-        .tab_ui
-        .read()
-        .get(&id)
-        .is_some_and(|ui| ui.selected_table.as_ref() == Some(&table_ref));
-
     let select_ref = table_ref.clone();
     let select_from_column = table_ref.clone();
     rsx! {
@@ -437,5 +454,112 @@ fn TableNode(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use dioxus::core::{AttributeValue, Mutation, NoOpMutations, VirtualDom};
+
+    use super::*;
+    use crate::db::{ConnectionRegistry, DbPool, TableKind, TableMeta, WriteProtection};
+    use crate::ui::test_dom::{provide_state, total_renders};
+
+    /// The schema size the per-keystroke cost was measured on.
+    const TABLES: usize = 300;
+
+    fn table(n: usize) -> TableMeta {
+        TableMeta {
+            schema: None,
+            name: format!("t{n:03}"),
+            kind: TableKind::Table,
+            columns: vec![],
+            indexes: vec![],
+            foreign_keys: vec![],
+            restriction: None,
+            internal: None,
+            kind_label: None,
+        }
+    }
+
+    fn table_ref(n: usize) -> TableRef {
+        TableRef {
+            schema: None,
+            name: format!("t{n:03}"),
+        }
+    }
+
+    /// A sidebar over a `TABLES`-table schema with table 0 selected, mounted
+    /// and rendered once.
+    fn mounted_sidebar() -> (VirtualDom, AppState, ConnectionId) {
+        let pool =
+            DbPool::Sqlite(sqlx::sqlite::SqlitePool::connect_lazy("sqlite::memory:").unwrap());
+        let id = ConnectionRegistry::default().insert("t.db", pool, WriteProtection::Open);
+        let mut dom = VirtualDom::new_with_props(SchemaSidebar, SchemaSidebarProps { id });
+        let state = provide_state(&dom);
+        dom.in_runtime(|| {
+            let mut state = state;
+            let tables = (0..TABLES).map(table).collect();
+            state.schemas.write().insert(id, SchemaLoad::Ready(tables));
+            state.tab_ui.write().entry(id).or_default().selected_table = Some(table_ref(0));
+        });
+        let edits = dom.rebuild_to_vec().edits;
+        // Exactly one row mounts highlighted — the one `tab_ui` names.
+        assert_eq!(selection_flips(&edits).0, 1, "{edits:#?}");
+        (dom, state, id)
+    }
+
+    /// How many `data-selected` attributes `edits` set to true, and to false.
+    fn selection_flips(edits: &[Mutation]) -> (usize, usize) {
+        let mut flips = (0, 0);
+        for edit in edits {
+            if let Mutation::SetAttribute {
+                name: "data-selected",
+                value: AttributeValue::Bool(selected),
+                ..
+            } = edit
+            {
+                match selected {
+                    true => flips.0 += 1,
+                    false => flips.1 += 1,
+                }
+            }
+        }
+        flips
+    }
+
+    #[tokio::test]
+    async fn a_sql_editor_flush_re_renders_nothing_in_the_sidebar() {
+        // `tab_ui` is one map for every tab, and the editor writes the
+        // buffer text into it on every flush — every 250 ms while typing.
+        // A row that read the map to decide whether it is the selected one
+        // re-rendered on each of those writes: 300 rows per flush.
+        let (mut dom, state, id) = mounted_sidebar();
+        let mounted = total_renders(&dom);
+        // The mount itself has to have rendered every row, or "nothing
+        // re-rendered" below would hold of an empty list too.
+        assert!(mounted > TABLES, "only {mounted} renders at mount");
+
+        for keystroke in 0..4 {
+            dom.in_runtime(|| state.set_sql_text(id, 0, 0, format!("select {keystroke}")));
+            dom.render_immediate(&mut NoOpMutations);
+        }
+
+        assert_eq!(total_renders(&dom) - mounted, 0);
+    }
+
+    #[tokio::test]
+    async fn selecting_a_table_re_renders_only_the_rows_whose_highlight_changed() {
+        let (mut dom, state, id) = mounted_sidebar();
+        let mounted = total_renders(&dom);
+
+        dom.in_runtime(|| state.select_table(id, &table_ref(7)));
+        let edits = dom.render_immediate_to_vec().edits;
+
+        // The highlight moves: one row lights up, the old one goes dark.
+        assert_eq!(selection_flips(&edits), (1, 1), "{edits:#?}");
+        // And that is all the work: the sidebar itself, which derives the
+        // selection, plus the two rows it changed for.
+        assert_eq!(total_renders(&dom) - mounted, 3);
     }
 }
