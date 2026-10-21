@@ -384,10 +384,8 @@ async fn postgres_rich_types_render_correctly() {
     assert_eq!(*col("iv"), Value::Text("1 mon 2 days 03:04:05".into()));
     assert_eq!(*col("iv_neg"), Value::Text("-3 days".into()));
     // numeric with 28 significant digits survives exactly — proof the
-    // value never went through f64 (which holds ~15-17). rust_decimal
-    // caps at 28-29 significant digits; beyond that the decode fails and
-    // the cell degrades to the <numeric> marker (covered in
-    // postgres_undecodable_cells_degrade_without_erroring_the_page).
+    // value never went through f64 (which holds ~15-17). Wider values are
+    // covered in postgres_values_read_as_the_server_prints_them.
     assert_eq!(
         *col("num"),
         Value::Text("123456789012345678.0987654321".into())
@@ -513,14 +511,18 @@ async fn postgres_undecodable_cells_degrade_without_erroring_the_page() {
         &row[idx]
     };
 
-    // rust_decimal can represent neither NaN nor 39 significant digits;
-    // both cells degrade to the marker instead of erroring the page.
-    assert_eq!(*col("nan_num"), Value::Text("<numeric>".into()));
-    assert_eq!(*col("big_num"), Value::Text("<numeric>".into()));
+    // Neither NaN nor 39 significant digits fits rust_decimal, which these
+    // once went through; they read in full now, and must still not cost
+    // the page.
+    assert_eq!(*col("nan_num"), Value::Text("NaN".into()));
+    assert_eq!(
+        *col("big_num"),
+        Value::Text("123456789012345678901234567890123456789".into())
+    );
     // sqlx only decodes one-dimensional arrays; a 2-D array degrades.
     assert_eq!(*col("matrix"), Value::Text("<int4[]>".into()));
-    // Infinite timestamps/dates would panic inside chrono if they reached
-    // it; the wire-format special case renders them like psql does.
+    // Infinite timestamps/dates panicked inside sqlx's chrono decode; they
+    // render like psql does.
     assert_eq!(*col("ts_inf"), Value::Text("infinity".into()));
     assert_eq!(*col("ts_neg_inf"), Value::Text("-infinity".into()));
     assert_eq!(*col("tstz_inf"), Value::Text("infinity".into()));
@@ -811,29 +813,80 @@ async fn postgres_multi_schema_introspection_has_parity_metadata() {
     pool.close().await;
 }
 
+/// Values wider than the Rust types sqlx would decode them into read as the
+/// server prints them. Each of these was wrong before, in one of three ways:
+/// a panic that closed the app (a `numeric` like `1e30`, inside
+/// rust_decimal), a marker (`NaN`, more than 28 digits, a date past chrono's
+/// year 262143), or a different value (`0001-01-01 BC` as `0000-01-01`,
+/// `24:00:00` as `00:00:00`, `10000-01-01` as `+10000-01-01`).
+///
+/// Compared against the server's own `::text` of the same value, so the
+/// expectation is the engine's spelling rather than one written here — except
+/// for the zoned types, whose text follows the session's time zone and which
+/// hubro prints in UTC with a `+00:00` offset.
 #[tokio::test]
-async fn finite_datetimes_beyond_chrono_range_degrade_to_markers() {
+async fn postgres_values_read_as_the_server_prints_them() {
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
-    // Postgres accepts these; chrono caps at ~year 262143, and sqlx's
-    // decode would panic on the overflow without the guard.
+    let as_printed = [
+        "1e30::numeric",
+        "(-1e30)::numeric",
+        "123456789012345678901234567890123456789::numeric",
+        "0.0000000000000000000000000000001::numeric",
+        "'NaN'::numeric",
+        "'Infinity'::numeric",
+        "'-Infinity'::numeric",
+        "1.5::numeric(10, 2)",
+        "0::numeric(5, 3)",
+        "ARRAY[1e30, 'NaN', NULL, 1.50]::numeric[]",
+        "'2024-02-29'::date",
+        "'0001-01-01 BC'::date",
+        "'4714-11-24 BC'::date",
+        "'10000-01-01'::date",
+        "'5874897-12-31'::date",
+        "'infinity'::date",
+        "'-infinity'::date",
+        "'1999-12-31 23:59:59.999999'::timestamp",
+        "'0044-03-15 12:00:00.5 BC'::timestamp",
+        "'4714-11-24 00:00:00 BC'::timestamp",
+        "'294276-12-31 23:59:59.999999'::timestamp",
+        "'infinity'::timestamp",
+        "'24:00:00'::time",
+        "'23:59:59.999999'::time",
+    ];
+    let select: Vec<String> = as_printed
+        .iter()
+        .map(|expr| format!("{expr}, ({expr})::text"))
+        .collect();
     let result = pool
-        .query(
-            "SELECT '5874000-01-01'::date AS far_date, \
-                    '294000-01-01 00:00:00+00'::timestamptz AS far_ts, \
-                    'ok' AS healthy",
-        )
+        .query(&format!("SELECT {}", select.join(", ")))
         .await
         .unwrap();
-    assert_eq!(
-        result.rows[0][0],
-        Value::Text("<out of chrono range>".into())
-    );
-    assert_eq!(
-        result.rows[0][1],
-        Value::Text("<out of chrono range>".into())
-    );
-    assert_eq!(result.rows[0][2], Value::Text("ok".into()));
+    let row = &result.rows[0];
+    for (n, expr) in as_printed.iter().enumerate() {
+        assert_eq!(row[2 * n], row[2 * n + 1], "{expr}");
+    }
+
+    let in_utc = [
+        (
+            "'0001-01-01 00:00:00+00 BC'::timestamptz",
+            "0001-01-01 00:00:00+00:00 BC",
+        ),
+        (
+            "'294276-12-31 23:59:59.999999+00'::timestamptz",
+            "294276-12-31 23:59:59.999999+00:00",
+        ),
+        ("'-infinity'::timestamptz", "-infinity"),
+        ("'24:00:00+02'::timetz", "24:00:00+02:00"),
+    ];
+    let select: Vec<&str> = in_utc.iter().map(|(expr, _)| *expr).collect();
+    let result = pool
+        .query(&format!("SELECT {}", select.join(", ")))
+        .await
+        .unwrap();
+    for (n, (expr, shown)) in in_utc.iter().enumerate() {
+        assert_eq!(result.rows[0][n], Value::Text((*shown).into()), "{expr}");
+    }
     pool.close().await;
 }
 
@@ -1898,17 +1951,69 @@ const PG_KEY_TYPES: &[(&str, &str, &[&str])] = &[
             "'-Infinity'",
         ],
     ),
-    ("numeric", "numeric", &["12345.678901", "0.10", "1e20"]),
+    // Past rust_decimal's range and its special values: `1e30` used to
+    // panic the page fetch, the others to read as the marker `<numeric>`.
+    (
+        "numeric",
+        "numeric",
+        &[
+            "12345.678901",
+            "0.10",
+            "1e20",
+            "1e30",
+            "123456789012345678901234567890.123456789",
+            "0.0000000000000000000000000000001",
+            "'NaN'",
+            "'Infinity'",
+        ],
+    ),
     ("int8", "bigint", &["9223372036854775807", "-1"]),
     ("uuid", "uuid", &["'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'"]),
+    // BC values read as astronomical years (`0000-01-01`), which the server
+    // refuses back; years past 9999 with a `+` sign, refused the same way.
     (
         "ts",
         "timestamp",
-        &["'2024-02-29 13:45:01.123456'", "'2024-01-01 00:00:00'"],
+        &[
+            "'2024-02-29 13:45:01.123456'",
+            "'2024-01-01 00:00:00'",
+            "'0044-03-15 12:00:00.5 BC'",
+            "'294276-12-31 23:59:59.999999'",
+            "'infinity'",
+        ],
     ),
-    ("tstz", "timestamptz", &["'2024-02-29 13:45:01.123456+02'"]),
-    ("date", "date", &["'2024-02-29'"]),
-    ("time", "time", &["'13:45:01.5'"]),
+    (
+        "tstz",
+        "timestamptz",
+        &[
+            "'2024-02-29 13:45:01.123456+02'",
+            "'0001-01-01 00:00:00+00 BC'",
+            "'-infinity'",
+        ],
+    ),
+    (
+        "date",
+        "date",
+        &[
+            "'2024-02-29'",
+            "'0001-01-01 BC'",
+            "'4714-11-24 BC'",
+            "'10000-01-01'",
+            "'infinity'",
+            "'-infinity'",
+        ],
+    ),
+    // `24:00:00` read as `00:00:00` — the key of a different row.
+    (
+        "time",
+        "time",
+        &["'13:45:01.5'", "'24:00:00'", "'00:00:00'"],
+    ),
+    (
+        "timetz",
+        "time with time zone",
+        &["'13:45:01.5+02'", "'24:00:00-03:30'", "'00:00:00-03:30'"],
+    ),
     ("interval", "interval", &["'1 day 02:03:04'"]),
     // A blob key used to be bound as the text `<blob N>`.
     ("bytea", "bytea", &["'\\x00ff10'", "''"]),

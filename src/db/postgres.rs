@@ -8,13 +8,12 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io::Write;
 
-use sqlx::postgres::types::{PgInterval, PgTimeTz};
+use sqlx::postgres::types::PgInterval;
 use sqlx::postgres::{
     PgDatabaseError, PgErrorPosition, PgHasArrayType, PgPool, PgPoolOptions, PgRow, PgTypeKind,
     PgValueFormat, PgValueRef,
 };
-use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
-use sqlx::types::{Decimal, JsonValue, Uuid};
+use sqlx::types::{JsonValue, Uuid};
 use sqlx::{Row as _, TypeInfo as _, ValueRef as _};
 
 use super::caps::Restriction;
@@ -23,6 +22,7 @@ use super::ddl::{
 };
 use super::error::DbError;
 use super::export::ExportFormat;
+use super::pg_wire;
 use super::schema::{
     ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, Internal, TableKind, TableMeta, TypeDetail,
     TypeRef,
@@ -32,7 +32,7 @@ use super::sql::Dialect;
 use super::sqlx_common::{self, get};
 use super::staged::CheckedStatement;
 use super::stats::{size_bytes, RowCount, TableStats};
-use super::value::{row_opt_text, row_text, trim_fraction, QueryResult, Value};
+use super::value::{row_opt_text, row_text, QueryResult, Value};
 
 /// Splices a password into a Postgres URL — see [`super::url::with_password`].
 pub fn url_with_password(url: &str, password: &str) -> Result<String, DbError> {
@@ -2135,57 +2135,22 @@ fn decode_typed(row: &PgRow, idx: usize, raw: &PgValueRef) -> Option<Value> {
             }
         }
         "BYTEA" => Some(Value::Blob(row.try_get::<Vec<u8>, _>(idx).ok()?)),
-        // Date/time family. `%.f` prints fractional seconds only when
-        // non-zero; trailing zeros are trimmed to match Postgres output.
-        // 'infinity'/'-infinity' must be caught from the wire bytes before
-        // chrono: sqlx 0.8 panics (not errors) decoding them.
-        "TIMESTAMP" => {
-            if let Some(inf) = infinity_marker(raw) {
-                return Some(Value::Text(inf.to_string()));
-            }
-            let ts = row.try_get::<NaiveDateTime, _>(idx).ok()?;
-            Some(Value::Text(trim_fraction(
-                ts.format("%Y-%m-%d %H:%M:%S%.f").to_string(),
-            )))
-        }
-        "TIMESTAMPTZ" => {
-            if let Some(inf) = infinity_marker(raw) {
-                return Some(Value::Text(inf.to_string()));
-            }
-            // Postgres sends timestamptz as an instant; render in UTC with
-            // an explicit offset so the timezone-awareness is visible.
-            let ts = row.try_get::<DateTime<Utc>, _>(idx).ok()?;
-            let local = trim_fraction(ts.format("%Y-%m-%d %H:%M:%S%.f").to_string());
-            Some(Value::Text(format!("{local}+00:00")))
-        }
-        "DATE" => {
-            if let Some(inf) = infinity_marker(raw) {
-                return Some(Value::Text(inf.to_string()));
-            }
-            let d = row.try_get::<NaiveDate, _>(idx).ok()?;
-            Some(Value::Text(d.format("%Y-%m-%d").to_string()))
-        }
-        "TIME" => {
-            let t = row.try_get::<NaiveTime, _>(idx).ok()?;
-            Some(Value::Text(trim_fraction(
-                t.format("%H:%M:%S%.f").to_string(),
-            )))
-        }
-        "TIMETZ" => {
-            let t = row.try_get::<PgTimeTz, _>(idx).ok()?;
-            let time = trim_fraction(t.time.format("%H:%M:%S%.f").to_string());
-            Some(Value::Text(format!("{time}{}", t.offset)))
-        }
+        // Date/time and numeric, rendered from the wire bytes as the server
+        // prints them — see `pg_wire` for what sqlx's chrono and
+        // rust_decimal decodes got wrong, one of which was a panic.
+        "TIMESTAMP" => wire_text(raw, |bytes| pg_wire::timestamp(bytes, "")),
+        // The wire holds an instant; it is rendered in UTC with an explicit
+        // offset so the timezone-awareness is visible.
+        "TIMESTAMPTZ" => wire_text(raw, |bytes| pg_wire::timestamp(bytes, "+00:00")),
+        "DATE" => wire_text(raw, pg_wire::date),
+        "TIME" => wire_text(raw, pg_wire::time),
+        "TIMETZ" => wire_text(raw, pg_wire::time_tz),
         "INTERVAL" => {
             let iv = row.try_get::<PgInterval, _>(idx).ok()?;
             Some(Value::Text(format_interval(&iv)))
         }
-        // Exact decimal string via rust_decimal — must not round-trip
-        // through f64. NaN and >28 significant digits are not representable
-        // and degrade to the marker.
-        "NUMERIC" => Some(Value::Text(
-            row.try_get::<Decimal, _>(idx).ok()?.to_string(),
-        )),
+        // Exact, never through f64: every digit and the column's scale.
+        "NUMERIC" => wire_text(raw, pg_wire::numeric),
         "UUID" => Some(Value::Text(row.try_get::<Uuid, _>(idx).ok()?.to_string())),
         // Bit strings, as the `0`/`1` text the server prints and the editor
         // accepts back. sqlx has no built-in decode for these
@@ -2194,7 +2159,7 @@ fn decode_typed(row: &PgRow, idx: usize, raw: &PgValueRef) -> Option<Value> {
         // becomes the row locator for a `bit(n)` primary key, so the save it
         // keys with is refused ("<" is not a valid binary digit) and such a
         // table is unsaveable however correct the cast is.
-        "BIT" | "VARBIT" => decode_bit_string(raw),
+        "BIT" | "VARBIT" => wire_text(raw, bits_from_binary),
         // Compact JSON text (serde_json Display is compact).
         "JSON" | "JSONB" => Some(Value::Text(
             row.try_get::<JsonValue, _>(idx).ok()?.to_string(),
@@ -2212,7 +2177,7 @@ fn decode_typed(row: &PgRow, idx: usize, raw: &PgValueRef) -> Option<Value> {
         "FLOAT8[]" => decode_array::<f64>(row, idx, |v| v.to_string()),
         "BOOL[]" => decode_array::<bool>(row, idx, |v| v.to_string()),
         "UUID[]" => decode_array::<Uuid>(row, idx, |v| v.to_string()),
-        "NUMERIC[]" => decode_array::<Decimal>(row, idx, |v| v.to_string()),
+        "NUMERIC[]" => wire_array(raw, pg_wire::numeric),
         _ => None,
     }
 }
@@ -2237,26 +2202,35 @@ fn internal_char_text(byte: u8) -> String {
     }
 }
 
-/// Decodes a `bit`/`bit varying` value to its `0`/`1` text.
+/// A value whose text format is already the text to show, and whose binary
+/// format `binary` renders: bit strings, and the [`pg_wire`] types.
 ///
-/// Read from the wire rather than through `try_get`, which refuses these OIDs
-/// unless sqlx is built with `bit-vec` — a dependency not worth taking for one
-/// display form. The binary encoding is a big-endian `i32` bit *count*
-/// followed by the bits packed MSB-first, so the last byte is padded and the
-/// count is what says where the value really ends.
-fn decode_bit_string(raw: &PgValueRef) -> Option<Value> {
+/// The text half is present for completeness of the match rather than for
+/// coverage: every row-returning path here goes through `sqlx::query`, which
+/// carries arguments and therefore always negotiates the binary format.
+fn wire_text(raw: &PgValueRef, binary: impl FnOnce(&[u8]) -> Option<String>) -> Option<Value> {
     let bytes = raw.as_bytes().ok()?;
     match raw.format() {
-        // Postgres prints the bits verbatim in text format. Present for
-        // completeness of the match rather than for coverage: every
-        // row-returning path here goes through `sqlx::query`, which carries
-        // arguments and therefore always negotiates the binary format.
         PgValueFormat::Text => Some(Value::Text(std::str::from_utf8(bytes).ok()?.to_string())),
-        PgValueFormat::Binary => bits_from_binary(bytes).map(Value::Text),
+        PgValueFormat::Binary => binary(bytes).map(Value::Text),
     }
 }
 
-/// The binary half of [`decode_bit_string`], split out so its rejections are
+/// A one-dimensional array of a [`pg_wire`] type, as the same literal
+/// [`decode_array`] builds: `{1.50,NaN,NULL}`. Binary format only — the
+/// arrays the other arms decode are not read from text either.
+fn wire_array(raw: &PgValueRef, element: impl Fn(&[u8]) -> Option<String>) -> Option<Value> {
+    if raw.format() != PgValueFormat::Binary {
+        return None;
+    }
+    let parts = pg_wire::array_elements(raw.as_bytes().ok()?)?
+        .into_iter()
+        .map(|item| item.map_or(Some("NULL".to_string()), &element))
+        .collect::<Option<Vec<_>>>()?;
+    Some(Value::Text(format!("{{{}}}", parts.join(","))))
+}
+
+/// The binary half of a bit string's [`wire_text`], split out so its rejections are
 /// reachable from a test: `PgValueRef` cannot be constructed outside sqlx, so
 /// left inline these would be four claims nothing could execute.
 ///
@@ -2300,71 +2274,6 @@ fn decode_fallback(row: &PgRow, idx: usize, raw: &PgValueRef) -> Value {
         return Value::Text(text);
     }
     Value::Text(format!("<{}>", raw.type_info().name().to_lowercase()))
-}
-
-/// Detects Postgres `infinity`/`-infinity` timestamp, timestamptz, and date
-/// values from the wire bytes. Binary format encodes them as i64::MAX/MIN
-/// (timestamp/timestamptz) or i32::MAX/MIN (date) big-endian; text format
-/// spells them out. They must not reach chrono — sqlx 0.8 decodes via
-/// `epoch + Duration`, whose overflow panics rather than erroring.
-fn infinity_marker(raw: &PgValueRef) -> Option<&'static str> {
-    let bytes = raw.as_bytes().ok()?;
-    match raw.format() {
-        PgValueFormat::Binary => {
-            if bytes == i64::MAX.to_be_bytes() || bytes == i32::MAX.to_be_bytes() {
-                Some("infinity")
-            } else if bytes == i64::MIN.to_be_bytes() || bytes == i32::MIN.to_be_bytes() {
-                Some("-infinity")
-            } else if binary_datetime_exceeds_chrono(bytes) {
-                // Postgres stores finite dates far beyond chrono's
-                // ~year-262143 cap; sqlx's chrono decode would panic on the
-                // overflow, so degrade those to a marker instead.
-                Some("<out of chrono range>")
-            } else {
-                None
-            }
-        }
-        // b"infinity" is coincidentally 8 bytes like a binary timestamp,
-        // but the formats are branched on above so exact ASCII match here
-        // is unambiguous.
-        PgValueFormat::Text => match bytes {
-            b"infinity" => Some("infinity"),
-            b"-infinity" => Some("-infinity"),
-            _ => None,
-        },
-    }
-}
-
-/// True when a binary timestamp (8-byte µs) or date (4-byte days) since the
-/// 2000-01-01 Postgres epoch cannot be represented by chrono.
-fn binary_datetime_exceeds_chrono(bytes: &[u8]) -> bool {
-    let epoch_date = NaiveDate::from_ymd_opt(2000, 1, 1).expect("static date");
-    match bytes.len() {
-        8 => {
-            let micros = i64::from_be_bytes(bytes.try_into().expect("length checked"));
-            let epoch = epoch_date.and_hms_opt(0, 0, 0).expect("static time");
-            // num_microseconds is None only if the span itself overflows
-            // i64; treat that as "no bound" on the affected side.
-            let max = NaiveDateTime::MAX
-                .signed_duration_since(epoch)
-                .num_microseconds()
-                .unwrap_or(i64::MAX);
-            let min = NaiveDateTime::MIN
-                .signed_duration_since(epoch)
-                .num_microseconds()
-                .unwrap_or(i64::MIN);
-            micros > max || micros < min
-        }
-        4 => {
-            let days = i64::from(i32::from_be_bytes(
-                bytes.try_into().expect("length checked"),
-            ));
-            let max = NaiveDate::MAX.signed_duration_since(epoch_date).num_days();
-            let min = NaiveDate::MIN.signed_duration_since(epoch_date).num_days();
-            days > max || days < min
-        }
-        _ => false,
-    }
 }
 
 /// Decodes a one-dimensional array column and renders it as a

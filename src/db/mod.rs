@@ -31,6 +31,7 @@ mod export;
 mod fk;
 mod import;
 mod page;
+mod pg_wire;
 mod plan;
 mod postgres;
 mod registry;

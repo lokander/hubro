@@ -10,7 +10,7 @@ repository = "https://github.com/lokander/hubro"
 
 [dependencies]
 dioxus = { version = "0.7.1", features = [] }
-sqlx = { version = "0.8", default-features = false, features = ["sqlite", "postgres", "runtime-tokio", "tls-rustls-ring", "macros", "chrono", "uuid", "json", "rust_decimal"] }
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "postgres", "runtime-tokio", "tls-rustls-ring", "macros", "uuid", "json"] }
 # SQL Server driver. Default features are off to drop native-tls and
 # Windows auth; `rustls` keeps TLS on the same rustls 0.23 sqlx uses, with no
 # OpenSSL. It does turn on rustls's aws-lc-rs provider beside sqlx's ring, and
@@ -23,8 +23,8 @@ sqlx = { version = "0.8", default-features = false, features = ["sqlite", "postg
 tiberius = { version = "0.13", default-features = false, features = ["rustls", "tds73", "chrono"] }
 # Adapts tokio's TcpStream to the futures-io traits tiberius expects.
 tokio-util = { version = "0.7", features = ["compat"] }
-# Same crate sqlx pulls in; direct dependency so UI code (history timestamps)
-# doesn't import chrono through sqlx's re-export.
+# Same crate tiberius pulls in; direct dependency so UI code (history timestamps)
+# doesn't reach for it through a driver's re-export.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
