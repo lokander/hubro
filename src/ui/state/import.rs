@@ -25,6 +25,12 @@ pub enum ImportStatus {
     },
     Done(ImportReport),
     Failed(String),
+    /// A file was picked for an import whose grid had gone by the time the
+    /// picker returned — see [`AppState::report_import_pick_dropped`].
+    Cancelled {
+        /// The table the import was meant for.
+        table: String,
+    },
 }
 
 impl ImportStatus {
@@ -73,6 +79,13 @@ impl ImportStatus {
             ImportStatus::Failed(err) => (
                 format!("Import failed: {err}"),
                 "text-red-600 dark:text-red-400",
+            ),
+            ImportStatus::Cancelled { table } => (
+                format!(
+                    "Import into {table} cancelled: the table was closed while its file picker \
+                     was open. Nothing was imported — open {table} and pick the file again."
+                ),
+                "text-amber-700 dark:text-amber-400",
             ),
         }
     }
@@ -215,6 +228,31 @@ impl AppState {
         self.import_tasks.write().remove(&id);
     }
 
+    /// Reports that a file picked for an import into `table` was dropped,
+    /// because the grid that asked for it unmounted (a table or tab switch)
+    /// while the picker was open.
+    ///
+    /// Dropped rather than carried over, deliberately. The import dialog is a
+    /// review of the file against the table on screen — its columns, its
+    /// mapping, a preview — so it cannot open over whichever table is shown
+    /// now, and opening it whenever `table` is next shown would start an
+    /// import the user may have forgotten asking for. What must not happen
+    /// is what did: the picker accepted a file and then nothing, anywhere.
+    ///
+    /// An import already running keeps its line: its outcome is the one the
+    /// user is waiting for, and this choice never started anything.
+    pub fn report_import_pick_dropped(mut self, id: ConnectionId, table: String) {
+        let running = matches!(
+            self.import_status.peek().get(&id),
+            Some(ImportStatus::Running { .. })
+        );
+        if !running {
+            self.import_status
+                .write()
+                .insert(id, ImportStatus::Cancelled { table });
+        }
+    }
+
     /// Clears the import line for one connection — the dialog's "dismiss"
     /// and what closing the dialog after a failure does.
     pub fn clear_import_status(mut self, id: ConnectionId) {
@@ -294,5 +332,41 @@ mod tests {
         let failed = ImportStatus::Failed("line 4: nope".into());
         assert!(failed.line().0.starts_with("Import failed:"));
         assert!(failed.line().1.contains("red"));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_pick_reports_a_cancelled_import_but_never_hides_a_running_one() {
+        use crate::db::{ConnectionRegistry, DbPool, WriteProtection};
+        use crate::ui::test_dom::provide_state;
+        use dioxus::core::VirtualDom;
+
+        let pool =
+            DbPool::Sqlite(sqlx::sqlite::SqlitePool::connect_lazy("sqlite::memory:").unwrap());
+        let id = ConnectionRegistry::default().insert("t.db", pool, WriteProtection::Open);
+        let dom = VirtualDom::new(|| rsx! {});
+        let state = provide_state(&dom);
+        dom.in_runtime(|| {
+            state.report_import_pick_dropped(id, "people".into());
+            let status = state.import_status.peek().get(&id).cloned();
+            assert_eq!(
+                status,
+                Some(ImportStatus::Cancelled {
+                    table: "people".into()
+                })
+            );
+            let (text, _) = status.unwrap().line();
+            assert!(
+                text.contains("people") && text.contains("cancelled"),
+                "{text}"
+            );
+
+            let mut statuses = state.import_status;
+            let running = ImportStatus::Running {
+                table: "orders".into(),
+            };
+            statuses.write().insert(id, running.clone());
+            state.report_import_pick_dropped(id, "people".into());
+            assert_eq!(state.import_status.peek().get(&id), Some(&running));
+        });
     }
 }

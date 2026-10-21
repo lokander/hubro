@@ -606,12 +606,14 @@ impl AppState {
     pub fn export_query(
         mut self,
         id: ConnectionId,
+        table: TableRef,
         sql: String,
         params: Vec<Value>,
         format: ExportFormat,
         path: PathBuf,
     ) {
         let slot = (id, ExportPane::Grid);
+        self.grid_export_tables.write().insert(id, table);
         let pool = self.registry.read().get(id).map(|c| c.pool.clone());
         let Some(pool) = pool else {
             self.begin_export(slot);
@@ -712,6 +714,14 @@ impl AppState {
             }
             self.finish_export(slot, generation, outcome);
         });
+    }
+
+    /// Clears a finished grid export's line — its Dismiss button. A running
+    /// export offers none, so its outcome cannot be dismissed before it is
+    /// known.
+    pub fn clear_grid_export_status(mut self, id: ConnectionId) {
+        self.export_status.write().remove(&(id, ExportPane::Grid));
+        self.grid_export_tables.write().remove(&id);
     }
 
     /// Marks a slot Running and returns the new export's generation.

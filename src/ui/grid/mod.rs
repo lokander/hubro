@@ -57,7 +57,7 @@ use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState};
 use super::schema::display_type;
 use super::selection::Selection;
 use super::stage::{required_insert_columns, PendingInsert, TableStage};
-use super::state::{find_table_meta, AppState, ExportPane, ExportStatus, ImportStatus, TableRef};
+use super::state::{find_table_meta, grid_export_line, AppState, ImportStatus, TableRef};
 
 const PAGE_SIZE: u32 = 100;
 
@@ -1495,11 +1495,22 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
 }
 
 /// Opens a file picker and, on a chosen file, opens the import dialog over
-/// the grid. A plain `spawn` (not `spawn_forever`) like the export's save
-/// dialog: nothing has started, so a grid that unmounts meanwhile has simply
-/// cancelled the choice.
-fn pick_import_file(mut target: Signal<Option<std::path::PathBuf>>) {
-    spawn(async move {
+/// the grid.
+///
+/// The picker does not block the window, so the grid can unmount while it is
+/// open (a table switch). A component-scoped `spawn` was cancelled with it:
+/// the picker stayed open, accepted a file, and nothing happened, anywhere —
+/// measured. So the task outlives the grid, and a file picked for a grid that
+/// is gone (its `target` signal dropped with it) is reported as a cancelled
+/// import instead ([`AppState::report_import_pick_dropped`], which says why
+/// it is not carried over).
+fn pick_import_file(
+    state: AppState,
+    id: ConnectionId,
+    table: TableRef,
+    mut target: Signal<Option<std::path::PathBuf>>,
+) {
+    dioxus::core::spawn_forever(async move {
         let picked = rfd::AsyncFileDialog::new()
             .set_title("Import into this table")
             .add_filter(
@@ -1510,7 +1521,10 @@ fn pick_import_file(mut target: Signal<Option<std::path::PathBuf>>) {
             .pick_file()
             .await;
         if let Some(file) = picked {
-            target.set(Some(file.path().to_path_buf()));
+            match target.try_write() {
+                Ok(mut slot) => *slot = Some(file.path().to_path_buf()),
+                Err(_) => state.report_import_pick_dropped(id, table.label()),
+            }
         }
     });
 }
@@ -1586,11 +1600,12 @@ fn GridToolbar(
     let state = use_context::<AppState>();
     // Whether the FK Back stack has anywhere to return to (reactive).
     let can_back = state.can_go_back(id);
-    let export_status: Option<ExportStatus> = state
-        .export_status
-        .read()
-        .get(&(id, ExportPane::Grid))
-        .cloned();
+    let export_line = grid_export_line(
+        &state.export_status.read(),
+        &state.grid_export_tables.read(),
+        id,
+        &table,
+    );
     let import_status: Option<ImportStatus> = state.import_status.read().get(&id).cloned();
     let export_table = table.clone();
     let refresh_table = table.clone();
@@ -1636,6 +1651,24 @@ fn GridToolbar(
                             onclick: move |_| state.clear_import_status(id),
                             "Dismiss"
                         }
+                    }
+                }
+            }
+        }
+        // The export reports on a line of its own too, for the same reason:
+        // in the toolbar row it was the shrinkable item, and at a normal
+        // window width "Exported 500000 rows" truncated to nothing — so an
+        // export finished with no visible outcome at all.
+        if let Some((text, class, finished)) = export_line {
+            div { class: "flex items-start gap-2 border-b border-slate-200 dark:border-slate-800 px-3 py-1.5 text-xs",
+                span { class: "min-w-0 truncate font-medium {class}", title: "{text}", "{text}" }
+                div { class: "flex-1" }
+                if finished {
+                    button {
+                        class: "shrink-0 rounded px-1.5 py-0.5 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800",
+                        title: "Dismiss",
+                        onclick: move |_| state.clear_grid_export_status(id),
+                        "Dismiss"
                     }
                 }
             }
@@ -1712,12 +1745,7 @@ fn GridToolbar(
                     "{status.text}"
                 }
             }
-            if let Some(status) = export_status.as_ref() {
-                {
-                    let (text, class) = status.line();
-                    rsx! { span { class: "truncate text-xs {class}", title: "{text}", "{text}" } }
-                }
-            }
+
             // Copy-as menu. Copies the selected cells only —
             // the Export buttons beside it cover the whole view.
             if let Some((sel_rows, sel_cols, sel_cells)) = selection_summary {
@@ -1793,7 +1821,10 @@ fn GridToolbar(
                         Some(reason) => reason.to_string(),
                         None => "Import a CSV or JSON file into this table".to_string(),
                     },
-                    onclick: move |_| pick_import_file(import_file),
+                    onclick: {
+                        let import_table = export_table.clone();
+                        move |_| pick_import_file(state, id, import_table.clone(), import_file)
+                    },
                     "Import…"
                 }
             }
@@ -2248,7 +2279,13 @@ fn spawn_grid_export(
         ExportFormat::Csv => ("CSV", "csv"),
         ExportFormat::Json => ("JSON", "json"),
     };
-    spawn(async move {
+    // `spawn_forever`: the save dialog does not block the window, and a
+    // table switch meanwhile unmounts this grid. A scoped task was cancelled
+    // with it, so the dialog accepted a path and nothing was written or
+    // reported — measured. The export needs nothing from the grid once its
+    // query is built, and its line names the table wherever it shows
+    // ([`grid_export_line`]).
+    dioxus::core::spawn_forever(async move {
         let picked = rfd::AsyncFileDialog::new()
             .set_title("Export table")
             .set_file_name(suggested)
@@ -2256,7 +2293,7 @@ fn spawn_grid_export(
             .save_file()
             .await;
         if let Some(file) = picked {
-            state.export_query(id, sql, params, format, file.path().to_path_buf());
+            state.export_query(id, table, sql, params, format, file.path().to_path_buf());
         }
     });
 }
@@ -2573,6 +2610,62 @@ mod tests {
         assert_eq!(
             confirm_notice(2, 3),
             "This will delete exactly 2 rows and apply 3 other change(s). Click again to save."
+        );
+    }
+
+    /// What `pick_import_file` tells a live grid from a gone one by: the
+    /// grid's own `import_file` signal, written once the picker returns.
+    /// A signal whose component has unmounted must refuse the write rather
+    /// than accept it into nothing — otherwise a dropped pick would vanish
+    /// silently again, and nothing else here would notice.
+    #[test]
+    fn a_signal_refuses_writes_once_its_component_unmounts() {
+        use dioxus::core::{NoOpMutations, VirtualDom};
+
+        #[derive(Clone, Copy)]
+        struct Slot(Signal<Option<Signal<Option<u8>>>>);
+        #[derive(Clone, Copy)]
+        struct Mounted(Signal<bool>);
+
+        #[component]
+        fn Child() -> Element {
+            let own = use_signal(|| None::<u8>);
+            let mut slot = use_context::<Slot>().0;
+            use_hook(move || slot.set(Some(own)));
+            rsx! {}
+        }
+        #[component]
+        fn Root() -> Element {
+            let mounted = use_context::<Mounted>().0;
+            rsx! {
+                if mounted() {
+                    Child {}
+                }
+            }
+        }
+
+        let mut dom = VirtualDom::new(Root);
+        let (slot, mounted) = dom.in_runtime(|| {
+            (
+                Slot(Signal::new_in_scope(None, ScopeId::ROOT)),
+                Mounted(Signal::new_in_scope(true, ScopeId::ROOT)),
+            )
+        });
+        dom.provide_root_context(slot);
+        dom.provide_root_context(mounted);
+        dom.rebuild(&mut NoOpMutations);
+
+        let mut own = dom.in_runtime(|| slot.0.peek().expect("the child mounted"));
+        assert!(
+            dom.in_runtime(|| own.try_write().is_ok()),
+            "a live signal takes the write"
+        );
+        let mut flag = mounted.0;
+        dom.in_runtime(|| flag.set(false));
+        dom.render_immediate(&mut NoOpMutations);
+        assert!(
+            dom.in_runtime(|| own.try_write().is_err()),
+            "an unmounted component's signal must refuse the write"
         );
     }
 }
