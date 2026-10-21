@@ -1017,8 +1017,13 @@ const SQLITE_READ_CALL_PRAGMAS: [&str; 10] = [
 /// rather than waved through.
 fn is_read_call_pragma(stripped: &str) -> bool {
     // A quoted schema or argument has been blanked to spaces, so "plain" is
-    // identifier characters, a sign, and whitespace.
-    let plain = |text: &str| {
+    // identifier characters and whitespace — and, for the argument alone, a
+    // sign (`integrity_check(-1)`).
+    let name_like = |text: &str| {
+        text.chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c.is_whitespace())
+    };
+    let argument_like = |text: &str| {
         text.chars()
             .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '+' || c.is_whitespace())
     };
@@ -1039,8 +1044,8 @@ fn is_read_call_pragma(stripped: &str) -> bool {
         return false;
     };
     SQLITE_READ_CALL_PRAGMAS.contains(&name.as_str())
-        && plain(schema)
-        && plain(argument)
+        && name_like(schema)
+        && argument_like(argument)
         && after.trim().trim_end_matches(';').trim().is_empty()
 }
 
@@ -3569,6 +3574,7 @@ mod tests {
             "PRAGMA a.b.table_info(t)",
             "PRAGMA user_version = 5 + x.table_info(t)",
             "PRAGMA table_info(a = 1)",
+            "PRAGMA x-1.table_info(t)",
         ] {
             assert_eq!(
                 statement_needs(sql, Dialect::Sqlite),
@@ -3593,6 +3599,7 @@ mod tests {
             ("PRAGMA foreign_key_list(t)", Dialect::Sqlite),
             ("PRAGMA foreign_key_check(t)", Dialect::Sqlite),
             ("PRAGMA integrity_check(5)", Dialect::Sqlite),
+            ("PRAGMA integrity_check(-1)", Dialect::Sqlite),
             ("PRAGMA quick_check(t)", Dialect::Sqlite),
             ("PRAGMA table_list(t)", Dialect::Sqlite),
             // `replace(` is the string function, not the statement.
@@ -3616,6 +3623,18 @@ mod tests {
             );
             assert!(!needs_confirmation(sql, dialect), "{sql:?} on {dialect:?}");
         }
+        // SQL Server never reaches the pragma reading — it has no pragmas,
+        // and every read there is scanned whole, since T-SQL needs no `;`
+        // between statements. Pinned because the arm order is what keeps it
+        // so: a `PRAGMA` arm checked first would read this as a bare pragma.
+        assert_eq!(
+            statement_needs("PRAGMA DELETE FROM t", Dialect::SqlServer),
+            StatementNeeds {
+                mutate: true,
+                ddl: false
+            }
+        );
+        assert!(statement_needs("PRAGMA table_info(t) DELETE FROM t", Dialect::SqlServer).mutate);
     }
 
     #[test]
