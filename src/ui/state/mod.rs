@@ -30,9 +30,6 @@ mod staging;
 pub use connect::ServerBackend;
 pub use import::{ImportRequest, ImportStatus};
 pub use schema_edit::{after_edit, SchemaEditRequest, SchemaEditStatus};
-// Reached from `session`'s restore path; defined beside the flow that
-// writes it.
-pub(crate) use connect::entra_secret_key;
 
 use std::collections::HashMap;
 #[cfg(test)]
@@ -856,6 +853,10 @@ pub struct EntraPrompt {
     /// Which backend the sign-in retry must reconnect with (routes the token's
     /// OAuth resource and the driver).
     pub backend: BackendKind,
+    /// Whether to remember the sign-in — keep its refresh token in the OS
+    /// keyring rather than for this session only. What the card offers, and
+    /// once it is submitted, what the user answered.
+    pub remember: bool,
 }
 
 /// Which phase of a connect is running, so the connections list can say more

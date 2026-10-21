@@ -187,8 +187,64 @@ pub(super) fn redeem_ssh_remember(
 /// Keyring key for a connection's cached Entra refresh token. Disjoint from the
 /// password (bare URL) and SSH passphrase (`#ssh`) keys, so the three never
 /// collide. Only a refresh token is ever cached here — never an access token.
+/// The same key holds it in session memory when the user did not ask to be
+/// remembered.
 pub(crate) fn entra_secret_key(url: &str) -> String {
     format!("{url}#entra")
+}
+
+/// Where a kept Entra refresh token was found. A token lives in exactly one of
+/// the two, and which one *is* the user's "remember" answer:
+/// [`place_entra_refresh`] puts it in the keyring only when they ticked the
+/// box, and takes it out of the other place either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RefreshSource {
+    Session,
+    Keyring,
+}
+
+/// Whether a silent sign-in keeps the refresh token it gets back in the
+/// keyring. No card was shown, so there is no fresh answer: the one the user
+/// gave when they signed in stands, and the redeemed token's source records it.
+///
+/// A rotated token must not change homes on its own — out of the keyring it
+/// would sign a remembered user out at the next start, and into it it would
+/// store a sign-in the user declined to have remembered.
+pub(super) fn redeemed_refresh_remembered(source: Option<RefreshSource>) -> bool {
+    source == Some(RefreshSource::Keyring)
+}
+
+/// What to do with the keyring entry for a sign-in's refresh token.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum RefreshKeyring {
+    /// Store this token there.
+    Store(String),
+    /// Delete whatever is there — an older remembered token outliving a
+    /// "don't remember" answer would keep the user signed in regardless.
+    Delete,
+}
+
+/// Puts a successful sign-in's refresh token where `remember` says: in session
+/// memory and out of the keyring, or the reverse. Returns the keyring half,
+/// which is I/O; the session half is done here.
+///
+/// The token is a long-lived credential — functionally a password — so it
+/// reaches the keyring on the same answer a password does, and like a password
+/// it is kept for the session either way.
+pub(super) fn place_entra_refresh(
+    session: &mut HashMap<String, String>,
+    url: &str,
+    refresh: String,
+    remember: bool,
+) -> RefreshKeyring {
+    let key = entra_secret_key(url);
+    if remember {
+        session.remove(&key);
+        RefreshKeyring::Store(refresh)
+    } else {
+        session.insert(key, refresh);
+        RefreshKeyring::Delete
+    }
 }
 
 /// Every key a connection's locator owns, in the keyring and in session
@@ -588,36 +644,6 @@ impl ServerBackend {
             },
         }
     }
-}
-
-/// Acquires one Entra token for `url`'s connection: redeem the cached refresh
-/// token when there is one, otherwise fall through to `open_browser`.
-///
-/// The four token acquisitions in the connect flows (two engines × silent and
-/// interactive) differ only in the resource and that opener, so this is the one
-/// place the keyring's cached refresh token is read. A keyring error means "no
-/// cached token" and falls through, exactly as an absent one does; only a
-/// refresh token is ever stored under [`entra_secret_key`], never an access
-/// token.
-async fn acquire_entra(
-    entra: &EntraAuth,
-    resource: &str,
-    url: &str,
-    open_browser: impl FnOnce(&str) -> Result<(), azure::AzureError>,
-) -> Result<azure::AccessToken, azure::AzureError> {
-    let cached = crate::secrets::get_password_async(entra_secret_key(url))
-        .await
-        .ok()
-        .flatten();
-    azure::acquire_token(
-        entra,
-        resource,
-        cached.as_deref(),
-        &azure::Endpoints::default(),
-        azure::INTERACTIVE_TIMEOUT,
-        open_browser,
-    )
-    .await
 }
 
 /// How an already-saved server connection is configured to connect: its SSH
@@ -1124,6 +1150,9 @@ impl AppState {
                     tunnel,
                     entra,
                     backend: backend.kind,
+                    // Offered ticked, as the password prompt is; parked only
+                    // if this connect cannot sign in silently.
+                    remember: true,
                 };
                 self.connect_server_entra(backend, pending, connect_url, tls_host, live_tunnel)
                     .await;
@@ -1194,6 +1223,93 @@ impl AppState {
         self.save_server_if_open(backend, &url, &name, tunnel, ServerAuth::Password);
     }
 
+    /// A kept Entra refresh token for `url`, and where it was kept: session
+    /// memory first, then the OS keyring. The one place either is read for it,
+    /// so a connect and the session-restore gate agree on whether one exists.
+    /// A keyring error means "none", exactly as an absent entry does.
+    pub(super) async fn cached_entra_refresh(self, url: &str) -> Option<(String, RefreshSource)> {
+        let key = entra_secret_key(url);
+        // A statement temporary: the read guard is dropped before the await.
+        let session = self.session_passwords.read().get(&key).cloned();
+        if let Some(token) = session {
+            return Some((token, RefreshSource::Session));
+        }
+        crate::secrets::get_password_async(key)
+            .await
+            .ok()
+            .flatten()
+            .map(|token| (token, RefreshSource::Keyring))
+    }
+
+    /// Acquires one Entra token for `url`'s connection: redeem the kept
+    /// refresh token when there is one, otherwise fall through to
+    /// `open_browser`. Also returns where the redeemed token was kept, which
+    /// [`redeemed_refresh_remembered`] reads.
+    ///
+    /// A refresh token Entra refuses for good is forgotten here, wherever it
+    /// was kept: it can never work again, and kept it would cost a token round
+    /// trip before every later sign-in card — at startup too, since the
+    /// restore gate reads it as a silent sign-in.
+    async fn acquire_entra(
+        self,
+        entra: &EntraAuth,
+        resource: &str,
+        url: &str,
+        open_browser: impl FnOnce(&str) -> Result<(), azure::AzureError>,
+    ) -> (
+        Result<azure::AccessToken, azure::AzureError>,
+        Option<RefreshSource>,
+    ) {
+        let cached = self.cached_entra_refresh(url).await;
+        let acquired = azure::acquire_token(
+            entra,
+            resource,
+            cached.as_ref().map(|(token, _)| token.as_str()),
+            &azure::Endpoints::default(),
+            azure::INTERACTIVE_TIMEOUT,
+            open_browser,
+        )
+        .await;
+        if acquired.refresh_rejected {
+            self.forget_entra_refresh(url).await;
+        }
+        (acquired.token, cached.map(|(_, source)| source))
+    }
+
+    /// Drops a connection's kept refresh token from session memory and the
+    /// keyring alike.
+    async fn forget_entra_refresh(mut self, url: &str) {
+        let key = entra_secret_key(url);
+        self.session_passwords.write().remove(&key);
+        let _ = crate::secrets::delete_password_async(key).await;
+    }
+
+    /// Keeps a sign-in's refresh token where `remember` says
+    /// ([`place_entra_refresh`]). A keyring that refuses the store leaves it
+    /// for the session instead, and says so, as a refused password store does.
+    async fn keep_entra_refresh(mut self, url: &str, refresh: String, remember: bool) {
+        let placed =
+            place_entra_refresh(&mut self.session_passwords.write(), url, refresh, remember);
+        match placed {
+            RefreshKeyring::Store(refresh) => {
+                let key = entra_secret_key(url);
+                let stored =
+                    crate::secrets::store_password_async(key.clone(), refresh.clone()).await;
+                if stored.is_err() {
+                    self.session_passwords.write().insert(key, refresh);
+                    self.connect_error.set(Some(
+                        "connected, but the sign-in could not be stored in the system \
+                         keyring — it is remembered for this session only"
+                            .to_string(),
+                    ));
+                }
+            }
+            RefreshKeyring::Delete => {
+                let _ = crate::secrets::delete_password_async(entra_secret_key(url)).await;
+            }
+        }
+    }
+
     /// The Entra branch of the connect: try to acquire a token silently — a
     /// managed identity always can; interactive only via a cached refresh token
     /// (the browser opener errors, so a missing/expired refresh falls through to
@@ -1208,21 +1324,24 @@ impl AppState {
         live_tunnel: Option<Tunnel>,
     ) {
         self.set_step(&pending.url, ConnectStep::SigningIn);
-        let token = acquire_entra(
-            &pending.entra,
-            backend.entra_resource,
-            &pending.url,
-            refuse_browser,
-        )
-        .await;
+        let (token, source) = self
+            .acquire_entra(
+                &pending.entra,
+                backend.entra_resource,
+                &pending.url,
+                refuse_browser,
+            )
+            .await;
         match token {
             Ok(token) => {
+                let remember = redeemed_refresh_remembered(source);
                 self.finish_entra_connect(
                     backend,
                     pending,
                     &connect_url,
                     tls_host,
                     token,
+                    remember,
                     live_tunnel,
                 )
                 .await;
@@ -1243,8 +1362,9 @@ impl AppState {
 
     /// Logs in with an acquired Entra token — spliced in as the password for
     /// Postgres, handed to tiberius as its AAD auth method for SQL Server —
-    /// and on success caches the refresh token (never the access token) and
-    /// saves the connection with its Entra auth mode.
+    /// and on success keeps the refresh token (never the access token) where
+    /// `remember` says, and saves the connection with its Entra auth mode.
+    #[allow(clippy::too_many_arguments)]
     async fn finish_entra_connect(
         mut self,
         backend: ServerBackend,
@@ -1252,6 +1372,7 @@ impl AppState {
         connect_url: &str,
         tls_host: Option<String>,
         token: azure::AccessToken,
+        remember: bool,
         live_tunnel: Option<Tunnel>,
     ) {
         let EntraPrompt {
@@ -1274,9 +1395,9 @@ impl AppState {
         self.finish_connect(url.clone(), name.clone(), result, live_tunnel);
         if connected {
             self.entra_prompt.set(None);
-            // Cache the refresh token for silent renewals; best-effort.
+            // Kept for silent renewals: in the keyring only on `remember`.
             if let Some(refresh) = token.refresh_token {
-                let _ = crate::secrets::store_password_async(entra_secret_key(&url), refresh).await;
+                self.keep_entra_refresh(&url, refresh, remember).await;
             }
             self.save_server_if_open(backend, &url, &name, tunnel, ServerAuth::Entra(entra));
         }
@@ -1307,21 +1428,26 @@ impl AppState {
             return;
         };
         let tls_host = backend.tls_host(&prompt.url, prompt.tunnel.is_some());
-        let token = acquire_entra(
-            &prompt.entra,
-            backend.entra_resource,
-            &prompt.url,
-            open_browser,
-        )
-        .await;
+        let (token, _) = self
+            .acquire_entra(
+                &prompt.entra,
+                backend.entra_resource,
+                &prompt.url,
+                open_browser,
+            )
+            .await;
         match token {
             Ok(token) => {
+                // The card's answer, given just now, decides — whatever an
+                // earlier sign-in was told.
+                let remember = prompt.remember;
                 self.finish_entra_connect(
                     backend,
                     prompt,
                     &connect_url,
                     tls_host,
                     token,
+                    remember,
                     live_tunnel,
                 )
                 .await;
@@ -1329,7 +1455,9 @@ impl AppState {
             Err(err) => {
                 drop(live_tunnel);
                 self.fail_connect(&prompt.url, err.to_string());
-                // Re-raise the card so the user can retry the sign-in in place.
+                // Re-raise the card so the user can retry the sign-in in
+                // place. It carries the answer they gave, so a failed sign-in
+                // does not re-tick a box they cleared.
                 self.entra_prompt.set(Some(prompt));
             }
         }
@@ -2419,7 +2547,7 @@ mod tests {
     fn negated(code: &str, names: &[&str]) -> Option<String> {
         code.match_indices('!').find_map(|(at, _)| {
             let rest = code[at + 1..].trim_start_matches(['*', '&', '(']);
-            let rest = ["prompt.", "self.", "state."]
+            let rest = ["prompt.", "self.", "state.", "acquired."]
                 .iter()
                 .find_map(|receiver| rest.strip_prefix(receiver))
                 .unwrap_or(rest);
@@ -2559,6 +2687,215 @@ mod tests {
     }
 
     #[test]
+    fn the_entra_remember_answer_is_not_inverted_at_any_hop_of_its_wire() {
+        // The refresh token is functionally a password, and reaches the
+        // keyring on the same kind of answer. The wire, in order: the card's
+        // checkbox → its sign-in → `connect_server_with_entra_signin` →
+        // `finish_entra_connect` → `keep_entra_refresh` → `place_entra_refresh`
+        // → the keyring write or delete. A silent sign-in joins at
+        // `connect_server_entra`, whose answer is where the redeemed token was
+        // kept; `acquire_entra` and the restore gate read that, and the former
+        // forgets a refused token. A `!` anywhere on it inverts a decision
+        // about a credential while moving no call — see
+        // `the_remember_answer_is_not_inverted_at_any_hop_of_its_wire` for
+        // why this names the whole wire rather than one function.
+        //
+        // What an inversion costs:
+        //
+        // - `remember` / `offered` — the token is stored exactly when the
+        //   user declined, and a remembered sign-in is deleted.
+        // - `refresh_rejected` — a working token is forgotten after every
+        //   sign-in, and a dead one is paid for before every card.
+        // - `has_refresh` — startup pops sign-in cards for connections it
+        //   could restore, and tries to restore ones it cannot.
+        const NAMES: &[&str] = &[
+            "remember",
+            "offered",
+            "refresh_rejected",
+            "redeemed_refresh_remembered",
+            "has_refresh",
+        ];
+        let source = include_str!("connect.rs");
+        let card = method_body(include_str!("../connections.rs"), "fn EntraSignInCard(");
+        let signin = method_body(source, "pub async fn connect_server_with_entra_signin(");
+        let silent = method_body(source, "async fn connect_server_entra(");
+        let finish = method_body(source, "async fn finish_entra_connect(");
+        let acquire = method_body(source, "async fn acquire_entra(");
+        let keep = method_body(source, "async fn keep_entra_refresh(");
+        let restore = method_body(include_str!("session.rs"), "async fn connects_silently(");
+        let hops = [
+            ("the card", &card),
+            ("the sign-in", &signin),
+            ("the silent connect", &silent),
+            ("finish_entra_connect", &finish),
+            ("acquire_entra", &acquire),
+            ("keep_entra_refresh", &keep),
+            ("the restore gate", &restore),
+        ];
+        for (hop, body) in hops {
+            let code = code_of(body);
+            assert_eq!(
+                negated(&code, NAMES),
+                None,
+                "a verdict about the refresh token is negated in {hop}: {code}"
+            );
+        }
+
+        // Bindings as written, since `let remember = true;` passes the sweep.
+        // Whitespace-collapsed, so a rustfmt wrap is not read as a severed
+        // decision.
+        let pinned = [
+            (&card, "let offered = prompt.remember;"),
+            (&card, "use_signal(move || offered)"),
+            (&card, "prompt.remember = *remember.peek();"),
+            (&card, "checked: remember(),"),
+            (&signin, "let remember = prompt.remember;"),
+            (
+                &silent,
+                "let remember = redeemed_refresh_remembered(source);",
+            ),
+            (
+                &finish,
+                "self.keep_entra_refresh(&url, refresh, remember).await;",
+            ),
+            (
+                &keep,
+                // No closing paren: a wrapped call gains a trailing comma.
+                "place_entra_refresh(&mut self.session_passwords.write(), url, refresh, remember",
+            ),
+            (
+                &restore,
+                "let has_refresh = self.cached_entra_refresh(&locator).await.is_some();",
+            ),
+            (&restore, "entra.can_acquire_silently(has_refresh)"),
+        ];
+        for (body, binding) in pinned {
+            assert!(
+                collapsed(&code_of(body)).contains(binding),
+                "`{binding}` is gone, so the answer is decided by something \
+                 other than the user or its policy: {body}"
+            );
+        }
+        // A failed sign-in re-raises the card with the answer it was given;
+        // rewriting it on the way re-ticks a box the user cleared.
+        assert!(
+            !collapsed(&code_of(&signin)).contains("prompt.remember ="),
+            "the sign-in rewrites the card's answer: {signin}"
+        );
+        // Both callers hand `finish_entra_connect` the binding above, not a
+        // literal — a line at a time, for CRLF checkouts.
+        for (hop, body) in [("the sign-in", &signin), ("the silent connect", &silent)] {
+            assert!(
+                body.lines().any(|line| line.trim() == "remember,"),
+                "{hop} hands finish_entra_connect something other than its answer"
+            );
+        }
+
+        // Each keyring call sits in the arm of the verdict that asks for it:
+        // swapping them stores a declined sign-in and deletes a remembered one
+        // while every binding above still reads correctly.
+        let store = method_body(&keep, "RefreshKeyring::Store(refresh) => {");
+        assert!(
+            store.contains("store_password_async") && !store.contains("delete_password_async"),
+            "{store}"
+        );
+        let delete = method_body(&keep, "RefreshKeyring::Delete => {");
+        assert!(
+            delete.contains("delete_password_async") && !delete.contains("store_password_async"),
+            "{delete}"
+        );
+        // And the eviction sits inside the rejection's gate.
+        let evict = method_body(&acquire, "if acquired.refresh_rejected {");
+        assert!(
+            evict.contains("self.forget_entra_refresh(url)"),
+            "a refused refresh token is not what gets forgotten: {evict}"
+        );
+
+        // Every route to the token's key, so a new write or read cannot join
+        // the wire without being named here. The edit and removal paths reach
+        // it through `secret_keys`, which moves or deletes all three keys.
+        let shipped_code = code_only(&shipped(source));
+        let named: usize = [
+            "fn entra_secret_key(",
+            "fn secret_keys(",
+            "fn place_entra_refresh(",
+            "async fn cached_entra_refresh(",
+            "async fn forget_entra_refresh(",
+            "async fn keep_entra_refresh(",
+        ]
+        .iter()
+        .map(|signature| {
+            ident_count(
+                &code_only(&method_body(source, signature)),
+                "entra_secret_key",
+            )
+        })
+        .sum();
+        assert_eq!(
+            ident_count(&shipped_code, "entra_secret_key"),
+            named,
+            "the refresh token's key is used outside the functions that \
+             carry the remember answer, so something reads or writes it \
+             without consulting it"
+        );
+        for other in [
+            include_str!("session.rs"),
+            include_str!("mod.rs"),
+            include_str!("../connections.rs"),
+        ] {
+            assert_eq!(
+                ident_count(&code_only(&shipped(other)), "entra_secret_key"),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn a_silent_sign_in_keeps_its_token_where_the_user_put_it() {
+        // Only a remembered token is in the keyring, so its rotation stays
+        // there; one kept for the session stays for the session. No source
+        // (managed identity, which returns no refresh token) is never a
+        // reason to start remembering.
+        assert!(redeemed_refresh_remembered(Some(RefreshSource::Keyring)));
+        assert!(!redeemed_refresh_remembered(Some(RefreshSource::Session)));
+        assert!(!redeemed_refresh_remembered(None));
+    }
+
+    #[test]
+    fn a_refresh_token_reaches_the_keyring_only_when_remembered() {
+        let url = "postgres://u@h:5432/db";
+        let key = entra_secret_key(url);
+        let other = entra_secret_key("postgres://u@other:5432/db");
+
+        // Remembered: to the keyring, and out of session memory, so the
+        // token has one home and the next silent sign-in reads it as
+        // remembered.
+        let mut session = HashMap::from([
+            (key.clone(), "older".to_string()),
+            (other.clone(), "theirs".to_string()),
+        ]);
+        assert_eq!(
+            place_entra_refresh(&mut session, url, "fresh".to_string(), true),
+            RefreshKeyring::Store("fresh".to_string())
+        );
+        assert!(!session.contains_key(&key));
+
+        // Declined: for the session only, and any remembered one is deleted,
+        // since keeping it would sign the user in at the next start anyway.
+        assert_eq!(
+            place_entra_refresh(&mut session, url, "fresh".to_string(), false),
+            RefreshKeyring::Delete
+        );
+        assert_eq!(session.get(&key).map(String::as_str), Some("fresh"));
+
+        assert_eq!(
+            session.get(&other).map(String::as_str),
+            Some("theirs"),
+            "placing one connection's token touched another's"
+        );
+    }
+
+    #[test]
     fn a_parked_choice_decides_whether_the_passphrase_is_stored() {
         // The policy itself, executed rather than read. The tests around it
         // pin *where* the write happens; these pin *what it decides*, which is
@@ -2674,11 +3011,8 @@ mod tests {
     /// The three locator-keyed keys, as a connection's secrets would sit in
     /// session memory: a database password, an SSH passphrase, an Entra token.
     ///
-    /// Nothing writes the `#entra` one into session memory today — refresh
-    /// tokens live in the keyring only. It is here because the point of
-    /// [`secret_keys`] is that these paths walk the *list* rather than the
-    /// keys they happen to know about, so the fixture holds a value under
-    /// every key the list names.
+    /// The `#entra` one is a refresh token from a sign-in the user did not ask
+    /// to have remembered ([`place_entra_refresh`]).
     fn session_for(locator: &str) -> HashMap<String, String> {
         HashMap::from([
             (locator.to_string(), "db-password".to_string()),

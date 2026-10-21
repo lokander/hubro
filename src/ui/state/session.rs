@@ -145,7 +145,8 @@ impl AppState {
     /// Whether a saved server connection can sign in without asking, so
     /// startup never blocks on a prompt or pops a browser. Password auth
     /// needs a stored or session password; Entra managed identity always
-    /// can; Entra interactive only with a cached refresh token. The keyring
+    /// can; Entra interactive only with a kept refresh token — which, across
+    /// a restart, means one the user asked to have remembered. The keyring
     /// reads are off-thread, and the session-memory borrow is dropped before
     /// the await.
     async fn connects_silently(self, connection: SavedConnection) -> bool {
@@ -159,11 +160,9 @@ impl AppState {
         };
         match auth {
             ServerAuth::Entra(entra) => {
-                let has_refresh = crate::secrets::get_password_async(entra_secret_key(&locator))
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some();
+                // The connect's own lookup, so the two agree on whether a
+                // sign-in is kept.
+                let has_refresh = self.cached_entra_refresh(&locator).await.is_some();
                 entra.can_acquire_silently(has_refresh)
             }
             ServerAuth::Password => {
