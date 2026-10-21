@@ -106,16 +106,28 @@ impl AppState {
         }
     }
 
-    /// Stages a row delete (the grid's row delete comes in through this).
-    pub fn stage_delete(mut self, id: ConnectionId, table: &TableRef, locator: RowLocator) {
+    /// Stages a delete for each of `locators` — the grid's "Delete N
+    /// selected", the only way a row delete comes in — in one write.
+    ///
+    /// One write rather than one per row: every write to `staged` notifies
+    /// everything reading it, in every tab, so staging a hundred-row selection
+    /// row by row sent a hundred rounds of notifications for one action.
+    /// (Dioxus already coalesced the re-renders and memo re-runs those
+    /// caused into one each; the notifications themselves it cannot merge.)
+    pub fn stage_deletes(mut self, id: ConnectionId, table: &TableRef, locators: Vec<RowLocator>) {
+        if locators.is_empty() {
+            return;
+        }
         self.nav_guard.set(None);
-        self.staged
-            .write()
+        let mut staged = self.staged.write();
+        let stage = staged
             .entry(id)
             .or_default()
             .entry(table.key())
-            .or_default()
-            .mark_delete(locator);
+            .or_default();
+        for locator in locators {
+            stage.mark_delete(locator);
+        }
     }
 
     /// The current stage of one table view, if any (cloned for rendering).
@@ -559,5 +571,109 @@ mod tests {
                 identity_values: vec![Value::Integer(id)],
             },
         }
+    }
+
+    thread_local! {
+        /// How often [`StageProbe`]'s memo has run, on this test's thread.
+        static PROBE_RECOMPUTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Reads one table's stage the way the grid's `page_view` memo does —
+    /// through [`AppState::table_stage`], inside a memo — and renders a
+    /// summary of it, so a test can count both the derivations and the renders
+    /// a burst of staging causes.
+    #[component]
+    fn StageProbe(id: ConnectionId, table: TableRef) -> Element {
+        let state = use_context::<AppState>();
+        let deletes = use_memo(move || {
+            PROBE_RECOMPUTES.with(|runs| runs.set(runs.get() + 1));
+            state
+                .table_stage(id, &table)
+                .map(|stage| stage.delete_count())
+        });
+        rsx! { "{deletes:?}" }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_selection_stages_every_row_in_one_write() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        use dioxus::core::{NoOpMutations, ReactiveContext, VirtualDom};
+
+        use crate::ui::test_dom::{provide_state, total_renders};
+
+        let pool =
+            DbPool::Sqlite(sqlx::sqlite::SqlitePool::connect_lazy("sqlite::memory:").unwrap());
+        let id = ConnectionRegistry::default().insert("t.db", pool, WriteProtection::Open);
+        let table = TableRef {
+            schema: None,
+            name: "t".into(),
+        };
+        let mut dom = VirtualDom::new_with_props(
+            StageProbe,
+            StageProbeProps {
+                id,
+                table: table.clone(),
+            },
+        );
+        let state = provide_state(&dom);
+        dom.rebuild_in_place();
+
+        // Every notification `staged` sends its subscribers. Each one is a
+        // pass over every component and memo reading the map — the grid's
+        // `page_view` among them.
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let listener = {
+            let notifications = notifications.clone();
+            dom.in_runtime(|| {
+                ReactiveContext::new_with_callback(
+                    move || {
+                        notifications.fetch_add(1, Ordering::Relaxed);
+                    },
+                    ScopeId::ROOT,
+                    std::panic::Location::caller(),
+                )
+            })
+        };
+        dom.in_runtime(|| listener.run_in(|| drop(state.staged.read())));
+
+        // Staging an empty selection changes nothing at all — not even the
+        // parked navigation, which a real stage clears.
+        dom.in_runtime(|| {
+            let mut state = state;
+            state
+                .nav_guard
+                .set(Some(PendingNav::new(id, NavAction::CloseConnection)));
+            state.stage_deletes(id, &table, Vec::new());
+        });
+        assert!(dom.in_runtime(|| state.nav_guard.peek().is_some()));
+        assert_eq!(notifications.load(Ordering::Relaxed), 0);
+
+        let renders = total_renders(&dom);
+        let recomputes = PROBE_RECOMPUTES.with(std::cell::Cell::get);
+        let locators = (0..100)
+            .map(|n| crate::db::RowLocator {
+                identity_values: vec![Value::Integer(n)],
+            })
+            .collect();
+        dom.in_runtime(|| state.stage_deletes(id, &table, locators));
+        dom.render_immediate(&mut NoOpMutations);
+
+        // All hundred rows are staged...
+        assert_eq!(
+            dom.in_runtime(|| state.table_stage(id, &table))
+                .map(|stage| stage.delete_count()),
+            Some(100)
+        );
+        // ...by one write, not one per row...
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+        // ...which, being an edit, releases a parked navigation like any
+        // other.
+        assert!(dom.in_runtime(|| state.nav_guard.peek().is_none()));
+        // Downstream, a burst of writes was already coalesced: the memo
+        // re-derives once and the reader renders once either way.
+        assert_eq!(PROBE_RECOMPUTES.with(std::cell::Cell::get) - recomputes, 1);
+        assert_eq!(total_renders(&dom) - renders, 1);
     }
 }
