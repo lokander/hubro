@@ -121,8 +121,9 @@ pub(super) fn date(bytes: &[u8]) -> Option<String> {
 ///
 /// `zone` is what a `timestamptz` carries: the wire holds an instant, which
 /// is rendered in UTC with the offset spelled out so it reads as zoned. The
-/// era comes after it because that is the order the server prints and
-/// accepts (`0001-01-01 00:00:00+00:00 BC`).
+/// era comes after it because that is the order the server prints
+/// (`0001-01-01 00:00:00+00:00 BC`); PostgreSQL also reads the era before
+/// the zone, so the order is a matter of display, not of the value.
 pub(super) fn timestamp(bytes: &[u8], zone: &str) -> Option<String> {
     let micros = i64::from_be_bytes(bytes.try_into().ok()?);
     Some(match micros {
