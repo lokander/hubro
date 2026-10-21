@@ -346,69 +346,90 @@ async fn liveness(client: &mut TdsClient, limit: Duration) -> Liveness {
     }
 }
 
-/// One checked-out connection. Returns itself to the pool on drop unless it
-/// was [`discarded`](Self::discard) or the pool has closed.
-struct PooledConn {
-    client: Option<TdsClient>,
-    pool: Arc<PoolInner>,
-    _permit: OwnedSemaphorePermit,
+/// A module of its own so that the client field is private to it: the only
+/// way to send a request is [`PooledConn::request`], which is what keeps a
+/// cancelled request's connection out of the pool.
+mod pooled {
+    use super::*;
+
+    /// One checked-out connection. Returns itself to the pool on drop unless it
+    /// was [`discarded`](Self::discard) or the pool has closed.
+    pub(super) struct PooledConn {
+        client: Option<TdsClient>,
+        pool: Arc<PoolInner>,
+        _permit: OwnedSemaphorePermit,
+    }
+
+    impl PooledConn {
+        pub(super) fn new(
+            client: Option<TdsClient>,
+            pool: Arc<PoolInner>,
+            permit: OwnedSemaphorePermit,
+        ) -> Self {
+            PooledConn {
+                client,
+                pool,
+                _permit: permit,
+            }
+        }
+
+        /// Runs one request on the client — the only way to reach it. The client
+        /// is out of `self` while the request is in flight, so a future dropped
+        /// mid-request (a cancelled run, grid page or export) drops the client
+        /// with it and closes the connection rather than pooling it. Pooled, it
+        /// would make the next borrower wait out the abandoned response (tiberius
+        /// drains it first), and an edit batch cancelled between `BEGIN TRAN` and
+        /// `COMMIT` would hand its open transaction to the next borrower, whose
+        /// own commit then only lowered `@@TRANCOUNT`.
+        pub(super) async fn request<T>(&mut self, f: impl AsyncFnOnce(&mut TdsClient) -> T) -> T {
+            let mut client = self.client.take().expect("connection already discarded");
+            let out = f(&mut client).await;
+            self.client = Some(client);
+            out
+        }
+
+        /// True once [`Self::discard`] ran. A [`MssqlTx`] can outlive its
+        /// connection this way (a fatal mid-script error discards it), so the
+        /// transaction entry points must check before touching the client.
+        pub(super) fn is_discarded(&self) -> bool {
+            self.client.is_none()
+        }
+
+        /// Drops the client instead of returning it to the pool — for connections
+        /// whose TDS stream may be left mid-response (driver-level errors, capped
+        /// reads that abandoned a result set).
+        pub(super) fn discard(&mut self) {
+            self.client = None;
+        }
+    }
+
+    impl Drop for PooledConn {
+        fn drop(&mut self) {
+            if let Some(client) = self.client.take() {
+                if !self.pool.closed.load(Ordering::SeqCst) {
+                    self.pool
+                        .idle
+                        .lock()
+                        .expect("pool lock poisoned")
+                        .push(IdleClient {
+                            client,
+                            since: Instant::now(),
+                        });
+                }
+                // Pool closed: dropping the client closes the socket. The graceful
+                // TDS logout needs an async context the destructor doesn't have.
+            }
+        }
+    }
 }
 
-impl PooledConn {
-    /// Runs one request on the client — the only way to reach it. The client
-    /// is out of `self` while the request is in flight, so a future dropped
-    /// mid-request (a cancelled run, grid page or export) drops the client
-    /// with it and closes the connection rather than pooling it. Pooled, it
-    /// would make the next borrower wait out the abandoned response (tiberius
-    /// drains it first), and an edit batch cancelled between `BEGIN TRAN` and
-    /// `COMMIT` would hand its open transaction to the next borrower, whose
-    /// own commit then only lowered `@@TRANCOUNT`.
-    async fn request<T>(&mut self, f: impl AsyncFnOnce(&mut TdsClient) -> T) -> T {
-        let mut client = self.client.take().expect("connection already discarded");
-        let out = f(&mut client).await;
-        self.client = Some(client);
-        out
-    }
-
-    /// True once [`Self::discard`] ran. A [`MssqlTx`] can outlive its
-    /// connection this way (a fatal mid-script error discards it), so the
-    /// transaction entry points must check before touching the client.
-    fn is_discarded(&self) -> bool {
-        self.client.is_none()
-    }
-
-    /// Drops the client instead of returning it to the pool — for connections
-    /// whose TDS stream may be left mid-response (driver-level errors, capped
-    /// reads that abandoned a result set).
-    fn discard(&mut self) {
-        self.client = None;
-    }
-}
+use pooled::PooledConn;
 
 /// The error for operations on a transaction whose connection was already
 /// discarded by an earlier fatal failure. Not a new failure: the server rolls
 /// the abandoned transaction back when the dead connection goes away.
 fn lost_connection() -> DbError {
     DbError::Query("the connection was lost — the transaction was rolled back by the server".into())
-}
-
-impl Drop for PooledConn {
-    fn drop(&mut self) {
-        if let Some(client) = self.client.take() {
-            if !self.pool.closed.load(Ordering::SeqCst) {
-                self.pool
-                    .idle
-                    .lock()
-                    .expect("pool lock poisoned")
-                    .push(IdleClient {
-                        client,
-                        since: Instant::now(),
-                    });
-            }
-            // Pool closed: dropping the client closes the socket. The graceful
-            // TDS logout needs an async context the destructor doesn't have.
-        }
-    }
 }
 
 impl MssqlPool {
@@ -454,11 +475,11 @@ impl MssqlPool {
             // Dropping the client closes its socket; nothing to log out of on
             // a session that is already gone.
         };
-        Ok(PooledConn {
-            client: Some(client),
-            pool: Arc::clone(&self.inner),
-            _permit: permit,
-        })
+        Ok(PooledConn::new(
+            Some(client),
+            Arc::clone(&self.inner),
+            permit,
+        ))
     }
 
     /// Closes the pool: idle connections are logged out, checked-out ones are
@@ -1706,11 +1727,7 @@ mod tests {
             .try_acquire_owned()
             .expect("fresh semaphore has a permit");
         MssqlTx {
-            conn: PooledConn {
-                client: None,
-                pool: inner,
-                _permit: permit,
-            },
+            conn: PooledConn::new(None, inner, permit),
             resolved: false,
             id: 0,
         }
