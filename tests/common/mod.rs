@@ -1058,7 +1058,7 @@ pub async fn fk_jump_failures(
         let Some(Value::Text(expect)) = source_row.get("expect") else {
             panic!("{label}: expect must be a text cell");
         };
-        let Some(filter) = build_fk_filter(fk, &source_row, parent, pool.dialect()) else {
+        let Some(filter) = build_fk_filter(fk, &source_row, parent) else {
             failures.push(format!("{label}: no jump was built"));
             continue;
         };

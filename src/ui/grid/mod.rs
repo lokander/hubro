@@ -57,7 +57,9 @@ use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState};
 use super::schema::display_type;
 use super::selection::Selection;
 use super::stage::{required_insert_columns, PendingInsert, TableStage};
-use super::state::{find_table_meta, grid_export_line, AppState, ImportStatus, TableRef};
+use super::state::{
+    find_table_meta, fk_jump_target, grid_export_line, AppState, ImportStatus, TableRef,
+};
 
 const PAGE_SIZE: u32 = 100;
 
@@ -631,9 +633,11 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let render_meta = use_memo(move || {
         let schemas = state.schemas.read();
         let dialect = state.registry.read().get(id).map(|c| c.pool.dialect());
+        let load = schemas.get(&id);
         Shared::new(TableRenderMeta::build(
-            find_table_meta(schemas.get(&id), &render_table),
+            find_table_meta(load, &render_table),
             dialect,
+            |fk| fk_jump_target(load, fk).is_some(),
         ))
     });
 

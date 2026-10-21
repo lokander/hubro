@@ -60,7 +60,7 @@ pub(crate) use coerce::{is_bit_string, parse_numeric_text, validate_bit_literal}
 pub use ddl::{Ddl, DdlObject, DdlSource};
 pub use error::DbError;
 pub use export::{write_result, ExportFormat};
-pub use fk::{build_fk_filter, resolve_referenced_column};
+pub use fk::{build_fk_filter, fk_target_columns, resolve_referenced_column};
 pub use import::{
     default_mapping, import_refusal, is_importable, mapping_from_header, open_source, preview,
     run_import, sniff_dialect, sniff_encoding, sniff_file, sniff_shape, ColumnBinding, CsvDialect,

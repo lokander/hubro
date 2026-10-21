@@ -119,7 +119,8 @@ pub(super) struct TableRenderMeta {
     /// Foreign keys of this table, indexed by `col_to_fk`.
     pub(super) foreign_keys: Vec<ForeignKeyMeta>,
     /// Referencing column → index into `foreign_keys`; a column in several FKs
-    /// takes the first (documented v1 limit).
+    /// takes the first (documented v1 limit). Only keys whose jump lands
+    /// somewhere are entered, so a column's link is never a dead click.
     pub(super) col_to_fk: HashMap<String, usize>,
     /// Required-column flagging for pending inserts: NOT NULL + no default +
     /// not auto-assigned (see [`required_insert_columns`] for the per-backend
@@ -133,12 +134,22 @@ impl TableRenderMeta {
     /// a type name alone cannot decide — Postgres `bit` versus SQL Server's.
     /// Without a live connection neither applies, and there is
     /// nothing to save through either. Empty when the schema isn't loaded yet.
-    pub(super) fn build(meta: Option<&TableMeta>, dialect: Option<Dialect>) -> Self {
+    ///
+    /// `lands` answers whether a jump along a foreign key has somewhere to go
+    /// (`state::fk_jump_target`); a key it refuses gets no link.
+    pub(super) fn build(
+        meta: Option<&TableMeta>,
+        dialect: Option<Dialect>,
+        lands: impl Fn(&ForeignKeyMeta) -> bool,
+    ) -> Self {
         let Some(meta) = meta else {
             return TableRenderMeta::default();
         };
         let mut col_to_fk = HashMap::new();
         for (index, fk) in meta.foreign_keys.iter().enumerate() {
+            if !lands(fk) {
+                continue;
+            }
             for column in &fk.columns {
                 col_to_fk.entry(column.clone()).or_insert(index);
             }
@@ -1417,7 +1428,8 @@ mod tests {
 
     #[test]
     fn render_metadata_resolves_kinds_and_foreign_keys_once_per_table() {
-        let meta = TableRenderMeta::build(Some(&detail_table_meta()), Some(Dialect::Sqlite));
+        let meta =
+            TableRenderMeta::build(Some(&detail_table_meta()), Some(Dialect::Sqlite), |_| true);
         assert_eq!(meta.schema_columns, ["id", "title"]);
         // Editor kinds come from the same helper the grid has always used.
         assert_eq!(meta.kind_of("title"), (EditorKind::Text, true));
@@ -1435,12 +1447,14 @@ mod tests {
         // Without a schema (or without a connection to name the dialect)
         // nothing is resolved rather than half-resolved.
         assert_eq!(
-            TableRenderMeta::build(None, None),
+            TableRenderMeta::build(None, None, |_| true),
             TableRenderMeta::default()
         );
-        assert!(TableRenderMeta::build(Some(&detail_table_meta()), None)
-            .required
-            .is_empty());
+        assert!(
+            TableRenderMeta::build(Some(&detail_table_meta()), None, |_| true)
+                .required
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1461,7 +1475,7 @@ mod tests {
             type_detail: crate::db::TypeDetail::Plain,
         });
 
-        let pg = TableRenderMeta::build(Some(&table), Some(Dialect::Postgres));
+        let pg = TableRenderMeta::build(Some(&table), Some(Dialect::Postgres), |_| true);
         assert_eq!(
             pg.kind_of("mask"),
             (EditorKind::BitString, true),
@@ -1471,11 +1485,11 @@ mod tests {
 
         // SQL Server's `bit` is a boolean, and must not be caught by the same
         // name — the distinction is the point of passing the dialect at all.
-        let ms = TableRenderMeta::build(Some(&table), Some(Dialect::SqlServer));
+        let ms = TableRenderMeta::build(Some(&table), Some(Dialect::SqlServer), |_| true);
         assert_ne!(ms.kind_of("mask").0, EditorKind::BitString);
 
         // No connection, no dialect, no refinement.
-        let none = TableRenderMeta::build(Some(&table), None);
+        let none = TableRenderMeta::build(Some(&table), None, |_| true);
         assert_eq!(none.kind_of("mask"), (EditorKind::Text, true));
     }
 
@@ -1489,13 +1503,39 @@ mod tests {
             referenced_table: "other".into(),
             referenced_columns: vec![Some("name".into())],
         });
-        let meta = TableRenderMeta::build(Some(&table), Some(Dialect::Sqlite));
+        let meta = TableRenderMeta::build(Some(&table), Some(Dialect::Sqlite), |_| true);
         assert_eq!(meta.col_to_fk["title"], 0);
         assert_eq!(
             meta.fk_of("title", &Value::Text("x".into()))
                 .map(|fk| fk.referenced_table.as_str()),
             Some("titles")
         );
+    }
+
+    #[test]
+    fn a_key_whose_jump_lands_nowhere_gets_no_link() {
+        // A link that does nothing when clicked reads as broken. A key whose
+        // target the schema cannot resolve is left out, and a column in two
+        // keys falls through to the one that does land.
+        let mut table = detail_table_meta();
+        table.foreign_keys.push(ForeignKeyMeta {
+            columns: vec!["title".into()],
+            referenced_schema: None,
+            referenced_table: "other".into(),
+            referenced_columns: vec![Some("name".into())],
+        });
+        let to_other = TableRenderMeta::build(Some(&table), Some(Dialect::Sqlite), |fk| {
+            fk.referenced_table != "titles"
+        });
+        assert_eq!(
+            to_other
+                .fk_of("title", &Value::Text("x".into()))
+                .map(|fk| fk.referenced_table.as_str()),
+            Some("other")
+        );
+        let nowhere = TableRenderMeta::build(Some(&table), Some(Dialect::Sqlite), |_| false);
+        assert!(nowhere.col_to_fk.is_empty());
+        assert_eq!(nowhere.fk_of("title", &Value::Text("x".into())), None);
     }
 
     #[test]

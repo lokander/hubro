@@ -6,9 +6,7 @@
 use std::collections::HashMap;
 
 use super::page::{Filter, KeyEquality};
-use super::schema::{ForeignKeyMeta, TableMeta};
-use super::sql::Dialect;
-use super::staged::cast_targets;
+use super::schema::{ColumnMeta, ForeignKeyMeta, TableMeta};
 use super::value::Value;
 
 /// The name of the target column the FK's `index`-th key column references.
@@ -32,23 +30,50 @@ pub fn resolve_referenced_column(
 /// Builds the multi-equality [`Filter`] that selects the row `fk` references
 /// in `target`, from the source row's values (column name → value).
 ///
-/// Each term carries the referenced column's cast on `dialect`, read off
-/// `target`, so the jump compares the source row's typed values the way a
-/// row's own key is re-addressed — see `staged::equalities_where` for what
-/// comparing them as text used to miss. The cast is the *target* column's
-/// because that is the column the predicate compares against; a foreign key
-/// may reference a column of a different (comparable) type.
+/// Each term carries the referenced column's metadata, read off `target`, so
+/// the jump binds the source row's typed values by the column they are
+/// compared against, the way a row's own key is re-addressed — see
+/// `staged::equalities_where` for what comparing them as text used to miss.
+/// It is the *target* column's because that is the column the predicate
+/// compares against; a foreign key may reference a column of a different
+/// (comparable) type.
 ///
 /// Returns `None` — the jump is a no-op — when the source row is missing any
 /// of the FK's referencing columns, when any of those values is NULL (a NULL
-/// foreign key references nothing), or when a referenced column can't be
-/// resolved (implicit PK reference against a target with no detectable PK).
+/// foreign key references nothing), or when the jump has nowhere to land
+/// ([`fk_target_columns`]).
 pub fn build_fk_filter(
     fk: &ForeignKeyMeta,
     source_row: &HashMap<String, Value>,
     target: &TableMeta,
-    dialect: Dialect,
 ) -> Option<Filter> {
+    let referenced = fk_target_columns(fk, target)?;
+    let mut terms = Vec::with_capacity(referenced.len());
+    for (column, meta) in fk.columns.iter().zip(referenced) {
+        let value = source_row.get(column)?;
+        if value.is_null() {
+            return None;
+        }
+        terms.push(KeyEquality {
+            column: meta.name.clone(),
+            value: value.clone(),
+            target: Some(meta.clone()),
+        });
+    }
+    Some(Filter::Equalities(terms))
+}
+
+/// The columns of `target` that `fk`'s key columns reference, in key order —
+/// or `None` when the foreign key leads nowhere hubro can show: it has no
+/// columns, a reference to the implicit primary key finds no primary-key
+/// column at its position, or a referenced column is missing from `target`
+/// (a stale schema, or a reference SQLite accepted to a column that does
+/// not exist). Whether a row's link is offered at all is decided by this,
+/// so a link is never a dead click.
+pub fn fk_target_columns<'a>(
+    fk: &ForeignKeyMeta,
+    target: &'a TableMeta,
+) -> Option<Vec<&'a ColumnMeta>> {
     if fk.columns.is_empty() {
         return None;
     }
@@ -57,22 +82,12 @@ pub fn build_fk_filter(
         .iter()
         .map(|c| c.name.clone())
         .collect();
-    let casts = cast_targets(target, dialect);
-    let mut terms = Vec::with_capacity(fk.columns.len());
-    for (index, column) in fk.columns.iter().enumerate() {
-        let value = source_row.get(column)?;
-        if value.is_null() {
-            return None;
-        }
-        let referenced = resolve_referenced_column(fk, index, &target_pk)?;
-        let cast = casts.get(referenced.as_str()).cloned();
-        terms.push(KeyEquality {
-            column: referenced,
-            value: value.clone(),
-            cast,
-        });
-    }
-    Some(Filter::Equalities(terms))
+    (0..fk.columns.len())
+        .map(|index| {
+            let name = resolve_referenced_column(fk, index, &target_pk)?;
+            target.columns.iter().find(|c| c.name == name)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -163,16 +178,38 @@ mod tests {
         target(&[("id", "integer", Some(1)), ("name", "text", None)])
     }
 
+    /// The jump's terms as `(column, value, the column's declared type)`.
+    fn jump(
+        fk: &ForeignKeyMeta,
+        source: &HashMap<String, Value>,
+        target: &TableMeta,
+    ) -> Option<Vec<(String, Value, String)>> {
+        let Filter::Equalities(terms) = build_fk_filter(fk, source, target)? else {
+            panic!("a jump builds an equalities filter");
+        };
+        Some(
+            terms
+                .into_iter()
+                .map(|term| {
+                    let meta = term.target.expect("every term is typed by its column");
+                    assert_eq!(meta.name, term.column);
+                    (term.column, term.value, meta.type_name)
+                })
+                .collect(),
+        )
+    }
+
+    fn term(column: &str, value: Value, type_name: &str) -> (String, Value, String) {
+        (column.into(), value, type_name.into())
+    }
+
     #[test]
     fn builds_single_column_equality() {
         let fk = make_fk(&["parent_id"], vec![Some("id")]);
         let source = row(&[("parent_id", Value::Integer(7))]);
         assert_eq!(
-            build_fk_filter(&fk, &source, &by_id(), Dialect::Sqlite),
-            Some(Filter::Equalities(vec![KeyEquality::uncast(
-                "id",
-                Value::Integer(7)
-            )]))
+            jump(&fk, &source, &by_id()),
+            Some(vec![term("id", Value::Integer(7), "integer")])
         );
     }
 
@@ -192,11 +229,11 @@ mod tests {
             ("seq", "INTEGER", Some(2)),
         ]);
         assert_eq!(
-            build_fk_filter(&fk, &source, &albums, Dialect::Sqlite),
-            Some(Filter::Equalities(vec![
-                KeyEquality::uncast("artist_id", Value::Integer(1)),
-                KeyEquality::uncast("seq", Value::Integer(2)),
-            ]))
+            jump(&fk, &source, &albums),
+            Some(vec![
+                term("artist_id", Value::Integer(1), "INTEGER"),
+                term("seq", Value::Integer(2), "INTEGER"),
+            ])
         );
     }
 
@@ -205,26 +242,20 @@ mod tests {
         let fk = make_fk(&["composer_id"], vec![None]);
         let source = row(&[("composer_id", Value::Integer(2))]);
         assert_eq!(
-            build_fk_filter(&fk, &source, &by_id(), Dialect::Sqlite),
-            Some(Filter::Equalities(vec![KeyEquality::uncast(
-                "id",
-                Value::Integer(2)
-            )]))
+            jump(&fk, &source, &by_id()),
+            Some(vec![term("id", Value::Integer(2), "integer")])
         );
         // A target with no primary key leaves the reference unresolvable.
         let keyless = target(&[("id", "integer", None)]);
-        assert_eq!(
-            build_fk_filter(&fk, &source, &keyless, Dialect::Sqlite),
-            None
-        );
+        assert_eq!(build_fk_filter(&fk, &source, &keyless), None);
+        assert_eq!(fk_target_columns(&fk, &keyless), None);
     }
 
     #[test]
-    fn each_term_carries_the_referenced_columns_cast() {
-        // The predicate compares against the target's column, so the cast is
-        // the target's — here a `real` source referencing `double precision`
-        // and a padded `character(3)` key, which only `bpchar` compares
-        // blank-insensitively.
+    fn each_term_is_typed_by_the_referenced_column() {
+        // The predicate compares against the target's column, so the type
+        // is the target's — here a `real` source referencing `double
+        // precision`, and a padded `character(3)` key.
         let fk = make_fk(&["ratio", "code"], vec![Some("r"), Some("c")]);
         let source = row(&[
             ("ratio", Value::Real(0.5)),
@@ -234,32 +265,36 @@ mod tests {
             ("r", "double precision", Some(1)),
             ("c", "character", Some(2)),
         ]);
-        let Some(Filter::Equalities(terms)) =
-            build_fk_filter(&fk, &source, &parent, Dialect::Postgres)
-        else {
-            panic!("a jump");
-        };
-        let casts: Vec<Option<&str>> = terms.iter().map(|t| t.cast.as_deref()).collect();
-        assert_eq!(casts, [Some("double precision"), Some("bpchar")]);
-        assert_eq!(terms[0].value, Value::Real(0.5));
-        // Dialects that cast nothing bind the values bare.
-        for dialect in [Dialect::Sqlite, Dialect::SqlServer] {
-            let Some(Filter::Equalities(terms)) = build_fk_filter(&fk, &source, &parent, dialect)
-            else {
-                panic!("a jump");
-            };
-            assert!(terms.iter().all(|t| t.cast.is_none()), "{dialect:?}");
-        }
+        assert_eq!(
+            jump(&fk, &source, &parent),
+            Some(vec![
+                term("r", Value::Real(0.5), "double precision"),
+                term("c", Value::Text("ab ".into()), "character"),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_reference_to_a_column_the_target_lacks_leads_nowhere() {
+        // SQLite accepts `REFERENCES parent(nope)`; so does a schema read
+        // before the target changed. Either way there is nothing to land on,
+        // so no link is offered and no jump is built.
+        let fk = make_fk(&["parent_id"], vec![Some("nope")]);
+        let source = row(&[("parent_id", Value::Integer(7))]);
+        assert_eq!(fk_target_columns(&fk, &by_id()), None);
+        assert_eq!(build_fk_filter(&fk, &source, &by_id()), None);
+        let fine = make_fk(&["parent_id"], vec![Some("id")]);
+        let parent = by_id();
+        let resolved = fk_target_columns(&fine, &parent).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "id");
     }
 
     #[test]
     fn null_fk_value_yields_no_jump() {
         let fk = make_fk(&["composer_id"], vec![None]);
         let source = row(&[("composer_id", Value::Null)]);
-        assert_eq!(
-            build_fk_filter(&fk, &source, &by_id(), Dialect::Sqlite),
-            None
-        );
+        assert_eq!(build_fk_filter(&fk, &source, &by_id()), None);
     }
 
     #[test]
@@ -267,19 +302,13 @@ mod tests {
         let fk = make_fk(&["a_id", "b_id"], vec![Some("a"), Some("b")]);
         let source = row(&[("a_id", Value::Integer(1)), ("b_id", Value::Null)]);
         let parent = target(&[("a", "integer", Some(1)), ("b", "integer", Some(2))]);
-        assert_eq!(
-            build_fk_filter(&fk, &source, &parent, Dialect::Sqlite),
-            None
-        );
+        assert_eq!(build_fk_filter(&fk, &source, &parent), None);
     }
 
     #[test]
     fn missing_source_column_yields_no_jump() {
         let fk = make_fk(&["parent_id"], vec![Some("id")]);
         let source = row(&[("other", Value::Integer(1))]);
-        assert_eq!(
-            build_fk_filter(&fk, &source, &by_id(), Dialect::Sqlite),
-            None
-        );
+        assert_eq!(build_fk_filter(&fk, &source, &by_id()), None);
     }
 }

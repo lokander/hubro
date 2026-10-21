@@ -382,6 +382,13 @@ type PgQuery<'q> = sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArgu
 /// SQL builders (`staged::ParamSql::value_sql`) render NULL values inline
 /// as the literal `NULL` instead of binding them, so a NULL never reaches
 /// this function from an edit.
+///
+/// Statement-cache caveat: each variant binds as its own Postgres type, and
+/// sqlx caches a prepared statement by its SQL text alone, with the types of
+/// its first execution. A builder whose one SQL text can be executed with
+/// different variants in one position must make them one type first — the
+/// staged builders bind everything under a cast as text for exactly this
+/// reason (see `staged::ParamSql::value_sql`).
 fn bind_params<'q>(mut query: PgQuery<'q>, params: &[Value]) -> PgQuery<'q> {
     for param in params {
         query = match param {

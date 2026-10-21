@@ -770,7 +770,8 @@ mod tests {
     }
 
     fn detail_fixture() -> DetailFixture {
-        let meta = TableRenderMeta::build(Some(&detail_table_meta()), Some(Dialect::Sqlite));
+        let meta =
+            TableRenderMeta::build(Some(&detail_table_meta()), Some(Dialect::Sqlite), |_| true);
         let result = two_column_result();
         let rows = view_rows(&result, &[], 0, Some(&pk_identity()), None, true);
         let nav = GridNav::build(vec!["id".into(), "title".into()], &rows, &meta.column_kinds);
