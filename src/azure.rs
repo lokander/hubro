@@ -320,19 +320,38 @@ async fn acquire_interactive(
 /// So every connection is read on its own task — one that is held open and
 /// silent cannot stall the one carrying the redirect, which a single
 /// accept-then-read did indefinitely — and only a request carrying `code` or
-/// `error` ([`carries_redirect`]) ends the wait. Anything else is answered
-/// 404 and the wait goes on, until `timeout` from now.
+/// `error` with this sign-in's `state` ([`carries_redirect`]) ends the wait.
+/// Anything else is answered 404 and the wait goes on, until `timeout` from
+/// now.
+///
+/// The listener lives exactly as long as this future: dropping it — a
+/// cancelled connect does, mid-wait — unbinds the port and ends every read,
+/// rather than leaving a socket open to any local process for the rest of the
+/// run.
 async fn wait_for_redirect(
     listener: TcpListener,
     expected_state: &str,
     timeout: Duration,
 ) -> Result<String, AzureError> {
     let (requests, mut arrived) = tokio::sync::mpsc::unbounded_channel();
-    // Dropping the reader set when this task is aborted ends every read still
-    // waiting on a silent connection, so none outlives the sign-in.
-    let acceptor = tokio::spawn(async move {
+    // Owned here, not detached: dropping the set aborts the acceptor, which
+    // drops the listener and its reader set, ending every read still waiting
+    // on a silent connection.
+    let mut acceptor = tokio::task::JoinSet::new();
+    acceptor.spawn(async move {
         let mut readers = tokio::task::JoinSet::new();
-        while let Ok((stream, _)) = listener.accept().await {
+        loop {
+            let stream = match listener.accept().await {
+                Ok((stream, _)) => stream,
+                // A connection the browser reset before it was accepted
+                // (macOS, Windows), or no file descriptors to spare: noise
+                // one step earlier, so keep listening. The pause keeps a
+                // persistent error from spinning; the wait's deadline bounds it.
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
             while readers.try_join_next().is_some() {}
             let requests = requests.clone();
             readers.spawn(async move {
@@ -344,7 +363,7 @@ async fn wait_for_redirect(
     });
     let found = tokio::time::timeout(timeout, async {
         while let Some((stream, target)) = arrived.recv().await {
-            if carries_redirect(&target) {
+            if carries_redirect(&target, expected_state) {
                 return Ok((stream, target));
             }
             respond(stream, "404 Not Found", "").await;
@@ -354,7 +373,7 @@ async fn wait_for_redirect(
         ))
     })
     .await;
-    acceptor.abort();
+    drop(acceptor);
     let (stream, target) = found.map_err(|_| AzureError::Timeout)??;
 
     let result = parse_redirect(&target, expected_state);
@@ -403,14 +422,16 @@ async fn read_request_target(mut stream: TcpStream) -> Option<(TcpStream, String
     Some((stream, target))
 }
 
-/// Whether a request target is the sign-in's redirect: one carrying the
-/// authorization `code`, or the `error` Entra sends instead. A favicon fetch,
-/// a bare `/`, anything unparseable is not, and must not end the wait.
-fn carries_redirect(target: &str) -> bool {
+/// Whether a request target is this sign-in's redirect: one carrying the
+/// authorization `code`, or the `error` Entra sends instead, together with the
+/// `state` the sign-in sent. A favicon fetch, a bare `/`, anything
+/// unparseable is not, and must not end the wait — nor may a request from a
+/// local process that does not know the state.
+fn carries_redirect(target: &str, expected_state: &str) -> bool {
     url::Url::parse(&format!("http://localhost{target}")).is_ok_and(|parsed| {
-        parsed
-            .query_pairs()
-            .any(|(key, _)| key == "code" || key == "error")
+        let pairs = || parsed.query_pairs();
+        pairs().any(|(key, _)| key == "code" || key == "error")
+            && pairs().any(|(key, value)| key == "state" && value == expected_state)
     })
 }
 
@@ -782,17 +803,20 @@ mod tests {
 
     #[test]
     fn only_a_code_or_an_error_ends_the_wait_for_the_redirect() {
-        assert!(carries_redirect("/?code=C&state=S"));
-        assert!(carries_redirect("/?error=access_denied&state=S"));
-        // What else a browser sends the listener.
+        assert!(carries_redirect("/?code=C&state=S", "S"));
+        assert!(carries_redirect("/?error=access_denied&state=S", "S"));
+        // What else a browser sends the listener, and a local process that
+        // does not know the state.
         for noise in [
             "/",
             "/favicon.ico",
             "/?state=S",
-            "/?codes=1",
+            "/?codes=1&state=S",
+            "/?code=C",
+            "/?code=C&state=OTHER",
             "not a target",
         ] {
-            assert!(!carries_redirect(noise), "{noise}");
+            assert!(!carries_redirect(noise, "S"), "{noise}");
         }
     }
 
