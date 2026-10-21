@@ -271,8 +271,23 @@ pub(super) fn secret_keys(locator: &str) -> [String; 3] {
     ]
 }
 
+/// The keys an edit that moves the locator carries across: [`secret_keys`]
+/// without the Entra refresh token.
+///
+/// The token is left behind, and [`AppState::update_saved`] forgets it,
+/// because where it is kept *is* the user's "remember" answer and the connect
+/// confirming the edit has already placed its own token under the new locator.
+/// Carrying the old one would apply an older answer over the new one: a
+/// remembered token migrated into the keyring after a "don't remember", or a
+/// session one carried next to a remembered token, whose next renewal then
+/// reads as declined and deletes it.
+pub(super) fn carried_secret_keys(locator: &str) -> [String; 2] {
+    [locator.to_string(), ssh_secret_key(locator)]
+}
+
 /// Carries a connection's in-memory secrets, and its parked "remember the
-/// passphrase" choice, across an edit that moved the locator.
+/// passphrase" choice, across an edit that moved the locator — all but the
+/// Entra refresh token ([`carried_secret_keys`]).
 ///
 /// [`AppState::update_saved`] migrates the keyring entries for a reason that
 /// applies just as much here: the locator is the key, so an edit that changes
@@ -302,7 +317,10 @@ pub(super) fn carry_session_secrets(session: &mut HashMap<String, String>, old: 
     // key onto itself is a no-op regardless — which
     // `an_unmoved_locator_and_unrelated_connections_are_untouched_by_an_edit`
     // executes rather than assumes.
-    for (old_key, new_key) in secret_keys(old).into_iter().zip(secret_keys(new)) {
+    for (old_key, new_key) in carried_secret_keys(old)
+        .into_iter()
+        .zip(carried_secret_keys(new))
+    {
         let Some(secret) = session.remove(&old_key) else {
             continue;
         };
@@ -934,6 +952,8 @@ impl AppState {
     /// secrets are carried across to the new key so an untouched password
     /// keeps working, then dropped from the old one; a secret already stored
     /// under the new locator (the connect that just succeeded wrote one) wins.
+    /// The Entra refresh token is the exception: the old one is forgotten,
+    /// never carried ([`carried_secret_keys`]).
     pub fn update_saved(mut self, old_locator: String, connection: SavedConnection) {
         let new_locator = connection.locator().to_string();
         let updated = self.saved.write().update(&old_locator, connection);
@@ -955,15 +975,18 @@ impl AppState {
             );
             // Read after the carry: what the confirming connect validated, or
             // the old session copy moved across when it validated nothing.
-            let moves: Vec<_> = secret_keys(&old_locator)
+            let moves: Vec<_> = carried_secret_keys(&old_locator)
                 .into_iter()
-                .zip(secret_keys(&new_locator))
+                .zip(carried_secret_keys(&new_locator))
                 .map(|(old, new)| {
                     let validated = self.session_passwords.peek().get(&new).cloned();
                     (old, new, validated)
                 })
                 .collect();
             spawn_forever(async move {
+                // Not carried ([`carried_secret_keys`]): the confirming
+                // connect already put its own token where the user said.
+                self.forget_entra_refresh(&old_locator).await;
                 for (old, new, validated) in moves {
                     migrate_secret(old, new, validated).await;
                 }
@@ -2747,6 +2770,7 @@ mod tests {
         let cached = method_body(source, "async fn cached_entra_refresh(");
         let forget = method_body(source, "async fn forget_entra_refresh(");
         let restore = method_body(include_str!("session.rs"), "async fn connects_silently(");
+        let edit = method_body(source, "pub fn update_saved(");
         let hops = [
             ("the card", &card),
             ("the sign-in", &signin),
@@ -2755,6 +2779,7 @@ mod tests {
             ("acquire_entra", &acquire),
             ("keep_entra_refresh", &keep),
             ("the restore gate", &restore),
+            ("update_saved", &edit),
         ];
         for (hop, body) in hops {
             let code = code_of(body);
@@ -2879,9 +2904,28 @@ mod tests {
             "a refused refresh token is not what gets forgotten: {evict}"
         );
 
+        // An edit moving the locator forgets the old token instead of
+        // carrying it: the confirming connect already placed its own by the
+        // user's answer. Inside the moved-locator gate — with `==` it would
+        // delete the token the connect just placed — and with the old locator,
+        // before the spawned migration walks only the carried keys.
+        let moved = collapsed(&code_of(&method_body(
+            &edit,
+            "if new_locator != old_locator {",
+        )));
+        assert!(
+            moved.contains("self.forget_entra_refresh(&old_locator).await;")
+                && moved.contains("carried_secret_keys(&old_locator)")
+                && moved.contains("carried_secret_keys(&new_locator)")
+                && ident_count(&moved, "secret_keys") == 0,
+            "an edit carries the refresh token across, or forgets the wrong \
+             one: {moved}"
+        );
+
         // Every route to the token's key, so a new write or read cannot join
-        // the wire without being named here. The edit and removal paths reach
-        // it through `secret_keys`, which moves or deletes all three keys.
+        // the wire without being named here. Removal reaches it through
+        // `secret_keys`, which deletes all three keys; an edit through
+        // `forget_entra_refresh`, above.
         let shipped_code = code_only(&shipped(source));
         let named: usize = [
             "fn entra_secret_key(",
@@ -3121,15 +3165,19 @@ mod tests {
             "the session database password stayed behind — the keyring copy \
              migrates, so this one must too or the two disagree"
         );
+        // The refresh token is never carried: where it is kept is the
+        // user's answer, and the confirming connect has placed its own.
+        // `update_saved` forgets the old one, keyring copy included.
         assert_eq!(
-            session
-                .get(entra_secret_key(NEW).as_str())
-                .map(String::as_str),
-            Some("refresh-token")
+            session.get(entra_secret_key(NEW).as_str()),
+            None,
+            "the edit carried a refresh token next to the one the confirming \
+             connect placed by the user's answer"
         );
-        // Nothing may be left under the old locator: it names no connection
-        // now, and a later connection reusing that URL would inherit it.
-        for key in secret_keys(OLD) {
+        // Nothing carried may be left under the old locator: it names no
+        // connection now, and a later connection reusing that URL would
+        // inherit it.
+        for key in carried_secret_keys(OLD) {
             assert!(
                 !session.contains_key(&key),
                 "{key} survived the edit under the old locator"
@@ -3152,10 +3200,10 @@ mod tests {
         // drifting.
         const OLD: &str = "postgres://u@old:5432/db";
         const NEW: &str = "postgres://u@new:5432/db";
-        // Every key, not just the bare locator: the passphrase and the Entra
-        // token are filed under the same moved locator and reach the same
-        // "read a session hit as already accepted" path, so a rule that held
-        // for the password alone would be three-quarters of a fix.
+        // Every key, not just the bare locator: the passphrase is filed under
+        // the same moved locator and reaches the same "read a session hit as
+        // already accepted" path, so a rule that held for the password alone
+        // would be half a fix. (The Entra token is never carried at all.)
         let mut session = session_for(OLD);
         for (index, key) in secret_keys(NEW).into_iter().enumerate() {
             session.insert(key, format!("validated-just-now-{index}"));
@@ -3173,7 +3221,7 @@ mod tests {
         }
         // The old copies still go: they are redundant, and leaving them lets a
         // later connection reusing that URL inherit them.
-        for key in secret_keys(OLD) {
+        for key in carried_secret_keys(OLD) {
             assert!(!session.contains_key(&key), "{key} survived the edit");
         }
 
@@ -3416,6 +3464,15 @@ mod tests {
             distinct.len(),
             3,
             "two secrets share a key and will overwrite each other"
+        );
+        // An edit carries all of them but the Entra token, whose home is the
+        // user's answer and which `update_saved` forgets instead.
+        assert_eq!(
+            carried_secret_keys(URL).to_vec(),
+            secret_keys(URL)
+                .into_iter()
+                .filter(|key| *key != entra_secret_key(URL))
+                .collect::<Vec<_>>()
         );
 
         let update = method_body(
@@ -4815,6 +4872,92 @@ mod tests {
                 "{to}: the edit lost a password nothing had replaced"
             );
             crate::secrets::delete_password(to).unwrap();
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)] // see the Postgres test above
+    #[tokio::test]
+    async fn an_edit_leaves_the_refresh_token_where_the_confirming_connect_put_it() {
+        // Where a refresh token is kept is the user's "remember" answer, and
+        // the connect confirming an edit has already placed its own token by
+        // the answer given then. Whatever the old locator held, in whichever
+        // home, must not come along: the token ends up in exactly one home.
+        use dioxus::core::{NoOpMutations, VirtualDom};
+
+        use crate::ui::test_dom::provide_state;
+
+        let _keyring = crate::secrets::tests::mock_keyring();
+        fn empty() -> Element {
+            rsx! {}
+        }
+        let mut dom = VirtualDom::new(empty);
+        let state = provide_state(&dom);
+        dom.rebuild_in_place();
+
+        // (old token's home, new answer)
+        for (case, (old_in_keyring, remember)) in
+            [(true, false), (false, true)].into_iter().enumerate()
+        {
+            let old = format!("postgres://u@entra-old-{case}:5432/a");
+            let new = format!("postgres://u@entra-new-{case}:5432/a");
+            let (old_key, new_key) = (entra_secret_key(&old), entra_secret_key(&new));
+            // A password too, so the spawned migration has something whose
+            // move says it has run.
+            crate::secrets::store_password(&old, "pw").unwrap();
+            if old_in_keyring {
+                crate::secrets::store_password(&old_key, "old-token").unwrap();
+            }
+            if remember {
+                crate::secrets::store_password(&new_key, "new-token").unwrap();
+            }
+            dom.in_runtime(|| {
+                let mut session = state.session_passwords;
+                if !old_in_keyring {
+                    session.write().insert(old_key.clone(), "old-token".into());
+                }
+                if !remember {
+                    session.write().insert(new_key.clone(), "new-token".into());
+                }
+                let connection = ServerBackend::POSTGRES.saved(
+                    "edited",
+                    &new,
+                    None,
+                    ServerAuth::Entra(EntraAuth::interactive_default()),
+                );
+                state.update_saved(old.clone(), connection);
+            });
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while crate::secrets::get_password(&old).unwrap().is_some() {
+                assert!(tokio::time::Instant::now() < deadline, "never migrated");
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(20), dom.wait_for_work())
+                        .await;
+                dom.render_immediate(&mut NoOpMutations);
+            }
+
+            let session = dom.in_runtime(|| state.session_passwords.peek().clone());
+            let homes = [
+                session.get(&new_key).cloned(),
+                crate::secrets::get_password(&new_key).unwrap(),
+            ];
+            let expected = if remember {
+                [None, Some("new-token".to_string())]
+            } else {
+                [Some("new-token".to_string()), None]
+            };
+            assert_eq!(
+                homes, expected,
+                "case {case}: the edit put the old token next to the new one, \
+                 so the answer the user just gave is not the one kept"
+            );
+            assert_eq!(session.get(&old_key), None, "case {case}");
+            assert_eq!(
+                crate::secrets::get_password(&old_key).unwrap(),
+                None,
+                "case {case}: the old locator's token outlived the edit"
+            );
+            crate::secrets::delete_password(&new).unwrap();
+            crate::secrets::delete_password(&new_key).unwrap();
         }
     }
 
