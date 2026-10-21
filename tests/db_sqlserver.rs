@@ -124,6 +124,9 @@ async fn a_connection_the_server_killed_while_idle_is_not_handed_to_the_next_que
         panic!("{row:?}")
     };
     admin.execute(&format!("KILL {spid}")).await.unwrap();
+    // A connection used within the last second is reused unchecked, so let
+    // it idle past that first.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     let result = pool.query("SELECT 1").await;
     assert_eq!(
         result.map(|r| r.rows).map_err(|e| e.to_string()),

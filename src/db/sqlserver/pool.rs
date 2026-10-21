@@ -50,7 +50,8 @@ use crate::db::value::{cap_value, ColumnInfo, QueryResult, Value};
 const MAX_CONNECTIONS: usize = 4;
 
 /// How long one connect may take, from dialing the socket to the end of the
-/// login, before it is abandoned — the bound a Postgres open already has
+/// session setup — an Azure routing redirect and its second login included —
+/// before it is abandoned: the bound a Postgres open already has
 /// (sqlx's 30s acquire timeout). tiberius's own 15s handshake timeout covers
 /// only what follows the TCP connect, and that connect has no bound of its
 /// own: measured, a host that drops SYNs held a connect for 133s on Linux,
@@ -62,6 +63,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// telling either end never answers at all, so the check needs a bound of its
 /// own or it would trade one failed query for a hang.
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A connection back in the pool for less than this is handed out without a
+/// check: it answered a moment ago. A schema load or a page of the grid takes
+/// connections in quick succession, and a round trip each would add up on a
+/// distant server. The cost is that a session killed within this window still
+/// fails one query.
+const CHECK_AFTER: Duration = Duration::from_secs(1);
 
 /// Idle longer than this and a connection is closed rather than checked: the
 /// Postgres pool's `idle_timeout` (sqlx's default). By then a middlebox may
@@ -297,6 +305,8 @@ struct IdleClient {
 /// sqlx checks every connection before handing it out (`test_before_acquire`).
 #[derive(Debug, PartialEq, Eq)]
 enum IdleReuse {
+    /// Used a moment ago ([`CHECK_AFTER`]): hand it out as it is.
+    Reuse,
     /// Run a trivial query first, and reuse it only if that answers in time.
     Check,
     /// Too old to be worth checking: close it and take the next.
@@ -304,19 +314,35 @@ enum IdleReuse {
 }
 
 fn idle_reuse(idle_for: Duration) -> IdleReuse {
-    if idle_for > IDLE_TIMEOUT {
+    if idle_for < CHECK_AFTER {
+        IdleReuse::Reuse
+    } else if idle_for > IDLE_TIMEOUT {
         IdleReuse::Discard
     } else {
         IdleReuse::Check
     }
 }
 
-/// Whether `client` still answers, within `limit`.
-async fn is_alive(client: &mut TdsClient, limit: Duration) -> bool {
-    matches!(
-        tokio::time::timeout(limit, run_batch(client, "SELECT 1")).await,
-        Ok(Ok(()))
-    )
+/// How an idle connection's check went.
+#[derive(Debug, PartialEq, Eq)]
+enum Liveness {
+    Alive,
+    /// It answered with an error, or its socket was closed: this one is gone.
+    Failed,
+    /// No answer at all within the bound. Whatever silenced it — a NAT or
+    /// firewall that forgot the connection, a network gone away — has almost
+    /// certainly silenced its idle siblings too, so they are dropped
+    /// unchecked rather than each waiting out [`PING_TIMEOUT`] in turn.
+    Silent,
+}
+
+/// Checks that `client` still answers, within `limit`.
+async fn liveness(client: &mut TdsClient, limit: Duration) -> Liveness {
+    match tokio::time::timeout(limit, run_batch(client, "SELECT 1")).await {
+        Ok(Ok(())) => Liveness::Alive,
+        Ok(Err(_)) => Liveness::Failed,
+        Err(_) => Liveness::Silent,
+    }
 }
 
 /// One checked-out connection. Returns itself to the pool on drop unless it
@@ -403,11 +429,14 @@ impl MssqlPool {
                     .await?;
             };
             match idle_reuse(since.elapsed()) {
-                IdleReuse::Check => {
-                    if is_alive(&mut client, PING_TIMEOUT).await {
-                        break client;
+                IdleReuse::Reuse => break client,
+                IdleReuse::Check => match liveness(&mut client, PING_TIMEOUT).await {
+                    Liveness::Alive => break client,
+                    Liveness::Failed => {}
+                    Liveness::Silent => {
+                        self.inner.idle.lock().expect("pool lock poisoned").clear();
                     }
-                }
+                },
                 IdleReuse::Discard => {}
             }
             // Dropping the client closes its socket; nothing to log out of on
@@ -473,14 +502,27 @@ pub async fn open_mssql_with(
 }
 
 /// Opens a TCP connection to `addr` and performs the TDS login, following at
-/// most one Azure-style routing redirect, then applies [`SESSION_SETUP`].
-/// Each connect gets `limit` ([`CONNECT_TIMEOUT`]).
+/// most one Azure-style routing redirect, then applies [`SESSION_SETUP`] —
+/// all of it within `limit` ([`CONNECT_TIMEOUT`]). The timeout is reported as
+/// an I/O timeout so [`friendly_connect_error`] files it with the network
+/// errors.
 async fn connect_client(
     config: &Config,
     addr: &(String, u16),
     limit: Duration,
 ) -> Result<TdsClient, DbError> {
-    let mut client = match connect_once(config.clone(), addr, limit).await {
+    match tokio::time::timeout(limit, connect_unbounded(config, addr)).await {
+        Ok(result) => result,
+        Err(_) => Err(connect_error(&TdsError::Io {
+            kind: std::io::ErrorKind::TimedOut,
+            message: format!("no answer from {}:{} within {limit:?}", addr.0, addr.1),
+        })),
+    }
+}
+
+/// [`connect_client`] without its bound.
+async fn connect_unbounded(config: &Config, addr: &(String, u16)) -> Result<TdsClient, DbError> {
+    let mut client = match connect_once(config.clone(), addr).await {
         // Azure SQL can answer the login with "actually, talk to this other
         // node"; a single redirect is all the protocol calls for. The redirect
         // target is dialed directly — it names a reachable gateway node.
@@ -489,7 +531,7 @@ async fn connect_client(
             redirected.host(&host);
             redirected.port(port);
             let addr = (host, port);
-            connect_once(redirected, &addr, limit).await
+            connect_once(redirected, &addr).await
         }
         other => other,
     }
@@ -500,32 +542,16 @@ async fn connect_client(
     }
 }
 
-/// One connect, TCP through login, abandoned after `limit`. The timeout is
-/// reported as an I/O timeout so [`friendly_connect_error`] files it with the
-/// network errors.
-async fn connect_once(
-    config: Config,
-    addr: &(String, u16),
-    limit: Duration,
-) -> Result<TdsClient, TdsError> {
+async fn connect_once(config: Config, addr: &(String, u16)) -> Result<TdsClient, TdsError> {
     let io_err = |e: std::io::Error| TdsError::Io {
         kind: e.kind(),
         message: e.to_string(),
     };
-    let connect = async {
-        let tcp = TcpStream::connect((addr.0.as_str(), addr.1))
-            .await
-            .map_err(io_err)?;
-        tcp.set_nodelay(true).map_err(io_err)?;
-        Client::connect(config, tcp.compat_write()).await
-    };
-    match tokio::time::timeout(limit, connect).await {
-        Ok(result) => result,
-        Err(_) => Err(TdsError::Io {
-            kind: std::io::ErrorKind::TimedOut,
-            message: format!("no answer from {}:{} within {limit:?}", addr.0, addr.1),
-        }),
-    }
+    let tcp = TcpStream::connect((addr.0.as_str(), addr.1))
+        .await
+        .map_err(io_err)?;
+    tcp.set_nodelay(true).map_err(io_err)?;
+    Client::connect(config, tcp.compat_write()).await
 }
 
 /// SQL Server's "Login failed for user '…'", its wrong-credentials code. Sent
@@ -1765,8 +1791,9 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_connection_is_checked_unless_it_has_idled_past_the_timeout() {
-        assert_eq!(idle_reuse(Duration::ZERO), IdleReuse::Check);
+    fn an_idle_connection_is_checked_unless_just_used_or_idle_past_the_timeout() {
+        assert_eq!(idle_reuse(Duration::ZERO), IdleReuse::Reuse);
+        assert_eq!(idle_reuse(CHECK_AFTER), IdleReuse::Check);
         assert_eq!(idle_reuse(IDLE_TIMEOUT), IdleReuse::Check);
         assert_eq!(
             idle_reuse(IDLE_TIMEOUT + Duration::from_secs(1)),
@@ -1836,23 +1863,38 @@ mod tests {
         let config = parts.into_config(&MssqlAuth::Password, None);
         let (port, epoch) = freezable_proxy(target).await;
         let pool = MssqlPool::new(config, ("127.0.0.1".to_string(), port));
-        // One connection, used and returned: the pool's only idle one.
-        query_with(&pool, "SELECT 1", &[]).await.unwrap();
-        assert_eq!(pool.inner.idle.lock().unwrap().len(), 1);
+        // Three connections, used and returned, and idle long enough to be
+        // checked before reuse.
+        {
+            let held = [
+                pool.acquire().await.unwrap(),
+                pool.acquire().await.unwrap(),
+                pool.acquire().await.unwrap(),
+            ];
+            drop(held);
+        }
+        for idle in pool.inner.idle.lock().unwrap().iter_mut() {
+            idle.since -= CHECK_AFTER;
+        }
+        assert_eq!(pool.inner.idle.lock().unwrap().len(), 3);
 
         epoch.fetch_add(1, Ordering::SeqCst);
         let started = Instant::now();
-        // Without the check the query goes to the silent connection and waits
+        // Without the check the query goes to a silent connection and waits
         // for good (statements have no timeout); with a check that has no
         // bound, so does the check.
         let result = tokio::time::timeout(
-            PING_TIMEOUT + Duration::from_secs(15),
+            PING_TIMEOUT * 3 + Duration::from_secs(15),
             query_with(&pool, "SELECT 2", &[]),
         )
         .await
         .expect("a silent idle connection must be given up on, not waited on");
         assert_eq!(result.unwrap().rows, vec![vec![Value::Integer(2)]]);
-        assert!(started.elapsed() >= PING_TIMEOUT, "{:?}", started.elapsed());
+        let waited = started.elapsed();
+        assert!(waited >= PING_TIMEOUT, "{waited:?}");
+        // One silent check is the verdict on all of them: the other two are
+        // not each waited out in turn.
+        assert!(waited < PING_TIMEOUT * 2, "{waited:?}");
         pool.close().await;
     }
 }
