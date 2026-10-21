@@ -73,14 +73,15 @@ pub use page::{
     PREVIEW_BYTES,
 };
 pub use plan::{
-    explain_statement, ExplainSupport, PlanDisplay, PlanNode, PlanTree, EXPENSIVE_SHARE, NO_EXPLAIN,
+    explain_statement, plan_reached_cell_cap, ExplainSupport, PlanDisplay, PlanNode, PlanTree,
+    EXPENSIVE_SHARE, NO_EXPLAIN,
 };
 pub use postgres::{
     build_url, normalize_pg_url, url_target, url_via_local_port, url_with_password, PgFlavor,
 };
 pub use registry::{
     engine_has_read_only_mode, CellFetch, Connection, ConnectionId, ConnectionRegistry, DbPool,
-    FETCH_CELL_MAX_BYTES, MAX_QUERY_ROWS, QUERY_CELL_CAP,
+    FETCH_CELL_MAX_BYTES, MAX_QUERY_ROWS, PLAN_CELL_CAP, QUERY_CELL_CAP,
 };
 pub use rowkey::{detect_row_identity, RowIdentity};
 pub use schema::{

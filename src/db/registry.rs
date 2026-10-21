@@ -32,6 +32,20 @@ pub const MAX_QUERY_ROWS: u64 = 10_000;
 /// read-only (never staged/exported through this), so the trim is display-only.
 pub const QUERY_CELL_CAP: usize = 64 * 1024;
 
+/// Per-cell byte cap for an `EXPLAIN` statement's output on the free-form
+/// query path, in place of [`QUERY_CELL_CAP`].
+///
+/// A plan is a document, not a value to preview: PostgreSQL returns a whole
+/// `EXPLAIN (FORMAT JSON)` plan in one cell, and a prefix of it does not
+/// parse, so the plan view fell back to raw JSON cut off mid-string.
+/// Measured on PostgreSQL 17, a `SELECT *` over a table with 400 partitions
+/// plans to 89,966 bytes as hubro decodes it (compact JSON; 200 partitions
+/// came to 44,965) — past the 64 KiB display cap. Its size follows the
+/// statement being explained rather than the data, so it is bounded by what
+/// the user wrote; the same 8 MiB as [`FETCH_CELL_MAX_BYTES`] still bounds it,
+/// and the plan view says so when a plan reaches it.
+pub const PLAN_CELL_CAP: usize = FETCH_CELL_MAX_BYTES;
+
 /// Cap on the full value [`DbPool::fetch_cell`] loads for a cell expand/edit.
 /// A value larger than this comes back as an 8 MiB prefix flagged
 /// [`CellFetch::capped`]; the editor then refuses to stage it (staging a
@@ -119,16 +133,24 @@ impl ScriptTx<'_> {
         sql: &str,
         max_rows: u64,
     ) -> Result<(QueryResult, bool), DbError> {
+        self.query_capped_to(sql, max_rows, QUERY_CELL_CAP).await
+    }
+
+    /// [`Self::query_capped`] with the per-cell cap chosen by the caller.
+    pub(super) async fn query_capped_to(
+        &mut self,
+        sql: &str,
+        max_rows: u64,
+        cell_cap: usize,
+    ) -> Result<(QueryResult, bool), DbError> {
         // `tx` deref-coerces to the `&mut Connection` these helpers take.
         match self {
-            ScriptTx::Sqlite(tx) => {
-                sqlite::query_capped_conn(tx, sql, max_rows, QUERY_CELL_CAP).await
-            }
+            ScriptTx::Sqlite(tx) => sqlite::query_capped_conn(tx, sql, max_rows, cell_cap).await,
             ScriptTx::Postgres(tx) => {
-                postgres::query_capped_conn(tx, sql, max_rows, QUERY_CELL_CAP).await
+                postgres::query_capped_conn(tx, sql, max_rows, cell_cap).await
             }
             ScriptTx::SqlServer(tx) => {
-                sqlserver::query_capped_conn(tx, sql, max_rows, QUERY_CELL_CAP).await
+                sqlserver::query_capped_conn(tx, sql, max_rows, cell_cap).await
             }
         }
     }
@@ -199,20 +221,21 @@ pub(super) enum ReadOnlyRun {
 }
 
 impl ReadOnlyRun {
-    /// Runs a row-returning statement, bounded like [`DbPool::query_capped`].
-    pub(super) async fn query_capped(
+    /// Runs a row-returning statement, bounded like [`DbPool::query_capped`]
+    /// with the per-cell cap chosen by the caller.
+    pub(super) async fn query_capped_to(
         &mut self,
         sql: &str,
         max_rows: u64,
+        cell_cap: usize,
     ) -> Result<(QueryResult, bool), DbError> {
         match self {
             ReadOnlyRun::Sqlite(conn) => {
-                sqlite::query_capped_conn(conn, sql, max_rows, QUERY_CELL_CAP).await
+                sqlite::query_capped_conn(conn, sql, max_rows, cell_cap).await
             }
             ReadOnlyRun::Postgres { conn, begin } => {
                 let mut tx = postgres::begin_read_only(conn, begin).await?;
-                let result =
-                    postgres::query_capped_conn(&mut tx, sql, max_rows, QUERY_CELL_CAP).await;
+                let result = postgres::query_capped_conn(&mut tx, sql, max_rows, cell_cap).await;
                 read_only_outcome(result, postgres::end_read_only(tx).await)
             }
         }
@@ -622,15 +645,27 @@ impl DbPool {
         params: &[Value],
         max_rows: u64,
     ) -> Result<(QueryResult, bool), DbError> {
+        self.query_capped_to(sql, params, max_rows, QUERY_CELL_CAP)
+            .await
+    }
+
+    /// [`Self::query_capped`] with the per-cell cap chosen by the caller.
+    pub(super) async fn query_capped_to(
+        &self,
+        sql: &str,
+        params: &[Value],
+        max_rows: u64,
+        cell_cap: usize,
+    ) -> Result<(QueryResult, bool), DbError> {
         match self {
             DbPool::Sqlite(pool) => {
-                sqlite::query_capped(pool, sql, params, max_rows, QUERY_CELL_CAP).await
+                sqlite::query_capped(pool, sql, params, max_rows, cell_cap).await
             }
             DbPool::Postgres(pg) => {
-                postgres::query_capped(pg.pool(), sql, params, max_rows, QUERY_CELL_CAP).await
+                postgres::query_capped(pg.pool(), sql, params, max_rows, cell_cap).await
             }
             DbPool::SqlServer(pool) => {
-                sqlserver::query_capped(pool, sql, params, max_rows, QUERY_CELL_CAP).await
+                sqlserver::query_capped(pool, sql, params, max_rows, cell_cap).await
             }
         }
     }
