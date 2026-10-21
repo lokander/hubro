@@ -537,9 +537,12 @@ pub fn take_opened() -> Option<UnboundedReceiver<OpenTarget>> {
 /// by a task of its own, started in parallel with the session restore — which
 /// on macOS, the only platform that delivers through it, meant a
 /// double-clicked database could be opened *during* the restore and then lose
-/// the foreground to the tab the restore activates last. That is exactly the
-/// failure the command-line path orders itself to avoid, and it does not
-/// survive being written as one sequence.
+/// the foreground to the tab the restore activated last.
+///
+/// The restore's connects now run in the background, beside these targets,
+/// and no longer take the foreground from anything opened meanwhile
+/// (`restored_tab_takes_focus` in `ui::state`); what this loop still decides
+/// is the order of the targets among themselves.
 ///
 /// Both sources are consumed in place: `startup` is taken on the first call,
 /// and `opened` yields until the queue closes. Returns `None` when neither can
@@ -828,12 +831,10 @@ mod tests {
     #[tokio::test]
     async fn the_command_line_target_opens_before_anything_the_os_delivers() {
         // The ordering this function exists for. The queue used to be drained
-        // by a task of its own, racing the session restore; the restore ends by
-        // activating whichever tab was in front last time, so anything opened
-        // alongside it silently loses the foreground. Sequencing every source
-        // through one function is what makes "after the restore, then argv,
-        // then the OS queue, one at a time" a property of the code rather than
-        // of a comment.
+        // by a task of its own, racing the session restore and the command
+        // line. Sequencing every source through one function is what makes
+        // "argv, then the OS queue, one at a time" a property of the code
+        // rather than of a comment.
         let (tx, rx) = unbounded_channel();
         let queued = |name: &str| OpenTarget::File(PathBuf::from(name));
         tx.send(queued("first-delivered.db")).unwrap();

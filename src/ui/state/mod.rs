@@ -911,6 +911,15 @@ pub struct Connecting {
     pub visible: bool,
 }
 
+/// A session tab whose connect is in flight: what its tab reopens showing,
+/// and whether it was the tab in front. Applied by whichever connect opens the
+/// locator (see `AppState::start_restore`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoredTab {
+    pub tab: SessionTab,
+    pub in_front: bool,
+}
+
 /// A connect started from the connections list, as opposed to one started by
 /// submitting a form: the list can cancel it, and a shift-click asks for the
 /// tab to open without stealing focus.
@@ -972,6 +981,14 @@ pub struct AppState {
     /// Live SSH tunnels, one per tunneled open connection. Removing an entry
     /// drops the [`Tunnel`], which shuts the forward down.
     pub tunnels: Signal<HashMap<ConnectionId, Tunnel>>,
+    /// Open connections whose SSH session has ended under them, with what to
+    /// tell the user. Nothing can reach the database through such a tunnel any
+    /// more, but the pool cannot know that, so without this the tab would go
+    /// on looking connected while every query failed with a driver error.
+    pub lost_tunnels: Signal<HashMap<ConnectionId, String>>,
+    /// Session tabs whose restore connect is still in flight, keyed by
+    /// locator. Cleared when the connect ends, however it ends.
+    pub restoring: Signal<HashMap<String, RestoredTab>>,
     /// Locators whose SSH key passphrase the user asked to remember, waiting
     /// for a tunnel open to accept it.
     ///
@@ -1304,6 +1321,8 @@ impl AppState {
             entra_prompt: Signal::new_in_scope(None, ScopeId::ROOT),
             confirm_quit: Signal::new_in_scope(false, ScopeId::ROOT),
             tunnels: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            lost_tunnels: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            restoring: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             ssh_remember: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             schemas: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             tab_ui: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
@@ -1883,6 +1902,7 @@ impl AppState {
         }
         // Dropping the Tunnel signals its forward task to shut down.
         self.tunnels.write().remove(&id);
+        self.lost_tunnels.write().remove(&id);
         self.open_locators
             .write()
             .retain(|(open_id, _)| *open_id != id);

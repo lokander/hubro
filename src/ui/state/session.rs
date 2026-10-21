@@ -73,6 +73,9 @@ impl AppState {
     /// connection whose password isn't stored is simply left for the user to
     /// click. A locator whose file/server is gone just fails to reopen through
     /// the normal connect-error path; it never blocks the rest of the restore.
+    ///
+    /// Returns once the connects have *started* (see [`Self::start_restore`]),
+    /// not once they have finished.
     pub async fn restore_session(mut self) {
         let Some(path) = default_session_path() else {
             return;
@@ -149,66 +152,300 @@ impl AppState {
         let plan = plan_session_restore(&session.tabs, &candidates, |loc| {
             ready_locators.contains(loc)
         });
-        for tab in &plan {
-            let saved_conn = saved
-                .iter()
-                .find(|s| saved_open_locator(s) == tab.locator)
-                .cloned();
-            let Some(saved_conn) = saved_conn else {
+        self.start_restore(plan, session.active, &saved);
+    }
+
+    /// Starts every planned tab's connect at once, each the way a click on
+    /// its row in the connections list would ([`Self::start_connect`]), in
+    /// the background.
+    ///
+    /// Concurrent, and cancellable, because restore used to await one tab at
+    /// a time: a tab whose server never answered held up every tab after it
+    /// and the command-line target behind them all, while its row showed a
+    /// spinner with no Cancel — a row has one only for a connect that has a
+    /// request.
+    ///
+    /// What each tab reopens showing — and whether it was the one in front —
+    /// waits in [`AppState::restoring`] until its tab opens
+    /// ([`Self::finish_connect`] applies it), whichever connect opens it.
+    /// The tab that was in front last time comes to the front again only if
+    /// nothing else has in the meantime ([`restored_tab_takes_focus`]): the
+    /// connects now finish in any order, and alongside whatever the command
+    /// line or the OS asked to open, which must not lose the foreground to a
+    /// tab the user did not ask for.
+    pub(super) fn start_restore(
+        mut self,
+        plan: Vec<SessionTab>,
+        active: Option<String>,
+        saved: &[SavedConnection],
+    ) {
+        for tab in plan {
+            let Some(saved_conn) = saved.iter().find(|s| saved_open_locator(s) == tab.locator)
+            else {
                 continue;
             };
-            let backend = ServerBackend::of(saved_conn.backend());
-            match saved_conn {
-                SavedConnection::Sqlite { path, .. } => self.connect(path).await,
-                SavedConnection::Postgres {
-                    url,
-                    name,
-                    tunnel,
-                    auth,
-                    ..
-                }
-                | SavedConnection::SqlServer {
-                    url,
-                    name,
-                    tunnel,
-                    auth,
-                    ..
-                } => self.connect_server(backend, url, name, tunnel, auth).await,
-            }
-            // Apply the remembered table, pane, and row detail panel
-            // to the freshly opened tab.
-            let id = self
-                .open_locators
-                .read()
-                .iter()
-                .find(|(_, locator)| *locator == tab.locator)
-                .map(|(id, _)| *id);
-            if let Some(id) = id {
-                let selected = tab.selected_table.as_ref().map(|name| TableRef {
-                    schema: tab.selected_schema.clone(),
-                    name: name.clone(),
-                });
-                let pane = Pane::from_session(tab.pane);
-                let mut tab_ui = self.tab_ui.write();
-                let ui = tab_ui.entry(id).or_default();
-                ui.selected_table = selected;
-                ui.pane = pane;
-                ui.row_detail = tab.row_detail;
-            }
+            let (tunnel, auth) = match saved_conn {
+                SavedConnection::Postgres { tunnel, auth, .. }
+                | SavedConnection::SqlServer { tunnel, auth, .. } => (tunnel.clone(), auth.clone()),
+                SavedConnection::Sqlite { .. } => (None, ServerAuth::Password),
+            };
+            let in_front = active.as_deref() == Some(tab.locator.as_str());
+            self.restoring
+                .write()
+                .insert(tab.locator.clone(), RestoredTab { tab, in_front });
+            self.start_connect(
+                saved_conn.locator(),
+                saved_conn.name().to_string(),
+                saved_conn.backend(),
+                tunnel,
+                auth,
+                false,
+            );
         }
-        // Restore the active view: the remembered active tab if it reopened,
-        // else the connections screen. (Each connect above set `active` to its
-        // own tab, so this override runs last.)
-        let active_id = session.active.as_ref().and_then(|locator| {
-            self.open_locators
-                .read()
-                .iter()
-                .find(|(_, l)| l == locator)
-                .map(|(id, _)| *id)
+    }
+
+    /// Applies a restored tab's remembered table, pane and row detail panel
+    /// to the tab `id` that just opened for it, and brings it to the front if
+    /// [`restored_tab_takes_focus`] says so.
+    pub(super) fn apply_restored(mut self, id: ConnectionId, restored: RestoredTab) {
+        let RestoredTab { tab, in_front } = restored;
+        {
+            let selected = tab.selected_table.map(|name| TableRef {
+                schema: tab.selected_schema,
+                name,
+            });
+            let mut tab_ui = self.tab_ui.write();
+            let ui = tab_ui.entry(id).or_default();
+            ui.selected_table = selected;
+            ui.pane = Pane::from_session(tab.pane);
+            ui.row_detail = tab.row_detail;
+        }
+        if restored_tab_takes_focus(in_front, *self.active.peek()) {
+            self.active.set(ActiveView::Connection(id));
+        }
+    }
+}
+
+/// Whether a restored tab that has just opened comes to the front: only the
+/// one that was in front last time, and only while the connections screen is
+/// still showing. Anything else showing was put there since — by the user, by
+/// the command line, by the OS — and outranks a remembered preference.
+pub(super) fn restored_tab_takes_focus(was_in_front: bool, showing: ActiveView) -> bool {
+    was_in_front && showing == ActiveView::Connections
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use dioxus::core::VirtualDom;
+
+    use super::*;
+    use crate::ui::test_dom::provide_state;
+
+    #[tokio::test]
+    async fn only_the_tab_that_was_in_front_comes_forward_and_only_onto_the_list() {
+        let pool =
+            DbPool::Sqlite(sqlx::sqlite::SqlitePool::connect_lazy("sqlite::memory:").unwrap());
+        let id = ConnectionRegistry::default().insert("x.db", pool, WriteProtection::Open);
+        let elsewhere = ActiveView::Connection(id);
+        assert!(restored_tab_takes_focus(true, ActiveView::Connections));
+        assert!(!restored_tab_takes_focus(false, ActiveView::Connections));
+        // Something else came forward while it connected: the user's own
+        // click, the command line's target, a file the OS handed over.
+        assert!(!restored_tab_takes_focus(true, elsewhere));
+        assert!(!restored_tab_takes_focus(false, elsewhere));
+    }
+
+    fn empty() -> Element {
+        rsx! {}
+    }
+
+    /// Runs `dom`'s tasks until `done` holds, failing after `limit`.
+    async fn run_until(dom: &mut VirtualDom, limit: Duration, done: impl Fn(&VirtualDom) -> bool) {
+        let deadline = tokio::time::Instant::now() + limit;
+        while !done(dom) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "not reached within {limit:?}"
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(50), dom.wait_for_work()).await;
+            dom.render_immediate(&mut dioxus::core::NoOpMutations);
+        }
+    }
+
+    async fn sqlite_file(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        // Options rather than a `sqlite://` URL, which would have to spell a
+        // Windows path.
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let pool = sqlx::sqlite::SqlitePool::connect_with(options)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        path
+    }
+
+    #[tokio::test]
+    async fn a_restored_tab_that_never_connects_holds_up_nothing_and_can_be_cancelled() {
+        // A Postgres server that accepts and never answers: sqlx waits out its
+        // 30s acquire timeout. It is the *first* tab, so a restore that
+        // awaited each tab in turn would hold the second up behind it.
+        let silent = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let hanging_url = format!(
+            "postgres://u@127.0.0.1:{}/db",
+            silent.local_addr().unwrap().port()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let restored_db = sqlite_file(dir.path(), "restored.db").await;
+        let argv_db = sqlite_file(dir.path(), "argv.db").await;
+
+        let mut dom = VirtualDom::new(empty);
+        let state = provide_state(&dom);
+        dom.rebuild_in_place();
+        let (hanging, restored) = dom.in_runtime(|| {
+            let mut saved = state.saved;
+            let mut saved = saved.write();
+            saved.add(SavedConnection::Postgres {
+                name: "hanging".into(),
+                url: hanging_url.clone(),
+                tunnel: None,
+                auth: ServerAuth::Password,
+                protection: WriteProtection::Open,
+                color: None,
+                group: None,
+            });
+            saved.add(SavedConnection::Sqlite {
+                name: "restored".into(),
+                path: restored_db.clone(),
+                protection: WriteProtection::Open,
+                color: None,
+                group: None,
+            });
+            let entries = saved.entries();
+            (
+                saved_open_locator(&entries[0]),
+                saved_open_locator(&entries[1]),
+            )
         });
-        match active_id {
-            Some(id) => self.active.set(ActiveView::Connection(id)),
-            None => self.active.set(ActiveView::Connections),
-        }
+        // A password in session memory, so the connect never reads the
+        // keyring.
+        dom.in_runtime(|| {
+            let mut passwords = state.session_passwords;
+            passwords.write().insert(hanging.clone(), "pw".into());
+        });
+        let plan = vec![
+            SessionTab {
+                locator: hanging.clone(),
+                ..SessionTab::default()
+            },
+            SessionTab {
+                locator: restored.clone(),
+                selected_table: Some("t".into()),
+                pane: SessionPane::Sql,
+                ..SessionTab::default()
+            },
+        ];
+        dom.in_runtime(|| {
+            let saved: Vec<SavedConnection> = state.saved.peek().entries().to_vec();
+            state.start_restore(plan, Some(restored.clone()), &saved);
+        });
+
+        let open_id = |dom: &VirtualDom, locator: &str| {
+            dom.in_runtime(|| {
+                state
+                    .open_locators
+                    .peek()
+                    .iter()
+                    .find(|(_, l)| l == locator)
+                    .map(|(id, _)| *id)
+            })
+        };
+        run_until(&mut dom, Duration::from_secs(10), |dom| {
+            open_id(dom, &restored).is_some()
+        })
+        .await;
+        let restored_id = open_id(&dom, &restored).unwrap();
+        dom.in_runtime(|| {
+            let tab_ui = state.tab_ui.peek();
+            let ui = &tab_ui[&restored_id];
+            assert_eq!(
+                ui.selected_table.as_ref().map(|t| t.name.as_str()),
+                Some("t")
+            );
+            assert_eq!(ui.pane, Pane::Sql);
+            assert_eq!(
+                *state.active.peek(),
+                ActiveView::Connection(restored_id),
+                "the tab that was in front comes forward onto the list"
+            );
+            // The hanging tab is still connecting, and its row can cancel it.
+            assert!(state.connecting.peek().iter().any(|c| c.locator == hanging));
+            assert!(state.connect_requests.peek().contains_key(&hanging));
+        });
+
+        // A target from the command line opens while the hanging tab still
+        // hangs, and stays in front.
+        dom.in_runtime(|| {
+            dioxus::core::spawn_forever(
+                state.open_target(crate::cli::OpenTarget::File(argv_db.clone())),
+            );
+        });
+        let argv = canonical(&argv_db).display().to_string();
+        run_until(&mut dom, Duration::from_secs(10), |dom| {
+            open_id(dom, &argv).is_some()
+        })
+        .await;
+        let argv_id = open_id(&dom, &argv).unwrap();
+        dom.in_runtime(|| {
+            assert_eq!(*state.active.peek(), ActiveView::Connection(argv_id));
+        });
+
+        // And a restored tab that was in front, opening *after* the target,
+        // leaves it in front.
+        let late_db = sqlite_file(dir.path(), "late.db").await;
+        let late = dom.in_runtime(|| {
+            let mut saved = state.saved;
+            let mut saved = saved.write();
+            saved.add(SavedConnection::Sqlite {
+                name: "late".into(),
+                path: late_db.clone(),
+                protection: WriteProtection::Open,
+                color: None,
+                group: None,
+            });
+            saved_open_locator(saved.entries().last().unwrap())
+        });
+        dom.in_runtime(|| {
+            let saved: Vec<SavedConnection> = state.saved.peek().entries().to_vec();
+            let plan = vec![SessionTab {
+                locator: late.clone(),
+                ..SessionTab::default()
+            }];
+            state.start_restore(plan, Some(late.clone()), &saved);
+        });
+        run_until(&mut dom, Duration::from_secs(10), |dom| {
+            open_id(dom, &late).is_some()
+        })
+        .await;
+        dom.in_runtime(|| {
+            assert_eq!(
+                *state.active.peek(),
+                ActiveView::Connection(argv_id),
+                "a remembered preference must not take the foreground from a target"
+            );
+            state.cancel_connect(&hanging);
+            assert!(state.connecting.peek().is_empty());
+            assert!(state.connect_requests.peek().is_empty());
+            assert!(state.restoring.peek().is_empty());
+        });
     }
 }
