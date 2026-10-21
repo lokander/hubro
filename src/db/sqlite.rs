@@ -212,72 +212,85 @@ fn query_error(err: sqlx::Error) -> DbError {
 }
 
 /// Why SQL text holding a NUL character never reaches SQLite — see
-/// [`SqlText`].
+/// [`SqlText`](door::SqlText).
 pub const NUL_IN_SQL: &str =
     "This statement contains a NUL character, which can't be sent to SQLite.";
 
-/// SQL text this backend may hand to sqlx-sqlite: text holding no NUL.
-///
-/// **The one door.** Every statement the SQLite backend runs, describes or
-/// prepares goes through a value of this type, which only [`SqlText::new`]
-/// builds, and every call that hands text to the driver lives in its `impl`
-/// block — `the_driver_is_handed_text_only_through_sql_text` holds the rest
-/// of this file to that. A choke point rather than a proof per path, because
-/// the paths are many (free-form queries, page reads, edits, imports,
-/// exports, introspection) and the next one would need a proof of its own.
-///
-/// The hang it prevents, in sqlx-sqlite 0.8.6 and unchanged in 0.9.0: sqlx
-/// splits a query into statements by calling `sqlite3_prepare_v3` in a loop,
-/// advancing by the tail SQLite reports. SQLite reads only up to a NUL, so
-/// once the statements before one are compiled the tail stays on the NUL —
-/// nothing consumed, and the loop never ends. The connection's worker thread
-/// spins a core for good, out of reach of any timeout. Measured with `SELECT
-/// 1` followed by a NUL. A NUL *inside* a quoted name or string literal fails
-/// cleanly instead, since SQLite reads the token as unterminated, and hubro's
-/// own builders quote every name: a table whose `sqlite_master` name holds a
-/// NUL — which a crafted file can have, and SQLite opens — gets
-/// `unrecognized token` rather than a hang. That holds only while every
-/// builder keeps quoting, which is the per-path proof this type replaces, and
-/// refusing every NUL gives that table a sentence instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SqlText<'a>(&'a str);
+use door::SqlText;
 
-impl<'a> SqlText<'a> {
-    /// `sql`, or [`NUL_IN_SQL`] when it holds a NUL anywhere.
-    fn new(sql: &'a str) -> Result<Self, DbError> {
-        if sql.contains('\0') {
-            return Err(DbError::Query(NUL_IN_SQL.to_string()));
+/// The one door SQL text passes through to sqlx-sqlite — see [`SqlText`].
+mod door {
+    use super::{query_error, sqlx_common, DbError, QueryResult, SqliteQuery, NUL_IN_SQL};
+
+    /// SQL text this backend may hand to sqlx-sqlite: text holding no NUL.
+    ///
+    /// **The one door.** Every statement the SQLite backend runs, describes or
+    /// prepares goes through a value of this type. It lives in a module of
+    /// its own so the compiler holds every construction to [`SqlText::new`],
+    /// and every call that hands text to the driver lives in that module —
+    /// `the_driver_is_handed_text_only_through_sql_text` holds the rest of
+    /// this file to that, and `only_known_files_hand_sql_text_to_sqlx` every
+    /// other file. A choke point rather than a proof per path, because the
+    /// paths are many (free-form queries, page reads, edits, imports,
+    /// exports, introspection) and the next one would need a proof of its own.
+    ///
+    /// The hang it prevents, in sqlx-sqlite 0.8.6 and unchanged in 0.9.0: sqlx
+    /// splits a query into statements by calling `sqlite3_prepare_v3` in a loop,
+    /// advancing by the tail SQLite reports. SQLite reads only up to a NUL, so
+    /// once the statements before one are compiled the tail stays on the NUL —
+    /// nothing consumed, and the loop never ends. The connection's worker thread
+    /// spins a core for good, out of reach of any timeout. Measured with `SELECT
+    /// 1` followed by a NUL. A NUL *inside* a quoted name or string literal fails
+    /// cleanly instead, since SQLite reads the token as unterminated, and hubro's
+    /// own builders quote every name: a table whose `sqlite_master` name holds a
+    /// NUL — which a crafted file can have, and SQLite opens — gets
+    /// `unrecognized token` rather than a hang. That holds only while every
+    /// builder keeps quoting, which is the per-path proof this type replaces, and
+    /// refusing every NUL gives that table a sentence instead.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct SqlText<'a>(&'a str);
+
+    impl<'a> SqlText<'a> {
+        /// `sql`, or [`NUL_IN_SQL`] when it holds a NUL anywhere. The only
+        /// way to build one.
+        pub(super) fn new(sql: &'a str) -> Result<Self, DbError> {
+            if sql.contains('\0') {
+                return Err(DbError::Query(NUL_IN_SQL.to_string()));
+            }
+            Ok(SqlText(sql))
         }
-        Ok(SqlText(sql))
-    }
 
-    /// A prepared (not simple-protocol) query over this text.
-    fn query(self) -> SqliteQuery<'a> {
-        sqlx::query(self.0)
-    }
+        /// A prepared (not simple-protocol) query over this text.
+        pub(super) fn query(self) -> SqliteQuery<'a> {
+            sqlx::query(self.0)
+        }
 
-    /// Runs this text without decoding rows — see [`sqlx_common::execute`].
-    async fn execute<'c, E>(self, executor: E) -> Result<u64, DbError>
-    where
-        E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
-    {
-        sqlx_common::execute(executor, self.0, query_error).await
-    }
+        /// Runs this text without decoding rows — see [`sqlx_common::execute`].
+        pub(super) async fn execute<'c, E>(self, executor: E) -> Result<u64, DbError>
+        where
+            E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
+        {
+            sqlx_common::execute(executor, self.0, query_error).await
+        }
 
-    /// See [`sqlx_common::fill_headers`].
-    async fn fill_headers<'c, E>(self, result: &mut QueryResult, executor: E)
-    where
-        E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
-    {
-        sqlx_common::fill_headers(result, executor, self.0).await;
-    }
+        /// See [`sqlx_common::fill_headers`].
+        pub(super) async fn fill_headers<'c, E>(self, result: &mut QueryResult, executor: E)
+        where
+            E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
+        {
+            sqlx_common::fill_headers(result, executor, self.0).await;
+        }
 
-    /// See [`sqlx_common::describe_columns`].
-    async fn describe_columns<'c, E>(self, executor: E) -> Result<Vec<String>, sqlx::Error>
-    where
-        E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
-    {
-        sqlx_common::describe_columns(executor, self.0).await
+        /// See [`sqlx_common::describe_columns`].
+        pub(super) async fn describe_columns<'c, E>(
+            self,
+            executor: E,
+        ) -> Result<Vec<String>, sqlx::Error>
+        where
+            E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
+        {
+            sqlx_common::describe_columns(executor, self.0).await
+        }
     }
 }
 
@@ -1378,13 +1391,13 @@ mod tests {
             "\0",
         ] {
             assert_eq!(
-                SqlText::new(sql),
-                Err(DbError::Query(NUL_IN_SQL.to_string())),
+                SqlText::new(sql).err(),
+                Some(DbError::Query(NUL_IN_SQL.to_string())),
                 "{sql:?}"
             );
         }
         for sql in ["SELECT 1", "", "SELECT '\\0'", "SELECT char(0)"] {
-            assert_eq!(SqlText::new(sql), Ok(SqlText(sql)), "{sql:?}");
+            assert!(SqlText::new(sql).is_ok(), "{sql:?}");
         }
     }
 
@@ -1445,94 +1458,206 @@ mod tests {
             .collect()
     }
 
-    /// Whether `code` names `word` as a whole identifier.
-    fn names(code: &str, word: &str) -> bool {
-        code.split(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .any(|token| token == word)
+    fn is_ident(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
     }
 
-    /// Everything that hands SQL text to the driver: sqlx's own entry points,
-    /// the trait that lets an executor take a bare `&str`, and the shared
-    /// helpers that take text.
-    const TEXT_TO_DRIVER: &[&str] = &[
-        "query",
-        "query_as",
-        "query_scalar",
-        "query_with",
-        "query_as_with",
-        "query_scalar_with",
-        "raw_sql",
-        "Executor",
-        "describe",
-        "prepare",
-        "prepare_with",
-        "execute",
-        "fill_headers",
-        "describe_columns",
+    /// Each occurrence of `word` in `code` as a whole identifier, by offset.
+    fn ident_at<'a>(code: &'a str, word: &'a str) -> impl Iterator<Item = usize> + 'a {
+        code.match_indices(word)
+            .map(|(at, _)| at)
+            .filter(move |&at| {
+                !code[..at].chars().next_back().is_some_and(is_ident)
+                    && !code[at + word.len()..].chars().next().is_some_and(is_ident)
+            })
+    }
+
+    /// What may follow `sqlx::` outside the door: types, traits and modules
+    /// none of which takes SQL text. An allowlist, so a text entry point
+    /// nobody listed — `query`, `raw_sql`, `Executor`, the `prelude`, a macro
+    /// — is refused by default. `query` is here only as the module in
+    /// `sqlx::query::Query`, the type the door hands out.
+    const SQLX_ALLOWED: &[&str] = &[
+        "sqlite",
+        "Sqlite",
+        "SqlitePool",
+        "SqlitePoolOptions",
+        "SqliteConnection",
+        "SqliteConnectOptions",
+        "SqliteRow",
+        "SqliteArguments",
+        "Postgres",
+        "pool",
+        "PoolConnection",
+        "Transaction",
+        "Connection",
+        "Row",
+        "TypeInfo",
+        "ValueRef",
+        "Error",
     ];
 
-    /// The other half of [`SqlText`]'s guarantee: outside its `impl` block,
-    /// this file reaches none of [`TEXT_TO_DRIVER`] except as a method on
-    /// what the door returns. Mutated by calling `sqlx::query` directly in
-    /// one function, importing `fill_headers` by its bare name, and calling
-    /// `sqlx_common::execute` from `execute_conn`: each fails here.
-    #[test]
-    fn the_driver_is_handed_text_only_through_sql_text() {
+    /// What may follow `sqlx_common::` outside the door: the helpers that
+    /// take rows or a transaction, not text.
+    const COMMON_ALLOWED: &[&str] = &[
+        "get",
+        "collect_all",
+        "collect_capped",
+        "export_stream",
+        "export_empty",
+        "commit_tx",
+        "rollback_tx",
+    ];
+
+    /// Every way `code` reaches the driver with text, as `(offset, what)`.
+    ///
+    /// - A path through `sqlx::` or `sqlx_common::` naming anything off the
+    ///   allowlists, down to its first type or trait, a macro
+    ///   (`sqlx::query!`) included. `sqlx::Executor::execute` fails on
+    ///   `Executor`.
+    /// - A `use` of either — `pub` or not, anywhere in the file — that
+    ///   imports anything off them, renames anything (`use sqlx as driver`),
+    ///   or globs (`use sqlx::prelude::*`).
+    /// - `extern crate sqlx as …`, and the `Executor` trait by any route:
+    ///   it is what lets a pool or connection run a bare `&str`.
+    fn reaches_driver(code: &str) -> Vec<(usize, String)> {
+        let mut found = Vec::new();
+        for (root, allowed) in [("sqlx", SQLX_ALLOWED), ("sqlx_common", COMMON_ALLOWED)] {
+            for at in ident_at(code, root) {
+                let rest = &code[at + root.len()..];
+                let Some(rest) = rest.strip_prefix("::") else {
+                    continue;
+                };
+                let path: String = rest
+                    .chars()
+                    .take_while(|c| is_ident(*c) || *c == ':')
+                    .collect();
+                let path = path.trim_end_matches(':');
+                let macro_call = rest[path.len()..].starts_with('!');
+                // Modules down to the first type or trait, which is checked
+                // too; what follows one (`Error::Database`) is its own item.
+                let mut checked = Vec::new();
+                for segment in path.split("::") {
+                    checked.push(segment);
+                    if segment.starts_with(char::is_uppercase) {
+                        break;
+                    }
+                }
+                let named = checked.iter().all(|segment| allowed.contains(segment))
+                    || (root == "sqlx" && checked == ["query", "Query"]);
+                if !path.is_empty() && (macro_call || !named) {
+                    found.push((at, format!("{root}::{path}")));
+                }
+            }
+        }
+        for at in ident_at(code, "use") {
+            let Some(end) = code[at..].find(';') else {
+                continue;
+            };
+            let statement = &code[at..at + end];
+            let mut tokens = statement
+                .split(|c: char| !is_ident(c))
+                .filter(|t| !t.is_empty());
+            if !tokens.any(|t| t == "sqlx" || t == "sqlx_common") {
+                continue;
+            }
+            if statement.contains('*') {
+                found.push((at, format!("glob: {statement}")));
+            }
+            for token in tokens {
+                let fine = SQLX_ALLOWED.contains(&token)
+                    || COMMON_ALLOWED.contains(&token)
+                    || ["sqlx", "sqlx_common", "self", "as", "_"].contains(&token);
+                if !fine {
+                    found.push((at, format!("`{token}` in: {statement}")));
+                }
+            }
+        }
+        for root in ["sqlx", "sqlx_common"] {
+            for at in ident_at(code, root) {
+                if code[at + root.len()..].starts_with(" as ") {
+                    found.push((at, format!("{root} renamed")));
+                }
+            }
+        }
+        for at in ident_at(code, "Executor") {
+            found.push((at, "Executor".to_string()));
+        }
+        found
+    }
+
+    /// This file's shipped code with `mod door` cut out.
+    fn sqlite_outside_the_door() -> String {
         let lines = shipped_code(include_str!("sqlite.rs"));
         let open = lines
             .iter()
-            .position(|line| line.starts_with("impl<'a> SqlText<'a> {"))
+            .position(|line| *line == "mod door {")
             .expect("the door is in this file");
         let close = open
             + lines[open..]
                 .iter()
                 .position(|line| *line == "}")
-                .expect("the door's impl block ends");
-        let outside = [&lines[..open], &lines[close + 1..]].concat().join("\n");
+                .expect("the door's module ends");
+        [&lines[..open], &lines[close + 1..]].concat().join("\n")
+    }
 
-        // Reached through a path: `sqlx::query(…)`, `sqlx_common::execute(…)`.
-        for path in ["sqlx::", "sqlx_common::"] {
-            for (at, _) in outside.match_indices(path) {
-                let rest = &outside[at + path.len()..];
-                let name: String = rest
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_')
-                    .collect();
-                // `sqlx::query::Query` names a type through the module.
-                let module = name == "query" && rest[name.len()..].starts_with("::Query<");
-                assert!(
-                    module || !TEXT_TO_DRIVER.contains(&name.as_str()),
-                    "`{path}{name}` outside `impl SqlText` hands text to the driver unchecked"
-                );
-            }
-        }
-        // Or brought in by a bare name, through a `use`.
-        let mut statement = String::new();
-        for line in outside.lines() {
-            if statement.is_empty() && !line.trim_start().starts_with("use ") {
-                continue;
-            }
-            statement.push_str(line);
-            if line.contains(';') {
-                assert!(
-                    !(statement.contains("sqlx") && statement.contains('*')),
-                    "`{statement}` glob-imports past `impl SqlText`"
-                );
-                for word in TEXT_TO_DRIVER {
-                    assert!(
-                        !names(&statement, word),
-                        "`{statement}` imports `{word}` past `impl SqlText`"
-                    );
-                }
-                statement.clear();
-            }
-        }
-        // The executor trait is what lets a pool or connection run a bare
-        // `&str`, and its methods need it in scope.
+    /// The other half of [`SqlText`]'s guarantee: outside `mod door`, this
+    /// file reaches the driver with text by no route [`reaches_driver`]
+    /// knows. The compiler already confines construction to
+    /// [`SqlText::new`]; this confines everything else. Mutated by calling
+    /// `sqlx::query` directly in one function, importing `fill_headers` by
+    /// its bare name, calling `sqlx_common::execute` from `execute_conn`, and
+    /// `use sqlx as driver` with `driver::query`: each fails here.
+    #[test]
+    fn the_driver_is_handed_text_only_through_sql_text() {
+        let code = sqlite_outside_the_door();
+        let found = reaches_driver(&code);
         assert!(
-            !names(&outside, "Executor"),
-            "Executor outside `impl SqlText`"
+            found.is_empty(),
+            "outside `mod door`, sqlite.rs hands text to the driver unchecked: {found:?}"
         );
+    }
+
+    /// The detector itself, against each route it exists to see — so a
+    /// loosened rule fails here rather than reading as a clean file.
+    #[test]
+    fn the_detector_sees_every_route_to_the_driver() {
+        for code in [
+            "sqlx::query(sql)",
+            "sqlx::query!(\"SELECT 1\")",
+            "sqlx::raw_sql(sql)",
+            "sqlx::query_scalar(sql)",
+            "::sqlx::query(sql)",
+            "sqlx_common::execute(conn, sql, e)",
+            "super::sqlx_common::fill_headers(r, pool, sql)",
+            "use sqlx::query;",
+            "pub(super) use sqlx::{query};",
+            "pub use sqlx::Executor;",
+            "use sqlx::{Row as _, Executor as _};",
+            "use sqlx::prelude::*;",
+            "use sqlx::*;",
+            "use sqlx as driver;",
+            "use super::sqlx_common as c;",
+            "use super::sqlx_common::{self as c};",
+            "use super::sqlx_common::{self, fill_headers};",
+            "extern crate sqlx as driver;",
+            "fn f<E: Executor<'static>>() {}",
+            "sqlx::Executor::execute(pool, sql)",
+        ] {
+            assert!(!reaches_driver(code).is_empty(), "missed: {code}");
+        }
+        for code in [
+            "use sqlx::sqlite::{SqlitePool, SqliteRow};",
+            "use sqlx::{Connection as _, Row as _};",
+            "use super::sqlx_common::{self, get};",
+            "type Q<'q> = sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>;",
+            "sqlx_common::collect_all(stream, decode, err)",
+            "sqlx::Connection::close(conn)",
+            "Err(sqlx::Error::Database(e)) => {}",
+            "let used = 1;",
+        ] {
+            assert_eq!(reaches_driver(code), vec![], "{code}");
+        }
     }
 
     /// Every shipped file under `src/`, as `(path relative to src, contents)`.
@@ -1558,60 +1683,59 @@ mod tests {
         out
     }
 
-    /// The files that hand SQL text to sqlx at all, so a new one has to be
-    /// weighed against the NUL hang rather than slip past [`SqlText`]:
+    /// The same detector over every other shipped file, so a SQLite path
+    /// written outside this file — the read-only run in `registry.rs`, say —
+    /// cannot slip past [`SqlText`] either. Three files are exempt, each for
+    /// a reason:
     ///
-    /// - `db/sqlite.rs`, through the door (pinned above).
     /// - `db/postgres.rs`: sqlx-postgres sends a statement whole, with no
     ///   prepare loop to stall in, and a Postgres-wire server has no NUL in
     ///   its names to build text from.
     /// - `db/sqlx_common.rs`: the shared helpers, generic over the driver;
-    ///   this file calls them only from inside the door.
+    ///   their text-taking ones are off [`COMMON_ALLOWED`], so only the door
+    ///   and `postgres.rs` call them.
     /// - `history.rs`: hubro's own history database, which is SQLite — so
-    ///   every statement it runs is a literal, which is checked here. What
-    ///   the user ran is stored there as a bound value, never as text.
+    ///   it may reach the driver only by `sqlx::query(` or
+    ///   `sqlx::query_scalar(` with a string literal, or the setup loop over
+    ///   an array of them. What the user ran is stored there as a bound value.
     #[test]
     fn only_known_files_hand_sql_text_to_sqlx() {
-        let mut found = Vec::new();
+        let mut reaching = Vec::new();
         for (path, source) in all_sources() {
-            let code = shipped_code(&source).join("\n");
-            let hands_text = ["sqlx::", "sqlx_common::"].iter().any(|prefix| {
-                TEXT_TO_DRIVER.iter().any(|word| {
-                    code.contains(&format!("{prefix}{word}("))
-                        || code.contains(&format!("{prefix}{word}_"))
-                })
-            }) || names(&code, "Executor");
-            if hands_text {
-                found.push(path);
+            let code = match path.as_str() {
+                "db/sqlite.rs" => sqlite_outside_the_door(),
+                _ => shipped_code(&source).join("\n"),
+            };
+            let found = reaches_driver(&code);
+            match path.as_str() {
+                "db/postgres.rs" | "db/sqlx_common.rs" => reaching.push(path),
+                "history.rs" => {
+                    for (at, what) in &found {
+                        let call = &code[*at..];
+                        let argument = ["sqlx::query(", "sqlx::query_scalar("]
+                            .iter()
+                            .find_map(|call_of| call.strip_prefix(call_of))
+                            .map(str::trim_start);
+                        let literal = argument.is_some_and(|argument| {
+                            argument.starts_with('"')
+                                || (argument.starts_with("statement)")
+                                    && code.contains("for statement in [\n"))
+                        });
+                        assert!(literal, "history.rs reaches the driver by `{what}`");
+                    }
+                    assert!(!found.is_empty(), "history's statements were not found");
+                    reaching.push(path);
+                }
+                _ => assert!(
+                    found.is_empty(),
+                    "{path} hands text to the driver past `SqlText`: {found:?}"
+                ),
             }
         }
-        found.sort();
+        reaching.sort();
         assert_eq!(
-            found,
-            [
-                "db/postgres.rs",
-                "db/sqlite.rs",
-                "db/sqlx_common.rs",
-                "history.rs"
-            ]
+            reaching,
+            ["db/postgres.rs", "db/sqlx_common.rs", "history.rs"]
         );
-
-        let history = shipped_code(include_str!("../history.rs")).join("\n");
-        let mut calls = 0;
-        for call in ["sqlx::query(", "sqlx::query_scalar("] {
-            for (at, _) in history.match_indices(call) {
-                calls += 1;
-                let argument = history[at + call.len()..].trim_start();
-                // The schema setup loops over an array of literals.
-                let literal = argument.starts_with('"')
-                    || (argument.starts_with("statement)")
-                        && history.contains("for statement in [\n"));
-                assert!(
-                    literal,
-                    "history runs a statement that is not a literal: {argument:.60}"
-                );
-            }
-        }
-        assert!(calls > 0, "history's statements were not found");
     }
 }
