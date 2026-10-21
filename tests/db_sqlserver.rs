@@ -23,10 +23,10 @@ mod common;
 
 use hubro::db::{
     apply_staged, detect_row_identity, mssql_url_with_password, run_script, split_statements,
-    Capabilities, DbError, DbPool, Dialect, ExportFormat, Filter, Generated, OpenTransaction,
-    PageRequest, Restriction, Rollback, RowCount, RowIdentity, RowLocator, ScriptDone, SortDir,
-    StagedChange, StatementOutcome, TableKind, TableMeta, Value, INSTEAD_OF_TRIGGER, PREVIEW_BYTES,
-    QUERY_CELL_CAP,
+    Capabilities, CheckedStatement, DbError, DbPool, Dialect, ExportFormat, Filter, Generated,
+    OpenTransaction, PageRequest, Restriction, Rollback, RowCount, RowIdentity, RowLocator,
+    ScriptDone, SortDir, StagedChange, StatementOutcome, TableKind, TableMeta, Value,
+    INSTEAD_OF_TRIGGER, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 async fn test_url() -> Option<String> {
@@ -2767,7 +2767,7 @@ async fn sqlserver_atomic_script_that_ends_hubros_transaction_is_not_reported_ro
             format!("{}\nCOMMIT\nGO\n{}", insert(1), insert(2)),
             0,
             vec![1],
-            Rollback::None,
+            Rollback::AlreadyEnded,
         ),
         // The same through a procedure, which no reading of the text can see.
         (
@@ -2778,7 +2778,7 @@ async fn sqlserver_atomic_script_that_ends_hubros_transaction_is_not_reported_ro
             ),
             1,
             vec![1],
-            Rollback::None,
+            Rollback::AlreadyEnded,
         ),
         // No error at all: the batch put a transaction back in place of
         // hubro's, and a later failure rolls back only that one.
@@ -2793,6 +2793,32 @@ async fn sqlserver_atomic_script_that_ends_hubros_transaction_is_not_reported_ro
             Rollback::OpenTransaction(OpenTransaction {
                 schema_changes_kept: false,
             }),
+        ),
+        // The same reopened transaction, doomed under XACT_ABORT by a caught
+        // error. Measured: the server rolls it back at the end of the batch
+        // (3998), so the statement fails rather than hubro's COMMIT, and the
+        // committed row stands.
+        (
+            format!(
+                "{}\nCOMMIT\nBEGIN TRAN\nGO\n{}\nGO\nSET XACT_ABORT ON\n\
+                 BEGIN TRY SELECT 1/0 END TRY BEGIN CATCH END CATCH",
+                insert(1),
+                insert(2)
+            ),
+            2,
+            vec![1],
+            Rollback::AlreadyEnded,
+        ),
+        // A severity-20 error ends the session, so nothing can be asked.
+        (
+            format!(
+                "{}\nCOMMIT\nBEGIN TRAN\nGO\n{}\nGO\nRAISERROR('boom', 20, 1) WITH LOG",
+                insert(1),
+                insert(2)
+            ),
+            2,
+            vec![1],
+            Rollback::ConnectionClosed,
         ),
         // Control: hubro's own transaction is still the one rolled back.
         (
@@ -2827,5 +2853,61 @@ async fn sqlserver_atomic_script_that_ends_hubros_transaction_is_not_reported_ro
         ],
     )
     .await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_edits_a_committing_trigger_kept_are_not_reported_unapplied() {
+    // An AFTER trigger that commits ends hubro's transaction: measured, the
+    // statement fails with 3609 and every change before it stands. Naming
+    // the failing change is what makes the UI say "nothing was applied".
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.edit_trigger_commit",
+            "CREATE TABLE dbo.edit_trigger_commit (a int)",
+        ],
+    )
+    .await;
+    mssql_script(
+        &pool,
+        "CREATE TRIGGER dbo.edit_trigger_commit_t ON dbo.edit_trigger_commit AFTER INSERT AS \
+         IF EXISTS (SELECT 1 FROM inserted WHERE a = 2) COMMIT",
+    )
+    .await
+    .unwrap();
+    let insert = |n| CheckedStatement {
+        sql: "INSERT INTO dbo.edit_trigger_commit VALUES (@P1)".into(),
+        params: vec![Value::Integer(n)],
+        expected_rows: 1,
+    };
+    let (index, error) = pool
+        .execute_all_checked(&[insert(1), insert(2), insert(3)])
+        .await
+        .unwrap_err();
+    assert_eq!(index, None, "{error}");
+    let rows = pool
+        .query("SELECT a FROM dbo.edit_trigger_commit ORDER BY a")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.rows,
+        [[Value::Integer(1)], [Value::Integer(2)]],
+        "the trigger's COMMIT kept both changes before the failure"
+    );
+
+    // Control: an ordinary failure is still hubro's rollback, named.
+    let (index, error) = pool
+        .execute_all_checked(&[insert(4), insert(5)].map(|mut s| {
+            s.expected_rows = 2;
+            s
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(index, Some(0), "{error}");
+    assert_eq!(mssql_open_transactions(&pool).await, Vec::<Value>::new());
+    run_all(&pool, &["DROP TABLE dbo.edit_trigger_commit"]).await;
     pool.close().await;
 }

@@ -22,7 +22,8 @@
 //! batch runs inside ONE [`ScriptTx`](super::registry::ScriptTx) and the
 //! commit happens after the last record is read, so a failure anywhere undoes
 //! every row already sent ([`ImportError::undone_rows`] says how many that
-//! was).
+//! was) — unless something on the server ended that transaction first, which
+//! the error then says ([`stopped`]).
 //!
 //! **Skip mode skips the rows hubro itself rejected**, during coercion, before
 //! any SQL was built for them. A row the *server* rejects aborts the import in
@@ -61,7 +62,7 @@ use std::path::Path;
 use super::caps::{self, TableAccess};
 use super::coerce::coerce_field;
 use super::error::DbError;
-use super::registry::{DbPool, ScriptTx};
+use super::registry::{DbPool, RolledBack, ScriptTx};
 use super::schema::{ColumnMeta, Generated, TableMeta};
 use super::sql::{qualified, quote_ident, Dialect};
 use super::staged::{cast_targets, ParamSql};
@@ -455,7 +456,8 @@ pub struct ImportError {
     pub line: Option<u64>,
     pub message: String,
     /// How many rows this import had already inserted when it failed — every
-    /// one of them rolled back.
+    /// one of them rolled back. Zero when hubro could not confirm the
+    /// rollback undid them ([`stopped`]), and the message then says so.
     ///
     /// Not decoration: it is the difference between "the import stopped
     /// before doing anything" and "the import had written 400 rows and undid
@@ -959,11 +961,9 @@ pub async fn run_import(
         }
         report.inserted_rows += batch.len() as u64;
     }
-    tx.commit().await.map_err(|e| ImportError {
-        line: None,
-        message: e.to_string(),
-        undone_rows: report.inserted_rows,
-    })?;
+    tx.commit()
+        .await
+        .map_err(|(e, found)| stopped(found, report.inserted_rows, None, e.to_string()))?;
     Ok(report)
 }
 
@@ -1015,11 +1015,29 @@ async fn abort(
     line: Option<u64>,
     message: impl Into<String>,
 ) -> ImportError {
-    tx.rollback().await;
+    let found = tx.rollback().await;
+    stopped(found, inserted, line, message.into())
+}
+
+/// The error for an import that stopped after `inserted` rows were sent.
+/// Only a rollback of hubro's own transaction undid them: measured on SQL
+/// Server, an `AFTER` trigger that commits fails the batch with 3609 and
+/// every row sent before it stays in the table.
+fn stopped(found: RolledBack, inserted: u64, line: Option<u64>, message: String) -> ImportError {
+    if found == RolledBack::Own {
+        return ImportError {
+            line,
+            message,
+            undone_rows: inserted,
+        };
+    }
     ImportError {
         line,
-        message: message.into(),
-        undone_rows: inserted,
+        message: format!(
+            "{message} — hubro could not confirm the import was rolled back, so rows it sent \
+             may have been kept; check the table before importing again"
+        ),
+        undone_rows: 0,
     }
 }
 
@@ -1155,6 +1173,22 @@ mod tests {
 
         // Nothing was attempted, so nothing was undone.
         assert_eq!(unknown.undone_rows, 0);
+    }
+
+    #[test]
+    fn a_stopped_import_claims_its_rows_undone_only_when_hubro_undid_them() {
+        let undone = stopped(RolledBack::Own, 400, Some(9), "boom".into());
+        assert_eq!((undone.undone_rows, undone.message.as_str()), (400, "boom"));
+        for found in [
+            RolledBack::Another,
+            RolledBack::Nothing,
+            RolledBack::Unknown,
+        ] {
+            let kept = stopped(found, 400, Some(9), "boom".into());
+            assert_eq!((kept.undone_rows, kept.line), (0, Some(9)), "{found:?}");
+            assert!(kept.message.starts_with("boom — "), "{found:?}");
+            assert!(kept.message.contains("may have been kept"), "{found:?}");
+        }
     }
 
     #[test]

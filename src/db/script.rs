@@ -1523,11 +1523,16 @@ pub struct StatementResult {
 /// data but not the schema was reported as if it had covered everything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rollback {
-    /// Nothing was undone. The sequential autocommit path, a failure before
-    /// the transaction opened, or one after hubro's transaction had already
-    /// ended ([`RolledBack::Nothing`]) — statements before the failure stand
-    /// unless the server undid them.
+    /// Nothing was undone. The sequential autocommit path, or a failure
+    /// before the transaction opened — statements before the failure stand.
     None,
+    /// The atomic path found hubro's transaction already over when it went
+    /// to roll back ([`RolledBack::Nothing`]): a statement committed it (a
+    /// `COMMIT` inside a SQL Server batch, or in a trigger), or the server
+    /// rolled it back (a deadlock, `XACT_ABORT`). Hubro undid nothing and
+    /// cannot tell which, so what stands — possibly part of the failing
+    /// statement itself — is the server error's to say.
+    AlreadyEnded,
     /// Everything the script had run was undone.
     Full,
     /// The transaction rolled back, but the connection has no
@@ -1551,8 +1556,10 @@ pub enum Rollback {
     /// script: statements before its `BEGIN`, and anything it had committed,
     /// stand.
     OpenTransaction(OpenTransaction),
-    /// The sequential path could not check what the script left open, so it
-    /// closed the connection instead of returning it to the pool. The server
+    /// Hubro could not check what the script left open — the sequential
+    /// path's check failed, or the atomic path's connection was lost
+    /// ([`RolledBack::Unknown`]) — so the connection was closed instead of
+    /// returned to the pool. The server
     /// discards anything uncommitted on a closed connection; whether there was
     /// anything, hubro cannot say.
     ConnectionClosed,
@@ -2029,7 +2036,7 @@ async fn run_script_atomic(
             }
         }
     }
-    if let Err(error) = tx.commit().await {
+    if let Err((error, found)) = tx.commit().await {
         // The commit itself failed (e.g. a deferred-constraint violation), not
         // any one statement — label it as such rather than blaming the last
         // statement, which actually succeeded.
@@ -2039,7 +2046,7 @@ async fn run_script_atomic(
             error,
             // Every statement ran before the commit was attempted, so the
             // whole script is in scope here.
-            rollback: rollback_cover(caps, pool.dialect(), statements),
+            rollback: atomic_rollback(caps, pool.dialect(), statements, found),
         });
     }
     Ok(())
@@ -2064,7 +2071,10 @@ fn atomic_rollback(
             schema_changes_kept: rollback_cover(caps, dialect, ran)
                 == Rollback::ExceptSchemaChanges,
         }),
-        RolledBack::Nothing => Rollback::None,
+        RolledBack::Nothing => Rollback::AlreadyEnded,
+        // The connection is gone, and with it whatever was open on it — what
+        // `ConnectionClosed` says.
+        RolledBack::Unknown => Rollback::ConnectionClosed,
     }
 }
 
@@ -4299,7 +4309,8 @@ mod tests {
         assert_eq!(at(RolledBack::Own), Rollback::Full);
         // The script committed hubro's transaction: "no changes were applied"
         // would hide what it committed.
-        assert_eq!(at(RolledBack::Nothing), Rollback::None);
+        assert_eq!(at(RolledBack::Nothing), Rollback::AlreadyEnded);
+        assert_eq!(at(RolledBack::Unknown), Rollback::ConnectionClosed);
         assert_eq!(
             at(RolledBack::Another),
             Rollback::OpenTransaction(OpenTransaction {

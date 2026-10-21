@@ -379,10 +379,13 @@ impl AppState {
                             err.message
                         ),
                         // No index: the transaction itself failed to open or
-                        // commit, so there is no rollback guarantee to claim.
+                        // commit, or the rollback may not have undone it (a
+                        // SQL Server trigger that commits), so there is no
+                        // rollback guarantee to claim. The stage is kept —
+                        // dropping it could lose edits that never landed.
                         _ => format!(
                             "{} — the batch may or may not have been applied; \
-                             refresh to see the current state",
+                             refresh to see the current state before saving again",
                             err.message
                         ),
                     };

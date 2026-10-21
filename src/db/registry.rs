@@ -155,27 +155,40 @@ impl ScriptTx<'_> {
         }
     }
 
-    /// Commits the transaction — the script's statements all take effect.
-    pub async fn commit(self) -> Result<(), DbError> {
+    /// Commits the transaction — the script's statements all take effect. A
+    /// failed commit says what the rollback that follows it covered, as
+    /// [`Self::rollback`] does.
+    pub async fn commit(self) -> Result<(), (DbError, RolledBack)> {
         match self {
             // The two sqlx variants resolve identically, so they share one
-            // generic helper rather than one wrapper each.
-            ScriptTx::Sqlite(tx) => sqlx_common::commit_tx(tx).await,
-            ScriptTx::Postgres(tx) => sqlx_common::commit_tx(tx).await,
+            // generic helper rather than one wrapper each. A failed commit
+            // there rolls the transaction back (see `rollback` for the limit).
+            ScriptTx::Sqlite(tx) => sqlx_common::commit_tx(tx)
+                .await
+                .map_err(|e| (e, RolledBack::Own)),
+            ScriptTx::Postgres(tx) => sqlx_common::commit_tx(tx)
+                .await
+                .map_err(|e| (e, RolledBack::Own)),
             ScriptTx::SqlServer(tx) => sqlserver::commit_tx(*tx).await,
         }
     }
 
-    /// Rolls the transaction back, and says what that covered. Best-effort: a
-    /// rollback failure leaves nothing committed anyway (the transaction also
-    /// rolls back on drop), so the original error is what the caller reports.
+    /// Rolls the transaction back, and says what that covered. Best-effort:
+    /// a failed rollback closes the connection, and the server discards what
+    /// was open on it.
     ///
-    /// Only SQL Server can answer anything but [`RolledBack::Own`]: there a
-    /// statement is a whole batch, and one can end the transaction it runs
-    /// in. A Postgres or SQLite statement that tries is refused inside one.
+    /// Only SQL Server asks: there a statement is a whole batch, and one can
+    /// end the transaction it runs in. The sqlx variants answer
+    /// [`RolledBack::Own`] unasked. That holds for SQLite and Postgres, which
+    /// refuse transaction control inside a statement, but not for
+    /// CockroachDB, whose `SHOW COMMIT TIMESTAMP` commits the open transaction
+    /// (measured, see `postgres::end_script_conn`).
     pub async fn rollback(self) -> RolledBack {
         match self {
             ScriptTx::Sqlite(tx) => sqlx_common::rollback_tx(tx).await,
+            // shortcut: claims the CockroachDB `SHOW COMMIT TIMESTAMP` case
+            // rolled back; ask the session as `end_script_conn` does if it
+            // turns up in a wrapped script.
             ScriptTx::Postgres(tx) => sqlx_common::rollback_tx(tx).await,
             ScriptTx::SqlServer(tx) => return sqlserver::rollback_tx(*tx).await,
         }
@@ -184,6 +197,7 @@ impl ScriptTx<'_> {
 }
 
 /// What [`ScriptTx::rollback`] found open when it rolled back.
+#[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RolledBack {
     /// The transaction hubro opened: everything run in it is undone.
@@ -191,10 +205,15 @@ pub enum RolledBack {
     /// A transaction a statement opened after committing hubro's: what ran
     /// before that commit stands.
     Another,
-    /// No transaction at all — a statement ended hubro's, or the server did
-    /// (a deadlock, `XACT_ABORT`); hubro cannot tell which, so cannot say
-    /// what stands.
+    /// No transaction at all: a statement ended hubro's (a `COMMIT` in a
+    /// batch or a trigger), or the server rolled it back (a deadlock,
+    /// `XACT_ABORT`, an error in a trigger). Hubro cannot tell which, so it
+    /// cannot say what stands.
     Nothing,
+    /// Hubro could not ask: the connection was lost, or the question failed.
+    /// The server discards what was open when the connection goes; what had
+    /// been committed stands.
+    Unknown,
 }
 
 /// One script's hold on a connection the *server* will not let write: what
@@ -795,7 +814,9 @@ impl DbPool {
     /// Executes every statement inside ONE transaction, committing only when
     /// each affected exactly its expected row count. Any failure rolls the
     /// whole batch back; the error names the failing statement by index
-    /// (`None` when opening or committing the transaction itself failed).
+    /// (`None` when opening or committing the transaction itself failed, or
+    /// when the rollback may not have undone the batch — a SQL Server
+    /// trigger can commit it).
     /// Staged edits apply through this so a batch either lands
     /// completely or not at all.
     pub async fn execute_all_checked(

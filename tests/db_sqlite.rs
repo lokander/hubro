@@ -754,7 +754,7 @@ async fn sql_text_holding_a_nul_is_refused_at_every_entry_point() {
         within("tx query_capped", tx.query_capped(read, 10)).await,
         Err(nul_refused())
     );
-    tx.rollback().await;
+    let _ = tx.rollback().await;
 
     // Nothing ran, and the pool is whole: a hung statement would also have
     // kept its connection.

@@ -353,7 +353,7 @@ pub fn ImportDialog(
                         if on_error() == ErrorMode::Skip {
                             "Rows that can't be imported will be skipped and listed by line. Everything else is committed together."
                         } else {
-                            "The import runs in one transaction: if any row can't be imported, nothing is written at all."
+                            "The import runs in one transaction: if any row can't be imported, the whole import is rolled back, and hubro says so if it can't confirm that."
                         }
                     }
 
