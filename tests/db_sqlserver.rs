@@ -107,6 +107,34 @@ async fn sqlserver_connects_and_validates_with_a_round_trip() {
 }
 
 #[tokio::test]
+async fn a_connection_the_server_killed_while_idle_is_not_handed_to_the_next_query() {
+    // The server — or an Azure gateway — may close a pooled connection while
+    // it sits idle. Measured before the pool checked idle connections: the
+    // next query failed with an I/O error ("peer closed connection without
+    // sending TLS close_notify"), and only the one after it worked.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    let admin = DbPool::open_mssql(&url).await.unwrap();
+    // open_mssql leaves exactly one idle connection; this query reuses it.
+    let spid = pool.query("SELECT @@SPID").await.unwrap();
+    let [row] = spid.rows.as_slice() else {
+        panic!("{spid:?}")
+    };
+    let Value::Integer(spid) = row[0] else {
+        panic!("{row:?}")
+    };
+    admin.execute(&format!("KILL {spid}")).await.unwrap();
+    let result = pool.query("SELECT 1").await;
+    assert_eq!(
+        result.map(|r| r.rows).map_err(|e| e.to_string()),
+        Ok(vec![vec![Value::Integer(1)]]),
+        "the killed session must be replaced before the query runs"
+    );
+    pool.close().await;
+    admin.close().await;
+}
+
+#[tokio::test]
 async fn sqlserver_bad_password_is_an_authentication_error() {
     let Some(url) = test_url().await else { return };
     let wrong = mssql_url_with_password(&url, "definitely-wrong-password").unwrap();
