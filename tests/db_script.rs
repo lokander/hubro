@@ -1007,7 +1007,10 @@ async fn sqlite_cancelled_script_does_not_return_its_transaction_to_the_pool() {
 /// would take minutes.
 const PG_ENDLESS_READ: &str = "SELECT generate_series(1, 2000000000)";
 
-#[tokio::test]
+// Multi-threaded, as the app's runtime is: a capped read with nothing
+// open goes back to the pool for sqlx to read the rest in a background
+// task, which on a single-threaded runtime holds the thread until it is done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_script_ending_in_a_capped_read_does_not_wait_for_the_rest() {
     // Ending a run asks the connection whether the script left a transaction
     // open. Asked after a read the row cap cut short, that question waited
@@ -1030,6 +1033,23 @@ async fn postgres_script_ending_in_a_capped_read_does_not_wait_for_the_rest() {
         .expect("a capped read must not wait for the rest of its result");
     assert_eq!(outcome, Ok(ScriptDone::default()));
     assert!(results[0].truncated);
+    // With nothing open, the connection went back to the pool for sqlx to
+    // read the rest in the background — two billion rows here, so end that
+    // session rather than let it run on behind the test.
+    let terminated = count(
+        &pool,
+        &format!(
+            "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity \
+             WHERE datname = current_database() AND pid <> pg_backend_pid() \
+             AND query = '{PG_ENDLESS_READ}'"
+        ),
+    )
+    .await;
+    assert_eq!(
+        terminated,
+        Value::Integer(1),
+        "the read is still being drained"
+    );
 
     // The same read at the end of a script inside its own transaction: the
     // transaction is still rolled back, and said to be.
@@ -1058,5 +1078,91 @@ async fn postgres_script_ending_in_a_capped_read_does_not_wait_for_the_rest() {
         Value::Integer(0)
     );
     pool.execute("DROP TABLE capped_tx").await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_capped_row_returning_write_keeps_its_write() {
+    // A data-modifying CTE that returns rows is a read by its first keyword,
+    // and writes only as fast as its rows are read. Measured, closing the
+    // connection after the row cap kept 0 rows of 3M; it must be read to the
+    // end, and the write kept, before the run reports done.
+    let Some(url) = pg_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.execute("DROP TABLE IF EXISTS capped_write")
+        .await
+        .unwrap();
+    pool.execute("CREATE TABLE capped_write (a integer)")
+        .await
+        .unwrap();
+
+    let (results, outcome) = collect_script(
+        &pool,
+        "WITH w AS (INSERT INTO capped_write SELECT generate_series(1, 300000) RETURNING a) \
+         SELECT a FROM w",
+    )
+    .await;
+    assert_eq!(outcome, Ok(ScriptDone::default()));
+    assert!(results[0].truncated);
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM capped_write").await,
+        Value::Integer(300_000),
+        "every row the statement wrote must be kept"
+    );
+    pool.execute("DROP TABLE capped_write").await.unwrap();
+    pool.close().await;
+}
+
+// Multi-threaded, as the app's runtime is: a capped read with nothing
+// open goes back to the pool for sqlx to read the rest in a background
+// task, which on a single-threaded runtime holds the thread until it is done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_capped_read_with_a_write_the_gate_cannot_see_keeps_it() {
+    // `SELECT f()` for a function that writes looks like a plain read, so it
+    // may be cut off at the cap — but never by closing the connection, which
+    // aborted the statement. Handed back to the pool, sqlx reads the rest in
+    // the background and the statement commits, as capped reads always did.
+    let Some(url) = pg_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.execute("DROP FUNCTION IF EXISTS capped_bump(integer)")
+        .await
+        .unwrap();
+    pool.execute("DROP TABLE IF EXISTS capped_side")
+        .await
+        .unwrap();
+    pool.execute("CREATE TABLE capped_side (a integer)")
+        .await
+        .unwrap();
+    pool.execute(
+        "CREATE FUNCTION capped_bump(i integer) RETURNS integer LANGUAGE sql \
+         AS 'INSERT INTO capped_side VALUES (i) RETURNING a'",
+    )
+    .await
+    .unwrap();
+
+    let (results, outcome) = collect_script(
+        &pool,
+        "SELECT capped_bump(g) FROM generate_series(1, 20000) g",
+    )
+    .await;
+    assert_eq!(outcome, Ok(ScriptDone::default()));
+    assert!(results[0].truncated);
+    let mut kept = Value::Null;
+    for _ in 0..300 {
+        kept = count(&pool, "SELECT count(*) FROM capped_side").await;
+        if kept == Value::Integer(20_000) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        kept,
+        Value::Integer(20_000),
+        "the function's writes must be kept"
+    );
+    pool.execute("DROP FUNCTION capped_bump(integer)")
+        .await
+        .unwrap();
+    pool.execute("DROP TABLE capped_side").await.unwrap();
     pool.close().await;
 }

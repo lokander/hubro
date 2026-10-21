@@ -263,8 +263,10 @@ impl AppState {
 ///
 /// The statement is editable, so it can open a transaction and not commit it.
 /// The run rolled that back, and reporting the edit as done would claim a
-/// change that is not there. A run whose connection was closed afterwards
-/// still ran the statement, and counts as done.
+/// change that is not there. Nor is a run whose connection was closed because
+/// its end could not be checked: the statement ran, but anything it left
+/// uncommitted went with the connection, so whether the change is there is
+/// for the schema to say.
 fn schema_edit_outcome(result: Result<ScriptDone, ScriptError>) -> Result<(), String> {
     match result {
         Ok(ScriptDone {
@@ -279,7 +281,17 @@ fn schema_edit_outcome(result: Result<ScriptDone, ScriptError>) -> Result<(), St
         }
         .to_string()),
         Ok(ScriptDone {
-            rolled_back: None, ..
+            rolled_back: None,
+            connection_closed: true,
+        }) => Err(
+            "The statement ran, but hubro could not check whether it left a transaction \
+                   open and closed the connection — anything it had not committed was \
+                   discarded. Check the schema."
+                .to_string(),
+        ),
+        Ok(ScriptDone {
+            rolled_back: None,
+            connection_closed: false,
         }) => Ok(()),
         Err(err) => Err(err.error.to_string()),
     }
@@ -302,13 +314,11 @@ mod tests {
         assert!(rolled_back(false).is_err_and(|e| e.contains("nothing changed")));
         assert!(rolled_back(true).is_err_and(|e| e.contains("Check the schema")));
         assert_eq!(schema_edit_outcome(Ok(ScriptDone::default())), Ok(()));
-        assert_eq!(
-            schema_edit_outcome(Ok(ScriptDone {
-                rolled_back: None,
-                connection_closed: true,
-            })),
-            Ok(())
-        );
+        assert!(schema_edit_outcome(Ok(ScriptDone {
+            rolled_back: None,
+            connection_closed: true,
+        }))
+        .is_err_and(|e| e.contains("Check the schema")));
         assert_eq!(
             schema_edit_outcome(Err(ScriptError {
                 statement_index: 0,
