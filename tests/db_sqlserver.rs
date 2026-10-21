@@ -23,8 +23,8 @@ mod common;
 
 use hubro::db::{
     apply_staged, detect_row_identity, mssql_url_with_password, run_script, split_statements,
-    Capabilities, DbError, DbPool, Dialect, ExportFormat, Filter, Generated, PageRequest,
-    Restriction, Rollback, RowCount, RowIdentity, RowLocator, SortDir, StagedChange,
+    wrap_atomically, Capabilities, DbError, DbPool, Dialect, ExportFormat, Filter, Generated,
+    PageRequest, Restriction, Rollback, RowCount, RowIdentity, RowLocator, SortDir, StagedChange,
     StatementOutcome, TableKind, TableMeta, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
@@ -842,6 +842,7 @@ async fn sqlserver_script_creates_modules_that_must_lead_a_batch() {
         &[
             "DROP VIEW IF EXISTS dbo.script_lead_view",
             "DROP PROCEDURE IF EXISTS dbo.script_lead_proc",
+            "DROP PROCEDURE IF EXISTS dbo.script_lead_gone",
             "DROP TABLE IF EXISTS dbo.script_lead_probe",
         ],
     )
@@ -867,6 +868,11 @@ async fn sqlserver_script_creates_modules_that_must_lead_a_batch() {
                SELECT id FROM dbo.script_lead_probe";
     let statements = split_statements(sql, pool.dialect());
     assert_eq!(statements.len(), 4);
+    assert!(wrap_atomically(
+        pool.backend_capabilities(),
+        pool.dialect(),
+        &statements
+    ));
     let mut results = Vec::new();
     run_script(&pool, pool.backend_capabilities(), &statements, |r| {
         results.push(r)
@@ -878,6 +884,32 @@ async fn sqlserver_script_creates_modules_that_must_lead_a_batch() {
         StatementOutcome::Rows(rows) => assert_eq!(rows.rows, vec![vec![Value::Integer(1)]]),
         other => panic!("expected rows from the SELECT, got {other:?}"),
     }
+
+    // A module sent as a plain batch joins the script transaction: when a
+    // later statement fails, the rollback takes the procedure with it.
+    let sql = "CREATE PROCEDURE dbo.script_lead_gone AS SELECT 1 AS one\n\
+               GO\n\
+               SELECT * FROM dbo.script_lead_missing";
+    let statements = split_statements(sql, pool.dialect());
+    assert!(wrap_atomically(
+        pool.backend_capabilities(),
+        pool.dialect(),
+        &statements
+    ));
+    let err = run_script(&pool, pool.backend_capabilities(), &statements, |_| {})
+        .await
+        .expect_err("the missing table must fail the script");
+    assert_eq!(err.statement_index, 1);
+    assert_eq!(err.rollback, Rollback::Full);
+    let gone = pool
+        .query("SELECT OBJECT_ID(N'dbo.script_lead_gone')")
+        .await
+        .unwrap();
+    assert_eq!(
+        gone.rows[0][0],
+        Value::Null,
+        "the procedure must be rolled back"
+    );
 
     run_all(
         &pool,
