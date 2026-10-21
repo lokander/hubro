@@ -570,14 +570,17 @@ pub fn save_connections(path: &Path, connections: &[SavedConnection]) -> Result<
     )
 }
 
-/// Why a group name was refused. Both cases are user input from
-/// the connections screen, so each carries the sentence shown there.
+/// Why a group operation was refused. Each case reaches the connections
+/// screen, so each carries the sentence shown there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupError {
     /// The name was empty, or only whitespace.
     Empty,
     /// Another group already has this name (compared case-insensitively).
     Duplicate(String),
+    /// The group being renamed no longer exists — the screen offering the
+    /// rename was showing a list that has since changed.
+    Unknown(String),
 }
 
 impl fmt::Display for GroupError {
@@ -585,6 +588,7 @@ impl fmt::Display for GroupError {
         match self {
             GroupError::Empty => write!(f, "a group needs a name"),
             GroupError::Duplicate(name) => write!(f, "there is already a group called “{name}”"),
+            GroupError::Unknown(name) => write!(f, "there is no group called “{name}” any more"),
         }
     }
 }
@@ -786,9 +790,17 @@ impl SavedList {
     /// Membership is stored as the group's name, so the rename has to rewrite
     /// every member in the same step — a rename that renamed only the header
     /// would empty the group and strand its connections under a name nothing
-    /// displays. Returns the trimmed new name (validated even when `old`
-    /// names no group, in which case nothing is renamed).
+    /// displays. Returns the trimmed new name.
+    ///
+    /// Renaming a group that does not exist is an error rather than a quiet
+    /// success: the caller takes `Ok` to mean the group is now called `new`,
+    /// and acts on it — persisting the list and carrying the group's fold
+    /// across — so an `Ok` for a rename that did nothing would move a fold
+    /// onto a group nobody made.
     pub fn rename_group(&mut self, old: &str, new: &str) -> Result<String, GroupError> {
+        let Some(index) = self.groups.iter().position(|g| g == old) else {
+            return Err(GroupError::Unknown(old.to_string()));
+        };
         let new = new.trim().to_string();
         if new.is_empty() {
             return Err(GroupError::Empty);
@@ -802,9 +814,6 @@ impl SavedList {
         {
             return Err(GroupError::Duplicate(existing.clone()));
         }
-        let Some(index) = self.groups.iter().position(|g| g == old) else {
-            return Ok(new);
-        };
         self.groups[index] = new.clone();
         for entry in &mut self.entries {
             if entry.group() == Some(old) {
@@ -1205,6 +1214,16 @@ mod tests {
             Err(GroupError::Empty)
         );
         assert_eq!(list.groups(), ["PRODUCTION", "Other"]);
+
+        // A group that is gone is reported, not renamed into existence: the
+        // caller would otherwise persist and carry a fold for a rename that
+        // did nothing.
+        let before = list.clone();
+        assert_eq!(
+            list.rename_group("Prod", "Staging"),
+            Err(GroupError::Unknown("Prod".to_string()))
+        );
+        assert_eq!(list, before);
     }
 
     #[test]
