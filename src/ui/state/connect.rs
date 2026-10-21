@@ -4092,6 +4092,10 @@ mod tests {
         }
     }
 
+    // The keyring guard is held across the awaits on purpose: it keeps the
+    // secrets tests from toggling the disable flag mid-flow, and this runtime
+    // is single-threaded.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn a_stored_password_survives_a_refusal_until_a_different_one_connects() {
         // The whole path, on a real server and the mock keyring: a role whose
