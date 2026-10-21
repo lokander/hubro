@@ -117,9 +117,10 @@ impl AppState {
                 backend: s.backend(),
             })
             .collect();
+        let order: Vec<String> = session.tabs.iter().map(|t| t.locator.clone()).collect();
         // No server connection is ready yet, so this is the local files.
         let local = plan_session_restore(&session.tabs, &candidates, |_| false);
-        self.start_restore(local, session.active.clone(), saved);
+        self.start_restore(local, session.active.clone(), saved, &order);
         for tab in &session.tabs {
             let Some(connection) = saved.iter().find(|s| {
                 s.backend() != BackendKind::Sqlite && saved_open_locator(s) == tab.locator
@@ -131,11 +132,12 @@ impl AppState {
             let connection = connection.clone();
             let candidates = candidates.clone();
             let active = session.active.clone();
+            let order = order.clone();
             spawn_forever(async move {
                 let ready = ready.await;
                 // The planner still makes the call, one tab at a time.
                 let plan = plan_session_restore(std::slice::from_ref(&tab), &candidates, |_| ready);
-                self.start_restore(plan, active, std::slice::from_ref(&connection));
+                self.start_restore(plan, active, std::slice::from_ref(&connection), &order);
             });
         }
     }
@@ -194,11 +196,18 @@ impl AppState {
     /// connects now finish in any order, and alongside whatever the command
     /// line or the OS asked to open, which must not lose the foreground to a
     /// tab the user did not ask for.
+    ///
+    /// For the same reason each tab takes its session place among the tabs
+    /// when it opens (`order`, the session's locators), rather than the place
+    /// its connect happened to finish in — local files finish first, so
+    /// without it every launch would move them ahead of the servers, and the
+    /// session saved on the way out would keep the new order.
     pub(super) fn start_restore(
         mut self,
         plan: Vec<SessionTab>,
         active: Option<String>,
         saved: &[SavedConnection],
+        order: &[String],
     ) {
         for tab in plan {
             let Some(saved_conn) = saved.iter().find(|s| saved_open_locator(s) == tab.locator)
@@ -211,9 +220,19 @@ impl AppState {
                 SavedConnection::Sqlite { .. } => (None, ServerAuth::Password),
             };
             let in_front = active.as_deref() == Some(tab.locator.as_str());
-            self.restoring
-                .write()
-                .insert(tab.locator.clone(), RestoredTab { tab, in_front });
+            let earlier = order
+                .iter()
+                .take_while(|locator| **locator != tab.locator)
+                .cloned()
+                .collect();
+            self.restoring.write().insert(
+                tab.locator.clone(),
+                RestoredTab {
+                    tab,
+                    in_front,
+                    earlier,
+                },
+            );
             self.start_connect(
                 saved_conn.locator(),
                 saved_conn.name().to_string(),
@@ -226,10 +245,21 @@ impl AppState {
     }
 
     /// Applies a restored tab's remembered table, pane and row detail panel
-    /// to the tab `id` that just opened for it, and brings it to the front if
+    /// to the tab `id` that just opened for it, moves it to its session place
+    /// ([`restored_place`]), and brings it to the front if
     /// [`restored_tab_takes_focus`] says so.
     pub(super) fn apply_restored(mut self, id: ConnectionId, restored: RestoredTab) {
-        let RestoredTab { tab, in_front } = restored;
+        let RestoredTab {
+            tab,
+            in_front,
+            earlier,
+        } = restored;
+        {
+            let mut open = self.open_locators.write();
+            let after = restored_place(&open, id, &earlier);
+            move_after(&mut open, id, after);
+            self.registry.write().move_after(id, after);
+        }
         {
             let selected = tab.selected_table.map(|name| TableRef {
                 schema: tab.selected_schema,
@@ -245,6 +275,42 @@ impl AppState {
             self.active.set(ActiveView::Connection(id));
         }
     }
+}
+
+/// Where a restored tab `id` that has just opened belongs among the `open`
+/// tabs: just after the last of them that came before it in the session
+/// (`earlier`), or first when none has opened yet. Tabs that are not from the
+/// session — opened by the user, the command line or the OS — never count, so
+/// they keep their places after the session's.
+pub(super) fn restored_place(
+    open: &[(ConnectionId, String)],
+    id: ConnectionId,
+    earlier: &[String],
+) -> Option<ConnectionId> {
+    open.iter()
+        .filter(|(open_id, _)| *open_id != id)
+        .rfind(|(_, locator)| earlier.contains(locator))
+        .map(|(open_id, _)| *open_id)
+}
+
+/// Moves `id`'s entry to just after `after`'s, or to the front.
+fn move_after(
+    open: &mut Vec<(ConnectionId, String)>,
+    id: ConnectionId,
+    after: Option<ConnectionId>,
+) {
+    let Some(from) = open.iter().position(|(open_id, _)| *open_id == id) else {
+        return;
+    };
+    let entry = open.remove(from);
+    let to = match after {
+        None => 0,
+        Some(after) => open
+            .iter()
+            .position(|(open_id, _)| *open_id == after)
+            .map_or(open.len(), |i| i + 1),
+    };
+    open.insert(to, entry);
 }
 
 /// Whether a restored tab that has just opened comes to the front: only the
@@ -377,7 +443,7 @@ mod tests {
         ];
         dom.in_runtime(|| {
             let saved: Vec<SavedConnection> = state.saved.peek().entries().to_vec();
-            state.start_restore(plan, Some(restored.clone()), &saved);
+            state.start_restore(plan, Some(restored.clone()), &saved, &[]);
         });
 
         let open_id = |dom: &VirtualDom, locator: &str| {
@@ -451,7 +517,7 @@ mod tests {
                 locator: late.clone(),
                 ..SessionTab::default()
             }];
-            state.start_restore(plan, Some(late.clone()), &saved);
+            state.start_restore(plan, Some(late.clone()), &saved, &[]);
         });
         run_until(&mut dom, Duration::from_secs(10), |dom| {
             open_id(dom, &late).is_some()
@@ -555,5 +621,139 @@ mod tests {
             "a tab whose keyring has not answered must not start"
         );
         dom.in_runtime(|| state.cancel_connect(&unlocked));
+    }
+
+    #[tokio::test]
+    async fn a_restored_tab_takes_its_session_place_however_late_it_opens() {
+        let registry_ids = |n: usize| {
+            let mut registry = ConnectionRegistry::default();
+            (0..n)
+                .map(|i| {
+                    let pool = DbPool::Sqlite(
+                        sqlx::sqlite::SqlitePool::connect_lazy("sqlite::memory:").unwrap(),
+                    );
+                    registry.insert(format!("{i}"), pool, WriteProtection::Open)
+                })
+                .collect::<Vec<_>>()
+        };
+        let ids = registry_ids(4);
+        let (server, local, argv, later) = (ids[0], ids[1], ids[2], ids[3]);
+        let entry = |id, l: &str| (id, l.to_string());
+        let earlier = |ls: &[&str]| ls.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+
+        // Session [server, local]: the local file opened first, and the
+        // command line's file after it; the server tab opens last.
+        let mut open = vec![
+            entry(local, "local"),
+            entry(argv, "argv"),
+            entry(server, "server"),
+        ];
+        let after = restored_place(&open, server, &earlier(&[]));
+        assert_eq!(after, None, "nothing came before it, so it goes first");
+        move_after(&mut open, server, after);
+        assert_eq!(
+            open.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>(),
+            ["server", "local", "argv"],
+            "the session's order, and the command line's tab after it"
+        );
+
+        // A third session tab, after both, lands after the last of them that
+        // is open — not after the command line's tab.
+        open.push(entry(later, "later"));
+        let after = restored_place(&open, later, &earlier(&["server", "local"]));
+        assert_eq!(after, Some(local));
+        move_after(&mut open, later, after);
+        assert_eq!(
+            open.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>(),
+            ["server", "local", "later", "argv"]
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_tabs_come_back_and_are_saved_in_session_order() {
+        // The server tab first, and slow to start (its readiness answers
+        // late), so it is the last to open: it must still come back first,
+        // and be saved first.
+        let Ok(pg) = std::env::var("HUBRO_PG_TEST_URL") else {
+            eprintln!("skipping: HUBRO_PG_TEST_URL not set");
+            return;
+        };
+        let mut parsed = url::Url::parse(&pg).unwrap();
+        let password = parsed.password().unwrap_or_default().to_string();
+        parsed.set_password(None).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let local_db = sqlite_file(dir.path(), "local.db").await;
+
+        let mut dom = VirtualDom::new(empty);
+        let state = provide_state(&dom);
+        dom.rebuild_in_place();
+        let saved = dom.in_runtime(|| {
+            let mut saved = state.saved;
+            let mut saved = saved.write();
+            saved.add(SavedConnection::Postgres {
+                name: "server".into(),
+                url: parsed.to_string(),
+                tunnel: None,
+                auth: ServerAuth::Password,
+                protection: WriteProtection::Open,
+                color: None,
+                group: None,
+            });
+            saved.add(SavedConnection::Sqlite {
+                name: "local".into(),
+                path: local_db.clone(),
+                protection: WriteProtection::Open,
+                color: None,
+                group: None,
+            });
+            saved.entries().to_vec()
+        });
+        let order: Vec<String> = saved.iter().map(saved_open_locator).collect();
+        let session = Session {
+            tabs: order
+                .iter()
+                .map(|locator| SessionTab {
+                    locator: locator.clone(),
+                    ..SessionTab::default()
+                })
+                .collect(),
+            ..Session::default()
+        };
+        dom.in_runtime(|| {
+            let mut passwords = state.session_passwords;
+            passwords.write().insert(order[0].clone(), password.clone());
+            state.restore_tabs(&session, &saved, |_| async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                true
+            });
+        });
+        run_until(&mut dom, Duration::from_secs(20), |dom| {
+            dom.in_runtime(|| state.open_locators.peek().len() == 2)
+        })
+        .await;
+        dom.in_runtime(|| {
+            let open: Vec<String> = state
+                .open_locators
+                .peek()
+                .iter()
+                .map(|(_, l)| l.clone())
+                .collect();
+            assert_eq!(open, order, "the tabs, in session order");
+            let names: Vec<String> = state
+                .registry
+                .peek()
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
+            assert_eq!(names.len(), 2);
+            assert_eq!(names[1], "local.db", "the tab bar, in session order");
+            let persisted: Vec<String> = state
+                .current_session()
+                .tabs
+                .iter()
+                .map(|t| t.locator.clone())
+                .collect();
+            assert_eq!(persisted, order, "and saved in that order");
+        });
     }
 }

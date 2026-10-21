@@ -1161,6 +1161,25 @@ impl ConnectionRegistry {
         id
     }
 
+    /// Moves connection `id` to just after `after`, or to the front when
+    /// `after` is `None` — so a tab can take its place among the others
+    /// rather than wherever it happened to be opened.
+    pub fn move_after(&mut self, id: ConnectionId, after: Option<ConnectionId>) {
+        let Some(from) = self.connections.iter().position(|c| c.id == id) else {
+            return;
+        };
+        let connection = self.connections.remove(from);
+        let to = match after {
+            None => 0,
+            Some(after) => self
+                .connections
+                .iter()
+                .position(|c| c.id == after)
+                .map_or(self.connections.len(), |i| i + 1),
+        };
+        self.connections.insert(to, connection);
+    }
+
     /// Re-marks an open connection after the user edits its saved entry,
     /// so a tab that is already open starts obeying the new
     /// protection without being reconnected.
