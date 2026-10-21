@@ -378,9 +378,9 @@ mod pooled {
         /// mid-request (a cancelled run, grid page or export) drops the client
         /// with it and closes the connection rather than pooling it. Pooled, it
         /// would make the next borrower wait out the abandoned response (tiberius
-        /// drains it first), and an edit batch cancelled between `BEGIN TRAN` and
-        /// `COMMIT` would hand its open transaction to the next borrower, whose
-        /// own commit then only lowered `@@TRANCOUNT`.
+        /// drains it first), and a transaction open on it would reach the next
+        /// borrower, whose own commit then only lowers `@@TRANCOUNT` — a second
+        /// guard beside [`MssqlTx`]'s and the script hold's own discard on drop.
         ///
         /// Closing the socket does not stop the batch server-side: tiberius
         /// sends no Attention, and SQL Server only notices on its next write,
