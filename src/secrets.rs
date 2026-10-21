@@ -103,13 +103,23 @@ pub fn delete_password(url: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use std::sync::{Mutex as TestMutex, Once};
+    use std::sync::{Mutex as TestMutex, MutexGuard, Once};
 
     // The disable-flag test mutates process-wide env; serialize the module's
     // tests so it can't poison the round-trip test running in parallel.
     static TEST_LOCK: TestMutex<()> = TestMutex::new(());
+
+    /// Routes keyring calls to the mock store, with the disable flag cleared,
+    /// for as long as the guard lives — for tests elsewhere that drive a flow
+    /// through the keyring.
+    pub(crate) fn mock_keyring() -> MutexGuard<'static, ()> {
+        let guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        use_mock();
+        std::env::remove_var("HUBRO_DISABLE_KEYRING");
+        guard
+    }
 
     // Route all keyring calls to the crate's in-memory mock store so tests
     // never touch (or prompt for) the user's real wallet.

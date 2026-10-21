@@ -103,8 +103,13 @@ pub(super) fn forget_failed_ssh_passphrase(
 /// because "answered no" and "never asked" are different states and the
 /// difference is user-visible: only the second may offer a ticked box on the
 /// next prompt. They were the same state while this was a set, which quietly
-/// unticked the re-prompt for a passphrase typed into the connection form —
-/// that path stashes the passphrase without parking a choice at all.
+/// unticked the re-prompt for a passphrase typed into the connection form.
+///
+/// That form parks its answer here too. It used to stash the passphrase
+/// without parking anything and store it itself once the connection opened,
+/// so an answer parked by an earlier, abandoned prompt was still waiting: the
+/// tunnel open redeemed it and stored the form's passphrase although its box
+/// was unticked.
 pub(super) fn park_ssh_remember(pending: &mut HashMap<String, bool>, url: &str, remember: bool) {
     pending.insert(url.to_string(), remember);
 }
@@ -120,9 +125,8 @@ pub(super) fn park_ssh_remember(pending: &mut HashMap<String, bool>, url: &str, 
 ///
 /// An attempt with no answer on record defaults to offering the box ticked:
 /// nothing has asked this session, so its prompt is a first prompt. That is
-/// usually a passphrase read back from the keyring, or one typed into the
-/// connection form, which stashes it without parking anything — but the rule
-/// is the record, not the source. An answer left parked by an earlier attempt
+/// usually a passphrase read back from the keyring — but the rule is the
+/// record, not the source. An answer left parked by an earlier attempt
 /// is honoured whatever supplied the passphrase this time. That is why the
 /// absence of an answer has to be distinguishable from an answer of "no", and
 /// why [`park_ssh_remember`] records both.
@@ -218,8 +222,8 @@ pub(super) fn carry_session_secrets(session: &mut HashMap<String, String>, old: 
         // the connect that just succeeded, and [`migrate_secret`] gives the
         // keyring copy the same precedence for the same reason. Overwriting it
         // would put an unvalidated secret where the next connect reads it as
-        // previously accepted — and `forget_stale_secret` then deletes the
-        // stored copy when it fails, so an unchecked secret costs a good one.
+        // previously accepted — so its failure prompts as if the stored copy
+        // had gone stale, and the answer to that prompt can delete it.
         session.entry(new_key).or_insert(secret);
     }
 }
@@ -253,13 +257,14 @@ pub(super) enum PasswordRetry {
     /// Nothing was remembered — a trust-auth attempt that turned out to need a
     /// password. Ask for one.
     Prompt,
-    /// A remembered password was refused: delete it from session memory and
-    /// the keyring, then ask for a new one.
-    ForgetStoredAndPrompt,
+    /// A remembered password was refused: drop it from session memory, then
+    /// ask for a new one. The keyring copy stays until a *different* password
+    /// connects — [`stored_password_after_connect`] decides it then.
+    ForgetSessionAndPrompt,
 }
 
 /// Decides whether a failed server connect raises the password prompt, and
-/// whether it first deletes the remembered password.
+/// whether it first drops the remembered password from session memory.
 ///
 /// Only [`DbError::CredentialsRejected`] qualifies. The backends build it from
 /// the server's error code alone (SQL Server 18456, PostgreSQL `28P01`), so
@@ -269,18 +274,22 @@ pub(super) enum PasswordRetry {
 /// failed." — so a database name that didn't exist deleted a working stored
 /// password and then prompted for one that could not help.
 ///
+/// Even the code is not proof the password is wrong: a Postgres role whose
+/// `VALID UNTIL` has passed gets `28P01` for its correct password, and a SQL
+/// Server contained-database user naming a missing database gets 18456. That
+/// is why a rejection no longer deletes the keyring copy at all.
+///
 /// `had_password` says whether the attempt used a remembered password, and
 /// [`AppState::connect_server`] only ever remembers passwords a connect
-/// accepted — so a rejection of one means it went stale. Without one, there
-/// is nothing to forget, and the rejection is a trust-auth guess turning out
-/// wrong.
-#[must_use = "the verdict decides whether the stored password is deleted"]
+/// accepted. Without one, there is nothing to forget, and the rejection is a
+/// trust-auth guess turning out wrong.
+#[must_use = "the verdict decides whether the remembered password is dropped"]
 pub(super) fn password_retry(err: &DbError, had_password: bool) -> Option<PasswordRetry> {
     if !err.credentials_rejected() {
         return None;
     }
     Some(if had_password {
-        PasswordRetry::ForgetStoredAndPrompt
+        PasswordRetry::ForgetSessionAndPrompt
     } else {
         PasswordRetry::Prompt
     })
@@ -299,6 +308,45 @@ fn remembered_credential(remembered: Option<&str>) -> (ServerCredential<'_>, boo
     };
     let offered = matches!(credential, ServerCredential::Password(_));
     (credential, offered)
+}
+
+/// What a password connect that just succeeded does to the keyring entry for
+/// its locator. See [`stored_password_after_connect`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StoredPassword {
+    /// Write the password that connected.
+    Store,
+    /// Delete the stored one: a different password connected, and the user
+    /// declined to remember it.
+    Delete,
+    /// Leave the keyring as it is.
+    Keep,
+}
+
+/// Decides what a successful password connect does to the stored password.
+///
+/// `remember` is the user's answer — `None` when nobody was asked, as for a
+/// password off the command line. `stored` is what the keyring holds for the
+/// locator, `None` when it holds nothing or cannot be read.
+///
+/// A refused password is never deleted on the refusal alone (see
+/// [`password_retry`]), so this is where a stale one goes: once a *different*
+/// password has connected, the stored one is demonstrably not the current
+/// one. Ticked, the new one replaces it; unticked, it is deleted. The same
+/// password connecting again leaves it, and so does a cancelled prompt, which
+/// never gets here. Without an answer nothing changes, because deleting a
+/// stored password is a decision the "remember" box takes.
+#[must_use = "the verdict decides whether the keyring entry is written or deleted"]
+pub(super) fn stored_password_after_connect(
+    remember: Option<bool>,
+    stored: Option<&str>,
+    connected: &str,
+) -> StoredPassword {
+    match remember {
+        Some(true) => StoredPassword::Store,
+        Some(false) if stored.is_some_and(|stored| stored != connected) => StoredPassword::Delete,
+        _ => StoredPassword::Keep,
+    }
 }
 
 /// A secret to hand a server backend at connect time. Which variant a connect
@@ -961,16 +1009,18 @@ impl AppState {
                     // instead — where every other entry is a secret a connect
                     // already accepted — makes a typo indistinguishable from a
                     // stored password that has gone stale, and
-                    // [`Self::connect_server`] answers that by *deleting* the
-                    // keyring entry for the locator. A mistyped `hubro
-                    // postgres://u:typ0@host/db` would then destroy the saved
-                    // credential of the connection it names.
+                    // [`Self::connect_server`] answers that with a prompt whose
+                    // answer can delete the keyring entry for the locator. A
+                    // mistyped `hubro postgres://u:typ0@host/db` would then
+                    // put the saved credential of the connection it names one
+                    // unticked box away from deletion.
                     //
                     // This path stores nothing until the connect succeeds, and
-                    // never forgets anything when it fails. `remember: false`:
+                    // never forgets anything when it fails. `remember: None`:
                     // a password that happened to be on a command line has not
-                    // been through the "remember password" decision, so it
-                    // stays out of the keyring either way.
+                    // been through the "remember password" decision, so the
+                    // keyring is left as it is either way — not written, and
+                    // a different stored password not deleted.
                     //
                     // Only for a password-authenticated connection, though:
                     // this flow saves with `ServerAuth::Password`, which for an
@@ -979,7 +1029,7 @@ impl AppState {
                     // no use for a password anyway, so it connects as saved.
                     Some(password) if matches!(auth, ServerAuth::Password) => {
                         self.connect_server_with_password(
-                            backend, url, name, password, false, tunnel,
+                            backend, url, name, password, None, tunnel,
                         )
                         .await
                     }
@@ -1056,12 +1106,13 @@ impl AppState {
         //
         // **Both sources hold only secrets a connect already accepted**, and
         // the `had_password` branch below relies on it: a rejection there is
-        // read as "the remembered password went stale" and answered by
-        // deleting it from the keyring. Anything that writes an *unvalidated*
-        // password into `session_passwords` turns a typo into the silent
-        // destruction of a saved credential, so a password the user has just
-        // supplied belongs in [`Self::connect_server_with_password`], which
-        // remembers it only once it has worked (see [`Self::open_target`]).
+        // read as "the remembered password may have gone stale" and answered
+        // with a prompt whose answer can replace or delete the keyring copy.
+        // Anything that writes an *unvalidated* password into
+        // `session_passwords` makes a typo look like a stale saved credential,
+        // so a password the user has just supplied belongs in
+        // [`Self::connect_server_with_password`], which remembers it only once
+        // it has worked (see [`Self::open_target`]).
         self.set_step(&url, ConnectStep::Credentials);
         let mut session_password = self.session_passwords.read().get(&url).cloned();
         if session_password.is_none() {
@@ -1079,14 +1130,17 @@ impl AppState {
         let result = backend
             .open(&connect_url, credential, tls_host.as_deref())
             .await;
-        // Whether to prompt, and whether to delete the remembered password
-        // first, is `password_retry`'s decision, on the structured signal the
-        // backends set from the server's error code — never on the message.
+        // Whether to prompt, and whether to drop the remembered password from
+        // session memory first, is `password_retry`'s decision, on the
+        // structured signal the backends set from the server's error code —
+        // never on the message. The keyring copy is not touched here: the
+        // code also comes back for a right password (an expired Postgres
+        // role, a SQL Server contained user naming a missing database).
         if let Err(err) = &result {
             if let Some(retry) = password_retry(err, had_password) {
                 self.release_connect(&url);
-                if retry == PasswordRetry::ForgetStoredAndPrompt {
-                    self.forget_stale_secret(url.clone(), err.to_string()).await;
+                if retry == PasswordRetry::ForgetSessionAndPrompt {
+                    self.forget_rejected_password(&url, err.to_string());
                 }
                 // live_tunnel drops here; the retry re-opens it.
                 self.password_prompt.set(Some(PasswordPrompt {
@@ -1251,16 +1305,17 @@ impl AppState {
 
     /// Completes the password prompt: connects with the entered password
     /// (through the tunnel when one is configured). On success the password
-    /// always lives in session memory; with `remember` it is also stored in
-    /// the OS keyring (silently staying session-only when no keyring is
-    /// available).
+    /// always lives in session memory, and [`stored_password_after_connect`]
+    /// decides the keyring: stored when `remember` is ticked (silently staying
+    /// session-only when no keyring is available), a different stored one
+    /// deleted when it is not, and nothing touched when nobody was asked.
     pub async fn connect_server_with_password(
         mut self,
         backend: ServerBackend,
         url: String,
         name: String,
         password: String,
-        remember: bool,
+        remember: Option<bool>,
         tunnel: Option<TunnelConfig>,
     ) {
         self.connect_error.set(None);
@@ -1288,18 +1343,30 @@ impl AppState {
             )
             .await;
         if result.is_ok() {
-            if remember {
-                // Off-thread; surface a non-fatal notice when the user asked
-                // to remember but the keyring store failed.
-                let store =
-                    crate::secrets::store_password_async(url.clone(), password.clone()).await;
-                if store.is_err() {
-                    self.connect_error.set(Some(
-                        "connected, but the password could not be stored in the system \
-                         keyring — it is remembered for this session only"
-                            .to_string(),
-                    ));
+            // An unreadable keyring reads as nothing stored, so it never
+            // licenses a delete.
+            let in_keyring = crate::secrets::get_password_async(url.clone())
+                .await
+                .ok()
+                .flatten();
+            match stored_password_after_connect(remember, in_keyring.as_deref(), &password) {
+                StoredPassword::Store => {
+                    // Off-thread; surface a non-fatal notice when the user
+                    // asked to remember but the keyring store failed.
+                    let store =
+                        crate::secrets::store_password_async(url.clone(), password.clone()).await;
+                    if store.is_err() {
+                        self.connect_error.set(Some(
+                            "connected, but the password could not be stored in the system \
+                             keyring — it is remembered for this session only"
+                                .to_string(),
+                        ));
+                    }
                 }
+                StoredPassword::Delete => {
+                    let _ = crate::secrets::delete_password_async(url.clone()).await;
+                }
+                StoredPassword::Keep => {}
             }
             self.session_passwords.write().insert(url.clone(), password);
             self.password_prompt.set(None);
@@ -1368,7 +1435,7 @@ impl AppState {
     /// Records — or withdraws — the user's "remember this SSH passphrase"
     /// choice for `url`, pending a tunnel open that accepts it. The policy
     /// itself is [`park_ssh_remember`], where a test can execute it.
-    fn set_ssh_remember(mut self, url: &str, remember: bool) {
+    pub fn set_ssh_remember(mut self, url: &str, remember: bool) {
         park_ssh_remember(&mut self.ssh_remember.write(), url, remember);
     }
 
@@ -1392,16 +1459,15 @@ impl AppState {
         }
     }
 
-    /// Drops a secret that just failed from everywhere it is remembered — this
-    /// session and the OS keyring — and surfaces `message`, so the retry prompt
-    /// starts from a clean slate instead of silently re-offering the credential
-    /// that was rejected. `key` is the connection URL for a database password,
-    /// [`ssh_secret_key`] for an SSH key passphrase.
-    async fn forget_stale_secret(mut self, key: String, message: String) {
-        // The write guard is a statement temporary: nothing is held across the
-        // keyring await below.
-        self.session_passwords.write().remove(&key);
-        let _ = crate::secrets::delete_password_async(key).await;
+    /// Drops a database password the server just refused from session memory
+    /// and surfaces `message`, so the retry prompt is not silently re-offered
+    /// the credential that was rejected.
+    ///
+    /// The keyring copy stays: the refusal code also comes back for a right
+    /// password, so only a different password connecting
+    /// ([`stored_password_after_connect`]) replaces or deletes it.
+    fn forget_rejected_password(mut self, url: &str, message: String) {
+        self.session_passwords.write().remove(url);
         self.connect_error.set(Some(message));
     }
 
@@ -1445,8 +1511,9 @@ impl AppState {
 
     /// Stores the session passphrase for `url` in the OS keyring under the
     /// `#ssh` key, surfacing a non-fatal notice when the keyring is
-    /// unavailable. Call after a successful tunneled connect.
-    pub async fn persist_ssh_passphrase(mut self, url: &str) {
+    /// unavailable. Only [`Self::open_tunnel`] calls it, once a tunnel has
+    /// accepted the passphrase and [`redeem_ssh_remember`] has said yes.
+    async fn persist_ssh_passphrase(mut self, url: &str) {
         let key = ssh_secret_key(url);
         let passphrase = self.session_passwords.read().get(&key).cloned();
         let Some(passphrase) = passphrase else {
@@ -2074,8 +2141,10 @@ mod tests {
             "the looked-up tunnel and auth must be the ones handed to the connect"
         );
         assert!(
-            body.contains("backend, url, name, password, false, tunnel,"),
-            "the password route must carry the looked-up tunnel too"
+            body.contains("backend, url, name, password, None, tunnel,"),
+            "the password route must carry the looked-up tunnel too, and no \
+             \"remember\" answer: nobody was asked, so the keyring must be \
+             neither written nor, for a different stored password, deleted"
         );
         assert!(
             body.contains("matches!(auth, ServerAuth::Password)"),
@@ -2089,11 +2158,12 @@ mod tests {
     fn a_command_line_password_never_enters_session_memory() {
         // `session_passwords` holds secrets a connect has *accepted*, and
         // `connect_server` acts on that: when a password read from there (or
-        // from the keyring) is rejected, it concludes the stored secret went
-        // stale and deletes the keyring entry for that locator. Writing an
-        // unvalidated password there therefore turns a typo into the silent
-        // destruction of a saved credential — `hubro postgres://u:typ0@host/db`
-        // wiping the password of the saved connection with the same URL.
+        // from the keyring) is rejected, it concludes the stored secret may
+        // have gone stale and prompts, and a different password connecting
+        // through that prompt deletes or replaces the keyring entry. Writing
+        // an unvalidated password there therefore makes a typo look like a
+        // stale saved credential — `hubro postgres://u:typ0@host/db` costing
+        // the saved connection with the same URL its password.
         //
         // The fix is a routing decision, and this checks that decision at its
         // source: the failure itself needs a live server, a keyring and a
@@ -2262,6 +2332,23 @@ mod tests {
             "a second, ungated write would store the passphrase whatever the \
              user chose, leaving the gate above inert"
         );
+        // Nor anywhere else: the connection form used to call it directly,
+        // gated on its own box, beside whatever answer an earlier prompt had
+        // left parked — which the tunnel open then redeemed against the form's
+        // passphrase. Code only, so prose naming the old call does not count.
+        for (file, source, calls) in [
+            ("connect.rs", include_str!("connect.rs"), 2),
+            ("connections.rs", include_str!("../connections.rs"), 0),
+        ] {
+            assert_eq!(
+                code_of(&shipped(source))
+                    .matches("persist_ssh_passphrase(")
+                    .count(),
+                calls,
+                "{file} defines or calls persist_ssh_passphrase somewhere besides \
+                 its definition and open_tunnel's gate"
+            );
+        }
     }
 
     /// The code of a function with its comment lines removed — the prose
@@ -2314,10 +2401,13 @@ mod tests {
         // argument resting on it was documented. Adding another per-function
         // sweep would invite the seventh.
         //
-        // The wire, in order: the card's checkbox → its submit → the state
-        // layer parks the answer → `open_tunnel` withdraws or redeems it →
-        // the prompt carries it back → the card. Plus the two gates the edit
-        // paths hang on, which decide whether any of it runs at all.
+        // The wire, in order: the card's checkbox — or the connection form's —
+        // → its submit → the state layer parks the answer → `open_tunnel`
+        // withdraws or redeems it → the prompt carries it back → the card.
+        // Plus the two gates the edit paths hang on, which decide whether any
+        // of it runs at all, and the database password's own answer, which
+        // the same card and form hand to `connect_server_with_password` to
+        // decide whether the stored password is written or deleted.
         //
         // What an inversion costs, so the list is not a mystery to whoever
         // trips it:
@@ -2343,11 +2433,21 @@ mod tests {
         ];
         let source = include_str!("connect.rs");
         let card = include_str!("../connections.rs");
+        let form = method_body(card, "fn submit_server_form(");
         let hops = [
             ("the card", method_body(card, "fn PasswordPromptCard(")),
+            ("the form's submit", form.clone()),
+            (
+                "the form's answer",
+                method_body(card, "fn form_ssh_remember("),
+            ),
             (
                 "the prompt's completion",
                 method_body(source, "pub async fn connect_server_with_ssh_passphrase("),
+            ),
+            (
+                "the password connect",
+                method_body(source, "pub async fn connect_server_with_password("),
             ),
             ("open_tunnel", open_tunnel_body()),
             ("update_saved", method_body(source, "pub fn update_saved(")),
@@ -2380,6 +2480,20 @@ mod tests {
                 code.contains(binding),
                 "`{binding}…` is gone, so a verdict is decided by something \
                  other than its policy: {code}"
+            );
+        }
+        // The form parks what its box says — unless the box was hidden — and
+        // hands the database password the same answer.
+        let form = collapsed(&code_of(&form));
+        for binding in [
+            "let remember_choice = *form.remember.peek();",
+            "state.set_ssh_remember(&url, form_ssh_remember(remember_choice, &auth));",
+            "entered_password, Some(remember_choice), tunnel.clone(),",
+        ] {
+            assert!(
+                form.contains(binding),
+                "the connection form no longer has `{binding}`, so the answer its \
+                 box gives is not the one parked or acted on: {form}"
             );
         }
         assert!(
@@ -2561,8 +2675,9 @@ mod tests {
         // connect files its validated password under the NEW locator. Carrying
         // the old value over the top of it would replace a secret the server
         // accepted with one it never saw — and the next connect reads a
-        // session hit as good, fails, and `forget_stale_secret` deletes the
-        // keyring copy, so a stored secret is lost to one nobody validated.
+        // session hit as good, fails, and prompts as if the keyring copy had
+        // gone stale, so a stored secret is put at risk by one nobody
+        // validated.
         //
         // `migrate_secret` gives the keyring copy the same precedence, in so
         // many words, so this is also the two stores agreeing rather than
@@ -2936,10 +3051,9 @@ mod tests {
         // were indistinguishable and both deleted the stored secret.
         let body = open_tunnel_body();
         assert!(
-            !body.contains("forget_stale_secret"),
-            "open_tunnel is deleting the keyring entry unconditionally again, \
-             but `stash_ssh_passphrase` puts the user's *unvalidated* typing \
-             in session memory, so one typo destroys the saved passphrase"
+            !body.contains("forget_rejected_password"),
+            "open_tunnel is answering a passphrase rejection with the database \
+             password's path, which ignores where the passphrase came from"
         );
         assert!(
             body.contains("forget_failed_ssh_passphrase("),
@@ -3296,7 +3410,7 @@ mod tests {
                 let rejected = matches!(err, DbError::CredentialsRejected(_));
                 assert_eq!(
                     password_retry(&err, true),
-                    rejected.then_some(PasswordRetry::ForgetStoredAndPrompt),
+                    rejected.then_some(PasswordRetry::ForgetSessionAndPrompt),
                     "{err:?} with a remembered password"
                 );
                 // Nothing remembered, nothing to forget — but the prompt is
@@ -3468,15 +3582,20 @@ mod tests {
     }
 
     #[test]
-    fn the_credentials_rejected_signal_survives_every_hop_to_the_keyring_delete() {
-        // Each hop between the server's error code and the keyring delete was
-        // a place the decision could be remade on text, or the signal lost.
+    fn the_credentials_rejected_signal_survives_every_hop_to_the_keyring() {
+        // Each hop between the server's error code and the keyring was a
+        // place the decision could be remade on text, or the signal lost. The
+        // refusal itself only prompts and forgets session memory; the keyring
+        // copy is replaced or deleted once a different password has connected.
         // The engine suites execute the first hops against real servers
         // (`*_only_a_refused_password_is_a_credential_rejection`), as does
         // `real_server_failures_reach_the_decision_intact` below through
-        // `ServerBackend::open`; the decision and the credential pairing are
-        // executed above. What is left needs a keyring and a Dioxus runtime to
-        // run, so it is read — pinned as written, not as "mentions".
+        // `ServerBackend::open`, and
+        // `a_stored_password_survives_a_refusal_until_a_different_one_connects`
+        // runs the whole path against Postgres; the decisions and the credential
+        // pairing are executed above. The rest is read as well — pinned as
+        // written, not as "mentions" — because the engine test skips without
+        // a server.
         let sources = all_sources();
         let file = |rel: &str| {
             let (_, text) = sources
@@ -3602,7 +3721,7 @@ mod tests {
                 body,
                 "{open} changed. If the change is deliberate and still returns the \
                  driver's DbError untouched, update the pin in \
-                 the_credentials_rejected_signal_survives_every_hop_to_the_keyring_delete"
+                 the_credentials_rejected_signal_survives_every_hop_to_the_keyring"
             );
         }
 
@@ -3621,18 +3740,18 @@ mod tests {
             "ServerBackend::open changed — it may be remapping the error. If the \
              change is deliberate and still returns the driver's DbError untouched, \
              update the pin in \
-             the_credentials_rejected_signal_survives_every_hop_to_the_keyring_delete"
+             the_credentials_rejected_signal_survives_every_hop_to_the_keyring"
         );
 
         // 4. `connect_server`: the decision's inputs and its consequence, in
         //    order, from the reads to the delete. The password is read under
         //    the connection's own key — session memory, then the keyring —
         //    the credential and the flag come from one call, the open gets
-        //    that credential, the verdict gets that flag, and the delete gets
-        //    the key the password was read under. Read key and delete key
+        //    that credential, the verdict gets that flag, and the forget gets
+        //    the key the password was read under. Read key and forget key
         //    are both `url`, which nothing in the method rebinds: read under
         //    another key (the SSH passphrase's, say) and a refusal of that
-        //    secret would delete the database password.
+        //    secret would forget the database password.
         let connect = method_body(&source, "pub async fn connect_server(");
         let mut from = 0;
         for step in [
@@ -3643,8 +3762,8 @@ mod tests {
             ".open(&connect_url, credential, tls_host.as_deref())",
             "if let Err(err) = &result {",
             "if let Some(retry) = password_retry(err, had_password) {",
-            "if retry == PasswordRetry::ForgetStoredAndPrompt {",
-            "self.forget_stale_secret(url.clone(), err.to_string()).await;",
+            "if retry == PasswordRetry::ForgetSessionAndPrompt {",
+            "self.forget_rejected_password(&url, err.to_string());",
         ] {
             let at = connect[from..].find(step).unwrap_or_else(|| {
                 panic!("connect_server no longer has, after the previous step: `{step}`")
@@ -3654,7 +3773,7 @@ mod tests {
         assert!(
             !rebinds(&connect, "url"),
             "connect_server rebinds `url`, so the key the password is read under \
-             and the key it is deleted under may no longer be the same"
+             and the key it is forgotten under may no longer be the same"
         );
         for read in ["session_passwords.read()", "get_password_async("] {
             assert_eq!(
@@ -3678,7 +3797,7 @@ mod tests {
                 uses,
                 "`{ident}` is bound or used somewhere new in connect_server. If the \
                  new use is deliberate and does not rebind or remap it, raise the \
-                 count in the_credentials_rejected_signal_survives_every_hop_to_the_keyring_delete"
+                 count in the_credentials_rejected_signal_survives_every_hop_to_the_keyring"
             );
         }
         assert!(
@@ -3687,8 +3806,11 @@ mod tests {
         );
 
         // 5. The verdict reaches the gate unaltered — no `let retry = …`, no
-        //    `retry = …` — the delete sits inside the gate, and nothing else in
-        //    connect_server deletes, forgets or writes session memory.
+        //    `retry = …` — the forget sits inside the gate, and nothing else in
+        //    connect_server forgets or writes session memory. Nothing in it
+        //    touches the keyring's copy at all, gate included: the refusal
+        //    code also comes back for a right password, so a refusal alone
+        //    never costs the stored one.
         let verdict = method_body(&connect, "if let Some(retry) = password_retry(");
         assert_eq!(
             ident_count(&verdict, "retry"),
@@ -3698,30 +3820,33 @@ mod tests {
         );
         let gate = method_body(
             &verdict,
-            "if retry == PasswordRetry::ForgetStoredAndPrompt {",
+            "if retry == PasswordRetry::ForgetSessionAndPrompt {",
         );
         assert_eq!(
             gate,
-            "if retry == PasswordRetry::ForgetStoredAndPrompt { \
-             self.forget_stale_secret(url.clone(), err.to_string()).await; }",
-            "the gate holds something other than the one delete. If the change is \
-             deliberate and still deletes only under `url`, update the pin"
+            "if retry == PasswordRetry::ForgetSessionAndPrompt { \
+             self.forget_rejected_password(&url, err.to_string()); }",
+            "the gate holds something other than the one session forget. If the \
+             change is deliberate and still forgets only under `url`, update the pin"
         );
         let outside_gate = connect.replacen(&gate, "", 1);
-        for delete in [
-            "forget_stale_secret",
-            "delete_password_async",
-            "session_passwords.write()",
-        ] {
+        for forget in ["forget_rejected_password", "session_passwords.write()"] {
             assert!(
-                !outside_gate.contains(delete),
-                "connect_server reaches `{delete}` outside the gate"
+                !outside_gate.contains(forget),
+                "connect_server reaches `{forget}` outside the gate"
+            );
+        }
+        for keyring in ["delete_password_async", "store_password_async"] {
+            assert!(
+                !connect.contains(keyring),
+                "connect_server writes the keyring (`{keyring}`) — a refused \
+                 password is a reason to prompt, not proof the stored one is wrong"
             );
         }
         assert_eq!(
-            source.matches("forget_stale_secret(").count(),
+            source.matches("forget_rejected_password(").count(),
             2,
-            "forget_stale_secret has a caller besides connect_server's gate"
+            "forget_rejected_password has a caller besides connect_server's gate"
         );
         assert!(
             verdict.contains("PromptKind::DbPassword"),
@@ -3733,11 +3858,70 @@ mod tests {
             "a second database-password prompt is a second, undecided path"
         );
 
-        // 6. `forget_stale_secret` is the delete — from session memory and the
-        //    keyring both, under the key it was handed.
-        let forget = method_body(&source, "async fn forget_stale_secret(");
-        assert!(forget.contains("self.session_passwords.write().remove(&key);"));
-        assert!(forget.contains("crate::secrets::delete_password_async(key).await;"));
+        // 6. `forget_rejected_password` forgets session memory only, under the
+        //    key it was handed — as written, so a keyring delete cannot be
+        //    added back inside it.
+        assert_eq!(
+            method_body(&source, "fn forget_rejected_password("),
+            "fn forget_rejected_password(mut self, url: &str, message: String) { \
+             self.session_passwords.write().remove(url); \
+             self.connect_error.set(Some(message)); }",
+            "forget_rejected_password does more than drop the session copy"
+        );
+
+        // 6b. Where the stored password *is* replaced or deleted: once the
+        //     prompt's password has connected, under the same `url`, decided by
+        //     `stored_password_after_connect` on the answer, the stored value
+        //     and the password that connected — each as written, in order, and
+        //     inside the success gate. The decision itself is executed by
+        //     `a_stored_password_survives_until_a_different_one_connects`.
+        let with_password = method_body(&source, "pub async fn connect_server_with_password(");
+        let success = method_body(&with_password, "if result.is_ok() {");
+        let mut from = 0;
+        for step in [
+            "let in_keyring = crate::secrets::get_password_async(url.clone()) .await .ok() .flatten();",
+            "match stored_password_after_connect(remember, in_keyring.as_deref(), &password) {",
+            "StoredPassword::Store => {",
+            "crate::secrets::store_password_async(url.clone(), password.clone()).await;",
+            "StoredPassword::Delete => { \
+             let _ = crate::secrets::delete_password_async(url.clone()).await; }",
+            "StoredPassword::Keep => {}",
+            "self.session_passwords.write().insert(url.clone(), password);",
+        ] {
+            let at = success[from..].find(step).unwrap_or_else(|| {
+                panic!(
+                    "connect_server_with_password's success branch no longer has, after \
+                     the previous step: `{step}`\n{success}"
+                )
+            });
+            from += at + step.len();
+        }
+        for (keyring, count) in [
+            ("get_password_async", 1),
+            ("store_password_async", 1),
+            ("delete_password_async", 1),
+        ] {
+            assert_eq!(
+                with_password.matches(keyring).count(),
+                count,
+                "connect_server_with_password reaches `{keyring}` outside its decision"
+            );
+        }
+        assert!(
+            !rebinds(&with_password, "url") && !rebinds(&with_password, "remember"),
+            "connect_server_with_password rebinds `url` or `remember`, so the \
+             keyring may be decided on another answer or written under another key"
+        );
+        // `password` counts the word in the store-failure notice too.
+        for (ident, uses) in [("in_keyring", 2), ("password", 6), ("remember", 2)] {
+            assert_eq!(
+                ident_count(&with_password, ident),
+                uses,
+                "`{ident}` is bound or used somewhere new in \
+                 connect_server_with_password. If the new use is deliberate and does \
+                 not rebind it, change the count:\n{with_password}"
+            );
+        }
 
         // 7. And no code in the UI decides on the words: no string literal in
         //    any shipped file under src/ui names a login or password failure.
@@ -3800,7 +3984,7 @@ mod tests {
             };
             assert_eq!(
                 retry_after(backend, &url, Some("definitely-wrong")).await,
-                Some(PasswordRetry::ForgetStoredAndPrompt),
+                Some(PasswordRetry::ForgetSessionAndPrompt),
                 "{var}: a refused password must be forgotten and re-asked"
             );
             let missing = with_db(&url, "hubro_no_such_database");
@@ -3819,6 +4003,218 @@ mod tests {
                 "{var}: a server that wants a password must still be asked for one"
             );
         }
+    }
+
+    #[test]
+    fn a_stored_password_survives_until_a_different_one_connects() {
+        // The server's refusal code also comes back for a right password — an
+        // expired Postgres role, a SQL Server contained user naming a missing
+        // database — so a refusal no longer deletes the stored password. This
+        // is the decision that does instead, once the prompt's password has
+        // connected. Both polarities lose something: deleting too eagerly
+        // costs a working credential, too rarely keeps re-offering a dead one.
+        use StoredPassword::{Delete, Keep, Store};
+        for (remember, stored, expected, why) in [
+            (
+                Some(true),
+                Some("old"),
+                Store,
+                "ticked: the new password replaces the stored one",
+            ),
+            (
+                Some(true),
+                None,
+                Store,
+                "ticked with nothing stored: the new one is stored",
+            ),
+            (
+                Some(true),
+                Some("new"),
+                Store,
+                "ticked: rewriting the same value is harmless",
+            ),
+            (
+                Some(false),
+                Some("old"),
+                Delete,
+                "unticked: a different password connected, so the stored one is stale \
+                 and the user declined to keep any",
+            ),
+            (
+                Some(false),
+                Some("new"),
+                Keep,
+                "unticked, but the stored password is the one that just connected",
+            ),
+            (
+                Some(false),
+                None,
+                Keep,
+                "unticked with nothing stored: nothing to delete",
+            ),
+            (
+                None,
+                Some("old"),
+                Keep,
+                "nobody was asked: the keyring is not touched",
+            ),
+            (None, None, Keep, "nobody was asked and nothing is stored"),
+        ] {
+            assert_eq!(
+                stored_password_after_connect(remember, stored, "new"),
+                expected,
+                "{why}"
+            );
+        }
+    }
+
+    /// Runs `connect` on `dom`'s root, driving the dom until it finishes.
+    async fn drive(
+        dom: &mut dioxus::core::VirtualDom,
+        connect: impl std::future::Future<Output = ()> + 'static,
+    ) {
+        let (finished, mut done) = tokio::sync::oneshot::channel::<()>();
+        dom.in_runtime(|| {
+            spawn_forever(async move {
+                connect.await;
+                let _ = finished.send(());
+            });
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while done.try_recv().is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the connect never finished"
+            );
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), dom.wait_for_work())
+                .await;
+            dom.render_immediate(&mut dioxus::core::NoOpMutations);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stored_password_survives_a_refusal_until_a_different_one_connects() {
+        // The whole path, on a real server and the mock keyring: a role whose
+        // `VALID UNTIL` has passed is refused with `28P01` for its *right*
+        // password, which used to delete it from the keyring.
+        use dioxus::core::VirtualDom;
+
+        use crate::ui::test_dom::provide_state;
+
+        let Ok(admin) = std::env::var("HUBRO_PG_TEST_URL") else {
+            return;
+        };
+        let _keyring = crate::secrets::tests::mock_keyring();
+        let mut admin = url::Url::parse(&admin).unwrap();
+        admin.set_path("/postgres");
+        let mut url = admin.clone();
+        url.set_username("hubro_expired_login").unwrap();
+        url.set_password(None).unwrap();
+        let url = url.to_string();
+        let pool = sqlx::PgPool::connect(admin.as_str()).await.unwrap();
+        for sql in [
+            "DROP ROLE IF EXISTS hubro_expired_login",
+            "CREATE ROLE hubro_expired_login LOGIN PASSWORD 'stored' VALID UNTIL '2000-01-01'",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
+        let keyring = || crate::secrets::get_password(&url).unwrap();
+
+        fn empty() -> Element {
+            rsx! {}
+        }
+        let mut dom = VirtualDom::new(empty);
+        let state = provide_state(&dom);
+        dom.rebuild_in_place();
+        // `None` connects as a saved connection does; `Some` as the prompt.
+        let connect = |password: Option<(&str, bool)>| {
+            let (url, password) = (url.clone(), password.map(|(p, r)| (p.to_string(), r)));
+            let backend = ServerBackend::POSTGRES;
+            let name = "expired".to_string();
+            async move {
+                match password {
+                    None => {
+                        state
+                            .connect_server(backend, url, name, None, ServerAuth::Password)
+                            .await
+                    }
+                    Some((password, remember)) => {
+                        state
+                            .connect_server_with_password(
+                                backend,
+                                url,
+                                name,
+                                password,
+                                Some(remember),
+                                None,
+                            )
+                            .await
+                    }
+                }
+            }
+        };
+        let open_id = |dom: &VirtualDom| {
+            dom.in_runtime(|| {
+                state
+                    .open_locators
+                    .peek()
+                    .iter()
+                    .find(|(_, l)| *l == url)
+                    .map(|(id, _)| *id)
+            })
+        };
+
+        // The stored password is refused: prompted for, gone from session
+        // memory, still in the keyring.
+        crate::secrets::store_password(&url, "stored").unwrap();
+        drive(&mut dom, connect(None)).await;
+        let (prompted, in_session) = dom.in_runtime(|| {
+            (
+                state.password_prompt.peek().is_some(),
+                state.session_passwords.peek().contains_key(&url),
+            )
+        });
+        assert!(prompted, "a refused stored password must raise the prompt");
+        assert!(!in_session);
+        assert_eq!(
+            keyring().as_deref(),
+            Some("stored"),
+            "the refusal deleted it"
+        );
+
+        // The role is renewed. The stored password, retyped unticked, now
+        // connects — but it is the same password, so it stays.
+        sqlx::query("ALTER ROLE hubro_expired_login PASSWORD 'stored' VALID UNTIL 'infinity'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        drive(&mut dom, connect(Some(("stored", false)))).await;
+        let id = open_id(&dom).expect("the renewed role must connect");
+        assert_eq!(keyring().as_deref(), Some("stored"));
+        dom.in_runtime(|| state.close_connection(id));
+
+        // A different password, unticked: the stale stored one is deleted.
+        sqlx::query("ALTER ROLE hubro_expired_login PASSWORD 'replacement'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        drive(&mut dom, connect(Some(("replacement", false)))).await;
+        let id = open_id(&dom).expect("the new password must connect");
+        assert_eq!(keyring(), None, "a different password connected unticked");
+        dom.in_runtime(|| state.close_connection(id));
+
+        // A different password, ticked: it replaces the stored one.
+        crate::secrets::store_password(&url, "stored").unwrap();
+        drive(&mut dom, connect(Some(("replacement", true)))).await;
+        let id = open_id(&dom).expect("the new password must connect");
+        assert_eq!(keyring().as_deref(), Some("replacement"));
+        dom.in_runtime(|| state.close_connection(id));
+
+        crate::secrets::delete_password(&url).unwrap();
+        sqlx::query("DROP ROLE hubro_expired_login")
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
