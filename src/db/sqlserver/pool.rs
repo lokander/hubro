@@ -381,6 +381,10 @@ mod pooled {
         /// drains it first), and an edit batch cancelled between `BEGIN TRAN` and
         /// `COMMIT` would hand its open transaction to the next borrower, whose
         /// own commit then only lowered `@@TRANCOUNT`.
+        ///
+        /// Closing the socket does not stop the batch server-side: tiberius
+        /// sends no Attention, and SQL Server only notices on its next write,
+        /// so cancelled work runs on and keeps its locks until its batch ends.
         pub(super) async fn request<T>(&mut self, f: impl AsyncFnOnce(&mut TdsClient) -> T) -> T {
             let mut client = self.client.take().expect("connection already discarded");
             let out = f(&mut client).await;
