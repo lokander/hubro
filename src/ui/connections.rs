@@ -1222,7 +1222,7 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
                             prompt.url,
                             prompt.name,
                             entered,
-                            remember_choice,
+                            Some(remember_choice),
                             prompt.tunnel,
                         )
                         .await;
@@ -1405,8 +1405,8 @@ struct ServerFormState {
 /// The submit pipeline both connection forms run: validate the
 /// tunnel fields, take the SSH passphrase and any password embedded in a
 /// pasted URL, settle the display name and auth mode, register the pending
-/// edit, carry a moved secret across, then dispatch the connect and close (and
-/// persist) only if it worked.
+/// edit, carry a moved secret across, then dispatch the connect and close only
+/// if it worked.
 ///
 /// `built` is the URL the calling form's own fields produced — `Ok` or the
 /// error to show. It is computed by the caller because that is the step the
@@ -1514,9 +1514,13 @@ fn submit_server_form(
             }
         }
         // An entered passphrase seeds session memory so the tunnel open finds
-        // it, exactly as if it came from the prompt.
+        // it, and parks its "remember" answer for that open to redeem once it
+        // accepts the passphrase, exactly as if both came from the prompt.
+        // Parked set *or cleared*: an answer left by an earlier, abandoned
+        // prompt would otherwise be redeemed against this passphrase.
         if let Some(passphrase) = &entered_passphrase {
             state.stash_ssh_passphrase(&url, passphrase.clone());
+            state.set_ssh_remember(&url, form_ssh_remember(remember_choice, &auth));
         }
         if matches!(auth, ServerAuth::Entra(_)) {
             // Entra: the connect either succeeds silently (and the flow saves
@@ -1567,23 +1571,26 @@ fn submit_server_form(
                     url.clone(),
                     display_name.clone(),
                     entered_password,
-                    remember_choice,
+                    Some(remember_choice),
                     tunnel.clone(),
                 )
                 .await;
         }
-        // The connect flow saves on success (`save_server_if_open`), which is
-        // why nothing is saved here; only close the form when the connection
-        // worked. Closing comes first for the reason above:
-        // `persist_ssh_passphrase` awaits, and by the time it returns the
-        // connections screen that owns `on_done` is gone.
+        // The connect flow saves on success (`save_server_if_open`), and the
+        // tunnel open stores the passphrase, which is why neither happens
+        // here; only close the form when the connection worked.
         if state.open_locators.peek().iter().any(|(_, l)| *l == url) {
             close_form(&state, &on_done);
-            if remember_choice && entered_passphrase.is_some() {
-                state.persist_ssh_passphrase(&url).await;
-            }
         }
     });
+}
+
+/// The "remember" answer the connection form parks for a passphrase typed
+/// into it. The form has one box, and it is shown only for password auth, so
+/// under Entra the user has seen no question: that is a "no", never the
+/// hidden box's default "yes".
+fn form_ssh_remember(remember: bool, auth: &ServerAuth) -> bool {
+    remember && matches!(auth, ServerAuth::Password)
 }
 
 /// The password pasted inside a URL, when the form is in paste mode. Used for
@@ -2183,6 +2190,12 @@ mod tests {
              answer the user gave is not the one that reaches the keyring \
              decision: {body}"
         );
+        // ...and hands it on as an answer. `None` means "nobody was asked",
+        // which leaves a stale stored password in place whatever the box said.
+        assert!(
+            body.contains("Some(remember_choice),"),
+            "the card no longer hands the database password its answer: {body}"
+        );
         // And the third place the same value passes through: what the rendered
         // box displays. Rendering is not testable without a runtime, but the
         // *binding* is text like the other two, and `checked: !remember()`
@@ -2195,6 +2208,18 @@ mod tests {
              so the box the user sees and the answer the card submits can \
              disagree: {rendered}"
         );
+    }
+
+    #[test]
+    fn the_form_parks_its_box_for_the_passphrase_only_where_it_shows_it() {
+        // The form's one "remember" box is rendered only for password auth.
+        // Under Entra it is hidden but keeps its default tick, so reading it
+        // there would store a passphrase the user was never asked about.
+        let entra = ServerAuth::Entra(crate::azure::EntraAuth::ManagedIdentity { client_id: None });
+        assert!(form_ssh_remember(true, &ServerAuth::Password));
+        assert!(!form_ssh_remember(false, &ServerAuth::Password));
+        assert!(!form_ssh_remember(true, &entra));
+        assert!(!form_ssh_remember(false, &entra));
     }
 
     #[test]
