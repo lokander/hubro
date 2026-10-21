@@ -397,6 +397,11 @@ fn word_at(sql: &str, at: usize, end: usize, dialect: Dialect) -> Option<(usize,
                 .find(|&i| sql.is_char_boundary(i))
                 .unwrap_or(0);
             unicode_space_len(sql, start, dialect) == 0
+        } else if dialect == Dialect::SqlServer && b.is_ascii_digit() {
+            // T-SQL ends a number at the first letter: `1BEGIN` is `1`,
+            // then BEGIN (see `strip_strings_and_comments`). A digit inside
+            // a name never gets here: the name's word swallowed it.
+            false
         } else {
             is_word_byte(b) && !matches!(b, b'@' | b'#' | b'$')
         }
@@ -405,6 +410,8 @@ fn word_at(sql: &str, at: usize, end: usize, dialect: Dialect) -> Option<(usize,
         return None;
     }
     let mut j = at + 1;
+    // A word runs on through digits and letters alike: an identifier such as
+    // `a1begin` is one name to T-SQL too.
     while j < end && is_word_byte(bytes[j]) && unicode_space_len(sql, j, dialect) == 0 {
         j += 1;
     }
@@ -882,6 +889,15 @@ pub struct StatementNeeds {
 /// statement that is transaction control *and nothing else* needs nothing
 /// ([`is_bare_transaction_control`]). That list says exactly which forms
 /// are still not caught.
+///
+/// **This gate is not airtight, and cannot be shown to be.** It is a keyword
+/// scan over a hand-written lexer that tries to match each engine's own
+/// tokenizer ([`region_at`]), and every place the two disagree is a
+/// statement the scan cannot see — several such places were found by
+/// measuring and are now matched, and nothing proves there are no more. It
+/// is the first line: it explains a refusal before anything runs. Enforcing
+/// read-only at the connection itself is the backstop that does not depend
+/// on lexing.
 pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
     // Stripped once here; every scan below works on the stripped form.
     // Each helper used to re-strip the same statement, up to ~6
@@ -1123,18 +1139,37 @@ fn has_word(stripped: &str, matches: impl Fn(&str) -> bool) -> bool {
 /// out to spaces, so token scans can't be fooled by literals like `'please do
 /// not DELETE me'`, a quote inside a bracketed identifier can't invert string
 /// tracking, and a keyword inside one can't masquerade as a token.
+///
+/// On SQL Server a space is also put between a digit and a letter (or `_`)
+/// straight after it, so word scans see the token boundary the engine sees:
+/// T-SQL ends a number at the first letter, so measured on SQL Server 2022,
+/// `SELECT 1DELETE FROM t`, `.5DELETE`, `1e+1DELETE`, `$1DELETE`,
+/// `€1DELETE` and `0x1UPDATE t SET …` each run the write. Postgres and
+/// SQLite reject a letter after a number ("trailing junk" / "unrecognized
+/// token"), so they keep the text as is. An identifier with a keyword after
+/// a digit (`tbl1delete`) is then over-charged — the safe side.
 fn strip_strings_and_comments(sql: &str, dialect: Dialect) -> String {
     let bytes = sql.as_bytes();
-    let mut out = vec![b' '; bytes.len()];
+    let mut out = Vec::with_capacity(bytes.len());
     for (range, kind) in lex_regions(sql, dialect) {
-        if kind == RegionKind::Code {
-            out[range.clone()].copy_from_slice(&bytes[range]);
+        if kind != RegionKind::Code {
+            out.resize(out.len() + range.len(), b' ');
+            continue;
+        }
+        for &byte in &bytes[range] {
+            if dialect == Dialect::SqlServer
+                && (byte.is_ascii_alphabetic() || byte == b'_')
+                && out.last().is_some_and(u8::is_ascii_digit)
+            {
+                out.push(b' ');
+            }
+            out.push(byte);
         }
     }
     // Multibyte chars survive intact: regions always start and end at ASCII
     // delimiters (a UTF-8 continuation byte can never equal an ASCII
     // quote/comment marker), so a code region copied here is never split
-    // mid-sequence.
+    // mid-sequence, and a space is only ever put before an ASCII byte.
     String::from_utf8_lossy(&out).into_owned()
 }
 
@@ -1328,6 +1363,10 @@ fn rollback_cover(caps: Capabilities, dialect: Dialect, ran: &[String]) -> Rollb
     }
 }
 
+/// Why a script holding a NUL character is refused — see [`script_refusal`].
+pub const NUL_IN_SCRIPT: &str =
+    "This script contains a NUL character, which can't be sent to the database.";
+
 /// The first statement of `statements` that `caps` doesn't permit: its index
 /// and the sentence explaining the refusal, or `None` when the whole script
 /// may run.
@@ -1341,6 +1380,13 @@ pub fn script_refusal(
     statements: &[String],
     dialect: Dialect,
 ) -> Option<(usize, &'static str)> {
+    // Before anything else, and whatever the capabilities: measured,
+    // sqlx-sqlite spins forever at full CPU on any statement holding a NUL,
+    // SQL Server runs straight past one, and Postgres fails the protocol
+    // message. Nothing a script needs is spelled with one.
+    if let Some(statement_index) = statements.iter().position(|s| s.contains('\0')) {
+        return Some((statement_index, NUL_IN_SCRIPT));
+    }
     if !caps.read_query && !statements.is_empty() {
         // Nothing reaches the connection at all, so the first statement
         // carries the refusal.
@@ -2212,6 +2258,14 @@ mod tests {
                 "WITH d AS (SELECT $é$'$é$ AS a), e AS (DELETE FROM t RETURNING 1) SELECT 1 --'",
                 MUTATE,
             ),
+            // T-SQL ends a number at the first letter (measured: each ran).
+            (Ms, "SELECT 1DELETE FROM t", MUTATE),
+            (Ms, "SELECT .5DELETE FROM t", MUTATE),
+            (Ms, "SELECT 1e+1DELETE FROM t", MUTATE),
+            (Ms, "SELECT $1DELETE FROM t", MUTATE),
+            (Ms, "SELECT €1DELETE FROM t", MUTATE),
+            (Ms, "SELECT 0x1UPDATE t SET a = 5", MUTATE),
+            (Ms, "SELECT 1BEGIN DELETE FROM t; SELECT 2; END", MUTATE),
             // Allowed: transaction control alone, and plain reads.
             (Ms, "BEGIN TRAN", NONE),
             (Ms, "BEGIN TRANSACTION", NONE),
@@ -2235,6 +2289,7 @@ mod tests {
             (Pg, "SELECT E'it''s \\' DELETE'", NONE),
             (Pg, "SELECT $q$ DELETE $q$", NONE),
             (Ms, "SELECT 1 /* /* */ DELETE FROM t */", NONE),
+            (Ms, "SELECT 0x1F, 1e5, $2.50 FROM t", NONE),
         ];
         let caps_sets = [
             ("full", Capabilities::FULL),
@@ -2283,6 +2338,18 @@ mod tests {
                     script_refusal(caps, &statements, dialect).is_some(),
                     refused,
                     "{sql:?} on {dialect:?} under {name}"
+                );
+            }
+        }
+        // A NUL is refused whatever the capabilities: measured, sqlx-sqlite
+        // spins forever on one and SQL Server runs straight past it.
+        for dialect in [Lite, Pg, Ms] {
+            let statements = split_statements("SELECT 1;\0DELETE FROM t", dialect);
+            for (name, caps) in caps_sets {
+                assert_eq!(
+                    script_refusal(caps, &statements, dialect),
+                    Some((1, NUL_IN_SCRIPT)),
+                    "{dialect:?} under {name}"
                 );
             }
         }
@@ -3213,6 +3280,12 @@ mod tests {
             );
         }
         assert_eq!(regions("--c\rx", Lite), [("--c\rx", Comment)]);
+        // Unicode line breaks end no comment, even on SQL Server (measured
+        // with U+0085, U+2028 and U+2029: `--c<char>, 2 AS b` is one column).
+        for brk in ["\u{85}", "\u{2028}", "\u{2029}"] {
+            let sql = format!("--c{brk}x");
+            assert_eq!(regions(&sql, Ms), [(sql.as_str(), Comment)], "{brk:?}");
+        }
         // Dollar quotes: Postgres only, never inside a name, any tag bytes.
         assert_eq!(
             regions("$q$;$q$ x", Pg),

@@ -586,10 +586,61 @@ async fn sqlserver_scripts_cannot_hide_a_write_from_the_gate() {
         "dbo.script_hidden",
         &[
             "SELECT 1 AS a --c\rDELETE FROM dbo.script_hidden",
+            "SELECT 1DELETE FROM dbo.script_hidden",
+            "SELECT $1DELETE FROM dbo.script_hidden",
+            "SELECT €1DELETE FROM dbo.script_hidden",
+            "SELECT .5DELETE FROM dbo.script_hidden",
             "SELECT 1 AS x$y$ DELETE FROM dbo.script_hidden SELECT 1 AS x$y$",
         ],
     )
     .await;
     pool.execute("DROP TABLE dbo.script_hidden").await.unwrap();
+    pool.close().await;
+}
+
+/// SQLite reads `$name(…)`, `:name(…)` and `@name(…)` as one variable whose
+/// parentheses hide a quote or `/*`, which this lexer does not model. It
+/// needs no modelling while sqlx-sqlite refuses every named parameter before
+/// running anything (measured: "parameters with non-integer names are not
+/// currently supported"), so these scripts delete nothing even on a fully
+/// capable connection. If a driver upgrade starts binding named parameters,
+/// this fails, and the lexer has to learn SQLite's variable token.
+#[tokio::test]
+async fn sqlite_tcl_variables_never_reach_a_later_statement() {
+    let fixture = FixtureDb::with_sql("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1)").await;
+    let pool = fixture.open().await;
+    for script in [
+        "SELECT $a('); DELETE FROM t; SELECT 'x'",
+        "SELECT :a(/*); DELETE FROM t; SELECT 1 /* */",
+        "SELECT @a('); DELETE FROM t; SELECT 'x'",
+    ] {
+        let statements = split_statements(script, pool.dialect());
+        let outcome = run_script(&pool, pool.backend_capabilities(), &statements, |_| {}).await;
+        assert!(outcome.is_err(), "{script:?} should fail before running");
+        let rows = pool.query("SELECT COUNT(*) FROM t").await.unwrap();
+        assert_eq!(rows.rows, vec![vec![Value::Integer(1)]], "{script:?}");
+    }
+    pool.close().await;
+}
+
+/// A NUL never reaches the driver: measured, sqlx-sqlite spins at full CPU
+/// forever on a statement holding one. The gate refuses it up front, on a
+/// fully capable connection too, and promptly.
+#[tokio::test]
+async fn sqlite_scripts_holding_a_nul_are_refused_not_run() {
+    let fixture = FixtureDb::with_sql("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1)").await;
+    let pool = fixture.open().await;
+    let statements = split_statements("SELECT 1;\0DELETE FROM t", pool.dialect());
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        run_script(&pool, pool.backend_capabilities(), &statements, |_| {}),
+    )
+    .await
+    .expect("a NUL must be refused, not handed to the driver");
+    let err = outcome.expect_err("a NUL must be refused");
+    assert_eq!(
+        err.error,
+        DbError::Unsupported(hubro::db::NUL_IN_SCRIPT.to_string())
+    );
     pool.close().await;
 }
