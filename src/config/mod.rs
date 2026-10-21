@@ -58,10 +58,16 @@ impl std::error::Error for ConfigError {}
 
 /// Serializes `value` to TOML and writes it to `path`, creating parent
 /// directories as needed. Writes to a temp file and renames so a crash
-/// mid-write can't corrupt the file — the one write path shared by all three
-/// domains' `save_*` functions.
+/// mid-write can't corrupt the file. Every whole-file save goes through it;
+/// settings, which are edited key by key, go through [`write_text_atomic`].
 pub(crate) fn write_toml_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), ConfigError> {
     let text = toml::to_string_pretty(value).map_err(|err| ConfigError(err.to_string()))?;
+    write_text_atomic(path, &text)
+}
+
+/// Writes already-rendered `text` to `path` the way [`write_toml_atomic`]
+/// does — parent directories created, temp file then rename.
+pub(crate) fn write_text_atomic(path: &Path, text: &str) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|err| ConfigError(format!("creating {}: {err}", parent.display())))?;
