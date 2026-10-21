@@ -142,21 +142,40 @@ fn top_level_plist_keys() -> Vec<String> {
 /// reason as the plist one: one property of one checked-in file does not repay
 /// a dependency.
 fn release_jobs() -> Vec<(String, String)> {
-    let after_jobs = RELEASE_WORKFLOW
+    jobs_of(RELEASE_WORKFLOW)
+}
+
+/// [`release_jobs`] over any workflow text, so the scanner itself can be fed
+/// the shapes it has to survive.
+///
+/// A job starts at any two-space-indented key, and the key is everything
+/// before the first colon — the reading `no_release_job_can_run_past_a_failed_dependency`
+/// already uses for `if:`. Requiring the line to *end* with the colon was the
+/// earlier rule, and it let `  publish-nightly: # no needs` fold into the
+/// previous job's body: the comment hid the new job, its missing `needs:`
+/// went unchecked, and the gate test passed with an ungated job in the file.
+fn jobs_of(workflow: &str) -> Vec<(String, String)> {
+    let after_jobs = workflow
         .split_once("\njobs:\n")
-        .expect("release.yml declares no jobs")
+        .expect("the workflow declares no jobs")
         .1;
     let mut jobs: Vec<(String, String)> = Vec::new();
     for line in after_jobs.lines() {
-        let starts_a_job = line.starts_with("  ")
+        let at_job_level = line.starts_with("  ")
             && !line.starts_with("   ")
-            && !line.trim_start().starts_with('#')
-            && line.trim_end().ends_with(':');
-        if starts_a_job {
-            jobs.push((line.trim().trim_end_matches(':').to_string(), String::new()));
-        } else if let Some((_, body)) = jobs.last_mut() {
-            body.push_str(line);
-            body.push('\n');
+            && !line.trim_start().starts_with('#');
+        let job_key = line
+            .split_once(':')
+            .filter(|_| at_job_level)
+            .map(|(key, _)| key.trim().trim_matches(|c| c == '"' || c == '\''));
+        match job_key {
+            Some(id) => jobs.push((id.to_string(), String::new())),
+            None => {
+                if let Some((_, body)) = jobs.last_mut() {
+                    body.push_str(line);
+                    body.push('\n');
+                }
+            }
         }
     }
     jobs
@@ -166,8 +185,15 @@ fn release_jobs() -> Vec<(String, String)> {
 /// `needs: a`) or block (`needs:` then `- a`) form — a reformat between the
 /// two is a reformat, not a change of meaning, and should not read as one.
 fn declared_needs(body: &str) -> Vec<String> {
-    let mut lines = body
+    // Comments are stripped first: `needs: bundle # waits for verify` names
+    // one job, and reading the comment's words as job ids would make any job
+    // that *mentions* `verify` look gated by it.
+    let without_comments: Vec<&str> = body
         .lines()
+        .map(|line| line.split_once('#').map_or(line, |(code, _)| code))
+        .collect();
+    let mut lines = without_comments
+        .into_iter()
         .skip_while(|line| !line.trim().starts_with("needs:"));
     let Some(first) = lines.next() else {
         return Vec::new();
@@ -521,6 +547,53 @@ fn no_release_job_runs_without_the_version_check_passing() {
              Cargo.toml or Info.plist would build and publish anyway"
         );
     }
+}
+
+#[test]
+fn the_job_scanner_sees_every_job_however_its_header_is_written() {
+    // The gate test above is only as good as the scanner's list of jobs: a job
+    // it never sees is a job it never checks, and the test passes. These are
+    // the header shapes YAML allows that a line-based reading can miss.
+    let workflow = "\
+on: push
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+  bundle: # gated
+    needs: verify # the version check
+  publish-nightly: # no needs
+    runs-on: ubuntu-latest
+  \"quoted\":
+    needs: [bundle]
+  'single':
+    needs: verify
+  mentions:
+    needs: bundle-old # not verify
+  bundle-old:
+    runs-on: ubuntu-latest
+";
+    let jobs = jobs_of(workflow);
+    let ids: Vec<&str> = jobs.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "verify",
+            "bundle",
+            "publish-nightly",
+            "quoted",
+            "single",
+            "mentions",
+            "bundle-old"
+        ]
+    );
+    let gated = |id: &str| needs_verify_transitively(&jobs, id);
+    assert!(gated("bundle"));
+    assert!(gated("quoted"), "gated through `bundle`");
+    assert!(gated("single"));
+    // The two that must read as ungated: the one whose header carries a
+    // comment, and the one whose `needs:` comment *names* `verify`.
+    assert!(!gated("publish-nightly"));
+    assert!(!gated("mentions"));
 }
 
 #[test]
