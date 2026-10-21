@@ -451,10 +451,11 @@ const UNREADABLE_OBJECT: &str = "SQLite can't read this object — its definitio
 /// identity already carry everything this backend knows about writability.
 /// An object it could *not* read — a virtual table whose module hubro's
 /// SQLite lacks, a view over one, a view calling an extension's function
-/// (SpatiaLite's `ST_*`, sqlean's) or naming a missing collation, a view over a
-/// table that has since been dropped — is still listed, so one such object costs the user that object
-/// rather than the whole schema tree, but as `NoRows`: opening it can only
-/// fail the same way, so the grid states why instead of running the query.
+/// (SpatiaLite's `ST_*`, sqlean's) or naming a missing collation, a view over
+/// a table that has since been dropped — is still listed, so one such object
+/// costs the user that object rather than the whole schema tree, but as
+/// `NoRows`: opening it can only fail the same way, so the grid states why
+/// instead of running the query.
 /// The DDL view still works on it, since that reads only `sqlite_master`.
 fn restriction_for(entry: &MasterEntry, columns_readable: bool) -> Option<Restriction> {
     if columns_readable {
@@ -535,11 +536,10 @@ enum ColumnReadError {
     Decode(DbError),
 }
 
-/// The objects whose columns the batched query below does not return.
-///
-/// Exactly the views and virtual tables: [`needs_resolving`] in SQL. Every
-/// table and view has at least one column, so an object missing from the
-/// batch's result is one it did not read.
+/// The rows the batched query reads: ordinary tables, i.e. `!needs_resolving`
+/// in SQL (see [`needs_resolving`]). Everything else is read one query each by
+/// [`read_each`] — every table and view has at least one column, so an object
+/// missing from the batch's result is one it did not read.
 const ORDINARY_TABLE: &str = "m.type = 'table' AND m.rootpage <> 0";
 
 /// Columns of every table and view, keyed by object name (unique per SQLite
@@ -917,10 +917,10 @@ pub async fn fetch_ddl(
 /// Two layers of `Option` because the two absences mean different things:
 /// `None` is no such object (never created, or dropped since the metadata was
 /// read — a row of another kind counts, since tables, views and indexes share
-/// one namespace), and
-/// `Some(None)` is an object whose row has a NULL `sql`, which for an index
-/// means SQLite created it itself for a constraint. Flattening them once
-/// made a dropped index show up as a reconstructed constraint index.
+/// one namespace), and `Some(None)` is an object whose row has a NULL `sql`,
+/// which for an index means SQLite created it itself for a constraint.
+/// Flattening them once made a dropped index show up as a reconstructed
+/// constraint index.
 async fn object_sql(
     pool: &SqlitePool,
     name: &str,
