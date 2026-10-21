@@ -252,3 +252,85 @@ async fn a_refresh_that_fails_for_any_other_reason_keeps_the_token() {
         assert!(acquired.token.is_err());
     }
 }
+
+/// What a real browser sends the loopback listener besides the redirect.
+#[derive(Clone, Copy, Debug)]
+enum Noise {
+    /// A speculative preconnect: opened and held, nothing sent.
+    IdlePreconnect,
+    /// A connection closed before sending a request.
+    EmptyConnection,
+    /// An unrelated request, such as the favicon fetch.
+    Favicon,
+}
+
+/// A browser that opens `noise` connections to the loopback listener before
+/// the redirect, on a connection of their own, as Chrome does.
+fn noisy_browser(noise: Noise) -> impl FnOnce(&str) -> Result<(), AzureError> {
+    move |auth_url: &str| {
+        let parsed = url::Url::parse(auth_url).unwrap();
+        let pairs: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+        let port = url::Url::parse(&pairs["redirect_uri"])
+            .unwrap()
+            .port()
+            .unwrap();
+        let state = pairs["state"].clone();
+        tokio::spawn(async move {
+            let mut first = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            match noise {
+                Noise::IdlePreconnect => {}
+                Noise::EmptyConnection => first.shutdown().await.unwrap(),
+                Noise::Favicon => first
+                    .write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .await
+                    .unwrap(),
+            }
+            // Give the listener the chance to take the noise first.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let request = format!(
+                "GET /?code=FAKE_CODE&state={state} HTTP/1.1\r\nHost: localhost\r\n\
+                 Connection: close\r\n\r\n"
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            drop(first);
+        });
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn the_redirect_is_found_among_the_browser_s_other_connections() {
+    let login = fake_server(
+        "HTTP/1.1 200 OK",
+        r#"{"access_token":"ACCESS_TOKEN","expires_in":3600,"refresh_token":"REFRESH_TOKEN"}"#,
+    )
+    .await;
+    let endpoints = Endpoints {
+        login,
+        imds: "http://127.0.0.1:1".to_string(),
+    };
+    for noise in [
+        Noise::IdlePreconnect,
+        Noise::EmptyConnection,
+        Noise::Favicon,
+    ] {
+        let acquired = acquire_token(
+            &EntraAuth::interactive_default(),
+            OSSRDBMS_RESOURCE,
+            None,
+            &endpoints,
+            Duration::from_secs(3),
+            noisy_browser(noise),
+        )
+        .await;
+        assert_eq!(
+            acquired.token.map(|token| token.secret),
+            Ok("ACCESS_TOKEN".to_string()),
+            "{noise:?} reached the listener before the redirect, and the \
+             sign-in the user completed was reported as failed"
+        );
+    }
+}
