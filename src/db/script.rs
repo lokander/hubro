@@ -1312,15 +1312,18 @@ fn explain_body(stripped: &str) -> &str {
     &stripped[i..]
 }
 
-/// Whether `sql` is written as an `EXPLAIN`. The plan view asks so
-/// it can leave such a statement alone instead of prefixing a second
-/// `EXPLAIN` onto it.
+/// Whether `sql` is written as an `EXPLAIN`, read as `dialect` reads it. The
+/// plan view asks so it can leave such a statement alone instead of
+/// prefixing a second `EXPLAIN` onto it, and the script path asks to give its
+/// output the plan cell cap ([`cell_cap`]).
 ///
-/// Lexed as SQLite: the plan view has no dialect to pass, and the answer only
-/// decides whether a prefix is added — the statement that results goes
-/// through the capability gate with its real dialect either way.
-pub fn is_explain(sql: &str) -> bool {
-    first_keyword(sql, Dialect::Sqlite).eq_ignore_ascii_case("explain")
+/// The dialect matters: Postgres and SQL Server nest block comments and
+/// SQLite does not, so `/* /* */ EXPLAIN */ SELECT …` is a `SELECT` on the
+/// first two. Read as SQLite on every engine, it was left unprefixed by the
+/// Explain button — running the `SELECT` instead of explaining it — and its
+/// rows were fetched under the plan cap rather than the display cap.
+pub fn is_explain(sql: &str, dialect: Dialect) -> bool {
+    first_keyword(sql, dialect).eq_ignore_ascii_case("explain")
 }
 
 /// Whether any word-ish token (identifier characters) of an
@@ -1700,9 +1703,11 @@ fn refuse_script(
 /// prefix of cannot be parsed or read, and [`QUERY_CELL_CAP`] for everything
 /// else — the display cap ordinary queries keep. Decided by the statement
 /// rather than by the Explain button, so a plan the user typed and ran is
-/// whole too.
-fn cell_cap(statement: &str) -> usize {
-    if is_explain(statement) {
+/// whole too — and read in the engine's own dialect, so a statement that
+/// only *looks* like an `EXPLAIN` behind a nested comment keeps the display
+/// cap ([`is_explain`]).
+fn cell_cap(statement: &str, dialect: Dialect) -> usize {
+    if is_explain(statement, dialect) {
         PLAN_CELL_CAP
     } else {
         QUERY_CELL_CAP
@@ -1720,9 +1725,14 @@ async fn run_script_sequential(
         // Reads stream through the row cap so a huge result never buffers in
         // full; writes report an affected-row count as before.
         let outcome = if classify_statement(statement, pool.dialect()).returns_rows() {
-            pool.query_capped_to(statement, &[], MAX_QUERY_ROWS, cell_cap(statement))
-                .await
-                .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated))
+            pool.query_capped_to(
+                statement,
+                &[],
+                MAX_QUERY_ROWS,
+                cell_cap(statement, pool.dialect()),
+            )
+            .await
+            .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated))
         } else {
             pool.execute(statement)
                 .await
@@ -1761,7 +1771,7 @@ async fn run_script_read_only(
     let mut outcome = Ok(());
     for (statement_index, statement) in statements.iter().enumerate() {
         let result = if classify_statement(statement, dialect).returns_rows() {
-            run.query_capped_to(statement, MAX_QUERY_ROWS, cell_cap(statement))
+            run.query_capped_to(statement, MAX_QUERY_ROWS, cell_cap(statement, dialect))
                 .await
                 .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated))
         } else {
@@ -1819,9 +1829,13 @@ async fn run_script_atomic(
     };
     for (statement_index, statement) in statements.iter().enumerate() {
         let outcome = if classify_statement(statement, pool.dialect()).returns_rows() {
-            tx.query_capped_to(statement, MAX_QUERY_ROWS, cell_cap(statement))
-                .await
-                .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated))
+            tx.query_capped_to(
+                statement,
+                MAX_QUERY_ROWS,
+                cell_cap(statement, pool.dialect()),
+            )
+            .await
+            .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated))
         } else {
             tx.execute(statement)
                 .await
@@ -3233,28 +3247,48 @@ mod tests {
             ExplainSupport::SQLITE,
         ] {
             let plan = explain_statement("SELECT * FROM t", support);
-            assert_eq!(cell_cap(&plan), PLAN_CELL_CAP, "{plan:?}");
+            assert_eq!(cell_cap(&plan, support.dialect), PLAN_CELL_CAP, "{plan:?}");
         }
-        for sql in [
-            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1",
-            "  -- a comment\nexplain select 1",
-            "(EXPLAIN SELECT 1)",
-        ] {
-            assert_eq!(cell_cap(sql), PLAN_CELL_CAP, "{sql:?}");
+        let all = [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer];
+        for dialect in all {
+            for sql in [
+                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1",
+                "  -- a comment\nexplain select 1",
+                "(EXPLAIN SELECT 1)",
+            ] {
+                assert_eq!(
+                    cell_cap(sql, dialect),
+                    PLAN_CELL_CAP,
+                    "{sql:?} on {dialect:?}"
+                );
+            }
+            // Everything else keeps the display cap, including a statement
+            // that only mentions EXPLAIN.
+            for sql in [
+                "SELECT * FROM t",
+                "WITH x AS (SELECT 1) SELECT * FROM x",
+                "SELECT 'EXPLAIN'",
+                "/* EXPLAIN */ SELECT 1",
+                "SELECT explain FROM t",
+                "PRAGMA table_info(t)",
+                "VALUES (1)",
+            ] {
+                assert_eq!(
+                    cell_cap(sql, dialect),
+                    QUERY_CELL_CAP,
+                    "{sql:?} on {dialect:?}"
+                );
+            }
         }
-        // Everything else keeps the display cap, including a statement that
-        // only mentions EXPLAIN.
-        for sql in [
-            "SELECT * FROM t",
-            "WITH x AS (SELECT 1) SELECT * FROM x",
-            "SELECT 'EXPLAIN'",
-            "/* EXPLAIN */ SELECT 1",
-            "SELECT explain FROM t",
-            "PRAGMA table_info(t)",
-            "VALUES (1)",
-        ] {
-            assert_eq!(cell_cap(sql), QUERY_CELL_CAP, "{sql:?}");
-        }
+        // Read in the engine's own dialect: Postgres and SQL Server nest
+        // block comments, so this EXPLAIN is commented out and the SELECT
+        // runs; SQLite does not, so there it is the EXPLAIN that runs.
+        // Read as SQLite everywhere, the SELECT got the plan cap (measured:
+        // a 200,000-byte cell on Postgres).
+        let nested = "/* /* */ EXPLAIN */ SELECT repeat('Z', 200000)";
+        assert_eq!(cell_cap(nested, Dialect::Postgres), QUERY_CELL_CAP);
+        assert_eq!(cell_cap(nested, Dialect::SqlServer), QUERY_CELL_CAP);
+        assert_eq!(cell_cap(nested, Dialect::Sqlite), PLAN_CELL_CAP);
     }
 
     #[test]

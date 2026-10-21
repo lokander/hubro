@@ -21,6 +21,7 @@
 
 use super::registry::PLAN_CELL_CAP;
 use super::script::is_explain;
+use super::sql::Dialect;
 use super::value::{QueryResult, Value};
 
 /// Why a connection offers no plan view. SQL Server has no `EXPLAIN`
@@ -42,6 +43,11 @@ pub struct ExplainSupport {
     /// Whether that prefix asks for PostgreSQL JSON, so the output can be
     /// parsed into a tree. `false` means "show whatever comes back".
     pub structured: bool,
+    /// The dialect the statement is read in to decide whether it already
+    /// is an `EXPLAIN`. Postgres nests block comments and SQLite does not,
+    /// so `/* /* */ EXPLAIN */ SELECT …` is an `EXPLAIN` to one and a
+    /// `SELECT` to the other.
+    pub dialect: Dialect,
 }
 
 impl ExplainSupport {
@@ -51,6 +57,7 @@ impl ExplainSupport {
     pub const PG_JSON: ExplainSupport = ExplainSupport {
         prefix: "EXPLAIN (FORMAT JSON)",
         structured: true,
+        dialect: Dialect::Postgres,
     };
 
     /// The portable spelling, for the Postgres-wire engines that are not
@@ -62,6 +69,7 @@ impl ExplainSupport {
     pub const PG_TEXT: ExplainSupport = ExplainSupport {
         prefix: "EXPLAIN",
         structured: false,
+        dialect: Dialect::Postgres,
     };
 
     /// SQLite. Its `EXPLAIN QUERY PLAN` returns rows rather than a document,
@@ -69,6 +77,7 @@ impl ExplainSupport {
     pub const SQLITE: ExplainSupport = ExplainSupport {
         prefix: "EXPLAIN QUERY PLAN",
         structured: false,
+        dialect: Dialect::Sqlite,
     };
 }
 
@@ -88,7 +97,7 @@ impl ExplainSupport {
 /// promise.
 pub fn explain_statement(sql: &str, support: ExplainSupport) -> String {
     let sql = sql.trim();
-    if is_explain(sql) {
+    if is_explain(sql, support.dialect) {
         return sql.to_string();
     }
     format!("{} {sql}", support.prefix)
@@ -447,6 +456,22 @@ mod tests {
                 "{sql:?}"
             );
         }
+    }
+
+    #[test]
+    fn whether_a_statement_is_already_an_explain_is_read_in_its_dialect() {
+        // Postgres nests block comments, so here the EXPLAIN is inside the
+        // comment and the statement is a SELECT, which needs the prefix.
+        // SQLite does not nest them: the first `*/` ends the comment, and
+        // the statement really is an EXPLAIN.
+        let sql = "/* /* */ EXPLAIN */ SELECT 1";
+        for support in [ExplainSupport::PG_JSON, ExplainSupport::PG_TEXT] {
+            assert_eq!(
+                explain_statement(sql, support),
+                format!("{} {sql}", support.prefix)
+            );
+        }
+        assert_eq!(explain_statement(sql, ExplainSupport::SQLITE), sql);
     }
 
     /// A `{"Plan": …}` document wrapped the way Postgres wraps it.

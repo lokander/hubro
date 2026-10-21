@@ -1702,23 +1702,27 @@ async fn postgres_a_plan_larger_than_the_display_cap_still_parses() {
         }
     }
 
-    // Ordinary queries keep the display cap on the same path.
-    let mut results = Vec::new();
-    run_script(
-        &pool,
-        caps,
-        &["SELECT repeat('Z', 200000) AS v".to_string()],
-        |r| results.push(r),
-    )
-    .await
-    .unwrap();
-    let StatementOutcome::Rows(rows) = &results[0].outcome else {
-        panic!("{results:?}");
-    };
-    let Value::Text(cell) = &rows.rows[0][0] else {
-        panic!("{rows:?}");
-    };
-    assert_eq!(cell.len(), QUERY_CELL_CAP);
+    // Ordinary queries keep the display cap on the same path — including
+    // one behind a comment that only looks like an EXPLAIN. Postgres nests
+    // block comments, so the EXPLAIN below is commented out and the SELECT
+    // runs; read with SQLite's rules it took the plan cap and came back at
+    // 200,000 bytes.
+    for sql in [
+        "SELECT repeat('Z', 200000) AS v",
+        "/* /* */ EXPLAIN */ SELECT repeat('Z', 200000) AS v",
+    ] {
+        let mut results = Vec::new();
+        run_script(&pool, caps, &[sql.to_string()], |r| results.push(r))
+            .await
+            .unwrap();
+        let StatementOutcome::Rows(rows) = &results[0].outcome else {
+            panic!("{sql}: {results:?}");
+        };
+        let Value::Text(cell) = &rows.rows[0][0] else {
+            panic!("{sql}: {rows:?}");
+        };
+        assert_eq!(cell.len(), QUERY_CELL_CAP, "{sql}");
+    }
 
     pool.execute("DROP TABLE big_plan CASCADE").await.unwrap();
     pool.close().await;
