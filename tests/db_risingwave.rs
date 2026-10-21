@@ -711,3 +711,40 @@ async fn risingwave_long_cells_load_through_every_key_type() {
     }
     pool.close().await;
 }
+
+#[tokio::test]
+async fn risingwave_reports_a_transaction_only_when_a_script_leaves_one_open() {
+    // Ending a run asks the server whether the script left a transaction
+    // open — the transaction status every Postgres-wire server sends. An
+    // ordinary script must come back with nothing rolled back (a server that
+    // reported a transaction while idle would put the rolled-back note on
+    // every run), and one that does leave a transaction open must say so.
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let caps = pool.backend_capabilities();
+    let run = |sql: &str| {
+        let statements = hubro::db::split_statements(sql, pool.dialect());
+        let pool = &pool;
+        async move { hubro::db::run_script(pool, caps, &statements, |_| {}).await }
+    };
+    let nothing = Ok(hubro::db::ScriptDone::default());
+    assert_eq!(run("SELECT 1").await, nothing);
+    assert_eq!(run("SELECT 1; SELECT 2").await, nothing);
+    // A plain `BEGIN` opens nothing here — measured, the session's status
+    // stays idle after it — so there is nothing to roll back or report.
+    assert_eq!(run("BEGIN; SELECT 1").await, nothing);
+    // Its read-only transaction is real, and is reported.
+    let left_open = run("BEGIN READ ONLY; SELECT 1").await;
+    assert!(
+        matches!(
+            left_open,
+            Ok(hubro::db::ScriptDone {
+                rolled_back: Some(_),
+                ..
+            })
+        ),
+        "{left_open:?}"
+    );
+    assert_eq!(run("SELECT 1").await, nothing, "the next run starts clean");
+    pool.close().await;
+}

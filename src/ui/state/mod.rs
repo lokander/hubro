@@ -57,7 +57,7 @@ use crate::db::{
     url_via_local_port, url_with_password, write_result, Capabilities, CellFetch, Connection,
     ConnectionId, ConnectionRegistry, DbError, DbPool, Ddl, DdlObject, Encoding, ExportFormat,
     Filter, ForeignKeyMeta, ImportOptions, ImportReport, MssqlAuth, OpenTransaction, Rollback,
-    RowLocator, SchemaOp, ScriptDone, SourceFormat, StagedChange, StatementOutcome,
+    RowLocator, SchemaOp, ScriptDone, ScriptError, SourceFormat, StagedChange, StatementOutcome,
     StatementResult, TableAccess, TableMeta, TableStats, Value, WriteProtection, NOTHING_TO_RUN,
 };
 use crate::history::{HistoryStore, SaveOutcome};
@@ -484,6 +484,9 @@ pub enum RunStatus {
         /// The script ended inside a transaction it had opened itself, and
         /// the run rolled it back — see [`ScriptDone::rolled_back`].
         rolled_back: Option<OpenTransaction>,
+        /// The run could not check what the script left open and closed its
+        /// connection — see [`ScriptDone::connection_closed`].
+        connection_closed: bool,
     },
     /// The statement at `statement_index` (0-based, into the script)
     /// failed. Outcomes of the statements before it stay visible in

@@ -493,9 +493,12 @@ pub async fn execute_conn(
 ///
 /// A probe that fails outright means the session is in a transaction an error
 /// has aborted (`SELECT 1` is refused until it ends) or the connection is
-/// broken; a `ROLLBACK` tells the two apart. An error is returned only when
+/// broken; a `ROLLBACK` tells those two apart. An error is returned only when
 /// the rollback fails too, and then the connection's state is unknown and the
-/// caller must not return it to the pool.
+/// caller must not return it to the pool. What the `ROLLBACK` cannot tell is a
+/// probe that failed for some third reason on a session with nothing open — it
+/// would succeed with a warning and the run would report a rollback that
+/// undid nothing. No such failure of `SELECT 1` on a live session is known.
 pub async fn end_script_conn(conn: &mut sqlx::postgres::PgConnection) -> Result<bool, DbError> {
     match sqlx::Connection::begin_with(&mut *conn, "SELECT 1").await {
         Ok(open) => {
@@ -509,6 +512,70 @@ pub async fn end_script_conn(conn: &mut sqlx::postgres::PgConnection) -> Result<
         Err(_) => {}
     }
     execute_conn(conn, "ROLLBACK").await.map(|_| true)
+}
+
+/// A script's last statement, when it returns rows, and the end of the
+/// script's hold on its connection — see
+/// [`ScriptConn::finish_with_read`](super::registry::ScriptConn::finish_with_read).
+///
+/// The same probe as [`end_script_conn`], sent *before* the read: a read
+/// cannot change the answer. When a transaction is open the read runs inside
+/// the handle the probe returned, so the script still sees its own
+/// uncommitted rows, and the handle's rollback ends it afterwards. When the
+/// read was cut short by the row cap, nothing follows it — the caller closes
+/// the connection, which ends the transaction server-side, rather than wait
+/// for the rest of the result.
+pub async fn finish_script_conn_with_read(
+    conn: &mut sqlx::postgres::PgConnection,
+    sql: &str,
+    max_rows: u64,
+    cell_cap: usize,
+) -> super::registry::FinishedRead {
+    use super::registry::FinishedRead;
+    let cut_short = |read: &Result<(QueryResult, bool), DbError>| matches!(read, Ok((_, true)));
+    let idle = match sqlx::Connection::begin_with(&mut *conn, "SELECT 1").await {
+        Ok(mut open) => {
+            let read = query_capped_conn(&mut open, sql, max_rows, cell_cap).await;
+            if cut_short(&read) {
+                return FinishedRead {
+                    read,
+                    ended: Ok(true),
+                    reusable: false,
+                };
+            }
+            let ended = open
+                .rollback()
+                .await
+                .map(|()| true)
+                .map_err(|e| DbError::Query(e.to_string()));
+            let reusable = ended.is_ok();
+            return FinishedRead {
+                read,
+                ended,
+                reusable,
+            };
+        }
+        Err(sqlx::Error::BeginFailed) => true,
+        // An aborted transaction (which refuses the read too, with the
+        // server's own message) or a broken connection: the ordinary end
+        // sorts them out.
+        Err(_) => false,
+    };
+    let read = query_capped_conn(conn, sql, max_rows, cell_cap).await;
+    if idle && cut_short(&read) {
+        return FinishedRead {
+            read,
+            ended: Ok(false),
+            reusable: false,
+        };
+    }
+    let ended = end_script_conn(conn).await;
+    let reusable = ended.is_ok() && !cut_short(&read);
+    FinishedRead {
+        read,
+        ended,
+        reusable,
+    }
 }
 
 /// Opens the read-only transaction one statement of a read-only script runs

@@ -70,9 +70,10 @@ const MAX_CONNECTIONS: usize = 4;
 /// stick. It is safe because a `SET` trailing one of those never runs as the
 /// session's own: measured, a procedure or trigger takes it into its body, and
 /// the rest refuse it as a syntax error (156). The other plain batch is bare
-/// transaction control ([`tsql_is_transaction_control`]), which holds nothing
-/// but the keywords and at most a transaction's name, so it has no room for a
-/// `SET`.
+/// transaction control ([`tsql_is_transaction_control`]): the keywords and at
+/// most a transaction's name, with a reserved word, a parenthesis or a string
+/// in the name's place turned away — so a `SET`, or an `EXEC` that could carry
+/// one, never rides along.
 const SESSION_SETUP: &str = "SET QUOTED_IDENTIFIER ON; \
      SET NOCOUNT OFF; \
      SET ANSI_NULLS ON; \
@@ -1115,6 +1116,75 @@ pub async fn end_script_conn(conn: &mut MssqlScriptConn) -> Result<bool, DbError
         held.discard();
     }
     ended
+}
+
+/// A script's last statement, when it returns rows, and the end of the
+/// script's hold on its connection — see
+/// [`ScriptConn::finish_with_read`](crate::db::registry::ScriptConn::finish_with_read).
+///
+/// `@@TRANCOUNT` is read *before* the read, which cannot change it. A read
+/// the row cap cut short, or one that left a second result set unread, is not
+/// followed by anything: tiberius would first drain the rest of the response
+/// — measured, 1.55 s for a capped `SELECT` over 3M rows on localhost, where
+/// discarding the connection takes 100 ms — so the connection is discarded
+/// instead, and the server rolls back whatever was open on it.
+pub async fn finish_script_conn_with_read(
+    conn: &mut MssqlScriptConn,
+    sql: &str,
+    max_rows: u64,
+    cell_cap: usize,
+) -> crate::db::registry::FinishedRead {
+    use crate::db::registry::FinishedRead;
+    let held = &mut conn.conn;
+    if held.is_discarded() {
+        return FinishedRead {
+            read: Err(lost_connection()),
+            ended: Err(lost_connection()),
+            reusable: false,
+        };
+    }
+    let before = async {
+        let row = held
+            .client()
+            .simple_query("SELECT @@TRANCOUNT")
+            .await?
+            .into_row()
+            .await?;
+        Ok::<_, TdsError>(row.and_then(|row| row.get::<i32, _>(0)).unwrap_or(0) > 0)
+    }
+    .await;
+    let open = match settle(held, before, "SELECT @@TRANCOUNT") {
+        Ok(open) => open,
+        Err(error) => {
+            held.discard();
+            return FinishedRead {
+                read: Err(error.clone()),
+                ended: Err(error),
+                reusable: false,
+            };
+        }
+    };
+    let read = run_query_capped(held.client(), sql, &[], max_rows, cell_cap).await;
+    match settle(held, read, sql) {
+        Ok((result, truncated, abandoned)) if truncated || abandoned => {
+            held.discard();
+            FinishedRead {
+                read: Ok((result, truncated)),
+                ended: Ok(open),
+                reusable: false,
+            }
+        }
+        read => {
+            let read = read.map(|(result, truncated, _)| (result, truncated));
+            let ended = end_script_conn(conn).await;
+            let reusable = ended.is_ok();
+            FinishedRead {
+                read,
+                ended,
+                reusable,
+            }
+        }
+    }
 }
 
 /// Streams a query to `out` in the given format, writing each row
