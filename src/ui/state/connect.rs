@@ -21,6 +21,10 @@ use super::*;
 /// keyring under `new` ([`stored_password_after_connect`]) — so nothing is
 /// carried, and the old copy goes. Carrying it would put back the password a
 /// "different password, unticked" connect had just declined to keep.
+///
+/// The session value is whatever last connected, asked or not: a different
+/// password from the command line (which never decides the keyring) followed
+/// by an edit that moves the locator drops the stored copy here too.
 async fn migrate_secret(old: String, new: String, validated: Option<String>) {
     if old == new {
         return;
