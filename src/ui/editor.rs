@@ -14,7 +14,8 @@ use super::js::js_string;
 use super::notice::{Banner, BannerKind, EmptyState, LoadingLine};
 use super::saved_panel::SavedQueriesPanel;
 use super::state::{
-    sql_export_status, AppState, ExportStatus, RunStatus, SchemaLoad, SharedStatement, SqlBuffer,
+    orphaned_sql_export_status, sql_export_status, AppState, ExportStatus, RunStatus, SchemaLoad,
+    SharedStatement, SqlBuffer,
 };
 
 /// Cap on rendered result rows (per statement). The query layer keeps up to
@@ -496,8 +497,25 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
                                 StatementSection {
                                     key: "{index}",
                                     id,
+                                    buffer: active,
                                     index: index + 1,
                                     result: statement.clone(),
+                                }
+                            }
+                        }
+                        if let Some(status) = orphaned_sql_export_status(
+                            &state.export_status.read(),
+                            &state.sql_export_sources.read(),
+                            id,
+                            active,
+                            &run.statements,
+                        ) {
+                            {
+                                let (text, class) = status.line();
+                                rsx! {
+                                    p { class: "px-4 py-2 text-xs {class}",
+                                        "Export of an earlier result: {text}"
+                                    }
                                 }
                             }
                         }
@@ -873,7 +891,12 @@ fn StatementErrorBlock(
 /// `PartialEq` lets prop diffing skip this whole subtree while the statement
 /// is unchanged — which is always, since results are write-once.
 #[component]
-fn StatementSection(id: ConnectionId, index: usize, result: SharedStatement) -> Element {
+fn StatementSection(
+    id: ConnectionId,
+    buffer: u64,
+    index: usize,
+    result: SharedStatement,
+) -> Element {
     let state = use_context::<AppState>();
     let summary = match &result.outcome {
         StatementOutcome::Affected(1) => "1 row affected".to_string(),
@@ -881,9 +904,9 @@ fn StatementSection(id: ConnectionId, index: usize, result: SharedStatement) -> 
         StatementOutcome::Rows(r) if r.rows.len() == 1 => "1 row".to_string(),
         StatementOutcome::Rows(r) => format!("{} rows", r.rows.len()),
     };
-    // Whether there is a held result to export (reads only). The rows
-    // themselves are cloned per export click, not per render — the buttons
-    // capture the shared statement and snapshot it when pressed.
+    // Whether there is a held result to export (reads only). The buttons
+    // capture the shared statement, and the export borrows its rows through
+    // the `Arc` — nothing is copied, per render or per click.
     let exportable =
         matches!(&result.outcome, StatementOutcome::Rows(rows) if !rows.rows.is_empty());
     let export_status: Option<ExportStatus> = sql_export_status(
@@ -916,7 +939,9 @@ fn StatementSection(id: ConnectionId, index: usize, result: SharedStatement) -> 
                             title: "Export this result to {label}",
                             onclick: {
                                 let statement = result.clone();
-                                move |_| spawn_result_export(state, id, statement.clone(), format)
+                                move |_| {
+                                    spawn_result_export(state, id, buffer, statement.clone(), format)
+                                }
                             },
                             "Export {label}"
                         }
@@ -955,9 +980,18 @@ fn StatementSection(id: ConnectionId, index: usize, result: SharedStatement) -> 
 /// Opens a native save dialog and, on a chosen path, writes the held
 /// result to it in `format` via [`AppState::export_result`] (a background
 /// task; the UI never blocks).
+///
+/// `spawn_forever`, not the component-scoped `spawn` the grid's dialogs use:
+/// the dialog does not block the window, and a rerun meanwhile empties the
+/// results while the new run is in flight, unmounting the section that asked.
+/// With a scoped task the dialog stayed open, accepted a path, and nothing
+/// was written or reported — measured. The task holds the result it was asked
+/// to export, so finishing it costs nothing, and its line lands under the run
+/// ([`orphaned_sql_export_status`]).
 fn spawn_result_export(
     state: AppState,
     id: ConnectionId,
+    buffer: u64,
     statement: SharedStatement,
     format: ExportFormat,
 ) {
@@ -966,7 +1000,7 @@ fn spawn_result_export(
         ExportFormat::Json => ("JSON", "json"),
     };
     let suggested = format!("query-result.{ext}");
-    spawn(async move {
+    dioxus::core::spawn_forever(async move {
         let picked = rfd::AsyncFileDialog::new()
             .set_title("Export query result")
             .set_file_name(suggested)
@@ -974,7 +1008,7 @@ fn spawn_result_export(
             .save_file()
             .await;
         if let Some(file) = picked {
-            state.export_result(id, statement, format, file.path().to_path_buf());
+            state.export_result(id, buffer, statement, format, file.path().to_path_buf());
         }
     });
 }
@@ -1024,10 +1058,32 @@ fn ResultTable(statement: SharedStatement) -> Element {
     }
 }
 
+/// How much of one cell's text a result grid puts into the DOM. The cell
+/// shows one truncated line and its tooltip the start of the value; the text
+/// goes in twice (content and `title`), and a typed `EXPLAIN` that is run
+/// rather than explained can return a plan cell of up to
+/// [`PLAN_CELL_CAP`] — sending 16 MiB to the webview to draw one line. The
+/// held result keeps the whole value, which is what an export writes.
+const RENDERED_CELL_BYTES: usize = 4 * 1024;
+
+/// `text` cut to at most `max` bytes at a character boundary, marked with an
+/// ellipsis when anything was cut.
+fn rendered_text(mut text: String, max: usize) -> String {
+    if text.len() > max {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push('…');
+    }
+    text
+}
+
 /// One result cell. NULL renders as an italic marker — distinct from an empty
 /// string — and blobs as their size tag, both via [`Value::display`].
 fn result_cell(value: &Value) -> Element {
-    let display = value.display();
+    let display = rendered_text(value.display(), RENDERED_CELL_BYTES);
     let class = match value {
         Value::Null => "px-3 py-1 font-mono text-xs italic text-slate-400 dark:text-slate-600",
         Value::Blob(_) => "px-3 py-1 font-mono text-xs text-violet-700 dark:text-violet-400",
@@ -1858,6 +1914,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_rendered_cell_is_bounded_at_a_character_boundary() {
+        assert_eq!(rendered_text("short".into(), 8), "short");
+        assert_eq!(rendered_text("exactly8".into(), 8), "exactly8");
+        assert_eq!(rendered_text("abcdefghij".into(), 8), "abcdefgh…");
+        // A three-byte character straddling the bound is dropped whole.
+        assert_eq!(rendered_text("abcdefg€".into(), 8), "abcdefg…");
+        let plan = "x".repeat(PLAN_CELL_CAP);
+        assert!(
+            rendered_text(plan, RENDERED_CELL_BYTES).len() <= RENDERED_CELL_BYTES + '…'.len_utf8()
+        );
+    }
+
     /// The results a [`Sections`] tree shows, kept in the root scope so the
     /// test can swap them between renders.
     #[derive(Clone, Copy)]
@@ -1870,7 +1939,7 @@ mod tests {
         let shown = use_context::<Shown>().0;
         rsx! {
             for (index, statement) in shown.read().iter().cloned().enumerate() {
-                StatementSection { key: "{statement.preview}", id, index, result: statement }
+                StatementSection { key: "{statement.preview}", id, buffer: 0, index, result: statement }
             }
         }
     }
@@ -1911,7 +1980,9 @@ mod tests {
         let (first, second) = (rows_statement("first"), rows_statement("second"));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out.csv");
-        dom.in_runtime(|| state.export_result(id, first.clone(), ExportFormat::Csv, path.clone()));
+        dom.in_runtime(|| {
+            state.export_result(id, 0, first.clone(), ExportFormat::Csv, path.clone())
+        });
         let done = Some(ExportStatus::Done { rows: 1 });
         let finished = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while dom.in_runtime(|| {
