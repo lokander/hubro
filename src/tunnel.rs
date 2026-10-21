@@ -467,15 +467,12 @@ impl Tunnel {
             offered_key: Arc::clone(&offered_key),
             _alive: alive_tx,
         };
-        let connect = client::connect(ssh_config, address, verifier);
-        let connected = match tokio::time::timeout(connect_limit, connect).await {
-            Ok(connected) => connected,
-            Err(_) => {
-                return Err(TunnelError::Connect(format!(
-                    "{}:{}: no answer within {connect_limit:?}",
-                    config.host, config.port
-                )))
-            }
+        let Some(connected) = connect_within(ssh_config, address, verifier, connect_limit).await
+        else {
+            return Err(TunnelError::Connect(format!(
+                "{}:{}: no answer within {connect_limit:?}",
+                config.host, config.port
+            )));
         };
         let mut handle = match connected {
             Ok(handle) => handle,
@@ -717,6 +714,57 @@ async fn best_rsa_hash(handle: &client::Handle<HostKeyVerifier>, is_rsa: bool) -
         // No EXT_INFO: most modern servers still accept rsa-sha2-256.
         Ok(None) => Some(HashAlg::Sha256),
         Err(_) => None,
+    }
+}
+
+/// Connects to the SSH server and runs the key exchange, giving up after
+/// `limit` — `None` then.
+///
+/// Giving up has to reach the session task as well as this future. russh
+/// spawns that task as soon as the server's banner arrives, and it owns the
+/// socket: dropping the connect future leaves it reading from a server that
+/// may never say anything again, holding the socket and the handler, for as
+/// long as that server keeps the connection open. So the socket is dialed
+/// here, a second handle to it is kept, and a timeout shuts it down: the task
+/// reads end-of-file and ends.
+///
+/// russh's own `inactivity_timeout` would end that task too, and was measured
+/// and rejected: it is not limited to the handshake, so with a 2s setting it
+/// also ended a session that sat idle for 4s before authenticating — an agent
+/// waiting on a touch — and an authenticated one idle for 3s.
+async fn connect_within(
+    ssh_config: Arc<client::Config>,
+    address: (&str, u16),
+    handler: HostKeyVerifier,
+    limit: Duration,
+) -> Option<Result<client::Handle<HostKeyVerifier>, russh::Error>> {
+    let dialed: Arc<Mutex<Option<std::net::TcpStream>>> = Arc::default();
+    let connect = {
+        let dialed = Arc::clone(&dialed);
+        async move {
+            let socket = tokio::net::TcpStream::connect(address).await?;
+            if ssh_config.nodelay {
+                let _ = socket.set_nodelay(true);
+            }
+            let socket = socket.into_std()?;
+            if let (Ok(second), Ok(mut slot)) = (socket.try_clone(), dialed.lock()) {
+                *slot = Some(second);
+            }
+            let socket = tokio::net::TcpStream::from_std(socket)?;
+            client::connect_stream(ssh_config, socket, handler).await
+        }
+    };
+    match tokio::time::timeout(limit, connect).await {
+        // On success the second handle just closes: it is a duplicate, and
+        // closing it leaves the session's socket open.
+        Ok(connected) => Some(connected),
+        Err(_) => {
+            let second = dialed.lock().ok().and_then(|mut slot| slot.take());
+            if let Some(second) = second {
+                let _ = second.shutdown(std::net::Shutdown::Both);
+            }
+            None
+        }
     }
 }
 
@@ -1565,6 +1613,50 @@ mod tests {
             panic!("expected a connect error, got {result:?}");
         };
         assert!(message.ends_with("no answer within 300ms"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_server_that_stalls_after_its_banner_leaves_no_session_behind() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        // A server that sends its banner and then never answers the key
+        // exchange: by then russh has spawned the session task, which owns
+        // the socket and the handler.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"SSH-2.0-Stalls_1.0\r\n").await.unwrap();
+            // Hold the connection open, reading whatever arrives, until the
+            // client closes it.
+            let mut sink = [0u8; 1024];
+            while matches!(socket.read(&mut sink).await, Ok(n) if n > 0) {}
+        });
+        let (alive_tx, alive) = watch::channel(());
+        let handler = HostKeyVerifier {
+            host: "127.0.0.1".into(),
+            port,
+            files: Vec::new(),
+            verdict: Arc::default(),
+            offered_key: Arc::default(),
+            _alive: alive_tx,
+        };
+        let connected = connect_within(
+            Arc::new(client_config("127.0.0.1", port, &[])),
+            ("127.0.0.1", port),
+            handler,
+            Duration::from_millis(500),
+        )
+        .await;
+        assert!(connected.is_none(), "the key exchange cannot have finished");
+        // The handler goes with the session task, so its signal firing is
+        // the task ending — and the server seeing its connection closed.
+        tokio::time::timeout(Duration::from_secs(5), session_end(alive))
+            .await
+            .expect("the session task must not outlive the abandoned connect");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the socket must be closed")
+            .unwrap();
     }
 
     /// Runs [`accept_loop`] on a fresh listener whose channel opens are made
