@@ -456,11 +456,28 @@ async fn postgres_generated_column_storage_matches_the_catalog() {
     )
     .await;
     // PG 18 made a bare GENERATED ALWAYS AS (…) *virtual* and only accepts
-    // this there; on 17 and earlier it is a syntax error, so the failure is
-    // ignored and the test still covers the STORED half.
-    let _ = pool
-        .query("ALTER TABLE ddl_gen ADD COLUMN v integer GENERATED ALWAYS AS (n * 3)")
+    // it there; on 17 and earlier it is a syntax error. So the virtual half is
+    // gated on the version the server reports, not on whether the statement
+    // happened to fail: swallowing the error used to mean a PG 18 server that
+    // refused it for some other reason dropped the half silently, and the
+    // test passed with only STORED checked. On 17 (the suite's documented
+    // image, and CI's) the skip is said out loud.
+    let version: i64 = probe(&pool, "SELECT current_setting('server_version_num')").await[0][0]
+        .display()
+        .parse()
+        .expect("server_version_num is an integer");
+    if version >= 180_000 {
+        run_one(
+            &pool,
+            "ALTER TABLE ddl_gen ADD COLUMN v integer GENERATED ALWAYS AS (n * 3)",
+        )
         .await;
+    } else {
+        eprintln!(
+            "server_version_num {version}: no virtual generated columns before PG 18, \
+             so only the STORED half of this test ran"
+        );
+    }
 
     let tables = pool.introspect().await.unwrap();
     let ddl = pool
@@ -483,7 +500,10 @@ async fn postgres_generated_column_storage_matches_the_catalog() {
          WHERE n.nspname = 'public' AND c.relname = 'ddl_gen' AND a.attgenerated <> ''",
     )
     .await;
-    assert!(!rows.is_empty(), "no generated columns to check");
+    // Exactly the columns the version allows, so a virtual column that was
+    // added and then not reported cannot pass as "only STORED to check".
+    let expected_columns = if version >= 180_000 { 2 } else { 1 };
+    assert_eq!(rows.len(), expected_columns, "generated columns: {rows:?}");
     for row in &rows {
         let name = row[0].display();
         let expected = match row[1].display().as_str() {
