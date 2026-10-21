@@ -8,7 +8,7 @@ name: CI
 # is exactly the change those tests exist to check, and `**/*.md` used to let
 # it land with no run at all. What is left is binary art only `dx bundle`
 # reads, which CI doesn't run. Not every .ico: assets/favicon.ico goes through
-# `asset!()`, so it is a compile input. tests/ci_triggers.rs checks each
+# `asset!()`, so it is a compile input. tests/ci_workflow.rs checks each
 # pattern below against what git tracks and what the code names.
 on:
   push:
@@ -77,6 +77,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # A Postgres for the engine suites, so the Linux leg runs them instead of
+      # skipping them: db_postgres and the shared suites (db_ddl, db_script,
+      # db_staged, …) all read HUBRO_PG_TEST_URL. Started first so it boots
+      # while cargo compiles. The same image and credentials as
+      # tests/db_postgres.rs's header and scripts/test-db.sh set 0. A plain
+      # `docker run` rather than `services:`, which fails a job outright on
+      # macOS and Windows runners and would take this matrix's other legs
+      # with it. HUBRO_REQUIRE_TEST_URLS makes a lost variable a failure
+      # rather than ~70 silent skips (tests/common/mod.rs).
+      - name: Start Postgres
+        if: runner.os == 'Linux'
+        run: |
+          docker run -d --name hubro-pg-test -e POSTGRES_PASSWORD=testpass \
+            -e POSTGRES_USER=tester -e POSTGRES_DB=demo -p 5433:5432 \
+            postgres:17-alpine
+          echo "HUBRO_PG_TEST_URL=postgres://tester:testpass@localhost:5433/demo" >> "$GITHUB_ENV"
+          echo "HUBRO_REQUIRE_TEST_URLS=HUBRO_PG_TEST_URL" >> "$GITHUB_ENV"
+
       # System libraries the Dioxus desktop build (wry/WebKitGTK), the tray
       # icon, and the native file dialog link against. The committed
       # assets/tailwind.css and assets/codemirror.js mean no Node/Tailwind
@@ -118,8 +136,23 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      # Builds every target and runs the fast suite. The Postgres, SQL
-      # Server, and SSH integration tests skip when their env vars are unset
-      # (no server in CI); the large-fixture perf tests are `#[ignore]`d.
+      # Over TCP on purpose: the image's entrypoint runs a socket-only
+      # server while it initialises and then restarts it, so a socket probe
+      # can answer ready just before the real server goes down and back up.
+      - name: Wait for Postgres
+        if: runner.os == 'Linux'
+        run: |
+          for _ in $(seq 60); do
+            docker exec hubro-pg-test pg_isready -h 127.0.0.1 -U tester -d demo && exit 0
+            sleep 2
+          done
+          docker logs hubro-pg-test
+          exit 1
+
+      # Builds every target and runs the fast suite. On Linux the Postgres
+      # suites run against the container above; every other engine, the SSH
+      # tunnel tests, and Postgres on macOS and Windows skip because their env
+      # vars are unset (no server there); the large-fixture perf tests are
+      # `#[ignore]`d.
       - name: Test
         run: cargo test --all-targets

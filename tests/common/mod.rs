@@ -642,6 +642,52 @@ const STALE_TEST_DB_SECONDS: u64 = 60;
 /// Prefix for the per-process databases, and so also the sweep's pattern.
 const TEST_DB_PREFIX: &str = "hubro_test_";
 
+/// Names engine variables that must be set, turning "skips and passes" into a
+/// failure for those engines: whitespace- or comma-separated, e.g.
+/// `HUBRO_REQUIRE_TEST_URLS=HUBRO_PG_TEST_URL`.
+///
+/// A suite whose variable is unset skips every test and reports success, so a
+/// run that is *supposed* to reach a server cannot tell "passed" from "never
+/// connected" — the trap the root CLAUDE.md opens its testing rules with. CI's
+/// Linux leg starts a Postgres and sets this, so losing the variable on the
+/// way to `cargo test` (a renamed step, a typo) fails the build instead of
+/// quietly skipping ~70 tests.
+///
+/// Honoured only by the per-process lookups below, which is to say for
+/// Postgres and SQL Server: the other engines read their variables in their
+/// own files. `a_required_url_names_an_engine_that_honours_it` refuses any
+/// other name, so the list cannot ask for a check nothing performs.
+const REQUIRE_TEST_URLS: &str = "HUBRO_REQUIRE_TEST_URLS";
+
+fn required_test_urls() -> Vec<&'static str> {
+    let listed = std::env::var(REQUIRE_TEST_URLS).unwrap_or_default();
+    [Engine::Postgres, Engine::SqlServer]
+        .into_iter()
+        .map(Engine::env)
+        .filter(|name| {
+            listed
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .any(|listed| listed == *name)
+        })
+        .collect()
+}
+
+#[test]
+fn a_required_url_names_an_engine_that_honours_it() {
+    let honoured = [Engine::Postgres, Engine::SqlServer].map(Engine::env);
+    let listed = std::env::var(REQUIRE_TEST_URLS).unwrap_or_default();
+    for name in listed
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|name| !name.is_empty())
+    {
+        assert!(
+            honoured.contains(&name),
+            "{REQUIRE_TEST_URLS} lists {name}, which only {honoured:?} honour — \
+             requiring it would check nothing"
+        );
+    }
+}
+
 /// Builds this process a database of its own and returns the URL naming it.
 ///
 /// # Why
@@ -680,6 +726,13 @@ async fn per_process_database(engine: Engine) -> Option<String> {
     let base = match std::env::var(engine.env()) {
         Ok(url) => url,
         Err(_) => {
+            if required_test_urls().contains(&engine.env()) {
+                panic!(
+                    "{} is not set, but {REQUIRE_TEST_URLS} says this run needs it — \
+                     every one of this engine's tests would skip and pass",
+                    engine.env()
+                );
+            }
             eprintln!("skipping: {} not set", engine.env());
             return None;
         }
