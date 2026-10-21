@@ -27,8 +27,8 @@
 mod common;
 
 use hubro::db::{
-    run_script, script_refusal, ConnectionRegistry, DbError, DbPool, Dialect, Value,
-    WriteProtection,
+    run_script, script_refusal, ConnectionRegistry, DbError, DbPool, Dialect, StatementOutcome,
+    Value, WriteProtection,
 };
 
 fn url(var: &str) -> Option<String> {
@@ -227,6 +227,37 @@ async fn yugabyte_refuses_writes_the_gate_cannot_see() {
     };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     assert_invisible_writes_are_refused("HUBRO_YUGABYTE_TEST_URL", &pool).await;
+    pool.close().await;
+}
+
+/// The gate's other side on a real marked connection: a read that calls
+/// `replace()` inside a CTE (or under `EXPLAIN`) runs, as the same read without
+/// the CTE always did. Matching the word `replace` alone charged it as a
+/// `REPLACE` statement and refused it before anything reached the server.
+#[tokio::test]
+async fn a_marked_postgres_connection_runs_a_read_that_calls_replace() {
+    let Some(url) = common::pg_test_url().await else {
+        return;
+    };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let marked = WriteProtection::ReadOnly.apply(pool.backend_capabilities());
+    let script = stmts(&[
+        "SELECT replace('a-b', '-', ' ') AS n",
+        "WITH x AS (SELECT replace('a-b', '-', ' ') AS n) SELECT n FROM x",
+        "EXPLAIN WITH x AS (SELECT replace('a-b', '-', ' ') AS n) SELECT n FROM x",
+    ]);
+    assert_eq!(script_refusal(marked, &script, Dialect::Postgres), None);
+    let mut rows = Vec::new();
+    run_script(&pool, marked, &script, |r| rows.push(r))
+        .await
+        .unwrap_or_else(|e| panic!("a read was refused on a marked connection: {e:?}"));
+    assert_eq!(rows.len(), 3);
+    for result in &rows[..2] {
+        let StatementOutcome::Rows(result) = &result.outcome else {
+            panic!("{result:?}");
+        };
+        assert_eq!(result.rows, vec![vec![Value::Text("a b".into())]]);
+    }
     pool.close().await;
 }
 

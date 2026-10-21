@@ -856,6 +856,11 @@ pub fn classify_statement(sql: &str, dialect: Dialect) -> StatementKind {
 /// but it also empties the table, so a connection that refuses row changes
 /// must refuse it too — otherwise `TRUNCATE t` would wipe every row on a
 /// connection where plain `DELETE` is blocked.
+///
+/// `replace` counts only where it can start SQLite's `REPLACE INTO`
+/// statement — see [`has_embedded_dml`]. Followed by `(`, it is the
+/// `replace()` string function both SQLite and Postgres have, and a read
+/// that calls it changes nothing.
 const EMBEDDED_DML_KEYWORDS: [&str; 6] =
     ["insert", "update", "delete", "merge", "replace", "truncate"];
 const EMBEDDED_DDL_KEYWORDS: [&str; 4] = ["create", "drop", "alter", "truncate"];
@@ -870,6 +875,36 @@ fn embedded_dml_keywords(dialect: Dialect) -> &'static [&'static str] {
         Dialect::SqlServer => &["insert", "update", "delete", "merge", "truncate"],
         Dialect::Sqlite | Dialect::Postgres => &EMBEDDED_DML_KEYWORDS,
     }
+}
+
+/// Whether an already-stripped statement holds an [`embedded_dml_keywords`]
+/// word for `dialect` — except `replace` straight before a `(` (whitespace
+/// and blanked comments between them allowed), which is a call of the string
+/// function rather than the statement. SQLite's `REPLACE` statement is always
+/// `REPLACE INTO`, so no write is spelled `replace (`; Postgres has no
+/// `REPLACE` statement at all, and SQL Server's list leaves the word out
+/// already. Matching the word alone refused `WITH x AS (SELECT replace(a,
+/// '-', ' ') AS n FROM t) SELECT * FROM x` on a read-only connection while the
+/// same query without the CTE ran.
+fn has_embedded_dml(stripped: &str, dialect: Dialect) -> bool {
+    let keywords = embedded_dml_keywords(dialect);
+    let mut rest = stripped;
+    while let Some(start) = rest.find(|c: char| c.is_alphanumeric() || c == '_') {
+        let after_start = &rest[start..];
+        let len = after_start
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(after_start.len());
+        let word = after_start[..len].to_ascii_lowercase();
+        rest = &after_start[len..];
+        if !keywords.contains(&word.as_str()) {
+            continue;
+        }
+        if word == "replace" && rest.trim_start().starts_with('(') {
+            continue;
+        }
+        return true;
+    }
+    false
 }
 
 /// T-SQL words that change the schema wherever they stand: `GRANT`, `DENY`,
@@ -950,6 +985,62 @@ fn has_opaque_word(dialect: Dialect, stripped: &str) -> bool {
 /// moves the WAL into the database. Charged like `VACUUM` and `ANALYZE`,
 /// whose effect nothing here names either: both capabilities.
 const SQLITE_WRITE_PRAGMAS: [&str; 3] = ["incremental_vacuum", "optimize", "wal_checkpoint"];
+
+/// SQLite pragmas whose call form reads: the argument names a table, an
+/// index or a limit, never a value to set. Measured on SQLite 3.53 against a
+/// file opened read-only (each ran) and read-write (none changed a byte):
+/// every one of these in `PRAGMA name(arg)` form. Measured the same way, the
+/// call form of a setting pragma does write — `user_version(5)`,
+/// `application_id(7)`, `journal_mode(WAL)`, `schema_version(9)`,
+/// `optimize(…)` were each refused read-only — which is why this is a list of
+/// readers rather than "call form is a read".
+const SQLITE_READ_CALL_PRAGMAS: [&str; 10] = [
+    "table_info",
+    "table_xinfo",
+    "table_list",
+    "index_info",
+    "index_xinfo",
+    "index_list",
+    "foreign_key_list",
+    "foreign_key_check",
+    "integrity_check",
+    "quick_check",
+];
+
+/// Whether an already-stripped `PRAGMA` statement is exactly `PRAGMA
+/// [schema.]name(argument)` for a name in [`SQLITE_READ_CALL_PRAGMAS`], with
+/// a plain word or number for the schema and the argument and nothing after
+/// the closing parenthesis. Any other shape is not this form and is left to
+/// the value-setting rule, so text this does not understand is charged
+/// rather than waved through.
+fn is_read_call_pragma(stripped: &str) -> bool {
+    // A quoted schema or argument has been blanked to spaces, so "plain" is
+    // identifier characters, a sign, and whitespace.
+    let plain = |text: &str| {
+        text.chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '+' || c.is_whitespace())
+    };
+    let rest = stripped.trim_start();
+    let Some(rest) = rest
+        .get(..6)
+        .filter(|head| head.eq_ignore_ascii_case("pragma"))
+        .map(|_| &rest[6..])
+    else {
+        return false;
+    };
+    let Some((head, tail)) = rest.split_once('(') else {
+        return false;
+    };
+    let (schema, name) = head.split_once('.').unwrap_or(("", head));
+    let name = name.trim().to_ascii_lowercase();
+    let Some((argument, after)) = tail.split_once(')') else {
+        return false;
+    };
+    SQLITE_READ_CALL_PRAGMAS.contains(&name.as_str())
+        && plain(schema)
+        && plain(argument)
+        && after.trim().trim_end_matches(';').trim().is_empty()
+}
 
 /// First keywords that make a statement schema-changing rather than a plain
 /// write. `grant`/`revoke` and `comment` are included: they change the
@@ -1037,7 +1128,7 @@ pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
     // covered by the same scan (it is a top-level word), so a recognized
     // opener needs no separate check — and an *unrecognized* one is
     // correctly left unattributed rather than assumed to be a row write.
-    let mutate = has(embedded_dml_keywords(dialect));
+    let mutate = has_embedded_dml(&stripped, dialect);
     let ddl = classify_statement(sql, dialect) == StatementKind::Ddl
         || has(&EMBEDDED_DDL_KEYWORDS)
         || (dialect == Dialect::SqlServer && has(&TSQL_EMBEDDED_DDL_KEYWORDS));
@@ -1082,10 +1173,10 @@ pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
 ///   property rather than a promise.
 /// - `SELECT`: an `INTO` token — `SELECT … INTO new_table` creates a table.
 /// - `PRAGMA`: a `=` or `(` — the value-setting forms — or one of the
-///   [`SQLITE_WRITE_PRAGMAS`] that write with no argument. This deliberately
-///   over-prompts call-form read pragmas like `PRAGMA table_info(t)`: some
-///   pragmas accept both spellings for setting, and prompting is the
-///   fail-safe side.
+///   [`SQLITE_WRITE_PRAGMAS`] that write with no argument. The call form
+///   sets as well as `=` does (`PRAGMA user_version(5)` writes the file), so
+///   it is only let through for the [`SQLITE_READ_CALL_PRAGMAS`], whose
+///   argument names what to read ([`is_read_call_pragma`]).
 /// - **Any read on SQL Server** gets the `WITH` scan, plus
 ///   [`TSQL_EMBEDDED_DDL_KEYWORDS`] and [`TSQL_OPAQUE_WORDS`]: T-SQL needs
 ///   no `;` between statements, so `SELECT 1 DELETE FROM t` is a SELECT and
@@ -1107,14 +1198,15 @@ fn confirmation_needed(sql: &str, stripped: &str, dialect: Dialect) -> bool {
         return true;
     }
     let embedded_write = || {
-        has_word(stripped, |word| {
-            let word = word.to_ascii_lowercase();
-            embedded_dml_keywords(dialect).contains(&word.as_str())
-                || EMBEDDED_DDL_KEYWORDS.contains(&word.as_str())
-                || word == "into"
-                || (dialect == Dialect::SqlServer
-                    && TSQL_EMBEDDED_DDL_KEYWORDS.contains(&word.as_str()))
-        }) || has_opaque_word(dialect, stripped)
+        has_embedded_dml(stripped, dialect)
+            || has_word(stripped, |word| {
+                let word = word.to_ascii_lowercase();
+                EMBEDDED_DDL_KEYWORDS.contains(&word.as_str())
+                    || word == "into"
+                    || (dialect == Dialect::SqlServer
+                        && TSQL_EMBEDDED_DDL_KEYWORDS.contains(&word.as_str()))
+            })
+            || has_opaque_word(dialect, stripped)
     };
     match first_keyword(sql, dialect).to_ascii_lowercase().as_str() {
         "with" => embedded_write(),
@@ -1135,8 +1227,7 @@ fn confirmation_needed(sql: &str, stripped: &str, dialect: Dialect) -> bool {
         _ if dialect == Dialect::SqlServer => embedded_write(),
         "select" => has_word(stripped, |word| word.eq_ignore_ascii_case("into")),
         "pragma" => {
-            stripped.contains('=')
-                || stripped.contains('(')
+            ((stripped.contains('=') || stripped.contains('(')) && !is_read_call_pragma(stripped))
                 || has_word(stripped, |word| {
                     SQLITE_WRITE_PRAGMAS.contains(&word.to_ascii_lowercase().as_str())
                 })
@@ -1846,8 +1937,9 @@ fn is_non_transactional(dialect: Dialect, stripped: &str) -> bool {
     if dialect == Dialect::Sqlite && first == "pragma" {
         // A value-setting PRAGMA (`= value` or `(value)`) is a no-op inside a
         // transaction; keep the script sequential so it actually applies. This
-        // over-declines call-form read PRAGMAs (`PRAGMA table_info(t)`), but
-        // running those sequentially is harmless. Mirrors `needs_confirmation`.
+        // over-declines call-form read PRAGMAs (`PRAGMA table_info(t)`), which
+        // `needs_confirmation` lets through, but running those sequentially is
+        // harmless.
         if stripped.contains('=') || stripped.contains('(') {
             return true;
         }
@@ -2425,6 +2517,27 @@ mod tests {
             // Postgres: finishing another session's prepared transaction.
             (Pg, "COMMIT PREPARED 'x'", BOTH),
             (Pg, "ROLLBACK PREPARED 'x'", BOTH),
+            // SQLite's REPLACE statement, wherever it stands; only the
+            // function call `replace(` is a read.
+            (Lite, "REPLACE INTO t VALUES (1)", MUTATE),
+            (
+                Lite,
+                "WITH x AS (SELECT 1 AS a) REPLACE INTO t SELECT a FROM x",
+                MUTATE,
+            ),
+            (
+                Lite,
+                "WITH x AS (SELECT replace(a, 'b', 'c') AS a FROM s) REPLACE INTO t SELECT a FROM x",
+                MUTATE,
+            ),
+            (
+                Pg,
+                "WITH x AS (SELECT replace(a, 'b', 'c') AS a FROM s) SELECT * FROM x",
+                NONE,
+            ),
+            // A setting pragma's call form sets, a reader's reads.
+            (Lite, "PRAGMA user_version(5)", BOTH),
+            (Lite, "PRAGMA table_info(t)", NONE),
             // SQLite pragmas that write with no argument.
             (Lite, "PRAGMA optimize", BOTH),
             (Lite, "PRAGMA incremental_vacuum", BOTH),
@@ -3353,18 +3466,26 @@ mod tests {
     fn an_unattributable_change_needs_both_capabilities() {
         // SELECT … INTO creates a table and names neither keyword set; a
         // PRAGMA changes state without naming either. Both are charged to
-        // both capabilities rather than guessed at.
-        //
-        // Call-form pragmas (`PRAGMA table_info(t)`) are read-only in fact
-        // but land here too, inheriting `needs_confirmation`'s deliberate
-        // over-prompt: some pragmas set through the call form, and refusing
-        // a read is the safe way to be wrong. Only SQLite and its dialect
-        // relatives have pragmas at all, and none of them is a read-only
-        // connection today.
+        // both capabilities rather than guessed at. The call form sets just
+        // as `=` does — each of these was measured writing the file, or
+        // refused on one opened read-only — so it is charged the same.
         for sql in [
             "SELECT * INTO backup FROM t",
             "PRAGMA journal_mode = WAL",
-            "PRAGMA table_info(t)",
+            "PRAGMA user_version(5)",
+            "PRAGMA main.user_version(5)",
+            "PRAGMA application_id(7)",
+            "PRAGMA journal_mode(WAL)",
+            "PRAGMA schema_version(9)",
+            "PRAGMA optimize(0x10002)",
+            "PRAGMA wal_checkpoint(PASSIVE)",
+            "PRAGMA incremental_vacuum(1)",
+            // A reader's name in a shape that is not its call form.
+            "PRAGMA table_info(t) = 1",
+            "PRAGMA table_info(user_version(5))",
+            "PRAGMA a.b.table_info(t)",
+            "PRAGMA user_version = 5 + x.table_info(t)",
+            "PRAGMA table_info(a = 1)",
         ] {
             assert_eq!(
                 statement_needs(sql, Dialect::Sqlite),
@@ -3374,6 +3495,43 @@ mod tests {
                 },
                 "{sql:?}"
             );
+        }
+        // The other side: reads that only *look* unattributable are not
+        // charged, so a connection marked read-only can still run them.
+        // Charging them both refused `PRAGMA table_info(t)` there outright —
+        // the "fail-safe" over-prompt became a refusal with no prompt.
+        for (sql, dialect) in [
+            ("PRAGMA table_info(t)", Dialect::Sqlite),
+            ("pragma TABLE_INFO ( 't' );", Dialect::Sqlite),
+            ("PRAGMA main.table_xinfo(t)", Dialect::Sqlite),
+            ("PRAGMA \"main\".index_list(t)", Dialect::Sqlite),
+            ("PRAGMA index_info(ix)", Dialect::Sqlite),
+            ("PRAGMA index_xinfo(ix)", Dialect::Sqlite),
+            ("PRAGMA foreign_key_list(t)", Dialect::Sqlite),
+            ("PRAGMA foreign_key_check(t)", Dialect::Sqlite),
+            ("PRAGMA integrity_check(5)", Dialect::Sqlite),
+            ("PRAGMA quick_check(t)", Dialect::Sqlite),
+            ("PRAGMA table_list(t)", Dialect::Sqlite),
+            // `replace(` is the string function, not the statement.
+            (
+                "WITH x AS (SELECT replace(name, '-', ' ') AS n FROM t) SELECT * FROM x",
+                Dialect::Postgres,
+            ),
+            (
+                "WITH x AS (SELECT REPLACE /* c */ (name, 'a', 'b') AS n FROM t) SELECT n FROM x",
+                Dialect::Sqlite,
+            ),
+            (
+                "EXPLAIN SELECT replace(name, 'a', 'b') FROM t",
+                Dialect::Postgres,
+            ),
+        ] {
+            assert_eq!(
+                statement_needs(sql, dialect),
+                StatementNeeds::default(),
+                "{sql:?} on {dialect:?}"
+            );
+            assert!(!needs_confirmation(sql, dialect), "{sql:?} on {dialect:?}");
         }
     }
 
@@ -4113,6 +4271,75 @@ mod read_only_backstop {
             .unwrap();
         pool.close().await;
         path
+    }
+
+    /// The gate's two sides for a SQLite connection marked read-only, through
+    /// the real [`run_script`]: a reading call-form pragma and a read calling
+    /// `replace()` run, and a setting pragma in the same call form is refused
+    /// by the gate — and, past the gate, by the engine, which is the
+    /// measurement that keeps it on the charged side.
+    #[tokio::test]
+    async fn a_marked_sqlite_connection_runs_reading_pragmas_and_refuses_setting_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sqlite_fixture(&dir, "main.db", false).await;
+        let pool = sqlite_pool(&path).await;
+        let marked = WriteProtection::ReadOnly.apply(Capabilities::FULL);
+
+        let mut outcomes = Vec::new();
+        run_script(
+            &pool,
+            marked,
+            &stmts(&[
+                "PRAGMA table_info(t)",
+                "WITH x AS (SELECT replace('a-b', '-', ' ') AS n) SELECT n FROM x",
+            ]),
+            |r| outcomes.push(r.outcome),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("a read was refused: {e:?}"));
+        assert!(
+            matches!(&outcomes[0], StatementOutcome::Rows(r) if r.rows.len() == 1 && r.rows[0][1] == Value::Text("a".into())),
+            "{outcomes:?}"
+        );
+        assert!(
+            matches!(&outcomes[1], StatementOutcome::Rows(r) if r.rows == vec![vec![Value::Text("a b".into())]]),
+            "{outcomes:?}"
+        );
+
+        let refused = run_script(&pool, marked, &stmts(&["PRAGMA user_version(5)"]), |_| {
+            panic!("a refused script must not execute a statement")
+        })
+        .await
+        .expect_err("a setting pragma's call form must be refused");
+        assert_eq!(
+            refused.error,
+            DbError::Unsupported(caps::NO_MUTATE.to_string())
+        );
+        let (result, _) = run_past_the_gate(&pool, &["PRAGMA user_version(5)"]).await;
+        assert!(
+            result.is_err(),
+            "the engine let PRAGMA user_version(5) write"
+        );
+        assert_eq!(
+            scalar(&pool, "PRAGMA user_version").await,
+            Value::Integer(0)
+        );
+
+        // Unmarked, the same call form really does write: what the refusal
+        // above is protecting.
+        run_script(
+            &pool,
+            Capabilities::FULL,
+            &stmts(&["PRAGMA user_version(5)"]),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scalar(&pool, "PRAGMA user_version").await,
+            Value::Integer(5)
+        );
+        pool.close().await;
     }
 
     #[tokio::test]
