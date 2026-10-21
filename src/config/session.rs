@@ -131,13 +131,14 @@ pub struct RestoreCandidate {
 /// A tab is reopened only when its locator still matches a saved connection —
 /// ad-hoc connections the user never saved are not resurrected. SQLite
 /// reconnects unconditionally; server backends (Postgres, SQL Server)
-/// reconnect only when a password is available (`password_available`: session
-/// memory or keyring), so startup never pops a wall of password prompts.
-/// Session order (and any duplicates) is preserved.
+/// reconnect only when `connects_silently` says they can sign in without
+/// asking — a password in session memory or the keyring, or an Entra
+/// connection that can get a token unattended — so startup never pops a wall
+/// of prompts. Session order (and any duplicates) is preserved.
 pub fn plan_session_restore(
     tabs: &[SessionTab],
     candidates: &[RestoreCandidate],
-    password_available: impl Fn(&str) -> bool,
+    connects_silently: impl Fn(&str) -> bool,
 ) -> Vec<SessionTab> {
     tabs.iter()
         .filter(
@@ -145,7 +146,7 @@ pub fn plan_session_restore(
                 None => false,
                 Some(c) => match c.backend {
                     BackendKind::Postgres | BackendKind::SqlServer => {
-                        password_available(&tab.locator)
+                        connects_silently(&tab.locator)
                     }
                     BackendKind::Sqlite => true,
                 },
