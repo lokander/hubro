@@ -93,7 +93,7 @@ fn locator_of(scope: String) -> Option<String> {
 
 /// Default location: `$XDG_DATA_HOME/hubro/history.db`.
 pub fn default_history_path() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("hubro").join("history.db"))
+    crate::config::app_data_file("history.db")
 }
 
 /// Handle to the history database. Cheap to clone (wraps a pool).
