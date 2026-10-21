@@ -13,8 +13,10 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
-use sqlx::{Row as _, TypeInfo as _, ValueRef as _};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteConnection, SqlitePool, SqlitePoolOptions, SqliteRow,
+};
+use sqlx::{Connection as _, Row as _, TypeInfo as _, ValueRef as _};
 
 use super::caps::Restriction;
 use super::ddl::{create_index_sql, terminate, Ddl, DdlObject, IndexExtras};
@@ -166,6 +168,27 @@ pub async fn open_sqlite(path: &Path) -> Result<SqlitePool, DbError> {
         .await
         .map_err(|e| DbError::Connect(e.to_string()))?;
     Ok(pool)
+}
+
+/// A new connection to `pool`'s database file, opened read-only
+/// (`SQLITE_OPEN_READONLY`) — the engine-side half of a connection the user
+/// marked read-only.
+///
+/// A flag on the *open*, not a pragma, because a pragma can be set back:
+/// `PRAGMA query_only = 0` undoes `PRAGMA query_only = 1`, and sqlx runs every
+/// statement in the string it is handed, so a lexer mismatch that hid a write
+/// from the gate could hide the pragma in front of it just as well. Nothing a
+/// statement can say reopens a connection read-write, and SQLite opens every
+/// `ATTACH`ed database with the same flags.
+///
+/// A connection of its own rather than one of the pool's: the pool's
+/// connections are the ones edits and imports write through, so they cannot
+/// be read-only, and the marking can change while the tab is open.
+pub async fn open_read_only(pool: &SqlitePool) -> Result<SqliteConnection, DbError> {
+    let options = (*pool.connect_options()).clone().read_only(true);
+    SqliteConnection::connect_with(&options)
+        .await
+        .map_err(|e| DbError::Connect(e.to_string()))
 }
 
 /// Runs an arbitrary query, decoding every cell into the backend-neutral

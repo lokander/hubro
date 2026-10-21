@@ -115,6 +115,12 @@ opening a file while hubro is already running starts a second copy.
   anything hubro cannot address one row of; see
   [Supported databases](#supported-databases) for which engines this applies
   to.
+- **Write protection** per connection — allow writes, confirm each one, or
+  refuse them. A connection marked read-only refuses writes in hubro and, on
+  SQLite and the Postgres-family engines, in the database too: the SQL editor
+  runs there in the engine's own read-only mode. SQL Server has no such mode,
+  so there a write hidden in a function or procedure call gets through — use
+  a login without write permission when that matters.
 - **Export** query and table results to CSV or JSON (streamed).
 - **Foreign-key navigation**, keyboard shortcuts (with a cheatsheet),
   dark/light theme, and window/session restore.

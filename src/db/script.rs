@@ -15,7 +15,7 @@ use std::ops::Range;
 
 use super::caps::{self, Capabilities};
 use super::error::DbError;
-use super::registry::{DbPool, MAX_QUERY_ROWS};
+use super::registry::{engine_enforces_read_only, DbPool, ReadOnlyRun, MAX_QUERY_ROWS};
 use super::sql::Dialect;
 use super::value::QueryResult;
 
@@ -999,11 +999,11 @@ pub struct StatementNeeds {
 /// tokenizer ([`region_at`]), and every place the two disagree is a
 /// statement the scan cannot see — several such places were found by
 /// measuring and are now matched, and nothing proves there are no more. It
-/// explains a refusal before anything runs, but it is also, today, the only
-/// line: nothing enforces read-only at the connection itself (a read-only
-/// session or transaction mode). That is the gap; once connection-level
-/// enforcement exists, it becomes the backstop that does not depend on
-/// lexing.
+/// explains a refusal before anything runs; on SQLite and the Postgres-wire
+/// engines a read-only script then runs where the engine refuses writes too
+/// ([`ReadOnlyRun`]), so a statement this scan misreads is refused there
+/// instead. **On SQL Server it is still the only line** — T-SQL has no
+/// read-only mode to fall back on.
 pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
     // Stripped once here; every scan below works on the stripped form.
     // Each helper used to re-strip the same statement, up to ~6
@@ -1470,6 +1470,13 @@ pub struct ScriptError {
 /// [`Connection::capabilities`](super::registry::Connection::capabilities).
 /// Taking it as an argument means a caller cannot accidentally consult the
 /// engine's own answer and skip the marking.
+///
+/// It is also read **per run**, which is what makes a change of marking take
+/// effect on an open tab without reconnecting: a connection that may not
+/// write ([`engine_enforces_read_only`]) runs the whole script through a
+/// [`ReadOnlyRun`], where the engine refuses a write the gate missed. Nothing
+/// about the pool itself changes with the marking, so there is nothing to
+/// re-apply. SQL Server has no such mode; there the gate is all there is.
 pub async fn run_script(
     pool: &DbPool,
     caps: Capabilities,
@@ -1478,6 +1485,27 @@ pub async fn run_script(
 ) -> Result<(), ScriptError> {
     if let Some(refusal) = refuse_script(caps, statements, pool.dialect()) {
         return Err(refusal);
+    }
+    if engine_enforces_read_only(caps) {
+        match pool.begin_read_only_run().await {
+            Ok(Some(run)) => {
+                return run_script_read_only(run, pool.dialect(), statements, on_result).await
+            }
+            // SQL Server: no read-only mode to run in, so the script runs as
+            // any other does, behind the gate alone.
+            Ok(None) => {}
+            Err(error) => {
+                return Err(ScriptError {
+                    statement_index: 0,
+                    preview: statements
+                        .first()
+                        .map(|s| statement_preview(s))
+                        .unwrap_or_default(),
+                    error,
+                    rollback: Rollback::None,
+                })
+            }
+        }
     }
     if wrap_atomically(caps, pool.dialect(), statements) {
         run_script_atomic(pool, caps, statements, on_result).await
@@ -1609,6 +1637,49 @@ async fn run_script_sequential(
         }
     }
     Ok(())
+}
+
+/// The read-only path: each statement through `run`, where the engine refuses
+/// a write (see [`ReadOnlyRun`]). Never wrapped in a script-long transaction —
+/// a read-only script has nothing to roll back, and on Postgres every
+/// statement already runs in a transaction of its own — so a failure reports
+/// [`Rollback::None`], as the sequential path does.
+async fn run_script_read_only(
+    mut run: ReadOnlyRun,
+    dialect: Dialect,
+    statements: &[String],
+    mut on_result: impl FnMut(StatementResult),
+) -> Result<(), ScriptError> {
+    let mut outcome = Ok(());
+    for (statement_index, statement) in statements.iter().enumerate() {
+        let result = if classify_statement(statement, dialect).returns_rows() {
+            run.query_capped(statement, MAX_QUERY_ROWS)
+                .await
+                .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated))
+        } else {
+            run.execute(statement)
+                .await
+                .map(|affected| (StatementOutcome::Affected(affected), false))
+        };
+        match result {
+            Ok((result, truncated)) => on_result(StatementResult {
+                preview: statement_preview(statement),
+                outcome: result,
+                truncated,
+            }),
+            Err(error) => {
+                outcome = Err(ScriptError {
+                    statement_index,
+                    preview: statement_preview(statement),
+                    error,
+                    rollback: Rollback::None,
+                });
+                break;
+            }
+        }
+    }
+    run.close().await;
+    outcome
 }
 
 /// The atomic path: all statements run in one transaction, committed only if
@@ -3938,5 +4009,332 @@ mod tests {
         let preview = statement_preview(&long);
         assert_eq!(preview.chars().count(), 61);
         assert!(preview.ends_with('…'));
+    }
+}
+
+/// The engine-side backstop of a read-only connection, driven **past the
+/// gate**: [`run_script_read_only`] is handed statements the gate would have
+/// refused, standing in for a write hidden from it by a lexer mismatch. The
+/// public-API half — writes the gate genuinely misses, sent through
+/// [`run_script`] — is `tests/db_read_only.rs`.
+///
+/// The SQLite half always runs. The Postgres-wire half runs once per engine
+/// whose `HUBRO_*_TEST_URL` is set (`tests/CLAUDE.md`), against fixtures named
+/// for this process so it does not collide with the engine's own suite.
+#[cfg(test)]
+mod read_only_backstop {
+    use super::*;
+    use crate::db::caps::WriteProtection;
+    use crate::db::plan::explain_statement;
+    use crate::db::value::Value;
+
+    #[test]
+    fn only_a_connection_that_may_not_write_is_enforced_by_the_engine() {
+        assert!(!engine_enforces_read_only(Capabilities::FULL));
+        assert!(engine_enforces_read_only(Capabilities::FULL.read_only()));
+        // The user's marking, as the run path receives it.
+        for (protection, enforced) in [
+            (WriteProtection::Open, false),
+            (WriteProtection::Confirm, false),
+            (WriteProtection::ReadOnly, true),
+        ] {
+            assert_eq!(
+                engine_enforces_read_only(protection.apply(Capabilities::FULL)),
+                enforced,
+                "{protection:?}"
+            );
+        }
+        // A backend without transactions (RisingWave) is still enforced
+        // when marked: its read-only transaction is the one kind it has.
+        let no_tx = Capabilities {
+            transactions: false,
+            transactional_ddl: false,
+            ..Capabilities::FULL
+        };
+        assert!(engine_enforces_read_only(
+            WriteProtection::ReadOnly.apply(no_tx)
+        ));
+    }
+
+    fn stmts(sql: &[&str]) -> Vec<String> {
+        sql.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Runs `statements` through the read-only path with the gate bypassed,
+    /// returning the outcome and the rows each read produced.
+    async fn run_past_the_gate(
+        pool: &DbPool,
+        statements: &[&str],
+    ) -> (Result<(), ScriptError>, Vec<StatementOutcome>) {
+        let run = pool
+            .begin_read_only_run()
+            .await
+            .expect("a read-only run opens")
+            .expect("this backend has a read-only mode");
+        let mut outcomes = Vec::new();
+        let result = run_script_read_only(run, pool.dialect(), &stmts(statements), |r| {
+            outcomes.push(r.outcome)
+        })
+        .await;
+        (result, outcomes)
+    }
+
+    async fn scalar(pool: &DbPool, sql: &str) -> Value {
+        let result = pool
+            .query(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        result.rows[0][0].clone()
+    }
+
+    async fn sqlite_pool(path: &std::path::Path) -> DbPool {
+        DbPool::open_sqlite(path).await.unwrap()
+    }
+
+    async fn sqlite_fixture(dir: &tempfile::TempDir, name: &str, wal: bool) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(if wal {
+                sqlx::sqlite::SqliteJournalMode::Wal
+            } else {
+                sqlx::sqlite::SqliteJournalMode::Delete
+            });
+        let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
+        sqlx::query("CREATE TABLE t (a INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO t VALUES (1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        path
+    }
+
+    #[tokio::test]
+    async fn sqlite_refuses_writes_the_gate_never_saw() {
+        for wal in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = sqlite_fixture(&dir, "main.db", wal).await;
+            let other = sqlite_fixture(&dir, "other.db", false).await;
+            let pool = sqlite_pool(&path).await;
+
+            let attacks: &[&[&str]] = &[
+                &["DELETE FROM t"],
+                &["INSERT INTO t VALUES (2)"],
+                &["CREATE TABLE t2 (a)"],
+                &["DROP TABLE t"],
+                &["PRAGMA user_version = 7"],
+                // sqlx runs every statement in the string it is handed, so a
+                // mismatch can carry the pragma that would undo `query_only`.
+                &["PRAGMA query_only = 0; DELETE FROM t"],
+                &["PRAGMA query_only = 0", "DELETE FROM t"],
+            ];
+            for attack in attacks {
+                let (result, _) = run_past_the_gate(&pool, attack).await;
+                assert!(result.is_err(), "wal={wal}: {attack:?} ran");
+            }
+            // ATTACH inherits the read-only flag; asking for more is refused.
+            let attach = format!("ATTACH '{}' AS o", other.display());
+            let (result, _) =
+                run_past_the_gate(&pool, &[&attach, "INSERT INTO o.t VALUES (9)"]).await;
+            assert!(result.is_err(), "wal={wal}: wrote through ATTACH");
+            let attach_rw = format!("ATTACH 'file:{}?mode=rw' AS o", other.display());
+            let (result, _) = run_past_the_gate(&pool, &[&attach_rw]).await;
+            assert!(result.is_err(), "wal={wal}: ATTACH widened to read-write");
+
+            assert_eq!(
+                scalar(&pool, "SELECT count(*) FROM t").await,
+                Value::Integer(1)
+            );
+            assert_eq!(scalar(&pool, "SELECT a FROM t").await, Value::Integer(1));
+            assert_eq!(
+                scalar(
+                    &pool,
+                    "SELECT count(*) FROM sqlite_master WHERE name = 't2'"
+                )
+                .await,
+                Value::Integer(0)
+            );
+            assert_eq!(
+                scalar(&pool, "PRAGMA user_version").await,
+                Value::Integer(0)
+            );
+            let other_pool = sqlite_pool(&other).await;
+            assert_eq!(
+                scalar(&other_pool, "SELECT count(*) FROM t").await,
+                Value::Integer(1)
+            );
+            other_pool.close().await;
+
+            // Reads still work, through the same path.
+            let explain = explain_statement(
+                "SELECT * FROM t",
+                pool.explain_support().expect("SQLite explains"),
+            );
+            let (result, outcomes) = run_past_the_gate(
+                &pool,
+                &["SELECT a FROM t", "PRAGMA table_info(t)", &explain],
+            )
+            .await;
+            result.unwrap_or_else(|e| panic!("wal={wal}: a read failed: {e:?}"));
+            assert_eq!(outcomes.len(), 3);
+            assert!(
+                matches!(&outcomes[0], StatementOutcome::Rows(r) if r.rows == vec![vec![Value::Integer(1)]])
+            );
+
+            // And the pool itself still writes: the marking lives in the run,
+            // not in the connection the rest of the app uses.
+            pool.execute("INSERT INTO t VALUES (3)").await.unwrap();
+            pool.close().await;
+        }
+    }
+
+    /// Every Postgres-wire engine whose URL is set, with its name.
+    fn pg_wire_urls() -> Vec<(&'static str, String)> {
+        [
+            "HUBRO_PG_TEST_URL",
+            "HUBRO_TIMESCALE_TEST_URL",
+            "HUBRO_CITUS_TEST_URL",
+            "HUBRO_CRDB_TEST_URL",
+            "HUBRO_YUGABYTE_TEST_URL",
+            "HUBRO_MATERIALIZE_TEST_URL",
+            "HUBRO_RISINGWAVE_TEST_URL",
+        ]
+        .into_iter()
+        .filter_map(|var| std::env::var(var).ok().map(|url| (var, url)))
+        .collect()
+    }
+
+    /// RisingWave applies an `INSERT` asynchronously: a row count read straight
+    /// after one can miss it, which would make a write that went through look
+    /// refused.
+    async fn settle(pool: &DbPool) {
+        if pool.pg_flavor() == Some(crate::db::postgres::PgFlavor::RisingWave) {
+            pool.execute("FLUSH").await.unwrap();
+        }
+    }
+
+    async fn table_exists(pool: &DbPool, name: &str) -> bool {
+        let sql =
+            format!("SELECT count(*) FROM information_schema.tables WHERE table_name = '{name}'");
+        scalar(pool, &sql).await != Value::Integer(0)
+    }
+
+    #[tokio::test]
+    async fn postgres_wire_engines_refuse_writes_the_gate_never_saw() {
+        let pid = std::process::id();
+        // Collected rather than panicking at the first, so one run reports
+        // every engine a regression reaches — the engines differ in exactly
+        // the ways this test exists for.
+        let mut failures = Vec::new();
+        for (var, url) in pg_wire_urls() {
+            let pool = DbPool::open_postgres(&url)
+                .await
+                .unwrap_or_else(|e| panic!("{var}: {e}"));
+            let t = format!("hubro_ro_t_{pid}");
+            let made = format!("hubro_ro_made_{pid}");
+            for name in [&t, &made] {
+                let _ = pool.execute(&format!("DROP TABLE IF EXISTS {name}")).await;
+            }
+            pool.execute(&format!("CREATE TABLE {t} (a int)"))
+                .await
+                .unwrap();
+
+            let insert = format!("INSERT INTO {t} VALUES (1)");
+            let create = format!("CREATE TABLE {made} (a int)");
+            let drop = format!("DROP TABLE {t}");
+            // Each attack is one run; a run stops at its first failure, so
+            // the statements after a refused one never reach the server —
+            // which is why the effects are checked below rather than the
+            // error of each statement.
+            let commit_then_insert = format!("COMMIT; {insert}");
+            let attacks: Vec<Vec<&str>> = vec![
+                vec![&insert],
+                vec![&create],
+                vec![&drop],
+                // Hidden behind a mismatch, two commands arrive as one
+                // statement; the extended protocol refuses the pair.
+                vec![&commit_then_insert],
+                // A statement can end or reopen hubro's transaction, but the
+                // next statement gets a new one.
+                vec!["COMMIT", &insert],
+                vec!["ROLLBACK", &create],
+                vec!["SET TRANSACTION READ WRITE", &insert],
+                vec!["BEGIN READ WRITE", &insert],
+                vec![
+                    "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+                    &insert,
+                ],
+                vec!["SET default_transaction_read_only = off", &insert],
+                vec!["RESET ALL", &create],
+                // CockroachDB: DDL leaves the transaction unless hubro's
+                // `SET LOCAL` holds it there, so turning the setting back on
+                // for the session must not help.
+                vec!["SET autocommit_before_ddl = on", &create],
+            ];
+            for attack in &attacks {
+                let (_, _) = run_past_the_gate(&pool, attack).await;
+            }
+            // The plain INSERT must be refused outright, everywhere.
+            let (result, _) = run_past_the_gate(&pool, &[&insert]).await;
+            match result {
+                Err(ScriptError {
+                    error: DbError::Query(_),
+                    ..
+                }) => {}
+                other => failures.push(format!("{var}: INSERT was not refused: {other:?}")),
+            }
+
+            settle(&pool).await;
+            if !table_exists(&pool, &t).await {
+                failures.push(format!("{var}: DROP TABLE went through"));
+                pool.execute(&format!("CREATE TABLE {t} (a int)"))
+                    .await
+                    .unwrap();
+            }
+            if table_exists(&pool, &made).await {
+                failures.push(format!("{var}: CREATE TABLE went through"));
+                pool.execute(&format!("DROP TABLE {made}")).await.unwrap();
+            }
+            let rows = scalar(&pool, &format!("SELECT count(*) FROM {t}")).await;
+            if rows != Value::Integer(0) {
+                failures.push(format!("{var}: a row was written ({rows:?})"));
+            }
+
+            // Reads still work through the same path: a table, the catalog,
+            // and the plan view's own spelling of EXPLAIN.
+            let select = format!("SELECT count(*) FROM {t}");
+            let explain = explain_statement(
+                &format!("SELECT * FROM {t}"),
+                pool.explain_support()
+                    .expect("every Postgres-wire engine explains"),
+            );
+            let (result, outcomes) = run_past_the_gate(
+                &pool,
+                &[
+                    &select,
+                    "SELECT count(*) FROM information_schema.columns",
+                    &explain,
+                ],
+            )
+            .await;
+            if let Err(e) = result {
+                failures.push(format!("{var}: a read failed: {e:?}"));
+            } else {
+                assert_eq!(outcomes.len(), 3, "{var}");
+            }
+
+            // Nothing leaked into the pool: the same connections still write.
+            pool.execute(&insert)
+                .await
+                .unwrap_or_else(|e| panic!("{var}: the pool stopped writing: {e}"));
+            pool.execute(&format!("DROP TABLE {t}")).await.unwrap();
+            pool.close().await;
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 }

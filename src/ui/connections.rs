@@ -14,7 +14,7 @@ use dioxus_icons::lucide::{
 };
 
 use crate::config::{BackendKind, ConnectionColor, EditPrefill, SavedConnection, ServerAuth};
-use crate::db::{Dialect, WriteProtection};
+use crate::db::{engine_has_read_only_mode, Dialect, WriteProtection};
 
 use super::icons::BackendIcon;
 use super::js::focus_on_mount;
@@ -37,6 +37,8 @@ use super::state::{ActiveView, AppState, ConnectStep, ServerBackend};
 #[component]
 fn RowSettings(
     locator: String,
+    /// Decides what the read-only hint can promise — see [`protection_hint`].
+    backend: BackendKind,
     protection: WriteProtection,
     color: Option<ConnectionColor>,
     /// The group this connection is in, if any.
@@ -143,7 +145,7 @@ fn RowSettings(
                 }
             }
             p { class: "mt-2 text-xs text-slate-500",
-                "{protection_hint(protection)}"
+                "{protection_hint(protection, backend)}"
             }
         }
     }
@@ -160,18 +162,26 @@ fn protection_label(protection: WriteProtection) -> &'static str {
 
 /// One sentence saying what the chosen state actually does, so the three
 /// buttons don't have to carry the whole explanation.
-fn protection_hint(protection: WriteProtection) -> &'static str {
+///
+/// The read-only sentence depends on the backend, because what enforces it
+/// does: where the engine has a read-only mode ([`engine_has_read_only_mode`])
+/// the SQL editor's scripts run in it, and the database refuses a write hubro
+/// misread; SQL Server has none, so there hubro's reading of each statement is
+/// all there is. Promising more than that would be worse than promising less.
+fn protection_hint(protection: WriteProtection, backend: BackendKind) -> &'static str {
     match protection {
         WriteProtection::Open => "Writes run without extra confirmation.",
         WriteProtection::Confirm => {
             "Every write asks first, naming this connection. Colour only warns — it changes nothing."
         }
-        // Deliberately not "outright": enforcement classifies statements, so
-        // a write reached through a function call in a SELECT is not caught.
-        // Promising more than that would be worse than promising less.
+        WriteProtection::ReadOnly if engine_has_read_only_mode(backend.into()) => {
+            "Writes are refused, including from the SQL editor, where the database itself \
+             refuses them too."
+        }
         WriteProtection::ReadOnly => {
-            "Writes are refused, including from the SQL editor. \
-             A write hidden inside a function call in a SELECT is not caught."
+            "Writes are refused, including from the SQL editor. SQL Server has no read-only \
+             mode, so a write hidden in a function or procedure call is not caught — use a \
+             login without write permission for that."
         }
     }
 }
@@ -763,6 +773,7 @@ fn SavedConnectionRow(
             if settings_open() == Some(row.locator.clone()) {
                 RowSettings {
                     locator: row.locator.clone(),
+                    backend: row.backend,
                     protection: row.protection,
                     color: row.color,
                     group: row.group.clone(),
@@ -2072,6 +2083,27 @@ const FORM_SELECT_CLASS: &str = "rounded border border-slate-300 dark:border-sla
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_read_only_hint_promises_the_database_refuses_only_where_it_does() {
+        for backend in [
+            BackendKind::Sqlite,
+            BackendKind::Postgres,
+            BackendKind::SqlServer,
+        ] {
+            let hint = protection_hint(WriteProtection::ReadOnly, backend);
+            assert_eq!(
+                hint.contains("database itself"),
+                engine_has_read_only_mode(backend.into()),
+                "{backend:?}: {hint}"
+            );
+            assert_eq!(
+                hint.contains("not caught"),
+                !engine_has_read_only_mode(backend.into()),
+                "{backend:?}: {hint}"
+            );
+        }
+    }
 
     #[test]
     fn the_prompt_card_offers_the_choice_the_prompt_carries() {
