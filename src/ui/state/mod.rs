@@ -36,7 +36,7 @@ pub(crate) use connect::entra_secret_key;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use dioxus::core::{spawn_forever, Task};
@@ -56,9 +56,9 @@ use crate::db::{
     script_refusal, split_statements, statement_preview, url_target, url_via_local_port,
     url_with_password, write_result, Capabilities, CellFetch, Connection, ConnectionId,
     ConnectionRegistry, DbError, DbPool, Ddl, DdlObject, Encoding, ExportFormat, Filter,
-    ForeignKeyMeta, ImportOptions, ImportReport, MssqlAuth, QueryResult, Rollback, RowLocator,
-    SchemaOp, SourceFormat, StagedChange, StatementResult, TableAccess, TableMeta, TableStats,
-    Value, WriteProtection, NOTHING_TO_RUN,
+    ForeignKeyMeta, ImportOptions, ImportReport, MssqlAuth, Rollback, RowLocator, SchemaOp,
+    SourceFormat, StagedChange, StatementOutcome, StatementResult, TableAccess, TableMeta,
+    TableStats, Value, WriteProtection, NOTHING_TO_RUN,
 };
 use crate::history::{HistoryStore, SaveOutcome};
 use crate::tunnel::{HostKeyInfo, Tunnel, TunnelAuth, TunnelConfig, TunnelError};
@@ -529,6 +529,32 @@ impl SharedStatement {
     pub fn new(result: StatementResult) -> Self {
         Self(Arc::new(result))
     }
+
+    /// A name for this result that does not keep its rows alive.
+    pub fn downgrade(&self) -> StatementRef {
+        StatementRef(Arc::downgrade(&self.0))
+    }
+
+    /// Whether `other` names this very result — the same identity
+    /// [`PartialEq`] compares.
+    pub fn is(&self, other: &StatementRef) -> bool {
+        std::ptr::eq(Arc::as_ptr(&self.0), other.0.as_ptr())
+    }
+}
+
+/// Which [`SharedStatement`] something was taken from, without holding on
+/// to its rows once the run that produced it is replaced.
+///
+/// Identity is the allocation, as for [`SharedStatement`]. A [`Weak`] keeps
+/// that allocation reserved after the rows are dropped, so a later result
+/// can never land at the same address and be mistaken for this one.
+#[derive(Debug, Clone)]
+pub struct StatementRef(Weak<StatementResult>);
+
+impl PartialEq for StatementRef {
+    fn eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.0, &other.0)
+    }
 }
 
 impl PartialEq for SharedStatement {
@@ -583,6 +609,29 @@ pub enum ExportStatus {
     Running,
     Done { rows: u64 },
     Failed(String),
+}
+
+/// The export line one SQL result section shows: the connection's latest
+/// SQL-pane export, on the section of the result it was taken from and on no
+/// other.
+///
+/// The status is kept per connection — one SQL export at a time, like the
+/// grid's — but every result section has an Export control, and all of them
+/// used to draw it: export the first of two `SELECT`s and both claimed
+/// "Exported … rows". Matching the section's own result by identity also
+/// keeps the line off another query tab's results and off the results of a
+/// later run, which the export did not write.
+pub fn sql_export_status(
+    statuses: &HashMap<(ConnectionId, ExportPane), ExportStatus>,
+    sources: &HashMap<ConnectionId, StatementRef>,
+    id: ConnectionId,
+    statement: &SharedStatement,
+) -> Option<ExportStatus> {
+    let source = sources.get(&id)?;
+    if !statement.is(source) {
+        return None;
+    }
+    statuses.get(&(id, ExportPane::Sql)).cloned()
 }
 
 impl ExportStatus {
@@ -971,6 +1020,10 @@ pub struct AppState {
     /// Latest export progress per connection and pane. Written from the
     /// `spawn_forever` export task.
     pub export_status: Signal<HashMap<(ConnectionId, ExportPane), ExportStatus>>,
+    /// The result each connection's latest SQL-pane export was taken from,
+    /// so only that result's section shows the status
+    /// ([`sql_export_status`]).
+    pub sql_export_sources: Signal<HashMap<ConnectionId, StatementRef>>,
     /// Monotonic id per export slot; a finishing task only records its
     /// outcome while it is still the slot's latest export, so a slow export
     /// can't overwrite the status of one started after it.
@@ -1145,6 +1198,7 @@ impl AppState {
             collapsed_groups: Signal::new_in_scope(Vec::new(), ScopeId::ROOT),
             pending_edit: Signal::new_in_scope(None, ScopeId::ROOT),
             export_status: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            sql_export_sources: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             export_generations: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             import_status: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             import_generations: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
@@ -1722,6 +1776,7 @@ impl AppState {
         self.export_status
             .write()
             .retain(|(conn, _), _| *conn != id);
+        self.sql_export_sources.write().remove(&id);
         self.export_generations
             .write()
             .retain(|(conn, _), _| *conn != id);
@@ -1886,6 +1941,68 @@ mod tests {
             fields,
             "the constructor slice does not build every field: {ctor}"
         );
+    }
+
+    fn rows_statement() -> SharedStatement {
+        SharedStatement::new(StatementResult {
+            preview: "SELECT 1".into(),
+            outcome: StatementOutcome::Rows(crate::db::QueryResult {
+                columns: Vec::new(),
+                rows: vec![vec![Value::Integer(1)]],
+            }),
+            truncated: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn the_sql_export_line_shows_on_the_exported_result_alone() {
+        let mut registry = ConnectionRegistry::default();
+        let pool =
+            || DbPool::Sqlite(sqlx::sqlite::SqlitePool::connect_lazy("sqlite::memory:").unwrap());
+        let id = registry.insert("a.db", pool(), WriteProtection::Open);
+        let other = registry.insert("b.db", pool(), WriteProtection::Open);
+
+        // Two results of one run; the first is exported.
+        let (first, second) = (rows_statement(), rows_statement());
+        let done = ExportStatus::Done { rows: 1 };
+        let mut statuses = HashMap::new();
+        statuses.insert((id, ExportPane::Sql), done.clone());
+        // A grid export on the same connection is the grid's line, not this.
+        statuses.insert((id, ExportPane::Grid), ExportStatus::Running);
+        let mut sources = HashMap::new();
+        sources.insert(id, first.downgrade());
+
+        assert_eq!(
+            sql_export_status(&statuses, &sources, id, &first),
+            Some(done)
+        );
+        assert_eq!(sql_export_status(&statuses, &sources, id, &second), None);
+        // A clone of the exported result is the same result.
+        assert!(sql_export_status(&statuses, &sources, id, &first.clone()).is_some());
+        // Another connection never sees it, even with an equal-looking result.
+        assert_eq!(sql_export_status(&statuses, &sources, other, &first), None);
+        // A later run's results did not produce the file.
+        let rerun = rows_statement();
+        assert_eq!(sql_export_status(&statuses, &sources, id, &rerun), None);
+        // And with no recorded source nothing shows, whatever the status says.
+        assert_eq!(
+            sql_export_status(&statuses, &HashMap::new(), id, &first),
+            None
+        );
+    }
+
+    #[test]
+    fn a_statement_ref_outlives_its_rows_without_matching_a_newcomer() {
+        let first = rows_statement();
+        let name = first.downgrade();
+        assert!(first.is(&name));
+        drop(first);
+        // The rows are gone, but the allocation the name points at is still
+        // reserved, so nothing allocated later can be taken for the original.
+        for _ in 0..64 {
+            let later = rows_statement();
+            assert!(!later.is(&name));
+        }
     }
 
     #[test]

@@ -586,7 +586,12 @@ impl AppState {
     /// the connection so it always reflects committed data; rows are pulled
     /// one at a time and written incrementally (see
     /// [`DbPool::export`](crate::db::DbPool::export)). Progress lands in
-    /// [`Self::export_status`]; the UI never blocks.
+    /// [`Self::export_status`].
+    ///
+    /// The export runs on a thread of its own ([`off_the_ui_thread`]), driven
+    /// there with `block_on`: formatting each row and writing the file are
+    /// synchronous, and inside the UI task they ran on the thread that draws
+    /// the window, between the stream's awaits.
     pub fn export_query(
         mut self,
         id: ConnectionId,
@@ -608,57 +613,78 @@ impl AppState {
         // spawn_forever: the export must survive the grid unmounting (a pane
         // or tab switch) — a plain spawn would cancel it mid-write.
         spawn_forever(async move {
-            use std::io::Write as _;
-            // Stream into a temp file and rename on success, so a mid-stream
-            // failure can't clobber an existing file at `path`.
-            let tmp = export_temp_path(&path);
-            let outcome = async {
-                let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-                let mut writer = std::io::BufWriter::new(file);
-                let rows = pool
-                    .export(&sql, &params, format, &mut writer)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                writer.flush().map_err(|e| e.to_string())?;
-                drop(writer);
-                std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-                Ok::<u64, String>(rows)
-            }
+            let runtime = tokio::runtime::Handle::current();
+            let outcome = off_the_ui_thread(move || {
+                use std::io::Write as _;
+                // Stream into a temp file and rename on success, so a
+                // mid-stream failure can't clobber an existing file at `path`.
+                let tmp = export_temp_path(&path);
+                let outcome = runtime.block_on(async {
+                    let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+                    let mut writer = std::io::BufWriter::new(file);
+                    let rows = pool
+                        .export(&sql, &params, format, &mut writer)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    writer.flush().map_err(|e| e.to_string())?;
+                    drop(writer);
+                    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+                    Ok::<u64, String>(rows)
+                });
+                if outcome.is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                outcome
+            })
             .await;
-            if outcome.is_err() {
-                let _ = std::fs::remove_file(&tmp);
-            }
             self.finish_export(slot, generation, outcome);
         });
     }
 
-    /// Writes an already-materialized [`QueryResult`] (the SQL editor's held
-    /// result) to `path` in `format`, in a background task. Shares the row
-    /// formatters with [`Self::export_query`]; no database round-trip.
+    /// Writes one of the SQL editor's held results to `path` in `format`, on
+    /// a thread of its own ([`off_the_ui_thread`]). Shares the row formatters
+    /// with [`Self::export_query`]; no database round-trip.
+    ///
+    /// Takes the shared statement rather than its rows: the export borrows
+    /// them through the `Arc` instead of copying every row on the UI thread
+    /// first, and the statement is recorded as the export's source in
+    /// [`Self::sql_export_sources`], so the status line lands on that result
+    /// alone ([`sql_export_status`]).
     pub fn export_result(
-        self,
+        mut self,
         id: ConnectionId,
-        result: QueryResult,
+        statement: SharedStatement,
         format: ExportFormat,
         path: PathBuf,
     ) {
         let slot = (id, ExportPane::Sql);
+        self.sql_export_sources
+            .write()
+            .insert(id, statement.downgrade());
         let generation = self.begin_export(slot);
         spawn_forever(async move {
-            use std::io::Write as _;
-            let tmp = export_temp_path(&path);
-            let outcome = (|| {
-                let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-                let mut writer = std::io::BufWriter::new(file);
-                let rows = write_result(&result, format, &mut writer).map_err(|e| e.to_string())?;
-                writer.flush().map_err(|e| e.to_string())?;
-                drop(writer);
-                std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-                Ok::<u64, String>(rows)
-            })();
-            if outcome.is_err() {
-                let _ = std::fs::remove_file(&tmp);
-            }
+            let outcome = off_the_ui_thread(move || {
+                use std::io::Write as _;
+                let StatementOutcome::Rows(result) = &statement.outcome else {
+                    return Err("this statement returned no rows".to_string());
+                };
+                let tmp = export_temp_path(&path);
+                let outcome = (|| {
+                    let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+                    let mut writer = std::io::BufWriter::new(file);
+                    let rows =
+                        write_result(result, format, &mut writer).map_err(|e| e.to_string())?;
+                    writer.flush().map_err(|e| e.to_string())?;
+                    drop(writer);
+                    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+                    Ok::<u64, String>(rows)
+                })();
+                if outcome.is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                outcome
+            })
+            .await;
             self.finish_export(slot, generation, outcome);
         });
     }
@@ -695,6 +721,21 @@ impl AppState {
         };
         self.export_status.write().insert(slot, status);
     }
+}
+
+/// Runs an export's synchronous work — formatting rows, writing and renaming
+/// the file — on tokio's blocking pool, and waits for it there.
+///
+/// Dioxus desktop polls its tasks on the thread that draws the window, so a
+/// task that does synchronous work holds the window for as long as the work
+/// takes; an export of a large result froze it. The blocking pool is the same
+/// place [`crate::secrets`] sends keyring calls for the same reason.
+async fn off_the_ui_thread<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .unwrap_or_else(|join_err| Err(format!("export task failed: {join_err}")))
 }
 
 /// Sibling temp path for an atomic export write (`foo.csv` → `foo.csv.part`).
