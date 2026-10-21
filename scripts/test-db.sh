@@ -13,7 +13,7 @@
 #   scripts/test-db.sh env 1         # KEY=VALUE lines for set 1
 #   scripts/test-db.sh down 1        # stop, keeping the data
 #   scripts/test-db.sh rm 1          # stop and delete — releases the set
-#   scripts/test-db.sh status       # which sets are up (0-3)
+#   scripts/test-db.sh status        # which sets have engines running
 #
 # The usual way to run a suite against a set:
 #
@@ -358,16 +358,28 @@ cmd_rm() {
 cmd_env() {
   local set=$1
   shift
+  local named=$#
   local engine name var url
-  local lines=()
+  local lines=() stopped=()
   select_engines "$@"
   for engine in "${SELECTED[@]}"; do
     name=$(name_for "$engine" "$set")
     # Only engines that are actually up: an unset variable makes that engine's
-    # tests skip, which is the honest outcome. Printing a URL for a container
-    # that is not running would make them fail instead, and look like the
-    # engine broke.
-    container_running "$name" || continue
+    # tests skip. Printing a URL for a container that is not running would make
+    # them fail instead, and look like the engine broke.
+    #
+    # But never *silently*. A skipped suite passes, so a container that
+    # crashed reads as a green run of its engine — the exact trap this script
+    # exists to remove. stderr is the one channel that reaches the person:
+    # `$(…)` captures stdout only, and the variables go nowhere visible.
+    if ! container_running "$name"; then
+      # An engine asked for by name and not up is a refusal, not a note: the
+      # caller said which suites they meant to run.
+      [ "$named" -eq 0 ] ||
+        die "$name is not running, so its tests would skip — start it with '$0 up $set $engine'"
+      stopped+=("$engine")
+      continue
+    fi
     # Checked here as well as in `create`: this output is what gets handed to
     # cargo, and a URL for a container that is actually published somewhere
     # else fails as a connection error the suite reports as the engine's
@@ -377,6 +389,9 @@ cmd_env() {
     url=$(url_for "$engine" "$set")
     lines+=("$var=$url")
   done
+  if [ "${#stopped[@]}" -gt 0 ]; then
+    echo "test-db: set $set: not running, so their tests will skip: ${stopped[*]}" >&2
+  fi
   # Collected first, printed last, so a refusal part-way through emits nothing
   # at all. Half a list is the worst outcome available here: the caller gets a
   # loud error on stderr *and* a usable-looking set of exports, and whichever
@@ -386,13 +401,20 @@ cmd_env() {
   fi
 }
 
+# Every set with at least one engine running, found from the container names
+# rather than by counting up from 0: `up` accepts any set number, and a fixed
+# range (this used to scan 0-3) leaves a set 7 running unseen.
 cmd_status() {
-  local set engine name
-  for set in 0 1 2 3; do
+  local names set engine name
+  names=$(docker ps --format '{{.Names}}')
+  local sets
+  sets=$(printf '%s\n' "$names" | sed -n 's/^hubro-[a-z]*-test\(-\([0-9]*\)\)\{0,1\}$/\2/p' |
+    sed 's/^$/0/' | sort -nu)
+  for set in $sets; do
     local running=()
     for engine in "${ENGINES[@]}"; do
       name=$(name_for "$engine" "$set")
-      container_running "$name" && running+=("$engine")
+      printf '%s\n' "$names" | grep -qx "$name" && running+=("$engine")
     done
     if [ "${#running[@]}" -gt 0 ]; then
       echo "set $set: ${running[*]}"
