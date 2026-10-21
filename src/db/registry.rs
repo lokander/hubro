@@ -166,17 +166,35 @@ impl ScriptTx<'_> {
         }
     }
 
-    /// Rolls the transaction back — none of the script's statements persist.
-    /// Best-effort: a rollback failure leaves nothing committed anyway (the
-    /// transaction also rolls back on drop), so the original error is what the
-    /// caller reports.
-    pub async fn rollback(self) {
+    /// Rolls the transaction back, and says what that covered. Best-effort: a
+    /// rollback failure leaves nothing committed anyway (the transaction also
+    /// rolls back on drop), so the original error is what the caller reports.
+    ///
+    /// Only SQL Server can answer anything but [`RolledBack::Own`]: there a
+    /// statement is a whole batch, and one can end the transaction it runs
+    /// in. A Postgres or SQLite statement that tries is refused inside one.
+    pub async fn rollback(self) -> RolledBack {
         match self {
             ScriptTx::Sqlite(tx) => sqlx_common::rollback_tx(tx).await,
             ScriptTx::Postgres(tx) => sqlx_common::rollback_tx(tx).await,
-            ScriptTx::SqlServer(tx) => sqlserver::rollback_tx(*tx).await,
+            ScriptTx::SqlServer(tx) => return sqlserver::rollback_tx(*tx).await,
         }
+        RolledBack::Own
     }
+}
+
+/// What [`ScriptTx::rollback`] found open when it rolled back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RolledBack {
+    /// The transaction hubro opened: everything run in it is undone.
+    Own,
+    /// A transaction a statement opened after committing hubro's: what ran
+    /// before that commit stands.
+    Another,
+    /// No transaction at all — a statement ended hubro's, or the server did
+    /// (a deadlock, `XACT_ABORT`); hubro cannot tell which, so cannot say
+    /// what stands.
+    Nothing,
 }
 
 /// One script's hold on a connection the *server* will not let write: what
