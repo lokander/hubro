@@ -782,6 +782,15 @@ pub struct ConnectRequest {
     focus: bool,
 }
 
+#[cfg(test)]
+impl ConnectRequest {
+    /// A focusing request around `task`, for a test that needs a row to show
+    /// its connect as cancellable.
+    pub(crate) fn for_test(task: Task) -> Self {
+        Self { task, focus: true }
+    }
+}
+
 /// App-wide state provided via context. `Copy` because it only holds signals.
 #[derive(Clone, Copy)]
 pub struct AppState {
@@ -1831,8 +1840,12 @@ mod tests {
             + source[start..]
                 .find("\n        }\n")
                 .expect("...that ends where it always has");
+        // The strays are looked for from the signature on, not from the
+        // literal: a `let field = Signal::new(..)` above the literal, used as
+        // a field shorthand, is the same mistake one line earlier.
+        let body = &source[ctor_fn..end];
         let ctor = &source[start..end];
-        let strays: Vec<&str> = ctor
+        let strays: Vec<&str> = body
             .lines()
             .filter(|line| line.contains("Signal::new("))
             .collect();
@@ -1845,10 +1858,33 @@ mod tests {
             strays.join("\n")
         );
         // The slice must actually contain the fields, or the assertion above
-        // passes by matching nothing at all.
+        // passes by matching nothing at all — every one of them, counted off
+        // the struct definition, so a field built anywhere else is noticed.
+        let fields = source
+            .lines()
+            .skip_while(|line| *line != "pub struct AppState {")
+            .skip(1)
+            .take_while(|line| *line != "}")
+            .filter(|line| {
+                // Top-level `name: Type` lines only: not doc comments, not the
+                // continuation lines of a wrapped type.
+                let Some(line) = line.strip_prefix("    ") else {
+                    return false;
+                };
+                let line = line.strip_prefix("pub ").unwrap_or(line);
+                line.split_once(':').is_some_and(|(name, _)| {
+                    !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                })
+            })
+            .count();
         assert!(
-            ctor.matches("Signal::new_in_scope(").count() > 20,
-            "the constructor slice came out too small to be the real one: {ctor}"
+            fields > 40,
+            "the AppState definition was not found: {fields} fields"
+        );
+        assert_eq!(
+            ctor.matches("Signal::new_in_scope(").count(),
+            fields,
+            "the constructor slice does not build every field: {ctor}"
         );
     }
 
