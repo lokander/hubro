@@ -10,9 +10,10 @@
 //!   table was opened; NaN, `Infinity` and anything past 28 significant digits
 //!   read as a `<numeric>` marker;
 //! - chrono counts years astronomically, so `0001-01-01 BC` arrived as
-//!   `0000-01-01` and `10000-01-01` as `+10000-01-01` — both refused by the
-//!   server as input, so a row keyed on one could be shown but not saved;
-//!   dates past chrono's year 262143 read as a marker;
+//!   `0000-01-01` and `10000-01-01` as `+10000-01-01` — both refused as
+//!   input by PostgreSQL, so a row keyed on one could be shown but not saved
+//!   (CockroachDB reads the year 0 back as 1 BC, but refuses the `+`); dates
+//!   past chrono's year 262143 read as a marker;
 //! - sqlx builds a `time` by adding to midnight, so `24:00:00` — a legal
 //!   `time` — read as `00:00:00`, a different value.
 //!
