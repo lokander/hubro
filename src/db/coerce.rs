@@ -211,9 +211,28 @@ pub(crate) fn validate_bit_literal(text: &str) -> Result<(), String> {
 /// - [`TypeClass::Exact`] takes them as the typed text, so an exact decimal
 ///   never round-trips through `f64`.
 ///
-/// Non-numbers, infinities and NaN are rejected everywhere. A class that is
-/// not numeric is a caller bug and is rejected too.
-pub(crate) fn parse_numeric_text(text: &str, class: TypeClass) -> Result<Value, String> {
+/// NaN and the infinities are accepted for the [`TypeClass::Float`] and
+/// [`TypeClass::Exact`] classes on [`Dialect::Postgres`] only — Postgres,
+/// CockroachDB and RisingWave store all three in `numeric`, `real` and
+/// `double precision`, and the grid shows them (`NaN`, `Infinity`), so a cell
+/// a user can see must be one they can type back. An exact column stages the
+/// server's own spelling (`NaN`, `Infinity`, `-Infinity`) whatever Rust
+/// spelling was typed (`nan`, `inf`, `+infinity`), so the pending cell reads
+/// as the saved one will — PostgreSQL 17 and CockroachDB were measured to
+/// accept those other spellings too, so this is display, not a fix for a
+/// refusal. SQL Server's `float` and
+/// `decimal` hold none of them and SQLite turns a NaN into NULL, so they stay
+/// rejected there, as they stay for an integer everywhere. An engine whose
+/// `numeric` lacks one (Materialize has no numeric infinity) refuses it with
+/// its own message at save time.
+///
+/// Other non-numbers are rejected everywhere. A class that is not numeric is
+/// a caller bug and is rejected too.
+pub(crate) fn parse_numeric_text(
+    text: &str,
+    class: TypeClass,
+    dialect: Dialect,
+) -> Result<Value, String> {
     let t = text.trim();
     if t.is_empty() {
         return Err("enter a number (or use the ∅ NULL button)".to_string());
@@ -221,10 +240,21 @@ pub(crate) fn parse_numeric_text(text: &str, class: TypeClass) -> Result<Value, 
     if let Ok(i) = t.parse::<i64>() {
         return Ok(Value::Integer(i));
     }
+    let special = dialect == Dialect::Postgres;
     match (class, t.parse::<f64>()) {
         (TypeClass::Integer, Ok(f)) if f.is_finite() => Err(format!("not a whole number: {t}")),
-        (TypeClass::Float, Ok(f)) if f.is_finite() => Ok(Value::Real(f)),
+        (TypeClass::Float, Ok(f)) if f.is_finite() || special => Ok(Value::Real(f)),
         (TypeClass::Exact, Ok(f)) if f.is_finite() => Ok(Value::Text(t.to_string())),
+        (TypeClass::Exact, Ok(f)) if special => Ok(Value::Text(
+            if f.is_nan() {
+                "NaN"
+            } else if f > 0.0 {
+                "Infinity"
+            } else {
+                "-Infinity"
+            }
+            .to_string(),
+        )),
         _ => Err(format!("not a number: {t}")),
     }
 }
@@ -380,8 +410,10 @@ fn coerce_text(
     match class {
         // Text, dates and everything unrecognized go to the server verbatim.
         TypeClass::Text | TypeClass::DateTime => Ok(Value::Text(text.to_string())),
-        TypeClass::Integer | TypeClass::Float | TypeClass::Exact => parse_numeric_text(text, class)
-            .map_err(|why| format!("column \"{}\": {why}", column.name)),
+        TypeClass::Integer | TypeClass::Float | TypeClass::Exact => {
+            parse_numeric_text(text, class, dialect)
+                .map_err(|why| format!("column \"{}\": {why}", column.name))
+        }
         TypeClass::Bool => match parse_bool_text(text) {
             Some(flag) => Ok(bool_value(dialect, flag)),
             None => Err(format!(
@@ -796,7 +828,17 @@ mod tests {
         assert!(err.contains("abc"), "{err}");
         // Fractional input for an integer column is rejected, not rounded.
         assert!(coerce("integer", &text("1.5")).is_err());
-        assert!(coerce("double precision", &text("NaN")).is_err());
+        // An integer holds no NaN; a Postgres float and numeric do, and the
+        // import takes it as the editor does.
+        assert!(coerce("integer", &text("NaN")).is_err());
+        assert!(matches!(
+            coerce("double precision", &text("NaN")),
+            Ok(Value::Real(f)) if f.is_nan()
+        ));
+        assert_eq!(
+            coerce("numeric", &text("-inf")),
+            Ok(Value::Text("-Infinity".into()))
+        );
     }
 
     #[test]

@@ -176,7 +176,7 @@ pub fn parse_input(kind: &EditorKind, dialect: Dialect, text: &str) -> Result<Va
             Ok(_) => Ok(Value::Text(text.to_string())),
             Err(err) => Err(format!("invalid JSON: {err}")),
         },
-        EditorKind::Numeric { kind } => parse_numeric(text, *kind),
+        EditorKind::Numeric { kind } => parse_numeric(text, *kind, dialect),
         EditorKind::Bool => Ok(bool_value(
             dialect,
             bool_checked(&Value::Text(text.trim().to_string())),
@@ -205,7 +205,7 @@ pub fn parse_input(kind: &EditorKind, dialect: Dialect, text: &str) -> Result<Va
 /// everywhere, `Integer` rejects a fractional value rather than rounding it
 /// through the save-time cast, `Float` stages [`Value::Real`], and `Exact`
 /// stages the typed text so precision survives.
-fn parse_numeric(text: &str, kind: NumericKind) -> Result<Value, String> {
+fn parse_numeric(text: &str, kind: NumericKind, dialect: Dialect) -> Result<Value, String> {
     parse_numeric_text(
         text,
         match kind {
@@ -213,6 +213,7 @@ fn parse_numeric(text: &str, kind: NumericKind) -> Result<Value, String> {
             NumericKind::Float => TypeClass::Float,
             NumericKind::Exact => TypeClass::Exact,
         },
+        dialect,
     )
 }
 
@@ -815,8 +816,8 @@ mod tests {
 
     #[test]
     fn numeric_input_stages_integer_real_or_exact_text() {
-        let float = |s| parse_numeric(s, NumericKind::Float);
-        let exact = |s| parse_numeric(s, NumericKind::Exact);
+        let float = |s| parse_numeric(s, NumericKind::Float, Dialect::Sqlite);
+        let exact = |s| parse_numeric(s, NumericKind::Exact, Dialect::Sqlite);
         assert_eq!(float("42"), Ok(Value::Integer(42)));
         assert_eq!(float(" -7 "), Ok(Value::Integer(-7)));
         assert_eq!(float("1.5"), Ok(Value::Real(1.5)));
@@ -838,8 +839,39 @@ mod tests {
     }
 
     #[test]
+    fn a_non_finite_number_is_accepted_only_where_the_server_stores_one() {
+        // The grid shows a Postgres NaN or infinity as `NaN`/`Infinity`, so
+        // the editor must take it back — in the server's spelling for an
+        // exact column, whichever spelling was typed.
+        let on = |dialect, kind, s| parse_numeric(s, kind, dialect);
+        let exact = |s| on(Dialect::Postgres, NumericKind::Exact, s);
+        let float = |s| on(Dialect::Postgres, NumericKind::Float, s);
+        assert_eq!(exact("NaN"), Ok(Value::Text("NaN".into())));
+        assert_eq!(exact(" nan "), Ok(Value::Text("NaN".into())));
+        assert_eq!(exact("Infinity"), Ok(Value::Text("Infinity".into())));
+        assert_eq!(exact("+inf"), Ok(Value::Text("Infinity".into())));
+        assert_eq!(exact("-Infinity"), Ok(Value::Text("-Infinity".into())));
+        assert_eq!(exact("-inf"), Ok(Value::Text("-Infinity".into())));
+        assert!(matches!(float("NaN"), Ok(Value::Real(f)) if f.is_nan()));
+        assert_eq!(float("Infinity"), Ok(Value::Real(f64::INFINITY)));
+        assert_eq!(float("-inf"), Ok(Value::Real(f64::NEG_INFINITY)));
+        // Never for an integer, and nowhere else: SQL Server stores none of
+        // them and SQLite turns NaN into NULL.
+        assert!(on(Dialect::Postgres, NumericKind::Integer, "NaN").is_err());
+        for dialect in [Dialect::SqlServer, Dialect::Sqlite] {
+            for kind in [NumericKind::Exact, NumericKind::Float] {
+                for s in ["NaN", "Infinity", "-inf"] {
+                    assert!(on(dialect, kind, s).is_err(), "{dialect:?} {kind:?} {s}");
+                }
+            }
+        }
+        // Still not a number.
+        assert!(exact("nanx").is_err());
+    }
+
+    #[test]
     fn integer_columns_reject_fractional_input() {
-        let integer = |s| parse_numeric(s, NumericKind::Integer);
+        let integer = |s| parse_numeric(s, NumericKind::Integer, Dialect::Postgres);
         assert_eq!(integer("42"), Ok(Value::Integer(42)));
         assert_eq!(integer(" -7 "), Ok(Value::Integer(-7)));
         // Fractional (or any non-i64) input must not stage: the save-time

@@ -2323,3 +2323,14 @@ async fn postgres_a_real_reads_as_its_shortest_decimal_and_writes_back_unchanged
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     pool.close().await;
 }
+
+/// The grid shows a NaN or an infinity, so the editor must take one back:
+/// an unchanged NaN cell re-saves, and a typed `Infinity` stores.
+#[tokio::test]
+async fn postgres_nan_and_infinity_go_through_the_editor_and_back() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let failures = common::non_finite_edit_failures(&pool, "non_finite_edits").await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    pool.close().await;
+}
