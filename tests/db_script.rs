@@ -566,9 +566,10 @@ async fn postgres_scripts_cannot_hide_a_write_from_the_gate() {
     pool.close().await;
 }
 
-/// SQL Server ends a line comment at a bare CR and has no dollar quotes; it
-/// also needs no `;` between statements, so each script below is a SELECT
-/// and a DELETE that a lexer disagreeing on either read as one SELECT.
+/// SQL Server ends a line comment at a bare CR, has no dollar quotes, and
+/// ends a number (hex too) at its first character that cannot continue it;
+/// it also needs no `;` between statements, so each script below is a SELECT
+/// and a write that a lexer disagreeing on any of these read as one SELECT.
 #[tokio::test]
 async fn sqlserver_scripts_cannot_hide_a_write_from_the_gate() {
     let Some(url) = common::mssql_test_url().await else {
@@ -590,6 +591,8 @@ async fn sqlserver_scripts_cannot_hide_a_write_from_the_gate() {
             "SELECT $1DELETE FROM dbo.script_hidden",
             "SELECT €1DELETE FROM dbo.script_hidden",
             "SELECT .5DELETE FROM dbo.script_hidden",
+            "SELECT 0xATRUNCATE TABLE dbo.script_hidden",
+            "SELECT 0x1FTRUNCATE TABLE dbo.script_hidden",
             "SELECT 1 AS x$y$ DELETE FROM dbo.script_hidden SELECT 1 AS x$y$",
         ],
     )

@@ -312,6 +312,22 @@ pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<String> {
                         i += space;
                         continue;
                     }
+                    if dialect == Dialect::SqlServer && bytes[i].is_ascii_digit() {
+                        if let Some(number_end) = tsql_number_end(sql, i, range.end) {
+                            significant = true;
+                            body.feed(BodyToken::Other);
+                            i = number_end;
+                            // A letter straight after a number starts a word
+                            // of its own (`1BEGIN`, `0xABEGIN`).
+                            if i < range.end && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_')
+                            {
+                                let end = word_end(sql, i, range.end, dialect);
+                                body.feed(BodyToken::Word(&sql[i..end]));
+                                i = end;
+                            }
+                            continue;
+                        }
+                    }
                     if let Some((word_end, bare)) = word_at(sql, i, range.end, dialect) {
                         significant = true;
                         body.feed(if bare {
@@ -397,11 +413,6 @@ fn word_at(sql: &str, at: usize, end: usize, dialect: Dialect) -> Option<(usize,
                 .find(|&i| sql.is_char_boundary(i))
                 .unwrap_or(0);
             unicode_space_len(sql, start, dialect) == 0
-        } else if dialect == Dialect::SqlServer && b.is_ascii_digit() {
-            // T-SQL ends a number at the first letter: `1BEGIN` is `1`,
-            // then BEGIN (see `strip_strings_and_comments`). A digit inside
-            // a name never gets here: the name's word swallowed it.
-            false
         } else {
             is_word_byte(b) && !matches!(b, b'@' | b'#' | b'$')
         }
@@ -409,14 +420,80 @@ fn word_at(sql: &str, at: usize, end: usize, dialect: Dialect) -> Option<(usize,
     if !starts || continues {
         return None;
     }
+    let bare = !matches!(previous, Some(b'.' | b'@' | b'#' | b'$'));
+    Some((word_end(sql, at, end, dialect), bare))
+}
+
+/// Where the word starting at `sql[at..]` ends (never past `end`). A word
+/// runs on through digits and letters alike: an identifier such as
+/// `a1begin` is one name to every engine here.
+fn word_end(sql: &str, at: usize, end: usize, dialect: Dialect) -> usize {
+    let bytes = sql.as_bytes();
     let mut j = at + 1;
-    // A word runs on through digits and letters alike: an identifier such as
-    // `a1begin` is one name to T-SQL too.
     while j < end && is_word_byte(bytes[j]) && unicode_space_len(sql, j, dialect) == 0 {
         j += 1;
     }
-    let bare = !matches!(previous, Some(b'.' | b'@' | b'#' | b'$'));
-    Some((j, bare))
+    j
+}
+
+/// If a T-SQL number literal starts at the ASCII digit `sql[at]`, returns
+/// where it ends (never past `end`).
+///
+/// T-SQL ends a number at the first character that cannot continue it, and
+/// a letter there starts the next token: measured on SQL Server 2022,
+/// `SELECT 1DELETE FROM t`, `1.5DELETE`, `1e+1DELETE`, `1e1EXEC p` and
+/// `0xAUPDATE t SET …` each run the statement after the number. The grammar
+/// is digits, an optional `.` and digits, and an optional `e`, sign and
+/// digits (`1EXEC` is `1E`, then `XEC`), or `0x` and a run of **hex** digits
+/// (`0xFDELETE` is `0x0FDE`, then `LETE`).
+///
+/// A digit starts a number only where a token can start: not after an
+/// identifier character, `@` or `#` (`a1begin`, `@1begin` and `#1begin` are
+/// names), not after a `$` that continues a name (`x$1begin`), and not after
+/// a `.` that follows a name (`m.5DELETE` is a syntax error). After any other
+/// character it does — a currency sign included, since T-SQL money literals
+/// take one (`$1DELETE`, `€1DELETE`, `＄1DELETE` all ran the DELETE). Only
+/// SQL Server reads numbers this way; Postgres and SQLite reject a letter
+/// straight after a number.
+fn tsql_number_end(sql: &str, at: usize, end: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    // The character before `at`, and the one before that.
+    let before = |i: usize| sql[..i].chars().next_back();
+    let in_name = |c: char| c.is_alphanumeric() || matches!(c, '_' | '@' | '#' | '$');
+    let starts = match before(at) {
+        None => true,
+        Some(c @ ('$' | '.')) => !before(at - c.len_utf8())
+            .is_some_and(|p| in_name(p) || (c == '.' && matches!(p, ']' | '"'))),
+        Some(c) => !in_name(c),
+    };
+    if !starts {
+        return None;
+    }
+    let digits = |mut j: usize| {
+        while j < end && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        j
+    };
+    if bytes[at] == b'0' && at + 1 < end && matches!(bytes[at + 1], b'x' | b'X') {
+        let mut j = at + 2;
+        while j < end && bytes[j].is_ascii_hexdigit() {
+            j += 1;
+        }
+        return Some(j);
+    }
+    let mut j = digits(at);
+    if j < end && bytes[j] == b'.' {
+        j = digits(j + 1);
+    }
+    if j < end && matches!(bytes[j], b'e' | b'E') {
+        j += 1;
+        if j < end && matches!(bytes[j], b'+' | b'-') {
+            j += 1;
+        }
+        j = digits(j);
+    }
+    Some(j)
 }
 
 /// One token of a statement, as [`BodyTracker`] sees it. Comments are not
@@ -895,9 +972,11 @@ pub struct StatementNeeds {
 /// tokenizer ([`region_at`]), and every place the two disagree is a
 /// statement the scan cannot see — several such places were found by
 /// measuring and are now matched, and nothing proves there are no more. It
-/// is the first line: it explains a refusal before anything runs. Enforcing
-/// read-only at the connection itself is the backstop that does not depend
-/// on lexing.
+/// explains a refusal before anything runs, but it is also, today, the only
+/// line: nothing enforces read-only at the connection itself (a read-only
+/// session or transaction mode). That is the gap; once connection-level
+/// enforcement exists, it becomes the backstop that does not depend on
+/// lexing.
 pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
     // Stripped once here; every scan below works on the stripped form.
     // Each helper used to re-strip the same statement, up to ~6
@@ -1140,14 +1219,14 @@ fn has_word(stripped: &str, matches: impl Fn(&str) -> bool) -> bool {
 /// not DELETE me'`, a quote inside a bracketed identifier can't invert string
 /// tracking, and a keyword inside one can't masquerade as a token.
 ///
-/// On SQL Server a space is also put between a digit and a letter (or `_`)
-/// straight after it, so word scans see the token boundary the engine sees:
-/// T-SQL ends a number at the first letter, so measured on SQL Server 2022,
-/// `SELECT 1DELETE FROM t`, `.5DELETE`, `1e+1DELETE`, `$1DELETE`,
-/// `€1DELETE` and `0x1UPDATE t SET …` each run the write. Postgres and
-/// SQLite reject a letter after a number ("trailing junk" / "unrecognized
-/// token"), so they keep the text as is. An identifier with a keyword after
-/// a digit (`tbl1delete`) is then over-charged — the safe side.
+/// On SQL Server a space is also put between a number literal and a letter
+/// straight after it, so word scans see the token boundary the engine sees
+/// ([`tsql_number_end`]: `SELECT 1DELETE FROM t` and `0xAUPDATE t SET …`
+/// each run the write). That is the one case where the result is longer
+/// than `sql`. Names keep their digits: `@1delete` or `tbl1delete` is one
+/// word, as it is to the engine. Postgres and SQLite reject a letter after a
+/// number ("trailing junk" / "unrecognized token"), so they keep the text
+/// as is.
 fn strip_strings_and_comments(sql: &str, dialect: Dialect) -> String {
     let bytes = sql.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -1156,20 +1235,30 @@ fn strip_strings_and_comments(sql: &str, dialect: Dialect) -> String {
             out.resize(out.len() + range.len(), b' ');
             continue;
         }
-        for &byte in &bytes[range] {
-            if dialect == Dialect::SqlServer
-                && (byte.is_ascii_alphabetic() || byte == b'_')
-                && out.last().is_some_and(u8::is_ascii_digit)
-            {
-                out.push(b' ');
+        let mut i = range.start;
+        while i < range.end {
+            if dialect == Dialect::SqlServer && bytes[i].is_ascii_digit() {
+                if let Some(number_end) = tsql_number_end(sql, i, range.end) {
+                    out.extend_from_slice(&bytes[i..number_end]);
+                    if number_end < range.end
+                        && (bytes[number_end].is_ascii_alphabetic() || bytes[number_end] == b'_')
+                    {
+                        out.push(b' ');
+                    }
+                    i = number_end;
+                    continue;
+                }
             }
-            out.push(byte);
+            out.push(bytes[i]);
+            i += 1;
         }
     }
     // Multibyte chars survive intact: regions always start and end at ASCII
     // delimiters (a UTF-8 continuation byte can never equal an ASCII
     // quote/comment marker), so a code region copied here is never split
-    // mid-sequence, and a space is only ever put before an ASCII byte.
+    // mid-sequence. The output has the input's byte length, except on SQL
+    // Server, where a space put after a number literal adds one byte each
+    // time — always before an ASCII letter, never inside a character.
     String::from_utf8_lossy(&out).into_owned()
 }
 
@@ -1991,6 +2080,25 @@ mod tests {
                 "SELECT 2"
             ]
         );
+        // A number ends at its first non-digit (non-hex after `0x`), so the
+        // word after it is a keyword (measured: `0xAUPDATE` ran an UPDATE)…
+        assert_eq!(
+            split_mssql("SELECT 1BEGIN SELECT 1; END; SELECT 2"),
+            ["SELECT 1BEGIN SELECT 1; END", "SELECT 2"]
+        );
+        // A hex literal takes every hex letter, so `0x1BEGIN` is `0x1BE`, then
+        // `GIN` — no BEGIN. (BEGIN, CASE and END all start with a hex letter.)
+        assert_eq!(
+            split_mssql("SELECT 0x1BEGIN; SELECT 2"),
+            ["SELECT 0x1BEGIN", "SELECT 2"]
+        );
+        // …but a digit inside a variable, temp table or other name starts no
+        // number, so nothing in it is a keyword (measured: `@1begin` and
+        // `#1begin` are legal names).
+        assert_eq!(
+            split_mssql("SELECT @1begin, #1begin, x1begin, x$1begin; SELECT 2"),
+            ["SELECT @1begin, #1begin, x1begin, x$1begin", "SELECT 2"]
+        );
         // An unclosed block cannot swallow the next batch: GO ends it.
         assert_eq!(
             split_mssql("BEGIN SELECT 1;\nGO\nSELECT 2; SELECT 3"),
@@ -2266,6 +2374,19 @@ mod tests {
             (Ms, "SELECT €1DELETE FROM t", MUTATE),
             (Ms, "SELECT 0x1UPDATE t SET a = 5", MUTATE),
             (Ms, "SELECT 1BEGIN DELETE FROM t; SELECT 2; END", MUTATE),
+            (Ms, "SELECT 0xAUPDATE t SET a = 1", MUTATE),
+            (Ms, "SELECT 0x1FINSERT INTO t VALUES (1)", MUTATE),
+            (
+                Ms,
+                "SELECT 0xFMERGE INTO t USING u ON 1 = 1 WHEN MATCHED THEN DELETE;",
+                MUTATE,
+            ),
+            (Ms, "SELECT 0xAGRANT SELECT ON t TO u", DDL),
+            (Ms, "SELECT 0xFREVOKE SELECT ON t FROM u", DDL),
+            (Ms, "SELECT 0xAKILL 5", BOTH),
+            (Ms, "SELECT 0xFINTO t2 FROM t", BOTH),
+            (Ms, "SELECT ＄1DELETE FROM t", MUTATE),
+            (Ms, "SELECT 1e1EXEC sp_who", BOTH),
             // Allowed: transaction control alone, and plain reads.
             (Ms, "BEGIN TRAN", NONE),
             (Ms, "BEGIN TRANSACTION", NONE),
@@ -2290,6 +2411,14 @@ mod tests {
             (Pg, "SELECT $q$ DELETE $q$", NONE),
             (Ms, "SELECT 1 /* /* */ DELETE FROM t */", NONE),
             (Ms, "SELECT 0x1F, 1e5, $2.50 FROM t", NONE),
+            // A hex literal keeps its hex letters (`0xFDELETE` is `0x0FDE`,
+            // then `LETE`: measured), and names keep their digits.
+            (Ms, "SELECT 0xFDELETE FROM t", NONE),
+            (
+                Ms,
+                "SELECT @1delete, #1delete, x1delete, x$1delete, É1delete",
+                NONE,
+            ),
         ];
         let caps_sets = [
             ("full", Capabilities::FULL),
@@ -3225,13 +3354,17 @@ mod tests {
             strip_strings_and_comments("SELECT $$drop$$, $t$delete$t$, $1", Dialect::Postgres);
         assert!(!stripped.contains("drop"));
         assert!(!stripped.contains("delete"));
-        assert!(stripped.contains("$1")); // parameter placeholder survives
-                                          // Length in bytes is preserved and multibyte text stays valid UTF-8.
+        // A parameter placeholder survives.
+        assert!(stripped.contains("$1"));
+        // Multibyte text stays valid UTF-8, and the byte length is kept —
+        // except on SQL Server, where a number glued to a word gets a space.
         let input = "SELECT übercol, 'смузи' FROM t";
         let stripped = strip_strings_and_comments(input, Dialect::Sqlite);
         assert_eq!(stripped.len(), input.len());
         assert!(stripped.contains("übercol"));
         assert!(!stripped.contains("смузи"));
+        let stripped = strip_strings_and_comments("SELECT 1DELETE", Dialect::SqlServer);
+        assert_eq!(stripped, "SELECT 1 DELETE");
     }
 
     #[test]
