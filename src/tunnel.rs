@@ -8,8 +8,10 @@
 
 use std::borrow::Cow;
 use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use russh::client;
 #[cfg(any(unix, windows))]
@@ -21,10 +23,32 @@ use russh::keys::{
 };
 use russh::Disconnect;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 mod known_hosts;
+
+/// How long reaching the SSH server may take — the TCP connect, the key
+/// exchange and the host key check — before the attempt is abandoned. The
+/// bound a Postgres open already has (sqlx's 30s acquire timeout). Measured
+/// without it: a bastion that drops SYNs held the connect for 133s on Linux,
+/// and one that accepts the TCP connection and never sends its banner held it
+/// for good.
+///
+/// Authentication is deliberately outside it: an agent may be waiting on the
+/// user (a confirmation prompt, a hardware key's touch), and a connect the
+/// user can see is waiting can be cancelled from its row.
+const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Once authenticated, a session that has heard nothing from the server for
+/// this long sends it a keepalive, and [`KEEPALIVE_MAX`] unanswered ones end
+/// the session. Without them a bastion that vanished silently (a dropped
+/// network, a suspended laptop's NAT entry gone) leaves the session looking
+/// alive for as long as the OS keeps retransmitting — and every forward
+/// through it hanging.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const KEEPALIVE_MAX: usize = 3;
 
 /// SSH tunnel settings persisted with a saved connection. No secrets here:
 /// key passphrases live in the OS keyring / session memory, like database
@@ -244,8 +268,15 @@ fn recorded_key_algorithms(host: &str, port: u16, files: &[PathBuf]) -> Vec<Algo
 /// check that a different type is Changed rather than Unknown is
 /// [`host_key_verdict`]'s, since negotiation is not enforced on the key a
 /// server sends. Nothing recorded → russh's defaults.
+///
+/// It also turns on keepalives ([`KEEPALIVE_INTERVAL`]), which russh leaves
+/// off.
 fn client_config(host: &str, port: u16, known_hosts_read: &[PathBuf]) -> client::Config {
-    let mut ssh_config = client::Config::default();
+    let mut ssh_config = client::Config {
+        keepalive_interval: Some(KEEPALIVE_INTERVAL),
+        keepalive_max: KEEPALIVE_MAX,
+        ..client::Config::default()
+    };
     let pinned = recorded_key_algorithms(host, port, known_hosts_read);
     if !pinned.is_empty() {
         ssh_config.preferred.key = Cow::Owned(pinned);
@@ -305,12 +336,20 @@ pub fn trust_host_key(
 /// known_hosts. `check_server_key` records its verdict (and the offered key) so
 /// [`Tunnel::open`] can turn a rejection into a precise [`TunnelError`] after
 /// `client::connect` fails.
+///
+/// The session owns its handler and drops it when it ends, however it ends,
+/// which is what makes `alive` the session's end signal (see
+/// [`Tunnel::session_ended`]). russh's own `disconnected` callback is not
+/// that: it is skipped when shutting down the socket fails, which is the
+/// likely case for a connection the server reset.
 struct HostKeyVerifier {
     host: String,
     port: u16,
     files: Vec<PathBuf>,
     verdict: Arc<Mutex<Option<HostKeyStatus>>>,
     offered_key: Arc<Mutex<Option<PublicKey>>>,
+    /// Never sent on; held only to be dropped with the session.
+    _alive: watch::Sender<()>,
 }
 
 impl client::Handler for HostKeyVerifier {
@@ -345,6 +384,10 @@ impl client::Handler for HostKeyVerifier {
 /// listener, aborts in-flight forwards, and disconnects the session.
 pub struct Tunnel {
     local_port: u16,
+    /// `host:port` of the SSH server, for [`Self::ended_message`].
+    server: String,
+    /// Closes when the SSH session ends (see [`HostKeyVerifier`]).
+    alive: watch::Receiver<()>,
     shutdown: Option<oneshot::Sender<()>>,
     /// Kept so the accept loop is tied to the tunnel's lifetime; the loop
     /// exits via the shutdown signal, not via abort, so the SSH disconnect
@@ -374,12 +417,35 @@ impl Tunnel {
     /// [`TunnelError::HostKeyUnknown`], a changed one
     /// [`TunnelError::HostKeyChanged`] and a revoked one
     /// [`TunnelError::HostKeyRevoked`], all before authentication.
+    ///
+    /// Reaching the server is abandoned after [`SSH_CONNECT_TIMEOUT`].
     pub async fn open(
         config: TunnelConfig,
         passphrase: Option<String>,
         target_host: String,
         target_port: u16,
         known_hosts_read: &[PathBuf],
+    ) -> Result<Tunnel, TunnelError> {
+        Self::open_within(
+            config,
+            passphrase,
+            target_host,
+            target_port,
+            known_hosts_read,
+            SSH_CONNECT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// [`Self::open`] with the connect bound as a parameter, so a test can
+    /// wait out a short one.
+    async fn open_within(
+        config: TunnelConfig,
+        passphrase: Option<String>,
+        target_host: String,
+        target_port: u16,
+        known_hosts_read: &[PathBuf],
+        connect_limit: Duration,
     ) -> Result<Tunnel, TunnelError> {
         // Load (and decrypt) the key first: fail fast on passphrase
         // problems without a wasted SSH connection.
@@ -392,14 +458,26 @@ impl Tunnel {
         let address = (config.host.as_str(), config.port);
         let verdict = Arc::new(Mutex::new(None));
         let offered_key = Arc::new(Mutex::new(None));
+        let (alive_tx, alive) = watch::channel(());
         let verifier = HostKeyVerifier {
             host: config.host.clone(),
             port: config.port,
             files: known_hosts_read.to_vec(),
             verdict: Arc::clone(&verdict),
             offered_key: Arc::clone(&offered_key),
+            _alive: alive_tx,
         };
-        let mut handle = match client::connect(ssh_config, address, verifier).await {
+        let connect = client::connect(ssh_config, address, verifier);
+        let connected = match tokio::time::timeout(connect_limit, connect).await {
+            Ok(connected) => connected,
+            Err(_) => {
+                return Err(TunnelError::Connect(format!(
+                    "{}:{}: no answer within {connect_limit:?}",
+                    config.host, config.port
+                )))
+            }
+        };
+        let mut handle = match connected {
             Ok(handle) => handle,
             // If the handshake failed because we rejected the host key, turn
             // the generic connect error into a precise host-key error the UI
@@ -434,7 +512,7 @@ impl Tunnel {
             .port();
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let task = tokio::spawn(accept_loop(
+        let task = tokio::spawn(forward(
             handle,
             listener,
             target_host,
@@ -444,9 +522,34 @@ impl Tunnel {
 
         Ok(Tunnel {
             local_port,
+            server: format!("{}:{}", config.host, config.port),
+            alive,
             shutdown: Some(shutdown_tx),
             _task: task,
         })
+    }
+
+    /// Resolves once the SSH session has ended: the server closed it, the
+    /// network dropped it (noticed by keepalives, [`KEEPALIVE_INTERVAL`]), or
+    /// the tunnel was dropped. From then on nothing can be forwarded, so a
+    /// database connection over the tunnel is gone even though its pool does
+    /// not know it — measured, with the bastion killed, every query on a
+    /// Postgres tab failed at once with "unexpected response from
+    /// SSLRequest" or "Connection reset by peer", and the tab still looked
+    /// connected. This is how the UI finds out.
+    ///
+    /// The forward itself keeps accepting, and each connection it accepts
+    /// fails its channel open at once and is closed. That is what keeps those
+    /// failures immediate: closing the port instead was tried, and a refused
+    /// connect is one sqlx retries until its 30s acquire timeout, so every
+    /// query took 30s to fail.
+    pub fn session_ended(&self) -> impl Future<Output = ()> + Send + 'static {
+        session_end(self.alive.clone())
+    }
+
+    /// What to tell the user once [`Self::session_ended`] has resolved.
+    pub fn ended_message(&self) -> String {
+        format!("SSH tunnel: the session to {} has ended", self.server)
     }
 
     /// The forwarded local port: connect Postgres to
@@ -617,16 +720,67 @@ async fn best_rsa_hash(handle: &client::Handle<HostKeyVerifier>, is_rsa: bool) -
     }
 }
 
-/// Accepts local connections and forwards each through its own
-/// `direct-tcpip` channel until the shutdown signal fires, then disconnects
-/// the SSH session. Dropping the `JoinSet` aborts in-flight copies.
-async fn accept_loop(
+/// Resolves when the sender half of `alive` is dropped — the session's end.
+async fn session_end(mut alive: watch::Receiver<()>) {
+    // Nothing is ever sent, so `changed` returns only once the sender is gone.
+    while alive.changed().await.is_ok() {}
+}
+
+/// Runs the forward over this session until the tunnel is dropped, then
+/// disconnects the session.
+async fn forward(
     handle: client::Handle<HostKeyVerifier>,
     listener: TcpListener,
     target_host: String,
     target_port: u16,
-    mut shutdown: oneshot::Receiver<()>,
+    shutdown: oneshot::Receiver<()>,
 ) {
+    let handle = Arc::new(handle);
+    let open = {
+        let handle = Arc::clone(&handle);
+        move |peer_port: u16| {
+            let handle = Arc::clone(&handle);
+            let target_host = target_host.clone();
+            async move {
+                handle
+                    .channel_open_direct_tcpip(
+                        target_host,
+                        u32::from(target_port),
+                        "127.0.0.1".to_string(),
+                        u32::from(peer_port),
+                    )
+                    .await
+                    .map(|channel| channel.into_stream())
+            }
+        }
+    };
+    accept_loop(listener, open, shutdown).await;
+    let _ = handle
+        .disconnect(Disconnect::ByApplication, "tunnel closed", "")
+        .await;
+}
+
+/// Accepts local connections and forwards each through the stream `open`
+/// makes for it — a `direct-tcpip` channel — until the shutdown signal fires.
+/// Returning drops the listener, so the local port stops accepting, and the
+/// `JoinSet`, which aborts in-flight forwards.
+///
+/// Opening a channel is a round trip to the SSH server, and for OpenSSH it
+/// lasts until the server's own connect to the target completes. So it runs
+/// inside the forward's task, never in this loop: awaited here, it held up
+/// every later connection and the shutdown signal with it — measured, a
+/// target that drops SYNs kept a second client waiting past 150s and a
+/// dropped tunnel's port open past 200s.
+async fn accept_loop<O, F, S, E>(
+    listener: TcpListener,
+    open: O,
+    mut shutdown: oneshot::Receiver<()>,
+) where
+    O: Fn(u16) -> F,
+    F: Future<Output = Result<S, E>> + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    E: Send + 'static,
+{
     let mut copies = tokio::task::JoinSet::new();
     loop {
         // Reap finished forwards so their results don't accumulate for the
@@ -641,32 +795,17 @@ async fn accept_loop(
                     // must not kill the tunnel; only shutdown ends the loop.
                     Err(_) => continue,
                 };
-                let channel = handle
-                    .channel_open_direct_tcpip(
-                        target_host.clone(),
-                        u32::from(target_port),
-                        "127.0.0.1".to_string(),
-                        u32::from(peer.port()),
-                    )
-                    .await;
-                match channel {
-                    Ok(channel) => {
-                        copies.spawn(async move {
-                            let mut channel_stream = channel.into_stream();
-                            let _ = tokio::io::copy_bidirectional(&mut stream, &mut channel_stream)
-                                .await;
-                        });
+                let channel = open(peer.port());
+                copies.spawn(async move {
+                    // A failed open drops the client's socket, and its pool
+                    // reports a connection error. Nothing useful to add here.
+                    if let Ok(mut channel) = channel.await {
+                        let _ = tokio::io::copy_bidirectional(&mut stream, &mut channel).await;
                     }
-                    // The client sees its socket close; the pool reports a
-                    // connection error. Nothing useful to do here.
-                    Err(_) => drop(stream),
-                }
+                });
             }
         }
     }
-    let _ = handle
-        .disconnect(Disconnect::ByApplication, "tunnel closed", "")
-        .await;
 }
 
 #[cfg(test)]
@@ -870,6 +1009,7 @@ mod tests {
             files: vec![path],
             verdict: Arc::default(),
             offered_key: Arc::default(),
+            _alive: watch::channel(()).0,
         };
         let offered = PublicKeyOrCertificate::from(pubkey(KEY_ECDSA));
         assert!(!verifier.check_server_key(&offered).await.unwrap());
@@ -1007,6 +1147,7 @@ mod tests {
             files: vec![path.clone()],
             verdict: Arc::default(),
             offered_key: Arc::default(),
+            _alive: watch::channel(()).0,
         };
 
         // Control: the recorded key, offered bare, is trusted.
@@ -1307,6 +1448,7 @@ mod tests {
             files: vec![path],
             verdict: Arc::default(),
             offered_key: Arc::default(),
+            _alive: watch::channel(()).0,
         };
         let offered = PublicKeyOrCertificate::from(pubkey(KEY_A));
         assert!(!verifier.check_server_key(&offered).await.unwrap());
@@ -1392,5 +1534,117 @@ mod tests {
         assert!(text.contains("method = \"keyfile\""));
         let back: TunnelConfig = toml::from_str(&text).unwrap();
         assert_eq!(back, keyfile);
+    }
+
+    #[tokio::test]
+    async fn an_ssh_server_that_never_answers_is_given_up_on_at_the_bound() {
+        // Accepted by the kernel, never by anyone who speaks SSH: measured,
+        // russh waits for the banner for good. Agent auth, so no key file is
+        // read before the connect.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let config = TunnelConfig {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            user: "nobody".into(),
+            auth: TunnelAuth::Agent,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            Tunnel::open_within(
+                config,
+                None,
+                "db".into(),
+                5432,
+                &[],
+                Duration::from_millis(300),
+            ),
+        )
+        .await
+        .expect("the connect must give up at its bound");
+        let Err(TunnelError::Connect(message)) = result else {
+            panic!("expected a connect error, got {result:?}");
+        };
+        assert!(message.ends_with("no answer within 300ms"), "{message}");
+    }
+
+    /// Runs [`accept_loop`] on a fresh listener whose channel opens are made
+    /// by `open`, returning the port, the shutdown sender and the loop's task.
+    async fn run_accept_loop<O, F>(
+        open: O,
+    ) -> (u16, oneshot::Sender<()>, tokio::task::JoinHandle<()>)
+    where
+        O: Fn(u16) -> F + Send + 'static,
+        F: Future<Output = Result<tokio::io::DuplexStream, ()>> + Send + 'static,
+    {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (shutdown_tx, shutdown) = oneshot::channel();
+        let task = tokio::spawn(accept_loop(listener, open, shutdown));
+        (port, shutdown_tx, task)
+    }
+
+    /// Whether a connect to the port is refused, i.e. the listener is gone.
+    async fn refused(port: u16) -> bool {
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err()
+    }
+
+    #[tokio::test]
+    async fn a_channel_that_never_opens_holds_up_neither_the_next_nor_shutdown() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        // The first open never completes — a target that drops SYNs keeps
+        // OpenSSH's channel open pending for minutes. Every later one opens
+        // at once onto a stream that greets its client.
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let open = {
+            let opens = Arc::clone(&opens);
+            move |_peer: u16| {
+                let first = opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                async move {
+                    if first {
+                        std::future::pending::<()>().await;
+                    }
+                    let (mut far, near) = tokio::io::duplex(64);
+                    far.write_all(b"hi").await.unwrap();
+                    // Keep the far end open for as long as the forward runs.
+                    tokio::spawn(async move {
+                        let mut sink = [0u8; 1];
+                        let _ = far.read(&mut sink).await;
+                    });
+                    Ok(near)
+                }
+            }
+        };
+        let (port, shutdown, task) = run_accept_loop(open).await;
+        let _stuck = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut next = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut greeting = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(5), next.read_exact(&mut greeting))
+            .await
+            .expect("the second client must not wait behind the first one's channel")
+            .unwrap();
+        assert_eq!(&greeting, b"hi");
+
+        shutdown.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("shutdown must not wait behind a pending channel")
+            .unwrap();
+        assert!(refused(port).await, "the port must close with the tunnel");
+    }
+
+    #[test]
+    fn sessions_send_keepalives() {
+        let config = client_config("h", 22, &[]);
+        assert_eq!(config.keepalive_interval, Some(KEEPALIVE_INTERVAL));
+        assert_ne!(
+            config.keepalive_max, 0,
+            "0 would never end a silent session"
+        );
     }
 }

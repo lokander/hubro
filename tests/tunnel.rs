@@ -263,6 +263,86 @@ async fn dropping_the_tunnel_closes_the_local_listener() {
     panic!("the local listener still accepts connections after the tunnel was dropped");
 }
 
+/// A forwarder between the tunnel and the SSH server that the test can cut,
+/// as a network failure would. Returns its port and the task to abort.
+async fn cuttable_link(host: &str, port: u16) -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let local = listener.local_addr().unwrap().port();
+    let server = (host.to_string(), port);
+    let link = tokio::spawn(async move {
+        // Aborting this task drops the set, which aborts every connection.
+        let mut connections = tokio::task::JoinSet::new();
+        while let Ok((mut client, _)) = listener.accept().await {
+            let server = server.clone();
+            connections.spawn(async move {
+                let mut upstream = tokio::net::TcpStream::connect((server.0.as_str(), server.1))
+                    .await
+                    .unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+            });
+        }
+    });
+    (local, link)
+}
+
+#[tokio::test]
+async fn a_session_that_ends_under_the_tunnel_is_reported_and_fails_fast() {
+    let Some(env) = ssh_env() else { return };
+    let (port, link) = cuttable_link(&env.host, env.port).await;
+    // Through the link, the server is a new host:port as far as known_hosts
+    // is concerned, so trust it there.
+    let config = TunnelConfig {
+        host: "127.0.0.1".into(),
+        port,
+        ..env.config()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let kh = vec![dir.path().join("known_hosts")];
+    let Err(TunnelError::HostKeyUnknown(info)) =
+        Tunnel::open(config.clone(), None, env.db_host.clone(), env.db_port, &kh).await
+    else {
+        panic!("first contact through the link must ask about the host key");
+    };
+    hubro::tunnel::trust_host_key(&info.host, info.port, &info.key_openssh, &kh[0]).unwrap();
+    let tunnel = Tunnel::open(config, None, env.db_host.clone(), env.db_port, &kh)
+        .await
+        .expect("tunnel should open through the link");
+    let url = format!(
+        "postgres://tester:testpass@127.0.0.1:{}/demo",
+        tunnel.local_port()
+    );
+    let pool = DbPool::open_postgres(&url)
+        .await
+        .expect("pg through tunnel");
+    pool.query("SELECT 1").await.expect("query");
+    let ended = tunnel.session_ended();
+    tokio::pin!(ended);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), &mut ended)
+            .await
+            .is_err(),
+        "a live session must not read as ended"
+    );
+
+    link.abort();
+    tokio::time::timeout(std::time::Duration::from_secs(5), &mut ended)
+        .await
+        .expect("the tunnel must notice its session ended");
+    assert!(tunnel
+        .ended_message()
+        .contains(&format!("127.0.0.1:{port}")));
+    // And the connection over it fails at once rather than after a timeout:
+    // the forward keeps accepting and closes what it cannot open, where a
+    // closed port would have had sqlx retry for its 30s acquire timeout.
+    let failed = tokio::time::timeout(std::time::Duration::from_secs(5), pool.query("SELECT 1"))
+        .await
+        .expect("a query over a dead session must fail promptly");
+    assert!(failed.is_err(), "{failed:?}");
+    pool.close().await;
+}
+
 // The desktop app drives the tunnel from a multi-thread tokio runtime
 // (dioxus-desktop), unlike the current-thread runtime of plain
 // `#[tokio::test]` — cover that environment too.
