@@ -19,8 +19,9 @@
 //!   everything else. Every failure degrades to raw text rather than
 //!   erroring — a plan nobody can parse is still a plan the user can read.
 
+use super::registry::PLAN_CELL_CAP;
 use super::script::is_explain;
-use super::value::QueryResult;
+use super::value::{QueryResult, Value};
 
 /// Why a connection offers no plan view. SQL Server has no `EXPLAIN`
 /// statement: its estimated plan comes from `SET SHOWPLAN_XML ON`, a session
@@ -121,6 +122,21 @@ impl PlanDisplay {
         }
         PlanDisplay::Raw(raw_text(result))
     }
+}
+
+/// Whether an `EXPLAIN` result holds a cell that reached [`PLAN_CELL_CAP`],
+/// and so was cut off there by the script path. A cut-off JSON plan cannot
+/// parse and lands in [`PlanDisplay::Raw`]; this is what lets the plan view
+/// say why, rather than show a document that stops mid-string.
+///
+/// The cap trims at a character boundary, up to three bytes short of it, so
+/// a plan that happens to end within those bytes reads as cut off too.
+pub fn plan_reached_cell_cap(result: &QueryResult) -> bool {
+    result
+        .rows
+        .iter()
+        .flatten()
+        .any(|value| matches!(value, Value::Text(text) if text.len() + 3 >= PLAN_CELL_CAP))
 }
 
 /// The first cell of a result, when it has one — where PostgreSQL puts the
@@ -748,5 +764,24 @@ mod tests {
                 "id | parent | notused | detail\n2 | 0 | 0 | SCAN artists".to_string()
             )
         );
+    }
+
+    #[test]
+    fn a_plan_is_cut_off_only_when_a_cell_reaches_the_plan_cap() {
+        let text = |len: usize| QueryResult {
+            columns: vec![ColumnInfo {
+                name: "QUERY PLAN".into(),
+            }],
+            rows: vec![vec![Value::Text("x".repeat(len))]],
+        };
+        // The cap trims at a character boundary, so anything from three bytes
+        // short of it counts.
+        assert!(plan_reached_cell_cap(&text(PLAN_CELL_CAP)));
+        assert!(plan_reached_cell_cap(&text(PLAN_CELL_CAP - 3)));
+        assert!(!plan_reached_cell_cap(&text(PLAN_CELL_CAP - 4)));
+        // The display cap ordinary cells get is far below it: a plan the
+        // size of that cap is a whole plan here.
+        assert!(!plan_reached_cell_cap(&text(64 * 1024)));
+        assert!(!plan_reached_cell_cap(&result(&["QUERY PLAN"], &[])));
     }
 }

@@ -4,9 +4,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::db::{
-    needs_confirmation, ConnectionId, Dialect, ExportFormat, PlanDisplay, PlanNode, PlanTree,
-    QueryResult, Rollback, StatementOutcome, TableMeta, Value, EXPENSIVE_SHARE, MARKED_READ_ONLY,
-    MAX_QUERY_ROWS, NO_DDL, NO_EXPLAIN, NO_MUTATE, NO_QUERY,
+    needs_confirmation, plan_reached_cell_cap, ConnectionId, Dialect, ExportFormat, PlanDisplay,
+    PlanNode, PlanTree, QueryResult, Rollback, StatementOutcome, TableMeta, Value, EXPENSIVE_SHARE,
+    MARKED_READ_ONLY, MAX_QUERY_ROWS, NO_DDL, NO_EXPLAIN, NO_MUTATE, NO_QUERY, PLAN_CELL_CAP,
 };
 
 use super::history_panel::HistoryPanel;
@@ -1060,6 +1060,8 @@ fn PlanSection(index: usize, structured: bool, result: SharedStatement) -> Eleme
         // shape the type allows rather than one seen in practice.
         StatementOutcome::Affected(n) => PlanDisplay::Raw(format!("{n} rows affected")),
     };
+    let cut_off =
+        matches!(&result.outcome, StatementOutcome::Rows(rows) if plan_reached_cell_cap(rows));
     rsx! {
         div { class: "border-b border-slate-200 dark:border-slate-800",
             p { class: "flex items-baseline gap-2 bg-slate-100 dark:bg-slate-900/60 px-4 py-1.5 text-xs",
@@ -1077,6 +1079,18 @@ fn PlanSection(index: usize, structured: bool, result: SharedStatement) -> Eleme
                         kind: BannerKind::Warning,
                         message: format!(
                             "Plan truncated — showing the first {MAX_QUERY_ROWS} rows of output.",
+                        ),
+                    }
+                }
+            }
+            if cut_off {
+                div { class: "px-4 pt-2",
+                    Banner {
+                        kind: BannerKind::Warning,
+                        message: format!(
+                            "Plan cut off — the server's output is larger than the {} MiB hubro \
+                             fetches, so only its beginning is shown.",
+                            PLAN_CELL_CAP / (1024 * 1024),
                         ),
                     }
                 }

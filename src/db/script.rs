@@ -15,7 +15,9 @@ use std::ops::Range;
 
 use super::caps::{self, Capabilities};
 use super::error::DbError;
-use super::registry::{engine_enforces_read_only, DbPool, ReadOnlyRun, MAX_QUERY_ROWS};
+use super::registry::{
+    engine_enforces_read_only, DbPool, ReadOnlyRun, MAX_QUERY_ROWS, PLAN_CELL_CAP, QUERY_CELL_CAP,
+};
 use super::sql::Dialect;
 use super::value::QueryResult;
 
@@ -1693,6 +1695,20 @@ fn refuse_script(
     })
 }
 
+/// The per-cell byte cap for one statement's rows on the script path:
+/// [`PLAN_CELL_CAP`] for an `EXPLAIN`, whose output is a plan document that a
+/// prefix of cannot be parsed or read, and [`QUERY_CELL_CAP`] for everything
+/// else — the display cap ordinary queries keep. Decided by the statement
+/// rather than by the Explain button, so a plan the user typed and ran is
+/// whole too.
+fn cell_cap(statement: &str) -> usize {
+    if is_explain(statement) {
+        PLAN_CELL_CAP
+    } else {
+        QUERY_CELL_CAP
+    }
+}
+
 /// The autocommit path: each statement commits on its own, so a failure leaves
 /// earlier statements' effects in place ([`Rollback::None`]).
 async fn run_script_sequential(
@@ -1704,7 +1720,7 @@ async fn run_script_sequential(
         // Reads stream through the row cap so a huge result never buffers in
         // full; writes report an affected-row count as before.
         let outcome = if classify_statement(statement, pool.dialect()).returns_rows() {
-            pool.query_capped(statement, &[], MAX_QUERY_ROWS)
+            pool.query_capped_to(statement, &[], MAX_QUERY_ROWS, cell_cap(statement))
                 .await
                 .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated))
         } else {
@@ -1745,7 +1761,7 @@ async fn run_script_read_only(
     let mut outcome = Ok(());
     for (statement_index, statement) in statements.iter().enumerate() {
         let result = if classify_statement(statement, dialect).returns_rows() {
-            run.query_capped(statement, MAX_QUERY_ROWS)
+            run.query_capped_to(statement, MAX_QUERY_ROWS, cell_cap(statement))
                 .await
                 .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated))
         } else {
@@ -1803,7 +1819,7 @@ async fn run_script_atomic(
     };
     for (statement_index, statement) in statements.iter().enumerate() {
         let outcome = if classify_statement(statement, pool.dialect()).returns_rows() {
-            tx.query_capped(statement, MAX_QUERY_ROWS)
+            tx.query_capped_to(statement, MAX_QUERY_ROWS, cell_cap(statement))
                 .await
                 .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated))
         } else {
@@ -3208,6 +3224,39 @@ mod tests {
     /// charged nothing at all, because the keyword scan looks only for write
     /// forms it can name and `CALL` names none. Three characters in front of a
     /// statement turned "needs both capabilities" into "needs none".
+    #[test]
+    fn only_an_explain_gets_the_plan_cell_cap() {
+        use crate::db::plan::{explain_statement, ExplainSupport};
+        for support in [
+            ExplainSupport::PG_JSON,
+            ExplainSupport::PG_TEXT,
+            ExplainSupport::SQLITE,
+        ] {
+            let plan = explain_statement("SELECT * FROM t", support);
+            assert_eq!(cell_cap(&plan), PLAN_CELL_CAP, "{plan:?}");
+        }
+        for sql in [
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1",
+            "  -- a comment\nexplain select 1",
+            "(EXPLAIN SELECT 1)",
+        ] {
+            assert_eq!(cell_cap(sql), PLAN_CELL_CAP, "{sql:?}");
+        }
+        // Everything else keeps the display cap, including a statement that
+        // only mentions EXPLAIN.
+        for sql in [
+            "SELECT * FROM t",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            "SELECT 'EXPLAIN'",
+            "/* EXPLAIN */ SELECT 1",
+            "SELECT explain FROM t",
+            "PRAGMA table_info(t)",
+            "VALUES (1)",
+        ] {
+            assert_eq!(cell_cap(sql), QUERY_CELL_CAP, "{sql:?}");
+        }
+    }
+
     #[test]
     fn explaining_never_loosens_the_gate() {
         use super::super::plan::{explain_statement, ExplainSupport};

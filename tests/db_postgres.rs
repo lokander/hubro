@@ -16,10 +16,11 @@
 mod common;
 
 use hubro::db::{
-    detect_row_identity, explain_statement, needs_confirmation, run_script, script_refusal,
-    url_with_password, Capabilities, DbError, DbPool, Dialect, Filter, Internal, PageRequest,
-    PgFlavor, PlanDisplay, Restriction, Rollback, RowCount, RowLocator, SortDir, TableKind,
-    TypeDetail, TypeRef, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
+    detect_row_identity, explain_statement, needs_confirmation, plan_reached_cell_cap, run_script,
+    script_refusal, url_with_password, Capabilities, DbError, DbPool, Dialect, Filter, Internal,
+    PageRequest, PgFlavor, PlanDisplay, Restriction, Rollback, RowCount, RowLocator, SortDir,
+    StatementOutcome, TableKind, TypeDetail, TypeRef, Value, WriteProtection, PREVIEW_BYTES,
+    QUERY_CELL_CAP,
 };
 
 async fn test_url() -> Option<String> {
@@ -1633,6 +1634,93 @@ async fn postgres_explains_a_query_as_a_structured_plan() {
     assert!(rows.iter().any(|(_, node)| node.expensive));
 
     pool.query("DROP TABLE fruits_plan").await.unwrap();
+    pool.close().await;
+}
+
+/// A plan larger than the display cap ordinary query cells get (400
+/// partitions: about 90 KB of compact JSON) still reaches the plan view whole,
+/// on every path a script can take: alone (autocommit), beside another
+/// statement (one transaction), and on a connection marked read-only (the
+/// engine-enforced run). A plan cut at 64 KiB does not parse, and the view
+/// fell back to raw JSON that stopped mid-string.
+#[tokio::test]
+async fn postgres_a_plan_larger_than_the_display_cap_still_parses() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.execute("DROP TABLE IF EXISTS big_plan CASCADE")
+        .await
+        .unwrap();
+    pool.execute("CREATE TABLE big_plan (id int, v text) PARTITION BY RANGE (id)")
+        .await
+        .unwrap();
+    pool.execute(
+        "DO $$ BEGIN FOR i IN 0..399 LOOP EXECUTE format(\
+         'CREATE TABLE big_plan_%s PARTITION OF big_plan FOR VALUES FROM (%s) TO (%s)', \
+         i, i * 10, i * 10 + 10); END LOOP; END $$",
+    )
+    .await
+    .unwrap();
+    let support = pool.explain_support().unwrap();
+    let plan = explain_statement("SELECT * FROM big_plan", support);
+
+    // The fixture is only worth something if its plan is past the cap.
+    let whole = pool.query(&plan).await.unwrap();
+    let Value::Text(json) = &whole.rows[0][0] else {
+        panic!("{whole:?}");
+    };
+    assert!(json.len() > QUERY_CELL_CAP, "plan is {} bytes", json.len());
+
+    let caps = pool.backend_capabilities();
+    let paths = [
+        ("alone", caps, vec![plan.clone()]),
+        ("in a transaction", caps, vec![plan.clone(), plan.clone()]),
+        (
+            "marked read-only",
+            WriteProtection::ReadOnly.apply(caps),
+            vec![plan.clone()],
+        ),
+    ];
+    for (path, caps, script) in paths {
+        let mut results = Vec::new();
+        run_script(&pool, caps, &script, |r| results.push(r))
+            .await
+            .unwrap_or_else(|e| panic!("{path}: {e:?}"));
+        assert_eq!(results.len(), script.len(), "{path}");
+        for result in &results {
+            let StatementOutcome::Rows(rows) = &result.outcome else {
+                panic!("{path}: {result:?}");
+            };
+            assert_eq!(rows.rows[0][0], whole.rows[0][0], "{path}: plan cut off");
+            assert!(
+                matches!(
+                    PlanDisplay::from_result(support.structured, rows),
+                    PlanDisplay::Tree(_)
+                ),
+                "{path}: a whole plan must parse as a tree"
+            );
+            assert!(!plan_reached_cell_cap(rows), "{path}");
+        }
+    }
+
+    // Ordinary queries keep the display cap on the same path.
+    let mut results = Vec::new();
+    run_script(
+        &pool,
+        caps,
+        &["SELECT repeat('Z', 200000) AS v".to_string()],
+        |r| results.push(r),
+    )
+    .await
+    .unwrap();
+    let StatementOutcome::Rows(rows) = &results[0].outcome else {
+        panic!("{results:?}");
+    };
+    let Value::Text(cell) = &rows.rows[0][0] else {
+        panic!("{rows:?}");
+    };
+    assert_eq!(cell.len(), QUERY_CELL_CAP);
+
+    pool.execute("DROP TABLE big_plan CASCADE").await.unwrap();
     pool.close().await;
 }
 
