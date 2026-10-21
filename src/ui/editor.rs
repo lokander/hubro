@@ -4,9 +4,10 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::db::{
-    needs_confirmation, plan_reached_cell_cap, ConnectionId, Dialect, ExportFormat, PlanDisplay,
-    PlanNode, PlanTree, Rollback, StatementOutcome, TableMeta, Value, EXPENSIVE_SHARE,
-    MARKED_READ_ONLY, MAX_QUERY_ROWS, NO_DDL, NO_EXPLAIN, NO_MUTATE, NO_QUERY, PLAN_CELL_CAP,
+    needs_confirmation, plan_reached_cell_cap, ConnectionId, Dialect, ExportFormat,
+    OpenTransaction, PlanDisplay, PlanNode, PlanTree, Rollback, StatementOutcome, TableMeta, Value,
+    EXPENSIVE_SHARE, MARKED_READ_ONLY, MAX_QUERY_ROWS, NO_DDL, NO_EXPLAIN, NO_MUTATE, NO_QUERY,
+    PLAN_CELL_CAP,
 };
 
 use super::history_panel::HistoryPanel;
@@ -789,12 +790,23 @@ fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
         RunStatus::Running => rsx! {
             LoadingLine { label: "Running…" }
         },
-        RunStatus::Done { elapsed_ms } => rsx! {
+        RunStatus::Done {
+            elapsed_ms,
+            rolled_back,
+        } => rsx! {
             p { class: "px-4 py-2 text-xs text-slate-500",
                 if statement_count == 1 {
                     "1 statement in {elapsed_ms} ms"
                 } else {
                     "{statement_count} statements in {elapsed_ms} ms"
+                }
+            }
+            // Every statement succeeded, and still none of what the script did
+            // inside its transaction is in the database — the one thing a
+            // timing line must not leave the user to discover.
+            if let Some(open) = rolled_back {
+                p { class: "border-t border-amber-300 dark:border-amber-900/50 px-4 py-3 text-sm text-amber-700 dark:text-amber-300",
+                    {left_open_note(open)}
                 }
             }
         },
@@ -820,6 +832,12 @@ fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
                     // the rollback was real, but it did not reach the schema
                     // changes, so "no changes were applied" would be false in
                     // the one direction that matters.
+                    Rollback::OpenTransaction(open) => format!(
+                        "Script stopped after {elapsed_ms} ms inside a transaction it had \
+                         opened, and hubro rolled that transaction back. Statements before its \
+                         BEGIN, and anything it committed, were not rolled back.{}",
+                        schema_kept_note(open),
+                    ),
                     Rollback::ExceptSchemaChanges => format!(
                         "Script rolled back after {elapsed_ms} ms, but this server does not undo \
                          schema changes on rollback — the schema changes it ran, and possibly \
@@ -850,6 +868,28 @@ fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
                 "Run cancelled — an in-flight statement may still complete on the server."
             }
         },
+    }
+}
+
+/// What a run that ended inside its own transaction tells the user: the
+/// transaction was rolled back, so its changes are gone.
+fn left_open_note(open: OpenTransaction) -> String {
+    format!(
+        "The script ended inside a transaction it opened and never committed, so hubro \
+         rolled it back — nothing it changed after its BEGIN was kept.{}",
+        schema_kept_note(open),
+    )
+}
+
+/// The caveat both open-transaction notes carry on a server whose rollback
+/// does not reach schema changes — empty when it does, or nothing changed the
+/// schema.
+fn schema_kept_note(open: OpenTransaction) -> &'static str {
+    if open.schema_changes_kept {
+        " This server does not undo schema changes on rollback, so the schema changes it \
+         ran were kept. Check the schema before running it again."
+    } else {
+        ""
     }
 }
 

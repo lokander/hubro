@@ -93,8 +93,8 @@ pub use schema_edit::{
 };
 pub use script::{
     classify_statement, needs_confirmation, run_script, script_refusal, split_statements,
-    statement_needs, statement_preview, Rollback, ScriptError, StatementKind, StatementNeeds,
-    StatementOutcome, StatementResult, NUL_IN_SCRIPT,
+    statement_needs, statement_preview, OpenTransaction, Rollback, ScriptDone, ScriptError,
+    StatementKind, StatementNeeds, StatementOutcome, StatementResult, NUL_IN_SCRIPT,
 };
 pub use sql::Dialect;
 pub use sqlite::{

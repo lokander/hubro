@@ -9,7 +9,9 @@
 //! transactions itself (`BEGIN`/`COMMIT`) or contains a statement that can't
 //! run inside a transaction (e.g. `VACUUM`, Postgres `CREATE INDEX
 //! CONCURRENTLY`), in which case it falls back to sequential autocommit and
-//! earlier statements' effects persist.
+//! earlier statements' effects persist. Either way the whole script runs on
+//! one connection, and a transaction the script opens itself and leaves open
+//! is rolled back when the run ends.
 
 use std::ops::Range;
 
@@ -1536,6 +1538,41 @@ pub enum Rollback {
     /// while YugabyteDB rolls that DML back normally. Claiming less than is
     /// known beats claiming more — the mistake this variant exists to stop.
     ExceptSchemaChanges,
+    /// The script had opened a transaction of its own (`BEGIN`) and failed
+    /// inside it, and hubro rolled that transaction back when the run ended.
+    /// Only the sequential path, which runs such scripts, reports it.
+    ///
+    /// What the rollback covered is the script's transaction, not the
+    /// script: statements before its `BEGIN`, and anything it had committed,
+    /// stand.
+    OpenTransaction(OpenTransaction),
+}
+
+/// A transaction a script opened itself and had not ended when the run did,
+/// which hubro rolled back rather than return the connection to the pool
+/// inside it — see [`ScriptConn`](super::registry::ScriptConn).
+///
+/// Rolled back, not committed and not kept open for a later run: a script
+/// that ends without its `COMMIT` has not said its changes are done, and
+/// rolling back is the one ending that leaves nothing the user did not ask
+/// for. Every change made since its `BEGIN` is discarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenTransaction {
+    /// The connection has no
+    /// [`transactional_ddl`](super::caps::Capabilities::transactional_ddl) and
+    /// the run changed the schema, so the rollback may not have covered all of
+    /// the transaction — as [`Rollback::ExceptSchemaChanges`] says for hubro's
+    /// own.
+    pub schema_changes_kept: bool,
+}
+
+/// A script that ran every statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScriptDone {
+    /// Set when the script ended inside a transaction it had opened itself
+    /// (a `BEGIN` with no `COMMIT`) and hubro rolled it back, so the run is
+    /// not mistaken for one whose changes took effect.
+    pub rolled_back: Option<OpenTransaction>,
 }
 
 /// Where and how a script failed.
@@ -1557,7 +1594,10 @@ pub struct ScriptError {
 /// Multi-statement scripts run atomically in one transaction unless
 /// [`wrap_atomically`] declines (self-managed transactions, a
 /// non-transactional statement, or a connection without the `transactions`
-/// capability) — then they run sequentially in autocommit, as before.
+/// capability) — then they run sequentially in autocommit, still on one
+/// connection ([`ScriptConn`](super::registry::ScriptConn)), and a transaction the script leaves open is
+/// rolled back and reported ([`ScriptDone::rolled_back`],
+/// [`Rollback::OpenTransaction`]).
 ///
 /// Every statement is checked against `caps` *before* any of them runs,
 /// so a script that the UI should have gated fails with a clear
@@ -1583,14 +1623,16 @@ pub async fn run_script(
     caps: Capabilities,
     statements: &[String],
     on_result: impl FnMut(StatementResult),
-) -> Result<(), ScriptError> {
+) -> Result<ScriptDone, ScriptError> {
     if let Some(refusal) = refuse_script(caps, statements, pool.dialect()) {
         return Err(refusal);
     }
     if engine_enforces_read_only(caps) {
         match pool.begin_read_only_run().await {
             Ok(Some(run)) => {
-                return run_script_read_only(run, pool.dialect(), statements, on_result).await
+                return run_script_read_only(run, pool.dialect(), statements, on_result)
+                    .await
+                    .map(|()| ScriptDone::default())
             }
             // SQL Server: no read-only mode to run in, so the script runs as
             // any other does, behind the gate alone.
@@ -1609,9 +1651,11 @@ pub async fn run_script(
         }
     }
     if wrap_atomically(caps, pool.dialect(), statements) {
-        run_script_atomic(pool, caps, statements, on_result).await
+        run_script_atomic(pool, caps, statements, on_result)
+            .await
+            .map(|()| ScriptDone::default())
     } else {
-        run_script_sequential(pool, statements, on_result).await
+        run_script_sequential(pool, caps, statements, on_result).await
     }
 }
 
@@ -1720,26 +1764,47 @@ fn cell_cap(statement: &str, dialect: Dialect) -> usize {
 }
 
 /// The autocommit path: each statement commits on its own, so a failure leaves
-/// earlier statements' effects in place ([`Rollback::None`]).
+/// earlier statements' effects in place ([`Rollback::None`]) — unless the
+/// script had opened a transaction of its own and was inside it, which
+/// [`ScriptConn::end`](super::registry::ScriptConn::end) rolls back ([`Rollback::OpenTransaction`]).
+///
+/// Every statement runs on the one connection the run holds: a script's own
+/// `BEGIN` and the statements after it must share a session, or the `BEGIN`
+/// opens a transaction nothing else runs in.
 async fn run_script_sequential(
     pool: &DbPool,
+    caps: Capabilities,
     statements: &[String],
     mut on_result: impl FnMut(StatementResult),
-) -> Result<(), ScriptError> {
+) -> Result<ScriptDone, ScriptError> {
+    let mut conn = match pool.acquire_script_conn().await {
+        Ok(conn) => conn,
+        Err(error) => {
+            return Err(ScriptError {
+                statement_index: 0,
+                preview: statements
+                    .first()
+                    .map(|s| statement_preview(s))
+                    .unwrap_or_default(),
+                error,
+                rollback: Rollback::None,
+            })
+        }
+    };
+    let mut failure = None;
     for (statement_index, statement) in statements.iter().enumerate() {
         // Reads stream through the row cap so a huge result never buffers in
         // full; writes report an affected-row count as before.
         let outcome = if classify_statement(statement, pool.dialect()).returns_rows() {
-            pool.query_capped_to(
+            conn.query_capped_to(
                 statement,
-                &[],
                 MAX_QUERY_ROWS,
                 cell_cap(statement, pool.dialect()),
             )
             .await
             .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated))
         } else {
-            pool.execute(statement)
+            conn.execute(statement)
                 .await
                 .map(|affected| (StatementOutcome::Affected(affected), false))
         };
@@ -1750,16 +1815,64 @@ async fn run_script_sequential(
                 truncated,
             }),
             Err(error) => {
-                return Err(ScriptError {
-                    statement_index,
-                    preview: statement_preview(statement),
-                    error,
-                    rollback: Rollback::None,
-                })
+                failure = Some((statement_index, error));
+                break;
             }
         }
     }
-    Ok(())
+    let ran = match &failure {
+        Some((statement_index, _)) => &statements[..=*statement_index],
+        None => statements,
+    };
+    let ended = conn.end().await;
+    sequential_outcome(caps, pool.dialect(), statements, ran, failure, ended)
+}
+
+/// How a sequential run reports, given how its statements went (`failure`)
+/// and how [`ScriptConn::end`](super::registry::ScriptConn::end) went (`ended`: whether it rolled back a
+/// transaction the script had left open). Over plain data so a test can
+/// execute every combination.
+///
+/// A failed end closed the connection, which ends whatever was open on it
+/// server-side, but hubro cannot say whether anything was: after a failed
+/// statement the statement's error is the one to report and nothing is
+/// claimed about a rollback; after a clean run the failure to end is itself
+/// the error, so the run is never reported as done when a transaction it
+/// opened may have been discarded.
+fn sequential_outcome(
+    caps: Capabilities,
+    dialect: Dialect,
+    statements: &[String],
+    ran: &[String],
+    failure: Option<(usize, DbError)>,
+    ended: Result<bool, DbError>,
+) -> Result<ScriptDone, ScriptError> {
+    let open_transaction = |rolled_back: bool| {
+        rolled_back.then(|| OpenTransaction {
+            schema_changes_kept: rollback_cover(caps, dialect, ran)
+                == Rollback::ExceptSchemaChanges,
+        })
+    };
+    match (failure, ended) {
+        (None, Ok(rolled_back)) => Ok(ScriptDone {
+            rolled_back: open_transaction(rolled_back),
+        }),
+        (None, Err(error)) => Err(ScriptError {
+            statement_index: statements.len().saturating_sub(1),
+            preview: "end of script".to_string(),
+            error,
+            rollback: Rollback::None,
+        }),
+        (Some((statement_index, error)), ended) => Err(ScriptError {
+            statement_index,
+            preview: statement_preview(&statements[statement_index]),
+            error,
+            rollback: match open_transaction(ended.unwrap_or(false)) {
+                Some(open) => Rollback::OpenTransaction(open),
+                None => Rollback::None,
+            },
+        }),
+    }
 }
 
 /// The read-only path: each statement through `run`, where the engine refuses
@@ -2004,6 +2117,18 @@ fn is_non_transactional(dialect: Dialect, stripped: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Whether `sql` is SQL Server transaction control and nothing else (`BEGIN
+/// TRAN`, `COMMIT`, `ROLLBACK`, with at most a transaction's name — see
+/// [`is_bare_transaction_control`]), which the backend sends as a plain batch:
+/// through `sp_executesql` a statement that changes `@@TRANCOUNT` fails with
+/// error 266.
+pub(crate) fn tsql_is_transaction_control(sql: &str) -> bool {
+    is_bare_transaction_control(
+        Dialect::SqlServer,
+        &strip_strings_and_comments(sql, Dialect::SqlServer),
+    )
 }
 
 /// Whether SQL Server accepts `sql` only as the first statement of a batch —
@@ -4262,6 +4387,112 @@ mod tests {
         ] {
             assert!(!tsql_leads_own_batch(sql), "{sql:?}");
         }
+    }
+
+    #[test]
+    fn sqlserver_transaction_control_is_recognized_and_nothing_else() {
+        // Sent as a plain batch, where a SET would outlive the statement — so
+        // only bare transaction control, never a statement with room for one.
+        for sql in [
+            "BEGIN TRAN",
+            "begin transaction",
+            "BEGIN TRANSACTION load_rows",
+            "BEGIN DISTRIBUTED TRAN",
+            "COMMIT",
+            "COMMIT TRAN",
+            "COMMIT WORK",
+            "ROLLBACK",
+            "ROLLBACK TRANSACTION",
+            "/* lead */ ROLLBACK TRAN -- done",
+        ] {
+            assert!(tsql_is_transaction_control(sql), "{sql:?}");
+        }
+        for sql in [
+            "BEGIN TRAN SET NOCOUNT ON",
+            "BEGIN TRAN\nSET NOCOUNT ON",
+            "BEGIN TRY SELECT 1 END TRY BEGIN CATCH SELECT 2 END CATCH",
+            "BEGIN SELECT 1 END",
+            "COMMIT SELECT 5",
+            "SAVE TRAN point",
+            "SELECT 'BEGIN TRAN'",
+            "-- BEGIN TRAN\nSELECT 1",
+            "INSERT INTO t VALUES (1)",
+        ] {
+            assert!(!tsql_is_transaction_control(sql), "{sql:?}");
+        }
+    }
+
+    /// The four ways a sequential run can end, decided over plain data: what
+    /// the statements did, and whether ending the run rolled back a
+    /// transaction the script had left open.
+    #[test]
+    fn a_sequential_run_reports_the_transaction_it_rolled_back() {
+        let script = stmts(&["BEGIN", "INSERT INTO t VALUES (1)", "SELECT 1"]);
+        let full = Capabilities::FULL;
+        let outcome = |failure, ended| {
+            let ran = match &failure {
+                Some((i, _)) => &script[..=*i],
+                None => &script[..],
+            };
+            sequential_outcome(full, Dialect::Postgres, &script, ran, failure, ended)
+        };
+        let failed = || Some((1, DbError::Query("boom".into())));
+        let open = OpenTransaction {
+            schema_changes_kept: false,
+        };
+
+        assert_eq!(
+            outcome(None, Ok(false)),
+            Ok(ScriptDone { rolled_back: None })
+        );
+        assert_eq!(
+            outcome(None, Ok(true)),
+            Ok(ScriptDone {
+                rolled_back: Some(open)
+            })
+        );
+        assert_eq!(
+            outcome(failed(), Ok(true)).unwrap_err().rollback,
+            Rollback::OpenTransaction(open)
+        );
+        let err = outcome(failed(), Ok(false)).unwrap_err();
+        assert_eq!((err.statement_index, err.rollback), (1, Rollback::None));
+        // A failed end after a failed statement: the statement's error stands,
+        // and nothing is claimed about a rollback.
+        let err = outcome(failed(), Err(DbError::Query("gone".into()))).unwrap_err();
+        assert_eq!(err.error, DbError::Query("boom".into()));
+        assert_eq!(err.rollback, Rollback::None);
+        // A failed end after a clean run is the run's error: it must not be
+        // reported as done when a transaction it opened may have been dropped.
+        let err = outcome(None, Err(DbError::Query("gone".into()))).unwrap_err();
+        assert_eq!(err.error, DbError::Query("gone".into()));
+        assert_eq!(err.statement_index, 2);
+    }
+
+    #[test]
+    fn a_rolled_back_transaction_keeps_schema_changes_only_where_the_engine_does() {
+        let no_ddl_rollback = Capabilities {
+            transactional_ddl: false,
+            ..Capabilities::FULL
+        };
+        let kept = |caps, ran: &[&str]| {
+            let ran = stmts(ran);
+            match sequential_outcome(caps, Dialect::Postgres, &ran, &ran, None, Ok(true)) {
+                Ok(ScriptDone {
+                    rolled_back: Some(open),
+                }) => open.schema_changes_kept,
+                other => panic!("expected a rolled-back transaction, got {other:?}"),
+            }
+        };
+        let with_ddl = [
+            "BEGIN",
+            "CREATE TABLE t (a int)",
+            "INSERT INTO t VALUES (1)",
+        ];
+        let without = ["BEGIN", "INSERT INTO t VALUES (1)"];
+        assert!(kept(no_ddl_rollback, &with_ddl));
+        assert!(!kept(no_ddl_rollback, &without));
+        assert!(!kept(Capabilities::FULL, &with_ddl));
     }
 
     #[test]

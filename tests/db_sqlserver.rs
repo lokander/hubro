@@ -23,9 +23,9 @@ mod common;
 
 use hubro::db::{
     apply_staged, detect_row_identity, mssql_url_with_password, run_script, split_statements,
-    Capabilities, DbError, DbPool, Dialect, ExportFormat, Filter, Generated, PageRequest,
-    Restriction, Rollback, RowCount, RowIdentity, RowLocator, SortDir, StagedChange,
-    StatementOutcome, TableKind, TableMeta, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
+    Capabilities, DbError, DbPool, Dialect, ExportFormat, Filter, Generated, OpenTransaction,
+    PageRequest, Restriction, Rollback, RowCount, RowIdentity, RowLocator, ScriptDone, SortDir,
+    StagedChange, StatementOutcome, TableKind, TableMeta, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 async fn test_url() -> Option<String> {
@@ -1012,7 +1012,7 @@ async fn sqlserver_a_script_cannot_turn_row_counts_off_for_later_writes() {
         let statements = split_statements(script, pool.dialect());
         let outcome = run_script(&pool, pool.backend_capabilities(), &statements, |_| {}).await;
         match outcome {
-            Ok(()) => assert!(accepted, "{script:?} was accepted"),
+            Ok(_) => assert!(accepted, "{script:?} was accepted"),
             Err(e) => assert!(
                 !accepted && e.error.to_string().contains("code: 156"),
                 "{script:?}: {e:?}"
@@ -2122,5 +2122,189 @@ async fn sqlserver_contains_filter_is_a_substring_search_whatever_the_needle_hol
     let mismatches = common::contains_filter_mismatches(&pool, Some("dbo"), "like_hostile").await;
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
     run_all(&pool, &["DROP TABLE dbo.like_hostile"]).await;
+    pool.close().await;
+}
+
+// A script that manages its own transaction runs on the sequential path,
+// which once took a pooled connection per statement and sent `BEGIN TRAN`
+// through `sp_executesql`. Measured before the fix: `BEGIN TRAN` failed with
+// error 266 and still opened its transaction, which went back to the pool; an
+// edit that later landed on that connection reported success and was lost
+// when the connection closed, and a read from another connection waited on
+// the abandoned transaction's locks.
+
+const MSSQL_SLOW: &str = "WAITFOR DELAY '00:00:00.200'; SELECT 1";
+
+/// `@@TRANCOUNT` on each of the pool's connections — four reads at once,
+/// slow enough that each needs a connection of its own.
+async fn mssql_open_transactions(pool: &DbPool) -> Vec<Value> {
+    let reads: Vec<_> = (0..4)
+        .map(|_| pool.query("WAITFOR DELAY '00:00:00.200'; SELECT @@TRANCOUNT"))
+        .collect();
+    futures_util::future::join_all(reads)
+        .await
+        .into_iter()
+        .map(|read| read.unwrap().rows[0][0].clone())
+        .filter(|count| *count != Value::Integer(0))
+        .collect()
+}
+
+#[tokio::test]
+async fn sqlserver_script_keeps_its_own_transaction_on_one_session() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.own_tx",
+            "CREATE TABLE dbo.own_tx (a int)",
+        ],
+    )
+    .await;
+    common::open_several_connections(&pool, MSSQL_SLOW).await;
+
+    let statements = split_statements(
+        "SELECT @@SPID, @@TRANCOUNT\nGO\nBEGIN TRAN\nGO\nINSERT INTO dbo.own_tx VALUES (1)\nGO\n\
+         SELECT @@SPID, @@TRANCOUNT\nGO\nROLLBACK\nGO\nSELECT @@SPID, @@TRANCOUNT",
+        pool.dialect(),
+    );
+    let mut sessions = Vec::new();
+    let outcome = run_script(&pool, pool.backend_capabilities(), &statements, |r| {
+        if let StatementOutcome::Rows(rows) = r.outcome {
+            sessions.push(rows.rows[0].clone());
+        }
+    })
+    .await;
+    assert_eq!(
+        outcome,
+        Ok(ScriptDone::default()),
+        "{}",
+        common::script_outcome(&outcome)
+    );
+    let spid = &sessions[0][0];
+    assert!(
+        sessions.iter().all(|row| &row[0] == spid),
+        "every statement must run in one session, got {sessions:?}"
+    );
+    let trancounts: Vec<&Value> = sessions.iter().map(|row| &row[1]).collect();
+    assert_eq!(
+        trancounts,
+        [&Value::Integer(0), &Value::Integer(1), &Value::Integer(0)],
+        "BEGIN TRAN must open the transaction the statements after it run in"
+    );
+    let rows = pool.query("SELECT count(*) FROM dbo.own_tx").await.unwrap();
+    assert_eq!(
+        rows.rows[0][0],
+        Value::Integer(0),
+        "ROLLBACK must undo the INSERT"
+    );
+    run_all(&pool, &["DROP TABLE dbo.own_tx"]).await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_script_left_inside_its_transaction_is_rolled_back_and_says_so() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.left_open",
+            "DROP TABLE IF EXISTS dbo.left_open_edit",
+            "CREATE TABLE dbo.left_open (a int)",
+            "CREATE TABLE dbo.left_open_edit (a int)",
+        ],
+    )
+    .await;
+    common::open_several_connections(&pool, MSSQL_SLOW).await;
+
+    let statements = split_statements(
+        "BEGIN TRAN\nGO\nINSERT INTO dbo.left_open VALUES (1)",
+        pool.dialect(),
+    );
+    let outcome = run_script(&pool, pool.backend_capabilities(), &statements, |_| {}).await;
+    assert_eq!(
+        outcome,
+        Ok(ScriptDone {
+            rolled_back: Some(OpenTransaction {
+                schema_changes_kept: false
+            })
+        }),
+        "{}",
+        common::script_outcome(&outcome)
+    );
+    assert_eq!(mssql_open_transactions(&pool).await, Vec::<Value>::new());
+
+    // The edit that used to land inside the abandoned transaction, report
+    // success, and vanish with the connection.
+    for n in 0..4 {
+        pool.execute_checked(
+            "INSERT INTO dbo.left_open_edit VALUES (@P1)",
+            &[Value::Integer(n)],
+            1,
+        )
+        .await
+        .unwrap();
+    }
+    pool.close().await;
+    let fresh = DbPool::open_mssql(&url).await.unwrap();
+    let edits = fresh
+        .query("SELECT count(*) FROM dbo.left_open_edit")
+        .await
+        .unwrap();
+    assert_eq!(
+        edits.rows[0][0],
+        Value::Integer(4),
+        "every edit must be kept"
+    );
+    let left = fresh
+        .query("SELECT count(*) FROM dbo.left_open")
+        .await
+        .unwrap();
+    assert_eq!(left.rows[0][0], Value::Integer(0));
+    run_all(
+        &fresh,
+        &["DROP TABLE dbo.left_open", "DROP TABLE dbo.left_open_edit"],
+    )
+    .await;
+    fresh.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_script_failing_inside_its_transaction_rolls_it_back() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.failed_tx",
+            "CREATE TABLE dbo.failed_tx (a int)",
+        ],
+    )
+    .await;
+    common::open_several_connections(&pool, MSSQL_SLOW).await;
+
+    let statements = split_statements(
+        "BEGIN TRAN\nGO\nINSERT INTO dbo.failed_tx VALUES (1)\nGO\n\
+         SELECT * FROM dbo.no_such_table\nGO\nCOMMIT",
+        pool.dialect(),
+    );
+    let err = run_script(&pool, pool.backend_capabilities(), &statements, |_| {})
+        .await
+        .unwrap_err();
+    assert_eq!(err.statement_index, 2, "{}", err.error);
+    assert_eq!(
+        err.rollback,
+        Rollback::OpenTransaction(OpenTransaction {
+            schema_changes_kept: false
+        })
+    );
+    assert_eq!(mssql_open_transactions(&pool).await, Vec::<Value>::new());
+    let rows = pool
+        .query("SELECT count(*) FROM dbo.failed_tx")
+        .await
+        .unwrap();
+    assert_eq!(rows.rows[0][0], Value::Integer(0));
+    run_all(&pool, &["DROP TABLE dbo.failed_tx"]).await;
     pool.close().await;
 }

@@ -409,7 +409,10 @@ impl AppState {
             self.sql_tasks.write().remove(&(id, buffer));
             if let Some(run) = self.sql_runs.write().get_mut(&(id, buffer)) {
                 run.status = match result {
-                    Ok(()) => RunStatus::Done { elapsed_ms },
+                    Ok(done) => RunStatus::Done {
+                        elapsed_ms,
+                        rolled_back: done.rolled_back,
+                    },
                     Err(err) => RunStatus::Failed {
                         error: err.error.to_string(),
                         statement_index: err.statement_index,

@@ -9,8 +9,8 @@ mod common;
 
 use common::FixtureDb;
 use hubro::db::{
-    run_script, split_statements, DbError, DbPool, Rollback, StatementOutcome, StatementResult,
-    Value,
+    run_script, split_statements, DbError, DbPool, OpenTransaction, Rollback, ScriptDone,
+    StatementOutcome, StatementResult, Value,
 };
 
 async fn pg_url() -> Option<String> {
@@ -21,7 +21,10 @@ async fn pg_url() -> Option<String> {
 async fn collect_script(
     pool: &DbPool,
     sql: &str,
-) -> (Vec<StatementResult>, Result<(), hubro::db::ScriptError>) {
+) -> (
+    Vec<StatementResult>,
+    Result<hubro::db::ScriptDone, hubro::db::ScriptError>,
+) {
     let statements = split_statements(sql, pool.dialect());
     let mut results = Vec::new();
     let outcome = run_script(pool, pool.backend_capabilities(), &statements, |r| {
@@ -499,7 +502,7 @@ async fn assert_hidden_writes_are_refused(pool: &DbPool, table: &str, scripts: &
                 matches!(err.error, DbError::Unsupported(_)),
                 "{script:?} must be refused by the gate, not fail at the server: {err:?}"
             ),
-            Ok(()) => panic!("{script:?} ran on a read-only connection, split as {statements:?}"),
+            Ok(_) => panic!("{script:?} ran on a read-only connection, split as {statements:?}"),
         }
         let rows = pool.query(&count).await.unwrap();
         assert_eq!(rows.rows, vec![vec![Value::Integer(1)]], "{script:?}");
@@ -648,5 +651,302 @@ async fn sqlite_scripts_holding_a_nul_are_refused_not_run() {
         err.error,
         DbError::Unsupported(hubro::db::NUL_IN_SCRIPT.to_string())
     );
+    pool.close().await;
+}
+
+// A script that manages its own transaction runs outside hubro's, on the
+// sequential path, and that path once took a pooled connection per statement:
+// `BEGIN` opened a transaction on one session while the statements after it
+// ran on others. Measured before the fix, on all four engines: a script's
+// `BEGIN; INSERT; ROLLBACK` left its row, a transaction the script left open
+// went back to the pool and swallowed later unrelated statements (on SQLite,
+// later edits failed with "cannot start a transaction within a transaction"
+// or "database is locked"), and on Postgres a transaction an error had
+// aborted failed every query that landed on its connection afterwards.
+
+/// Slow enough that four at once need four pooled connections.
+const SQLITE_SLOW: &str = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c \
+                           WHERE x < 300000) SELECT count(*) FROM c";
+
+async fn count(pool: &DbPool, sql: &str) -> Value {
+    pool.query(sql).await.unwrap().rows[0][0].clone()
+}
+
+/// Every pooled connection can take a guarded write and commit it: none is
+/// left inside a transaction a script abandoned. Six writes, so each of the
+/// several connections [`common::open_several_connections`] opened is used.
+async fn sqlite_pool_takes_edits(pool: &DbPool, table: &str) {
+    for n in 0..6 {
+        pool.execute_checked(
+            &format!("INSERT INTO {table} VALUES (?)"),
+            &[Value::Integer(n)],
+            1,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("edit {n} failed on a pooled connection: {e}"));
+    }
+}
+
+#[tokio::test]
+async fn sqlite_script_keeps_its_own_transaction_on_one_connection() {
+    let fixture = FixtureDb::with_sql("CREATE TABLE own_tx (a INTEGER)").await;
+    let pool = fixture.open().await;
+    common::open_several_connections(&pool, SQLITE_SLOW).await;
+
+    let (_, outcome) =
+        collect_script(&pool, "BEGIN; INSERT INTO own_tx VALUES (1); ROLLBACK").await;
+    assert_eq!(outcome, Ok(ScriptDone::default()));
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM own_tx").await,
+        Value::Integer(0),
+        "the script's ROLLBACK must undo its INSERT"
+    );
+
+    let (_, outcome) = collect_script(&pool, "BEGIN; INSERT INTO own_tx VALUES (2); COMMIT").await;
+    assert_eq!(outcome, Ok(ScriptDone::default()));
+    let fresh = fixture.open().await;
+    assert_eq!(
+        count(&fresh, "SELECT count(*) FROM own_tx").await,
+        Value::Integer(1),
+        "the script's COMMIT must commit its INSERT"
+    );
+    fresh.close().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_script_left_inside_its_transaction_is_rolled_back_and_says_so() {
+    let fixture =
+        FixtureDb::with_sql("CREATE TABLE left_open (a INTEGER); CREATE TABLE edits (a INTEGER)")
+            .await;
+    let pool = fixture.open().await;
+    common::open_several_connections(&pool, SQLITE_SLOW).await;
+
+    let (results, outcome) = collect_script(&pool, "BEGIN; INSERT INTO left_open VALUES (1)").await;
+    assert_eq!(results.len(), 2, "both statements ran");
+    assert_eq!(
+        outcome,
+        Ok(ScriptDone {
+            rolled_back: Some(OpenTransaction {
+                schema_changes_kept: false
+            })
+        }),
+        "a script that ends inside its own transaction must say it was rolled back"
+    );
+
+    sqlite_pool_takes_edits(&pool, "edits").await;
+    let fresh = fixture.open().await;
+    assert_eq!(
+        count(&fresh, "SELECT count(*) FROM left_open").await,
+        Value::Integer(0),
+        "the uncommitted INSERT must be gone, not parked on a pooled connection"
+    );
+    assert_eq!(
+        count(&fresh, "SELECT count(*) FROM edits").await,
+        Value::Integer(6)
+    );
+    fresh.close().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_script_failing_inside_its_transaction_rolls_it_back() {
+    let fixture =
+        FixtureDb::with_sql("CREATE TABLE failed_tx (a INTEGER); CREATE TABLE edits (a INTEGER)")
+            .await;
+    let pool = fixture.open().await;
+    common::open_several_connections(&pool, SQLITE_SLOW).await;
+
+    let (_, outcome) = collect_script(
+        &pool,
+        "BEGIN; INSERT INTO failed_tx VALUES (1); SELECT * FROM no_such_table; COMMIT",
+    )
+    .await;
+    let err = outcome.unwrap_err();
+    assert_eq!(err.statement_index, 2);
+    assert_eq!(
+        err.rollback,
+        Rollback::OpenTransaction(OpenTransaction {
+            schema_changes_kept: false
+        })
+    );
+
+    sqlite_pool_takes_edits(&pool, "edits").await;
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM failed_tx").await,
+        Value::Integer(0)
+    );
+    pool.close().await;
+}
+
+/// Each pooled connection's open transaction, if any, as seen from inside it:
+/// `pg_current_xact_id_if_assigned()` is NULL in a query's own implicit
+/// transaction and the id of the abandoned one when the query runs inside a
+/// transaction that wrote. Four at once, so each of the pool's four
+/// connections answers; a connection inside an aborted transaction fails.
+async fn pg_open_transactions(pool: &DbPool) -> Vec<String> {
+    let reads: Vec<_> = (0..4)
+        .map(|_| pool.query("SELECT pg_current_xact_id_if_assigned()::text, pg_sleep(0.2)"))
+        .collect();
+    futures_util::future::join_all(reads)
+        .await
+        .into_iter()
+        .filter_map(|read| match read {
+            Ok(result) if result.rows[0][0] == Value::Null => None,
+            Ok(result) => Some(format!("open transaction {:?}", result.rows[0][0])),
+            Err(e) => Some(e.to_string()),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn postgres_script_keeps_its_own_transaction_on_one_session() {
+    let Some(url) = pg_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.execute("DROP TABLE IF EXISTS own_tx").await.unwrap();
+    pool.execute("CREATE TABLE own_tx (a integer)")
+        .await
+        .unwrap();
+    common::open_several_connections(&pool, "SELECT pg_sleep(0.2)").await;
+
+    let (results, outcome) = collect_script(
+        &pool,
+        "SELECT pg_backend_pid(); BEGIN; SELECT pg_backend_pid(); \
+         INSERT INTO own_tx VALUES (1); SELECT pg_backend_pid(); ROLLBACK; \
+         SELECT pg_backend_pid()",
+    )
+    .await;
+    assert_eq!(outcome, Ok(ScriptDone::default()));
+    let pids: Vec<&Value> = results
+        .iter()
+        .filter_map(|r| match &r.outcome {
+            StatementOutcome::Rows(rows) => Some(&rows.rows[0][0]),
+            StatementOutcome::Affected(_) => None,
+        })
+        .collect();
+    assert_eq!(pids.len(), 4);
+    assert!(
+        pids.iter().all(|pid| *pid == pids[0]),
+        "every statement of the script must run in one session, got {pids:?}"
+    );
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM own_tx").await,
+        Value::Integer(0),
+        "the script's ROLLBACK must undo its INSERT"
+    );
+    pool.execute("DROP TABLE own_tx").await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_script_left_inside_its_transaction_is_rolled_back_and_says_so() {
+    let Some(url) = pg_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.execute("DROP TABLE IF EXISTS left_open")
+        .await
+        .unwrap();
+    pool.execute("CREATE TABLE left_open (a integer)")
+        .await
+        .unwrap();
+    common::open_several_connections(&pool, "SELECT pg_sleep(0.2)").await;
+
+    let (_, outcome) = collect_script(&pool, "BEGIN; INSERT INTO left_open VALUES (1)").await;
+    assert_eq!(
+        outcome,
+        Ok(ScriptDone {
+            rolled_back: Some(OpenTransaction {
+                schema_changes_kept: false
+            })
+        })
+    );
+    assert_eq!(pg_open_transactions(&pool).await, Vec::<String>::new());
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM left_open").await,
+        Value::Integer(0)
+    );
+
+    // A script that ends its own transaction leaves nothing to report.
+    let (_, outcome) =
+        collect_script(&pool, "BEGIN; INSERT INTO left_open VALUES (2); COMMIT").await;
+    assert_eq!(outcome, Ok(ScriptDone::default()));
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM left_open").await,
+        Value::Integer(1)
+    );
+    pool.execute("DROP TABLE left_open").await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_script_failing_inside_its_transaction_rolls_it_back() {
+    let Some(url) = pg_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.execute("DROP TABLE IF EXISTS failed_tx")
+        .await
+        .unwrap();
+    pool.execute("CREATE TABLE failed_tx (a integer)")
+        .await
+        .unwrap();
+    common::open_several_connections(&pool, "SELECT pg_sleep(0.2)").await;
+
+    let (_, outcome) = collect_script(
+        &pool,
+        "BEGIN; INSERT INTO failed_tx VALUES (1); SELECT * FROM no_such_table; COMMIT",
+    )
+    .await;
+    let err = outcome.unwrap_err();
+    assert_eq!(err.statement_index, 2);
+    assert_eq!(
+        err.rollback,
+        Rollback::OpenTransaction(OpenTransaction {
+            schema_changes_kept: false
+        })
+    );
+    // No connection is left in the aborted transaction, failing whatever
+    // query lands on it next.
+    assert_eq!(pg_open_transactions(&pool).await, Vec::<String>::new());
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM failed_tx").await,
+        Value::Integer(0)
+    );
+    pool.execute("DROP TABLE failed_tx").await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_cancelled_script_does_not_return_its_transaction_to_the_pool() {
+    // The editor cancels a run by dropping it mid-statement, so the run never
+    // reaches the end that would roll the script's transaction back. The
+    // connection must then be closed rather than returned: returned, it went
+    // back inside the transaction once its statement finished.
+    let Some(url) = pg_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.execute("DROP TABLE IF EXISTS cancelled_tx")
+        .await
+        .unwrap();
+    pool.execute("CREATE TABLE cancelled_tx (a integer)")
+        .await
+        .unwrap();
+
+    let statements = split_statements(
+        "BEGIN; INSERT INTO cancelled_tx VALUES (1); SELECT pg_sleep(1.5)",
+        pool.dialect(),
+    );
+    let run = run_script(&pool, pool.backend_capabilities(), &statements, |_| {});
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), run)
+            .await
+            .is_err(),
+        "the run should still be sleeping when it is cancelled"
+    );
+    // Past the sleep, so a connection that was going back to the pool has.
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+    assert_eq!(pg_open_transactions(&pool).await, Vec::<String>::new());
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM cancelled_tx").await,
+        Value::Integer(0)
+    );
+    pool.execute("DROP TABLE cancelled_tx").await.unwrap();
     pool.close().await;
 }

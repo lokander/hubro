@@ -96,8 +96,8 @@ mod common;
 
 use hubro::db::{
     apply_staged, detect_row_identity, run_script, split_statements, Capabilities, DbPool, Filter,
-    Internal, PageRequest, PgFlavor, Restriction, Rollback, RowIdentity, RowLocator, SortDir,
-    StagedChange, TableKind, TableMeta, Value,
+    Internal, OpenTransaction, PageRequest, PgFlavor, Restriction, Rollback, RowIdentity,
+    RowLocator, ScriptDone, SortDir, StagedChange, StatementOutcome, TableKind, TableMeta, Value,
 };
 
 fn test_url() -> Option<String> {
@@ -848,5 +848,102 @@ async fn cockroach_real_keys_are_re_addressed_by_their_shortest_spelling() {
     pool.query("DROP TABLE real_refs, real_keys, real_precise")
         .await
         .unwrap();
+    pool.close().await;
+}
+
+/// Each pooled connection's transaction status as CockroachDB reports it —
+/// `NoTxn` outside one — from four reads at once, slow enough that each
+/// needs a connection of its own. A connection inside an aborted transaction
+/// fails the read instead.
+async fn crdb_open_transactions(pool: &DbPool) -> Vec<String> {
+    let reads: Vec<_> = (0..4)
+        .map(|_| pool.query("SELECT *, pg_sleep(0.2) FROM [SHOW TRANSACTION STATUS]"))
+        .collect();
+    futures_util::future::join_all(reads)
+        .await
+        .into_iter()
+        .filter_map(|read| match read {
+            Ok(result) if result.rows[0][0] == Value::Text("NoTxn".into()) => None,
+            Ok(result) => Some(format!("{:?}", result.rows[0][0])),
+            Err(e) => Some(e.to_string()),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn cockroach_script_keeps_its_own_transaction_on_one_session() {
+    // The sequential path once took a pooled connection per statement, so
+    // `BEGIN` and the statements after it reported different
+    // `pg_backend_pid()`s, `ROLLBACK` undid nothing, and a transaction left
+    // open swallowed later statements while a reader on another connection
+    // waited on its locks.
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.execute("DROP TABLE IF EXISTS own_tx").await.unwrap();
+    pool.execute("CREATE TABLE own_tx (a INT8)").await.unwrap();
+    let opens: Vec<_> = (0..4).map(|_| pool.query("SELECT pg_sleep(0.2)")).collect();
+    for open in futures_util::future::join_all(opens).await {
+        open.unwrap();
+    }
+    let caps = pool.backend_capabilities();
+    let run = |sql: &str| {
+        let statements = split_statements(sql, pool.dialect());
+        let pool = &pool;
+        async move {
+            let mut rows = Vec::new();
+            let outcome = run_script(pool, caps, &statements, |r| {
+                if let StatementOutcome::Rows(result) = r.outcome {
+                    rows.push(result.rows[0][0].clone());
+                }
+            })
+            .await;
+            (rows, outcome)
+        }
+    };
+
+    let (pids, outcome) = run(
+        "SELECT pg_backend_pid(); BEGIN; SELECT pg_backend_pid(); INSERT INTO own_tx VALUES (1); \
+         SELECT pg_backend_pid(); ROLLBACK; SELECT pg_backend_pid()",
+    )
+    .await;
+    assert_eq!(outcome, Ok(ScriptDone::default()));
+    assert_eq!(pids.len(), 4);
+    assert!(
+        pids.iter().all(|pid| *pid == pids[0]),
+        "every statement must run in one session, got {pids:?}"
+    );
+    let rows = pool.query("SELECT count(*) FROM own_tx").await.unwrap();
+    assert_eq!(
+        rows.rows[0][0],
+        Value::Integer(0),
+        "ROLLBACK must undo the INSERT"
+    );
+
+    let (_, outcome) = run("BEGIN; INSERT INTO own_tx VALUES (2)").await;
+    assert_eq!(
+        outcome,
+        Ok(ScriptDone {
+            rolled_back: Some(OpenTransaction {
+                schema_changes_kept: false
+            })
+        })
+    );
+    assert_eq!(crdb_open_transactions(&pool).await, Vec::<String>::new());
+
+    let (_, outcome) =
+        run("BEGIN; INSERT INTO own_tx VALUES (3); SELECT * FROM no_such_table; COMMIT").await;
+    let err = outcome.unwrap_err();
+    assert_eq!(err.statement_index, 2);
+    assert_eq!(
+        err.rollback,
+        Rollback::OpenTransaction(OpenTransaction {
+            schema_changes_kept: false
+        })
+    );
+    assert_eq!(crdb_open_transactions(&pool).await, Vec::<String>::new());
+    let rows = pool.query("SELECT count(*) FROM own_tx").await.unwrap();
+    assert_eq!(rows.rows[0][0], Value::Integer(0));
+
+    pool.execute("DROP TABLE own_tx").await.unwrap();
     pool.close().await;
 }

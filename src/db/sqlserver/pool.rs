@@ -38,7 +38,7 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt as _};
 use super::{column_infos, decode_row};
 use crate::db::error::DbError;
 use crate::db::export::{export_io_err, ExportFormat, ExportSink};
-use crate::db::script::tsql_leads_own_batch;
+use crate::db::script::{tsql_is_transaction_control, tsql_leads_own_batch};
 use crate::db::staged::CheckedStatement;
 use crate::db::value::{cap_value, ColumnInfo, QueryResult, Value};
 
@@ -69,7 +69,10 @@ const MAX_CONNECTIONS: usize = 4;
 /// SCHEMA`/`DEFAULT`/`RULE`), which runs as a plain batch, where a `SET` would
 /// stick. It is safe because a `SET` trailing one of those never runs as the
 /// session's own: measured, a procedure or trigger takes it into its body, and
-/// the rest refuse it as a syntax error (156).
+/// the rest refuse it as a syntax error (156). The other plain batch is bare
+/// transaction control ([`tsql_is_transaction_control`]), which holds nothing
+/// but the keywords and at most a transaction's name, so it has no room for a
+/// `SET`.
 const SESSION_SETUP: &str = "SET QUOTED_IDENTIFIER ON; \
      SET NOCOUNT OFF; \
      SET ANSI_NULLS ON; \
@@ -699,13 +702,20 @@ fn statement_rows(counts: &[u64]) -> u64 {
 /// a plain batch instead; nothing it does counts as an affected row, so it
 /// reports 0.
 ///
+/// Bare transaction control (`BEGIN TRAN`, `COMMIT`, `ROLLBACK`:
+/// [`tsql_is_transaction_control`]) runs as a plain batch too. Inside
+/// `sp_executesql` it fails with error 266 — the RPC refuses to return with
+/// `@@TRANCOUNT` different from what it started with — and measured, the
+/// `BEGIN TRAN` that error is about has still opened its transaction, so a
+/// script could not open one and was left with one open anyway.
+///
 /// The report is the *sum* of every count, trigger rows included — unlike
 /// [`statement_rows`], and deliberately: a script statement is a whole `GO`
 /// batch, and its several statements' counts arrive as the same token as
 /// their triggers', so no rule over the counts can tell the batch's own rows
 /// from theirs. The sum is what SQL Server reported; nothing is held to it.
 async fn run_statement(client: &mut TdsClient, sql: &str) -> Result<u64, TdsError> {
-    if tsql_leads_own_batch(sql) {
+    if tsql_leads_own_batch(sql) || tsql_is_transaction_control(sql) {
         run_batch(client, sql).await.map(|()| 0)
     } else {
         run_execute(client, sql, &[])
@@ -784,11 +794,23 @@ pub async fn query_capped_conn(
     max_rows: u64,
     cell_cap: usize,
 ) -> Result<(QueryResult, bool), DbError> {
-    if tx.conn.is_discarded() {
+    query_capped_held(&mut tx.conn, sql, max_rows, cell_cap).await
+}
+
+/// [`query_capped_conn`] on any connection held across statements. A
+/// truncated read keeps the connection for the same reason in both: the
+/// script may have a transaction of its own open on it.
+async fn query_capped_held(
+    conn: &mut PooledConn,
+    sql: &str,
+    max_rows: u64,
+    cell_cap: usize,
+) -> Result<(QueryResult, bool), DbError> {
+    if conn.is_discarded() {
         return Err(lost_connection());
     }
-    let result = run_query_capped(tx.conn.client(), sql, &[], max_rows, cell_cap).await;
-    let (result, truncated, _abandoned) = settle(&mut tx.conn, result, sql)?;
+    let result = run_query_capped(conn.client(), sql, &[], max_rows, cell_cap).await;
+    let (result, truncated, _abandoned) = settle(conn, result, sql)?;
     Ok((result, truncated))
 }
 
@@ -940,11 +962,17 @@ pub async fn begin_tx(pool: &MssqlPool) -> Result<MssqlTx, DbError> {
 /// rows. Errors (instead of panicking) when an earlier fatal failure already
 /// discarded the transaction's connection.
 pub async fn execute_conn(tx: &mut MssqlTx, sql: &str) -> Result<u64, DbError> {
-    if tx.conn.is_discarded() {
+    execute_held(&mut tx.conn, sql).await
+}
+
+/// One script statement on a connection held across statements — a script
+/// transaction's or a [`MssqlScriptConn`]'s.
+async fn execute_held(conn: &mut PooledConn, sql: &str) -> Result<u64, DbError> {
+    if conn.is_discarded() {
         return Err(lost_connection());
     }
-    let result = run_statement(tx.conn.client(), sql).await;
-    settle(&mut tx.conn, result, sql)
+    let result = run_statement(conn.client(), sql).await;
+    settle(conn, result, sql)
 }
 
 /// [`execute_conn`] with bound parameters — the write path for a batch of
@@ -1006,6 +1034,87 @@ pub async fn rollback_tx(mut tx: MssqlTx) {
         tx.resolved = true;
     }
     // On error the Drop impl discards the connection.
+}
+
+/// One pooled connection held for a whole script that runs outside hubro's
+/// transaction — one that manages its own (`BEGIN TRAN` … `COMMIT`), or holds
+/// a statement SQL Server refuses inside a user transaction. Holding it is
+/// what keeps the script's own transaction on the connection that opened it.
+///
+/// Ended by [`end_script_conn`], which rolls back whatever transaction the
+/// script left open. The registry's
+/// [`ScriptConn`](crate::db::registry::ScriptConn) discards a connection that
+/// was not ended — a cancelled run — so none goes back to the pool with a
+/// transaction still open on it.
+pub struct MssqlScriptConn {
+    conn: PooledConn,
+}
+
+impl MssqlScriptConn {
+    /// Drops the connection instead of returning it to the pool. The server
+    /// rolls back any transaction left open on it when the session goes.
+    pub fn discard(&mut self) {
+        self.conn.discard();
+    }
+}
+
+/// Checks a connection out for one script — see [`MssqlScriptConn`].
+pub async fn acquire_script_conn(pool: &MssqlPool) -> Result<MssqlScriptConn, DbError> {
+    Ok(MssqlScriptConn {
+        conn: pool.acquire().await?,
+    })
+}
+
+/// [`execute_conn`] on a script's held connection.
+pub async fn execute_script_conn(conn: &mut MssqlScriptConn, sql: &str) -> Result<u64, DbError> {
+    execute_held(&mut conn.conn, sql).await
+}
+
+/// [`query_capped_conn`] on a script's held connection.
+pub async fn query_capped_script_conn(
+    conn: &mut MssqlScriptConn,
+    sql: &str,
+    max_rows: u64,
+    cell_cap: usize,
+) -> Result<(QueryResult, bool), DbError> {
+    query_capped_held(&mut conn.conn, sql, max_rows, cell_cap).await
+}
+
+/// Rolls back a transaction the script left open and answers one
+/// question in the same batch: was there one. `@@TRANCOUNT` is the session's
+/// own count, so it covers every nesting level and a transaction an error has
+/// made uncommittable (`XACT_STATE() = -1`), which only a rollback can end.
+///
+/// A plain batch rather than `sp_executesql`, like every statement that
+/// changes `@@TRANCOUNT`: inside the RPC a `ROLLBACK` that ends a transaction
+/// opened outside it fails with error 266.
+const END_SCRIPT: &str =
+    "IF @@TRANCOUNT > 0 BEGIN ROLLBACK TRAN; SELECT CAST(1 AS int) END ELSE SELECT CAST(0 AS int)";
+
+/// Ends a script's hold on its connection: rolls back any transaction the
+/// script left open and reports whether there was one. A failure discards the
+/// connection, since its transaction state is then unknown; the error is the
+/// caller's to report.
+pub async fn end_script_conn(conn: &mut MssqlScriptConn) -> Result<bool, DbError> {
+    let held = &mut conn.conn;
+    if held.is_discarded() {
+        return Err(lost_connection());
+    }
+    let ended = async {
+        let row = held
+            .client()
+            .simple_query(END_SCRIPT)
+            .await?
+            .into_row()
+            .await?;
+        Ok::<_, TdsError>(row.and_then(|row| row.get::<i32, _>(0)) == Some(1))
+    }
+    .await;
+    let ended = settle(held, ended, END_SCRIPT);
+    if ended.is_err() {
+        held.discard();
+    }
+    ended
 }
 
 /// Streams a query to `out` in the given format, writing each row
