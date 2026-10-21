@@ -2138,9 +2138,7 @@ fn GridBars(
                         // clear it — the rows render red (pending
                         // delete) from the stage now.
                         let locators = selection_locators(&selected.peek());
-                        for locator in locators {
-                            state.stage_delete(id, &delete_table, locator);
-                        }
+                        state.stage_deletes(id, &delete_table, locators);
                         selected.set(HashMap::new());
                     },
                     "Delete {selected.read().len()} selected"

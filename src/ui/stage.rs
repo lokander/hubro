@@ -4,7 +4,7 @@
 //!
 //! The cell editors and insert/delete affordances only push changes in
 //! through [`AppState::stage_cell_edit`](super::state::AppState::stage_cell_edit)
-//! / the `stage_insert_*` / `stage_delete` family; everything downstream —
+//! / the `stage_insert_*` / `stage_deletes` family; everything downstream —
 //! dirty rendering, the Save/Discard bar, the transactional apply — already
 //! works.
 //!

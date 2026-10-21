@@ -855,7 +855,7 @@ pub struct AppState {
     pub tab_ui: Signal<HashMap<ConnectionId, TabUi>>,
     /// Staged (unsaved) edits per connection, keyed by [`TableRef::key`].
     /// The grid's editors push changes in via [`Self::stage_cell_edit`], the
-    /// `stage_insert_*` family, and [`Self::stage_delete`];
+    /// `stage_insert_*` family, and [`Self::stage_deletes`];
     /// [`Self::save_staged`] applies a table's stage in one transaction.
     pub staged: Signal<HashMap<ConnectionId, HashMap<String, TableStage>>>,
     /// Per-table grid refresh nonce, keyed by (connection,
