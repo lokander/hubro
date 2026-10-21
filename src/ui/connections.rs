@@ -556,6 +556,9 @@ fn SavedConnectionRow(
     let mut confirm_remove = confirm_remove;
     let mut settings_open = settings_open;
     let mut open_form = open_form;
+    // Asked once per render, by borrow: three checks below need it, and each
+    // used to clone the signal's string and the row's locator to compare.
+    let settings_shown = settings_open.read().as_deref() == Some(row.locator.as_str());
     rsx! {
         // Same row-hover shade as the sidebar's table list. The
         // Edit/Remove buttons hover one step further so they
@@ -720,18 +723,18 @@ fn SavedConnectionRow(
                     // form, so this is the only place it can
                     // be protected from.
                     button {
-                        class: if settings_open() == Some(row.locator.clone()) {
+                        class: if settings_shown {
                             "cursor-pointer rounded bg-slate-300 dark:bg-slate-700 p-1.5 text-slate-900 dark:text-slate-200"
                         } else {
                             "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200"
                         },
                         title: "Group, write protection and colour",
                         aria_label: "Group, write protection and colour",
-                        aria_expanded: if settings_open() == Some(row.locator.clone()) { "true" } else { "false" },
+                        aria_expanded: if settings_shown { "true" } else { "false" },
                         onclick: {
                             let locator = row.locator.clone();
                             move |_| {
-                                let open = settings_open() == Some(locator.clone());
+                                let open = settings_open.peek().as_deref() == Some(locator.as_str());
                                 settings_open.set((!open).then(|| locator.clone()));
                             }
                         },
@@ -777,7 +780,7 @@ fn SavedConnectionRow(
             // full-width click target, so a floating popover
             // would have to be dismissed before the row could
             // be used.
-            if settings_open() == Some(row.locator.clone()) {
+            if settings_shown {
                 RowSettings {
                     locator: row.locator.clone(),
                     backend: row.backend,
@@ -840,11 +843,7 @@ pub(super) fn ConnectionsScreen() -> Element {
         }
     });
     let query = search();
-    // The same test `arrange` applies, so the fold override below and the
-    // section filtering can't disagree about what "searching" means.
-    let searching = !query.trim().is_empty();
-    let groups: Vec<String> = state.saved.read().groups().to_vec();
-    let collapsed: Vec<String> = state.collapsed_groups.read().clone();
+    let has_groups = !state.saved.read().groups().is_empty();
     // Whether anything is saved at all — the empty state's condition, which
     // a search that matches nothing must not trigger.
     let has_saved = !state.saved.read().entries().is_empty();
@@ -852,7 +851,22 @@ pub(super) fn ConnectionsScreen() -> Element {
     // with the connections filed under it, then the ungrouped ones, narrowed
     // by the search box. `arrange` owns those two rules so the render body
     // stays a straight walk over what it returned.
-    let sections: Vec<SectionView> = {
+    //
+    // Memoized, not built in the render body. Building it is not free:
+    // `arrange` clones every saved entry, and each SQLite row's open-locator
+    // canonicalizes its path — a filesystem call per row. And this screen
+    // re-renders for much that is not the list: each keystroke of a new
+    // group's name, a prompt card appearing, a connect error. Reads exactly
+    // the six signals the list is made of, so it rebuilds when one of those
+    // changes and otherwise hands the render the list it already has.
+    let sections = use_memo(move || {
+        let query = search();
+        // The same test `arrange` applies, so the fold override below and the
+        // section filtering can't disagree about what "searching" means.
+        let searching = !query.trim().is_empty();
+        let saved = state.saved.read();
+        let groups = saved.groups();
+        let collapsed = state.collapsed_groups.read();
         let open = state.open_locators.read();
         let connecting = state.connecting.read();
         let requests = state.connect_requests.read();
@@ -881,9 +895,7 @@ pub(super) fn ConnectionsScreen() -> Element {
                 auth,
             }
         };
-        state
-            .saved
-            .read()
+        saved
             .arrange(&query)
             .into_iter()
             .map(|section| SectionView {
@@ -898,8 +910,8 @@ pub(super) fn ConnectionsScreen() -> Element {
                 rows: section.entries.iter().map(&row_for).collect(),
                 name: section.name,
             })
-            .collect()
-    };
+            .collect::<Vec<SectionView>>()
+    });
 
     let pick_file = move |_| {
         spawn(async move {
@@ -1026,12 +1038,14 @@ pub(super) fn ConnectionsScreen() -> Element {
             }
             // A search that matches nothing says so, rather than looking like
             // an empty connections list.
-            if has_saved && sections.is_empty() {
+            if has_saved && sections.read().is_empty() {
                 p { class: "text-sm text-slate-500 dark:text-slate-400",
                     "No connection matches “{query}”."
                 }
             }
-            for section in sections {
+            // Iterating the borrow: the memo keeps its value, so each row is
+            // cloned into its props rather than moved.
+            for section in sections.read().iter() {
                 // One bordered block per section, so a group reads as
                 // containing its rows rather than sitting above them.
                 div {
@@ -1053,25 +1067,22 @@ pub(super) fn ConnectionsScreen() -> Element {
                     // The ungrouped rows are labelled only once a group
                     // exists: with no groups at all the list is exactly the
                     // flat one it has always been, header and all.
-                    if section.name.is_none() && !groups.is_empty() {
+                    if section.name.is_none() && has_groups {
                         div { class: "border-b border-slate-200 dark:border-slate-800 px-3 py-1.5 text-xs font-semibold uppercase tracking-wide text-slate-500",
                             "Ungrouped"
                         }
                     }
                     if !section.collapsed {
-                        // The emptiness check comes first so the loop below
-                        // can *move* the rows instead of cloning every row of
-                        // every section on every render.
                         if section.rows.is_empty() {
                             p { class: "px-4 py-3 text-xs text-slate-500 dark:text-slate-400",
                                 "No connections here yet — open a connection's shield button and pick this group."
                             }
                         }
                         ul { class: "divide-y divide-slate-200 dark:divide-slate-800",
-                            for row in section.rows {
+                            for row in section.rows.iter() {
                                 SavedConnectionRow {
                                     key: "{row.locator}",
-                                    row,
+                                    row: row.clone(),
                                     confirm_remove,
                                     settings_open,
                                     open_form,
