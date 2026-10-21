@@ -1219,7 +1219,7 @@ pub async fn real_round_trip_failures(pool: &DbPool, prefix: &str) -> Vec<String
 /// `numeric` holds `1e400`, past `f64`: shown as its 401 digits, committed
 /// unchanged and typed as `1e400`, it must stay that number — `1e400` parses
 /// as an infinite `f64`, and treating that as typed infinity saved
-/// `Infinity` over it.
+/// `Infinity` over it — and typed into the float column it must be refused.
 pub async fn non_finite_edit_failures(pool: &DbPool, prefix: &str) -> Vec<String> {
     use hubro::db::{apply_staged, detect_row_identity, RowLocator, StagedChange, Value};
     use hubro::ui::editing::{editor_kind, parse_input};
@@ -1304,6 +1304,13 @@ pub async fn non_finite_edit_failures(pool: &DbPool, prefix: &str) -> Vec<String
                 held.rows[0][0]
             ));
         }
+    }
+    // A float holds no `1e400`; the server refuses it as out of range, and
+    // the editor must too rather than stage the infinity Rust parses it as.
+    let d = table.columns.iter().find(|c| c.name == "d").unwrap();
+    let kind = editor_kind(&d.type_name, &d.type_detail, Some(pool.dialect()));
+    if let Ok(value) = parse_input(&kind, pool.dialect(), "1e400") {
+        failures.push(format!("d = \"1e400\": the editor staged {value:?}"));
     }
     failures
 }
