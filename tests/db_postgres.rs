@@ -1008,6 +1008,11 @@ async fn postgres_empty_results_keep_their_column_headers() {
 /// connection, so the first introspection's every query sees the table —
 /// which is why the test is built that way: before temp tables were left out,
 /// it was listed by the first introspection here and not by the second.
+///
+/// The probe is what keeps this from passing vacuously. Introspection leaving
+/// the table out only means something if this pool could see it at all, so
+/// each round first asks the same pool whether the catalog lists it, under
+/// the very `LOCAL TEMPORARY` label the filter relies on.
 #[tokio::test]
 async fn postgres_temporary_tables_are_not_listed() {
     let Some(url) = test_url().await else { return };
@@ -1015,7 +1020,16 @@ async fn postgres_temporary_tables_are_not_listed() {
     pool.execute("CREATE TEMP TABLE temp_unlisted (email text UNIQUE)")
         .await
         .unwrap();
+    let mut seen_by_probe = 0;
     for attempt in 0..4 {
+        let probe = pool
+            .query(
+                "SELECT 1 FROM information_schema.tables \
+                 WHERE table_name = 'temp_unlisted' AND table_type = 'LOCAL TEMPORARY'",
+            )
+            .await
+            .unwrap();
+        seen_by_probe += probe.rows.len();
         let tables = pool.introspect().await.unwrap();
         let listed: Vec<_> = tables
             .iter()
@@ -1023,6 +1037,10 @@ async fn postgres_temporary_tables_are_not_listed() {
             .collect();
         assert!(listed.is_empty(), "introspection {attempt}: {listed:?}");
     }
+    assert!(
+        seen_by_probe > 0,
+        "the pool never saw its own temp table, so nothing above was tested"
+    );
     pool.close().await;
 }
 
