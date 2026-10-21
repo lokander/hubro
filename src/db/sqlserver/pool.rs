@@ -54,7 +54,15 @@ const MAX_CONNECTIONS: usize = 4;
 /// Server's own drivers set) explicitly so the session never depends on
 /// server or database defaults. TEXTSIZE lifts the legacy cap on
 /// text/ntext/image reads.
+///
+/// NOCOUNT OFF is what every guarded write's row count stands on
+/// ([`statement_rows`]). A server whose `user options` turn NOCOUNT on for
+/// new sessions sends no counts at all — measured, with 512 configured, a
+/// one-row update reported none, so every edit read as zero rows and was
+/// refused. Statements cannot undo this pin for later ones: a script's `SET`
+/// runs inside `sp_executesql` and lapses with it, as does a trigger's.
 const SESSION_SETUP: &str = "SET QUOTED_IDENTIFIER ON; \
+     SET NOCOUNT OFF; \
      SET ANSI_NULLS ON; \
      SET ANSI_PADDING ON; \
      SET ANSI_WARNINGS ON; \
@@ -631,12 +639,43 @@ async fn read_first_result_set<S: RowSink>(
 }
 
 /// Runs a parameterized non-row statement via the driver's RPC path,
-/// returning the summed affected-row count.
-async fn run_execute(client: &mut TdsClient, sql: &str, params: &[Value]) -> Result<u64, TdsError> {
+/// returning every affected-row count its response carried, in arrival order:
+/// one per statement the server ran on its behalf, *triggers included*. Read
+/// it with [`statement_rows`] or sum it, and say which.
+async fn run_execute(
+    client: &mut TdsClient,
+    sql: &str,
+    params: &[Value],
+) -> Result<Vec<u64>, TdsError> {
     let mut query = Query::new(sql.to_string());
     bind_params(&mut query, params);
     let result = query.execute(client).await?;
-    Ok(result.total())
+    Ok(result.into_iter().collect())
+}
+
+/// The rows one statement itself affected, out of every count its response
+/// carried — the number the guarded writes hold to an expected count, which
+/// on Postgres (one command tag) and SQLite (`changes()`) already leaves
+/// trigger work out.
+///
+/// Here it does not come apart by kind: through `sp_executesql` the
+/// statement's count and every count from DML its triggers ran arrive as the
+/// same `DONEINPROC` token. It comes apart by order. A trigger runs inside the
+/// statement that fired it, so its statements finish, and are reported,
+/// first; the statement's own count is the last. Measured against SQL Server
+/// 2022 for `AFTER INSERT`/`UPDATE`/`DELETE` triggers that write more rows
+/// than the statement does, a nested trigger, a trigger returning a result
+/// set, and `INSTEAD OF` triggers: always last, always the statement's. An
+/// `INSTEAD OF` trigger replaces the statement, whose count is then the rows
+/// the trigger fired for — what the WHERE clause matched, not what the
+/// trigger went on to write.
+///
+/// Only sound while the session reports counts at all: under `NOCOUNT ON`
+/// the statement sends none, and the last count would be a trigger's that
+/// turned `NOCOUNT` off for itself. [`SESSION_SETUP`] pins it off. No count
+/// reads as zero rows, which no guarded write expects.
+fn statement_rows(counts: &[u64]) -> u64 {
+    counts.last().copied().unwrap_or(0)
 }
 
 /// Runs one script statement that returns no rows, reporting its affected
@@ -644,11 +683,19 @@ async fn run_execute(client: &mut TdsClient, sql: &str, params: &[Value]) -> Res
 /// ([`tsql_leads_own_batch`]) cannot go through `sp_executesql`, so it runs as
 /// a plain batch instead; nothing it does counts as an affected row, so it
 /// reports 0.
+///
+/// The report is the *sum* of every count, trigger rows included — unlike
+/// [`statement_rows`], and deliberately: a script statement is a whole `GO`
+/// batch, and its several statements' counts arrive as the same token as
+/// their triggers', so no rule over the counts can tell the batch's own rows
+/// from theirs. The sum is what SQL Server reported; nothing is held to it.
 async fn run_statement(client: &mut TdsClient, sql: &str) -> Result<u64, TdsError> {
     if tsql_leads_own_batch(sql) {
         run_batch(client, sql).await.map(|()| 0)
     } else {
-        run_execute(client, sql, &[]).await
+        run_execute(client, sql, &[])
+            .await
+            .map(|counts| counts.iter().sum())
     }
 }
 
@@ -803,7 +850,7 @@ pub async fn execute_all_checked(
     for (index, statement) in statements.iter().enumerate() {
         let result = run_execute(conn.client(), &statement.sql, &statement.params).await;
         let affected = match result {
-            Ok(affected) => affected,
+            Ok(counts) => statement_rows(&counts),
             Err(e) => {
                 rollback_on(&mut conn, is_fatal(&e)).await;
                 return Err((Some(index), query_error(&e, &statement.sql)));
@@ -887,7 +934,9 @@ pub async fn execute_conn(tx: &mut MssqlTx, sql: &str) -> Result<u64, DbError> {
 
 /// [`execute_conn`] with bound parameters — the write path for a batch of
 /// imported rows, which must run inside the script transaction and
-/// must not interpolate its values into the SQL.
+/// must not interpolate its values into the SQL. Reports the statement's own
+/// rows ([`statement_rows`]), not its triggers': the import holds each batch
+/// to the rows it carried.
 pub async fn execute_with_conn(
     tx: &mut MssqlTx,
     sql: &str,
@@ -897,7 +946,7 @@ pub async fn execute_with_conn(
         return Err(lost_connection());
     }
     let result = run_execute(tx.conn.client(), sql, params).await;
-    settle(&mut tx.conn, result, sql)
+    settle(&mut tx.conn, result, sql).map(|counts| statement_rows(&counts))
 }
 
 /// Commits a script transaction — its statements all take effect. A failed
@@ -1302,5 +1351,48 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("connection was lost"));
         rollback_tx(tx).await;
+    }
+
+    #[test]
+    fn a_statement_is_held_to_its_own_count_not_its_triggers() {
+        // The count sequences SQL Server 2022 sent, in arrival order, for one
+        // statement through `sp_executesql`. Trigger counts come first; the
+        // statement's own is last.
+        let cases: &[(&str, &[u64], u64)] = &[
+            ("no trigger", &[1], 1),
+            ("an after trigger writing an audit row", &[1, 1], 1),
+            (
+                "an after trigger writing more rows than the statement",
+                &[2, 5, 1],
+                1,
+            ),
+            ("a nested trigger", &[1, 1, 1, 1], 1),
+            ("an instead-of trigger writing other rows", &[5, 1], 1),
+            // The summed count read this as the one row the edit expected.
+            (
+                "a statement-level trigger on a statement matching nothing",
+                &[1, 0],
+                0,
+            ),
+            // Under NOCOUNT ON: no count is no rows, never a pass.
+            ("no counts at all", &[], 0),
+        ];
+        for (case, counts, expected) in cases {
+            assert_eq!(statement_rows(counts), *expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn every_session_reports_row_counts() {
+        // `statement_rows` is only sound while the session sends counts, and
+        // a server's `user options` can turn them off for new sessions.
+        let options: Vec<String> = SESSION_SETUP
+            .split(';')
+            .map(|option| option.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect();
+        assert!(
+            options.iter().any(|option| option == "SET NOCOUNT OFF"),
+            "{options:?}"
+        );
     }
 }

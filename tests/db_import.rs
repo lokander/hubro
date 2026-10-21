@@ -775,6 +775,48 @@ async fn mssql_skip_mode_reports_lines_and_commits_the_rest() {
 }
 
 #[tokio::test]
+async fn mssql_import_counts_its_own_rows_not_the_triggers() {
+    // Every batch is held to the rows it carried, and SQL Server reports a
+    // trigger's DML alongside the statement that fired it. Summed, a table
+    // with an audit trigger refused every import: three rows read as six.
+    let Some(url) = mssql_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    for sql in [
+        "IF OBJECT_ID('dbo.import_audited', 'U') IS NOT NULL DROP TABLE dbo.import_audited",
+        "IF OBJECT_ID('dbo.import_audit', 'U') IS NOT NULL DROP TABLE dbo.import_audit",
+        "CREATE TABLE dbo.import_audited (id int PRIMARY KEY, name nvarchar(100) NOT NULL)",
+        "CREATE TABLE dbo.import_audit (n int IDENTITY PRIMARY KEY, name nvarchar(100) NOT NULL)",
+        "CREATE TRIGGER dbo.import_audited_log ON dbo.import_audited AFTER INSERT AS
+         INSERT INTO dbo.import_audit (name) SELECT name FROM inserted",
+    ] {
+        pool.execute(sql).await.unwrap();
+    }
+    let tables = pool.introspect().await.unwrap();
+    let table = find(&tables, "import_audited");
+
+    let report = import(
+        &pool,
+        table,
+        &options(vec![bind(0, "id"), bind(1, "name")], ErrorMode::Abort),
+        csv("id,name\n1,ada\n2,grace\n3,alan\n").as_mut(),
+    )
+    .await
+    .expect("the trigger's rows are not the import's");
+    assert_eq!(report.inserted_rows, 3);
+    assert_eq!(pool.count_table_rows(table).await.unwrap(), 3);
+    // The trigger ran, so its rows were in the response the guard read.
+    let audit = pool
+        .query("SELECT COUNT(*) FROM dbo.import_audit")
+        .await
+        .unwrap();
+    assert_eq!(audit.rows, vec![vec![Value::Integer(3)]]);
+
+    pool.execute("DROP TABLE dbo.import_audited").await.unwrap();
+    pool.execute("DROP TABLE dbo.import_audit").await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn postgres_a_partially_applied_batch_is_rolled_back_and_counted() {
     // The row-count guard's own case, attacked the way the reviewer did: a
     // BEFORE INSERT trigger drops half of every batch, so the statement
