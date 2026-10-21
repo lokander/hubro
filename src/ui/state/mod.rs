@@ -914,12 +914,14 @@ pub struct Connecting {
 }
 
 /// A session tab whose connect is in flight: what its tab reopens showing,
-/// and whether it was the tab in front. Applied by whichever connect opens the
-/// locator (see `AppState::start_restore`).
+/// whether it was the tab in front, and where it goes among the tabs. Applied
+/// by whichever connect opens the locator (see `AppState::start_restore`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoredTab {
     pub tab: SessionTab,
     pub in_front: bool,
+    /// The locators of the session's tabs before this one, in order.
+    pub earlier: Vec<String>,
 }
 
 /// A connect started from the connections list, as opposed to one started by
