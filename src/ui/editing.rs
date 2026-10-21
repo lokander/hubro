@@ -875,7 +875,14 @@ mod tests {
         for big in ["1e400", "-1e400", huge.as_str()] {
             assert_eq!(exact(big), Ok(Value::Text(big.into())), "{big}");
             assert!(float(big).is_err(), "{big}");
-            assert!(on(Dialect::SqlServer, NumericKind::Float, big).is_err());
+            for dialect in [Dialect::SqlServer, Dialect::Sqlite] {
+                for kind in [NumericKind::Exact, NumericKind::Float] {
+                    assert!(
+                        on(dialect, kind, big).is_err(),
+                        "{dialect:?} {kind:?} {big}"
+                    );
+                }
+            }
         }
     }
 
