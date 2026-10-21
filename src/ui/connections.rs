@@ -1333,12 +1333,20 @@ fn HostKeyPromptCard(prompt: super::state::HostKeyPrompt) -> Element {
 /// Interactive Entra sign-in prompt. A Postgres or SQL Server connect
 /// needs a Microsoft browser sign-in (no cached refresh token); the button
 /// opens the browser and completes the connect, Cancel abandons it.
+/// "Remember" keeps the sign-in's refresh token in the OS keyring, so later
+/// connects and startup sign in silently; without it the sign-in lasts this
+/// session only.
 #[component]
 fn EntraSignInCard(prompt: super::state::EntraPrompt) -> Element {
     let state = use_context::<AppState>();
+    // Seeded from the prompt, which carries the answer back after a failed
+    // sign-in, so a cleared box is not re-ticked.
+    let offered = prompt.remember;
+    let mut remember = use_signal(move || offered);
     let prompt_for_signin = prompt.clone();
     let sign_in = move || {
-        let prompt = prompt_for_signin.clone();
+        let mut prompt = prompt_for_signin.clone();
+        prompt.remember = *remember.peek();
         // spawn_forever: signing in clears `entra_prompt`, unmounting this card;
         // a scope-tied spawn would be cancelled mid sign-in.
         dioxus::core::spawn_forever(async move {
@@ -1369,6 +1377,14 @@ fn EntraSignInCard(prompt: super::state::EntraPrompt) -> Element {
                     onclick: move |_| cancel_prompt(state, state.entra_prompt),
                     "Cancel"
                 }
+            }
+            label { class: "mt-2 flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
+                input {
+                    r#type: "checkbox",
+                    checked: remember(),
+                    onchange: move |evt| remember.set(evt.checked()),
+                }
+                "Stay signed in: remember in the system keyring (falls back to this session only)"
             }
         }
     }
@@ -1533,7 +1549,7 @@ fn submit_server_form(
             // tab and unmounts it. This task outlives that (it is root-spawned),
             // so calling the handler afterwards would touch a dropped scope's
             // storage and panic. The Entra path yields after opening the tab
-            // (it caches the refresh token), so the unmount really does land
+            // (it keeps the refresh token), so the unmount really does land
             // first.
             //
             // Guarded because ordering alone is not a guarantee: a *second*
@@ -1804,8 +1820,8 @@ fn PostgresForm(
                     ssh_passphrase,
                     radio_group: "pg-ssh-auth",
                 }
-                // Only meaningful for password auth — Entra caches its refresh
-                // token in the keyring regardless.
+                // Only meaningful for password auth — Entra asks on its
+                // sign-in card.
                 if asks_remember(&auth_mode()) {
                     label { class: "flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
                         input {
@@ -2050,8 +2066,8 @@ fn SqlServerForm(
                     ssh_passphrase,
                     radio_group: "mssql-ssh-auth",
                 }
-                // Only meaningful for password auth — Entra caches its refresh
-                // token in the keyring regardless.
+                // Only meaningful for password auth — Entra asks on its
+                // sign-in card.
                 if asks_remember(&auth_mode()) {
                     label { class: "flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
                         input {

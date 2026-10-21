@@ -9,7 +9,7 @@
 //!
 //! - **Interactive** — OAuth 2.0 authorization-code + PKCE with a `127.0.0.1`
 //!   loopback redirect; opens the user's browser to sign in. A cached refresh
-//!   token (persisted by the caller) is redeemed silently first, so the browser
+//!   token (kept by the caller) is redeemed silently first, so the browser
 //!   only opens on first sign-in or once the refresh token lapses.
 //! - **Managed identity** — the Azure Instance Metadata Service (IMDS), or the
 //!   `IDENTITY_ENDPOINT` used by App Service / Container Apps. Only works inside
@@ -17,7 +17,8 @@
 //!
 //! The token never touches the driver directly: the caller splices it in as the
 //! password via [`crate::db::url_with_password`]. Only the refresh token is
-//! worth persisting (in the OS keyring); access tokens are always re-acquired.
+//! worth keeping — in the OS keyring when the user asked to be remembered,
+//! otherwise for the session; access tokens are always re-acquired.
 
 use std::fmt;
 use std::time::{Duration, SystemTime};
@@ -153,6 +154,29 @@ impl fmt::Display for AzureError {
 
 impl std::error::Error for AzureError {}
 
+/// Whether the identity provider refused a refresh token for good: RFC 6749's
+/// `invalid_grant`, which Entra answers for an expired, revoked or otherwise
+/// unusable one. A kept token that earns it can never be redeemed again, so
+/// keeping it costs a wasted token round trip before every sign-in card.
+///
+/// Anything else — a network failure, a 5xx, `temporarily_unavailable` — says
+/// nothing about the token, and forgetting it then would sign an offline user
+/// out of a sign-in that still works.
+pub fn rejects_refresh(err: &AzureError) -> bool {
+    matches!(err, AzureError::OAuth { error, .. } if error == "invalid_grant")
+}
+
+/// What [`acquire_token`] produced, and what became of the cached refresh token
+/// it was handed.
+#[derive(Debug)]
+pub struct Acquisition {
+    pub token: Result<AccessToken, AzureError>,
+    /// The cached refresh token was refused ([`rejects_refresh`]): the caller
+    /// should forget it. Reported even when the interactive fallback then
+    /// succeeded, since that is a different token.
+    pub refresh_rejected: bool,
+}
+
 /// Acquires an access token for `auth`, scoped to `resource` (the target
 /// service's OAuth resource — [`OSSRDBMS_RESOURCE`] for Azure Postgres,
 /// [`SQLDB_RESOURCE`] for Azure SQL). `cached_refresh` is an optional refresh
@@ -167,27 +191,31 @@ pub async fn acquire_token(
     endpoints: &Endpoints,
     timeout: Duration,
     open_browser: impl FnOnce(&str) -> Result<(), AzureError>,
-) -> Result<AccessToken, AzureError> {
+) -> Acquisition {
+    let acquired = |token| Acquisition {
+        token,
+        refresh_rejected: false,
+    };
     match auth {
         EntraAuth::ManagedIdentity { client_id } => {
-            acquire_managed_identity(client_id.as_deref(), resource, endpoints).await
+            acquired(acquire_managed_identity(client_id.as_deref(), resource, endpoints).await)
         }
         EntraAuth::Interactive { tenant, client_id } => {
             if tenant.trim().is_empty() {
-                return Err(AzureError::Config(
+                return acquired(Err(AzureError::Config(
                     "the tenant must not be empty".to_string(),
-                ));
+                )));
             }
             let client_id = client_id.as_deref().unwrap_or(AZURE_CLI_CLIENT_ID);
             // Silent renewal first: a valid refresh token skips the browser.
+            let mut refresh_rejected = false;
             if let Some(refresh) = cached_refresh {
-                if let Ok(token) =
-                    redeem_refresh_token(endpoints, tenant, client_id, resource, refresh).await
-                {
-                    return Ok(token);
+                match redeem_refresh_token(endpoints, tenant, client_id, resource, refresh).await {
+                    Ok(token) => return acquired(Ok(token)),
+                    Err(err) => refresh_rejected = rejects_refresh(&err),
                 }
             }
-            acquire_interactive(
+            let token = acquire_interactive(
                 endpoints,
                 tenant,
                 client_id,
@@ -195,7 +223,11 @@ pub async fn acquire_token(
                 timeout,
                 open_browser,
             )
-            .await
+            .await;
+            Acquisition {
+                token,
+                refresh_rejected,
+            }
         }
     }
 }
@@ -720,6 +752,25 @@ mod tests {
             parse_redirect("/?error=access_denied&error_description=nope&state=S", "S"),
             Err(AzureError::OAuth { error, description }) if error == "access_denied" && description == "nope"
         ));
+    }
+
+    #[test]
+    fn only_invalid_grant_condemns_a_refresh_token() {
+        let oauth = |error: &str| AzureError::OAuth {
+            error: error.to_string(),
+            description: "AADSTS700082: the refresh token has expired".to_string(),
+        };
+        assert!(rejects_refresh(&oauth("invalid_grant")));
+        // Says nothing about the token: forgetting it would sign an offline or
+        // unlucky user out of a sign-in that still works.
+        for transient in [
+            oauth("temporarily_unavailable"),
+            oauth("HTTP 503"),
+            AzureError::Http("connection refused".to_string()),
+            AzureError::Timeout,
+        ] {
+            assert!(!rejects_refresh(&transient), "{transient:?}");
+        }
     }
 
     #[test]

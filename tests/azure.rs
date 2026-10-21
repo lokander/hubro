@@ -84,6 +84,7 @@ async fn interactive_flow_exchanges_the_code_for_a_token() {
         fake_browser,
     )
     .await
+    .token
     .unwrap();
 
     assert_eq!(token.secret, "ACCESS_TOKEN");
@@ -103,7 +104,7 @@ async fn a_cached_refresh_token_is_redeemed_without_opening_a_browser() {
     };
 
     // browser_must_not_open panics if the interactive flow is reached.
-    let token = acquire_token(
+    let acquired = acquire_token(
         &EntraAuth::interactive_default(),
         OSSRDBMS_RESOURCE,
         Some("CACHED_REFRESH"),
@@ -111,8 +112,9 @@ async fn a_cached_refresh_token_is_redeemed_without_opening_a_browser() {
         Duration::from_secs(5),
         browser_must_not_open,
     )
-    .await
-    .unwrap();
+    .await;
+    assert!(!acquired.refresh_rejected);
+    let token = acquired.token.unwrap();
 
     assert_eq!(token.secret, "RENEWED");
     assert_eq!(token.refresh_token.as_deref(), Some("ROTATED"));
@@ -145,6 +147,7 @@ async fn managed_identity_reads_the_token_from_imds() {
         browser_must_not_open,
     )
     .await
+    .token
     .unwrap();
 
     assert_eq!(token.secret, "MI_TOKEN");
@@ -174,6 +177,7 @@ async fn a_token_endpoint_error_surfaces_as_an_oauth_error() {
         fake_browser,
     )
     .await
+    .token
     .unwrap_err();
 
     assert!(
@@ -181,4 +185,70 @@ async fn a_token_endpoint_error_surfaces_as_an_oauth_error() {
         "expected an OAuth error, got {err:?}"
     );
     assert!(err.to_string().contains("token expired"));
+}
+
+/// The opener a silent connect passes: no browser, so the flow ends here.
+fn refuse_browser(_: &str) -> Result<(), AzureError> {
+    Err(AzureError::Browser(
+        "interactive sign-in required".to_string(),
+    ))
+}
+
+#[tokio::test]
+async fn a_refused_refresh_token_is_reported_so_the_caller_forgets_it() {
+    let login = fake_server(
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"invalid_grant","error_description":"AADSTS700082: expired"}"#,
+    )
+    .await;
+    let endpoints = Endpoints {
+        login,
+        imds: "http://127.0.0.1:1".to_string(),
+    };
+
+    let acquired = acquire_token(
+        &EntraAuth::interactive_default(),
+        OSSRDBMS_RESOURCE,
+        Some("STALE_REFRESH"),
+        &endpoints,
+        Duration::from_secs(5),
+        refuse_browser,
+    )
+    .await;
+
+    assert!(
+        acquired.refresh_rejected,
+        "a refresh token Entra refused for good was not reported, so it stays \
+         kept and costs a token round trip before every later sign-in"
+    );
+    // Still falls through to the interactive flow, which this opener refuses.
+    assert!(matches!(acquired.token, Err(AzureError::Browser(_))));
+}
+
+#[tokio::test]
+async fn a_refresh_that_fails_for_any_other_reason_keeps_the_token() {
+    // An outage, and a token endpoint nobody is listening on: neither says the
+    // token is bad, and forgetting it would sign the user out over a blip.
+    let outage = fake_server(
+        "HTTP/1.1 503 Service Unavailable",
+        r#"{"error":"temporarily_unavailable","error_description":"try later"}"#,
+    )
+    .await;
+    for login in [outage, "http://127.0.0.1:1".to_string()] {
+        let endpoints = Endpoints {
+            login: login.clone(),
+            imds: "http://127.0.0.1:1".to_string(),
+        };
+        let acquired = acquire_token(
+            &EntraAuth::interactive_default(),
+            OSSRDBMS_RESOURCE,
+            Some("GOOD_REFRESH"),
+            &endpoints,
+            Duration::from_secs(5),
+            refuse_browser,
+        )
+        .await;
+        assert!(!acquired.refresh_rejected, "{login}");
+        assert!(acquired.token.is_err());
+    }
 }
