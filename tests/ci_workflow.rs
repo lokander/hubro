@@ -1,4 +1,7 @@
-//! What `ci.yml` declines to run on, checked against what the build and the
+//! Two claims `ci.yml` makes, made checkable: what it declines to run on, and
+//! that its Linux leg really runs the Postgres suites.
+//!
+//! **What it declines to run on**, checked against what the build and the
 //! tests actually read.
 //!
 //! A `paths-ignore` entry is a claim that no change to the files it matches
@@ -24,6 +27,11 @@
 //! What this cannot see is a walker that reads raw *bytes* from a directory an
 //! ignore pattern covers — none exists today. A test like that would need its
 //! directory taken out of `paths-ignore`, and this file's checks extended.
+//!
+//! **That the Postgres suites run.** Every engine suite skips, and passes,
+//! when its variable is unset. The Linux leg starts a Postgres, and
+//! `HUBRO_REQUIRE_TEST_URLS` turns a lost `HUBRO_PG_TEST_URL` into a failure —
+//! but only while ci.yml still sets it, which is what the last test pins.
 
 use std::process::Command;
 
@@ -113,10 +121,10 @@ fn the_matcher_reads_patterns_as_github_does() {
     // `**/` matches zero directories too — which is how `assets/**/*.ico`
     // came to cover `assets/favicon.ico`.
     assert!(glob_matches("assets/**/*.ico", "assets/favicon.ico"));
-    assert!(glob_matches("assets/**/*.ico", "assets/icons/icon.ico"));
+    assert!(glob_matches("assets/**/*.ico", "assets/icons/app.ico"));
     assert!(glob_matches("**/*.md", "README.md"));
     assert!(glob_matches("**/*.md", "src/db/CLAUDE.md"));
-    assert!(glob_matches("docs/**", "docs/screenshot.png"));
+    assert!(glob_matches("docs/**", "docs/images/shot.png"));
     assert!(glob_matches("LICENSE", "LICENSE"));
     // `*` stops at a slash, and `**/` consumes whole directories only.
     assert!(!glob_matches("*.md", "docs/PERFORMANCE.md"));
@@ -134,7 +142,7 @@ fn the_workflow_has_no_include_filter_this_cannot_read() {
         assert_ne!(
             line.trim(),
             "paths:",
-            "ci.yml uses an include filter; tests/ci_triggers.rs checks only paths-ignore"
+            "ci.yml uses an include filter; tests/ci_workflow.rs checks only paths-ignore"
         );
     }
 }
@@ -210,4 +218,30 @@ fn push_and_pull_request_ignore_the_same_files() {
         "the push trigger's list was not found"
     );
     assert_eq!(ignored_patterns(push_side), ignored_patterns(pr_side));
+}
+
+#[test]
+fn the_linux_leg_requires_the_postgres_it_starts() {
+    // Without the requirement, deleting the container step leaves every
+    // Postgres test skipping and CI green — the state this replaced, where a
+    // comment in db_postgres.rs called stock-Postgres detection "the side CI
+    // can actually reach" and CI reached none of it.
+    let code: Vec<&str> = CI_WORKFLOW
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .collect();
+    let sets = |assignment: &str| {
+        code.iter()
+            .any(|line| line.contains(&format!("echo \"{assignment}")))
+    };
+    assert!(
+        sets("HUBRO_PG_TEST_URL=postgres://"),
+        "ci.yml no longer points the Postgres suites at a server"
+    );
+    assert!(
+        sets("HUBRO_REQUIRE_TEST_URLS=HUBRO_PG_TEST_URL"),
+        "ci.yml no longer requires HUBRO_PG_TEST_URL, so losing it would skip \
+         the Postgres suites and pass"
+    );
 }
