@@ -465,7 +465,7 @@ async fn materialize_rolls_back_a_transaction_including_its_ddl() {
     tx.execute(&format!("CREATE TABLE {table} (id int)"))
         .await
         .unwrap();
-    tx.rollback().await;
+    let _ = tx.rollback().await;
 
     let survivors = pool
         .query(&format!(

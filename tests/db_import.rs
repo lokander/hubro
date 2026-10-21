@@ -22,9 +22,10 @@ use std::io::BufReader;
 
 use common::FixtureDb;
 use hubro::db::{
-    run_import, ColumnBinding, CsvDialect, CsvReader, DbPool, Dialect, EmptyField, Encoding,
-    ErrorMode, ImportError, ImportOptions, ImportReport, JsonReader, JsonShape, PageRequest,
-    PgFlavor, RecordSource, SourceField, TableAccess, TableMeta, Value, INSTEAD_OF_TRIGGER,
+    run_import, run_script, split_statements, ColumnBinding, CsvDialect, CsvReader, DbPool,
+    Dialect, EmptyField, Encoding, ErrorMode, ImportError, ImportOptions, ImportReport, JsonReader,
+    JsonShape, PageRequest, PgFlavor, RecordSource, SourceField, TableAccess, TableMeta, Value,
+    INSTEAD_OF_TRIGGER,
 };
 
 async fn pg_url() -> Option<String> {
@@ -1350,6 +1351,53 @@ async fn mssql_an_empty_field_in_a_not_null_column_takes_its_default() {
     assert_empty_fields_take_the_column_default(&pool).await;
 
     pool.execute("DROP TABLE dbo.import_defaults, dbo.import_all_default")
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn mssql_import_a_committing_trigger_kept_is_not_reported_undone() {
+    // Measured: an AFTER trigger that commits fails its batch with 3609, and
+    // every row sent before it stays in the table.
+    let Some(url) = mssql_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    pool.execute("DROP TABLE IF EXISTS dbo.import_trigger_commit")
+        .await
+        .unwrap();
+    pool.execute("CREATE TABLE dbo.import_trigger_commit (id int PRIMARY KEY, name nvarchar(100))")
+        .await
+        .unwrap();
+    let statements = split_statements(
+        "CREATE TRIGGER dbo.import_trigger_commit_t ON dbo.import_trigger_commit AFTER INSERT AS \
+         IF EXISTS (SELECT 1 FROM inserted WHERE id = 1100) COMMIT",
+        pool.dialect(),
+    );
+    run_script(&pool, pool.backend_capabilities(), &statements, |_| {})
+        .await
+        .unwrap();
+    let tables = pool.introspect().await.unwrap();
+    let table = find(&tables, "import_trigger_commit");
+    let mut file = String::from("id,name\n");
+    for i in 1..=1200 {
+        file.push_str(&format!("{i},row{i}\n"));
+    }
+    let err = import(
+        &pool,
+        table,
+        &options(vec![bind(0, "id"), bind(1, "name")], ErrorMode::Abort),
+        csv(file.as_str()).as_mut(),
+    )
+    .await
+    .unwrap_err();
+    let kept = pool.count_table_rows(table).await.unwrap();
+    assert_eq!(
+        kept, 1200,
+        "the trigger's COMMIT kept every row sent: {err}"
+    );
+    assert_eq!(err.undone_rows, 0, "{err}");
+    assert!(err.message.contains("may have been kept"), "{err}");
+    pool.execute("DROP TABLE dbo.import_trigger_commit")
         .await
         .unwrap();
     pool.close().await;

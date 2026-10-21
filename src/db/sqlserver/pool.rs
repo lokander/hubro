@@ -1016,56 +1016,26 @@ impl RowSink for CappedRows {
 /// belong to no statement). This is the safety net for row edits: a WHERE
 /// clause that unexpectedly matches more (or fewer) rows than the one being
 /// edited must never commit.
+///
+/// The index is also `None` when the rollback did not undo hubro's own
+/// transaction ([`rollback_tx`]) — measured, an `AFTER` trigger that
+/// commits fails the statement with 3609 and every change before it stands —
+/// so the failure does not claim to have applied nothing.
 pub async fn execute_all_checked(
     pool: &MssqlPool,
     statements: &[CheckedStatement],
 ) -> Result<(), (Option<usize>, DbError)> {
-    let mut conn = pool.acquire().await.map_err(|e| (None, e))?;
-    let begin = run_batch(conn.client(), "BEGIN TRAN").await;
-    settle(&mut conn, begin, "BEGIN TRAN").map_err(|e| (None, e))?;
+    let mut tx = begin_tx(pool).await.map_err(|e| (None, e))?;
     for (index, statement) in statements.iter().enumerate() {
-        let result = run_execute(conn.client(), &statement.sql, &statement.params).await;
-        let affected = match result {
-            Ok(counts) => statement_rows(&counts),
-            Err(e) => {
-                rollback_on(&mut conn, is_fatal(&e)).await;
-                return Err((Some(index), query_error(&e, &statement.sql)));
-            }
+        let error = match execute_with_conn(&mut tx, &statement.sql, &statement.params).await {
+            Ok(affected) if affected == statement.expected_rows => continue,
+            Ok(affected) => DbError::row_count_mismatch(affected, statement.expected_rows),
+            Err(e) => e,
         };
-        if affected != statement.expected_rows {
-            rollback_on(&mut conn, false).await;
-            return Err((
-                Some(index),
-                DbError::row_count_mismatch(affected, statement.expected_rows),
-            ));
-        }
+        let undone = rollback_tx(tx).await == RolledBack::Own;
+        return Err((undone.then_some(index), error));
     }
-    match run_batch(conn.client(), "COMMIT TRAN").await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // Any commit failure — fatal or a server error like a doomed
-            // transaction (3930) — may leave the session inside a transaction;
-            // never return such a connection to the pool.
-            conn.discard();
-            Err((None, query_error(&e, "COMMIT TRAN")))
-        }
-    }
-}
-
-/// Best-effort rollback after a failure mid-transaction. When the failure was
-/// fatal (stream state unknown) or the rollback itself fails, the connection
-/// is discarded — an open transaction must never return to the pool.
-async fn rollback_on(conn: &mut PooledConn, already_fatal: bool) {
-    if already_fatal {
-        conn.discard();
-        return;
-    }
-    if run_batch(conn.client(), "IF @@TRANCOUNT > 0 ROLLBACK TRAN")
-        .await
-        .is_err()
-    {
-        conn.discard();
-    }
+    commit_tx(tx).await.map_err(|(e, _)| (None, e))
 }
 
 /// A script transaction: one connection checked out of the pool for
@@ -1096,17 +1066,25 @@ pub async fn begin_tx(pool: &MssqlPool) -> Result<MssqlTx, DbError> {
     let mut conn = pool.acquire().await?;
     let begin = async {
         let row = conn.client().simple_query(BEGIN).await?.into_row().await?;
-        Ok::<_, TdsError>(row.and_then(|row| row.get::<i64, _>(0)).unwrap_or(0))
+        Ok::<_, TdsError>(row.and_then(|row| row.get::<i64, _>(0)))
     }
     .await;
-    let id = settle(&mut conn, begin, BEGIN)?;
-    Ok(MssqlTx {
-        conn,
-        resolved: false,
-        id,
-    })
+    match settle(&mut conn, begin, BEGIN)? {
+        Some(id) => Ok(MssqlTx {
+            conn,
+            resolved: false,
+            id,
+        }),
+        // Without its id no later answer about this transaction can be
+        // trusted; nothing has run in it yet, so refusing costs nothing.
+        None => {
+            conn.discard();
+            Err(DbError::Query(format!(
+                "{BEGIN} returned no transaction id"
+            )))
+        }
+    }
 }
-
 /// Runs a non-row statement in the script transaction, returning affected
 /// rows. Errors (instead of panicking) when an earlier fatal failure already
 /// discarded the transaction's connection.
@@ -1142,49 +1120,42 @@ pub async fn execute_with_conn(
 }
 
 /// Commits a script transaction — its statements all take effect. A failed
-/// commit discards the connection (nothing was committed; the server rolls
-/// the transaction back with the session). A transaction whose connection was
-/// already discarded by an earlier fatal failure cannot commit and errors.
-pub async fn commit_tx(mut tx: MssqlTx) -> Result<(), DbError> {
+/// commit is rolled back like a failed statement, and says what that covered
+/// ([`rollback_tx`]): measured, a script that committed hubro's transaction
+/// and opened its own (`… COMMIT BEGIN TRAN`) can doom that one under
+/// `XACT_ABORT` without failing a statement, so the `COMMIT TRAN` fails with
+/// 3930 while the first part stands. A transaction whose connection was
+/// already lost cannot commit, and what the server kept is unknown.
+pub async fn commit_tx(mut tx: MssqlTx) -> Result<(), (DbError, RolledBack)> {
     if tx.conn.is_discarded() {
         tx.resolved = true;
-        return Err(lost_connection());
+        return Err((lost_connection(), RolledBack::Unknown));
     }
     let commit = run_batch(tx.conn.client(), "COMMIT TRAN").await;
-    let result = settle(&mut tx.conn, commit, "COMMIT TRAN");
-    match result {
+    match settle(&mut tx.conn, commit, "COMMIT TRAN") {
         Ok(()) => {
             tx.resolved = true;
             Ok(())
         }
-        Err(e) => {
-            // Explicit: whether or not the failure was fatal, this connection
-            // must not carry a half-dead transaction back to the pool.
-            tx.conn.discard();
-            tx.resolved = true;
-            Err(e)
-        }
+        Err(e) => Err((e, rollback_tx(tx).await)),
     }
 }
 
-/// Rolls a script transaction back, and says whether what it rolled back was
-/// still hubro's transaction. A statement can end it from inside the batch:
-/// measured, `INSERT … COMMIT` (or an `EXEC`'d procedure that commits) fails
-/// with error 266 after its `COMMIT` took effect, and `… COMMIT BEGIN TRAN`
-/// raises nothing and leaves a new transaction in its place.
+/// Rolls a script transaction back, and says what it rolled back. A
+/// statement can end hubro's transaction from inside its batch: measured,
+/// `INSERT … COMMIT` (or an `EXEC`'d procedure that commits, or an `AFTER`
+/// trigger, error 3609) fails after its `COMMIT` took effect, and `… COMMIT
+/// BEGIN TRAN` raises nothing and leaves a new transaction in its place.
 ///
-/// Best-effort: a rollback failure discards the connection, which rolls the
-/// transaction back server-side anyway. On a connection an earlier fatal
-/// failure already discarded this is a no-op — the server rolls the abandoned
-/// transaction back when the dead connection goes away (the script runner
-/// rolls back unconditionally after any statement error, so this path must
-/// not panic).
+/// Whatever cannot be asked — the connection is already lost, or the
+/// question fails (a severity-20 error ends the session) — is
+/// [`RolledBack::Unknown`]: the server rolls back what was open when the
+/// connection goes, and what had been committed stands. This path must not
+/// panic: the script runner rolls back after any statement error.
 pub async fn rollback_tx(mut tx: MssqlTx) -> RolledBack {
     if tx.conn.is_discarded() {
         tx.resolved = true;
-        // shortcut: assumes the dead session still held hubro's transaction;
-        // whether a script had ended it can no longer be asked.
-        return RolledBack::Own;
+        return RolledBack::Unknown;
     }
     // A plain batch, as any statement that changes `@@TRANCOUNT` must be.
     let rollback = format!(
@@ -1204,17 +1175,13 @@ pub async fn rollback_tx(mut tx: MssqlTx) -> RolledBack {
         Ok::<_, TdsError>(row.and_then(|row| row.get::<i32, _>(0)))
     }
     .await;
+    // On error the Drop impl discards the connection.
+    tx.resolved = found.is_ok();
     match found {
-        Ok(found) => {
-            tx.resolved = true;
-            match found {
-                Some(0) => RolledBack::Nothing,
-                Some(2) => RolledBack::Another,
-                _ => RolledBack::Own,
-            }
-        }
-        // The Drop impl discards the connection.
-        Err(_) => RolledBack::Own,
+        Ok(Some(1)) => RolledBack::Own,
+        Ok(Some(2)) => RolledBack::Another,
+        Ok(Some(0)) => RolledBack::Nothing,
+        _ => RolledBack::Unknown,
     }
 }
 
@@ -1730,16 +1697,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rollback_of_a_discarded_tx_is_a_noop_not_a_panic() {
-        // The server rolls the abandoned transaction back when the dead
-        // connection goes away; client-side there is nothing left to do.
-        assert_eq!(rollback_tx(discarded_tx()).await, RolledBack::Own);
+    async fn rollback_of_a_discarded_tx_claims_nothing_and_does_not_panic() {
+        // The server rolls back what was open when the dead connection goes
+        // away, but a script may have committed hubro's transaction first,
+        // and nothing can be asked any more.
+        assert_eq!(rollback_tx(discarded_tx()).await, RolledBack::Unknown);
     }
 
     #[tokio::test]
     async fn commit_of_a_discarded_tx_errors_instead_of_panicking() {
-        let err = commit_tx(discarded_tx()).await.unwrap_err();
+        let (err, found) = commit_tx(discarded_tx()).await.unwrap_err();
         assert!(err.to_string().contains("connection was lost"));
+        assert_eq!(found, RolledBack::Unknown);
     }
 
     #[tokio::test]
@@ -1751,7 +1720,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("connection was lost"));
-        rollback_tx(tx).await;
+        assert_eq!(rollback_tx(tx).await, RolledBack::Unknown);
     }
 
     #[test]

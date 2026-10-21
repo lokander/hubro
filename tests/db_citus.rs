@@ -557,7 +557,7 @@ async fn scripts_and_exports_span_distributed_and_reference_tables() {
     ))
     .await
     .unwrap();
-    tx.rollback().await;
+    let _ = tx.rollback().await;
 
     let survived = pool
         .query(&format!("SELECT count(*) FROM {orders} WHERE id = 90001"))

@@ -302,8 +302,10 @@ impl AppState {
     /// in-flight statement itself is NOT interrupted and may still complete
     /// server-side. What happens to its connection depends on the path:
     /// - In hubro's own transaction (the atomic path), dropping it queues a
-    ///   rollback, so once the statement finishes nothing of the run is kept;
-    ///   the connection then goes back to the pool.
+    ///   rollback, so once the statement finishes nothing of the run is kept
+    ///   — unless a SQL Server batch had committed that transaction itself,
+    ///   whose committed part stands; the connection then goes back to the
+    ///   pool.
     /// - Outside it (the sequential path, which every one-statement script
     ///   takes), the held connection is closed rather than returned, since
     ///   the script may have a transaction of its own open on it. A statement

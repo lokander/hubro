@@ -684,7 +684,7 @@ async fn a_forced_serialization_failure_classifies_as_transient() {
         .execute("UPDATE yb_serial SET v = 2 WHERE id = 1")
         .await
         .expect_err("a REPEATABLE READ update of a row changed since its snapshot must be refused");
-    tx.rollback().await;
+    let _ = tx.rollback().await;
 
     assert!(
         refused.is_transient(),

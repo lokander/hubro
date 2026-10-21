@@ -104,7 +104,7 @@ async fn force_serialization_failure(pool: &DbPool, table: &str) -> DbError {
         .execute(&format!("UPDATE {table} SET v = 2 WHERE id = 1"))
         .await
         .expect_err("a REPEATABLE READ update of a row changed since its snapshot must be refused");
-    tx.rollback().await;
+    let _ = tx.rollback().await;
     pool.execute(&format!("DROP TABLE {table}")).await.unwrap();
     refused
 }
@@ -166,8 +166,8 @@ async fn a_deadlock_is_not_classified_as_transient() {
         first.query_capped(&cross_first, 1),
         second.query_capped(&cross_second, 1)
     );
-    first.rollback().await;
-    second.rollback().await;
+    let _ = first.rollback().await;
+    let _ = second.rollback().await;
     let deadlock = match (a, b) {
         (Err(e), Ok(_)) | (Ok(_), Err(e)) => e,
         (a, b) => panic!("expected exactly one deadlock victim, got {a:?} and {b:?}"),

@@ -837,9 +837,15 @@ fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
                          earlier statements stand unless the server undid them itself.",
                     ),
                     Rollback::ConnectionClosed => format!(
-                        "Script stopped after {elapsed_ms} ms, and hubro closed the connection \
-                         rather than check what the script left open: the server discarded \
-                         anything it had not committed. Statements it committed stand.",
+                        "Script stopped after {elapsed_ms} ms, and hubro could not check what \
+                         the script left open, so the connection was closed: the server \
+                         discarded anything it had not committed. Statements it committed stand.",
+                    ),
+                    Rollback::AlreadyEnded => format!(
+                        "Script stopped after {elapsed_ms} ms, but its transaction had already \
+                         ended: the script committed it, or the server rolled it back (the error \
+                         says which). Hubro rolled nothing back, so what ran before it ended — \
+                         part of the failing statement included — may stand.",
                     ),
                     // The claim this exists to stop hubro making:
                     // the rollback was real, but it did not reach the schema
