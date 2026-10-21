@@ -4,8 +4,9 @@ mod common;
 
 use common::FixtureDb;
 use hubro::db::{
-    apply_staged, explain_statement, Capabilities, DbError, DbPool, PlanDisplay, Restriction,
-    RowCount, RowIdentity, RowLocator, StagedChange, TableKind, TableMeta, Value,
+    apply_staged, explain_statement, Capabilities, DbError, DbPool, ExportFormat, PageRequest,
+    PlanDisplay, Restriction, RowCount, RowIdentity, RowLocator, StagedChange, TableKind,
+    TableMeta, Value, NUL_IN_SQL,
 };
 
 fn table<'a>(tables: &'a [TableMeta], name: &str) -> &'a TableMeta {
@@ -684,5 +685,171 @@ async fn sqlite_explains_a_query_as_raw_output() {
     let after = pool.query("SELECT count(*) FROM artists").await.unwrap();
     assert_eq!(before.rows, after.rows);
 
+    pool.close().await;
+}
+
+/// `fut`, or a failure naming `what` once it has run for ten seconds. A NUL
+/// that reaches sqlx-sqlite never comes back — its worker thread spins
+/// forever — so without this a regression hangs the suite instead of
+/// failing it. The spinning thread outlives the timeout and dies with the
+/// test binary.
+async fn within<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+        .await
+        .unwrap_or_else(|_| panic!("{what} hung: the NUL reached the driver"))
+}
+
+fn nul_refused() -> DbError {
+    DbError::Query(NUL_IN_SQL.to_string())
+}
+
+/// Every way SQL text reaches SQLite outside the script runner, handed a
+/// statement that is complete before its NUL — the shape that hangs
+/// sqlx-sqlite (measured: `SELECT 1` followed by a NUL spun a core until
+/// killed). Each is refused with a sentence, promptly, and nothing ran.
+#[tokio::test]
+async fn sql_text_holding_a_nul_is_refused_at_every_entry_point() {
+    let fixture =
+        FixtureDb::with_sql("CREATE TABLE t (id INTEGER PRIMARY KEY); INSERT INTO t VALUES (1)")
+            .await;
+    let pool = fixture.open().await;
+    let read = "SELECT * FROM t;\0";
+    let write = "DELETE FROM t;\0";
+
+    assert_eq!(within("query", pool.query(read)).await, Err(nul_refused()));
+    assert_eq!(
+        within("execute", pool.execute(write)).await,
+        Err(nul_refused())
+    );
+    assert_eq!(
+        within("query_capped", pool.query_capped(read, &[], 10)).await,
+        Err(nul_refused())
+    );
+    assert_eq!(
+        within("execute_checked", pool.execute_checked(write, &[], 1)).await,
+        Err(nul_refused())
+    );
+    let mut out = Vec::new();
+    assert_eq!(
+        within(
+            "export",
+            pool.export(read, &[], ExportFormat::Csv, &mut out)
+        )
+        .await,
+        Err(nul_refused())
+    );
+    assert!(out.is_empty(), "a refused export writes nothing");
+
+    // The transaction a script or an import runs in.
+    let mut tx = pool.begin_script_tx().await.unwrap();
+    assert_eq!(
+        within("tx execute", tx.execute(write)).await,
+        Err(nul_refused())
+    );
+    assert_eq!(
+        within("tx execute_with", tx.execute_with(write, &[])).await,
+        Err(nul_refused())
+    );
+    assert_eq!(
+        within("tx query_capped", tx.query_capped(read, 10)).await,
+        Err(nul_refused())
+    );
+    tx.rollback().await;
+
+    // Nothing ran, and the pool is whole: a hung statement would also have
+    // kept its connection.
+    let rows = within("count", pool.query("SELECT count(*) FROM t")).await;
+    assert_eq!(rows.unwrap().rows, vec![vec![Value::Integer(1)]]);
+    pool.close().await;
+}
+
+/// A table whose `sqlite_master` name holds a NUL. A crafted file can carry
+/// one, and SQLite opens it: it compares names as C strings, so `t` NUL `x`
+/// is still the table `t` to it (measured, and `integrity_check` says ok).
+/// hubro reads the whole name, so it is listed, and every statement built
+/// from it carries the NUL. Inside quotes that fails rather than hangs, but
+/// with `unrecognized token` — the refusal says what is actually wrong, and
+/// does not depend on every builder quoting.
+#[tokio::test]
+async fn a_table_whose_catalog_name_holds_a_nul_is_refused_not_hung() {
+    let fixture = FixtureDb::with_sql(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES (1, 'x'); \
+         PRAGMA writable_schema = ON; \
+         UPDATE sqlite_master SET name = 't' || char(0) || 'x' WHERE name = 't'; \
+         PRAGMA writable_schema = OFF;",
+    )
+    .await;
+    let pool = fixture.open().await;
+    // Introspection binds names rather than building text from them, so the
+    // table is listed whole, with the columns SQLite resolves for `t`.
+    let tables = within("introspect", pool.introspect()).await.unwrap();
+    let crafted = table(&tables, "t\0x").clone();
+    let columns: Vec<&str> = crafted.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(columns, ["id", "v"]);
+
+    let request = PageRequest {
+        schema: None,
+        table: crafted.name.clone(),
+        limit: 10,
+        offset: 0,
+        sort: None,
+        filter: None,
+        extra_key_column: None,
+    };
+    assert_eq!(
+        within("fetch_page", pool.fetch_page(&request)).await,
+        Err(nul_refused())
+    );
+    assert_eq!(
+        within(
+            "fetch_page_bounded",
+            pool.fetch_page_bounded(&request, &crafted.columns, &["id"])
+        )
+        .await
+        .err(),
+        Some(nul_refused())
+    );
+    assert_eq!(
+        within("count_rows", pool.count_rows(&request)).await,
+        Err(nul_refused())
+    );
+    assert_eq!(
+        within("count_table_rows", pool.count_table_rows(&crafted)).await,
+        Err(nul_refused())
+    );
+    let (sql, params) = request.export_sql(pool.dialect());
+    let mut out = Vec::new();
+    assert_eq!(
+        within(
+            "export",
+            pool.export(&sql, &params, ExportFormat::Json, &mut out)
+        )
+        .await,
+        Err(nul_refused())
+    );
+    let identity = RowIdentity::PrimaryKey {
+        columns: vec!["id".into()],
+    };
+    let err = within(
+        "apply_staged",
+        apply_staged(
+            &pool,
+            &pool.backend_access(&crafted),
+            &crafted,
+            &identity,
+            &[StagedChange::Delete {
+                locator: RowLocator {
+                    identity_values: vec![Value::Integer(1)],
+                },
+            }],
+        ),
+    )
+    .await
+    .expect_err("a delete built from the name must be refused");
+    assert_eq!(err.message, nul_refused().to_string(), "{err}");
+
+    // The row is still there, read under the name SQLite knows.
+    let rows = within("count", pool.query("SELECT count(*) FROM t")).await;
+    assert_eq!(rows.unwrap().rows, vec![vec![Value::Integer(1)]]);
     pool.close().await;
 }
