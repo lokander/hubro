@@ -2100,10 +2100,14 @@ pub fn wrap_atomically(caps: Capabilities, dialect: Dialect, statements: &[Strin
 /// control, so the script is managing atomicity itself and must not be
 /// wrapped again.
 fn manages_own_transaction(stripped: &str) -> bool {
+    let words = leading_words(stripped, 3);
     matches!(
-        leading_words(stripped, 1).first().map(String::as_str),
+        words.first().map(String::as_str),
         Some("begin" | "start" | "commit" | "rollback" | "savepoint" | "release" | "end")
     )
+        // CockroachDB: commits the open transaction, so wrapped, the
+        // statements before it were committed under a "rolled back" report.
+        || words == ["show", "commit", "timestamp"]
 }
 
 /// Whether an already-stripped statement is transaction control and nothing
@@ -4328,6 +4332,27 @@ mod tests {
                 schema_changes_kept: true
             })
         );
+    }
+
+    #[test]
+    fn a_statement_that_commits_the_open_transaction_is_never_wrapped() {
+        for sql in ["SHOW COMMIT TIMESTAMP", "show  commit\ttimestamp;"] {
+            assert!(
+                !wraps(
+                    Dialect::Postgres,
+                    &stmts(&["INSERT INTO t VALUES (1)", sql])
+                ),
+                "{sql:?}"
+            );
+        }
+        // Only that statement: other SHOWs are reads like any other.
+        assert!(wraps(
+            Dialect::Postgres,
+            &stmts(&[
+                "INSERT INTO t VALUES (1)",
+                "SHOW TRANSACTION ISOLATION LEVEL"
+            ])
+        ));
     }
 
     #[test]

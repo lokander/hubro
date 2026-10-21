@@ -1120,11 +1120,11 @@ pub async fn execute_with_conn(
 }
 
 /// Commits a script transaction — its statements all take effect. A failed
-/// commit is rolled back like a failed statement, and says what that covered
-/// ([`rollback_tx`]): measured, a script that committed hubro's transaction
-/// and opened its own (`… COMMIT BEGIN TRAN`) can doom that one under
-/// `XACT_ABORT` without failing a statement, so the `COMMIT TRAN` fails with
-/// 3930 while the first part stands. A transaction whose connection was
+/// commit goes through [`rollback_tx`] like a failed statement, so it says
+/// what that covered: a connection lost at `COMMIT` is
+/// [`RolledBack::Unknown`]. (A transaction doomed under `XACT_ABORT` never
+/// gets here — measured, the server rolls it back at the end of its batch,
+/// 3998, and that statement fails.) A transaction whose connection was
 /// already lost cannot commit, and what the server kept is unknown.
 pub async fn commit_tx(mut tx: MssqlTx) -> Result<(), (DbError, RolledBack)> {
     if tx.conn.is_discarded() {
@@ -1175,8 +1175,9 @@ pub async fn rollback_tx(mut tx: MssqlTx) -> RolledBack {
         Ok::<_, TdsError>(row.and_then(|row| row.get::<i32, _>(0)))
     }
     .await;
-    // On error the Drop impl discards the connection.
-    tx.resolved = found.is_ok();
+    // Unless it answered, the Drop impl discards the connection — what
+    // `Unknown` is reported as.
+    tx.resolved = matches!(found, Ok(Some(0..=2)));
     match found {
         Ok(Some(1)) => RolledBack::Own,
         Ok(Some(2)) => RolledBack::Another,

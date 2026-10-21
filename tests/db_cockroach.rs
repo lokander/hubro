@@ -1083,6 +1083,46 @@ async fn cockroach_a_row_returning_statement_that_commits_is_not_reported_rolled
     pool.close().await;
 }
 
+#[tokio::test]
+async fn cockroach_a_script_whose_show_commit_timestamp_commits_is_not_wrapped() {
+    // Wrapped in hubro's transaction, the SHOW committed it and the failure
+    // after it was reported as a full rollback with rows in the table.
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.execute("DROP TABLE IF EXISTS show_commit_wrapped")
+        .await
+        .unwrap();
+    pool.execute("CREATE TABLE show_commit_wrapped (a INT8)")
+        .await
+        .unwrap();
+    let statements = split_statements(
+        "INSERT INTO show_commit_wrapped VALUES (1); SHOW COMMIT TIMESTAMP; \
+         INSERT INTO show_commit_wrapped VALUES (2); SELECT * FROM no_such_table",
+        pool.dialect(),
+    );
+    let outcome = run_script(&pool, pool.backend_capabilities(), &statements, |_| {}).await;
+    let rows = pool
+        .query("SELECT a FROM show_commit_wrapped ORDER BY a")
+        .await
+        .unwrap();
+    let err = outcome.unwrap_err();
+    assert_eq!(
+        (err.statement_index, err.rollback),
+        (3, Rollback::None),
+        "{}",
+        err.error
+    );
+    assert_eq!(
+        rows.rows,
+        [[Value::Integer(1)], [Value::Integer(2)]],
+        "run in autocommit, as reported"
+    );
+    pool.execute("DROP TABLE show_commit_wrapped")
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
 /// A `real` once read as the `f32` widened to `f64` — `0.1` showed as
 /// `0.10000000149011612` in the grid, the export and the clipboard. It reads
 /// as its shortest decimal now, and that decimal must still store the same

@@ -179,16 +179,13 @@ impl ScriptTx<'_> {
     ///
     /// Only SQL Server asks: there a statement is a whole batch, and one can
     /// end the transaction it runs in. The sqlx variants answer
-    /// [`RolledBack::Own`] unasked. That holds for SQLite and Postgres, which
-    /// refuse transaction control inside a statement, but not for
-    /// CockroachDB, whose `SHOW COMMIT TIMESTAMP` commits the open transaction
-    /// (measured, see `postgres::end_script_conn`).
+    /// [`RolledBack::Own`] unasked: SQLite and Postgres refuse transaction
+    /// control inside a statement, and CockroachDB's `SHOW COMMIT TIMESTAMP`,
+    /// which commits the open transaction, is never wrapped
+    /// (`manages_own_transaction`).
     pub async fn rollback(self) -> RolledBack {
         match self {
             ScriptTx::Sqlite(tx) => sqlx_common::rollback_tx(tx).await,
-            // shortcut: claims the CockroachDB `SHOW COMMIT TIMESTAMP` case
-            // rolled back; ask the session as `end_script_conn` does if it
-            // turns up in a wrapped script.
             ScriptTx::Postgres(tx) => sqlx_common::rollback_tx(tx).await,
             ScriptTx::SqlServer(tx) => return sqlserver::rollback_tx(*tx).await,
         }
