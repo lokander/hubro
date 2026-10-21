@@ -1,4 +1,22 @@
-//! Small formatting helpers shared across the UI.
+//! Small helpers shared across the app: display formatting, and the one
+//! rule every search box matches by.
+
+/// Whether `text` contains `query`, case-insensitively — the rule every
+/// search box in the app matches by, so two lists never disagree on the same
+/// input.
+///
+/// Folds with full Unicode lowercase on both sides, not ASCII: `Årsrapport`
+/// has to be found by `årsrapp`. That is why this runs in Rust rather than
+/// as SQLite `LIKE`, whose case folding stops at ASCII. An empty (or
+/// whitespace-only) query matches everything, so an unfiltered list renders
+/// through the same path.
+pub fn search_matches(text: &str, query: &str) -> bool {
+    let query = query.trim();
+    if query.is_empty() {
+        return true;
+    }
+    text.to_lowercase().contains(&query.to_lowercase())
+}
 
 /// Formats a byte count for display, e.g. blob sizes in the data grid.
 ///
@@ -46,6 +64,15 @@ pub fn human_count(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_folds_case_beyond_ascii() {
+        assert!(search_matches("Årsrapport", "årsrapp"));
+        assert!(search_matches("årsrapport", "ÅRSRAPP"));
+        assert!(search_matches("SELECT 1", "select"));
+        assert!(!search_matches("Årsrapport", "staging"));
+        assert!(search_matches("anything", "  "));
+    }
 
     #[test]
     fn counts_group_from_the_right_and_never_lead_with_a_separator() {

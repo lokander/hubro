@@ -22,6 +22,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::Row as _;
 
+use crate::util::search_matches;
+
 /// Maximum entries kept per connection locator; older ones are pruned on
 /// insert.
 pub const HISTORY_CAP: i64 = 500;
@@ -232,36 +234,42 @@ impl HistoryStore {
         Ok(true)
     }
 
-    /// Lists one locator's entries newest-first, optionally filtered by a
-    /// case-insensitive substring match on the SQL text.
+    /// Lists one locator's entries newest-first, at most `limit` of them,
+    /// optionally filtered by a case-insensitive substring match on the SQL
+    /// text ([`search_matches`]).
+    ///
+    /// The filter runs in Rust, not as SQLite `LIKE`, whose case folding is
+    /// ASCII-only — so a search reads every one of the locator's entries and
+    /// applies `limit` afterwards. [`HISTORY_CAP`] is what bounds that read.
     pub async fn list(
         &self,
         locator: &str,
         search: Option<&str>,
         limit: i64,
     ) -> Result<Vec<HistoryEntry>, String> {
-        let filtered = search.map(str::trim).filter(|s| !s.is_empty());
-        let mut query = String::from(
-            "SELECT id, sql, executed_at, success, error FROM entries WHERE locator = ?",
-        );
-        if filtered.is_some() {
-            query.push_str(" AND sql LIKE ? ESCAPE '\\'");
-        }
-        query.push_str(" ORDER BY id DESC LIMIT ?");
-        let mut prepared = sqlx::query(&query).bind(locator);
-        if let Some(needle) = filtered {
-            prepared = prepared.bind(format!("%{}%", escape_like(needle)));
-        }
-        let rows = prepared
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| e.to_string())?;
+        let needle = search.map(str::trim).filter(|s| !s.is_empty());
+        // SQLite reads a negative LIMIT as "no limit".
+        let read_limit = if needle.is_some() { -1 } else { limit };
+        let rows = sqlx::query(
+            "SELECT id, sql, executed_at, success, error FROM entries WHERE locator = ? \
+             ORDER BY id DESC LIMIT ?",
+        )
+        .bind(locator)
+        .bind(read_limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
         let mut entries = Vec::with_capacity(rows.len());
         for row in rows {
+            let sql: String = row.try_get("sql").map_err(|e| e.to_string())?;
+            if let Some(needle) = needle {
+                if !search_matches(&sql, needle) {
+                    continue;
+                }
+            }
             entries.push(HistoryEntry {
                 id: row.try_get("id").map_err(|e| e.to_string())?,
-                sql: row.try_get("sql").map_err(|e| e.to_string())?,
+                sql,
                 executed_at: row.try_get("executed_at").map_err(|e| e.to_string())?,
                 success: row
                     .try_get::<i64, _>("success")
@@ -270,6 +278,8 @@ impl HistoryStore {
                 error: row.try_get("error").map_err(|e| e.to_string())?,
             });
         }
+        // Negative means "no limit" here too, as it did when SQL applied it.
+        entries.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
         Ok(entries)
     }
 
@@ -342,52 +352,43 @@ impl HistoryStore {
 
     /// The saved queries usable from one connection: its own plus every
     /// global one, its own first and each group by name. `search` is an
-    /// optional case-insensitive substring, matched against the name, the
-    /// description and the SQL — a query is as likely to be remembered by
-    /// what it selects as by what it was called.
+    /// optional case-insensitive substring ([`search_matches`]), matched
+    /// against the name, the description and the SQL — a query is as likely
+    /// to be remembered by what it selects as by what it was called. Filtered
+    /// in Rust for the same reason as [`Self::list`].
     pub async fn saved_queries(
         &self,
         locator: &str,
         search: Option<&str>,
     ) -> Result<Vec<SavedQuery>, String> {
-        let filtered = search.map(str::trim).filter(|s| !s.is_empty());
-        let mut query = String::from(
-            "SELECT id, locator, name, description, sql, updated_at FROM saved_queries \
-             WHERE (locator = ? OR locator = ?)",
-        );
-        if filtered.is_some() {
-            query.push_str(
-                " AND (name LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\' \
-                 OR sql LIKE ? ESCAPE '\\')",
-            );
-        }
+        let needle = search.map(str::trim).filter(|s| !s.is_empty());
         // The connection's own queries first, then the globals; alphabetical
         // within each group, case-insensitively so "Users" doesn't sort
         // before every lowercase name.
-        query.push_str(" ORDER BY (locator = ?) ASC, name COLLATE NOCASE ASC");
-        let mut prepared = sqlx::query(&query).bind(locator).bind(GLOBAL_SCOPE);
-        if let Some(needle) = filtered {
-            let pattern = format!("%{}%", escape_like(needle));
-            prepared = prepared
-                .bind(pattern.clone())
-                .bind(pattern.clone())
-                .bind(pattern);
-        }
-        let rows = prepared
-            .bind(GLOBAL_SCOPE)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| e.to_string())?;
+        let rows = sqlx::query(
+            "SELECT id, locator, name, description, sql, updated_at FROM saved_queries \
+             WHERE (locator = ? OR locator = ?) \
+             ORDER BY (locator = ?) ASC, name COLLATE NOCASE ASC",
+        )
+        .bind(locator)
+        .bind(GLOBAL_SCOPE)
+        .bind(GLOBAL_SCOPE)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
         let mut queries = Vec::with_capacity(rows.len());
         for row in rows {
-            queries.push(SavedQuery {
+            let query = SavedQuery {
                 id: row.try_get("id").map_err(|e| e.to_string())?,
                 name: row.try_get("name").map_err(|e| e.to_string())?,
                 description: row.try_get("description").map_err(|e| e.to_string())?,
                 sql: row.try_get("sql").map_err(|e| e.to_string())?,
                 locator: locator_of(row.try_get("locator").map_err(|e| e.to_string())?),
                 updated_at: row.try_get("updated_at").map_err(|e| e.to_string())?,
-            });
+            };
+            if needle.is_none_or(|needle| saved_query_matches(&query, needle)) {
+                queries.push(query);
+            }
         }
         Ok(queries)
     }
@@ -411,25 +412,20 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Escapes LIKE wildcards in user input so "50%" matches literally (same
-/// scheme as the data-grid filter in `db::page`).
-fn escape_like(needle: &str) -> String {
-    needle
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
+/// Whether a saved query matches a search: by its name, its description or
+/// its SQL, any one of them.
+fn saved_query_matches(query: &SavedQuery, needle: &str) -> bool {
+    search_matches(&query.name, needle)
+        || query
+            .description
+            .as_deref()
+            .is_some_and(|description| search_matches(description, needle))
+        || search_matches(&query.sql, needle)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn escape_like_escapes_wildcards_and_backslashes() {
-        assert_eq!(escape_like("50%_x"), "50\\%\\_x");
-        assert_eq!(escape_like("a\\b"), "a\\\\b");
-        assert_eq!(escape_like("plain"), "plain");
-    }
 
     #[test]
     fn an_absent_or_empty_locator_is_the_global_scope() {
