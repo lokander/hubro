@@ -1479,3 +1479,137 @@ async fn sqlserver_offers_no_plan_view_rather_than_a_dangerous_one() {
 
     pool.close().await;
 }
+
+/// Key types whose locator has to find its row again — the matrix
+/// [`common::row_addressing_failures`] walks. Each entry is a slug, the
+/// column type and the key literals stored under it.
+const MSSQL_KEY_TYPES: &[(&str, &str, &[&str])] = &[
+    // `CAST(float AS nvarchar)` keeps six significant digits and its own
+    // exponent spelling (`1e+020`), which a key bound as Rust's `Display`
+    // never equals.
+    (
+        "float",
+        "float",
+        &["1e20", "0.1", "123456789.123", "-2.5e-300"],
+    ),
+    ("real", "real", &["1e20", "0.1", "3.4028235e38"]),
+    ("decimal", "decimal(30,6)", &["12345.678901", "0.1", "1e20"]),
+    ("bigint", "bigint", &["9223372036854775807", "-1"]),
+    (
+        "guid",
+        "uniqueidentifier",
+        &["'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'"],
+    ),
+    (
+        "datetime2",
+        "datetime2",
+        &["'2024-02-29 13:45:01.1234567'", "'2024-01-01 00:00:00'"],
+    ),
+    ("datetime", "datetime", &["'2024-02-29 13:45:01.123'"]),
+    (
+        "dto",
+        "datetimeoffset",
+        &["'2024-02-29 13:45:01.1234567 +02:00'"],
+    ),
+    ("date", "date", &["'2024-02-29'"]),
+    ("time", "time", &["'13:45:01.5'"]),
+    // A blob key used to be bound as the text `<blob N>`.
+    ("varbinary", "varbinary(16)", &["0x00FF10", "0x"]),
+    (
+        "nvarchar",
+        "nvarchar(20)",
+        &["N'plain'", "N'trailing  '", "N'quote''s'"],
+    ),
+    ("char3", "char(3)", &["'ab'", "'abc'"]),
+    ("bit", "bit", &["0", "1"]),
+    ("money", "money", &["12.3456"]),
+];
+
+#[tokio::test]
+async fn sqlserver_every_key_type_reads_and_writes_the_same_row() {
+    // The expand popup, the truncated-cell editor and the clipboard load a
+    // long cell's full value through `fetch_cell`; Save re-addresses the row
+    // through the staged writer. Both start from the same locator, so both
+    // must find the same row for every key type the grid can hold — a float
+    // key that saved but expanded to NULL was the bug this pins.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    let mut fixtures: Vec<String> = Vec::new();
+    for (slug, type_name, literals) in MSSQL_KEY_TYPES {
+        let rows: Vec<String> = literals
+            .iter()
+            .enumerate()
+            .map(|(n, lit)| {
+                format!(
+                    "({lit}, CONCAT(N'{n}:', REPLICATE(CAST(N'x' AS nvarchar(max)), 5000)), N't')"
+                )
+            })
+            .collect();
+        fixtures.push(format!("DROP TABLE IF EXISTS dbo.addr_{slug}"));
+        fixtures.push(format!(
+            "CREATE TABLE dbo.addr_{slug} (k {type_name} NOT NULL PRIMARY KEY, \
+             body nvarchar(max), tag nvarchar(20))"
+        ));
+        fixtures.push(format!(
+            "INSERT INTO dbo.addr_{slug} VALUES {}",
+            rows.join(", ")
+        ));
+    }
+    // A composite key mixing a float with text: the clause covers every
+    // column, not just the first.
+    fixtures.extend([
+        "DROP TABLE IF EXISTS dbo.addr_composite".to_string(),
+        "CREATE TABLE dbo.addr_composite (a float NOT NULL, b nvarchar(5) NOT NULL, \
+         body nvarchar(max), tag nvarchar(20), PRIMARY KEY (a, b))"
+            .to_string(),
+        "INSERT INTO dbo.addr_composite VALUES
+            (1e20, N'x', CONCAT(N'0:', REPLICATE(CAST(N'x' AS nvarchar(max)), 5000)), N't'),
+            (1e20, N'y', CONCAT(N'1:', REPLICATE(CAST(N'x' AS nvarchar(max)), 5000)), N't')"
+            .to_string(),
+    ]);
+    let fixtures: Vec<&str> = fixtures.iter().map(String::as_str).collect();
+    run_all(&pool, &fixtures).await;
+
+    let mut failures = Vec::new();
+    let slugs = MSSQL_KEY_TYPES
+        .iter()
+        .map(|(slug, _, _)| *slug)
+        .chain(["composite"]);
+    for slug in slugs.clone() {
+        let table = introspect_table(&pool, &format!("addr_{slug}")).await;
+        failures.extend(common::row_addressing_failures(&pool, &table).await);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    let drops: Vec<String> = slugs
+        .map(|slug| format!("DROP TABLE dbo.addr_{slug}"))
+        .collect();
+    let drops: Vec<&str> = drops.iter().map(String::as_str).collect();
+    run_all(&pool, &drops).await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_contains_filter_is_a_substring_search_whatever_the_needle_holds() {
+    // T-SQL's `LIKE` reads `[…]` as a character class: unescaped, `[a]`
+    // matched every value holding an `a`, and a lone `[` matched nothing.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    let insert = format!(
+        "INSERT INTO dbo.like_hostile VALUES {}",
+        common::like_hostile_rows("N")
+    );
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.like_hostile",
+            "CREATE TABLE dbo.like_hostile (id int NOT NULL PRIMARY KEY, v nvarchar(20))",
+            &insert,
+        ],
+    )
+    .await;
+    let mismatches = common::contains_filter_mismatches(&pool, Some("dbo"), "like_hostile").await;
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    run_all(&pool, &["DROP TABLE dbo.like_hostile"]).await;
+    pool.close().await;
+}

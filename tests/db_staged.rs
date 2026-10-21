@@ -585,11 +585,15 @@ async fn postgres_staged_text_values_coerce_to_column_types() {
 /// a `character(3)` column as just "character", and `$1::character` means
 /// char(1) — the cast would silently truncate "xyz" to 'x' on SET, and a
 /// char(n) key column cast in the WHERE clause would never match its row
-/// (aborting every save). The builder must leave these params uncast;
-/// Postgres's assignment/comparison coercion then applies the column's
-/// true modifier.
+/// (aborting every save). The builder casts to the unbounded `bpchar`
+/// instead, so the column's true modifier applies on assignment.
+///
+/// Leaving the parameter uncast, as this once did, assigned correctly but
+/// compared wrongly: a key shorter than its width reads back padded (`"ab "`),
+/// and `char = text` compares as text with the column's padding stripped and
+/// the parameter's kept, so that row could never be saved.
 #[tokio::test]
-async fn postgres_char_n_columns_round_trip_uncast() {
+async fn postgres_char_n_columns_round_trip_without_truncating() {
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     for sql in [
@@ -601,7 +605,7 @@ async fn postgres_char_n_columns_round_trip_uncast() {
             label text NOT NULL,
             tag character(3)
         )",
-        "INSERT INTO staged_charn.items VALUES ('abc', 'one', 'aaa')",
+        "INSERT INTO staged_charn.items VALUES ('abc', 'one', 'aaa'), ('ab', 'short', 'bbb')",
     ] {
         pool.query(sql).await.unwrap();
     }
@@ -648,6 +652,24 @@ async fn postgres_char_n_columns_round_trip_uncast() {
         Value::Text("xyz".into()),
         "character(3) SET must not truncate to char(1)"
     );
+
+    // A key shorter than its width, as the grid reads it back: padded.
+    let short = vec![Value::Text("ab ".into())];
+    let counts = apply_staged(
+        &pool,
+        &pool.backend_access(&items),
+        &items,
+        &identity,
+        &[update(short, "label", Value::Text("found".into()))],
+    )
+    .await
+    .unwrap();
+    assert_eq!(counts.updated_rows, 1);
+    let check = pool
+        .query("SELECT label FROM staged_charn.items WHERE code = 'ab'")
+        .await
+        .unwrap();
+    assert_eq!(check.rows[0][0], Value::Text("found".into()));
 
     pool.close().await;
 }

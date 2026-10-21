@@ -637,3 +637,77 @@ async fn risingwave_has_no_pg_class_statistics_so_none_are_invented() {
         .unwrap();
     pool.close().await;
 }
+
+#[tokio::test]
+async fn risingwave_long_cells_load_through_every_key_type() {
+    // Editing is refused here, but expanding a long cell is a read and still
+    // re-addresses its row from the grid's locator — through the typed,
+    // cast key predicate the writers use elsewhere, which on this engine
+    // nothing else exercises.
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let key_types: &[(&str, &str, &[&str])] = &[
+        ("float8", "double precision", &["1e20", "0.1"]),
+        ("float4", "real", &["1e20", "0.1"]),
+        ("numeric", "numeric", &["12345.678901"]),
+        ("text", "varchar", &["'plain'", "'trailing  '"]),
+        ("tstz", "timestamptz", &["'2024-02-29 13:45:01.123456+02'"]),
+        ("bytea", "bytea", &["'\\x00ff10'"]),
+    ];
+    for (slug, type_name, literals) in key_types {
+        let rows: Vec<String> = literals
+            .iter()
+            .enumerate()
+            .map(|(n, lit)| format!("({lit}, '{n}:' || repeat('x', 5000))"))
+            .collect();
+        for sql in [
+            format!("DROP TABLE IF EXISTS rw_addr_{slug}"),
+            format!("CREATE TABLE rw_addr_{slug} (k {type_name} PRIMARY KEY, body varchar)"),
+            format!("INSERT INTO rw_addr_{slug} VALUES {}", rows.join(", ")),
+            "FLUSH".to_string(),
+        ] {
+            pool.query(&sql)
+                .await
+                .unwrap_or_else(|e| panic!("{slug}: {sql}: {e}"));
+        }
+    }
+
+    let tables = pool.introspect().await.unwrap();
+    let mut failures = Vec::new();
+    for (slug, _, literals) in key_types {
+        let table = find(&tables, &format!("rw_addr_{slug}"));
+        let identity = detect_row_identity(table, pool.dialect()).expect("a keyed table");
+        let request = PageRequest {
+            schema: table.schema.clone(),
+            table: table.name.clone(),
+            limit: 100,
+            offset: 0,
+            sort: None,
+            filter: None,
+            extra_key_column: None,
+        };
+        let page = pool
+            .fetch_page_bounded(&request, &table.columns, &["k"])
+            .await
+            .unwrap();
+        assert_eq!(page.result.rows.len(), literals.len(), "{slug}");
+        for row in &page.result.rows {
+            let locator = RowLocator {
+                identity_values: vec![row[0].clone()],
+            };
+            match pool.fetch_cell(table, &identity, &locator, "body").await {
+                Ok(cell) if cell.full_len > 5000 => {}
+                Ok(cell) => failures.push(format!("{slug} {:?}: got {:?}", row[0], cell.value)),
+                Err(e) => failures.push(format!("{slug} {:?}: {e}", row[0])),
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    for (slug, _, _) in key_types {
+        pool.query(&format!("DROP TABLE rw_addr_{slug}"))
+            .await
+            .unwrap();
+    }
+    pool.close().await;
+}

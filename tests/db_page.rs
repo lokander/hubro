@@ -157,6 +157,20 @@ async fn contains_filter_treats_percent_and_underscore_literally() {
 }
 
 #[tokio::test]
+async fn contains_filter_is_a_substring_search_whatever_the_needle_holds() {
+    let fixture = FixtureDb::with_sql(&format!(
+        "CREATE TABLE hostile (id INTEGER PRIMARY KEY, v TEXT);
+         INSERT INTO hostile (id, v) VALUES {};",
+        common::like_hostile_rows("")
+    ))
+    .await;
+    let pool = fixture.open().await;
+    let mismatches = common::contains_filter_mismatches(&pool, None, "hostile").await;
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn equals_filter_with_text_value_matches_numeric_column_via_affinity() {
     let fixture = FixtureDb::numbers(25).await;
     let pool = fixture.open().await;
