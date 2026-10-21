@@ -230,6 +230,15 @@ fn connect_error(err: &sqlx::Error) -> DbError {
 /// An unknown database (`3D000`) or a
 /// missing `CONNECT` privilege (`42501`) is a [`DbError::Connect`] — the
 /// password worked, and asking for another cannot help.
+///
+/// `28P01` is the server's wrong-credentials code, not proof: a role whose
+/// `VALID UNTIL` has passed gets it too (measured), and so, presumably, does a
+/// pooler refusing on the server's behalf. CockroachDB v26.2 in secure mode
+/// sends `28P01` for a wrong password, an unknown user and a missing password
+/// alike (measured), so it prompts as Postgres does. Another Postgres-wire
+/// engine that refused a password with a different SQLSTATE would get no
+/// prompt at all — the connect would report the error, and a password could
+/// be entered only by editing the connection.
 fn connect_error_from(sqlstate: Option<&str>, message: String) -> DbError {
     if sqlstate == Some(INVALID_PASSWORD) {
         DbError::CredentialsRejected(message)
