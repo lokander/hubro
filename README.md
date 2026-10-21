@@ -140,7 +140,7 @@ with the version that was actually run.
 | Engine | Via backend | Verified version | Browse | Edit | Script | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
 | SQLite | SQLite | 3.46.0 | Yes | Yes | Atomic | A table without a primary key stays editable through its `rowid`. |
-| PostgreSQL | Postgres | 17.10 | Yes | Yes | Atomic | The reference implementation. A table with no primary key or unique index is read-only. |
+| PostgreSQL | Postgres | 17.10 | Yes | Yes | Atomic | The reference implementation. A table with no primary key or unique index is read-only, and so is one with a `DO INSTEAD` rule, which hides from hubro what a write really changed. |
 | SQL Server | SQL Server | 2022 (16.0.4265.3) | Yes | Yes | Atomic | `GO` batches are split and run in order. A table with an enabled `INSTEAD OF` trigger is read-only, and refuses imports: the server reports the rows the trigger fired for, not the rows it wrote, so hubro cannot check a write to it. |
 | TimescaleDB | Postgres | 2.29.1 (on PostgreSQL 17.10) | Yes | Keyed hypertables | Atomic | Chunks and extension schemas are hidden as internal; `hypertable` and `continuous aggregate` show as badges. A hypertable with no key is read-only — see below. |
 | Citus | Postgres | 14.1-1 (on PostgreSQL 18.4) | Yes | Yes | Atomic | Distributed and reference tables page, sort, filter, and edit through the distribution key. Changing a row's distribution column is refused by the server — Citus will not move a row between shards. Shards are hidden as internal. Needs `sslmode=disable` — see below. |

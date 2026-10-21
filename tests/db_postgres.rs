@@ -20,7 +20,7 @@ use hubro::db::{
     plan_reached_cell_cap, run_script, script_refusal, url_with_password, Capabilities, DbError,
     DbPool, Dialect, Filter, Internal, PageRequest, PgFlavor, PlanDisplay, Restriction, Rollback,
     RowCount, RowLocator, SortDir, StagedChange, StatementOutcome, TableKind, TableMeta,
-    TypeDetail, TypeRef, Value, WriteProtection, PREVIEW_BYTES, QUERY_CELL_CAP,
+    TypeDetail, TypeRef, Value, WriteProtection, INSTEAD_RULE, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 async fn test_url() -> Option<String> {
@@ -2332,5 +2332,83 @@ async fn postgres_nan_and_infinity_go_through_the_editor_and_back() {
     let pool = DbPool::open_postgres(&url).await.unwrap();
     let failures = common::non_finite_edit_failures(&pool, "non_finite_edits").await;
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_a_do_instead_rule_refuses_editing_before_anything_is_written() {
+    // A `DO INSTEAD` rule replaces the statement, and the command tag the
+    // guard reads is that of whatever the rule ran: this redirect reports
+    // `UPDATE 1` while the table is untouched. A `DO ALSO` rule keeps the
+    // statement and its tag, and a view keeps the reason it already had,
+    // though every view carries an instead rule of its own (`_RETURN`).
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    for sql in [
+        "DROP VIEW IF EXISTS rule_view",
+        "DROP TABLE IF EXISTS rule_redirected, rule_also, rule_log",
+        "CREATE TABLE rule_redirected (id int PRIMARY KEY, name text NOT NULL)",
+        "CREATE TABLE rule_also (id int PRIMARY KEY, name text NOT NULL)",
+        "CREATE TABLE rule_log (id int PRIMARY KEY)",
+        "INSERT INTO rule_redirected VALUES (1, 'first')",
+        "INSERT INTO rule_log VALUES (1)",
+        "CREATE VIEW rule_view AS SELECT id FROM rule_also",
+        "CREATE RULE rule_redirect AS ON UPDATE TO rule_redirected \
+         DO INSTEAD UPDATE rule_log SET id = id",
+        "CREATE RULE rule_also_log AS ON UPDATE TO rule_also \
+         DO ALSO INSERT INTO rule_log VALUES (2)",
+    ] {
+        pool.query(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    let tables = pool.introspect().await.unwrap();
+    let find = |name: &str| tables.iter().find(|t| t.name == name).unwrap().clone();
+    for (name, expected) in [
+        ("rule_redirected", Some(INSTEAD_RULE)),
+        ("rule_also", None),
+        ("rule_log", None),
+        ("rule_view", Some(Restriction::View)),
+    ] {
+        assert_eq!(
+            pool.backend_access(&find(name)).restriction,
+            expected,
+            "{name}"
+        );
+    }
+
+    let table = find("rule_redirected");
+    let identity = detect_row_identity(&table, Dialect::Postgres).unwrap();
+    let err = apply_staged(
+        &pool,
+        &pool.backend_access(&table),
+        &table,
+        &identity,
+        &[StagedChange::Update {
+            locator: RowLocator {
+                identity_values: vec![Value::Integer(1)],
+            },
+            column: "name".into(),
+            value: Value::Text("renamed".into()),
+        }],
+    )
+    .await
+    .expect_err("an edit the guard cannot check must be refused");
+    assert!(
+        err.message.contains(INSTEAD_RULE.message()),
+        "{}",
+        err.message
+    );
+    let unchanged = pool
+        .query("SELECT name FROM rule_redirected WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(unchanged.rows, vec![vec![Value::Text("first".into())]]);
+
+    pool.query("DROP VIEW rule_view").await.unwrap();
+    pool.query("DROP TABLE rule_redirected, rule_also, rule_log")
+        .await
+        .unwrap();
     pool.close().await;
 }

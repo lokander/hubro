@@ -16,7 +16,7 @@ use sqlx::postgres::{
 use sqlx::types::{JsonValue, Uuid};
 use sqlx::{Row as _, TypeInfo as _, ValueRef as _};
 
-use super::caps::Restriction;
+use super::caps::{Restriction, INSTEAD_RULE};
 use super::ddl::{
     create_table_sql, create_view_sql, terminate, ColumnExtra, Ddl, DdlObject, TableExtras,
 };
@@ -1364,6 +1364,30 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     .await
     .map_err(map_err)?;
 
+    // Tables whose writes a `DO INSTEAD` rule replaces (see [`INSTEAD_RULE`]).
+    // Views are left out: every one carries an instead rule, `_RETURN`, and
+    // is refused as a view already. Not best-effort like the extension
+    // queries above: a failure here would leave such a table editable, and
+    // every engine measured has `pg_rewrite` — CockroachDB, Materialize and
+    // RisingWave with no rules in it, since none of them can create one.
+    let rule_rows = sqlx::query(
+        "SELECT DISTINCT n.nspname AS table_schema, c.relname AS table_name \
+         FROM pg_rewrite r \
+         JOIN pg_class c ON c.oid = r.ev_class \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE r.is_instead AND c.relkind NOT IN ('v', 'm')",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(map_err)?;
+    let mut instead_rules = std::collections::HashSet::with_capacity(rule_rows.len());
+    for row in &rule_rows {
+        instead_rules.insert((
+            get::<String, _>(row, "table_schema")?,
+            get::<String, _>(row, "table_name")?,
+        ));
+    }
+
     // Columns with PK positions resolved in SQL (LEFT JOIN on the pkey
     // constraint), one row per column. Identity and generated columns have a
     // NULL column_default even though the database supplies their value, so
@@ -1561,7 +1585,8 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
             // Per-object narrowing only where the driver knows something the
             // resolver cannot derive. Kind and row identity carry the
             // rest, so this is `None` for everything but a streaming engine's
-            // two edges. A *source* resolves to a view and would otherwise be
+            // two edges and a table whose writes a `DO INSTEAD` rule
+            // replaces. A *source* resolves to a view and would otherwise be
             // refused with "Views are read-only", a sentence that sends the
             // reader looking for a view definition that does not exist; a
             // *sink* has no rows at all, which nothing about its kind says.
@@ -1574,6 +1599,8 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
                 // is the server's own classification, so any engine reporting
                 // it inherits this.
                 Some(Restriction::NoRows(STREAMING_SINK))
+            } else if instead_rules.contains(&key) {
+                Some(INSTEAD_RULE)
             } else {
                 None
             },
