@@ -27,6 +27,7 @@ use std::io::Write;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use futures_util::TryStreamExt as _;
 use tiberius::error::Error as TdsError;
@@ -47,6 +48,26 @@ use crate::db::value::{cap_value, ColumnInfo, QueryResult, Value};
 /// Matches PgPool's `max_connections(4)`: enough for the grid, introspection,
 /// and a script transaction to run concurrently without deadlocking.
 const MAX_CONNECTIONS: usize = 4;
+
+/// How long one connect may take, from dialing the socket to the end of the
+/// login, before it is abandoned — the bound a Postgres open already has
+/// (sqlx's 30s acquire timeout). tiberius's own 15s handshake timeout covers
+/// only what follows the TCP connect, and that connect has no bound of its
+/// own: measured, a host that drops SYNs held a connect for 133s on Linux,
+/// and with it the whole connections row and anything queued behind it.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long an idle connection may answer its liveness check before it is
+/// presumed dead and replaced. A connection a NAT or firewall dropped without
+/// telling either end never answers at all, so the check needs a bound of its
+/// own or it would trade one failed query for a hang.
+const PING_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Idle longer than this and a connection is closed rather than checked: the
+/// Postgres pool's `idle_timeout` (sqlx's default). By then a middlebox may
+/// well have forgotten it silently, and a check would only wait out
+/// [`PING_TIMEOUT`] to find that out.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Session options every pooled connection runs right after login. tiberius
 /// logs in with the ODBC option flag, whose server-side defaults already
@@ -258,8 +279,44 @@ struct PoolInner {
     permits: Arc<Semaphore>,
     /// Connected clients not currently checked out. Sync mutex: never held
     /// across an await.
-    idle: Mutex<Vec<TdsClient>>,
+    idle: Mutex<Vec<IdleClient>>,
     closed: AtomicBool,
+}
+
+/// A connected client waiting in the pool, and when it was put there.
+struct IdleClient {
+    client: TdsClient,
+    since: Instant,
+}
+
+/// What [`MssqlPool::acquire`] does with an idle connection before handing it
+/// out. The server, or an Azure gateway, may have closed it while it waited,
+/// and a connection the pool cannot vouch for fails the next query instead —
+/// measured: after a `KILL` of an idle session, the next query failed with an
+/// I/O error and the one after it worked. Postgres never shows this, because
+/// sqlx checks every connection before handing it out (`test_before_acquire`).
+#[derive(Debug, PartialEq, Eq)]
+enum IdleReuse {
+    /// Run a trivial query first, and reuse it only if that answers in time.
+    Check,
+    /// Too old to be worth checking: close it and take the next.
+    Discard,
+}
+
+fn idle_reuse(idle_for: Duration) -> IdleReuse {
+    if idle_for > IDLE_TIMEOUT {
+        IdleReuse::Discard
+    } else {
+        IdleReuse::Check
+    }
+}
+
+/// Whether `client` still answers, within `limit`.
+async fn is_alive(client: &mut TdsClient, limit: Duration) -> bool {
+    matches!(
+        tokio::time::timeout(limit, run_batch(client, "SELECT 1")).await,
+        Ok(Ok(()))
+    )
 }
 
 /// One checked-out connection. Returns itself to the pool on drop unless it
@@ -305,7 +362,10 @@ impl Drop for PooledConn {
                     .idle
                     .lock()
                     .expect("pool lock poisoned")
-                    .push(client);
+                    .push(IdleClient {
+                        client,
+                        since: Instant::now(),
+                    });
             }
             // Pool closed: dropping the client closes the socket. The graceful
             // TDS logout needs an async context the destructor doesn't have.
@@ -327,16 +387,31 @@ impl MssqlPool {
     }
 
     /// Checks a connection out, connecting a fresh client when no idle one is
-    /// available (up to [`MAX_CONNECTIONS`] total; further callers wait).
+    /// available (up to [`MAX_CONNECTIONS`] total; further callers wait). An
+    /// idle one is handed out only once it has answered a check
+    /// ([`idle_reuse`]); one that does not is dropped for the next.
     async fn acquire(&self) -> Result<PooledConn, DbError> {
         let permit = Arc::clone(&self.inner.permits)
             .acquire_owned()
             .await
             .map_err(|_| DbError::Query("the connection is closed".into()))?;
-        let idle = self.inner.idle.lock().expect("pool lock poisoned").pop();
-        let client = match idle {
-            Some(client) => client,
-            None => connect_client(&self.inner.config, &self.inner.addr).await?,
+        let client = loop {
+            // A statement of its own, so the guard is gone before any await.
+            let idle = self.inner.idle.lock().expect("pool lock poisoned").pop();
+            let Some(IdleClient { mut client, since }) = idle else {
+                break connect_client(&self.inner.config, &self.inner.addr, CONNECT_TIMEOUT)
+                    .await?;
+            };
+            match idle_reuse(since.elapsed()) {
+                IdleReuse::Check => {
+                    if is_alive(&mut client, PING_TIMEOUT).await {
+                        break client;
+                    }
+                }
+                IdleReuse::Discard => {}
+            }
+            // Dropping the client closes its socket; nothing to log out of on
+            // a session that is already gone.
         };
         Ok(PooledConn {
             client: Some(client),
@@ -350,11 +425,11 @@ impl MssqlPool {
     pub async fn close(&self) {
         self.inner.closed.store(true, Ordering::SeqCst);
         self.inner.permits.close();
-        let clients: Vec<TdsClient> = {
+        let clients: Vec<IdleClient> = {
             let mut idle = self.inner.idle.lock().expect("pool lock poisoned");
             idle.drain(..).collect()
         };
-        for client in clients {
+        for IdleClient { client, .. } in clients {
             let _ = client.close().await;
         }
     }
@@ -399,8 +474,13 @@ pub async fn open_mssql_with(
 
 /// Opens a TCP connection to `addr` and performs the TDS login, following at
 /// most one Azure-style routing redirect, then applies [`SESSION_SETUP`].
-async fn connect_client(config: &Config, addr: &(String, u16)) -> Result<TdsClient, DbError> {
-    let mut client = match connect_once(config.clone(), addr).await {
+/// Each connect gets `limit` ([`CONNECT_TIMEOUT`]).
+async fn connect_client(
+    config: &Config,
+    addr: &(String, u16),
+    limit: Duration,
+) -> Result<TdsClient, DbError> {
+    let mut client = match connect_once(config.clone(), addr, limit).await {
         // Azure SQL can answer the login with "actually, talk to this other
         // node"; a single redirect is all the protocol calls for. The redirect
         // target is dialed directly — it names a reachable gateway node.
@@ -409,7 +489,7 @@ async fn connect_client(config: &Config, addr: &(String, u16)) -> Result<TdsClie
             redirected.host(&host);
             redirected.port(port);
             let addr = (host, port);
-            connect_once(redirected, &addr).await
+            connect_once(redirected, &addr, limit).await
         }
         other => other,
     }
@@ -420,16 +500,32 @@ async fn connect_client(config: &Config, addr: &(String, u16)) -> Result<TdsClie
     }
 }
 
-async fn connect_once(config: Config, addr: &(String, u16)) -> Result<TdsClient, TdsError> {
+/// One connect, TCP through login, abandoned after `limit`. The timeout is
+/// reported as an I/O timeout so [`friendly_connect_error`] files it with the
+/// network errors.
+async fn connect_once(
+    config: Config,
+    addr: &(String, u16),
+    limit: Duration,
+) -> Result<TdsClient, TdsError> {
     let io_err = |e: std::io::Error| TdsError::Io {
         kind: e.kind(),
         message: e.to_string(),
     };
-    let tcp = TcpStream::connect((addr.0.as_str(), addr.1))
-        .await
-        .map_err(io_err)?;
-    tcp.set_nodelay(true).map_err(io_err)?;
-    Client::connect(config, tcp.compat_write()).await
+    let connect = async {
+        let tcp = TcpStream::connect((addr.0.as_str(), addr.1))
+            .await
+            .map_err(io_err)?;
+        tcp.set_nodelay(true).map_err(io_err)?;
+        Client::connect(config, tcp.compat_write()).await
+    };
+    match tokio::time::timeout(limit, connect).await {
+        Ok(result) => result,
+        Err(_) => Err(TdsError::Io {
+            kind: std::io::ErrorKind::TimedOut,
+            message: format!("no answer from {}:{} within {limit:?}", addr.0, addr.1),
+        }),
+    }
 }
 
 /// SQL Server's "Login failed for user '…'", its wrong-credentials code. Sent
@@ -1633,5 +1729,130 @@ mod tests {
             options.iter().any(|option| option == "SET NOCOUNT OFF"),
             "{options:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_connect_that_gets_no_answer_is_abandoned_at_its_bound() {
+        // A listener that is never accepted from: the kernel completes the TCP
+        // handshake, and then nothing answers the prelogin — the stage
+        // tiberius's own 15s bound covers, which is why the outer limit here is
+        // shorter than that: only the connect's own bound can end this in time.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = (
+            "127.0.0.1".to_string(),
+            listener.local_addr().unwrap().port(),
+        );
+        let mut config = Config::new();
+        config.host(&addr.0);
+        config.port(addr.1);
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            connect_client(&config, &addr, Duration::from_millis(300)),
+        )
+        .await
+        .expect("the connect must give up at its own bound, not wait for tiberius's");
+        let Err(DbError::Connect(message)) = result else {
+            panic!("expected a connect error, got {result:?}");
+        };
+        assert!(
+            message.starts_with("network error") && message.contains("within 300ms"),
+            "{message}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn an_idle_connection_is_checked_unless_it_has_idled_past_the_timeout() {
+        assert_eq!(idle_reuse(Duration::ZERO), IdleReuse::Check);
+        assert_eq!(idle_reuse(IDLE_TIMEOUT), IdleReuse::Check);
+        assert_eq!(
+            idle_reuse(IDLE_TIMEOUT + Duration::from_secs(1)),
+            IdleReuse::Discard
+        );
+    }
+
+    /// A TCP forwarder that can be told to go silent on the connections it
+    /// already carries, as a NAT or firewall that dropped them would: their
+    /// sockets stay open and nothing more arrives on either side. Connections
+    /// made after that are forwarded normally.
+    async fn freezable_proxy(target: (String, u16)) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let epoch = Arc::new(AtomicUsize::new(0));
+        let accept_epoch = Arc::clone(&epoch);
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let server = TcpStream::connect((target.0.as_str(), target.1))
+                    .await
+                    .unwrap();
+                let born = accept_epoch.load(Ordering::SeqCst);
+                let (client_read, client_write) = client.into_split();
+                let (server_read, server_write) = server.into_split();
+                for (mut from, mut to) in [
+                    (
+                        Box::new(client_read) as Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+                        Box::new(server_write) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+                    ),
+                    (Box::new(server_read), Box::new(client_write)),
+                ] {
+                    let epoch = Arc::clone(&accept_epoch);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        loop {
+                            let n = match from.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => n,
+                            };
+                            if epoch.load(Ordering::SeqCst) != born {
+                                // Frozen: hold both sockets open, forward nothing.
+                                std::future::pending::<()>().await;
+                            }
+                            if to.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            }
+        });
+        (port, epoch)
+    }
+
+    #[tokio::test]
+    async fn an_idle_connection_that_never_answers_is_replaced_not_waited_on() {
+        let Ok(url) = std::env::var("HUBRO_MSSQL_TEST_URL") else {
+            eprintln!("skipping: HUBRO_MSSQL_TEST_URL not set");
+            return;
+        };
+        let parts = parse_mssql_url(&url).unwrap();
+        let target = (parts.host.clone(), parts.port);
+        let config = parts.into_config(&MssqlAuth::Password, None);
+        let (port, epoch) = freezable_proxy(target).await;
+        let pool = MssqlPool::new(config, ("127.0.0.1".to_string(), port));
+        // One connection, used and returned: the pool's only idle one.
+        query_with(&pool, "SELECT 1", &[]).await.unwrap();
+        assert_eq!(pool.inner.idle.lock().unwrap().len(), 1);
+
+        epoch.fetch_add(1, Ordering::SeqCst);
+        let started = Instant::now();
+        // Without the check the query goes to the silent connection and waits
+        // for good (statements have no timeout); with a check that has no
+        // bound, so does the check.
+        let result = tokio::time::timeout(
+            PING_TIMEOUT + Duration::from_secs(15),
+            query_with(&pool, "SELECT 2", &[]),
+        )
+        .await
+        .expect("a silent idle connection must be given up on, not waited on");
+        assert_eq!(result.unwrap().rows, vec![vec![Value::Integer(2)]]);
+        assert!(started.elapsed() >= PING_TIMEOUT, "{:?}", started.elapsed());
+        pool.close().await;
     }
 }
