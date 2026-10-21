@@ -355,8 +355,19 @@ struct PooledConn {
 }
 
 impl PooledConn {
-    fn client(&mut self) -> &mut TdsClient {
-        self.client.as_mut().expect("connection already discarded")
+    /// Runs one request on the client — the only way to reach it. The client
+    /// is out of `self` while the request is in flight, so a future dropped
+    /// mid-request (a cancelled run, grid page or export) drops the client
+    /// with it and closes the connection rather than pooling it. Pooled, it
+    /// would make the next borrower wait out the abandoned response (tiberius
+    /// drains it first), and an edit batch cancelled between `BEGIN TRAN` and
+    /// `COMMIT` would hand its open transaction to the next borrower, whose
+    /// own commit then only lowered `@@TRANCOUNT`.
+    async fn request<T>(&mut self, f: impl AsyncFnOnce(&mut TdsClient) -> T) -> T {
+        let mut client = self.client.take().expect("connection already discarded");
+        let out = f(&mut client).await;
+        self.client = Some(client);
+        out
     }
 
     /// True once [`Self::discard`] ran. A [`MssqlTx`] can outlive its
@@ -490,7 +501,7 @@ pub async fn open_mssql_with(
     let pool = MssqlPool::new(config, addr);
     {
         let mut conn = pool.acquire().await?;
-        run_query(conn.client(), "SELECT 1", &[])
+        conn.request(async |c| run_query(c, "SELECT 1", &[]).await)
             .await
             .map_err(|e| {
                 // A failed validation never returns the connection to the pool.
@@ -866,7 +877,9 @@ pub async fn query_with(
     params: &[Value],
 ) -> Result<QueryResult, DbError> {
     let mut conn = pool.acquire().await?;
-    let result = run_query(conn.client(), sql, params).await;
+    let result = conn
+        .request(async |c| run_query(c, sql, params).await)
+        .await;
     let (result, abandoned) = settle(&mut conn, result, sql)?;
     // Unread result sets left on the stream must not ride back to the pool —
     // the next borrower would pay for draining them.
@@ -880,7 +893,7 @@ pub async fn query_with(
 /// affected-row count.
 pub async fn execute(pool: &MssqlPool, sql: &str) -> Result<u64, DbError> {
     let mut conn = pool.acquire().await?;
-    let result = run_statement(conn.client(), sql).await;
+    let result = conn.request(async |c| run_statement(c, sql).await).await;
     settle(&mut conn, result, sql)
 }
 
@@ -904,7 +917,9 @@ pub async fn query_capped(
     cell_cap: usize,
 ) -> Result<(QueryResult, bool), DbError> {
     let mut conn = pool.acquire().await?;
-    let result = run_query_capped(conn.client(), sql, params, max_rows, cell_cap).await;
+    let result = conn
+        .request(async |c| run_query_capped(c, sql, params, max_rows, cell_cap).await)
+        .await;
     let (result, truncated, abandoned) = settle(&mut conn, result, sql)?;
     if truncated || abandoned {
         let needs = statement_needs(sql, crate::db::sql::Dialect::SqlServer);
@@ -913,7 +928,7 @@ pub async fn query_capped(
             // writes after a long SELECT) only finishes once its response has
             // been read; discarding the connection here aborted it. Read the
             // rest, and report an error it ends in.
-            let drained = run_batch(conn.client(), "SELECT 1").await;
+            let drained = conn.request(async |c| run_batch(c, "SELECT 1").await).await;
             settle(&mut conn, drained, sql)?;
         } else {
             conn.discard();
@@ -948,7 +963,9 @@ async fn query_capped_held(
     if conn.is_discarded() {
         return Err(lost_connection());
     }
-    let result = run_query_capped(conn.client(), sql, &[], max_rows, cell_cap).await;
+    let result = conn
+        .request(async |c| run_query_capped(c, sql, &[], max_rows, cell_cap).await)
+        .await;
     let (result, truncated, _abandoned) = settle(conn, result, sql)?;
     Ok((result, truncated))
 }
@@ -1064,11 +1081,12 @@ impl Drop for MssqlTx {
 pub async fn begin_tx(pool: &MssqlPool) -> Result<MssqlTx, DbError> {
     const BEGIN: &str = "BEGIN TRAN; SELECT CURRENT_TRANSACTION_ID()";
     let mut conn = pool.acquire().await?;
-    let begin = async {
-        let row = conn.client().simple_query(BEGIN).await?.into_row().await?;
-        Ok::<_, TdsError>(row.and_then(|row| row.get::<i64, _>(0)))
-    }
-    .await;
+    let begin = conn
+        .request(async |c| {
+            let row = c.simple_query(BEGIN).await?.into_row().await?;
+            Ok::<_, TdsError>(row.and_then(|row| row.get::<i64, _>(0)))
+        })
+        .await;
     match settle(&mut conn, begin, BEGIN)? {
         Some(id) => Ok(MssqlTx {
             conn,
@@ -1098,7 +1116,7 @@ async fn execute_held(conn: &mut PooledConn, sql: &str) -> Result<u64, DbError> 
     if conn.is_discarded() {
         return Err(lost_connection());
     }
-    let result = run_statement(conn.client(), sql).await;
+    let result = conn.request(async |c| run_statement(c, sql).await).await;
     settle(conn, result, sql)
 }
 
@@ -1115,7 +1133,10 @@ pub async fn execute_with_conn(
     if tx.conn.is_discarded() {
         return Err(lost_connection());
     }
-    let result = run_execute(tx.conn.client(), sql, params).await;
+    let result = tx
+        .conn
+        .request(async |c| run_execute(c, sql, params).await)
+        .await;
     settle(&mut tx.conn, result, sql).map(|counts| statement_rows(&counts))
 }
 
@@ -1131,7 +1152,10 @@ pub async fn commit_tx(mut tx: MssqlTx) -> Result<(), (DbError, RolledBack)> {
         tx.resolved = true;
         return Err((lost_connection(), RolledBack::Unknown));
     }
-    let commit = run_batch(tx.conn.client(), "COMMIT TRAN").await;
+    let commit = tx
+        .conn
+        .request(async |c| run_batch(c, "COMMIT TRAN").await)
+        .await;
     match settle(&mut tx.conn, commit, "COMMIT TRAN") {
         Ok(()) => {
             tx.resolved = true;
@@ -1164,17 +1188,13 @@ pub async fn rollback_tx(mut tx: MssqlTx) -> RolledBack {
          IF @@TRANCOUNT > 0 ROLLBACK TRAN; SELECT @found",
         tx.id
     );
-    let found = async {
-        let row = tx
-            .conn
-            .client()
-            .simple_query(&rollback)
-            .await?
-            .into_row()
-            .await?;
-        Ok::<_, TdsError>(row.and_then(|row| row.get::<i32, _>(0)))
-    }
-    .await;
+    let found = tx
+        .conn
+        .request(async |c| {
+            let row = c.simple_query(&rollback).await?.into_row().await?;
+            Ok::<_, TdsError>(row.and_then(|row| row.get::<i32, _>(0)))
+        })
+        .await;
     // Unless it answered, the Drop impl discards the connection — what
     // `Unknown` is reported as.
     tx.resolved = matches!(found, Ok(Some(0..=2)));
@@ -1250,16 +1270,12 @@ pub async fn end_script_conn(conn: &mut MssqlScriptConn) -> Result<bool, DbError
     if held.is_discarded() {
         return Err(lost_connection());
     }
-    let ended = async {
-        let row = held
-            .client()
-            .simple_query(END_SCRIPT)
-            .await?
-            .into_row()
-            .await?;
-        Ok::<_, TdsError>(row.and_then(|row| row.get::<i32, _>(0)) == Some(1))
-    }
-    .await;
+    let ended = held
+        .request(async |c| {
+            let row = c.simple_query(END_SCRIPT).await?.into_row().await?;
+            Ok::<_, TdsError>(row.and_then(|row| row.get::<i32, _>(0)) == Some(1))
+        })
+        .await;
     let ended = settle(held, ended, END_SCRIPT);
     if ended.is_err() {
         held.discard();
@@ -1310,16 +1326,16 @@ pub async fn finish_script_conn_with_read(
             reusable: false,
         };
     }
-    let before = async {
-        let row = held
-            .client()
-            .simple_query("SELECT @@TRANCOUNT")
-            .await?
-            .into_row()
-            .await?;
-        Ok::<_, TdsError>(row.and_then(|row| row.get::<i32, _>(0)).unwrap_or(0) > 0)
-    }
-    .await;
+    let before = held
+        .request(async |c| {
+            let row = c
+                .simple_query("SELECT @@TRANCOUNT")
+                .await?
+                .into_row()
+                .await?;
+            Ok::<_, TdsError>(row.and_then(|row| row.get::<i32, _>(0)).unwrap_or(0) > 0)
+        })
+        .await;
     let open = match settle(held, before, "SELECT @@TRANCOUNT") {
         Ok(open) => open,
         Err(error) => {
@@ -1336,7 +1352,9 @@ pub async fn finish_script_conn_with_read(
             };
         }
     };
-    let read = run_query_capped(held.client(), sql, &[], max_rows, cell_cap).await;
+    let read = held
+        .request(async |c| run_query_capped(c, sql, &[], max_rows, cell_cap).await)
+        .await;
     match settle(held, read, sql) {
         Ok((result, truncated, abandoned)) if truncated || abandoned => {
             held.discard();
@@ -1374,24 +1392,25 @@ pub async fn export(
     let mut conn = pool.acquire().await?;
     // The stream borrows the client, so driver errors are collected and
     // settled after the stream is dropped.
-    let outcome = async {
-        let (mut rows, abandoned) = read_first_result_set(conn.client(), sql, params, |columns| {
-            let columns = columns
-                .map(|columns| columns.iter().map(|c| c.name().to_string()).collect())
-                .unwrap_or_default();
-            let mut sink = ExportSink::new(format, columns);
-            sink.begin(out).map_err(io_to_tds)?;
-            Ok(ExportRows {
-                sink,
-                out,
-                written: 0,
+    let outcome = conn
+        .request(async |c| {
+            let (mut rows, abandoned) = read_first_result_set(c, sql, params, |columns| {
+                let columns = columns
+                    .map(|columns| columns.iter().map(|c| c.name().to_string()).collect())
+                    .unwrap_or_default();
+                let mut sink = ExportSink::new(format, columns);
+                sink.begin(out).map_err(io_to_tds)?;
+                Ok(ExportRows {
+                    sink,
+                    out,
+                    written: 0,
+                })
             })
+            .await?;
+            rows.sink.end(rows.out).map_err(io_to_tds)?;
+            Ok((rows.written, abandoned))
         })
-        .await?;
-        rows.sink.end(rows.out).map_err(io_to_tds)?;
-        Ok((rows.written, abandoned))
-    }
-    .await;
+        .await;
     let (written, abandoned) = settle(&mut conn, outcome, sql)?;
     // An abandoned second result set must not ride back to the pool.
     if abandoned {
@@ -1913,5 +1932,86 @@ mod tests {
         // not each waited out in turn.
         assert!(waited < PING_TIMEOUT * 2, "{waited:?}");
         pool.close().await;
+    }
+
+    /// A pool on the test server, or `None` (skip) when none is configured.
+    fn test_pool() -> Option<MssqlPool> {
+        let Ok(url) = std::env::var("HUBRO_MSSQL_TEST_URL") else {
+            eprintln!("skipping: HUBRO_MSSQL_TEST_URL not set");
+            return None;
+        };
+        let parts = parse_mssql_url(&url).unwrap();
+        let addr = (parts.host.clone(), parts.port);
+        Some(MssqlPool::new(
+            parts.into_config(&MssqlAuth::Password, None),
+            addr,
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_query_cancelled_mid_request_does_not_hand_its_wait_to_the_next() {
+        let Some(pool) = test_pool() else { return };
+        query_with(&pool, "SELECT 1", &[]).await.unwrap();
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(300),
+            query_with(&pool, "WAITFOR DELAY '00:00:03'; SELECT 1", &[]),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the query must still have been running");
+        let idle = pool.inner.idle.lock().unwrap().len();
+        let started = Instant::now();
+        let next = query_with(&pool, "SELECT 2", &[]).await.unwrap();
+        let waited = started.elapsed();
+        eprintln!("idle after cancel: {idle}; next query took {waited:?}");
+        assert_eq!(next.rows, vec![vec![Value::Integer(2)]]);
+        assert_eq!(
+            idle, 0,
+            "a connection cancelled mid-request went back to the pool"
+        );
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn an_edit_batch_cancelled_mid_transaction_leaves_no_open_transaction_behind() {
+        let Some(pool) = test_pool() else { return };
+        let table = format!("hubro_cancelled_tx_{}", std::process::id());
+        execute(&pool, &format!("CREATE TABLE {table} (id int)"))
+            .await
+            .unwrap();
+        let insert = |id: i64| CheckedStatement {
+            sql: format!("INSERT INTO {table} (id) VALUES (@P1)"),
+            params: vec![Value::Integer(id)],
+            expected_rows: 1,
+        };
+        let stalled = [
+            insert(1),
+            CheckedStatement {
+                sql: "WAITFOR DELAY '00:00:02'".into(),
+                params: vec![],
+                expected_rows: 0,
+            },
+        ];
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(500),
+            execute_all_checked(&pool, &stalled),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the batch must still have been running");
+        // The next edit is reported committed...
+        execute_all_checked(&pool, &[insert(2)]).await.unwrap();
+        pool.close().await;
+        // ...so a fresh session must see it, and only it.
+        let fresh = test_pool().unwrap();
+        let rows = query_with(&fresh, &format!("SELECT id FROM {table} ORDER BY id"), &[])
+            .await
+            .unwrap()
+            .rows;
+        execute(&fresh, &format!("DROP TABLE {table}"))
+            .await
+            .unwrap();
+        fresh.close().await;
+        eprintln!("rows after a cancelled batch and a committed one: {rows:?}");
+        assert_eq!(rows, vec![vec![Value::Integer(2)]]);
     }
 }
