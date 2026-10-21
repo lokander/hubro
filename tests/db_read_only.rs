@@ -332,10 +332,22 @@ async fn a_marked_run_that_cannot_open_its_read_only_connection_fails_closed() {
         .expect_err("a marked run must not fall back to the pool's own connections");
     assert!(matches!(refused.error, DbError::Connect(_)), "{refused:?}");
 
-    // The fallback it refused is real: unmarked, the pool still runs it.
-    run_script(&pool, pool.backend_capabilities(), &script, |_| {})
-        .await
-        .expect("the pool's own connection still reads the renamed file");
+    // The fallback it refused is real: unmarked, the pool still runs it, on
+    // the connection it already holds. sqlx hands a finished connection back
+    // to the pool from a spawned task, so an acquire that races that return
+    // opens a new connection by name instead, and that fails just as the
+    // read-only open did; macOS CI lost this race once. So wait for the
+    // connection to come back rather than reading a lost race as "no
+    // fallback".
+    let mut lost_races = 0;
+    while let Err(err) = run_script(&pool, pool.backend_capabilities(), &script, |_| {}).await {
+        lost_races += 1;
+        assert!(
+            lost_races < 50,
+            "the pool's own connection still reads the renamed file: {err:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 
     std::fs::rename(&moved, fixture.path()).unwrap();
     pool.close().await;
