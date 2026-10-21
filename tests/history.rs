@@ -55,7 +55,7 @@ async fn search_matches_substrings_and_escapes_wildcards() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].sql, "SELECT * FROM artists");
 
-    // Case-insensitive (SQLite LIKE default for ASCII).
+    // Case-insensitive.
     assert_eq!(
         store.list("db", Some("ARTISTS"), 50).await.unwrap().len(),
         1
@@ -77,6 +77,66 @@ async fn search_matches_substrings_and_escapes_wildcards() {
 
     // The limit applies.
     assert_eq!(store.list("db", None, 2).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn searches_fold_case_beyond_ascii_like_the_connections_list() {
+    // SQLite's LIKE folds ASCII only, so `årsrapp` used to miss `Årsrapport`
+    // here while the connections list — which folds in Rust — found it.
+    let (_dir, store) = temp_store().await;
+    store
+        .record("db", "SELECT * FROM Årsrapport", true, None)
+        .await
+        .unwrap();
+    store
+        .save_query("Årsrapport", None, "SELECT 1", Some("db"))
+        .await
+        .unwrap();
+    store
+        .save_query("Totals", Some("Til ÅRSRAPPORTEN"), "SELECT 2", Some("db"))
+        .await
+        .unwrap();
+    store
+        .save_query("Sums", None, "SELECT * FROM ÅRSRAPPORT", None)
+        .await
+        .unwrap();
+
+    let hits = store.list("db", Some("årsrapp"), 50).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].sql, "SELECT * FROM Årsrapport");
+
+    // Name, description and SQL each fold the same way.
+    let names: Vec<String> = store
+        .saved_queries("db", Some("årsrapp"))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|q| q.name)
+        .collect();
+    assert_eq!(names, ["Totals", "Årsrapport", "Sums"]);
+    assert!(hubro::config::name_matches("Årsrapport", "årsrapp"));
+}
+
+#[tokio::test]
+async fn a_search_limits_the_matches_not_the_entries_it_reads() {
+    // Filtering moved out of SQL, so the limit has to follow it: an older
+    // match must not be crowded out by newer entries that do not match.
+    let (_dir, store) = temp_store().await;
+    store
+        .record("db", "SELECT 'old hit'", true, None)
+        .await
+        .unwrap();
+    store
+        .record("db", "SELECT 'older hit'", true, None)
+        .await
+        .unwrap();
+    for _ in 0..5 {
+        store.record("db", "SELECT 1", true, None).await.unwrap();
+    }
+    let hits = store.list("db", Some("hit"), 1).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].sql, "SELECT 'older hit'");
+    assert_eq!(store.list("db", Some("hit"), 50).await.unwrap().len(), 2);
 }
 
 #[tokio::test]

@@ -600,19 +600,16 @@ pub struct GroupSection {
     pub entries: Vec<SavedConnection>,
 }
 
-/// Whether a connection's name matches a search box's contents:
-/// case-insensitive substring, with an empty (or whitespace-only) query
-/// matching everything so the unfiltered list renders through the same path.
+/// Whether a connection's name matches a search box's contents, by the
+/// app-wide rule in [`crate::util::search_matches`]: case-insensitive
+/// substring, with an empty (or whitespace-only) query matching everything so
+/// the unfiltered list renders through the same path.
 ///
 /// Deliberately the *name* alone, which is what the issue asked for and what
 /// the box says it does. Matching the URL or the group name as well would
 /// make hits appear that the user can't see the reason for.
 pub fn name_matches(name: &str, query: &str) -> bool {
-    let query = query.trim();
-    if query.is_empty() {
-        return true;
-    }
-    name.to_lowercase().contains(&query.to_lowercase())
+    crate::util::search_matches(name, query)
 }
 
 /// Whether two group names are the same name: case-insensitively,
