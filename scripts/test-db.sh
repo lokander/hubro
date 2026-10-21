@@ -11,15 +11,21 @@
 #   scripts/test-db.sh up            # set 0, every engine
 #   scripts/test-db.sh up 1 pg crdb  # set 1, just those two
 #   scripts/test-db.sh env 1         # KEY=VALUE lines for set 1
+#   scripts/test-db.sh test 1 pg -- --test db_postgres   # cargo test against it
 #   scripts/test-db.sh down 1        # stop, keeping the data
 #   scripts/test-db.sh rm 1          # stop and delete — releases the set
 #   scripts/test-db.sh status        # which sets have engines running
 #
 # The usual way to run a suite against a set:
 #
-#   env $(scripts/test-db.sh env 1) cargo test --test db_cockroach
+#   scripts/test-db.sh test 1 crdb -- --test db_cockroach
 #
-# (fish: `env (scripts/test-db.sh env 1) cargo test …` — no `$`.)
+# which runs `cargo test` with that set's variables, and only if they could all
+# be produced. The shell form, `env $(scripts/test-db.sh env 1) cargo test`,
+# runs cargo whatever `env` said: a refusal prints nothing, `env` then sets
+# nothing, and every engine suite skips and passes. If you want the shell form,
+# make it stop: `vars=$(scripts/test-db.sh env 1 crdb) && env $vars cargo test`.
+# Wrap either in `nice -n 10`, and put cargo's own flags after the `--`.
 #
 # The `docker run` lines in the test headers are deliberately NOT deleted. They
 # document what each engine needs and why; this script is the convenience, not
@@ -321,7 +327,7 @@ cmd_up() {
   for engine in "${SELECTED[@]}"; do ready "$engine" "$set"; done
   echo
   echo "run a suite against it with:"
-  echo "  env \$($0 env $set) cargo test"
+  echo "  $0 test $set -- <cargo test arguments>"
 }
 
 cmd_down() {
@@ -401,6 +407,31 @@ cmd_env() {
   fi
 }
 
+# `cargo test` with the set's variables, run only when `env` succeeded — the
+# guarantee `env $(… env …) cargo test` cannot give, since a command
+# substitution's failure does not stop the command around it. Engines go
+# before `--`, cargo's arguments after it.
+cmd_test() {
+  local set=$1
+  shift
+  local engines=()
+  while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
+    engines+=("$1")
+    shift
+  done
+  [ "$#" -gt 0 ] && shift # the `--`
+  local exports
+  # On its own line, so `set -e` sees a refusal from `env` and stops here.
+  exports=$(cmd_env "$set" ${engines[@]+"${engines[@]}"})
+  [ -n "$exports" ] ||
+    die "no engine in set $set is running, so every engine suite would skip — start one with '$0 up $set <engine>'"
+  local vars=() line
+  # Read line by line rather than word-split: the SQL Server URL carries `?`
+  # and `&`, and an unquoted expansion would glob them.
+  while IFS= read -r line; do vars+=("$line"); done <<<"$exports"
+  exec env "${vars[@]}" cargo test "$@"
+}
+
 # Every set with at least one engine running, found from the container names
 # rather than by counting up from 0: `up` accepts any set number, and a fixed
 # range (this used to scan 0-3) leaves a set 7 running unseen.
@@ -451,7 +482,7 @@ main() {
   local command=${1:-}
   shift || true
   case "$command" in
-    up | down | env)
+    up | down | env | test)
       local set=0
       if [ "${1:-}" ] && [[ ${1} =~ ^[0-9]+$ ]]; then
         set=$1
