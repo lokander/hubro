@@ -163,7 +163,8 @@ pub async fn open_sqlite(path: &Path) -> Result<SqlitePool, DbError> {
         .await
         .map_err(|e| DbError::Connect(e.to_string()))?;
     // Forces a read so "not a database" / corrupt files fail here, not later.
-    sqlx::query("PRAGMA schema_version")
+    SqlText::new("PRAGMA schema_version")?
+        .query()
         .fetch_one(&pool)
         .await
         .map_err(|e| DbError::Connect(e.to_string()))?;
@@ -195,8 +196,9 @@ pub async fn open_read_only(pool: &SqlitePool) -> Result<SqliteConnection, DbErr
 /// [`Value`] model. Free-form SQL whose result is shown to the user, so a
 /// zero-row result recovers its headers.
 pub async fn query(pool: &SqlitePool, sql: &str) -> Result<QueryResult, DbError> {
+    let checked = SqlText::new(sql)?;
     let mut result = query_with(pool, sql, &[]).await?;
-    sqlx_common::fill_headers(&mut result, pool, sql).await;
+    checked.fill_headers(&mut result, pool).await;
     Ok(result)
 }
 
@@ -209,10 +211,80 @@ fn query_error(err: sqlx::Error) -> DbError {
     DbError::Query(err.to_string())
 }
 
+/// Why SQL text holding a NUL character never reaches SQLite — see
+/// [`SqlText`].
+pub const NUL_IN_SQL: &str =
+    "This statement contains a NUL character, which can't be sent to SQLite.";
+
+/// SQL text this backend may hand to sqlx-sqlite: text holding no NUL.
+///
+/// **The one door.** Every statement the SQLite backend runs, describes or
+/// prepares goes through a value of this type, which only [`SqlText::new`]
+/// builds, and every call that hands text to the driver lives in its `impl`
+/// block — `the_driver_is_handed_text_only_through_sql_text` holds the rest
+/// of this file to that. A choke point rather than a proof per path, because
+/// the paths are many (free-form queries, page reads, edits, imports,
+/// exports, introspection) and the next one would need a proof of its own.
+///
+/// The hang it prevents, in sqlx-sqlite 0.8.6 and unchanged in 0.9.0: sqlx
+/// splits a query into statements by calling `sqlite3_prepare_v3` in a loop,
+/// advancing by the tail SQLite reports. SQLite reads only up to a NUL, so
+/// once the statements before one are compiled the tail stays on the NUL —
+/// nothing consumed, and the loop never ends. The connection's worker thread
+/// spins a core for good, out of reach of any timeout. Measured with `SELECT
+/// 1` followed by a NUL. A NUL *inside* a quoted name or string literal fails
+/// cleanly instead, since SQLite reads the token as unterminated, and hubro's
+/// own builders quote every name: a table whose `sqlite_master` name holds a
+/// NUL — which a crafted file can have, and SQLite opens — gets
+/// `unrecognized token` rather than a hang. That holds only while every
+/// builder keeps quoting, which is the per-path proof this type replaces, and
+/// refusing every NUL gives that table a sentence instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SqlText<'a>(&'a str);
+
+impl<'a> SqlText<'a> {
+    /// `sql`, or [`NUL_IN_SQL`] when it holds a NUL anywhere.
+    fn new(sql: &'a str) -> Result<Self, DbError> {
+        if sql.contains('\0') {
+            return Err(DbError::Query(NUL_IN_SQL.to_string()));
+        }
+        Ok(SqlText(sql))
+    }
+
+    /// A prepared (not simple-protocol) query over this text.
+    fn query(self) -> SqliteQuery<'a> {
+        sqlx::query(self.0)
+    }
+
+    /// Runs this text without decoding rows — see [`sqlx_common::execute`].
+    async fn execute<'c, E>(self, executor: E) -> Result<u64, DbError>
+    where
+        E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
+    {
+        sqlx_common::execute(executor, self.0, query_error).await
+    }
+
+    /// See [`sqlx_common::fill_headers`].
+    async fn fill_headers<'c, E>(self, result: &mut QueryResult, executor: E)
+    where
+        E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
+    {
+        sqlx_common::fill_headers(result, executor, self.0).await;
+    }
+
+    /// See [`sqlx_common::describe_columns`].
+    async fn describe_columns<'c, E>(self, executor: E) -> Result<Vec<String>, sqlx::Error>
+    where
+        E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
+    {
+        sqlx_common::describe_columns(executor, self.0).await
+    }
+}
+
 /// Executes a statement without decoding rows, returning the driver's
 /// affected-row count.
 pub async fn execute(pool: &SqlitePool, sql: &str) -> Result<u64, DbError> {
-    sqlx_common::execute(pool, sql, query_error).await
+    SqlText::new(sql)?.execute(pool).await
 }
 
 /// Executes parameterized writes inside ONE transaction, committing only
@@ -227,12 +299,19 @@ pub async fn execute_all_checked(
     pool: &SqlitePool,
     statements: &[CheckedStatement],
 ) -> Result<(), (Option<usize>, DbError)> {
+    // Every statement is checked before the transaction opens, so a refused
+    // one leaves nothing to roll back.
+    let checked = statements
+        .iter()
+        .enumerate()
+        .map(|(index, statement)| SqlText::new(&statement.sql).map_err(|e| (Some(index), e)))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut tx = pool
         .begin()
         .await
         .map_err(|e| (None, DbError::Query(e.to_string())))?;
-    for (index, statement) in statements.iter().enumerate() {
-        let result = bind_params(sqlx::query(&statement.sql), &statement.params)
+    for (index, (statement, sql)) in statements.iter().zip(checked).enumerate() {
+        let result = bind_params(sql.query(), &statement.params)
             .execute(&mut *tx)
             .await;
         // Dropping the transaction would roll back too; do it explicitly and
@@ -291,7 +370,7 @@ pub async fn query_with(
     sql: &str,
     params: &[Value],
 ) -> Result<QueryResult, DbError> {
-    let stream = bind_params(sqlx::query(sql), params).fetch(pool);
+    let stream = bind_params(SqlText::new(sql)?.query(), params).fetch(pool);
     sqlx_common::collect_all(stream, decode_value, query_error).await
 }
 
@@ -307,10 +386,11 @@ pub async fn query_capped(
     max_rows: u64,
     cell_cap: usize,
 ) -> Result<(QueryResult, bool), DbError> {
-    let stream = bind_params(sqlx::query(sql), params).fetch(pool);
+    let sql = SqlText::new(sql)?;
+    let stream = bind_params(sql.query(), params).fetch(pool);
     let (mut result, truncated) =
         sqlx_common::collect_capped(stream, max_rows, cell_cap, decode_value, query_error).await?;
-    sqlx_common::fill_headers(&mut result, pool, sql).await;
+    sql.fill_headers(&mut result, pool).await;
     Ok((result, truncated))
 }
 
@@ -323,10 +403,11 @@ pub async fn query_capped_conn(
     max_rows: u64,
     cell_cap: usize,
 ) -> Result<(QueryResult, bool), DbError> {
-    let stream = sqlx::query(sql).fetch(&mut *conn);
+    let sql = SqlText::new(sql)?;
+    let stream = sql.query().fetch(&mut *conn);
     let (mut result, truncated) =
         sqlx_common::collect_capped(stream, max_rows, cell_cap, decode_value, query_error).await?;
-    sqlx_common::fill_headers(&mut result, &mut *conn, sql).await;
+    sql.fill_headers(&mut result, &mut *conn).await;
     Ok((result, truncated))
 }
 
@@ -337,7 +418,7 @@ pub async fn execute_conn(
     conn: &mut sqlx::sqlite::SqliteConnection,
     sql: &str,
 ) -> Result<u64, DbError> {
-    sqlx_common::execute(conn, sql, query_error).await
+    SqlText::new(sql)?.execute(conn).await
 }
 
 /// [`execute_conn`] with bound parameters — the write path for a batch of
@@ -348,7 +429,7 @@ pub async fn execute_with_conn(
     sql: &str,
     params: &[Value],
 ) -> Result<u64, DbError> {
-    bind_params(sqlx::query(sql), params)
+    bind_params(SqlText::new(sql)?.query(), params)
         .execute(conn)
         .await
         .map(|done| done.rows_affected())
@@ -367,7 +448,8 @@ pub async fn export(
     format: ExportFormat,
     out: &mut impl Write,
 ) -> Result<u64, DbError> {
-    let stream = bind_params(sqlx::query(sql), params).fetch(pool);
+    let sql = SqlText::new(sql)?;
+    let stream = bind_params(sql.query(), params).fetch(pool);
     if let Some(rows) =
         sqlx_common::export_stream(stream, format, out, decode_value, query_error).await?
     {
@@ -376,9 +458,7 @@ pub async fn export(
     // No rows streamed, so no row carried the column names: describe the
     // statement instead. This one propagates its failure — an export whose
     // header cannot be determined is an empty file that says nothing.
-    let columns = sqlx_common::describe_columns(pool, sql)
-        .await
-        .map_err(query_error)?;
+    let columns = sql.describe_columns(pool).await.map_err(query_error)?;
     sqlx_common::export_empty(format, columns, out)?;
     Ok(0)
 }
@@ -394,7 +474,8 @@ pub async fn introspect(pool: &SqlitePool) -> Result<Vec<TableMeta>, DbError> {
          WHERE {MASTER_FILTER} \
          ORDER BY m.name"
     );
-    let rows = sqlx::query(&sql)
+    let rows = SqlText::new(&sql)?
+        .query()
         .fetch_all(pool)
         .await
         .map_err(|e| DbError::Introspect(e.to_string()))?;
@@ -589,7 +670,8 @@ async fn table_columns(pool: &SqlitePool, entries: &[MasterEntry]) -> Result<Col
          WHERE {MASTER_FILTER} AND {ORDINARY_TABLE} \
          ORDER BY m.name, x.cid"
     );
-    let rows = sqlx::query(&sql)
+    let rows = SqlText::new(&sql)?
+        .query()
         .fetch_all(pool)
         .await
         .map_err(|e| DbError::Introspect(e.to_string()))?;
@@ -606,9 +688,10 @@ async fn table_columns(pool: &SqlitePool, entries: &[MasterEntry]) -> Result<Col
         .filter(|entry| !columns.contains_key(&entry.name))
         .collect();
     let sql = format!("SELECT {XINFO_COLUMNS} FROM pragma_table_xinfo(?1) x ORDER BY x.cid");
-    let sql = sql.as_str();
+    let sql = SqlText::new(&sql)?;
     let (resolved, unreadable) = read_each(&pending, |name| async move {
-        let rows = sqlx::query(sql)
+        let rows = sql
+            .query()
             .bind(name)
             .fetch_all(pool)
             .await
@@ -704,7 +787,8 @@ async fn table_indexes(pool: &SqlitePool) -> Result<HashMap<String, Vec<IndexMet
          JOIN pragma_index_info(il.name) ii \
          WHERE {MASTER_FILTER}"
     );
-    let column_rows = sqlx::query(&sql)
+    let column_rows = SqlText::new(&sql)?
+        .query()
         .fetch_all(pool)
         .await
         .map_err(|e| DbError::Introspect(e.to_string()))?;
@@ -726,7 +810,8 @@ async fn table_indexes(pool: &SqlitePool) -> Result<HashMap<String, Vec<IndexMet
          WHERE {MASTER_FILTER} \
          ORDER BY m.name, il.seq"
     );
-    let rows = sqlx::query(&sql)
+    let rows = SqlText::new(&sql)?
+        .query()
         .fetch_all(pool)
         .await
         .map_err(|e| DbError::Introspect(e.to_string()))?;
@@ -765,7 +850,8 @@ async fn table_foreign_keys(
          FROM sqlite_master m JOIN pragma_foreign_key_list(m.name) fk \
          WHERE {MASTER_FILTER}"
     );
-    let rows = sqlx::query(&sql)
+    let rows = SqlText::new(&sql)?
+        .query()
         .fetch_all(pool)
         .await
         .map_err(|e| DbError::Introspect(e.to_string()))?;
@@ -831,24 +917,27 @@ pub async fn fetch_table_stats(
     pool: &SqlitePool,
     table: &TableMeta,
 ) -> Result<TableStats, DbError> {
-    let analyzed: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'",
-    )
+    let analyzed = SqlText::new(
+        "SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'",
+    )?
+    .query()
     .fetch_one(pool)
     .await
     .map_err(|e| DbError::Introspect(e.to_string()))?;
+    let analyzed: i64 = get(&analyzed, "n")?;
     if analyzed == 0 {
         return Ok(TableStats::default());
     }
     // Any of the table's rows will do: ANALYZE writes one per index, plus one
     // with a NULL `idx` when there is no index, and every one of them opens
     // with the table's own row count.
-    let stat: Option<String> =
-        sqlx::query_scalar("SELECT stat FROM sqlite_stat1 WHERE tbl = ?1 AND stat IS NOT NULL")
-            .bind(&table.name)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| DbError::Introspect(e.to_string()))?;
+    let stat = SqlText::new("SELECT stat FROM sqlite_stat1 WHERE tbl = ?1 AND stat IS NOT NULL")?
+        .query()
+        .bind(&table.name)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| DbError::Introspect(e.to_string()))?;
+    let stat: Option<String> = stat.map(|row| get(&row, "stat")).transpose()?;
     Ok(TableStats {
         rows: stat
             .as_deref()
@@ -955,7 +1044,8 @@ async fn object_sql(
     // their own: a trigger may share a name with an index or table, and
     // whichever row came first would otherwise answer for both.
     let row =
-        sqlx::query("SELECT type, sql FROM sqlite_master WHERE name = ?1 AND type <> 'trigger'")
+        SqlText::new("SELECT type, sql FROM sqlite_master WHERE name = ?1 AND type <> 'trigger'")?
+            .query()
             .bind(name)
             .fetch_optional(pool)
             .await
@@ -973,11 +1063,12 @@ async fn object_sql(
 /// The stored `CREATE INDEX` statements of every explicitly created index on
 /// `table`, in name order.
 async fn index_sql(pool: &SqlitePool, table: &str) -> Result<Vec<String>, DbError> {
-    let rows = sqlx::query(
+    let rows = SqlText::new(
         "SELECT sql FROM sqlite_master \
          WHERE type = 'index' AND tbl_name = ?1 AND sql IS NOT NULL \
          ORDER BY name",
-    )
+    )?
+    .query()
     .bind(table)
     .fetch_all(pool)
     .await
@@ -1273,5 +1364,254 @@ mod tests {
         let empty = dir.path().join("empty.db");
         std::fs::write(&empty, b"").unwrap();
         assert!(check_sqlite_file(&empty).is_ok());
+    }
+
+    #[test]
+    fn sql_text_refuses_a_nul_wherever_it_sits() {
+        for sql in [
+            "SELECT 1\0",
+            "\0SELECT 1",
+            "SELECT 1; \0 DELETE FROM t",
+            "SELECT 1 -- \0",
+            "SELECT * FROM \"t\0x\"",
+            "SELECT '\0'",
+            "\0",
+        ] {
+            assert_eq!(
+                SqlText::new(sql),
+                Err(DbError::Query(NUL_IN_SQL.to_string())),
+                "{sql:?}"
+            );
+        }
+        for sql in ["SELECT 1", "", "SELECT '\\0'", "SELECT char(0)"] {
+            assert_eq!(SqlText::new(sql), Ok(SqlText(sql)), "{sql:?}");
+        }
+    }
+
+    /// A batch with a NUL in any statement is refused before its transaction
+    /// opens: the statements ahead of it never run, rather than running and
+    /// rolling back. The first statement is set up to fail its row count, so
+    /// running it at all would report that failure, at index 0, instead.
+    #[tokio::test]
+    async fn a_checked_batch_holding_a_nul_runs_none_of_its_statements() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        SqlText::new("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1)")
+            .unwrap()
+            .execute(&pool)
+            .await
+            .unwrap();
+        let statements = [
+            CheckedStatement {
+                sql: "DELETE FROM t".into(),
+                params: vec![],
+                expected_rows: 2,
+            },
+            CheckedStatement {
+                sql: "DELETE FROM t;\0".into(),
+                params: vec![],
+                expected_rows: 0,
+            },
+        ];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            execute_all_checked(&pool, &statements),
+        )
+        .await
+        .expect("a NUL must be refused, not handed to the driver");
+        assert_eq!(
+            outcome,
+            Err((Some(1), DbError::Query(NUL_IN_SQL.to_string())))
+        );
+        let rows = query(&pool, "SELECT count(*) FROM t").await.unwrap();
+        assert_eq!(rows.rows, vec![vec![Value::Integer(1)]]);
+    }
+
+    /// `source` up to its test module, with comment lines dropped. Line-based,
+    /// so a CRLF checkout reads the same.
+    fn shipped_code(source: &str) -> Vec<&str> {
+        let lines: Vec<&str> = source.lines().collect();
+        let end = lines
+            .windows(2)
+            .position(|w| w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod "))
+            .unwrap_or(lines.len());
+        lines[..end]
+            .iter()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .copied()
+            .collect()
+    }
+
+    /// Whether `code` names `word` as a whole identifier.
+    fn names(code: &str, word: &str) -> bool {
+        code.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|token| token == word)
+    }
+
+    /// Everything that hands SQL text to the driver: sqlx's own entry points,
+    /// the trait that lets an executor take a bare `&str`, and the shared
+    /// helpers that take text.
+    const TEXT_TO_DRIVER: &[&str] = &[
+        "query",
+        "query_as",
+        "query_scalar",
+        "query_with",
+        "query_as_with",
+        "query_scalar_with",
+        "raw_sql",
+        "Executor",
+        "describe",
+        "prepare",
+        "prepare_with",
+        "execute",
+        "fill_headers",
+        "describe_columns",
+    ];
+
+    /// The other half of [`SqlText`]'s guarantee: outside its `impl` block,
+    /// this file reaches none of [`TEXT_TO_DRIVER`] except as a method on
+    /// what the door returns. Mutated by calling `sqlx::query` directly in
+    /// one function, importing `fill_headers` by its bare name, and calling
+    /// `sqlx_common::execute` from `execute_conn`: each fails here.
+    #[test]
+    fn the_driver_is_handed_text_only_through_sql_text() {
+        let lines = shipped_code(include_str!("sqlite.rs"));
+        let open = lines
+            .iter()
+            .position(|line| line.starts_with("impl<'a> SqlText<'a> {"))
+            .expect("the door is in this file");
+        let close = open
+            + lines[open..]
+                .iter()
+                .position(|line| *line == "}")
+                .expect("the door's impl block ends");
+        let outside = [&lines[..open], &lines[close + 1..]].concat().join("\n");
+
+        // Reached through a path: `sqlx::query(…)`, `sqlx_common::execute(…)`.
+        for path in ["sqlx::", "sqlx_common::"] {
+            for (at, _) in outside.match_indices(path) {
+                let rest = &outside[at + path.len()..];
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                // `sqlx::query::Query` names a type through the module.
+                let module = name == "query" && rest[name.len()..].starts_with("::Query<");
+                assert!(
+                    module || !TEXT_TO_DRIVER.contains(&name.as_str()),
+                    "`{path}{name}` outside `impl SqlText` hands text to the driver unchecked"
+                );
+            }
+        }
+        // Or brought in by a bare name, through a `use`.
+        let mut statement = String::new();
+        for line in outside.lines() {
+            if statement.is_empty() && !line.trim_start().starts_with("use ") {
+                continue;
+            }
+            statement.push_str(line);
+            if line.contains(';') {
+                assert!(
+                    !(statement.contains("sqlx") && statement.contains('*')),
+                    "`{statement}` glob-imports past `impl SqlText`"
+                );
+                for word in TEXT_TO_DRIVER {
+                    assert!(
+                        !names(&statement, word),
+                        "`{statement}` imports `{word}` past `impl SqlText`"
+                    );
+                }
+                statement.clear();
+            }
+        }
+        // The executor trait is what lets a pool or connection run a bare
+        // `&str`, and its methods need it in scope.
+        assert!(
+            !names(&outside, "Executor"),
+            "Executor outside `impl SqlText`"
+        );
+    }
+
+    /// Every shipped file under `src/`, as `(path relative to src, contents)`.
+    fn all_sources() -> Vec<(String, String)> {
+        fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.push((rel, std::fs::read_to_string(&path).unwrap()));
+                }
+            }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        walk(&root, &root, &mut out);
+        out
+    }
+
+    /// The files that hand SQL text to sqlx at all, so a new one has to be
+    /// weighed against the NUL hang rather than slip past [`SqlText`]:
+    ///
+    /// - `db/sqlite.rs`, through the door (pinned above).
+    /// - `db/postgres.rs`: sqlx-postgres sends a statement whole, with no
+    ///   prepare loop to stall in, and a Postgres-wire server has no NUL in
+    ///   its names to build text from.
+    /// - `db/sqlx_common.rs`: the shared helpers, generic over the driver;
+    ///   this file calls them only from inside the door.
+    /// - `history.rs`: hubro's own history database, which is SQLite — so
+    ///   every statement it runs is a literal, which is checked here. What
+    ///   the user ran is stored there as a bound value, never as text.
+    #[test]
+    fn only_known_files_hand_sql_text_to_sqlx() {
+        let mut found = Vec::new();
+        for (path, source) in all_sources() {
+            let code = shipped_code(&source).join("\n");
+            let hands_text = ["sqlx::", "sqlx_common::"].iter().any(|prefix| {
+                TEXT_TO_DRIVER.iter().any(|word| {
+                    code.contains(&format!("{prefix}{word}("))
+                        || code.contains(&format!("{prefix}{word}_"))
+                })
+            }) || names(&code, "Executor");
+            if hands_text {
+                found.push(path);
+            }
+        }
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                "db/postgres.rs",
+                "db/sqlite.rs",
+                "db/sqlx_common.rs",
+                "history.rs"
+            ]
+        );
+
+        let history = shipped_code(include_str!("../history.rs")).join("\n");
+        let mut calls = 0;
+        for call in ["sqlx::query(", "sqlx::query_scalar("] {
+            for (at, _) in history.match_indices(call) {
+                calls += 1;
+                let argument = history[at + call.len()..].trim_start();
+                // The schema setup loops over an array of literals.
+                let literal = argument.starts_with('"')
+                    || (argument.starts_with("statement)")
+                        && history.contains("for statement in [\n"));
+                assert!(
+                    literal,
+                    "history runs a statement that is not a literal: {argument:.60}"
+                );
+            }
+        }
+        assert!(calls > 0, "history's statements were not found");
     }
 }
