@@ -1072,9 +1072,20 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     // unique index (that query had already landed elsewhere), and, once the
     // pool had grown, listed with no columns at all while every attempt to
     // open it failed with "cannot access temporary tables of other sessions".
-    // `LOCAL TEMPORARY` is the server's own classification, reported by
-    // CockroachDB too, so no schema-name pattern is needed; the index and
-    // foreign-key queries' `pg\_%` filter excludes the same schemas.
+    //
+    // One filter on this query is enough, because each engine that has temp
+    // tables at all either hides the ones it would otherwise get wrong or
+    // labels them. Measured with a temp table held open by a second session:
+    // PostgreSQL leaves other sessions' temp schemas out of
+    // `information_schema` entirely (they are still in `pg_class`), so the
+    // only temp table it can list is the introspecting connection's own —
+    // labelled `LOCAL TEMPORARY`. CockroachDB lists *every* session's temp
+    // tables, and labels each one the same way. Materialize lists no temp
+    // table or view at all, not even to the session that made it. Being the
+    // server's own classification, the label needs no schema-name pattern;
+    // the index and foreign-key queries' `pg\_%` filter excludes the same
+    // schemas, but cannot be applied here without also dropping
+    // CockroachDB's `pg_extension`, which is listed and marked internal.
     let table_rows = sqlx::query(
         "SELECT table_schema, table_name, table_type \
          FROM information_schema.tables \
@@ -1949,11 +1960,18 @@ fn decode_typed(row: &PgRow, idx: usize, raw: &PgValueRef) -> Option<Value> {
     }
 }
 
-/// One byte of Postgres's internal `"char"` type, as the server's own output
-/// function prints it: nothing for a zero byte, a backslash and three octal
-/// digits for one with the high bit set (it is a byte, not a character, so the
-/// first byte of a multi-byte UTF-8 character lands here), the character
-/// itself otherwise.
+/// One byte of Postgres's internal `"char"` type, as PostgreSQL 15 and later
+/// print it: nothing for a zero byte, a backslash and three octal digits for
+/// one with the high bit set (it is a byte, not a character, so the first byte
+/// of a multi-byte UTF-8 character lands here), the character itself
+/// otherwise. Those versions also read `\ooo` back as that byte, so the text
+/// round-trips through an edit.
+///
+/// PostgreSQL 14 and earlier print a high byte raw and read only the first
+/// byte of their input, so `\303` written back there stores a backslash
+/// (measured on 14.24). Every PostgreSQL-based engine hubro is verified
+/// against is 15 or later — the oldest, YugabyteDB, is 15.12 — and a
+/// `"char"` with the high bit set is rare outside deliberately odd data.
 fn internal_char_text(byte: u8) -> String {
     match byte {
         0 => String::new(),
