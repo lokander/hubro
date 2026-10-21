@@ -724,9 +724,13 @@ async fn best_rsa_hash(handle: &client::Handle<HostKeyVerifier>, is_rsa: bool) -
 /// spawns that task as soon as the server's banner arrives, and it owns the
 /// socket: dropping the connect future leaves it reading from a server that
 /// may never say anything again, holding the socket and the handler, for as
-/// long as that server keeps the connection open. So the socket is dialed
-/// here, a second handle to it is kept, and a timeout shuts it down: the task
-/// reads end-of-file and ends.
+/// long as that server keeps the connection open. (Dropping the handle does
+/// not reach it either: during a key exchange the task does not look at its
+/// handle's channel.) So the socket is dialed here and a second handle to it
+/// is kept in a [`ShutdownOnDrop`], which shuts it down unless the connect
+/// succeeds — when the bound fires, and just as much when the future is
+/// dropped from outside, which is what Cancel on a connecting row does. The
+/// task then reads end-of-file and ends.
 ///
 /// russh's own `inactivity_timeout` would end that task too, and was measured
 /// and rejected: it is not limited to the handshake, so with a 2s setting it
@@ -738,32 +742,37 @@ async fn connect_within(
     handler: HostKeyVerifier,
     limit: Duration,
 ) -> Option<Result<client::Handle<HostKeyVerifier>, russh::Error>> {
-    let dialed: Arc<Mutex<Option<std::net::TcpStream>>> = Arc::default();
-    let connect = {
-        let dialed = Arc::clone(&dialed);
-        async move {
-            let socket = tokio::net::TcpStream::connect(address).await?;
-            if ssh_config.nodelay {
-                let _ = socket.set_nodelay(true);
-            }
-            let socket = socket.into_std()?;
-            if let (Ok(second), Ok(mut slot)) = (socket.try_clone(), dialed.lock()) {
-                *slot = Some(second);
-            }
-            let socket = tokio::net::TcpStream::from_std(socket)?;
-            client::connect_stream(ssh_config, socket, handler).await
+    let mut guard = ShutdownOnDrop(None);
+    let connect = async {
+        let socket = tokio::net::TcpStream::connect(address).await?;
+        if ssh_config.nodelay {
+            let _ = socket.set_nodelay(true);
         }
+        let socket = socket.into_std()?;
+        guard.0 = socket.try_clone().ok();
+        let socket = tokio::net::TcpStream::from_std(socket)?;
+        client::connect_stream(ssh_config, socket, handler).await
     };
-    match tokio::time::timeout(limit, connect).await {
-        // On success the second handle just closes: it is a duplicate, and
-        // closing it leaves the session's socket open.
-        Ok(connected) => Some(connected),
-        Err(_) => {
-            let second = dialed.lock().ok().and_then(|mut slot| slot.take());
-            if let Some(second) = second {
-                let _ = second.shutdown(std::net::Shutdown::Both);
-            }
-            None
+    let connected = tokio::time::timeout(limit, connect).await.ok()?;
+    if connected.is_ok() {
+        // The session owns the socket now; the duplicate handle just closes,
+        // which leaves the socket open.
+        guard.0 = None;
+    }
+    // A failed connect's session task has ended or is ending on its own; the
+    // shutdown is harmless there.
+    Some(connected)
+}
+
+/// A second handle to a socket that is shut down — for every handle, so for
+/// whichever task owns the first — when this is dropped while still holding
+/// it.
+struct ShutdownOnDrop(Option<std::net::TcpStream>);
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        if let Some(socket) = self.0.take() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
         }
     }
 }
@@ -1653,6 +1662,55 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), session_end(alive))
             .await
             .expect("the session task must not outlive the abandoned connect");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the socket must be closed")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_connect_to_a_stalled_server_leaves_no_session_behind() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        // A server that sends its banner and then never answers the key
+        // exchange: by then russh has spawned the session task, which owns
+        // the socket and the handler.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"SSH-2.0-Stalls_1.0\r\n").await.unwrap();
+            // Hold the connection open, reading whatever arrives, until the
+            // client closes it.
+            let mut sink = [0u8; 1024];
+            while matches!(socket.read(&mut sink).await, Ok(n) if n > 0) {}
+        });
+        let (alive_tx, alive) = watch::channel(());
+        let handler = HostKeyVerifier {
+            host: "127.0.0.1".into(),
+            port,
+            files: Vec::new(),
+            verdict: Arc::default(),
+            offered_key: Arc::default(),
+            _alive: alive_tx,
+        };
+        // Cancel on a connecting row drops the connect future long before its
+        // own bound fires.
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(500),
+            connect_within(
+                Arc::new(client_config("127.0.0.1", port, &[])),
+                ("127.0.0.1", port),
+                handler,
+                Duration::from_secs(30),
+            ),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the key exchange cannot have finished");
+        // The handler goes with the session task, so its signal firing is
+        // the task ending — and the server seeing its connection closed.
+        tokio::time::timeout(Duration::from_secs(5), session_end(alive))
+            .await
+            .expect("the session task must not outlive the cancelled connect");
         tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .expect("the socket must be closed")
