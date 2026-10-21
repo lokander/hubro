@@ -314,7 +314,7 @@ pub fn sniff_file(path: &Path) -> io::Result<FileSniff> {
     File::open(path)?
         .take(SNIFF_BYTES as u64)
         .read_to_end(&mut head)?;
-    Ok(sniff_head(path, without_bom(&head)))
+    Ok(sniff_head(path, &head))
 }
 
 /// `sample` without a leading UTF-8 byte-order mark. The readers drop it
@@ -327,8 +327,9 @@ fn without_bom(sample: &[u8]) -> &[u8] {
     sample.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(sample)
 }
 
-/// [`sniff_file`]'s decision over a sample already read (and BOM-stripped).
+/// [`sniff_file`]'s decision over the sample it read, BOM and all.
 fn sniff_head(path: &Path, head: &[u8]) -> FileSniff {
+    let head = without_bom(head);
     let encoding = sniff_encoding(head);
     let extension = path
         .extension()
@@ -371,13 +372,21 @@ pub enum EmptyField {
 }
 
 impl EmptyField {
-    pub fn label(self) -> &'static str {
+    /// The option's wording as the dialog's "Empty fields" select offers it.
+    /// One string for the dialog and [`Self::label`], so the rule the option
+    /// states — including the default that replaces a NULL a NOT NULL column
+    /// cannot hold — reads the same wherever it is named.
+    pub fn choice(self) -> &'static str {
         match self {
-            EmptyField::Null => {
-                "empty fields become NULL (or the column's default where NULL isn't allowed)"
-            }
-            EmptyField::EmptyText => "empty fields become an empty string",
+            EmptyField::Null => "become NULL (or the column's default where NULL isn't allowed)",
+            EmptyField::EmptyText => "become an empty string",
         }
+    }
+
+    /// The option named in a sentence, e.g. in a coercion error that points
+    /// at it.
+    pub fn label(self) -> String {
+        format!("empty fields {}", self.choice())
     }
 }
 
@@ -1557,7 +1566,7 @@ mod tests {
         let array = bom(br#"[{"id":1}]"#);
         for name in ["export.json", "export.txt"] {
             assert_eq!(
-                sniff_head(Path::new(name), without_bom(&array)).format,
+                sniff_head(Path::new(name), &array).format,
                 SourceFormat::Json(JsonShape::Array),
                 "{name}"
             );
@@ -1565,9 +1574,7 @@ mod tests {
         // A BOM'd headerless CSV: its first field is the number 1, not
         // "\u{feff}1", so it is not mistaken for a header.
         let numbers = bom(b"1,2\n3,4\n");
-        let SourceFormat::Csv(dialect) =
-            sniff_head(Path::new("n.csv"), without_bom(&numbers)).format
-        else {
+        let SourceFormat::Csv(dialect) = sniff_head(Path::new("n.csv"), &numbers).format else {
             panic!("not sniffed as CSV");
         };
         assert!(!dialect.has_header);

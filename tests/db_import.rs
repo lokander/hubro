@@ -24,7 +24,7 @@ use common::FixtureDb;
 use hubro::db::{
     run_import, ColumnBinding, CsvDialect, CsvReader, DbPool, Dialect, EmptyField, Encoding,
     ErrorMode, ImportError, ImportOptions, ImportReport, JsonReader, JsonShape, PageRequest,
-    RecordSource, SourceField, TableAccess, TableMeta, Value,
+    PgFlavor, RecordSource, SourceField, TableAccess, TableMeta, Value,
 };
 
 async fn pg_url() -> Option<String> {
@@ -1197,9 +1197,7 @@ async fn postgres_an_empty_field_in_a_not_null_column_takes_its_default() {
     assert_eq!(report.defaulted_cells, 5);
     let stored = pool
         .query(
-            // `id IS NOT NULL` rather than the id itself: a serial's value is
-            // the engine's (CockroachDB's is `unique_rowid()`, not 1, 2).
-            "SELECT id IS NOT NULL, seq, created_at IS NOT NULL, \
+            "SELECT id, seq, created_at IS NOT NULL, \
              created_at = '2024-01-01 00:00:00+00' FROM import_events ORDER BY seq",
         )
         .await
@@ -1209,18 +1207,23 @@ async fn postgres_an_empty_field_in_a_not_null_column_takes_its_default() {
         .iter()
         .map(|row| row.iter().map(Value::display).collect())
         .collect();
+    // Each row's `seq`, whether `created_at` was filled, and whether it is
+    // the file's own timestamp: the first row's was blank, the second's not.
+    let rest: Vec<&[String]> = rows.iter().map(|row| &row[1..]).collect();
     assert_eq!(
-        rows,
-        vec![
-            vec![
-                "true".to_string(),
-                "1".into(),
-                "true".into(),
-                "false".into()
-            ],
-            vec!["true".to_string(), "2".into(), "true".into(), "true".into()],
-        ]
+        rest,
+        vec![&["1", "true", "false"][..], &["2", "true", "true"][..]]
     );
+    // The serial key the server filled in. On Postgres that is its sequence,
+    // so exactly 1 and 2; other engines speaking the protocol fill a serial
+    // their own way (CockroachDB's is `unique_rowid()`), where all that can
+    // be asserted is two distinct keys.
+    let ids: Vec<&str> = rows.iter().map(|row| row[0].as_str()).collect();
+    if pool.pg_flavor() == Some(PgFlavor::Postgres) {
+        assert_eq!(ids, vec!["1", "2"]);
+    } else {
+        assert_ne!(ids[0], ids[1], "{ids:?}");
+    }
 
     pool.execute("DROP TABLE import_defaults, import_all_default, import_events")
         .await

@@ -738,7 +738,7 @@ mod tests {
         let err = coerce("integer", &text("   ")).unwrap_err();
         assert!(!err.contains('∅'), "{err}");
         assert!(err.contains("empty value is not a number"), "{err}");
-        assert!(err.contains(EmptyField::Null.label()), "{err}");
+        assert!(err.contains(&EmptyField::Null.label()), "{err}");
     }
 
     #[test]
