@@ -34,18 +34,21 @@ impl Dialect {
 
     /// Renders a cast of `expr` (already-safe SQL, e.g. a quoted identifier
     /// or a placeholder) to `target` (an introspected/static type name).
-    /// Postgres uses the postfix `expr::type` shape; SQLite shares the arm
-    /// but no builder ever casts there (its type affinity coerces on its
-    /// own). SQL Server uses the prefix `CAST(expr AS type)` shape.
+    /// Postgres uses the postfix `expr::type` shape; SQLite and SQL Server
+    /// the prefix `CAST(expr AS type)` one. SQLite has no `::` operator at
+    /// all ("unrecognized token"), so although no builder casts there today
+    /// (its type affinity coerces on its own), the shape it gets is one it
+    /// can run.
     ///
     /// Callers pass a **dialect-neutral** target for the generic cases and
     /// this method translates it: the stringify target `"text"` becomes
     /// `nvarchar(max)` on SQL Server (T-SQL has no `text`-as-cast-target
     /// worth using — the legacy `text` type is deprecated and not
-    /// comparable). Any other target renders verbatim.
+    /// comparable). Any other target, and `text` on SQLite, renders verbatim.
     pub(crate) fn cast_expr(self, expr: &str, target: &str) -> String {
         match self {
-            Dialect::Sqlite | Dialect::Postgres => format!("{expr}::{target}"),
+            Dialect::Postgres => format!("{expr}::{target}"),
+            Dialect::Sqlite => format!("CAST({expr} AS {target})"),
             Dialect::SqlServer => {
                 let target = if target == "text" {
                     "nvarchar(max)"
@@ -262,6 +265,27 @@ mod tests {
             restriction: None,
             internal: None,
             kind_label: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_casts_are_a_shape_sqlite_runs() {
+        // Measured: SQLite rejects the postfix `?::integer` ("unrecognized
+        // token"), so the shape is pinned and then run against the engine.
+        assert_eq!(
+            Dialect::Sqlite.cast_expr("\"c\"", "text"),
+            "CAST(\"c\" AS text)"
+        );
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        for target in ["integer", "real", "text"] {
+            let cast = Dialect::Sqlite.cast_expr(&Dialect::Sqlite.placeholder(1), target);
+            let sql = format!("SELECT typeof({cast})");
+            let storage: String = sqlx::query_scalar(&sql)
+                .bind("42")
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(storage, target, "{sql}");
         }
     }
 
