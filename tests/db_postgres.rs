@@ -1674,6 +1674,13 @@ async fn postgres_a_plan_larger_than_the_display_cap_still_parses() {
     let paths = [
         ("alone", caps, vec![plan.clone()]),
         ("in a transaction", caps, vec![plan.clone(), plan.clone()]),
+        // A script with its own transaction control runs on one held
+        // connection, the plan in the middle of it.
+        (
+            "beside its own BEGIN",
+            caps,
+            vec!["BEGIN".to_string(), plan.clone(), "ROLLBACK".to_string()],
+        ),
         (
             "marked read-only",
             WriteProtection::ReadOnly.apply(caps),
@@ -1686,7 +1693,10 @@ async fn postgres_a_plan_larger_than_the_display_cap_still_parses() {
             .await
             .unwrap_or_else(|e| panic!("{path}: {e:?}"));
         assert_eq!(results.len(), script.len(), "{path}");
-        for result in &results {
+        for (statement, result) in script.iter().zip(&results) {
+            if *statement != plan {
+                continue;
+            }
             let StatementOutcome::Rows(rows) = &result.outcome else {
                 panic!("{path}: {result:?}");
             };
