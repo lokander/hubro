@@ -1453,8 +1453,8 @@ fn submit_server_form(
     } else {
         None
     };
-    // A password pasted inside the URL is used for this connect (and
-    // remembered for the session on success) but never persisted.
+    // A password pasted inside the URL is used for this connect, like a typed
+    // one, but never written into the saved locator.
     let embedded_password = embedded_url_password(*form.use_url.peek(), &form.pasted_url.peek());
     let url = match built {
         Ok(url) => url,
@@ -1489,7 +1489,8 @@ fn submit_server_form(
             entered_password = embedded;
         }
     }
-    let remember_choice = *form.remember.peek();
+    // `None` when the box was not on screen: nobody was asked.
+    let remember_choice = asks_remember(&form.auth_mode.peek()).then(|| *form.remember.peek());
     form_error.set(None);
     // spawn_forever: closing the modal (X or Escape) unmounts the form, and a
     // scope-tied `spawn` would be cancelled at its next await — abandoning the
@@ -1520,7 +1521,7 @@ fn submit_server_form(
         // prompt would otherwise be redeemed against this passphrase.
         if let Some(passphrase) = &entered_passphrase {
             state.stash_ssh_passphrase(&url, passphrase.clone());
-            state.set_ssh_remember(&url, form_ssh_remember(remember_choice, &auth));
+            state.set_ssh_remember(&url, remember_choice);
         }
         if matches!(auth, ServerAuth::Entra(_)) {
             // Entra: the connect either succeeds silently (and the flow saves
@@ -1571,7 +1572,7 @@ fn submit_server_form(
                     url.clone(),
                     display_name.clone(),
                     entered_password,
-                    Some(remember_choice),
+                    remember_choice,
                     tunnel.clone(),
                 )
                 .await;
@@ -1585,17 +1586,17 @@ fn submit_server_form(
     });
 }
 
-/// The "remember" answer the connection form parks for a passphrase typed
-/// into it. The form has one box, and it is shown only for password auth, so
-/// under Entra the user has seen no question: that is a "no", never the
-/// hidden box's default "yes".
-fn form_ssh_remember(remember: bool, auth: &ServerAuth) -> bool {
-    remember && matches!(auth, ServerAuth::Password)
+/// Whether the connection form shows its "remember" box for `auth_mode`.
+/// The box is rendered on this and its answer read on this, so a hidden box —
+/// which keeps its default tick — is never taken for an answer.
+fn asks_remember(auth_mode: &str) -> bool {
+    auth_mode == "password"
 }
 
 /// The password pasted inside a URL, when the form is in paste mode. Used for
-/// that connect (and remembered for the session on success) but never
-/// persisted — the saved locator is the password-free normalization.
+/// that connect exactly as a typed one — the "remember" box decides the
+/// keyring — but never written into the saved locator, which is the
+/// password-free normalization.
 fn embedded_url_password(use_url: bool, pasted: &str) -> Option<String> {
     if !use_url {
         return None;
@@ -1805,7 +1806,7 @@ fn PostgresForm(
                 }
                 // Only meaningful for password auth — Entra caches its refresh
                 // token in the keyring regardless.
-                if auth_mode() == "password" {
+                if asks_remember(&auth_mode()) {
                     label { class: "flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
                         input {
                             r#type: "checkbox",
@@ -2051,7 +2052,7 @@ fn SqlServerForm(
                 }
                 // Only meaningful for password auth — Entra caches its refresh
                 // token in the keyring regardless.
-                if auth_mode() == "password" {
+                if asks_remember(&auth_mode()) {
                     label { class: "flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
                         input {
                             r#type: "checkbox",
@@ -2192,6 +2193,7 @@ mod tests {
         );
         // ...and hands it on as an answer. `None` means "nobody was asked",
         // which leaves a stale stored password in place whatever the box said.
+        // (The card always renders its box, so it always has an answer.)
         assert!(
             body.contains("Some(remember_choice),"),
             "the card no longer hands the database password its answer: {body}"
@@ -2211,15 +2213,30 @@ mod tests {
     }
 
     #[test]
-    fn the_form_parks_its_box_for_the_passphrase_only_where_it_shows_it() {
-        // The form's one "remember" box is rendered only for password auth.
-        // Under Entra it is hidden but keeps its default tick, so reading it
-        // there would store a passphrase the user was never asked about.
-        let entra = ServerAuth::Entra(crate::azure::EntraAuth::ManagedIdentity { client_id: None });
-        assert!(form_ssh_remember(true, &ServerAuth::Password));
-        assert!(!form_ssh_remember(false, &ServerAuth::Password));
-        assert!(!form_ssh_remember(true, &entra));
-        assert!(!form_ssh_remember(false, &entra));
+    fn the_form_asks_to_remember_exactly_where_the_password_route_runs() {
+        // The box is hidden under Entra but keeps its default tick, so its
+        // value is an answer only where it is shown. The password route —
+        // the one that hands the answer on — runs for whatever
+        // `auth_from_form` maps to `Password`, so the two must agree for
+        // every mode the selector offers.
+        let source = include_str!("connections.rs");
+        // The selector's option values, read off its `select`.
+        let modes: Vec<&str> = source
+            .lines()
+            .skip_while(|line| line.trim() != "fn AuthModeFields(")
+            .take_while(|line| !line.trim_start().starts_with("if auth_mode()"))
+            .filter_map(|line| line.split_once("value: \"").map(|(_, rest)| rest))
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        assert_eq!(modes, ["password", "entra-interactive", "entra-mi"]);
+        for mode in modes {
+            assert_eq!(
+                asks_remember(mode),
+                matches!(auth_from_form(mode, "tenant", ""), Ok(ServerAuth::Password)),
+                "{mode}: the box's visibility and the password route disagree"
+            );
+        }
+        assert!(!asks_remember("entra-mi"));
     }
 
     #[test]

@@ -35,9 +35,10 @@ pub enum DbError {
     /// [`DbError::Transient`].
     ///
     /// This is the one connect failure that may cost a stored secret: the
-    /// connect flow reads it as "the remembered password has gone stale",
-    /// deletes that password from the keyring and asks for a new one. So
-    /// every other code the server can refuse a login with stays a
+    /// connect flow reads it as "the remembered password may have gone
+    /// stale", drops it from session memory and asks for a new one — and a
+    /// *different* password connecting through that prompt replaces or, left
+    /// unticked, deletes the stored one. So every other code the server can refuse a login with stays a
     /// [`DbError::Connect`], including failures whose text mentions a failed
     /// login.
     ///
@@ -50,16 +51,19 @@ pub enum DbError {
     /// passed, which `auth_failed` reports as a wrong password. SQL
     /// authentication switched off on the server, and a pooler such as
     /// pgbouncer refusing on the server's behalf, are expected to look the
-    /// same but were not measured. These are known residuals of deciding on
-    /// the wire, where they cannot be told apart from a wrong password.
+    /// same but were not measured. They cannot be told apart from a wrong
+    /// password on the wire, which is why a refusal alone never deletes the
+    /// stored password: these cases cost a needless prompt, and the stored
+    /// password survives unless a different one connects.
     ///
     /// SQL Server's error 4060 ("Cannot open database … requested by the
     /// login. The login failed.") is the case that made this a variant:
     /// it is sent for a database that does not exist, is offline or
     /// restoring, or that this login may not open — measured, all four — and
     /// only *after* the password was accepted. A wrong password together with
-    /// any of those is 18456. Deleting the password there destroys a working
-    /// credential and then asks for one that cannot help.
+    /// any of those is 18456. Prompting there asks for a password that cannot
+    /// help, and when this flow still deleted on a refusal it destroyed a
+    /// working credential too.
     ///
     /// Displays exactly as [`DbError::Connect`] does: what the user reads is
     /// not the decision, and the message carries the classifier's own words.

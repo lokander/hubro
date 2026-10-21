@@ -14,13 +14,24 @@ use super::*;
 /// missing secret, or a keyring that refuses, just means nothing to carry.
 /// An existing secret under `new` is left alone — it came from the connect
 /// that just succeeded and is therefore the more current one.
-async fn migrate_secret(old: String, new: String) {
+///
+/// `validated` is what session memory holds under `new`: the secret the
+/// connect confirming this edit just used. When it differs from the stored
+/// one, the stored one is stale, and the connect has already decided the
+/// keyring under `new` ([`stored_password_after_connect`]) — so nothing is
+/// carried, and the old copy goes. Carrying it would put back the password a
+/// "different password, unticked" connect had just declined to keep.
+async fn migrate_secret(old: String, new: String, validated: Option<String>) {
     if old == new {
         return;
     }
     let Ok(Some(secret)) = crate::secrets::get_password_async(old.clone()).await else {
         return;
     };
+    if validated.is_some_and(|validated| validated != secret) {
+        let _ = crate::secrets::delete_password_async(old).await;
+        return;
+    }
     match crate::secrets::get_password_async(new.clone()).await {
         // Nothing under the new key yet: carry the secret across, and only
         // drop the old copy once the new one is safely written — deleting
@@ -90,7 +101,8 @@ pub(super) fn forget_failed_ssh_passphrase(
 
 /// Records the user's "remember this passphrase" answer for `url` — ticked or
 /// cleared — to be redeemed by [`redeem_ssh_remember`] once a tunnel open
-/// accepts it.
+/// accepts it. `None` means nobody was asked (the connection form hides its
+/// box under Entra): any earlier answer is withdrawn and none recorded.
 ///
 /// Withdrawing matters as much as parking: the intent is keyed by locator and
 /// outlives the attempt that parked it whenever that attempt *pauses* — on a
@@ -109,9 +121,17 @@ pub(super) fn forget_failed_ssh_passphrase(
 /// without parking anything and store it itself once the connection opened,
 /// so an answer parked by an earlier, abandoned prompt was still waiting: the
 /// tunnel open redeemed it and stored the form's passphrase although its box
-/// was unticked.
-pub(super) fn park_ssh_remember(pending: &mut HashMap<String, bool>, url: &str, remember: bool) {
-    pending.insert(url.to_string(), remember);
+/// was unticked. Withdrawing on `None` closes that for a hidden box as well,
+/// without recording a "no" the user never gave.
+pub(super) fn park_ssh_remember(
+    pending: &mut HashMap<String, bool>,
+    url: &str,
+    remember: Option<bool>,
+) {
+    match remember {
+        Some(remember) => pending.insert(url.to_string(), remember),
+        None => pending.remove(url),
+    };
 }
 
 /// Withdraws the parked choice for a passphrase a tunnel open rejected, and
@@ -297,10 +317,11 @@ pub(super) fn password_retry(err: &DbError, had_password: bool) -> Option<Passwo
 
 /// The credential a saved connection offers from memory, and whether that is a
 /// remembered password — derived from the credential itself, so the two cannot
-/// disagree. [`password_retry`] deletes the stored password on the strength of
-/// the flag, so a flag that said "remembered" while the open sent nothing
-/// would delete every stored password on its first use: the server refuses
-/// the empty login, and the refusal is pinned on the password.
+/// disagree. [`password_retry`] reads a refusal as the remembered password
+/// failing on the strength of the flag, so a flag that said "remembered"
+/// while the open sent nothing would prompt on every first use — the server
+/// refuses the empty login, and the refusal is pinned on the password — and
+/// an unticked answer to that prompt deletes the stored one.
 fn remembered_credential(remembered: Option<&str>) -> (ServerCredential<'_>, bool) {
     let credential = match remembered {
         Some(password) => ServerCredential::Password(password),
@@ -894,12 +915,19 @@ impl AppState {
                 &old_locator,
                 &new_locator,
             );
+            // Read after the carry: what the confirming connect validated, or
+            // the old session copy moved across when it validated nothing.
+            let moves: Vec<_> = secret_keys(&old_locator)
+                .into_iter()
+                .zip(secret_keys(&new_locator))
+                .map(|(old, new)| {
+                    let validated = self.session_passwords.peek().get(&new).cloned();
+                    (old, new, validated)
+                })
+                .collect();
             spawn_forever(async move {
-                for (old, new) in secret_keys(&old_locator)
-                    .into_iter()
-                    .zip(secret_keys(&new_locator))
-                {
-                    migrate_secret(old, new).await;
+                for (old, new, validated) in moves {
+                    migrate_secret(old, new, validated).await;
                 }
             });
         }
@@ -1343,12 +1371,17 @@ impl AppState {
             )
             .await;
         if result.is_ok() {
-            // An unreadable keyring reads as nothing stored, so it never
-            // licenses a delete.
-            let in_keyring = crate::secrets::get_password_async(url.clone())
-                .await
-                .ok()
-                .flatten();
+            // Only an unticked answer consults what is stored, so only it reads
+            // the keyring: a locked wallet can raise an unlock dialog. An
+            // unreadable keyring reads as nothing stored, so it never licenses
+            // a delete.
+            let in_keyring = match remember {
+                Some(false) => crate::secrets::get_password_async(url.clone())
+                    .await
+                    .ok()
+                    .flatten(),
+                _ => None,
+            };
             match stored_password_after_connect(remember, in_keyring.as_deref(), &password) {
                 StoredPassword::Store => {
                     // Off-thread; surface a non-fatal notice when the user
@@ -1364,7 +1397,14 @@ impl AppState {
                     }
                 }
                 StoredPassword::Delete => {
-                    let _ = crate::secrets::delete_password_async(url.clone()).await;
+                    let delete = crate::secrets::delete_password_async(url.clone()).await;
+                    if delete.is_err() {
+                        self.connect_error.set(Some(
+                            "connected, but the previous password could not be removed from \
+                             the system keyring"
+                                .to_string(),
+                        ));
+                    }
                 }
                 StoredPassword::Keep => {}
             }
@@ -1420,7 +1460,7 @@ impl AppState {
         //
         // Set *or cleared*, so an unticked box on a later attempt is not
         // ignored because an earlier one ticked it.
-        self.set_ssh_remember(&url, remember);
+        self.set_ssh_remember(&url, Some(remember));
         self.password_prompt.set(None);
         self.connect_server(
             ServerBackend::of(backend),
@@ -1435,7 +1475,7 @@ impl AppState {
     /// Records — or withdraws — the user's "remember this SSH passphrase"
     /// choice for `url`, pending a tunnel open that accepts it. The policy
     /// itself is [`park_ssh_remember`], where a test can execute it.
-    pub fn set_ssh_remember(mut self, url: &str, remember: bool) {
+    pub fn set_ssh_remember(mut self, url: &str, remember: Option<bool>) {
         park_ssh_remember(&mut self.ssh_remember.write(), url, remember);
     }
 
@@ -2213,7 +2253,7 @@ mod tests {
         // gating it on the *connection* being open drops the choice again.
         let body = ssh_passphrase_body();
         assert!(
-            body.contains("set_ssh_remember(&url, remember)"),
+            body.contains("set_ssh_remember(&url, Some(remember))"),
             "the remember choice is dropped, or parked as something other than \
              what the user actually chose: {body}"
         );
@@ -2438,8 +2478,8 @@ mod tests {
             ("the card", method_body(card, "fn PasswordPromptCard(")),
             ("the form's submit", form.clone()),
             (
-                "the form's answer",
-                method_body(card, "fn form_ssh_remember("),
+                "the form's question",
+                method_body(card, "fn asks_remember("),
             ),
             (
                 "the prompt's completion",
@@ -2482,13 +2522,13 @@ mod tests {
                  other than its policy: {code}"
             );
         }
-        // The form parks what its box says — unless the box was hidden — and
-        // hands the database password the same answer.
+        // The form reads its box only when it showed it — `None` otherwise —
+        // and hands that one answer to both the passphrase and the password.
         let form = collapsed(&code_of(&form));
         for binding in [
-            "let remember_choice = *form.remember.peek();",
-            "state.set_ssh_remember(&url, form_ssh_remember(remember_choice, &auth));",
-            "entered_password, Some(remember_choice), tunnel.clone(),",
+            "let remember_choice = asks_remember(&form.auth_mode.peek()).then(|| *form.remember.peek());",
+            "state.set_ssh_remember(&url, remember_choice);",
+            "entered_password, remember_choice, tunnel.clone(),",
         ] {
             assert!(
                 form.contains(binding),
@@ -2527,7 +2567,7 @@ mod tests {
         let mut pending = HashMap::new();
 
         // Ticked, then accepted from a passphrase just typed: stored.
-        park_ssh_remember(&mut pending, url, true);
+        park_ssh_remember(&mut pending, url, Some(true));
         assert!(redeem_ssh_remember(
             &mut pending,
             url,
@@ -2535,7 +2575,7 @@ mod tests {
         ));
 
         // Unticked: never stored, however the passphrase was accepted.
-        park_ssh_remember(&mut pending, url, false);
+        park_ssh_remember(&mut pending, url, Some(false));
         assert!(!redeem_ssh_remember(
             &mut pending,
             url,
@@ -2544,8 +2584,8 @@ mod tests {
 
         // An earlier tick must not survive a later untick — the intent is
         // keyed by locator and outlives the attempt that made it.
-        park_ssh_remember(&mut pending, url, true);
-        park_ssh_remember(&mut pending, url, false);
+        park_ssh_remember(&mut pending, url, Some(true));
+        park_ssh_remember(&mut pending, url, Some(false));
         assert!(!redeem_ssh_remember(
             &mut pending,
             url,
@@ -2558,6 +2598,22 @@ mod tests {
             url,
             Some(PassphraseSource::Session)
         ));
+
+        // Nobody asked (the form's box hidden): an earlier tick is withdrawn,
+        // so it cannot store this passphrase — and no "no" is recorded in its
+        // place, so a re-prompt is a first prompt and offers the box ticked.
+        park_ssh_remember(&mut pending, url, Some(true));
+        park_ssh_remember(&mut pending, url, None);
+        assert!(
+            !redeem_ssh_remember(&mut pending, url, Some(PassphraseSource::Session)),
+            "an answer left by an earlier attempt survived an unasked one"
+        );
+        park_ssh_remember(&mut pending, url, Some(false));
+        park_ssh_remember(&mut pending, url, None);
+        assert!(
+            withdraw_ssh_remember(&mut pending, url),
+            "an unasked answer was recorded as a no"
+        );
     }
 
     #[test]
@@ -2566,7 +2622,7 @@ mod tests {
 
         // One tick, one write: the next acceptance must not store again.
         let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, url, true);
+        park_ssh_remember(&mut pending, url, Some(true));
         assert!(redeem_ssh_remember(
             &mut pending,
             url,
@@ -2582,7 +2638,7 @@ mod tests {
         // re-written — but the intent is still consumed, so it cannot lie in
         // wait for an unrelated later attempt.
         let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, url, true);
+        park_ssh_remember(&mut pending, url, Some(true));
         assert!(!redeem_ssh_remember(
             &mut pending,
             url,
@@ -2596,14 +2652,14 @@ mod tests {
         // No passphrase at all (agent auth, or an unencrypted key) stores
         // nothing and leaves nothing behind either.
         let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, url, true);
+        park_ssh_remember(&mut pending, url, Some(true));
         assert!(!redeem_ssh_remember(&mut pending, url, None));
         assert!(pending.is_empty());
 
         // Other locators are untouched throughout.
         let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, url, true);
-        park_ssh_remember(&mut pending, "postgres://u@other:5432/db", true);
+        park_ssh_remember(&mut pending, url, Some(true));
+        park_ssh_remember(&mut pending, "postgres://u@other:5432/db", Some(true));
         assert!(redeem_ssh_remember(
             &mut pending,
             url,
@@ -2767,7 +2823,7 @@ mod tests {
         const URL: &str = "postgres://u@h:5432/db";
         let mut session = session_for(URL);
         let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, URL, true);
+        park_ssh_remember(&mut pending, URL, Some(true));
 
         forget_connection_secrets(&mut session, &mut pending, URL);
 
@@ -2781,7 +2837,7 @@ mod tests {
         // is user-visible: a recreated connection has never been asked, so its
         // first prompt must come up ticked.
         let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, URL, true);
+        park_ssh_remember(&mut pending, URL, Some(true));
         forget_connection_secrets(&mut session_for(URL), &mut pending, URL);
         assert!(
             withdraw_ssh_remember(&mut pending, URL),
@@ -2792,7 +2848,7 @@ mod tests {
 
         let mut session = session_for(URL);
         let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, URL, true);
+        park_ssh_remember(&mut pending, URL, Some(true));
         forget_connection_secrets(&mut session, &mut pending, URL);
         for key in secret_keys(URL) {
             assert!(
@@ -2805,7 +2861,7 @@ mod tests {
         const OTHER: &str = "postgres://u@other:5432/db";
         let mut session = session_for(OTHER);
         let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, OTHER, true);
+        park_ssh_remember(&mut pending, OTHER, Some(true));
         forget_connection_secrets(&mut session, &mut pending, URL);
         assert_eq!(session, session_for(OTHER));
         assert!(pending.contains_key(OTHER));
@@ -2881,7 +2937,22 @@ mod tests {
         // locator and the edited connection loses it at the next restart —
         // the very loss re-keying on edit exists to prevent, restored without
         // moving a call.
-        let migration = &update[spawn_at..];
+        // The pairs are built before the spawn (each with what session memory
+        // validated under its new key, read after the carry) and the spawned
+        // task walks exactly those.
+        let moves_at = update
+            .find("let moves")
+            .expect("the migration's key pairs must still be built");
+        assert!(
+            carry_at < moves_at && moves_at < spawn_at,
+            "the migration's pairs are read before the session carry, or inside \
+             the spawn: {update}"
+        );
+        assert!(
+            update[spawn_at..].contains("in moves {"),
+            "the spawned migration walks something other than the pairs: {update}"
+        );
+        let migration = &update[moves_at..];
         let from = migration
             .find("secret_keys(&old_locator)")
             .expect("the migration must read the old locator's keys");
@@ -2962,7 +3033,7 @@ mod tests {
 
         // Unticked, typed, rejected: the re-prompt still offers unticked.
         let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, URL, false);
+        park_ssh_remember(&mut pending, URL, Some(false));
         assert!(
             !withdraw_ssh_remember(&mut pending, URL),
             "a mistyped passphrase re-ticked a box the user had cleared"
@@ -2971,7 +3042,7 @@ mod tests {
         // Ticked, typed, rejected: still ticked, and the intent is withdrawn
         // either way — it was made about the passphrase that just failed.
         let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, URL, true);
+        park_ssh_remember(&mut pending, URL, Some(true));
         assert!(withdraw_ssh_remember(&mut pending, URL));
         assert!(
             !redeem_ssh_remember(&mut pending, URL, Some(PassphraseSource::Session)),
@@ -2980,8 +3051,8 @@ mod tests {
         );
 
         // Never asked at all: a passphrase read back from the keyring, or one
-        // typed into the connection form — which stashes it in session memory
-        // without parking a choice. Both must offer the default, and "no
+        // typed into the connection form while its box was hidden — which
+        // parks no answer. Both must offer the default, and "no
         // answer" is only distinguishable from "answered no" because the
         // answer itself is stored. While this was a `HashSet` the two were the
         // same state, which silently unticked the form user's re-prompt.
@@ -2990,7 +3061,7 @@ mod tests {
             withdraw_ssh_remember(&mut pending, URL),
             "a first prompt for this connection came up unticked"
         );
-        park_ssh_remember(&mut pending, "postgres://u@other:5432/db", false);
+        park_ssh_remember(&mut pending, "postgres://u@other:5432/db", Some(false));
         assert!(
             withdraw_ssh_remember(&mut pending, URL),
             "another connection's declined choice decided this prompt"
@@ -2998,7 +3069,7 @@ mod tests {
 
         // Another connection's parked choice is not withdrawn with it.
         let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, "postgres://u@other:5432/db", true);
+        park_ssh_remember(&mut pending, "postgres://u@other:5432/db", Some(true));
         let _ = withdraw_ssh_remember(&mut pending, URL);
         assert_eq!(pending.len(), 1);
     }
@@ -3500,6 +3571,30 @@ mod tests {
         lines[..end].join("\n")
     }
 
+    /// `code` with the contents of every `"…"` literal removed (escapes
+    /// honoured), so counting identifiers does not count words in messages.
+    fn without_string_literals(code: &str) -> String {
+        let mut out = String::new();
+        let (mut in_string, mut escaped) = (false, false);
+        for ch in code.chars() {
+            if in_string {
+                match (escaped, ch) {
+                    (true, _) => escaped = false,
+                    (false, '\\') => escaped = true,
+                    (false, '"') => {
+                        in_string = false;
+                        out.push(ch);
+                    }
+                    _ => {}
+                }
+            } else {
+                in_string = ch == '"';
+                out.push(ch);
+            }
+        }
+        out
+    }
+
     /// How often `ident` occurs in `code` as a whole identifier — `retry` in
     /// `Some(retry)`, not in `password_retry`.
     fn ident_count(code: &str, ident: &str) -> usize {
@@ -3879,12 +3974,14 @@ mod tests {
         let success = method_body(&with_password, "if result.is_ok() {");
         let mut from = 0;
         for step in [
-            "let in_keyring = crate::secrets::get_password_async(url.clone()) .await .ok() .flatten();",
+            "let in_keyring = match remember { \
+             Some(false) => crate::secrets::get_password_async(url.clone()) .await .ok() .flatten(), \
+             _ => None, };",
             "match stored_password_after_connect(remember, in_keyring.as_deref(), &password) {",
             "StoredPassword::Store => {",
             "crate::secrets::store_password_async(url.clone(), password.clone()).await;",
             "StoredPassword::Delete => { \
-             let _ = crate::secrets::delete_password_async(url.clone()).await; }",
+             let delete = crate::secrets::delete_password_async(url.clone()).await;",
             "StoredPassword::Keep => {}",
             "self.session_passwords.write().insert(url.clone(), password);",
         ] {
@@ -3912,10 +4009,11 @@ mod tests {
             "connect_server_with_password rebinds `url` or `remember`, so the \
              keyring may be decided on another answer or written under another key"
         );
-        // `password` counts the word in the store-failure notice too.
-        for (ident, uses) in [("in_keyring", 2), ("password", 6), ("remember", 2)] {
+        // String literals out, so the notices' prose is not counted as code.
+        let without_strings = without_string_literals(&with_password);
+        for (ident, uses) in [("in_keyring", 2), ("password", 5), ("remember", 3)] {
             assert_eq!(
-                ident_count(&with_password, ident),
+                ident_count(&without_strings, ident),
                 uses,
                 "`{ident}` is bound or used somewhere new in \
                  connect_server_with_password. If the new use is deliberate and does \
@@ -4219,6 +4317,93 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+    }
+
+    #[allow(clippy::await_holding_lock)] // see the Postgres test above
+    #[tokio::test]
+    async fn an_edit_never_carries_a_password_a_different_one_replaced() {
+        // An edit that moves the locator migrates the keyring *after* the
+        // connect that confirmed it has decided the new locator's entry. Had
+        // the migration copied the old password across regardless, a
+        // different password connecting unticked would leave the keyring
+        // exactly as stale as before — under the new locator.
+        use dioxus::core::{NoOpMutations, VirtualDom};
+
+        use crate::ui::test_dom::provide_state;
+
+        let _keyring = crate::secrets::tests::mock_keyring();
+        fn empty() -> Element {
+            rsx! {}
+        }
+        let mut dom = VirtualDom::new(empty);
+        let state = provide_state(&dom);
+        dom.rebuild_in_place();
+        // `connected` is what the confirming connect left in session memory
+        // under the new locator; `None` when it validated no password.
+        let edit = |dom: &mut VirtualDom, old: &str, new: &str, connected: Option<&str>| {
+            crate::secrets::store_password(old, "old-password").unwrap();
+            let (old, new) = (old.to_string(), new.to_string());
+            let connected = connected.map(str::to_string);
+            dom.in_runtime(|| {
+                if let Some(password) = connected {
+                    let mut session = state.session_passwords;
+                    session.write().insert(new.clone(), password);
+                }
+                let connection =
+                    ServerBackend::POSTGRES.saved("edited", &new, None, ServerAuth::Password);
+                state.update_saved(old, connection);
+            });
+        };
+        // The migration is spawned and always ends by deleting the old copy.
+        async fn settle(dom: &mut VirtualDom, old: &str) {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while crate::secrets::get_password(old).unwrap().is_some() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the migration never ran"
+                );
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(20), dom.wait_for_work())
+                        .await;
+                dom.render_immediate(&mut NoOpMutations);
+            }
+        }
+
+        // A different password connected (unticked, so nothing was stored
+        // under the new locator): the old one is stale and is not carried.
+        const OLD: &str = "postgres://u@edit-old:5432/a";
+        const NEW: &str = "postgres://u@edit-new:5432/a";
+        edit(&mut dom, OLD, NEW, Some("different-password"));
+        settle(&mut dom, OLD).await;
+        assert_eq!(
+            crate::secrets::get_password(NEW).unwrap(),
+            None,
+            "the edit carried the old password over the one that replaced it"
+        );
+
+        // The same password connected — "leave it empty to keep the existing
+        // one" — or none was validated: it moves with the edit as before.
+        for (from, to, connected) in [
+            (
+                "postgres://u@same-old:5432/a",
+                "postgres://u@same-new:5432/a",
+                Some("old-password"),
+            ),
+            (
+                "postgres://u@none-old:5432/a",
+                "postgres://u@none-new:5432/a",
+                None,
+            ),
+        ] {
+            edit(&mut dom, from, to, connected);
+            settle(&mut dom, from).await;
+            assert_eq!(
+                crate::secrets::get_password(to).unwrap().as_deref(),
+                Some("old-password"),
+                "{to}: the edit lost a password nothing had replaced"
+            );
+            crate::secrets::delete_password(to).unwrap();
+        }
     }
 
     #[tokio::test]

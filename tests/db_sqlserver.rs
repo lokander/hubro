@@ -172,8 +172,9 @@ async fn connect_failure(url: &str) -> Option<DbError> {
 
 #[tokio::test]
 async fn sqlserver_only_a_refused_password_is_a_credential_rejection() {
-    // A rejection deletes the stored password, so each failure here that
-    // still has a correct password must stay a plain Connect. SQL Server
+    // A rejection prompts for a new password, whose answer can replace or
+    // delete the stored one, so each failure here that still has a correct
+    // password must stay a plain Connect. SQL Server
     // answers all of the database cases with error 4060, whose message ends
     // "The login failed." — the text that once classified them as a wrong
     // password.
