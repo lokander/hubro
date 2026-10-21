@@ -851,6 +851,105 @@ async fn cockroach_real_keys_are_re_addressed_by_their_shortest_spelling() {
     pool.close().await;
 }
 
+/// Cockroach sends `DECIMAL`, dates and times in Postgres's binary encoding,
+/// so the values wider than the Rust types sqlx decodes those into broke here
+/// exactly as on PostgreSQL: a `1e30` panicked the page fetch (and with it
+/// the app), `0001-01-01 BC` read as `0000-01-01` and `24:00:00` as
+/// `00:00:00`. They now read as the server's own values and address their
+/// rows again.
+///
+/// One difference from PostgreSQL: Cockroach prints a decimal in exponent
+/// form (`1E+30`, `1E-31`), where the grid shows every digit. The same value
+/// — which the round trip below is what proves.
+#[tokio::test]
+async fn cockroach_values_past_the_rust_types_read_and_address_their_rows() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let shown = [
+        ("1e30::decimal", "1000000000000000000000000000000"),
+        (
+            "0.0000000000000000000000000000001::decimal",
+            "0.0000000000000000000000000000001",
+        ),
+        ("'NaN'::decimal", "NaN"),
+        ("1.5::decimal(10, 2)", "1.50"),
+        (
+            "ARRAY[1e30, 'NaN', NULL]::decimal[]",
+            "{1000000000000000000000000000000,NaN,NULL}",
+        ),
+        ("'0001-01-01 BC'::date", "0001-01-01 BC"),
+        ("'10000-01-01'::date", "10000-01-01"),
+        (
+            "'0044-03-15 12:00:00.5 BC'::timestamp",
+            "0044-03-15 12:00:00.5 BC",
+        ),
+        (
+            "'0001-01-01 00:00:00+00 BC'::timestamptz",
+            "0001-01-01 00:00:00+00:00 BC",
+        ),
+        ("'24:00:00'::time", "24:00:00"),
+        ("'24:00:00+02'::timetz", "24:00:00+02:00"),
+    ];
+    let select: Vec<&str> = shown.iter().map(|(expr, _)| *expr).collect();
+    let result = pool
+        .query(&format!("SELECT {}", select.join(", ")))
+        .await
+        .unwrap();
+    for (n, (expr, text)) in shown.iter().enumerate() {
+        assert_eq!(result.rows[0][n], Value::Text((*text).into()), "{expr}");
+    }
+
+    let keys: &[(&str, &str, &[&str])] = &[
+        (
+            "decimal",
+            "decimal",
+            &[
+                "1e30",
+                "123456789012345678901234567890.123456789",
+                "0.0000000000000000000000000000001",
+                "'NaN'",
+            ],
+        ),
+        (
+            "date",
+            "date",
+            &["'0001-01-01 BC'", "'10000-01-01'", "'infinity'"],
+        ),
+        ("ts", "timestamp", &["'0044-03-15 12:00:00.5 BC'"]),
+        ("tstz", "timestamptz", &["'0001-01-01 00:00:00+00 BC'"]),
+        ("time", "time", &["'24:00:00'", "'00:00:00'"]),
+        (
+            "timetz",
+            "timetz",
+            &["'24:00:00-03:30'", "'00:00:00-03:30'"],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (slug, type_name, literals) in keys {
+        let table = format!("wide_key_{slug}");
+        pool.query(&format!("DROP TABLE IF EXISTS {table}"))
+            .await
+            .unwrap();
+        pool.query(&format!(
+            "CREATE TABLE {table} (k {type_name} PRIMARY KEY, body text, tag text)"
+        ))
+        .await
+        .unwrap();
+        let rows: Vec<String> = literals
+            .iter()
+            .enumerate()
+            .map(|(n, lit)| format!("({lit}, '{n}:' || repeat('x', 5000), 't')"))
+            .collect();
+        pool.query(&format!("INSERT INTO {table} VALUES {}", rows.join(", ")))
+            .await
+            .unwrap_or_else(|e| panic!("{slug}: {e}"));
+        let tables = pool.introspect().await.unwrap();
+        failures.extend(common::row_addressing_failures(&pool, find(&tables, &table)).await);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    pool.close().await;
+}
+
 /// Each pooled connection's transaction status as CockroachDB reports it —
 /// `NoTxn` outside one — from four reads at once, slow enough that each
 /// needs a connection of its own. A connection inside an aborted transaction
