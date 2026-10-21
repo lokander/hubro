@@ -562,8 +562,9 @@ async fn connect_failure(url: &str) -> Option<DbError> {
 
 #[tokio::test]
 async fn postgres_only_a_refused_password_is_a_credential_rejection() {
-    // A rejection deletes the stored password, so each failure here that
-    // still has a correct password must stay a plain Connect.
+    // A rejection prompts for a new password, whose answer can replace or
+    // delete the stored one, so each failure here that still has a correct
+    // password must stay a plain Connect.
     let Some(url) = test_url().await else { return };
     let admin = DbPool::open_postgres(&url).await.unwrap();
     let database: String = url::Url::parse(&url).unwrap().path()[1..].to_string();

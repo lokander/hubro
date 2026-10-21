@@ -2641,8 +2641,9 @@ mod tests {
 
     #[test]
     fn only_invalid_password_rejects_the_credentials() {
-        // The connect flow deletes the stored password on CredentialsRejected,
-        // so the variant is a promise that the *password* was refused. The
+        // The connect flow prompts for a new password on CredentialsRejected,
+        // and an unticked different answer deletes the stored one, so the
+        // variant is a promise that the *password* was refused. The
         // SQLSTATEs below were measured against PostgreSQL 17, except where
         // a row says otherwise.
         let rejected = |code| connect_error_from(code, "m".into()).credentials_rejected();

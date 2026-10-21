@@ -567,8 +567,8 @@ async fn connect_once(config: Config, addr: &(String, u16)) -> Result<TdsClient,
 /// user '…'", 18456's text (sqlcmd prints both against SQL Server 2022). tiberius
 /// 0.13 keeps the first — `TokenStream::flush_done`, `tds/stream/token.rs`
 /// lines 197-199 — so `Error::code()` is 4060. A tiberius that kept the last
-/// token instead would make every such failure an 18456 and put the deletion
-/// back, with only the engine suite (`tests/db_sqlserver.rs`, not run by CI)
+/// token instead would make every such failure an 18456 and put the needless
+/// prompt back, with only the engine suite (`tests/db_sqlserver.rs`, not run by CI)
 /// to notice.
 const LOGIN_FAILED: u32 = 18456;
 
@@ -587,9 +587,10 @@ fn connect_error(err: &TdsError) -> DbError {
 /// tiberius `TokenError` cannot be built outside tiberius).
 ///
 /// Decided on the server's error code and nothing else: the connect flow
-/// deletes the stored password on [`DbError::CredentialsRejected`], and text
-/// is shared between codes — 4060's own message ends in "The login failed.",
-/// which is how a missing database used to delete a working password. Only
+/// prompts for a new password on [`DbError::CredentialsRejected`] (whose
+/// answer can replace or delete the stored one), and text is shared between
+/// codes — 4060's own message ends in "The login failed.", which is how a
+/// missing database used to delete a working password. Only
 /// 18456 — the server's wrong-credentials code, not a guarantee the password
 /// was wrong (see [`LOGIN_FAILED`]) — qualifies. Other codes in that family —
 /// a disabled account (18470, measured) — refuse a password that is still
@@ -1569,8 +1570,9 @@ mod tests {
 
     #[test]
     fn only_login_failed_rejects_the_credentials() {
-        // The connect flow deletes the stored password on CredentialsRejected,
-        // so the variant is a promise that the *password* was refused. Every
+        // The connect flow prompts for a new password on CredentialsRejected,
+        // and an unticked different answer deletes the stored one, so the
+        // variant is a promise that the *password* was refused. Every
         // code below was measured against SQL Server 2022.
         let rejected = |code| connect_error_from(code, "m".into()).credentials_rejected();
         assert!(
