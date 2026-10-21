@@ -213,7 +213,7 @@ async fn sqlite_a_dropped_index_is_missing_rather_than_a_constraint_index() {
 }
 
 #[tokio::test]
-async fn sqlite_statements_ending_in_a_line_comment_stay_runnable() {
+async fn sqlite_statements_ending_in_a_comment_stay_runnable() {
     // `sqlite_master` stores the statement exactly as written, comment and
     // all. Appending `;` to a trailing `--` line comments the terminator out,
     // and the indexes then arrive as one unparseable statement.
@@ -224,16 +224,23 @@ async fn sqlite_statements_ending_in_a_line_comment_stay_runnable() {
     // rule, not another engine's: a bare `\r` ends one on Postgres and SQL
     // Server but not here, so `ix4`'s comment runs to the end.
     //
-    // SQLite keeps a trailing comment only when a `;` follows it on a later
-    // line — at the very end of the input it stores the text up to the last
-    // token — so each statement here is written that way.
+    // A block comment left open at the end of input is no error to SQLite,
+    // which stores it with the index (`ix0`); no line break ends it, so it
+    // swallows every statement after it unless it is closed — and silently,
+    // since the rest of the text is then a comment SQLite accepts. It has to
+    // be the last statement of the setup for the same reason. A closed one
+    // (`ix5`) must be left alone: a second `*/` after it is a syntax error.
+    //
+    // A plain `CREATE TABLE` is stored only up to its `)`, so the table is
+    // `STRICT`: then SQLite stores its trailing comment too.
     let fixture = FixtureDb::with_sql(
-        "CREATE TABLE t ( -- columns\n a INTEGER, b INTEGER) -- trailing\n;\n\
+        "CREATE TABLE t ( -- columns\n a INTEGER, b INTEGER) STRICT -- trailing\n;\n\
          CREATE INDEX ix1 ON t(a) -- first\n;\n\
          CREATE INDEX ix2 ON t(a, b) -- by date\n  WHERE b IS NOT NULL -- partial\n;\n\
          CREATE INDEX ix3 ON t(b, a) -- note;\n;\n\
          CREATE INDEX ix4 ON t(b, a) -- not partial\rWHERE a > 0\n;\n\
-         CREATE INDEX ix5 ON t(b) -- last\n;",
+         CREATE INDEX ix5 ON t(b) /* closed */\n;\n\
+         CREATE INDEX ix0 ON t(a, b) /* unclosed",
     )
     .await;
     let pool = fixture.open().await;
@@ -242,7 +249,19 @@ async fn sqlite_statements_ending_in_a_line_comment_stay_runnable() {
         .fetch_ddl(table(&tables, None, "t"), &DdlObject::Object)
         .await
         .unwrap();
-    assert!(ddl.sql.contains("-- first\n;"), "{}", ddl.sql);
+    // The fixture text survives into the DDL, so each case is really there.
+    for kept in [
+        "STRICT -- trailing\n;",
+        "-- first\n;",
+        "/* closed */;",
+        "/* unclosed */;",
+    ] {
+        assert!(
+            ddl.sql.contains(kept),
+            "{kept:?} missing from:\n{}",
+            ddl.sql
+        );
+    }
 
     // The real assertion: the emitted text runs, and rebuilds every index.
     let target = FixtureDb::with_sql("").await;
@@ -255,7 +274,7 @@ async fn sqlite_statements_ending_in_a_line_comment_stay_runnable() {
         .map(|i| i.name.as_str())
         .collect();
     names.sort_unstable();
-    assert_eq!(names, ["ix1", "ix2", "ix3", "ix4", "ix5"]);
+    assert_eq!(names, ["ix0", "ix1", "ix2", "ix3", "ix4", "ix5"]);
 }
 
 #[tokio::test]

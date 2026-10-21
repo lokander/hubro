@@ -198,6 +198,10 @@ pub struct IndexExtras {
 /// runnable. Likewise a `;` that ends a comment (`-- note;`) is not a
 /// terminator, and still gets one.
 ///
+/// A block comment still open at the end (`CREATE INDEX … /* note`, which
+/// SQLite accepts and stores) gets closed first, one `*/` per open level:
+/// no line break ends it, so a `;` anywhere after it would be comment too.
+///
 /// Where comments, strings and quoted names start and end is read by the
 /// script lexer for `dialect` — the same reading the script tab splits on
 /// when the text is run back — rather than by a second scanner of its own.
@@ -207,10 +211,10 @@ pub fn terminate(sql: &str, dialect: Dialect) -> String {
         return trimmed.to_string();
     }
     if script::ends_in_line_comment(trimmed, dialect) {
-        format!("{trimmed}\n;")
-    } else {
-        format!("{trimmed};")
+        return format!("{trimmed}\n;");
     }
+    let open = script::open_block_comments_at_end(trimmed, dialect);
+    format!("{trimmed}{};", " */".repeat(open))
 }
 
 /// Wraps a native view body (`pg_get_viewdef`) in the `CREATE VIEW` header
@@ -658,6 +662,53 @@ mod tests {
             lite("CREATE TABLE t (a TEXT DEFAULT 'O''Brien') /* tail */"),
             "CREATE TABLE t (a TEXT DEFAULT 'O''Brien') /* tail */;"
         );
+        // An unclosed block comment is closed before the terminator, which
+        // would otherwise be comment on any line; a `;` inside it is not one.
+        assert_eq!(
+            lite("CREATE INDEX i ON t(a) /* unclosed"),
+            "CREATE INDEX i ON t(a) /* unclosed */;"
+        );
+        assert_eq!(
+            lite("CREATE INDEX i ON t(a) /* unclosed;"),
+            "CREATE INDEX i ON t(a) /* unclosed; */;"
+        );
+        // `/*/` opens a comment without closing it: the `*` is the opener's.
+        assert_eq!(
+            lite("CREATE INDEX i ON t(a) /*/"),
+            "CREATE INDEX i ON t(a) /*/ */;"
+        );
+    }
+
+    #[test]
+    fn terminate_always_ends_in_a_terminator_its_dialect_reads_as_code() {
+        // The property every case above is an instance of, checked by the
+        // same lexer the script tab splits the text on when it is run back.
+        // It cannot tell a valid ending from a stray `*/` (which reads as code
+        // too); the exact cases and the engine replay in `tests/db_ddl.rs`
+        // cover that.
+        let texts = [
+            "CREATE INDEX i ON t(a)",
+            "CREATE INDEX i ON t(a) -- note",
+            "CREATE INDEX i ON t(a) -- note;",
+            "CREATE INDEX i ON t(a) -- a\n WHERE b > 0 -- b",
+            "CREATE INDEX i ON t(a) -- a\rWHERE b > 0",
+            "CREATE INDEX i ON t(a) /* closed */",
+            "CREATE INDEX i ON t(a) /* unclosed",
+            "CREATE INDEX i ON t(a) /* x /* y",
+            "CREATE INDEX i ON t(a) /*/",
+            "CREATE INDEX i ON t(a) /* x /* y */ -- z */",
+            "CREATE TABLE t ([a -- b] TEXT)",
+        ];
+        for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
+            for sql in texts {
+                let out = terminate(sql, dialect);
+                assert!(
+                    script::ends_with_terminator(&out, dialect),
+                    "{dialect:?}: {out:?}"
+                );
+                assert!(out.starts_with(sql), "{dialect:?}: {out:?}");
+            }
+        }
     }
 
     #[test]
@@ -681,6 +732,12 @@ mod tests {
         let sql = "CREATE INDEX i ON t(a) /* x /* y */ -- z */";
         assert_eq!(terminate(sql, Dialect::Postgres), format!("{sql};"));
         assert_eq!(terminate(sql, Dialect::Sqlite), format!("{sql}\n;"));
+        // Nested comments leave two levels open on Postgres and SQL Server,
+        // and one on SQLite, whose comment simply runs to the end.
+        let sql = "CREATE INDEX i ON t(a) /* x /* y";
+        assert_eq!(terminate(sql, Dialect::Postgres), format!("{sql} */ */;"));
+        assert_eq!(terminate(sql, Dialect::SqlServer), format!("{sql} */ */;"));
+        assert_eq!(terminate(sql, Dialect::Sqlite), format!("{sql} */;"));
         // A `--` inside a dollar quote is the function's text.
         let sql = "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 -- one $$";
         assert_eq!(terminate(sql, Dialect::Postgres), format!("{sql};"));
