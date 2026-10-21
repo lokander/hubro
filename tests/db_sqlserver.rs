@@ -1061,6 +1061,42 @@ async fn sqlserver_empty_results_keep_their_column_headers() {
 }
 
 #[tokio::test]
+async fn sqlserver_every_read_path_keeps_only_the_first_result_set() {
+    // The buffered, capped and export paths share one result loop, which
+    // reads the first result set and stops at the second — one statement,
+    // one result, as on the sqlx backends.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    let sql = "SELECT 1 AS a UNION ALL SELECT 2; SELECT 3 AS b";
+    let first = vec![vec![Value::Integer(1)], vec![Value::Integer(2)]];
+
+    let result = pool.query(sql).await.unwrap();
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        ["a"]
+    );
+    assert_eq!(result.rows, first);
+
+    let (result, truncated) = pool.query_capped(sql, &[], 100).await.unwrap();
+    assert_eq!(result.rows, first);
+    assert!(!truncated);
+
+    let mut csv = Vec::new();
+    let written = pool
+        .export(sql, &[], ExportFormat::Csv, &mut csv)
+        .await
+        .unwrap();
+    assert_eq!(written, 2);
+    assert_eq!(String::from_utf8(csv).unwrap(), "a\n1\n2\n");
+
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn sqlserver_export_streams_csv_and_json() {
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();

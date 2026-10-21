@@ -24,12 +24,13 @@
 //! (TDS Transaction Manager requests), which nothing here uses.
 
 use std::io::Write;
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_util::TryStreamExt as _;
 use tiberius::error::Error as TdsError;
-use tiberius::{AuthMethod, Client, Config, EncryptionLevel, Query, QueryItem};
+use tiberius::{AuthMethod, Client, Column, Config, EncryptionLevel, Query, QueryItem, Row};
 use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt as _};
@@ -39,7 +40,7 @@ use crate::db::error::DbError;
 use crate::db::export::{export_io_err, ExportFormat, ExportSink};
 use crate::db::script::tsql_leads_own_batch;
 use crate::db::staged::CheckedStatement;
-use crate::db::value::{cap_value, QueryResult, Value};
+use crate::db::value::{cap_value, ColumnInfo, QueryResult, Value};
 
 /// Matches PgPool's `max_connections(4)`: enough for the grid, introspection,
 /// and a script transaction to run concurrently without deadlocking.
@@ -576,31 +577,57 @@ async fn run_query(
     sql: &str,
     params: &[Value],
 ) -> Result<(QueryResult, bool), TdsError> {
+    // No caps: `u64::MAX`/`usize::MAX` make both bounds unreachable, so this
+    // is the capped read with its two limiters switched off rather than a
+    // second copy of the same loop.
+    let (result, _, abandoned) =
+        run_query_capped(client, sql, params, u64::MAX, usize::MAX).await?;
+    Ok((result, abandoned))
+}
+
+/// What [`read_first_result_set`] does with each row it reads.
+trait RowSink {
+    /// Takes one row; `Break` stops reading with the rest of the response
+    /// still unread.
+    fn row(&mut self, row: &Row) -> Result<ControlFlow<()>, TdsError>;
+}
+
+/// Runs a parameterized query and feeds its first result set to the sink
+/// `start` builds from that set's columns (`None`: the batch returned no
+/// result set). The one copy of the TDS result loop: the buffered, capped and
+/// export paths differ only in their sinks.
+///
+/// Returns the sink and whether the stream was abandoned with data still
+/// unread — the sink stopped early, or a second result set arrived. Only the
+/// first is read, which mirrors the sqlx backends, where one statement yields
+/// one result.
+async fn read_first_result_set<S: RowSink>(
+    client: &mut TdsClient,
+    sql: &str,
+    params: &[Value],
+    start: impl FnOnce(Option<&[Column]>) -> Result<S, TdsError>,
+) -> Result<(S, bool), TdsError> {
     let mut query = Query::new(sql.to_string());
     bind_params(&mut query, params);
     let mut stream = query.query(client).await?;
-    let columns = match stream.columns().await? {
-        Some(columns) => column_infos(columns),
-        None => Vec::new(),
-    };
-    let mut rows = Vec::new();
+    let mut sink = start(stream.columns().await?)?;
     let mut result_sets = 0usize;
-    let mut abandoned = false;
     while let Some(item) = stream.try_next().await? {
         match item {
             QueryItem::Metadata(_) => {
                 result_sets += 1;
-                // Only the first result set is kept — mirrors the sqlx
-                // backends, where one statement yields one result.
                 if result_sets > 1 {
-                    abandoned = true;
-                    break;
+                    return Ok((sink, true));
                 }
             }
-            QueryItem::Row(row) => rows.push(decode_row(&row)),
+            QueryItem::Row(row) => {
+                if sink.row(&row)?.is_break() {
+                    return Ok((sink, true));
+                }
+            }
         }
     }
-    Ok((QueryResult { columns, rows }, abandoned))
+    Ok((sink, false))
 }
 
 /// Runs a parameterized non-row statement via the driver's RPC path,
@@ -715,43 +742,48 @@ async fn run_query_capped(
     max_rows: u64,
     cell_cap: usize,
 ) -> Result<(QueryResult, bool, bool), TdsError> {
-    let mut query = Query::new(sql.to_string());
-    bind_params(&mut query, params);
-    let mut stream = query.query(client).await?;
-    let columns = match stream.columns().await? {
-        Some(columns) => column_infos(columns),
-        None => Vec::new(),
+    let (rows, abandoned) = read_first_result_set(client, sql, params, |columns| {
+        Ok(CappedRows {
+            columns: columns.map(column_infos).unwrap_or_default(),
+            rows: Vec::new(),
+            max_rows,
+            cell_cap,
+            truncated: false,
+        })
+    })
+    .await?;
+    let result = QueryResult {
+        columns: rows.columns,
+        rows: rows.rows,
     };
-    let mut rows: Vec<Vec<Value>> = Vec::new();
-    let mut truncated = false;
-    let mut abandoned = false;
-    let mut result_sets = 0usize;
-    while let Some(item) = stream.try_next().await? {
-        match item {
-            QueryItem::Metadata(_) => {
-                result_sets += 1;
-                if result_sets > 1 {
-                    abandoned = true;
-                    break;
-                }
-            }
-            QueryItem::Row(row) => {
-                // The cap+1'th row that reaches us proves there is more; stop
-                // before decoding it so exactly `max_rows` rows are retained.
-                if rows.len() as u64 >= max_rows {
-                    truncated = true;
-                    abandoned = true;
-                    break;
-                }
-                let values = decode_row(&row)
-                    .into_iter()
-                    .map(|v| cap_value(v, cell_cap))
-                    .collect();
-                rows.push(values);
-            }
+    Ok((result, rows.truncated, abandoned))
+}
+
+/// [`run_query_capped`]'s sink: decodes and keeps at most `max_rows` rows,
+/// each cell capped to `cell_cap` bytes.
+struct CappedRows {
+    columns: Vec<ColumnInfo>,
+    rows: Vec<Vec<Value>>,
+    max_rows: u64,
+    cell_cap: usize,
+    truncated: bool,
+}
+
+impl RowSink for CappedRows {
+    fn row(&mut self, row: &Row) -> Result<ControlFlow<()>, TdsError> {
+        // The cap+1'th row that reaches us proves there is more; stop before
+        // decoding it so exactly `max_rows` rows are retained.
+        if self.rows.len() as u64 >= self.max_rows {
+            self.truncated = true;
+            return Ok(ControlFlow::Break(()));
         }
+        let values = decode_row(row)
+            .into_iter()
+            .map(|v| cap_value(v, self.cell_cap))
+            .collect();
+        self.rows.push(values);
+        Ok(ControlFlow::Continue(()))
     }
-    Ok((QueryResult { columns, rows }, truncated, abandoned))
 }
 
 /// Executes parameterized writes inside ONE transaction, committing only
@@ -925,41 +957,27 @@ pub async fn export(
     out: &mut impl Write,
 ) -> Result<u64, DbError> {
     let mut conn = pool.acquire().await?;
-    let mut query = Query::new(sql.to_string());
-    bind_params(&mut query, params);
     // The stream borrows the client, so driver errors are collected and
     // settled after the stream is dropped.
-    let mut written = 0u64;
-    let mut abandoned = false;
-    let outcome: Result<(), TdsError> = async {
-        let mut stream = query.query(conn.client()).await?;
-        let columns: Vec<String> = match stream.columns().await? {
-            Some(columns) => columns.iter().map(|c| c.name().to_string()).collect(),
-            None => Vec::new(),
-        };
-        let mut sink = ExportSink::new(format, columns);
-        sink.begin(out).map_err(io_to_tds)?;
-        let mut result_sets = 0usize;
-        while let Some(item) = stream.try_next().await? {
-            match item {
-                QueryItem::Metadata(_) => {
-                    result_sets += 1;
-                    if result_sets > 1 {
-                        abandoned = true;
-                        break;
-                    }
-                }
-                QueryItem::Row(row) => {
-                    let values = decode_row(&row);
-                    sink.write_row(&values, out).map_err(io_to_tds)?;
-                    written += 1;
-                }
-            }
-        }
-        sink.end(out).map_err(io_to_tds)
+    let outcome = async {
+        let (mut rows, abandoned) = read_first_result_set(conn.client(), sql, params, |columns| {
+            let columns = columns
+                .map(|columns| columns.iter().map(|c| c.name().to_string()).collect())
+                .unwrap_or_default();
+            let mut sink = ExportSink::new(format, columns);
+            sink.begin(out).map_err(io_to_tds)?;
+            Ok(ExportRows {
+                sink,
+                out,
+                written: 0,
+            })
+        })
+        .await?;
+        rows.sink.end(rows.out).map_err(io_to_tds)?;
+        Ok((rows.written, abandoned))
     }
     .await;
-    settle(&mut conn, outcome, sql)?;
+    let (written, abandoned) = settle(&mut conn, outcome, sql)?;
     // An abandoned second result set must not ride back to the pool.
     if abandoned {
         conn.discard();
@@ -967,8 +985,24 @@ pub async fn export(
     Ok(written)
 }
 
+/// [`export`]'s sink: writes each row through as it arrives.
+struct ExportRows<'w, W> {
+    sink: ExportSink,
+    out: &'w mut W,
+    written: u64,
+}
+
+impl<W: Write> RowSink for ExportRows<'_, W> {
+    fn row(&mut self, row: &Row) -> Result<ControlFlow<()>, TdsError> {
+        let values = decode_row(row);
+        self.sink.write_row(&values, self.out).map_err(io_to_tds)?;
+        self.written += 1;
+        Ok(ControlFlow::Continue(()))
+    }
+}
+
 /// Smuggles a writer I/O failure through the driver error type so the export
-/// loop above has a single error channel; unwrapped by [`query_error`] into
+/// sink and the result loop it runs in share a single error channel; unwrapped by [`query_error`] into
 /// the same message [`export_io_err`] would produce.
 fn io_to_tds(err: std::io::Error) -> TdsError {
     let db_err = export_io_err(err);
