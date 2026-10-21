@@ -443,18 +443,25 @@ fn word_end(sql: &str, at: usize, end: usize, dialect: Dialect) -> usize {
 /// a letter there starts the next token: measured on SQL Server 2022,
 /// `SELECT 1DELETE FROM t`, `1.5DELETE`, `1e+1DELETE`, `1e1EXEC p` and
 /// `0xAUPDATE t SET …` each run the statement after the number. The grammar
-/// is digits, an optional `.` and digits, and an optional `e`, sign and
-/// digits (`1EXEC` is `1E`, then `XEC`), or `0x` and a run of **hex** digits
-/// (`0xFDELETE` is `0x0FDE`, then `LETE`).
+/// is digits, an optional `.` and digits, and an optional exponent — an
+/// `e`, optional sign and at least one digit — or `0x` and a run of **hex**
+/// digits (`0xFDELETE` is `0x0FDE`, then `LETE`).
 ///
 /// A digit starts a number only where a token can start: not after an
 /// identifier character, `@` or `#` (`a1begin`, `@1begin` and `#1begin` are
-/// names), not after a `$` that continues a name (`x$1begin`), and not after
-/// a `.` that follows a name (`m.5DELETE` is a syntax error). After any other
-/// character it does — a currency sign included, since T-SQL money literals
-/// take one (`$1DELETE`, `€1DELETE`, `＄1DELETE` all ran the DELETE). Only
-/// SQL Server reads numbers this way; Postgres and SQLite reject a letter
-/// straight after a number.
+/// names), and not after a `$` that continues a name (`x$1begin`). After any
+/// other character it does — a `.` always, and a currency sign, since T-SQL
+/// money literals take one (`$1DELETE`, `€1DELETE`, `＄1DELETE` all ran the
+/// DELETE). "Identifier character" uses `char::is_alphanumeric`, which also
+/// takes `²`, `½` and `①`; measured, `SELECT 1²1DELETE …` (and with `½`,
+/// `①`) is a syntax error, so not starting a number after one only spares a
+/// statement that cannot run. Only SQL Server reads numbers this way;
+/// Postgres and SQLite reject a letter straight after a number.
+///
+/// **Narrow only what was measured.** Each "does not start a number" above
+/// stops the gate charging a word, so each is backed by a measurement; where
+/// the engine's reading is unknown, this function picks the reading that
+/// splits more.
 fn tsql_number_end(sql: &str, at: usize, end: usize) -> Option<usize> {
     let bytes = sql.as_bytes();
     // The character before `at`, and the one before that.
@@ -462,8 +469,14 @@ fn tsql_number_end(sql: &str, at: usize, end: usize) -> Option<usize> {
     let in_name = |c: char| c.is_alphanumeric() || matches!(c, '_' | '@' | '#' | '$');
     let starts = match before(at) {
         None => true,
-        Some(c @ ('$' | '.')) => !before(at - c.len_utf8())
-            .is_some_and(|p| in_name(p) || (c == '.' && matches!(p, ']' | '"'))),
+        // `.5` is a literal wherever it stands: after a keyword or a money
+        // sign as much as after a space (measured: `SELECT.5DELETE FROM t`,
+        // `SELECT DISTINCT.5DELETE …` and `SELECT $.5DELETE …` each ran the
+        // DELETE). After a name it is a syntax error (`m.5DELETE`), so
+        // starting a number there only over-charges a statement that cannot
+        // run.
+        Some('.') => true,
+        Some('$') => !before(at - 1).is_some_and(in_name),
         Some(c) => !in_name(c),
     };
     if !starts {
@@ -486,12 +499,19 @@ fn tsql_number_end(sql: &str, at: usize, end: usize) -> Option<usize> {
     if j < end && bytes[j] == b'.' {
         j = digits(j + 1);
     }
+    // An exponent only with at least one digit: otherwise the number ends
+    // before the `e`, which then starts the next word. Measured, `1EXEC p`
+    // and `1EXECUTE p` are syntax errors while `1E+EXEC p` runs the EXEC; the
+    // engine's reading of a bare `1E` is not pinned down, and ending the
+    // number early is the reading that charges more.
     if j < end && matches!(bytes[j], b'e' | b'E') {
-        j += 1;
-        if j < end && matches!(bytes[j], b'+' | b'-') {
-            j += 1;
+        let mut k = j + 1;
+        if k < end && matches!(bytes[k], b'+' | b'-') {
+            k += 1;
         }
-        j = digits(j);
+        if k < end && bytes[k].is_ascii_digit() {
+            j = digits(k);
+        }
     }
     Some(j)
 }
@@ -2387,6 +2407,12 @@ mod tests {
             (Ms, "SELECT 0xFINTO t2 FROM t", BOTH),
             (Ms, "SELECT ＄1DELETE FROM t", MUTATE),
             (Ms, "SELECT 1e1EXEC sp_who", BOTH),
+            (Ms, "SELECT.5DELETE FROM t", MUTATE),
+            (Ms, "SELECT DISTINCT.5DELETE FROM t", MUTATE),
+            (Ms, "SELECT $.5DELETE FROM t", MUTATE),
+            (Ms, "SELECT 1E+EXEC p", BOTH),
+            (Ms, "SELECT 1EXECUTE p", BOTH),
+            (Ms, "SELECT 1EXEC sp_rename 'a', 'b'", BOTH),
             // Allowed: transaction control alone, and plain reads.
             (Ms, "BEGIN TRAN", NONE),
             (Ms, "BEGIN TRANSACTION", NONE),
