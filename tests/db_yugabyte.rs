@@ -647,6 +647,55 @@ async fn yugabyte_script_dml_rolls_back_but_its_ddl_does_not() {
 }
 
 #[tokio::test]
+async fn a_forced_serialization_failure_classifies_as_transient() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+
+    // `40001` raised on demand rather than by losing a race: a REPEATABLE
+    // READ transaction takes its snapshot, a second session commits an update
+    // to the same row, and the transaction's own update of that row is then
+    // refused. The order is enforced by the awaits, so it does not depend on
+    // how fast the cluster is. This is the classification the catalog reads'
+    // one retry depends on, and Yugabyte is the engine that made it necessary
+    // (the header's finding 2).
+    with_ddl(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS yb_serial CASCADE".to_string(),
+            "CREATE TABLE yb_serial (id int PRIMARY KEY, v int)".to_string(),
+        ],
+    )
+    .await;
+    pool.execute("INSERT INTO yb_serial VALUES (1, 0)")
+        .await
+        .unwrap();
+
+    let mut tx = pool.begin_script_tx().await.unwrap();
+    tx.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .unwrap();
+    tx.query_capped("SELECT v FROM yb_serial WHERE id = 1", 1)
+        .await
+        .unwrap();
+    pool.execute("UPDATE yb_serial SET v = 1 WHERE id = 1")
+        .await
+        .unwrap();
+    let refused = tx
+        .execute("UPDATE yb_serial SET v = 2 WHERE id = 1")
+        .await
+        .expect_err("a REPEATABLE READ update of a row changed since its snapshot must be refused");
+    tx.rollback().await;
+
+    assert!(
+        refused.is_transient(),
+        "a server-sent 40001 must classify as transient, got: {refused:?}"
+    );
+
+    with_ddl(&pool, &["DROP TABLE yb_serial CASCADE".to_string()]).await;
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn yugabyte_refuses_concurrent_ddl_without_corrupting_anything() {
     let Some(url) = test_url() else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
@@ -689,12 +738,15 @@ async fn yugabyte_refuses_concurrent_ddl_without_corrupting_anything() {
     // faster machine. What must hold either way is that a loser fails
     // *cleanly*, which is the part hubro's behaviour actually rests on.
     //
-    // The loser is also where hubro's transient classification is
-    // pinned against a *real* server-sent SQLSTATE rather than a hand-built
-    // error: this is the one place in the suite that reliably makes a live
-    // engine raise `40001`. The retry that classification feeds is on the
-    // catalog reads, not here — a DDL conflict is reported, never re-run — but
-    // if the code stopped being recognised, this is what would notice.
+    // The loser's error is also checked for transient classification. It is
+    // not where that classification is *pinned*, though: everything in this
+    // loop sits behind a race, and a run where neither statement loses checks
+    // none of it and passes. (Measured on the development machine: one of the
+    // two lost in 10 runs out of 10. That is an observation about this box,
+    // not a property of the cluster.)
+    // `a_forced_serialization_failure_classifies_as_transient` raises `40001`
+    // with no race at all, and is what would notice the code going
+    // unrecognised.
     for outcome in [&a, &b] {
         if let Err(error) = outcome {
             let message = error.message().to_lowercase();
