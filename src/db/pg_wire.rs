@@ -1,5 +1,11 @@
-//! Postgres binary wire values rendered as the text the server prints for
-//! them: `numeric`, `date`, `timestamp`, `timestamptz`, `time` and `timetz`.
+//! Postgres binary wire values rendered as text in the server's own notation:
+//! `numeric`, `date`, `timestamp`, `timestamptz`, `time` and `timetz`.
+//!
+//! `numeric`, `date`, `timestamp` and `time` read exactly as PostgreSQL's
+//! `::text` of the same value. The zoned two do not quite: a `timestamptz`
+//! is shown in UTC with a `+00:00` offset whatever the session's time zone,
+//! and a zone is always written with its minutes (`+02:00` where the server
+//! prints `+02`) — both in a form the server reads back as the same value.
 //!
 //! These used to go through sqlx's decodes into `rust_decimal` and `chrono`,
 //! and every one of those types is narrower than the column it was read from.
