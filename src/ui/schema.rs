@@ -169,32 +169,42 @@ fn SchemaBody(id: ConnectionId, meta: TableMeta) -> Element {
             }
             // How big the thing is — under the name it describes and
             // above the columns, since it is read far more often than any one
-            // column. Withheld from objects with no rows at all (a RisingWave
-            // sink): their emptiness is already stated by the grid,
-            // and offering to count them would be offering a failure.
+            // column. Withheld from objects with no rows to show (a RisingWave
+            // sink, a SQLite object the engine cannot resolve): the grid
+            // already states why, and offering to count them would be
+            // offering a failure.
             if unreadable_reason(&meta).is_none() {
                 TableStatsLine { id, table: table.clone() }
             }
-            table { class: "w-full border-collapse text-left",
-                thead {
-                    tr { class: "border-b border-slate-300 dark:border-slate-700",
-                        th { class: "px-3 py-1.5 text-xs uppercase tracking-wide text-slate-500", "Column" }
-                        th { class: "px-3 py-1.5 text-xs uppercase tracking-wide text-slate-500", "Type" }
-                        th { class: "px-3 py-1.5 text-xs uppercase tracking-wide text-slate-500", "Null" }
-                        th { class: "px-3 py-1.5 text-xs uppercase tracking-wide text-slate-500", "Key" }
-                        th { class: "px-3 py-1.5 text-xs uppercase tracking-wide text-slate-500", "Default" }
-                        if rename_column != Rename::Hidden {
-                            th { class: "px-3 py-1.5" }
+            // An object whose columns could not be read at all — a SQLite
+            // object the engine cannot resolve — gets the reason in place of
+            // an empty column table, which would otherwise read as "this
+            // object has no columns" with nothing to say why. A sink has
+            // columns and keeps its table.
+            if let Some(reason) = unreadable_reason(&meta).filter(|_| meta.columns.is_empty()) {
+                p { class: "px-3 text-xs text-slate-500 dark:text-slate-500", "{reason}" }
+            } else {
+                table { class: "w-full border-collapse text-left",
+                    thead {
+                        tr { class: "border-b border-slate-300 dark:border-slate-700",
+                            th { class: "px-3 py-1.5 text-xs uppercase tracking-wide text-slate-500", "Column" }
+                            th { class: "px-3 py-1.5 text-xs uppercase tracking-wide text-slate-500", "Type" }
+                            th { class: "px-3 py-1.5 text-xs uppercase tracking-wide text-slate-500", "Null" }
+                            th { class: "px-3 py-1.5 text-xs uppercase tracking-wide text-slate-500", "Key" }
+                            th { class: "px-3 py-1.5 text-xs uppercase tracking-wide text-slate-500", "Default" }
+                            if rename_column != Rename::Hidden {
+                                th { class: "px-3 py-1.5" }
+                            }
                         }
                     }
-                }
-                tbody {
-                    for column in meta.columns.clone() {
-                        ColumnRow {
-                            key: "{column.name}",
-                            column,
-                            editing,
-                            rename: rename_column,
+                    tbody {
+                        for column in meta.columns.clone() {
+                            ColumnRow {
+                                key: "{column.name}",
+                                column,
+                                editing,
+                                rename: rename_column,
+                            }
                         }
                     }
                 }

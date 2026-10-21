@@ -102,8 +102,10 @@ async fn introspection_lists_all_tables_and_views_sorted_by_name() {
 }
 
 /// A database holding objects SQLite cannot resolve on hubro's connection:
-/// a virtual table whose module hubro's SQLite lacks, a view over it, and a
-/// view over a table dropped after the view was created — beside ordinary
+/// a virtual table whose module hubro's SQLite lacks, a view over it, a view
+/// calling a function nothing registered (what a SpatiaLite `ST_*` or sqlean
+/// call is without the extension loaded), and a view over a table dropped
+/// after the view was created — beside ordinary
 /// objects that must come through intact, and a virtual table whose module
 /// *is* built in.
 ///
@@ -121,6 +123,7 @@ const UNRESOLVABLE_SCHEMA: &str = "
     CREATE TABLE gone (x INTEGER);
     CREATE VIEW over_gone AS SELECT x FROM gone;
     DROP TABLE gone;
+    CREATE VIEW over_func AS SELECT nosuchfunc(1) AS x;
     PRAGMA writable_schema = ON;
     INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql)
         VALUES ('table', 'shapes', 'shapes', 0, 'CREATE VIRTUAL TABLE shapes USING nosuchmod(geom)');
@@ -159,7 +162,7 @@ async fn an_object_sqlite_cannot_resolve_costs_only_itself() {
     // The unresolvable ones are still listed, with no columns, and declared
     // unreadable so the grid explains instead of running a query that can
     // only fail the same way.
-    for name in ["shapes", "over_shapes", "over_gone"] {
+    for name in ["shapes", "over_shapes", "over_func", "over_gone"] {
         let meta = table(&tables, name);
         assert!(meta.columns.is_empty(), "{name}: {:?}", meta.columns);
         assert!(
@@ -212,6 +215,9 @@ async fn tables_whose_names_merely_resemble_sqlite_internals_are_listed() {
          CREATE TABLE \"SQLiteXData\" (x INTEGER);
          CREATE INDEX idx_xdata ON \"SQLiteXData\"(x);
          CREATE TABLE \"sqlite-log\" (id INTEGER REFERENCES sqlitest(id));
+         PRAGMA writable_schema = ON;
+         CREATE TABLE \"SQLITE_Upper\" (x INTEGER);
+         PRAGMA writable_schema = OFF;
          INSERT INTO sqlitest (note) VALUES ('a');
          ANALYZE;",
     )
@@ -221,7 +227,9 @@ async fn tables_whose_names_merely_resemble_sqlite_internals_are_listed() {
 
     let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
     // SQLite's own bookkeeping (`sqlite_sequence` from AUTOINCREMENT,
-    // `sqlite_stat1` from ANALYZE) stays hidden.
+    // `sqlite_stat1` from ANALYZE) stays hidden, and so does a reserved name
+    // in another case: SQLite reserves the prefix case-insensitively and only
+    // creates one like `SQLITE_Upper` under `writable_schema`.
     assert_eq!(names, ["SQLiteXData", "sqlite-log", "sqlitest"]);
     // And every batched catalog read sees them too, not just the object list.
     assert_eq!(table(&tables, "sqlitest").columns.len(), 2);

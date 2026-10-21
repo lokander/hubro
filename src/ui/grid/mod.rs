@@ -475,9 +475,10 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
 
     // Whether this object has any rows to list at all, so that a
     // declared-unbrowsable object never reaches the server: the query it would
-    // otherwise run is one the engine answers with an error about an object
-    // that stores nothing. A RisingWave sink is the case — it writes outward
-    // to Kafka or another database.
+    // otherwise run is one the engine can only answer with an error. Two cases:
+    // a RisingWave sink, which writes outward to Kafka or another database and
+    // stores nothing, and a SQLite object the engine can list but not resolve
+    // (a virtual table whose module is missing, a view over a dropped table).
     //
     // Resolved through a memo for the reason `fetch_meta` above is: `registry`
     // and `schemas` are whole-map signals, so a raw read would make every
@@ -1125,7 +1126,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                 read_only_notice,
             }
             // Read-only notice (views / no usable row key). Suppressed for an
-            // object with no rows at all: its restriction explains both why it
+            // object with no rows to show: its restriction explains both why it
             // cannot be edited and why it cannot be opened, and the grid below
             // is already showing that same sentence — twice on one screen
             // reads as two problems.
@@ -1156,13 +1157,14 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                         None => rsx! {
                             DelayedLoading { label: "Loading…" }
                         },
-                        // An object the backend declares has no rows
-                        // is not a failure to report in red: nothing went
+                        // An object the backend declares has no rows to show
+                        // is not a failure to report in red: it is a known
+                        // property of the object, not something that just went
                         // wrong, and there is simply nothing to list. A
-                        // RisingWave sink is the case — it writes outward to
-                        // Kafka or another database and stores nothing itself.
-                        // The sentence is the backend's own, so it explains the
-                        // object rather than naming the engine.
+                        // RisingWave sink stores nothing itself; a SQLite
+                        // object the engine cannot resolve has rows hubro
+                        // cannot reach. The sentence is the backend's own, so
+                        // it explains the object rather than naming the engine.
                         //
                         // Guarded on the error alone would be wrong:
                         // `Unsupported` is also how `refuse_paged_read` reports

@@ -100,9 +100,10 @@ pub enum Restriction {
     /// not writable (a DuckDB view over a Parquet file, a StarRocks
     /// duplicate-key table), or the user's own read-only marking.
     Declared(&'static str),
-    /// The object has no rows *at all*, so it is neither writable nor
-    /// browsable — a RisingWave sink, which writes outward to Kafka or another
-    /// database and stores nothing of its own.
+    /// The object has no rows hubro can show, so it is neither writable nor
+    /// browsable. Two cases today: a RisingWave sink, which writes outward to
+    /// Kafka or another database and stores nothing of its own, and a SQLite
+    /// object the engine can list but not resolve (below).
     ///
     /// The one restriction that also narrows reading. It is a distinct variant
     /// rather than a flag beside [`Self::Declared`] because a backend declares
@@ -111,10 +112,12 @@ pub enum Restriction {
     /// to a view — correctly unwritable, but views are browsable, so opening
     /// one ran a query the engine answered with `table or source not found`.
     ///
-    /// SQLite also declares it for an object it can list but not read — a
-    /// virtual table whose module hubro's SQLite lacks, or a view over a table
-    /// that has since been dropped. Such an object may well have rows, but
-    /// none hubro can show, and opening it could only fail the same way.
+    /// SQLite declares it for an object it can list but not resolve — a
+    /// virtual table whose module hubro's SQLite lacks, or a view that calls a
+    /// missing function or collation or reads a table that has since been
+    /// dropped. Such an object may well have rows, but none hubro can show,
+    /// and opening it could only fail the same way. It has no columns either,
+    /// since reading them is what failed.
     NoRows(&'static str),
 }
 

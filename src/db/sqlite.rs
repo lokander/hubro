@@ -5,9 +5,9 @@
 //! foreign keys come from the pragma table-valued functions
 //! (`pragma_table_xinfo`, `pragma_index_list`, `pragma_index_info`,
 //! `pragma_foreign_key_list`) joined against it — no per-table `PRAGMA`
-//! round-trips. The one exception is a database holding an object SQLite
-//! cannot resolve, where columns fall back to one query per object so that
-//! object costs only itself (see `table_columns`).
+//! round-trips for ordinary tables. Views and virtual tables are the exception:
+//! their columns are read one query each, so one SQLite cannot resolve costs
+//! only itself (see `table_columns`).
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -360,11 +360,10 @@ pub async fn export(
     Ok(0)
 }
 
-/// Lists tables and views with columns, indexes, and foreign keys. Four
-/// batched queries total — see the module header for the pragma
-/// table-valued-function strategy — unless some object's columns cannot be
-/// read, when columns alone fall back to one query per object (see
-/// [`table_columns`]).
+/// Lists tables and views with columns, indexes, and foreign keys: five
+/// queries, plus one per view or virtual table — see the module header
+/// for the pragma table-valued-function strategy and [`table_columns`] for the
+/// exception.
 pub async fn introspect(pool: &SqlitePool) -> Result<Vec<TableMeta>, DbError> {
     let sql = format!(
         "SELECT m.name AS name, m.type AS type, m.rootpage AS rootpage \
@@ -444,15 +443,16 @@ const UNREADABLE_VIRTUAL_TABLE: &str =
 
 /// Why any other object whose columns SQLite could not read is not opened.
 const UNREADABLE_OBJECT: &str = "SQLite can't read this object — its definition refers to \
-     a table, column or virtual-table module that isn't available.";
+     a table, column, function, collation or virtual-table module that isn't available.";
 
 /// The restriction introspection records for one object.
 ///
 /// `None` for everything SQLite could read the columns of: kind and row
 /// identity already carry everything this backend knows about writability.
 /// An object it could *not* read — a virtual table whose module hubro's
-/// SQLite lacks, a view over one, a view over a table that has since been
-/// dropped — is still listed, so one such object costs the user that object
+/// SQLite lacks, a view over one, a view calling an extension's function
+/// (SpatiaLite's `ST_*`, sqlean's) or naming a missing collation, a view over a
+/// table that has since been dropped — is still listed, so one such object costs the user that object
 /// rather than the whole schema tree, but as `NoRows`: opening it can only
 /// fail the same way, so the grid states why instead of running the query.
 /// The DDL view still works on it, since that reads only `sqlite_master`.
@@ -473,16 +473,16 @@ fn restriction_for(entry: &MasterEntry, columns_readable: bool) -> Option<Restri
 /// matches any one character and hid user tables such as `sqlitest` and
 /// `sqlite-log`. `LIKE` stays case-insensitive on purpose: SQLite reserves the
 /// prefix in any case (`CREATE TABLE SQLITE_x` is refused as "reserved for
-/// internal use"), so this hides exactly what SQLite itself owns. Nothing
-/// tests that half, and nothing can short of forging `sqlite_master`: a
-/// case-sensitive match differs only on names SQLite refuses to create.
+/// internal use"), so this hides exactly what SQLite itself owns — including
+/// a mixed-case name forged in under `writable_schema`, which is the only way
+/// one gets there.
 const MASTER_FILTER: &str =
     "m.type IN ('table', 'view') AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'";
 
-/// Whether a failed catalog read is about one object rather than the
-/// database: SQLite's generic `SQLITE_ERROR`, which is what it raises when a
-/// virtual table's module is missing (`no such module: …`) or a view refers to
-/// something that no longer exists (`no such table: …`).
+/// Whether a failed catalog read is SQLite's generic `SQLITE_ERROR` — what it
+/// raises when resolving one object fails: a virtual table's module is missing
+/// (`no such module: …`), or a view refers to a table, column, function or
+/// collation that isn't there (`no such table: …`, `no such function: …`).
 ///
 /// Decided on the result code, never the message. `BUSY`, `LOCKED`, `IOERR`,
 /// `CORRUPT` and the rest say the database cannot be read at all, and
@@ -496,13 +496,51 @@ fn is_object_scoped(extended_code: Option<&str>) -> bool {
         .is_some_and(|code| code & 0xff == SQLITE_ERROR)
 }
 
-/// [`is_object_scoped`] for a driver error.
-fn object_scoped_error(err: &sqlx::Error) -> bool {
-    match err {
-        sqlx::Error::Database(db) => is_object_scoped(db.code().as_deref()),
-        _ => false,
-    }
+/// Whether reading this object's columns makes SQLite *resolve* something —
+/// compile a view's `SELECT`, connect a virtual table to its module — and so
+/// can fail for a reason that belongs to this object alone.
+///
+/// An ordinary table never can: SQLite answers `pragma_table_xinfo` for one
+/// from the parsed schema without resolving anything
+/// (`sqlite3ViewGetColumnNames` returns before doing any work for a
+/// non-virtual table), so a failure reading one is about the database or about
+/// hubro's query, never about that table.
+fn needs_resolving(entry: &MasterEntry) -> bool {
+    entry.view || entry.virtual_table
 }
+
+/// Whether a failure reading `entry`'s columns is that object's own — the one
+/// decision that turns an error into a dimmed entry instead of a failed
+/// schema tree. Both halves must hold: the object is one whose read resolves
+/// something ([`needs_resolving`]), and the failure is the generic error that
+/// resolving raises ([`is_object_scoped`]).
+fn charged_to_object(entry: &MasterEntry, err: &sqlx::Error) -> bool {
+    needs_resolving(entry)
+        && match err {
+            sqlx::Error::Database(db) => is_object_scoped(db.code().as_deref()),
+            _ => false,
+        }
+}
+
+/// Columns keyed by object name, and the names of the objects whose columns
+/// SQLite could not read.
+type ColumnsRead = (HashMap<String, Vec<ColumnMeta>>, HashSet<String>);
+
+/// Why reading one object's columns failed: the driver's error, kept whole so
+/// [`charged_to_object`] can read its result code, or a row that would not
+/// decode, which is never the object's fault.
+#[derive(Debug)]
+enum ColumnReadError {
+    Driver(sqlx::Error),
+    Decode(DbError),
+}
+
+/// The objects whose columns the batched query below does not return.
+///
+/// Exactly the views and virtual tables: [`needs_resolving`] in SQL. Every
+/// table and view has at least one column, so an object missing from the
+/// batch's result is one it did not read.
+const ORDINARY_TABLE: &str = "m.type = 'table' AND m.rootpage <> 0";
 
 /// Columns of every table and view, keyed by object name (unique per SQLite
 /// schema), plus the names of the objects whose columns SQLite could not read.
@@ -512,57 +550,82 @@ fn object_scoped_error(err: &sqlx::Error) -> bool {
 /// which builds an explicit projection from this metadata — must know about
 /// them, and they must be read-only.
 ///
-/// One batched query normally. But `pragma_table_xinfo` has to *resolve* each
-/// object — connect a virtual table to its module, compile a view's `SELECT` —
-/// and one object that cannot be resolved fails the whole statement, which
-/// used to empty the schema tree for a database holding a single SpatiaLite
-/// table or a view over a dropped table. So on an object-scoped failure the
-/// columns are read again one object at a time, and the objects that fail
-/// alone are reported rather than failing the rest. The index and
-/// foreign-key pragmas need no such fallback: they read the schema without
-/// resolving anything (measured — both answer an empty list for such an
-/// object), which the tests over such a database hold them to.
-async fn table_columns(
-    pool: &SqlitePool,
-    entries: &[MasterEntry],
-) -> Result<(HashMap<String, Vec<ColumnMeta>>, HashSet<String>), DbError> {
+/// Ordinary tables are read in one batched query. Views and virtual tables
+/// are read one query each, because `pragma_table_xinfo` has to resolve them,
+/// and in a batch one that cannot be resolved fails the whole statement —
+/// which used to empty the schema tree for a database holding a single
+/// SpatiaLite table, or a view over a dropped table. Read alone, such an
+/// object costs only itself (see [`read_each`]). The index and foreign-key
+/// pragmas need none of this: they read the schema without resolving anything
+/// (measured — both answer an empty list for such an object), which the tests
+/// over such a database hold them to.
+async fn table_columns(pool: &SqlitePool, entries: &[MasterEntry]) -> Result<ColumnsRead, DbError> {
     let sql = format!(
         "SELECT m.name AS table_name, {XINFO_COLUMNS} \
          FROM sqlite_master m JOIN pragma_table_xinfo(m.name) x \
-         WHERE {MASTER_FILTER} \
+         WHERE {MASTER_FILTER} AND {ORDINARY_TABLE} \
          ORDER BY m.name, x.cid"
     );
+    let rows = sqlx::query(&sql)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| DbError::Introspect(e.to_string()))?;
     let mut columns: HashMap<String, Vec<ColumnMeta>> = HashMap::new();
+    for row in rows {
+        let table: String = get(&row, "table_name")?;
+        if let Some(column) = column_meta(&row)? {
+            columns.entry(table).or_default().push(column);
+        }
+    }
+
+    let pending: Vec<&MasterEntry> = entries
+        .iter()
+        .filter(|entry| !columns.contains_key(&entry.name))
+        .collect();
+    let sql = format!("SELECT {XINFO_COLUMNS} FROM pragma_table_xinfo(?1) x ORDER BY x.cid");
+    let sql = sql.as_str();
+    let (resolved, unreadable) = read_each(&pending, |name| async move {
+        let rows = sqlx::query(sql)
+            .bind(name)
+            .fetch_all(pool)
+            .await
+            .map_err(ColumnReadError::Driver)?;
+        let mut list = Vec::with_capacity(rows.len());
+        for row in &rows {
+            list.extend(column_meta(row).map_err(ColumnReadError::Decode)?);
+        }
+        Ok(list)
+    })
+    .await?;
+    columns.extend(resolved);
+    Ok((columns, unreadable))
+}
+
+/// Reads each entry's columns through `read`, one object at a time, recording
+/// the objects whose failure is their own ([`charged_to_object`]) as
+/// unreadable and carrying on. Any other failure fails the whole read.
+///
+/// Takes the read as a parameter so the decision can be run against failures
+/// a real database will not produce on demand — a `BUSY` or an `IOERR`
+/// mid-loop must surface as an error, not as one more dimmed object.
+async fn read_each<F, Fut>(entries: &[&MasterEntry], mut read: F) -> Result<ColumnsRead, DbError>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<ColumnMeta>, ColumnReadError>>,
+{
+    let mut columns = HashMap::new();
     let mut unreadable = HashSet::new();
-    match sqlx::query(&sql).fetch_all(pool).await {
-        Ok(rows) => {
-            for row in rows {
-                let table: String = get(&row, "table_name")?;
-                if let Some(column) = column_meta(&row)? {
-                    columns.entry(table).or_default().push(column);
-                }
+    for entry in entries {
+        match read(entry.name.clone()).await {
+            Ok(list) => {
+                columns.insert(entry.name.clone(), list);
             }
-        }
-        Err(err) if object_scoped_error(&err) => {
-            let sql =
-                format!("SELECT {XINFO_COLUMNS} FROM pragma_table_xinfo(?1) x ORDER BY x.cid");
-            for entry in entries {
-                match sqlx::query(&sql).bind(&entry.name).fetch_all(pool).await {
-                    Ok(rows) => {
-                        let mut list = Vec::with_capacity(rows.len());
-                        for row in rows {
-                            list.extend(column_meta(&row)?);
-                        }
-                        columns.insert(entry.name.clone(), list);
-                    }
-                    Err(err) if object_scoped_error(&err) => {
-                        unreadable.insert(entry.name.clone());
-                    }
-                    Err(err) => return Err(DbError::Introspect(err.to_string())),
-                }
+            Err(ColumnReadError::Driver(err)) if charged_to_object(entry, &err) => {
+                unreadable.insert(entry.name.clone());
             }
+            Err(ColumnReadError::Driver(err)) => return Err(DbError::Introspect(err.to_string())),
+            Err(ColumnReadError::Decode(err)) => return Err(err),
         }
-        Err(err) => return Err(DbError::Introspect(err.to_string())),
     }
     Ok((columns, unreadable))
 }
@@ -853,7 +916,8 @@ pub async fn fetch_ddl(
 ///
 /// Two layers of `Option` because the two absences mean different things:
 /// `None` is no such object (never created, or dropped since the metadata was
-/// read — a row of another kind counts, since names share one namespace), and
+/// read — a row of another kind counts, since tables, views and indexes share
+/// one namespace), and
 /// `Some(None)` is an object whose row has a NULL `sql`, which for an index
 /// means SQLite created it itself for a constraint. Flattening them once
 /// made a dropped index show up as a reconstructed constraint index.
@@ -864,11 +928,15 @@ async fn object_sql(
 ) -> Result<Option<Option<String>>, DbError> {
     // `type` is matched in Rust rather than through a bound IN-list: sqlx has
     // no array binding on SQLite, and the kind set is a fixed literal here.
-    let row = sqlx::query("SELECT type, sql FROM sqlite_master WHERE name = ?1")
-        .bind(name)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| DbError::Introspect(e.to_string()))?;
+    // Triggers are excluded because they are the one kind with a namespace of
+    // their own: a trigger may share a name with an index or table, and
+    // whichever row came first would otherwise answer for both.
+    let row =
+        sqlx::query("SELECT type, sql FROM sqlite_master WHERE name = ?1 AND type <> 'trigger'")
+            .bind(name)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| DbError::Introspect(e.to_string()))?;
     let Some(row) = row else {
         return Ok(None);
     };
@@ -949,6 +1017,133 @@ mod tests {
         // No code, or one that isn't a number, is not evidence of anything.
         assert!(!is_object_scoped(None));
         assert!(!is_object_scoped(Some("HY000")));
+    }
+
+    /// A driver error carrying a chosen SQLite result code — what the per-object
+    /// read meets from a real database, without needing one that is busy or
+    /// failing I/O on demand.
+    #[derive(Debug)]
+    struct FakeSqliteError(&'static str);
+
+    impl std::fmt::Display for FakeSqliteError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "fake sqlite error {}", self.0)
+        }
+    }
+
+    impl std::error::Error for FakeSqliteError {}
+
+    impl sqlx::error::DatabaseError for FakeSqliteError {
+        fn message(&self) -> &str {
+            "fake"
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.0.into())
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn db_error(code: &'static str) -> ColumnReadError {
+        ColumnReadError::Driver(sqlx::Error::Database(Box::new(FakeSqliteError(code))))
+    }
+
+    fn entry(name: &str, view: bool, virtual_table: bool) -> MasterEntry {
+        MasterEntry {
+            name: name.into(),
+            view,
+            virtual_table,
+        }
+    }
+
+    fn one_column() -> Vec<ColumnMeta> {
+        vec![ColumnMeta {
+            name: "c".into(),
+            type_name: "TEXT".into(),
+            nullable: true,
+            primary_key_position: None,
+            default: None,
+            generated: Generated::Never,
+            type_detail: TypeDetail::Plain,
+        }]
+    }
+
+    /// Runs [`read_each`] over `entries`, failing the read of `failing` with
+    /// whatever `fail` builds and answering one column for everything else.
+    fn read_with_failure(
+        entries: &[MasterEntry],
+        failing: &str,
+        fail: impl Fn() -> ColumnReadError,
+    ) -> Result<ColumnsRead, DbError> {
+        let refs: Vec<&MasterEntry> = entries.iter().collect();
+        let read = |name: String| {
+            let result = if name == failing {
+                Err(fail())
+            } else {
+                Ok(one_column())
+            };
+            std::future::ready(result)
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(read_each(&refs, read))
+    }
+
+    #[test]
+    fn a_view_or_virtual_table_that_cannot_be_resolved_costs_only_itself() {
+        // The failing object comes first, so carrying on past it is tested
+        // too, not just recording it.
+        for failing in [entry("v", true, false), entry("z", false, true)] {
+            let entries = [
+                failing.clone(),
+                entry("t", false, false),
+                entry("w", true, false),
+            ];
+            let (columns, unreadable) =
+                read_with_failure(&entries, &failing.name, || db_error("1")).unwrap();
+            assert_eq!(unreadable, HashSet::from([failing.name.clone()]));
+            assert!(!columns.contains_key(&failing.name));
+            assert!(columns.contains_key("t") && columns.contains_key("w"));
+        }
+    }
+
+    #[test]
+    fn a_failure_that_is_not_the_objects_own_fails_the_whole_read() {
+        let view = [entry("v", true, false), entry("t", false, false)];
+        // The database itself can't be read: BUSY, CORRUPT, IOERR_READ.
+        for code in ["5", "11", "266"] {
+            assert!(
+                read_with_failure(&view, "v", || db_error(code)).is_err(),
+                "code {code} was charged to the view"
+            );
+        }
+        // Not a database error at all.
+        assert!(read_with_failure(&view, "v", || ColumnReadError::Driver(
+            sqlx::Error::PoolTimedOut
+        ))
+        .is_err());
+        // A row that would not decode.
+        assert!(
+            read_with_failure(&view, "v", || ColumnReadError::Decode(DbError::Introspect(
+                "bad row".into()
+            )))
+            .is_err()
+        );
+        // And an ordinary table resolves nothing, so even the generic error is
+        // not its own: something is wrong with the read, not the table.
+        let table = [entry("t", false, false), entry("v", true, false)];
+        assert!(read_with_failure(&table, "t", || db_error("1")).is_err());
     }
 
     #[test]

@@ -186,6 +186,21 @@ async fn sqlite_a_dropped_index_is_missing_rather_than_a_constraint_index() {
         .expect_err("a dropped index has no DDL");
     assert!(err.to_string().contains("no index named idx_t_a"), "{err}");
 
+    // A trigger may share an index's name — triggers have a namespace of their
+    // own — and must not answer for it, even when its row comes first.
+    pool.execute(
+        "CREATE TRIGGER idx_t_b AFTER INSERT ON t BEGIN SELECT 1; END; \
+         CREATE INDEX idx_t_b ON t(b);",
+    )
+    .await
+    .unwrap();
+    let ddl = pool
+        .fetch_ddl(stale, &DdlObject::Index("idx_t_b".into()))
+        .await
+        .unwrap();
+    assert_eq!(ddl.source, DdlSource::Native);
+    assert_eq!(ddl.sql, "CREATE INDEX idx_t_b ON t(b);");
+
     // A name now held by an object of another kind is no index either.
     pool.execute("CREATE TABLE idx_t_a (z INTEGER)")
         .await
