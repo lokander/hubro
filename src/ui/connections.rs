@@ -2260,6 +2260,128 @@ mod tests {
             "prod"
         );
     }
+
+    #[tokio::test]
+    async fn the_memoized_list_follows_every_signal_it_is_built_from() {
+        // The list is a memo, so a signal it should read but only peeks at —
+        // or one read in the render body instead of inside the memo — leaves
+        // the list stale when that signal changes. One step per signal; each
+        // asserts on what the change should put on screen.
+        use std::path::PathBuf;
+
+        use dioxus::core::{spawn_forever, Mutation, VirtualDom};
+
+        use crate::db::{ConnectionRegistry, DbPool};
+        use crate::ui::state::{saved_open_locator, ConnectRequest, Connecting};
+        use crate::ui::test_dom::{listeners, provide_state, texts, type_into};
+
+        let mut dom = VirtualDom::new(ConnectionsScreen);
+        let state = provide_state(&dom);
+        let path = PathBuf::from("/nonexistent/hubro-test/a.db");
+        dom.in_runtime(|| {
+            let mut saved = state.saved;
+            let mut saved = saved.write();
+            saved.create_group("G").unwrap();
+            saved.add(SavedConnection::Sqlite {
+                name: "alpha".into(),
+                path: path.clone(),
+                protection: WriteProtection::Open,
+                color: None,
+                group: Some("G".into()),
+            });
+        });
+        let mounted = dom.rebuild_to_vec().edits;
+        assert!(texts(&mounted).contains(&"alpha"), "{mounted:#?}");
+        let search = listeners(&mounted, "input");
+        assert_eq!(search.len(), 1, "the search box should be the only input");
+        let locator = dom.in_runtime(|| state.saved.peek().entries()[0].locator());
+        let canonical = dom.in_runtime(|| saved_open_locator(&state.saved.peek().entries()[0]));
+
+        // `saved`: the row's marking shows as a badge.
+        dom.in_runtime(|| {
+            let mut saved = state.saved;
+            saved
+                .write()
+                .set_marking(&locator, WriteProtection::Confirm, None);
+        });
+        let edits = dom.render_immediate_to_vec().edits;
+        assert!(
+            texts(&edits).contains(&"confirm writes"),
+            "saved: {edits:#?}"
+        );
+
+        // `open_locators`: the "open" badge — static text, so it shows as
+        // edits; nothing outside the memo reads the list. Each step writes
+        // only its own signal: a second signal the memo reads, written in the
+        // same step, would rebuild the list whether or not this one is read.
+        dom.in_runtime(|| {
+            let pool =
+                DbPool::Sqlite(sqlx::sqlite::SqlitePool::connect_lazy("sqlite::memory:").unwrap());
+            let id = ConnectionRegistry::default().insert("a.db", pool, WriteProtection::Open);
+            let mut open = state.open_locators;
+            open.write().push((id, canonical.clone()));
+        });
+        let edits = dom.render_immediate_to_vec().edits;
+        assert!(
+            !edits.is_empty(),
+            "open_locators: nothing on screen changed"
+        );
+
+        // `connecting`: the row's locator line becomes the connect step.
+        dom.in_runtime(|| {
+            let mut connecting = state.connecting;
+            connecting.write().push(Connecting {
+                locator: canonical.clone(),
+                step: ConnectStep::Opening,
+                visible: true,
+            });
+        });
+        let edits = dom.render_immediate_to_vec().edits;
+        assert!(
+            texts(&edits).contains(&ConnectStep::Opening.label()),
+            "connecting: {edits:#?}"
+        );
+
+        // `connect_requests`: a connect started from the list can be called
+        // off. The Cancel button is all static template, so it shows as
+        // edits rather than text; nothing outside the memo reads the map, so
+        // any edit at all is the memo's.
+        dom.in_runtime(|| {
+            let task = spawn_forever(std::future::pending());
+            let mut requests = state.connect_requests;
+            requests
+                .write()
+                .insert(canonical.clone(), ConnectRequest::for_test(task));
+        });
+        let edits = dom.render_immediate_to_vec().edits;
+        assert!(
+            !edits.is_empty(),
+            "connect_requests: nothing on screen changed"
+        );
+
+        // `collapsed_groups`: folding the group takes its row off screen.
+        dom.in_runtime(|| {
+            let mut collapsed = state.collapsed_groups;
+            collapsed.write().push("G".into());
+        });
+        let edits = dom.render_immediate_to_vec().edits;
+        assert!(
+            edits
+                .iter()
+                .any(|edit| matches!(edit, Mutation::Remove { .. })),
+            "collapsed_groups: {edits:#?}"
+        );
+
+        // `search`: the render body reads it too (the field's value), so an
+        // edit proves nothing here. Only the memo can empty the list, and
+        // only an empty list says nothing matched.
+        type_into(&dom, search[0], "zzz");
+        let edits = dom.render_immediate_to_vec().edits;
+        assert!(
+            texts(&edits).contains(&"No connection matches “zzz”."),
+            "search: {edits:#?}"
+        );
+    }
 }
 
 /// Builds the tunnel config from the SSH form fields — `Ok(None)` when the

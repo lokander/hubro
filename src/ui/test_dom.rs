@@ -6,9 +6,14 @@
 //! components it should — see "Driving can confirm a bug" in
 //! `docs/interactive-testing.md`.
 
+use std::any::Any;
 use std::path::Path;
+use std::rc::Rc;
 
-use dioxus::core::{generation, ScopeId, VirtualDom};
+use dioxus::core::{generation, ElementId, Event, Mutation, ScopeId, VirtualDom};
+use dioxus::html::{
+    set_event_converter, PlatformEventData, SerializedFormData, SerializedHtmlEventConverter,
+};
 
 use super::state::AppState;
 use crate::config::{SavedList, Settings};
@@ -44,4 +49,47 @@ pub(crate) fn total_renders(dom: &VirtualDom) -> usize {
         .filter(|&scope| dom.get_scope(scope).is_some())
         .map(|scope| dom.in_scope(scope, generation))
         .sum()
+}
+
+/// The text `edits` put on screen: every text node they created or changed.
+/// Static text inside an `rsx!` template is not among them — only text that
+/// interpolates a value is.
+pub(crate) fn texts(edits: &[Mutation]) -> Vec<&str> {
+    edits
+        .iter()
+        .filter_map(|edit| match edit {
+            Mutation::CreateTextNode { value, .. } | Mutation::SetText { value, .. } => {
+                Some(value.as_str())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The elements `edits` attached a listener for `event` to (`"input"`, not
+/// `"oninput"`), in mount order.
+pub(crate) fn listeners(edits: &[Mutation], event: &str) -> Vec<ElementId> {
+    edits
+        .iter()
+        .filter_map(|edit| match edit {
+            Mutation::NewEventListener { name, id } if name == event => Some(*id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Delivers an `input` event to `element` as though the user had typed until
+/// the field read `value`. Run [`VirtualDom::render_immediate`] after it to
+/// see what the handler changed.
+///
+/// Events reach a handler through a converter the renderer installs, and a
+/// bare `VirtualDom` has none; this installs the serialized one, which is
+/// process-wide but stateless, so every test that calls this installs the
+/// same thing.
+pub(crate) fn type_into(dom: &VirtualDom, element: ElementId, value: &str) {
+    set_event_converter(Box::new(SerializedHtmlEventConverter));
+    let form = SerializedFormData::new(value.to_string(), Vec::new());
+    let data: Rc<dyn Any> = Rc::new(PlatformEventData::new(Box::new(form)));
+    dom.runtime()
+        .handle_event("input", Event::new(data, true), element);
 }
