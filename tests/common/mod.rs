@@ -1203,6 +1203,96 @@ pub async fn real_round_trip_failures(pool: &DbPool, prefix: &str) -> Vec<String
 }
 
 // ---------------------------------------------------------------------------
+// NaN and infinity: shown by the grid, so typed back through the editor
+// ---------------------------------------------------------------------------
+
+/// Every way a NaN or infinity in a `numeric`, `double precision` or `real`
+/// column fails to go through the cell editor and back — one line each,
+/// empty when none does. Postgres-wire engines only: the others store none.
+///
+/// Builds `{prefix} (k int PRIMARY KEY, n numeric, d double precision,
+/// r real)`. Row 1 holds NaN in every column, and each cell's *shown* text
+/// is committed unchanged through the editor's own parse (`editor_kind` and
+/// `parse_input`, as the grid calls them) and saved: it must save and still
+/// hold NaN. Row 2 holds zeros, and `Infinity`, `-inf` and `nan` are typed
+/// into it the same way; the server must then hold what was typed.
+pub async fn non_finite_edit_failures(pool: &DbPool, prefix: &str) -> Vec<String> {
+    use hubro::db::{apply_staged, detect_row_identity, RowLocator, StagedChange, Value};
+    use hubro::ui::editing::{editor_kind, parse_input};
+    pool.query(&format!("DROP TABLE IF EXISTS {prefix}"))
+        .await
+        .unwrap();
+    pool.query(&format!(
+        "CREATE TABLE {prefix} (k int PRIMARY KEY, n numeric, d double precision, r real)"
+    ))
+    .await
+    .unwrap();
+    pool.query(&format!(
+        "INSERT INTO {prefix} VALUES (1, 'NaN', 'NaN', 'NaN'), (2, 0, 0, 0)"
+    ))
+    .await
+    .unwrap();
+    let tables = pool.introspect().await.unwrap();
+    let table = tables
+        .iter()
+        .find(|t| t.name == prefix)
+        .unwrap_or_else(|| panic!("{prefix} missing from introspection"));
+    let identity = detect_row_identity(table, pool.dialect()).expect("a keyed table");
+    let access = pool.backend_access(table);
+    let shown = pool
+        .query(&format!("SELECT n, d, r FROM {prefix} WHERE k = 1"))
+        .await
+        .unwrap();
+    let mut failures = Vec::new();
+    let edits = ["n", "d", "r"]
+        .iter()
+        .zip(&shown.rows[0])
+        .map(|(column, cell)| (1, *column, cell.display(), "NaN"))
+        .chain([
+            (2, "n", "Infinity".to_string(), "Infinity"),
+            (2, "d", "-inf".to_string(), "-Infinity"),
+            (2, "r", "nan".to_string(), "NaN"),
+        ]);
+    for (k, column, typed, stored) in edits {
+        let meta = table.columns.iter().find(|c| c.name == column).unwrap();
+        let kind = editor_kind(&meta.type_name, &meta.type_detail, Some(pool.dialect()));
+        let value = match parse_input(&kind, pool.dialect(), &typed) {
+            Ok(value) => value,
+            Err(why) => {
+                failures.push(format!(
+                    "{column} = {typed:?}: the editor refused it: {why}"
+                ));
+                continue;
+            }
+        };
+        let change = StagedChange::Update {
+            locator: RowLocator {
+                identity_values: vec![Value::Integer(k)],
+            },
+            column: column.into(),
+            value,
+        };
+        if let Err(e) = apply_staged(pool, &access, table, &identity, &[change]).await {
+            failures.push(format!("{column} = {typed:?}: the save failed: {e}"));
+            continue;
+        }
+        let held = pool
+            .query(&format!(
+                "SELECT {column}::text FROM {prefix} WHERE k = {k}"
+            ))
+            .await
+            .unwrap();
+        if held.rows[0][0] != Value::Text(stored.into()) {
+            failures.push(format!(
+                "{column} = {typed:?}: the server holds {:?}, not {stored}",
+                held.rows[0][0]
+            ));
+        }
+    }
+    failures
+}
+
+// ---------------------------------------------------------------------------
 // The contains filter is a substring search, whatever the needle holds
 // ---------------------------------------------------------------------------
 
