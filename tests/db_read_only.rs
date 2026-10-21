@@ -336,9 +336,9 @@ async fn a_marked_run_that_cannot_open_its_read_only_connection_fails_closed() {
     // the connection it already holds. sqlx hands a finished connection back
     // to the pool from a spawned task, so an acquire that races that return
     // opens a new connection by name instead, and that fails just as the
-    // read-only open did; macOS CI lost this race once. So wait for the
-    // connection to come back rather than reading a lost race as "no
-    // fallback".
+    // read-only open did; CI lost this race under load on macOS and Linux.
+    // So wait for the connection to come back rather than reading a lost
+    // race as "no fallback".
     let mut lost_races = 0;
     while let Err(err) = run_script(&pool, pool.backend_capabilities(), &script, |_| {}).await {
         lost_races += 1;
