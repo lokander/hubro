@@ -36,6 +36,9 @@ dirs = "7"
 # shared copy, and rfd refuses `gtk3` alongside it.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 url = "2"
+# preserve_order: JSON objects keep the key order they arrived in (import
+# preview, json/jsonb cells, the JSON viewer) rather than sorting them; pinned
+# by `a_json_preview_lists_keys_in_the_order_the_file_has_them`.
 serde_json = { version = "1", features = ["preserve_order"] }
 futures-util = { version = "0.3", default-features = false }
 percent-encoding = "2"

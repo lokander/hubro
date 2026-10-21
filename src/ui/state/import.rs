@@ -33,30 +33,43 @@ impl ImportStatus {
     ///
     /// A completed import with skipped rows is deliberately *not* green: it
     /// succeeded, but rows the user expected are missing, and that has to
-    /// read as something to look at rather than as a clean result.
+    /// read as something to look at rather than as a clean result. The same
+    /// goes for values that took their column's default: the table now holds
+    /// something the file did not say.
     pub fn line(&self) -> (String, &'static str) {
         match self {
             ImportStatus::Running { table } => (
                 format!("Importing into {table}…"),
                 "text-slate-500 dark:text-slate-400",
             ),
-            ImportStatus::Done(report) if report.skipped_rows > 0 => (
-                format!(
-                    "Imported {} row{}, skipped {}",
-                    report.inserted_rows,
-                    plural(report.inserted_rows),
-                    report.skipped_rows
-                ),
-                "text-amber-700 dark:text-amber-400",
-            ),
-            ImportStatus::Done(report) => (
-                format!(
+            ImportStatus::Done(report) => {
+                let mut text = format!(
                     "Imported {} row{}",
                     report.inserted_rows,
                     plural(report.inserted_rows)
-                ),
-                "text-emerald-700 dark:text-emerald-400",
-            ),
+                );
+                if report.skipped_rows > 0 {
+                    text.push_str(&format!(", skipped {}", report.skipped_rows));
+                }
+                if report.defaulted_cells > 0 {
+                    text.push_str(&format!(
+                        "; {} empty value{} took {} column's default",
+                        report.defaulted_cells,
+                        plural(report.defaulted_cells),
+                        if report.defaulted_cells == 1 {
+                            "its"
+                        } else {
+                            "their"
+                        }
+                    ));
+                }
+                let color = if report.skipped_rows > 0 || report.defaulted_cells > 0 {
+                    "text-amber-700 dark:text-amber-400"
+                } else {
+                    "text-emerald-700 dark:text-emerald-400"
+                };
+                (text, color)
+            }
             ImportStatus::Failed(err) => (
                 format!("Import failed: {err}"),
                 "text-red-600 dark:text-red-400",
@@ -226,6 +239,7 @@ mod tests {
             inserted_rows: 1,
             skipped: vec![],
             skipped_rows: 0,
+            defaulted_cells: 0,
         });
         assert_eq!(clean.line().0, "Imported 1 row");
         assert!(clean.line().1.contains("emerald"));
@@ -239,10 +253,43 @@ mod tests {
                 reason: "nope".into(),
             }],
             skipped_rows: 1,
+            defaulted_cells: 0,
         });
         assert_eq!(partial.line().0, "Imported 3 rows, skipped 1");
         assert!(partial.line().1.contains("amber"), "{}", partial.line().1);
         assert_eq!(partial.report().map(|r| r.skipped.len()), Some(1));
+
+        // Values the file left empty that took their column's default are
+        // counted, and keep the line off green: the table holds something the
+        // file did not say.
+        let defaulted = ImportStatus::Done(ImportReport {
+            inserted_rows: 5,
+            skipped: vec![],
+            skipped_rows: 0,
+            defaulted_cells: 4,
+        });
+        assert_eq!(
+            defaulted.line().0,
+            "Imported 5 rows; 4 empty values took their column's default"
+        );
+        assert!(
+            defaulted.line().1.contains("amber"),
+            "{}",
+            defaulted.line().1
+        );
+        let one = ImportStatus::Done(ImportReport {
+            inserted_rows: 2,
+            skipped: vec![SkippedRow {
+                line: 3,
+                reason: "nope".into(),
+            }],
+            skipped_rows: 1,
+            defaulted_cells: 1,
+        });
+        assert_eq!(
+            one.line().0,
+            "Imported 2 rows, skipped 1; 1 empty value took its column's default"
+        );
 
         let failed = ImportStatus::Failed("line 4: nope".into());
         assert!(failed.line().0.starts_with("Import failed:"));

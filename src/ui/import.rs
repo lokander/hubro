@@ -12,7 +12,11 @@
 //!
 //! - **empty fields** become NULL or an empty string ([`EmptyField`]) — CSV
 //!   cannot tell the two apart, and silently picking one is how an import
-//!   quietly rewrites every blank cell;
+//!   quietly rewrites every blank cell. "NULL" says outright that a NOT NULL
+//!   column with a default takes the default instead, because that is the
+//!   one place the choice rewrites a value: an exported `''` in such a column
+//!   comes back as the default unless "empty string" is chosen. The status
+//!   line then counts how many values that happened to;
 //! - **a row that can't be imported** aborts everything or is skipped and
 //!   reported ([`ErrorMode`]). Abort is the default and the safe one; skip is
 //!   a decision made here, before starting, because a half-imported table
@@ -312,7 +316,7 @@ pub fn ImportDialog(
                                 option {
                                     value: "null",
                                     selected: empty_field() == EmptyField::Null,
-                                    "become NULL"
+                                    "become NULL (or the column's default where NULL isn't allowed)"
                                 }
                                 option {
                                     value: "text",
