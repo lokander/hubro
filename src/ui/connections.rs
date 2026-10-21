@@ -2239,6 +2239,97 @@ mod tests {
         assert!(!asks_remember("entra-mi"));
     }
 
+    /// `code` with comment lines dropped, string-literal contents removed and
+    /// whitespace collapsed: what a pin about code should read.
+    fn code_without_prose(code: &str) -> String {
+        let code: String = code
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut out = String::new();
+        let (mut in_string, mut escaped) = (false, false);
+        for ch in code.chars() {
+            if in_string {
+                match (escaped, ch) {
+                    (true, _) => escaped = false,
+                    (false, '\\') => escaped = true,
+                    (false, '"') => {
+                        in_string = false;
+                        out.push(ch);
+                    }
+                    _ => {}
+                }
+            } else {
+                in_string = ch == '"';
+                out.push(ch);
+            }
+        }
+        out.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn the_form_reads_its_remember_box_only_where_it_renders_it() {
+        // The submit reads the box only where `asks_remember` says it is
+        // shown. That is only an answer if the box *is* shown there: a render
+        // gate turned round hides it under password auth, and its default tick
+        // then stores the password and the passphrase unasked — with every
+        // other test green. So each form renders it once, inside that gate.
+        let source = include_str!("connections.rs");
+        for form in ["fn PostgresForm(", "fn SqlServerForm("] {
+            let body: Vec<&str> = source
+                .lines()
+                .skip_while(|line| line.trim() != form)
+                .take_while(|line| line.trim_end() != "}")
+                .collect();
+            let code = code_without_prose(&body.join("\n"));
+            let gate = "if asks_remember(&auth_mode()) { label {";
+            assert_eq!(
+                code.matches(gate).count(),
+                1,
+                "{form}: the box's gate: {code}"
+            );
+            assert_eq!(
+                code.matches("remember()").count(),
+                1,
+                "{form}: the box is read somewhere besides its own `checked:`: {code}"
+            );
+            // The gate's block, by brace matching, holds the box.
+            let at = code.find(gate).unwrap() + gate.len() - "label {".len();
+            let mut depth = 0usize;
+            let mut end = code.len();
+            for (offset, ch) in code[at..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            end = at + offset;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                code[at..end].contains("checked: remember(),"),
+                "{form}: the box is rendered outside the gate its answer is read \
+                 under: {code}"
+            );
+        }
+        // And the submit's producer is the only read of the forms' box.
+        let shipped: String = source
+            .lines()
+            .take_while(|line| line.trim() != "#[cfg(test)]")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let shipped = code_without_prose(&shipped);
+        assert_eq!(shipped.matches("form.remember").count(), 1, "{shipped}");
+        assert!(shipped.contains(
+            "let remember_choice = asks_remember(&form.auth_mode.peek()).then(|| *form.remember.peek());"
+        ));
+    }
+
     #[test]
     fn an_embedded_password_is_only_taken_from_a_pasted_url() {
         // Field mode: the password field is the only source, even if the
