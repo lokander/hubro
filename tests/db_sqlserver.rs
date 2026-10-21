@@ -2739,3 +2739,93 @@ async fn sqlserver_a_real_reads_as_its_shortest_decimal_and_writes_back_unchange
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     pool.close().await;
 }
+
+#[tokio::test]
+async fn sqlserver_atomic_script_that_ends_hubros_transaction_is_not_reported_rolled_back() {
+    // A batch is one statement, so a COMMIT inside it is not seen as the
+    // script managing its own transaction and the script is wrapped in
+    // hubro's. Measured before the fix: every case below was reported
+    // `Rollback::Full` — "no changes were applied" — with rows in the table.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.ended_tx",
+            "DROP PROCEDURE IF EXISTS dbo.ended_tx_commit",
+            "CREATE TABLE dbo.ended_tx (a int)",
+        ],
+    )
+    .await;
+    mssql_script(&pool, "CREATE PROCEDURE dbo.ended_tx_commit AS COMMIT")
+        .await
+        .unwrap();
+    let insert = |n| format!("INSERT INTO dbo.ended_tx VALUES ({n})");
+    let cases = [
+        // Error 266 after the COMMIT took effect; nothing left to roll back.
+        (
+            format!("{}\nCOMMIT\nGO\n{}", insert(1), insert(2)),
+            0,
+            vec![1],
+            Rollback::None,
+        ),
+        // The same through a procedure, which no reading of the text can see.
+        (
+            format!(
+                "{}\nGO\nEXEC dbo.ended_tx_commit\nGO\n{}",
+                insert(1),
+                insert(2)
+            ),
+            1,
+            vec![1],
+            Rollback::None,
+        ),
+        // No error at all: the batch put a transaction back in place of
+        // hubro's, and a later failure rolls back only that one.
+        (
+            format!(
+                "{}\nCOMMIT\nBEGIN TRAN\nGO\n{}\nGO\nSELECT * FROM dbo.no_such_table",
+                insert(1),
+                insert(2)
+            ),
+            2,
+            vec![1],
+            Rollback::OpenTransaction(OpenTransaction {
+                schema_changes_kept: false,
+            }),
+        ),
+        // Control: hubro's own transaction is still the one rolled back.
+        (
+            format!("{}\nGO\nSELECT * FROM dbo.no_such_table", insert(1)),
+            1,
+            vec![],
+            Rollback::Full,
+        ),
+    ];
+    for (sql, failed_at, kept, rollback) in cases {
+        run_all(&pool, &["DELETE FROM dbo.ended_tx"]).await;
+        let err = mssql_script(&pool, &sql).await.unwrap_err();
+        let rows = pool
+            .query("SELECT a FROM dbo.ended_tx ORDER BY a")
+            .await
+            .unwrap();
+        let kept: Vec<Vec<Value>> = kept.into_iter().map(|n| vec![Value::Integer(n)]).collect();
+        assert_eq!(rows.rows, kept, "{sql:?}");
+        assert_eq!(
+            (err.statement_index, err.rollback),
+            (failed_at, rollback),
+            "{sql:?}: {}",
+            err.error
+        );
+        assert_eq!(mssql_open_transactions(&pool).await, Vec::<Value>::new());
+    }
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE dbo.ended_tx",
+            "DROP PROCEDURE dbo.ended_tx_commit",
+        ],
+    )
+    .await;
+    pool.close().await;
+}

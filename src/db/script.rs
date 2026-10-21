@@ -18,7 +18,8 @@ use std::ops::Range;
 use super::caps::{self, Capabilities};
 use super::error::DbError;
 use super::registry::{
-    engine_enforces_read_only, DbPool, ReadOnlyRun, MAX_QUERY_ROWS, PLAN_CELL_CAP, QUERY_CELL_CAP,
+    engine_enforces_read_only, DbPool, ReadOnlyRun, RolledBack, MAX_QUERY_ROWS, PLAN_CELL_CAP,
+    QUERY_CELL_CAP,
 };
 use super::sql::Dialect;
 use super::value::QueryResult;
@@ -1522,8 +1523,10 @@ pub struct StatementResult {
 /// data but not the schema was reported as if it had covered everything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rollback {
-    /// Nothing was undone. The sequential autocommit path, or a failure
-    /// before the transaction opened — statements before the failure stand.
+    /// Nothing was undone. The sequential autocommit path, a failure before
+    /// the transaction opened, or one after hubro's transaction had already
+    /// ended ([`RolledBack::Nothing`]) — statements before the failure stand
+    /// unless the server undid them.
     None,
     /// Everything the script had run was undone.
     Full,
@@ -1540,7 +1543,9 @@ pub enum Rollback {
     ExceptSchemaChanges,
     /// The script had opened a transaction of its own (`BEGIN`) and failed
     /// inside it, and hubro rolled that transaction back when the run ended.
-    /// Only the sequential path, which runs such scripts, reports it.
+    /// The sequential path, which runs such scripts, reports it, and so does
+    /// the atomic path when a SQL Server batch committed hubro's transaction
+    /// and opened another ([`RolledBack::Another`]).
     ///
     /// What the rollback covered is the script's transaction, not the
     /// script: statements before its `BEGIN`, and anything it had committed,
@@ -2007,14 +2012,19 @@ async fn run_script_atomic(
                 truncated,
             }),
             Err(error) => {
-                tx.rollback().await;
+                let found = tx.rollback().await;
                 return Err(ScriptError {
                     statement_index,
                     preview: statement_preview(statement),
                     error,
                     // Only what ran can have escaped the rollback — a schema
                     // change later in the script never reached the server.
-                    rollback: rollback_cover(caps, pool.dialect(), &statements[..=statement_index]),
+                    rollback: atomic_rollback(
+                        caps,
+                        pool.dialect(),
+                        &statements[..=statement_index],
+                        found,
+                    ),
                 });
             }
         }
@@ -2033,6 +2043,29 @@ async fn run_script_atomic(
         });
     }
     Ok(())
+}
+
+/// What a failed atomic run reports its rollback covered, given what
+/// [`ScriptTx::rollback`](super::registry::ScriptTx::rollback) found open.
+/// Only hubro's own transaction is [`rollback_cover`]'s to judge; a SQL Server
+/// batch can commit it from inside (`INSERT … COMMIT`, an `EXEC`'d procedure),
+/// and saying "no changes were applied" then hides rows that are in the table.
+fn atomic_rollback(
+    caps: Capabilities,
+    dialect: Dialect,
+    ran: &[String],
+    found: RolledBack,
+) -> Rollback {
+    match found {
+        RolledBack::Own => rollback_cover(caps, dialect, ran),
+        // Committed, then reopened (`… COMMIT BEGIN TRAN`): only the script's
+        // transaction was undone, as the sequential path reports one.
+        RolledBack::Another => Rollback::OpenTransaction(OpenTransaction {
+            schema_changes_kept: rollback_cover(caps, dialect, ran)
+                == Rollback::ExceptSchemaChanges,
+        }),
+        RolledBack::Nothing => Rollback::None,
+    }
 }
 
 /// Whether a script should run atomically in one transaction. Only when the
@@ -4253,6 +4286,36 @@ mod tests {
         assert_eq!(
             rollback_cover(escapes, Dialect::Postgres, &failing_ddl[..=1]),
             Rollback::ExceptSchemaChanges
+        );
+    }
+
+    #[test]
+    fn an_atomic_rollback_claims_only_what_it_found_open() {
+        let ran = stmts(&[
+            "INSERT INTO t VALUES (1)\nCOMMIT",
+            "INSERT INTO t VALUES (2)",
+        ]);
+        let at = |found| atomic_rollback(Capabilities::FULL, Dialect::SqlServer, &ran, found);
+        assert_eq!(at(RolledBack::Own), Rollback::Full);
+        // The script committed hubro's transaction: "no changes were applied"
+        // would hide what it committed.
+        assert_eq!(at(RolledBack::Nothing), Rollback::None);
+        assert_eq!(
+            at(RolledBack::Another),
+            Rollback::OpenTransaction(OpenTransaction {
+                schema_changes_kept: false
+            })
+        );
+        let escapes = Capabilities {
+            transactional_ddl: false,
+            ..Capabilities::FULL
+        };
+        let ddl = stmts(&["CREATE TABLE t (a int)\nCOMMIT BEGIN TRAN", "SELECT 1/0"]);
+        assert_eq!(
+            atomic_rollback(escapes, Dialect::SqlServer, &ddl, RolledBack::Another),
+            Rollback::OpenTransaction(OpenTransaction {
+                schema_changes_kept: true
+            })
         );
     }
 

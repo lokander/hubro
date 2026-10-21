@@ -39,6 +39,7 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt as _};
 use super::{column_infos, decode_row};
 use crate::db::error::DbError;
 use crate::db::export::{export_io_err, ExportFormat, ExportSink};
+use crate::db::registry::RolledBack;
 use crate::db::script::{
     final_read_may_close, statement_needs, tsql_is_transaction_control, tsql_leads_own_batch,
 };
@@ -1075,6 +1076,10 @@ async fn rollback_on(conn: &mut PooledConn, already_fatal: bool) {
 pub struct MssqlTx {
     conn: PooledConn,
     resolved: bool,
+    /// `CURRENT_TRANSACTION_ID()` once `BEGIN TRAN` ran: [`rollback_tx`]
+    /// compares it to tell this transaction from one a script opened after
+    /// committing it.
+    id: i64,
 }
 
 impl Drop for MssqlTx {
@@ -1087,12 +1092,18 @@ impl Drop for MssqlTx {
 
 /// Opens a script transaction on a dedicated pooled connection.
 pub async fn begin_tx(pool: &MssqlPool) -> Result<MssqlTx, DbError> {
+    const BEGIN: &str = "BEGIN TRAN; SELECT CURRENT_TRANSACTION_ID()";
     let mut conn = pool.acquire().await?;
-    let begin = run_batch(conn.client(), "BEGIN TRAN").await;
-    settle(&mut conn, begin, "BEGIN TRAN")?;
+    let begin = async {
+        let row = conn.client().simple_query(BEGIN).await?.into_row().await?;
+        Ok::<_, TdsError>(row.and_then(|row| row.get::<i64, _>(0)).unwrap_or(0))
+    }
+    .await;
+    let id = settle(&mut conn, begin, BEGIN)?;
     Ok(MssqlTx {
         conn,
         resolved: false,
+        id,
     })
 }
 
@@ -1156,22 +1167,55 @@ pub async fn commit_tx(mut tx: MssqlTx) -> Result<(), DbError> {
     }
 }
 
-/// Rolls a script transaction back. Best-effort: a rollback failure discards
-/// the connection, which rolls the transaction back server-side anyway. On a
-/// connection an earlier fatal failure already discarded this is a no-op
-/// success — the server rolls the abandoned transaction back when the dead
-/// connection goes away (the script runner rolls back unconditionally after
-/// any statement error, so this path must not panic).
-pub async fn rollback_tx(mut tx: MssqlTx) {
+/// Rolls a script transaction back, and says whether what it rolled back was
+/// still hubro's transaction. A statement can end it from inside the batch:
+/// measured, `INSERT … COMMIT` (or an `EXEC`'d procedure that commits) fails
+/// with error 266 after its `COMMIT` took effect, and `… COMMIT BEGIN TRAN`
+/// raises nothing and leaves a new transaction in its place.
+///
+/// Best-effort: a rollback failure discards the connection, which rolls the
+/// transaction back server-side anyway. On a connection an earlier fatal
+/// failure already discarded this is a no-op — the server rolls the abandoned
+/// transaction back when the dead connection goes away (the script runner
+/// rolls back unconditionally after any statement error, so this path must
+/// not panic).
+pub async fn rollback_tx(mut tx: MssqlTx) -> RolledBack {
     if tx.conn.is_discarded() {
         tx.resolved = true;
-        return;
+        // shortcut: assumes the dead session still held hubro's transaction;
+        // whether a script had ended it can no longer be asked.
+        return RolledBack::Own;
     }
-    let rollback = run_batch(tx.conn.client(), "IF @@TRANCOUNT > 0 ROLLBACK TRAN").await;
-    if rollback.is_ok() {
-        tx.resolved = true;
+    // A plain batch, as any statement that changes `@@TRANCOUNT` must be.
+    let rollback = format!(
+        "DECLARE @found int = CASE WHEN @@TRANCOUNT = 0 THEN 0 \
+         WHEN CURRENT_TRANSACTION_ID() = {} THEN 1 ELSE 2 END; \
+         IF @@TRANCOUNT > 0 ROLLBACK TRAN; SELECT @found",
+        tx.id
+    );
+    let found = async {
+        let row = tx
+            .conn
+            .client()
+            .simple_query(&rollback)
+            .await?
+            .into_row()
+            .await?;
+        Ok::<_, TdsError>(row.and_then(|row| row.get::<i32, _>(0)))
     }
-    // On error the Drop impl discards the connection.
+    .await;
+    match found {
+        Ok(found) => {
+            tx.resolved = true;
+            match found {
+                Some(0) => RolledBack::Nothing,
+                Some(2) => RolledBack::Another,
+                _ => RolledBack::Own,
+            }
+        }
+        // The Drop impl discards the connection.
+        Err(_) => RolledBack::Own,
+    }
 }
 
 /// One pooled connection held for a whole script that runs outside hubro's
@@ -1681,6 +1725,7 @@ mod tests {
                 _permit: permit,
             },
             resolved: false,
+            id: 0,
         }
     }
 
@@ -1688,7 +1733,7 @@ mod tests {
     async fn rollback_of_a_discarded_tx_is_a_noop_not_a_panic() {
         // The server rolls the abandoned transaction back when the dead
         // connection goes away; client-side there is nothing left to do.
-        rollback_tx(discarded_tx()).await;
+        assert_eq!(rollback_tx(discarded_tx()).await, RolledBack::Own);
     }
 
     #[tokio::test]
