@@ -51,8 +51,10 @@ pub enum DbError {
     /// authentication switched off on the server, and a pooler such as
     /// pgbouncer refusing on the server's behalf, are expected to look the
     /// same but were not measured. These are known residuals of deciding on
-    /// the wire, where they cannot be told apart from a wrong password. SQL Server's error 4060 ("Cannot open database … requested by
-    /// the login. The login failed.") is the case that made this a variant:
+    /// the wire, where they cannot be told apart from a wrong password.
+    ///
+    /// SQL Server's error 4060 ("Cannot open database … requested by the
+    /// login. The login failed.") is the case that made this a variant:
     /// it is sent for a database that does not exist, is offline or
     /// restoring, or that this login may not open — measured, all four — and
     /// only *after* the password was accepted. A wrong password together with

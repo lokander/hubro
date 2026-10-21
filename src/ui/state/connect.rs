@@ -3275,8 +3275,14 @@ mod tests {
 
     /// `line` without a trailing `//` comment. A `//` inside a string literal
     /// (a URL) is kept: it counts as a comment only where the quotes before it
-    /// are balanced. Approximate — escaped quotes are skipped, char literals
-    /// are not handled — which is enough for the shipped code it reads.
+    /// are balanced. Approximate — escaped quotes and the `'"'` char literal
+    /// are skipped, but quotes are tracked per line, so a continuation line of
+    /// a multi-line string that holds `//` is cut there.
+    ///
+    /// **It fails open.** Cutting too much drops real code, which weakens the
+    /// must-not-contain checks it feeds (nothing outside the gate, no message
+    /// text under `src/ui`) instead of tripping them; the ordered and verbatim
+    /// pins would fail loudly. Enough for the shipped code it reads today.
     fn strip_trailing_comment(line: &str) -> &str {
         let bytes = line.as_bytes();
         let mut in_string = false;
@@ -3284,6 +3290,7 @@ mod tests {
         while i < bytes.len() {
             match bytes[i] {
                 b'\\' if in_string => i += 1,
+                b'\'' if !in_string && bytes.get(i + 1..i + 3) == Some(b"\"'") => i += 2,
                 b'"' => in_string = !in_string,
                 b'/' if !in_string && bytes.get(i + 1) == Some(&b'/') => return &line[..i],
                 _ => {}
@@ -3329,6 +3336,44 @@ mod tests {
                 !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
             })
             .count()
+    }
+
+    /// How many occurrences of `call` (ending in `(`) in collapsed `code` build
+    /// a value rather than match one. A pattern is `(_)`, the declaration's
+    /// `(String)`, or a binding followed by `=>` or `|`.
+    fn constructions_of(code: &str, call: &str) -> usize {
+        code.match_indices(call)
+            .filter(|(at, _)| {
+                let rest = &code[at + call.len()..];
+                let Some(close) = rest.find(')') else {
+                    return true;
+                };
+                let (arg, after) = (rest[..close].trim(), rest[close + 1..].trim_start());
+                let pattern = arg == "_"
+                    || arg == "String"
+                    || after.starts_with("=>")
+                    || after.starts_with('|');
+                !pattern
+            })
+            .count()
+    }
+
+    /// Whether `code` rebinds `ident`: `let ident`, `let mut ident`, or an
+    /// assignment `ident = …` (not `==`).
+    fn rebinds(code: &str, ident: &str) -> bool {
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+        code.match_indices(ident).any(|(at, _)| {
+            let before = &code[..at];
+            let after = &code[at + ident.len()..];
+            if before.chars().next_back().is_some_and(is_ident)
+                || after.chars().next().is_some_and(is_ident)
+            {
+                return false;
+            }
+            before.ends_with("let ")
+                || before.ends_with("let mut ")
+                || (after.trim_start().starts_with('=') && !after.trim_start().starts_with("=="))
+        })
     }
 
     /// Every `.rs` file under `src/`, as `(path relative to src, contents)`.
@@ -3415,36 +3460,39 @@ mod tests {
         }
 
         // 1b. Built nowhere else in the shipped code: those two constructions
-        //     are every occurrence outside error.rs, and error.rs holds only
-        //     the declaration and the three match arms — no `From` that
-        //     would build it from a driver error.
-        let mut outside = Vec::new();
+        //     are every construction in src/, error.rs included — no `From`
+        //     that would build it from a driver error. Match arms and the
+        //     declaration are patterns, not constructions, and are fine
+        //     anywhere.
+        let mut built = Vec::new();
         for (rel, text) in &sources {
             let code = collapsed(&code_only(&shipped(text)));
-            let n = code.matches("CredentialsRejected(").count();
-            if rel == "db/error.rs" {
-                for arm in [
-                    "CredentialsRejected(String),",
-                    "| DbError::CredentialsRejected(m) => m,",
-                    "matches!(self, DbError::CredentialsRejected(_))",
-                    "DbError::Connect(m) | DbError::CredentialsRejected(m) => {",
-                ] {
-                    assert!(code.contains(arm), "error.rs no longer has `{arm}`");
-                }
-                assert_eq!(n, 4, "error.rs builds or matches CredentialsRejected anew");
-            } else if n > 0 {
-                outside.push((rel.clone(), n));
+            let n = constructions_of(&code, "CredentialsRejected(");
+            if n > 0 {
+                built.push((rel.clone(), n));
             }
         }
-        outside.sort();
+        built.sort();
         assert_eq!(
-            outside,
+            built,
             vec![
                 ("db/postgres.rs".to_string(), 1),
                 ("db/sqlserver/pool.rs".to_string(), 1)
             ],
-            "CredentialsRejected is built outside the two code-reading classifiers"
+            "CredentialsRejected is constructed outside the two code-reading \
+             classifiers. A new match arm is not counted here; if this is one the \
+             pattern check in `constructions_of` missed, teach it the shape"
         );
+        // And the patterns error.rs needs are still there.
+        let error_rs = file("db/error.rs");
+        for arm in [
+            "CredentialsRejected(String),",
+            "| DbError::CredentialsRejected(m) => m,",
+            "matches!(self, DbError::CredentialsRejected(_))",
+            "DbError::Connect(m) | DbError::CredentialsRejected(m) => {",
+        ] {
+            assert!(error_rs.contains(arm), "error.rs no longer has `{arm}`");
+        }
 
         // 2. The registry passes the error through untouched — each body as
         //    written, so no `map_err`, `or_else` or `match` can remap it.
@@ -3467,7 +3515,13 @@ mod tests {
                  Ok(DbPool::SqlServer( sqlserver::open_mssql_with(url, auth, tls_host).await?, )) }",
             ),
         ] {
-            assert_eq!(method_body(&registry, open), body, "{open} changed");
+            assert_eq!(
+                method_body(&registry, open),
+                body,
+                "{open} changed. If the change is deliberate and still returns the \
+                 driver's DbError untouched, update the pin in \
+                 the_credentials_rejected_signal_survives_every_hop_to_the_keyring_delete"
+            );
         }
 
         // 3. So does `ServerBackend::open`, as written.
@@ -3482,16 +3536,27 @@ mod tests {
              DbPool::open_mssql_with(&url, &auth, tls_host).await } _ => { \
              debug_assert!(aad_token.is_none(), \"a Postgres token belongs in the URL\"); \
              DbPool::open_postgres(&url).await } } }",
-            "ServerBackend::open changed — it may be remapping the error"
+            "ServerBackend::open changed — it may be remapping the error. If the \
+             change is deliberate and still returns the driver's DbError untouched, \
+             update the pin in \
+             the_credentials_rejected_signal_survives_every_hop_to_the_keyring_delete"
         );
 
         // 4. `connect_server`: the decision's inputs and its consequence, in
-        //    order. The credential and the flag come from one call, the open
-        //    gets that credential, the verdict gets that flag, and the delete
-        //    gets the connection's own key.
+        //    order, from the reads to the delete. The password is read under
+        //    the connection's own key — session memory, then the keyring —
+        //    the credential and the flag come from one call, the open gets
+        //    that credential, the verdict gets that flag, and the delete gets
+        //    the key the password was read under. Read key and delete key
+        //    are both `url`, which nothing in the method rebinds: read under
+        //    another key (the SSH passphrase's, say) and a refusal of that
+        //    secret would delete the database password.
         let connect = method_body(&source, "pub async fn connect_server(");
         let mut from = 0;
         for step in [
+            "let mut session_password = self.session_passwords.read().get(&url).cloned();",
+            "if session_password.is_none() {",
+            "session_password = crate::secrets::get_password_async(url.clone())",
             "let (credential, had_password) = remembered_credential(session_password.as_deref());",
             ".open(&connect_url, credential, tls_host.as_deref())",
             "if let Err(err) = &result {",
@@ -3504,17 +3569,34 @@ mod tests {
             });
             from += at + step.len();
         }
-        // Each input bound once and used once — a rebinding (`let had_password
-        // = true`, a second `credential`) adds an occurrence.
+        assert!(
+            !rebinds(&connect, "url"),
+            "connect_server rebinds `url`, so the key the password is read under \
+             and the key it is deleted under may no longer be the same"
+        );
+        for read in ["session_passwords.read()", "get_password_async("] {
+            assert_eq!(
+                connect.matches(read).count(),
+                1,
+                "connect_server reads a remembered secret a second way (`{read}`)"
+            );
+        }
+        // Each input bound once and used as written — a rebinding (`let
+        // had_password = true`, a second `credential`, a `result.map_err`
+        // between the open and the verdict) adds an occurrence.
         for (ident, uses) in [
             ("had_password", 2),
             ("credential", 2),
             ("session_password", 4),
+            ("result", 3),
+            ("err", 3),
         ] {
             assert_eq!(
                 ident_count(&connect, ident),
                 uses,
-                "`{ident}` is bound or used somewhere new in connect_server"
+                "`{ident}` is bound or used somewhere new in connect_server. If the \
+                 new use is deliberate and does not rebind or remap it, raise the \
+                 count in the_credentials_rejected_signal_survives_every_hop_to_the_keyring_delete"
             );
         }
         assert!(
@@ -3529,7 +3611,8 @@ mod tests {
         assert_eq!(
             ident_count(&verdict, "retry"),
             2,
-            "the verdict is rebound or overridden before the gate:\n{verdict}"
+            "the verdict is rebound or overridden before the gate. If the new use \
+             is deliberate and does not rebind it, raise the count:\n{verdict}"
         );
         let gate = method_body(
             &verdict,
@@ -3539,7 +3622,8 @@ mod tests {
             gate,
             "if retry == PasswordRetry::ForgetStoredAndPrompt { \
              self.forget_stale_secret(url.clone(), err.to_string()).await; }",
-            "the gate holds something other than the one delete"
+            "the gate holds something other than the one delete. If the change is \
+             deliberate and still deletes only under `url`, update the pin"
         );
         let outside_gate = connect.replacen(&gate, "", 1);
         for delete in [
@@ -3580,7 +3664,8 @@ mod tests {
             for words in ["authentication failed", "login failed"] {
                 assert!(
                     !code.contains(words),
-                    "src/{rel} names `{words}` in code — a decision on message text"
+                    "src/{rel} names `{words}` in code — a decision on, or a display \
+                     of, message text. If it is only displayed, allow-list it here"
                 );
             }
         }
