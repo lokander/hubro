@@ -451,8 +451,8 @@ impl ParamSql {
     /// values (the editor stages rich Postgres types as text)
     /// coerce to the column type instead of failing the bind-type check.
     ///
-    /// **Under a cast every value binds as text** ([`cast_text`]), whatever
-    /// [`Value`] it is, and the cast parses it. sqlx caches a prepared
+    /// **On Postgres, under a cast every value binds as text**
+    /// ([`cast_text`]), whatever [`Value`] it is, and the cast parses it. sqlx caches a prepared
     /// statement by its SQL text alone, with the parameter types of its first
     /// execution, and the cast — part of the text — is decided by the
     /// *column*, while a typed bind would be decided by the *value*. The cell
@@ -464,6 +464,9 @@ impl ParamSql {
     /// message"), or — silently — a float's bits read as an `int8`, landing a
     /// jump on an empty page and writing a wrong number. A text bind under a
     /// cast is one type for every value, so one statement is one bind shape.
+    /// Gated on the dialect, not on there being a cast: it rests on sqlx's
+    /// Postgres cache and Postgres's text input functions, and a cast another
+    /// dialect gains ([`column_cast`]) keeps its typed bind.
     ///
     /// The same rendering applies in WHERE key clauses: `col = NULL` is
     /// never true, so a NULL identity value matches nothing and the
@@ -474,10 +477,13 @@ impl ParamSql {
             return "NULL".to_string();
         }
         match cast {
-            // `cast` is only ever `Some` when [`cast_targets`] decided this
-            // dialect needs one (never on SQLite or SQL Server).
+            // `cast` comes from [`column_cast`], the one place that decides
+            // whether a column's binds carry one.
             Some(cast) => {
-                self.values.push(Value::Text(cast_text(value)));
+                self.values.push(match self.dialect {
+                    Dialect::Postgres => Value::Text(cast_text(value)),
+                    Dialect::Sqlite | Dialect::SqlServer => value.clone(),
+                });
                 let placeholder = self.dialect.placeholder(self.values.len());
                 self.dialect.cast_expr(&placeholder, cast)
             }
@@ -531,16 +537,27 @@ fn float_spelling(wide: f64) -> String {
 /// SET/key value. A column absent from the map (not castable, not
 /// introspected at all, or any non-Postgres dialect — SQLite's type
 /// affinity coerces on its own) binds its placeholder uncast, exactly as
-/// before.
+/// before. Each entry is [`column_cast`]'s answer.
 pub(super) fn cast_targets(table: &TableMeta, dialect: Dialect) -> HashMap<&str, String> {
-    if dialect != Dialect::Postgres {
-        return HashMap::new();
-    }
     table
         .columns
         .iter()
-        .filter_map(|column| cast_target(column).map(|cast| (column.name.as_str(), cast)))
+        .filter_map(|column| column_cast(column, dialect).map(|cast| (column.name.as_str(), cast)))
         .collect()
+}
+
+/// The cast a value bound against `column` carries on `dialect`, or `None`
+/// for an uncast placeholder — the one decision every bound position takes
+/// its cast from: SETs and inserts (through [`cast_targets`]), the import,
+/// and key predicates ([`key_equality_sql`]), so a column cannot be cast in
+/// one of them and not in another. Only Postgres casts today
+/// ([`cast_target`]); SQLite's type affinity coerces on its own, and SQL
+/// Server converts a parameter implicitly.
+pub(super) fn column_cast(column: &ColumnMeta, dialect: Dialect) -> Option<String> {
+    match dialect {
+        Dialect::Postgres => cast_target(column),
+        Dialect::Sqlite | Dialect::SqlServer => None,
+    }
 }
 
 /// The Postgres cast target for one column's bound parameters, derived from
@@ -824,7 +841,7 @@ pub(super) fn equalities_where(terms: &[KeyEquality], dialect: Dialect) -> (Stri
 
 /// `"column" = $n::cast` for one key value against the column `meta`
 /// describes — the one rendering every key predicate shares. The column
-/// decides both the cast ([`cast_target`], Postgres only) and the spelling
+/// decides both the cast ([`column_cast`]) and the spelling
 /// ([`key_spelling`]); a column hubro has no metadata for binds the value
 /// as it is.
 fn key_equality_sql(
@@ -834,9 +851,7 @@ fn key_equality_sql(
     params: &mut ParamSql,
 ) -> String {
     let dialect = params.dialect;
-    let cast = meta
-        .filter(|_| dialect == Dialect::Postgres)
-        .and_then(cast_target);
+    let cast = meta.and_then(|meta| column_cast(meta, dialect));
     let value = match meta {
         Some(meta) => key_spelling(meta, dialect, value),
         None => Cow::Borrowed(value),
@@ -1486,6 +1501,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(statements[0].params, [Value::Real(1.5), Value::Integer(2)]);
+        // The text bind is Postgres's rule, not a cast's: a cast on another
+        // dialect keeps the value typed.
+        for dialect in [Dialect::SqlServer, Dialect::Sqlite] {
+            let mut params = ParamSql::new(dialect);
+            params.value_sql(&Value::Real(1.5), Some("real"));
+            assert_eq!(params.into_values(), [Value::Real(1.5)], "{dialect:?}");
+        }
+        let mut params = ParamSql::new(Dialect::Postgres);
+        params.value_sql(&Value::Real(1.5), Some("real"));
+        assert_eq!(params.into_values(), [Value::Text("1.5e0".into())]);
     }
 
     #[test]
