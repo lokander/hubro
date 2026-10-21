@@ -89,8 +89,27 @@ impl AppState {
         if session.tabs.is_empty() {
             return;
         }
-        // Snapshot the saved list in canonical open-locator form up front.
         let saved: Vec<SavedConnection> = self.saved.read().entries().to_vec();
+        self.restore_tabs(&session, &saved, move |connection| {
+            self.connects_silently(connection)
+        });
+    }
+
+    /// Plans and starts the restore of `session`'s tabs, asking `ready`
+    /// whether each server connection can sign in without a prompt.
+    ///
+    /// SQLite tabs start at once. Each server tab waits only on its own
+    /// `ready` — a keyring read — in a task of its own, so a keyring that is
+    /// slow to answer (a locked wallet waiting on its unlock dialog) holds up
+    /// that tab and nothing else: not the local files, not the other servers,
+    /// not the command-line target. It used to be asked about every saved
+    /// server connection, one after another, before any tab started. Saved
+    /// connections the session never had open are not asked about at all.
+    pub(super) fn restore_tabs<F, Fut>(self, session: &Session, saved: &[SavedConnection], ready: F)
+    where
+        F: Fn(SavedConnection) -> Fut,
+        Fut: std::future::Future<Output = bool> + 'static,
+    {
         let candidates: Vec<RestoreCandidate> = saved
             .iter()
             .map(|s| RestoreCandidate {
@@ -98,61 +117,63 @@ impl AppState {
                 backend: s.backend(),
             })
             .collect();
-        // Which server-backend locators (Postgres, SQL Server) can connect
-        // silently, so startup never blocks on a prompt or pops a browser?
-        // Password auth needs a stored/session password; Entra managed
-        // identity always can; Entra interactive only with a cached refresh
-        // token. The keyring reads are off-thread and the session-memory
-        // borrow is dropped before the await.
-        let mut ready_locators: HashSet<String> = HashSet::new();
-        for candidate in &candidates {
-            match candidate.backend {
-                // SQLite needs no credentials; plan_session_restore always
-                // keeps it.
-                BackendKind::Sqlite => continue,
-                // Both fall through to the auth-availability check below.
-                BackendKind::Postgres | BackendKind::SqlServer => {}
-            }
-            let auth = saved.iter().find_map(|s| match s {
-                SavedConnection::Postgres { auth, .. }
-                | SavedConnection::SqlServer { auth, .. }
-                    if saved_open_locator(s) == candidate.locator =>
-                {
-                    Some(auth.clone())
-                }
-                _ => None,
-            });
-            let ready = match auth {
-                Some(ServerAuth::Entra(entra)) => {
-                    let has_refresh =
-                        crate::secrets::get_password_async(entra_secret_key(&candidate.locator))
-                            .await
-                            .ok()
-                            .flatten()
-                            .is_some();
-                    entra.can_acquire_silently(has_refresh)
-                }
-                _ => {
-                    let in_session = self
-                        .session_passwords
-                        .read()
-                        .contains_key(&candidate.locator);
-                    in_session
-                        || crate::secrets::get_password_async(candidate.locator.clone())
-                            .await
-                            .ok()
-                            .flatten()
-                            .is_some()
-                }
+        // No server connection is ready yet, so this is the local files.
+        let local = plan_session_restore(&session.tabs, &candidates, |_| false);
+        self.start_restore(local, session.active.clone(), saved);
+        for tab in &session.tabs {
+            let Some(connection) = saved.iter().find(|s| {
+                s.backend() != BackendKind::Sqlite && saved_open_locator(s) == tab.locator
+            }) else {
+                continue;
             };
-            if ready {
-                ready_locators.insert(candidate.locator.clone());
+            let ready = ready(connection.clone());
+            let tab = tab.clone();
+            let connection = connection.clone();
+            let candidates = candidates.clone();
+            let active = session.active.clone();
+            spawn_forever(async move {
+                let ready = ready.await;
+                // The planner still makes the call, one tab at a time.
+                let plan = plan_session_restore(std::slice::from_ref(&tab), &candidates, |_| ready);
+                self.start_restore(plan, active, std::slice::from_ref(&connection));
+            });
+        }
+    }
+
+    /// Whether a saved server connection can sign in without asking, so
+    /// startup never blocks on a prompt or pops a browser. Password auth
+    /// needs a stored or session password; Entra managed identity always
+    /// can; Entra interactive only with a cached refresh token. The keyring
+    /// reads are off-thread, and the session-memory borrow is dropped before
+    /// the await.
+    async fn connects_silently(self, connection: SavedConnection) -> bool {
+        let locator = saved_open_locator(&connection);
+        let auth = match connection {
+            SavedConnection::Postgres { auth, .. } | SavedConnection::SqlServer { auth, .. } => {
+                auth
+            }
+            // Needs no credentials; the planner always keeps it.
+            SavedConnection::Sqlite { .. } => return true,
+        };
+        match auth {
+            ServerAuth::Entra(entra) => {
+                let has_refresh = crate::secrets::get_password_async(entra_secret_key(&locator))
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some();
+                entra.can_acquire_silently(has_refresh)
+            }
+            ServerAuth::Password => {
+                let in_session = self.session_passwords.read().contains_key(&locator);
+                in_session
+                    || crate::secrets::get_password_async(locator)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some()
             }
         }
-        let plan = plan_session_restore(&session.tabs, &candidates, |loc| {
-            ready_locators.contains(loc)
-        });
-        self.start_restore(plan, session.active, &saved);
     }
 
     /// Starts every planned tab's connect at once, each the way a click on
@@ -447,5 +468,92 @@ mod tests {
             assert!(state.connect_requests.peek().is_empty());
             assert!(state.restoring.peek().is_empty());
         });
+    }
+
+    #[tokio::test]
+    async fn a_keyring_that_never_answers_holds_up_only_its_own_tab() {
+        // A server tab whose keyring read never returns — a locked wallet
+        // waiting on its unlock dialog — must not hold up the local file, nor
+        // another server tab whose read does return.
+        let silent = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let url = |db: &str| {
+            format!(
+                "postgres://u@127.0.0.1:{}/{db}",
+                silent.local_addr().unwrap().port()
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let local_db = sqlite_file(dir.path(), "local.db").await;
+
+        let mut dom = VirtualDom::new(empty);
+        let state = provide_state(&dom);
+        dom.rebuild_in_place();
+        let saved = dom.in_runtime(|| {
+            let mut saved = state.saved;
+            let mut saved = saved.write();
+            for name in ["locked", "unlocked"] {
+                saved.add(SavedConnection::Postgres {
+                    name: name.into(),
+                    url: url(name),
+                    tunnel: None,
+                    auth: ServerAuth::Password,
+                    protection: WriteProtection::Open,
+                    color: None,
+                    group: None,
+                });
+            }
+            saved.add(SavedConnection::Sqlite {
+                name: "local".into(),
+                path: local_db.clone(),
+                protection: WriteProtection::Open,
+                color: None,
+                group: None,
+            });
+            saved.entries().to_vec()
+        });
+        let [locked, unlocked, local] = [0, 1, 2].map(|i| saved_open_locator(&saved[i]));
+        let session = Session {
+            // The locked tab first: a restore that asked the keyring about
+            // every tab before starting any would never get past it.
+            tabs: [&locked, &unlocked, &local]
+                .map(|locator| SessionTab {
+                    locator: locator.clone(),
+                    ..SessionTab::default()
+                })
+                .to_vec(),
+            ..Session::default()
+        };
+        dom.in_runtime(|| {
+            // Session memory for the one that gets through, so its connect
+            // never reads the real keyring either.
+            let mut passwords = state.session_passwords;
+            passwords.write().insert(unlocked.clone(), "pw".into());
+            state.restore_tabs(&session, &saved, |connection| {
+                let answers = connection.name() != "locked";
+                async move {
+                    if !answers {
+                        std::future::pending::<()>().await;
+                    }
+                    true
+                }
+            });
+        });
+        let opened = |dom: &VirtualDom| {
+            dom.in_runtime(|| state.open_locators.peek().iter().any(|(_, l)| *l == local))
+        };
+        let connecting = |dom: &VirtualDom, locator: &str| {
+            dom.in_runtime(|| state.connecting.peek().iter().any(|c| c.locator == locator))
+        };
+        run_until(&mut dom, Duration::from_secs(10), |dom| {
+            opened(dom) && connecting(dom, &unlocked)
+        })
+        .await;
+        assert!(
+            !connecting(&dom, &locked),
+            "a tab whose keyring has not answered must not start"
+        );
+        dom.in_runtime(|| state.cancel_connect(&unlocked));
     }
 }

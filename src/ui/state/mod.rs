@@ -34,7 +34,9 @@ pub use schema_edit::{after_edit, SchemaEditRequest, SchemaEditStatus};
 // writes it.
 pub(crate) use connect::entra_secret_key;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
