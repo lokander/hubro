@@ -30,7 +30,8 @@ use super::schema::{
 use super::sql::qualified;
 use super::stats::{size_bytes, RowCount, TableStats};
 use super::value::{
-    row_flag, row_int, row_opt_int, row_opt_text, row_text, trim_fraction, ColumnInfo, Value,
+    real_from_f32, row_flag, row_int, row_opt_int, row_opt_text, row_text, trim_fraction,
+    ColumnInfo, Value,
 };
 
 /// Splices a password into an mssql URL — see [`super::url::with_password`].
@@ -601,7 +602,9 @@ fn decode_float(row: &Row, idx: usize) -> Option<Value> {
     if let Some(v) = opt(row.try_get::<f64, _>(idx), Value::Real) {
         return Some(v);
     }
-    opt(row.try_get::<f32, _>(idx), |f| Value::Real(f as f64))
+    opt(row.try_get::<f32, _>(idx), |f| {
+        Value::Real(real_from_f32(f))
+    })
 }
 
 /// Graceful degradation for values [`decode_typed`] can't produce: a text

@@ -2310,3 +2310,16 @@ async fn postgres_contains_filter_is_a_substring_search_whatever_the_needle_hold
     pool.query("DROP TABLE like_hostile").await.unwrap();
     pool.close().await;
 }
+
+/// A `real` once read as the `f32` widened to `f64` — `0.1` showed as
+/// `0.10000000149011612` in the grid, the export and the clipboard. It reads
+/// as its shortest decimal now, and that decimal must still store the same
+/// value when written back.
+#[tokio::test]
+async fn postgres_a_real_reads_as_its_shortest_decimal_and_writes_back_unchanged() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let failures = common::real_round_trip_failures(&pool, "real_trip").await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    pool.close().await;
+}

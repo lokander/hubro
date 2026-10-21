@@ -535,9 +535,9 @@ fn float_spelling(wide: f64) -> String {
 /// name — computed ONCE per [`build_statements`] call so rendering a value
 /// looks its column up in O(1) instead of re-scanning `table.columns` per
 /// SET/key value. A column absent from the map (not castable, not
-/// introspected at all, or any non-Postgres dialect — SQLite's type
-/// affinity coerces on its own) binds its placeholder uncast, exactly as
-/// before. Each entry is [`column_cast`]'s answer.
+/// introspected at all, SQLite, and every SQL Server column but a `real`)
+/// binds its placeholder uncast, exactly as before. Each entry is
+/// [`column_cast`]'s answer.
 pub(super) fn cast_targets(table: &TableMeta, dialect: Dialect) -> HashMap<&str, String> {
     table
         .columns
@@ -550,13 +550,25 @@ pub(super) fn cast_targets(table: &TableMeta, dialect: Dialect) -> HashMap<&str,
 /// for an uncast placeholder — the one decision every bound position takes
 /// its cast from: SETs and inserts (through [`cast_targets`]), the import,
 /// and key predicates ([`key_equality_sql`]), so a column cannot be cast in
-/// one of them and not in another. Only Postgres casts today
-/// ([`cast_target`]); SQLite's type affinity coerces on its own, and SQL
-/// Server converts a parameter implicitly.
+/// one of them and not in another. Postgres casts every plain type
+/// ([`cast_target`]); SQLite's type affinity coerces on its own; SQL Server
+/// converts a parameter implicitly, except into a `real`.
+///
+/// SQL Server's one cast is `real`. A `real` cell reads as the shortest
+/// decimal that is its `f32` ([`super::value::real_from_f32`]), and tiberius
+/// binds that as a `float`: compared uncast, the column widens to `float`
+/// and `0.1` (the float64) never equals the widened `0.1f32`, so a `real`
+/// key re-addresses no row and a foreign key into one jumps to nothing.
+/// `CAST(@P1 AS real)` rounds the parameter to the column's own `f32` first.
 pub(super) fn column_cast(column: &ColumnMeta, dialect: Dialect) -> Option<String> {
     match dialect {
         Dialect::Postgres => cast_target(column),
-        Dialect::Sqlite | Dialect::SqlServer => None,
+        Dialect::SqlServer => column
+            .type_name
+            .trim()
+            .eq_ignore_ascii_case("real")
+            .then(|| "real".to_string()),
+        Dialect::Sqlite => None,
     }
 }
 
@@ -867,9 +879,13 @@ fn key_equality_sql(
 /// `value` itself, except where the server would read hubro's spelling of
 /// it as some other value.
 ///
-/// - **A `real` read off a Postgres-family wire** binds as the shortest
-///   decimal spelling of its `f32` (`'1e-1'::real`) instead of the `f64` it
-///   was widened to on reading (`0.10000000149011612`). CockroachDB keeps a
+/// - **A `real` holding an `f32` widened to `f64`** binds as the shortest
+///   decimal spelling of that `f32` (`'1e-1'::real`) instead of the widened
+///   digits (`0.10000000149011612`). A cell read off the wire no longer
+///   arrives widened — it reads as that shortest decimal already
+///   ([`super::value::real_from_f32`]), which [`cast_text`] spells the same
+///   way — so this arm is what keeps a widened value from any other source
+///   from missing its row. CockroachDB keeps a
 ///   `real` as a 64-bit float, so `::real` rounds nothing there — measured
 ///   on v26.2.5, a key stored as `0.1` holds the float64 `0.1`,
 ///   `0.10000000149011612::float8::real` stays that float64 and matches
@@ -1256,9 +1272,40 @@ mod tests {
         let casts = cast_targets(&keyed, Dialect::Postgres);
         assert_eq!(casts.get("mask").map(String::as_str), Some("bit varying"));
 
-        // And no other dialect casts anything.
+        // SQLite casts nothing, and SQL Server nothing but a `real`.
         assert!(cast_targets(&keyed, Dialect::Sqlite).is_empty());
         assert!(cast_targets(&keyed, Dialect::SqlServer).is_empty());
+    }
+
+    #[test]
+    fn a_sql_server_real_key_is_compared_as_a_real() {
+        // A `real` cell reads as its shortest decimal (`0.1`), which binds
+        // as a float; uncast, SQL Server widens the column instead and the
+        // two never meet.
+        let mut table = typed_pg_table();
+        table.columns = ["real", "REAL", "float", "decimal"]
+            .iter()
+            .enumerate()
+            .map(|(n, type_name)| ColumnMeta {
+                name: format!("c{n}"),
+                type_name: (*type_name).into(),
+                ..table.columns[0].clone()
+            })
+            .collect();
+        let casts = cast_targets(&table, Dialect::SqlServer);
+        assert_eq!(
+            casts,
+            HashMap::from([("c0", "real".to_string()), ("c1", "real".to_string())])
+        );
+        let identity = RowIdentity::PrimaryKey {
+            columns: vec!["c0".into(), "c2".into()],
+        };
+        let locator = RowLocator {
+            identity_values: vec![Value::Real(0.1), Value::Real(0.1)],
+        };
+        let (clause, params) = row_where(&table, &identity, Dialect::SqlServer, &locator).unwrap();
+        assert_eq!(clause, " WHERE \"c0\" = CAST(@P1 AS real) AND \"c2\" = @P2");
+        assert_eq!(params, vec![Value::Real(0.1), Value::Real(0.1)]);
     }
 
     #[test]

@@ -853,14 +853,17 @@ async fn cockroach_real_keys_are_re_addressed_by_their_shortest_spelling() {
 
 /// Cockroach sends `DECIMAL`, dates and times in Postgres's binary encoding,
 /// so the values wider than the Rust types sqlx decodes those into broke here
-/// exactly as on PostgreSQL: a `1e30` panicked the page fetch (and with it
-/// the app), `0001-01-01 BC` read as `0000-01-01` and `24:00:00` as
-/// `00:00:00`. They now read as the server's own values and address their
-/// rows again.
+/// as on PostgreSQL: a `1e30` panicked the page fetch (and with it the app),
+/// NaN and more than 28 digits read as a marker no key can be bound from, and
+/// `24:00:00` read as `00:00:00` — the key of a different row. They now read
+/// as the server's own values and address their rows.
 ///
-/// One difference from PostgreSQL: Cockroach prints a decimal in exponent
-/// form (`1E+30`, `1E-31`), where the grid shows every digit. The same value
-/// — which the round trip below is what proves.
+/// Two differences from PostgreSQL, both measured. Cockroach reads an
+/// astronomical year back (`0000-01-01` is 1 BC to it), so the BC dates that
+/// PostgreSQL refused as keys were only *shown* wrong here — the display
+/// assertions are what pin them. And it prints a decimal in exponent form
+/// (`1E+30`, `1E-31`) where the grid shows every digit: the same value, which
+/// the round trip is what proves.
 #[tokio::test]
 async fn cockroach_values_past_the_rust_types_read_and_address_their_rows() {
     let Some(url) = test_url() else { return };
@@ -1077,5 +1080,18 @@ async fn cockroach_a_row_returning_statement_that_commits_is_not_reported_rolled
         "the INSERT was committed"
     );
     pool.execute("DROP TABLE show_commit").await.unwrap();
+    pool.close().await;
+}
+
+/// A `real` once read as the `f32` widened to `f64` — `0.1` showed as
+/// `0.10000000149011612` in the grid, the export and the clipboard. It reads
+/// as its shortest decimal now, and that decimal must still store the same
+/// value when written back.
+#[tokio::test]
+async fn cockroach_a_real_reads_as_its_shortest_decimal_and_writes_back_unchanged() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let failures = common::real_round_trip_failures(&pool, "real_trip").await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
     pool.close().await;
 }
