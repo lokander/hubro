@@ -288,6 +288,20 @@ impl std::error::Error for CliError {}
 /// userinfo, so `postgres://user:SEK RET@host/db` parses and connects
 /// perfectly well.)
 ///
+/// The cost of the last-`@` rule is cosmetic over-redaction when an `@`
+/// follows the authority: `postgres://u@host:5432/db?application_name=a@b`
+/// comes out as `postgres://u@host:***@b`, the port and path folded into the
+/// "password". Bounding the colon search to the authority instead was
+/// considered and rejected, because the string cannot say where the
+/// authority ends: `postgres://user@server:1234/ss@host/db` — an Azure-style
+/// `user@server` login whose password is `1234/ss` — has exactly the same
+/// shape, and `url::Url` parses it as user `user`, port 1234, no password. Any
+/// rule that showed the port in the first would print the password in the
+/// second. Neither shape reaches an error message as typed — the
+/// [`CliError::UnusableUrl`] text never quotes the URL, and an
+/// [`OpenTarget`] holds the normalized locator — so the over-redaction is
+/// the side to be on.
+///
 /// It is closed one level up instead, by no [`CliError`] variant carrying a
 /// *credential* past a space. Variant by variant:
 ///
@@ -751,6 +765,25 @@ mod tests {
         ] {
             assert_eq!(redact_url(text), text, "{text}");
         }
+    }
+
+    #[test]
+    fn an_at_sign_after_the_authority_costs_the_port_and_never_a_password() {
+        // Over-redaction, pinned so that it is a decision rather than an
+        // accident: the port and path are folded into the "password"…
+        assert_eq!(
+            redact_url("postgres://u@host:5432/db?application_name=a@b"),
+            "postgres://u@host:***@b"
+        );
+        // …because this is the same shape, and here the folded part *is* the
+        // password — a `user@server` login whose password holds a `/`.
+        assert_eq!(
+            redact_url("postgres://user@server:1234/ss@host/db"),
+            "postgres://user@server:***@host/db"
+        );
+        // The password-bearing form of the first is still cut at the right
+        // colon: whatever else goes, the secret does.
+        assert!(!redact_url("postgres://u:pw@host:5432/db?application_name=a@b").contains("pw"),);
     }
 
     #[test]
