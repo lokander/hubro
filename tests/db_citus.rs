@@ -33,6 +33,8 @@
 //! The rest of the Postgres suite also passes against this container — point
 //! `HUBRO_PG_TEST_URL` at it to re-run it there.
 
+mod common;
+
 use std::collections::HashMap;
 
 use tokio::sync::Mutex;
@@ -472,9 +474,7 @@ async fn v1_certificate_failure_says_what_to_do() {
     //
     // Skipped rather than failed if the server has a modern certificate, so
     // the suite still passes against a Citus someone has re-certified.
-    let Some(base) = url.split('?').next() else {
-        return;
-    };
+    let base = url.split_once('?').map_or(url.as_str(), |(base, _)| base);
     let connected = DbPool::open_postgres(&format!("{base}?sslmode=require")).await;
     let err = match connected {
         Ok(pool) => {
@@ -625,7 +625,7 @@ async fn shards_are_marked_internal_when_citus_stops_hiding_them() {
     .await
     .unwrap();
 
-    let shard_url = swap_database(&url, db);
+    let shard_url = common::with_database(&url, db);
     let shard_pool = DbPool::open_postgres(&shard_url).await.unwrap();
     // Three shapes that each broke a different draft of the shard rule: a
     // plain table in `public`, one in a schema outside the search path
@@ -706,20 +706,6 @@ async fn shards_are_marked_internal_when_citus_stops_hiding_them() {
         .unwrap();
 }
 
-/// Rewrites a Postgres URL to point at a different database, preserving the
-/// query string (this suite's URLs carry `sslmode=disable`).
-fn swap_database(url: &str, database: &str) -> String {
-    let (base, query) = match url.split_once('?') {
-        Some((base, query)) => (base, Some(query)),
-        None => (url, None),
-    };
-    let root = base.rsplit_once('/').expect("a url with a database path").0;
-    match query {
-        Some(query) => format!("{root}/{database}?{query}"),
-        None => format!("{root}/{database}"),
-    }
-}
-
 #[tokio::test]
 async fn a_user_table_cannot_be_hidden_by_impersonating_a_shard_name() {
     let Some(url) = test_url() else { return };
@@ -743,7 +729,7 @@ async fn a_user_table_cannot_be_hidden_by_impersonating_a_shard_name() {
     .await
     .unwrap();
 
-    let shadow_pool = DbPool::open_postgres(&swap_database(&url, db))
+    let shadow_pool = DbPool::open_postgres(&common::with_database(&url, db))
         .await
         .unwrap();
     for sql in [
