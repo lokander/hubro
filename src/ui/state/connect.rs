@@ -973,6 +973,13 @@ impl AppState {
                 &old_locator,
                 &new_locator,
             );
+            // The refresh token is not carried ([`carried_secret_keys`]): the
+            // confirming connect already put its own where the user said. Its
+            // session copy goes now, for the reason above; the keyring copy
+            // in the spawn.
+            self.session_passwords
+                .write()
+                .remove(&entra_secret_key(&old_locator));
             // Read after the carry: what the confirming connect validated, or
             // the old session copy moved across when it validated nothing.
             let moves: Vec<_> = carried_secret_keys(&old_locator)
@@ -984,8 +991,6 @@ impl AppState {
                 })
                 .collect();
             spawn_forever(async move {
-                // Not carried ([`carried_secret_keys`]): the confirming
-                // connect already put its own token where the user said.
                 self.forget_entra_refresh(&old_locator).await;
                 for (old, new, validated) in moves {
                     migrate_secret(old, new, validated).await;
@@ -1334,14 +1339,14 @@ impl AppState {
                     ));
                 }
             }
-            // Read first, so a machine with no keyring at all — where nothing
-            // can have been remembered — is not told a delete failed.
+            // Always deleted; the read only decides whether a failure is
+            // worth saying, so a machine with no keyring at all — where
+            // nothing can have been remembered — is not told one failed.
             RefreshKeyring::Delete => {
                 let key = entra_secret_key(url);
                 let held = crate::secrets::get_password_async(key.clone()).await;
-                if matches!(held, Ok(Some(_)))
-                    && crate::secrets::delete_password_async(key).await.is_err()
-                {
+                let deleted = crate::secrets::delete_password_async(key).await;
+                if matches!(held, Ok(Some(_))) && deleted.is_err() {
                     self.connect_error.set(Some(
                         "connected, but an earlier remembered sign-in could not be removed \
                          from the system keyring — it will still sign you in"
@@ -2855,6 +2860,14 @@ mod tests {
             finish.lines().any(|line| line.trim() == "remember,"),
             "finish_entra_connect no longer takes the answer out of the prompt"
         );
+        // Taken out, then handed on, and nothing in between: a shadowing
+        // `let remember = true;` keeps both lines above as written.
+        assert_eq!(
+            ident_count(&code_of(&finish), "remember"),
+            2,
+            "finish_entra_connect rebinds the answer between the prompt and \
+             the keyring: {finish}"
+        );
 
         // Where a kept token was found *is* the answer, so the labels are as
         // much a decision as any gate: swapped, a remembered token is read as
@@ -2913,6 +2926,18 @@ mod tests {
             &edit,
             "if new_locator != old_locator {",
         )));
+        let spawned_at = moved
+            .find("spawn_forever(")
+            .expect("the keyring migration is still spawned");
+        assert!(
+            moved[..spawned_at].contains(
+                "self.session_passwords .write() .remove(&entra_secret_key(&old_locator));"
+            ) || moved[..spawned_at].contains(
+                "self.session_passwords.write().remove(&entra_secret_key(&old_locator));"
+            ),
+            "the old locator's session token is not dropped before the spawn, \
+             so it outlives the edit by three keyring round trips: {moved}"
+        );
         assert!(
             moved.contains("self.forget_entra_refresh(&old_locator).await;")
                 && moved.contains("carried_secret_keys(&old_locator)")
@@ -2924,8 +2949,8 @@ mod tests {
 
         // Every route to the token's key, so a new write or read cannot join
         // the wire without being named here. Removal reaches it through
-        // `secret_keys`, which deletes all three keys; an edit through
-        // `forget_entra_refresh`, above.
+        // `secret_keys`, which deletes all three keys; an edit drops it,
+        // above.
         let shipped_code = code_only(&shipped(source));
         let named: usize = [
             "fn entra_secret_key(",
@@ -2934,6 +2959,7 @@ mod tests {
             "async fn cached_entra_refresh(",
             "async fn forget_entra_refresh(",
             "async fn keep_entra_refresh(",
+            "pub fn update_saved(",
         ]
         .iter()
         .map(|signature| {
@@ -4872,6 +4898,70 @@ mod tests {
                 "{to}: the edit lost a password nothing had replaced"
             );
             crate::secrets::delete_password(to).unwrap();
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)] // see the Postgres test above
+    #[tokio::test]
+    async fn a_sign_in_keeps_its_token_in_the_home_its_answer_names() {
+        // The keyring half of `place_entra_refresh`'s verdict, executed: an
+        // older remembered token is already in the keyring, and the new
+        // sign-in's answer decides whether it is replaced or removed. Both
+        // must leave the fresh token in exactly the home the answer names.
+        use dioxus::core::{NoOpMutations, VirtualDom};
+
+        use crate::ui::test_dom::provide_state;
+
+        let _keyring = crate::secrets::tests::mock_keyring();
+        fn empty() -> Element {
+            rsx! {}
+        }
+        let mut dom = VirtualDom::new(empty);
+        let state = provide_state(&dom);
+        dom.rebuild_in_place();
+
+        for remember in [false, true] {
+            let url = format!("postgres://u@keep-{remember}:5432/a");
+            let key = entra_secret_key(&url);
+            crate::secrets::store_password(&key, "older").unwrap();
+            let (task_url, task_key) = (url.clone(), key.clone());
+            dom.in_runtime(|| {
+                spawn_forever(async move {
+                    state
+                        .keep_entra_refresh(&task_url, "fresh".to_string(), remember)
+                        .await;
+                    // Marks the task done, whatever it decided.
+                    crate::secrets::store_password(&format!("{task_key}-done"), "1").unwrap();
+                });
+            });
+            let done = format!("{key}-done");
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while crate::secrets::get_password(&done).unwrap().is_none() {
+                assert!(tokio::time::Instant::now() < deadline, "never ran");
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(20), dom.wait_for_work())
+                        .await;
+                dom.render_immediate(&mut NoOpMutations);
+            }
+
+            let session = dom.in_runtime(|| state.session_passwords.peek().clone());
+            let homes = [
+                session.get(&key).cloned(),
+                crate::secrets::get_password(&key).unwrap(),
+            ];
+            let expected = if remember {
+                [None, Some("fresh".to_string())]
+            } else {
+                [Some("fresh".to_string()), None]
+            };
+            assert_eq!(
+                homes, expected,
+                "remember = {remember}: the token is not in the one home the \
+                 answer names — unticked, an older remembered token outliving \
+                 the answer keeps the user signed in regardless"
+            );
+            crate::secrets::delete_password(&key).unwrap();
+            crate::secrets::delete_password(&done).unwrap();
         }
     }
 
