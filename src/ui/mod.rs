@@ -19,6 +19,8 @@ mod shell;
 mod sidebar;
 pub mod stage;
 mod state;
+#[cfg(test)]
+mod test_dom;
 
 pub use stage::TableStage;
 pub use state::{tab_title, ActiveView, AppState, TableRef};
