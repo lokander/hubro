@@ -23,6 +23,7 @@ use std::collections::HashMap;
 
 use tiberius::{ColumnType, Row};
 
+use super::caps::INSTEAD_OF_TRIGGER;
 use super::error::DbError;
 use super::schema::{
     ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta, TypeDetail,
@@ -91,7 +92,12 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
 
     let table_rows = query_with(
         pool,
-        "SELECT s.name, o.name, o.type \
+        "SELECT s.name, o.name, o.type, \
+                CASE WHEN o.type = 'U' AND EXISTS ( \
+                    SELECT 1 FROM sys.triggers tr \
+                    WHERE tr.parent_id = o.object_id \
+                      AND tr.is_instead_of_trigger = 1 AND tr.is_disabled = 0 \
+                ) THEN 1 ELSE 0 END \
          FROM sys.objects o \
          JOIN sys.schemas s ON s.schema_id = o.schema_id \
          WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0 \
@@ -203,9 +209,10 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
             columns: Vec::new(),
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
-            // No per-object narrowing: kind and row identity already carry
-            // everything this backend knows about writability.
-            restriction: None,
+            // Kind and row identity carry the rest. A view keeps its own
+            // reason, which already refuses editing whatever its triggers do;
+            // a disabled trigger does not fire, so it restricts nothing.
+            restriction: row_flag(row, 3).then_some(INSTEAD_OF_TRIGGER),
             // SQL Server's system objects live in `sys`, which introspection
             // already skips; its partitioned tables are one object with
             // partitions underneath rather than child tables.

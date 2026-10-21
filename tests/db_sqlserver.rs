@@ -25,7 +25,8 @@ use hubro::db::{
     apply_staged, detect_row_identity, mssql_url_with_password, run_script, split_statements,
     Capabilities, DbError, DbPool, Dialect, ExportFormat, Filter, Generated, OpenTransaction,
     PageRequest, Restriction, Rollback, RowCount, RowIdentity, RowLocator, ScriptDone, SortDir,
-    StagedChange, StatementOutcome, TableKind, TableMeta, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
+    StagedChange, StatementOutcome, TableKind, TableMeta, Value, INSTEAD_OF_TRIGGER, PREVIEW_BYTES,
+    QUERY_CELL_CAP,
 };
 
 async fn test_url() -> Option<String> {
@@ -1084,10 +1085,11 @@ async fn sqlserver_a_script_cannot_turn_row_counts_off_for_later_writes() {
 }
 
 #[tokio::test]
-async fn sqlserver_an_instead_of_trigger_that_makes_the_edit_can_be_saved() {
-    // An INSTEAD OF trigger replaces the statement: the server reports the
-    // trigger's own DML first, then the rows the trigger fired for as the
-    // statement's count. The trigger's write must not be added to it.
+async fn sqlserver_an_instead_of_trigger_refuses_editing_before_anything_is_written() {
+    // An INSTEAD OF trigger replaces the statement, and the count the server
+    // reports for it is the rows the trigger *fired for*, whatever the trigger
+    // wrote. One that writes nothing still reads as one row updated, so the
+    // guard cannot check an edit to such a table and editing is refused.
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
@@ -1108,11 +1110,36 @@ async fn sqlserver_an_instead_of_trigger_that_makes_the_edit_can_be_saved() {
     .await;
 
     let table = introspect_table(&pool, "trig_instead").await;
+    assert_eq!(table.restriction, Some(INSTEAD_OF_TRIGGER));
     let identity = detect_row_identity(&table, Dialect::SqlServer).unwrap();
+    let access = pool.backend_access(&table);
+    assert!(!access.can_mutate());
+    assert_eq!(
+        access.read_only_notice(),
+        Some(INSTEAD_OF_TRIGGER.message())
+    );
+    let err = apply_staged(&pool, &access, &table, &identity, &[retitle(1, "renamed")])
+        .await
+        .expect_err("an edit the guard cannot check must be refused");
+    assert!(
+        err.message.contains(INSTEAD_OF_TRIGGER.message()),
+        "{}",
+        err.message
+    );
+    let unchanged = pool
+        .query("SELECT title FROM dbo.trig_instead WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(unchanged.rows, vec![vec![Value::Text("first".into())]]);
+
+    // The count path under the refusal still holds the statement to its own
+    // rows: the trigger's DML comes first in the response and is not added.
+    let mut unguarded = table.clone();
+    unguarded.restriction = None;
     let counts = apply_staged(
         &pool,
-        &pool.backend_access(&table),
-        &table,
+        &pool.backend_access(&unguarded),
+        &unguarded,
         &identity,
         &[retitle(1, "renamed")],
     )
@@ -1132,6 +1159,78 @@ async fn sqlserver_an_instead_of_trigger_that_makes_the_edit_can_be_saved() {
     );
 
     run_all(&pool, &["DROP TABLE dbo.trig_instead"]).await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_only_an_enabled_instead_of_trigger_on_a_table_restricts_it() {
+    // Each of INSERT, UPDATE and DELETE restricts the table: the restriction
+    // covers editing as a whole, so one kind is enough. An AFTER trigger runs
+    // beside the statement rather than in place of it, and a disabled
+    // INSTEAD OF trigger does not fire (measured: four rows inserted, four
+    // landed), so neither restricts. A view keeps the reason it already had.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    let names = [
+        "io_insert",
+        "io_update",
+        "io_delete",
+        "io_after",
+        "io_disabled",
+    ];
+    for name in names {
+        run_all(
+            &pool,
+            &[
+                &format!("DROP TABLE IF EXISTS dbo.{name}"),
+                &format!("CREATE TABLE dbo.{name} (id int NOT NULL PRIMARY KEY)"),
+            ],
+        )
+        .await;
+    }
+    run_all(&pool, &["DROP VIEW IF EXISTS dbo.io_view"]).await;
+    // A plain batch, like a trigger: `sp_executesql` refuses CREATE VIEW too.
+    create_trigger(
+        &pool,
+        "CREATE VIEW dbo.io_view AS SELECT id FROM dbo.io_after",
+    )
+    .await;
+    for (name, timing) in [
+        ("io_insert", "INSTEAD OF INSERT"),
+        ("io_update", "INSTEAD OF UPDATE"),
+        ("io_delete", "INSTEAD OF DELETE"),
+        ("io_after", "AFTER INSERT, UPDATE, DELETE"),
+        ("io_disabled", "INSTEAD OF UPDATE"),
+        ("io_view", "INSTEAD OF INSERT"),
+    ] {
+        create_trigger(
+            &pool,
+            &format!("CREATE TRIGGER dbo.{name}_trigger ON dbo.{name} {timing} AS SELECT 1"),
+        )
+        .await;
+    }
+    run_all(
+        &pool,
+        &["DISABLE TRIGGER dbo.io_disabled_trigger ON dbo.io_disabled"],
+    )
+    .await;
+
+    for (name, expected) in [
+        ("io_insert", Some(INSTEAD_OF_TRIGGER)),
+        ("io_update", Some(INSTEAD_OF_TRIGGER)),
+        ("io_delete", Some(INSTEAD_OF_TRIGGER)),
+        ("io_after", None),
+        ("io_disabled", None),
+        ("io_view", Some(Restriction::View)),
+    ] {
+        let table = introspect_table(&pool, name).await;
+        assert_eq!(pool.backend_access(&table).restriction, expected, "{name}");
+    }
+
+    run_all(&pool, &["DROP VIEW dbo.io_view"]).await;
+    for name in names {
+        run_all(&pool, &[&format!("DROP TABLE dbo.{name}")]).await;
+    }
     pool.close().await;
 }
 

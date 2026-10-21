@@ -24,7 +24,7 @@ use common::FixtureDb;
 use hubro::db::{
     run_import, ColumnBinding, CsvDialect, CsvReader, DbPool, Dialect, EmptyField, Encoding,
     ErrorMode, ImportError, ImportOptions, ImportReport, JsonReader, JsonShape, PageRequest,
-    PgFlavor, RecordSource, SourceField, TableAccess, TableMeta, Value,
+    PgFlavor, RecordSource, SourceField, TableAccess, TableMeta, Value, INSTEAD_OF_TRIGGER,
 };
 
 async fn pg_url() -> Option<String> {
@@ -813,6 +813,47 @@ async fn mssql_import_counts_its_own_rows_not_the_triggers() {
 
     pool.execute("DROP TABLE dbo.import_audited").await.unwrap();
     pool.execute("DROP TABLE dbo.import_audit").await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn mssql_an_instead_of_insert_trigger_refuses_the_import() {
+    // An INSTEAD OF trigger replaces the INSERT, and the count SQL Server
+    // reports for the statement is the rows the trigger fired for, not the
+    // rows it wrote. Measured: this trigger keeps only even ids, four rows
+    // imported, two landed, and the guard saw 4 of 4. No count can catch it,
+    // so the table is refused before anything is read from the file.
+    let Some(url) = mssql_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    for sql in [
+        "IF OBJECT_ID('dbo.import_instead', 'U') IS NOT NULL DROP TABLE dbo.import_instead",
+        "CREATE TABLE dbo.import_instead (id int PRIMARY KEY, name nvarchar(100) NOT NULL)",
+        "CREATE TRIGGER dbo.import_instead_evens ON dbo.import_instead INSTEAD OF INSERT AS
+         SET NOCOUNT ON;
+         INSERT INTO dbo.import_instead SELECT id, name FROM inserted WHERE id % 2 = 0",
+    ] {
+        pool.execute(sql).await.unwrap();
+    }
+    let tables = pool.introspect().await.unwrap();
+    let table = find(&tables, "import_instead");
+
+    let err = import(
+        &pool,
+        table,
+        &options(vec![bind(0, "id"), bind(1, "name")], ErrorMode::Abort),
+        csv("id,name\n1,ada\n2,grace\n3,alan\n4,edsger\n").as_mut(),
+    )
+    .await
+    .expect_err("an import the guard cannot check must be refused");
+    assert!(
+        err.message.contains(INSTEAD_OF_TRIGGER.message()),
+        "{}",
+        err.message
+    );
+    assert_eq!(err.undone_rows, 0);
+    assert_eq!(pool.count_table_rows(table).await.unwrap(), 0);
+
+    pool.execute("DROP TABLE dbo.import_instead").await.unwrap();
     pool.close().await;
 }
 
