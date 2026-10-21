@@ -539,30 +539,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "borsh"
-version = "1.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "553c5d846a6ba5150c65e3b1b8ec073bcf1abc20f9b7220de384a4443ea4e20a"
-dependencies = [
- "borsh-derive",
- "bytes",
- "cfg_aliases",
-]
-
-[[package]]
-name = "borsh-derive"
-version = "1.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12cdfe656708a01f89b451a7d36466e6fe6c414de0aa18fc54f864f6f9ca9f56"
-dependencies = [
- "once_cell",
- "proc-macro-crate 3.5.0",
- "proc-macro2",
- "quote",
- "syn 3.0.9",
-]
-
-[[package]]
 name = "built"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5631,23 +5607,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust_decimal"
-version = "1.43.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7653272e75dcac41dc199fbea6f5797633994fafd339943c06c9af16bf29cd3a"
-dependencies = [
- "arrayvec",
- "borsh",
- "bytes",
- "num-traits",
- "rand 0.8.8",
- "rand 0.9.5",
- "serde",
- "serde_json",
- "wasm-bindgen",
-]
-
-[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6318,7 +6277,6 @@ checksum = "ee6798b1838b6a0f69c007c133b8df5866302197e404e8b6ee8ed3e3a5e68dc6"
 dependencies = [
  "base64 0.22.1",
  "bytes",
- "chrono",
  "crc",
  "crossbeam-queue",
  "either",
@@ -6334,7 +6292,6 @@ dependencies = [
  "memchr",
  "once_cell",
  "percent-encoding",
- "rust_decimal",
  "rustls",
  "serde",
  "serde_json",
@@ -6398,7 +6355,6 @@ dependencies = [
  "bitflags 2.13.2",
  "byteorder",
  "bytes",
- "chrono",
  "crc",
  "digest 0.10.7",
  "dotenvy",
@@ -6419,7 +6375,6 @@ dependencies = [
  "percent-encoding",
  "rand 0.8.8",
  "rsa 0.9.10",
- "rust_decimal",
  "serde",
  "sha1 0.10.7",
  "sha2 0.10.9",
@@ -6442,7 +6397,6 @@ dependencies = [
  "base64 0.22.1",
  "bitflags 2.13.2",
  "byteorder",
- "chrono",
  "crc",
  "dotenvy",
  "etcetera",
@@ -6459,7 +6413,6 @@ dependencies = [
  "memchr",
  "once_cell",
  "rand 0.8.8",
- "rust_decimal",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -6479,7 +6432,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2d12fe70b2c1b4401038055f90f151b78208de1f9f89a7dbfd41587a10c3eea"
 dependencies = [
  "atoi",
- "chrono",
  "flume",
  "futures-channel",
  "futures-core",
