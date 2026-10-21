@@ -15,6 +15,10 @@ Rules for `src/db/`. The project-wide guidance is in the root `CLAUDE.md`.
 
 - A failure the *server* declared retryable is `DbError::Transient`, classified on SQLSTATE `40001` alone and never on message text — YugabyteDB's stale catalog snapshot and CockroachDB's transaction conflicts share the code and share nothing in their wording. Only the multi-statement catalog reads act on it: `DbPool::introspect` and `fetch_ddl` run **once** more via `retry_transient`, because a schema change landing between their queries is nobody's mistake and nothing the user can act on. Never retry a write on it, and never loop — a second failure isn't a racing schema change, and a schema tree that hangs is worse than one that reports an error.
 
+## Credentials
+
+- **`DbError::CredentialsRejected` is the one connect error that may cost a stored secret**: the connect flow reads it as "the remembered password went stale", deletes it from the keyring and prompts (`password_retry` in `src/ui/state/connect.rs`). So it is built from the server's error code and nothing else — SQL Server 18456, PostgreSQL SQLSTATE `28P01` — in one `connect_error_from` per backend, and everything else refused at login stays `DbError::Connect`. Text is not a signal: SQL Server's 4060 ("Cannot open database … The login failed.") is sent for a database that is missing, offline, restoring or forbidden to the login, always *after* the password was accepted, and matching "login failed" on it deleted working passwords. A disabled login (18470) keeps its password too. A new backend that never builds the variant never raises the password prompt; one that builds it from text reopens that bug.
+
 ## Capabilities
 
 - Capabilities are declared per *server*, not just per driver: `DbPool::backend_capabilities` consults `PgFlavor` because RisingWave speaks the Postgres protocol but has no read-write transactions. Declaring `transactions: false` is what makes the script tab stop wrapping batches and editing refuse with a reason — hubro's row-count write guard *is* a transaction, so a backend without one is not offered unguarded editing.
