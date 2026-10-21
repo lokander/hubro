@@ -363,6 +363,58 @@ impl ScriptConn {
         self.ended = ended.is_ok();
         ended
     }
+
+    /// Runs the script's last statement when it returns rows, and ends the
+    /// hold — [`Self::end`]'s answer comes back beside the read's.
+    ///
+    /// Separate because of a read the row cap cut short. The rest of its
+    /// result is still on its way, and nothing more can be asked of the
+    /// connection until it has all arrived and been thrown away: ending such a
+    /// run the ordinary way, with a question after the read, made a capped
+    /// `SELECT` over 3M rows return in 1.3 s on Postgres and 1.55 s on SQL
+    /// Server instead of 30 and 100 ms — on localhost; over a network, minutes.
+    /// So a cut-short read is not followed by anything: the connection is
+    /// closed, which also ends whatever was open on it. Whether anything was
+    /// is asked *before* the read, which can neither open a transaction nor
+    /// end one, so the answer still holds after it.
+    ///
+    /// SQLite has no stream to wait for (its worker stops stepping when the
+    /// read is dropped), so there the read is simply followed by
+    /// [`Self::end`].
+    pub(super) async fn finish_with_read(
+        mut self,
+        sql: &str,
+        max_rows: u64,
+        cell_cap: usize,
+    ) -> (Result<(QueryResult, bool), DbError>, Result<bool, DbError>) {
+        if let HeldConn::Sqlite(conn) = &mut self.held {
+            let read = sqlite::query_capped_conn(conn, sql, max_rows, cell_cap).await;
+            return (read, self.end().await);
+        }
+        let finished = match &mut self.held {
+            HeldConn::Postgres(conn) => {
+                postgres::finish_script_conn_with_read(conn, sql, max_rows, cell_cap).await
+            }
+            HeldConn::SqlServer(conn) => {
+                sqlserver::finish_script_conn_with_read(conn, sql, max_rows, cell_cap).await
+            }
+            HeldConn::Sqlite(_) => unreachable!("handled above"),
+        };
+        // Left false when the connection must not go back to the pool — the
+        // read was cut short, or ending failed — so the drop closes it.
+        self.ended = finished.reusable;
+        (finished.read, finished.ended)
+    }
+}
+
+/// How [`ScriptConn::finish_with_read`] went on one backend: the read, what
+/// ending the hold found (whether a transaction the script left open was
+/// rolled back or discarded), and whether the connection may go back to the
+/// pool.
+pub(super) struct FinishedRead {
+    pub(super) read: Result<(QueryResult, bool), DbError>,
+    pub(super) ended: Result<bool, DbError>,
+    pub(super) reusable: bool,
 }
 
 /// A read-only statement's outcome, given how its rollback went: the

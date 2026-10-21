@@ -925,7 +925,8 @@ async fn cockroach_script_keeps_its_own_transaction_on_one_session() {
         Ok(ScriptDone {
             rolled_back: Some(OpenTransaction {
                 schema_changes_kept: false
-            })
+            }),
+            connection_closed: false,
         })
     );
     assert_eq!(crdb_open_transactions(&pool).await, Vec::<String>::new());

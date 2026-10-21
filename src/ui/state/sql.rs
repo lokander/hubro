@@ -298,18 +298,26 @@ impl AppState {
     /// Aborts the in-flight run, keeping the outcomes of the statements
     /// that already finished visible and marking the run cancelled.
     ///
-    /// Cancelling only drops the sqlx future — on BOTH backends the
-    /// in-flight statement itself is NOT interrupted and still completes
-    /// (a cancelled UPDATE still commits):
-    /// - SQLite: the statement runs to completion on sqlx's worker thread;
-    ///   only the future stops being polled.
-    /// - Postgres: returning the pooled connection makes sqlx drain the
-    ///   socket until the in-flight query has finished server-side, after
-    ///   which the connection goes back to the pool healthy — the server
-    ///   never sees a disconnect, so the query is not aborted.
+    /// Cancelling only drops the run's future — on every backend the
+    /// in-flight statement itself is NOT interrupted and may still complete
+    /// server-side. What happens to its connection depends on the path:
+    /// - In hubro's own transaction (the atomic path), dropping it queues a
+    ///   rollback, so once the statement finishes nothing of the run is kept;
+    ///   the connection then goes back to the pool.
+    /// - Outside it (the sequential path, which every one-statement script
+    ///   takes), the held connection is closed rather than returned, since
+    ///   the script may have a transaction of its own open on it. A statement
+    ///   that commits on its own (a cancelled autocommit UPDATE) may still
+    ///   take effect; whatever the script left uncommitted is discarded by the
+    ///   server. SQLite's worker thread runs the statement to completion
+    ///   before the close; Postgres and SQL Server notice the disconnect when
+    ///   they next send to the client.
+    /// - On a connection marked read-only, Postgres's per-statement
+    ///   transaction goes back to the pool after sqlx drains the in-flight
+    ///   query; SQLite's read-only connection is closed.
     ///
-    /// Either way each cancelled long-running query pins one pool
-    /// connection until the statement finishes.
+    /// Either way each cancelled long-running statement keeps its server
+    /// session busy until it finishes.
     pub fn cancel_sql(mut self, id: ConnectionId, buffer: u64) {
         let task = self.sql_tasks.write().remove(&(id, buffer));
         let Some(task) = task else { return };
@@ -397,8 +405,7 @@ impl AppState {
             // (the future is dropped), so they are not recorded. Recorded
             // fire-and-forget: a wedged history.db must never delay the
             // status update below.
-            let error_text = result.as_ref().err().map(|e| e.error.to_string());
-            let success = result.is_ok();
+            let (status, success, error_text) = finished_run(result, elapsed_ms);
             spawn_forever(async move {
                 self.record_history(id, script, success, error_text).await;
             });
@@ -408,19 +415,7 @@ impl AppState {
             }
             self.sql_tasks.write().remove(&(id, buffer));
             if let Some(run) = self.sql_runs.write().get_mut(&(id, buffer)) {
-                run.status = match result {
-                    Ok(done) => RunStatus::Done {
-                        elapsed_ms,
-                        rolled_back: done.rolled_back,
-                    },
-                    Err(err) => RunStatus::Failed {
-                        error: err.error.to_string(),
-                        statement_index: err.statement_index,
-                        preview: err.preview,
-                        elapsed_ms,
-                        rollback: err.rollback,
-                    },
-                };
+                run.status = status;
             }
         });
         self.sql_tasks.write().insert((id, buffer), task);
@@ -779,6 +774,51 @@ async fn off_the_ui_thread<T: Send + 'static>(
 /// Sibling temp path for an atomic export write (`foo.csv` → `foo.csv.part`).
 /// Streaming into this and renaming on success keeps a mid-stream failure
 /// from clobbering an existing file at the destination.
+/// What a finished run shows and what history records of it.
+///
+/// History records whether the run's work took effect as it was written: a
+/// run whose transaction hubro rolled back is recorded as failed, with the
+/// reason, even though every statement ran — "success" beside a script whose
+/// changes are gone would send the user looking for rows that are not there.
+/// A run whose connection was closed after it is recorded as a success: every
+/// statement ran, and nothing is known to be lost.
+fn finished_run(
+    result: Result<ScriptDone, ScriptError>,
+    elapsed_ms: u64,
+) -> (RunStatus, bool, Option<String>) {
+    match result {
+        Ok(done) => {
+            let rolled_back = done.rolled_back.map(|_| {
+                "The script ended inside a transaction it never committed; hubro rolled it back."
+                    .to_string()
+            });
+            (
+                RunStatus::Done {
+                    elapsed_ms,
+                    rolled_back: done.rolled_back,
+                    connection_closed: done.connection_closed,
+                },
+                rolled_back.is_none(),
+                rolled_back,
+            )
+        }
+        Err(err) => {
+            let error = err.error.to_string();
+            (
+                RunStatus::Failed {
+                    error: error.clone(),
+                    statement_index: err.statement_index,
+                    preview: err.preview,
+                    elapsed_ms,
+                    rollback: err.rollback,
+                },
+                false,
+                Some(error),
+            )
+        }
+    }
+}
+
 fn export_temp_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".part");
@@ -923,5 +963,78 @@ mod tests {
                 "its own tab's run"
             );
         });
+    }
+
+    use crate::db::OpenTransaction;
+
+    /// The wire from what a run returned to what the editor shows and what
+    /// history records — the rolled-back report must reach both.
+    #[test]
+    fn a_rolled_back_run_is_shown_and_recorded_as_rolled_back() {
+        let open = OpenTransaction {
+            schema_changes_kept: true,
+        };
+        let (status, success, error) = finished_run(
+            Ok(ScriptDone {
+                rolled_back: Some(open),
+                connection_closed: false,
+            }),
+            7,
+        );
+        assert_eq!(
+            status,
+            RunStatus::Done {
+                elapsed_ms: 7,
+                rolled_back: Some(open),
+                connection_closed: false,
+            }
+        );
+        assert!(
+            !success,
+            "history must not record a rolled-back run as a success"
+        );
+        assert!(error.is_some_and(|e| e.contains("rolled it back")));
+
+        let (status, success, error) = finished_run(
+            Ok(ScriptDone {
+                rolled_back: None,
+                connection_closed: true,
+            }),
+            7,
+        );
+        assert_eq!(
+            status,
+            RunStatus::Done {
+                elapsed_ms: 7,
+                rolled_back: None,
+                connection_closed: true,
+            }
+        );
+        assert!(success);
+        assert_eq!(error, None);
+
+        let (_, success, error) = finished_run(Ok(ScriptDone::default()), 7);
+        assert!(success);
+        assert_eq!(error, None);
+
+        let (status, success, error) = finished_run(
+            Err(ScriptError {
+                statement_index: 1,
+                preview: "SELECT nope".into(),
+                error: DbError::Query("boom".into()),
+                rollback: Rollback::OpenTransaction(open),
+            }),
+            7,
+        );
+        assert!(matches!(
+            status,
+            RunStatus::Failed {
+                rollback: Rollback::OpenTransaction(o),
+                statement_index: 1,
+                ..
+            } if o == open
+        ));
+        assert!(!success);
+        assert!(error.is_some_and(|e| e.contains("boom")));
     }
 }

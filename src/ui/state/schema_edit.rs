@@ -164,24 +164,7 @@ impl AppState {
         // without transactional DDL is not a rollback, just an unobserved
         // outcome.
         let task = spawn_forever(async move {
-            let outcome = match run_script(&pool, caps, &statements, |_| {}).await {
-                // The statement is editable, so it can open a transaction and
-                // not commit it. The run rolled that back, and reporting the
-                // edit as done would claim a change that is not there.
-                Ok(ScriptDone {
-                    rolled_back: Some(open),
-                }) => Err(if open.schema_changes_kept {
-                    "The statement opened a transaction and never committed it, so it was \
-                     rolled back — but this server keeps schema changes through a rollback. \
-                     Check the schema."
-                } else {
-                    "The statement opened a transaction and never committed it, so it was \
-                     rolled back — nothing changed."
-                }
-                .to_string()),
-                Ok(ScriptDone { rolled_back: None }) => Ok(()),
-                Err(err) => Err(err.error.to_string()),
-            };
+            let outcome = schema_edit_outcome(run_script(&pool, caps, &statements, |_| {}).await);
             self.finish_schema_edit(id, generation, outcome, &request);
         });
         self.schema_edit_tasks.write().insert(id, task);
@@ -276,9 +259,66 @@ impl AppState {
     }
 }
 
+/// Whether a schema edit's run counts as done.
+///
+/// The statement is editable, so it can open a transaction and not commit it.
+/// The run rolled that back, and reporting the edit as done would claim a
+/// change that is not there. A run whose connection was closed afterwards
+/// still ran the statement, and counts as done.
+fn schema_edit_outcome(result: Result<ScriptDone, ScriptError>) -> Result<(), String> {
+    match result {
+        Ok(ScriptDone {
+            rolled_back: Some(open),
+            ..
+        }) => Err(if open.schema_changes_kept {
+            "The statement opened a transaction and never committed it, so it was rolled back \
+             — but this server keeps schema changes through a rollback. Check the schema."
+        } else {
+            "The statement opened a transaction and never committed it, so it was rolled back \
+             — nothing changed."
+        }
+        .to_string()),
+        Ok(ScriptDone {
+            rolled_back: None, ..
+        }) => Ok(()),
+        Err(err) => Err(err.error.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rolled_back_schema_edit_is_not_done() {
+        let rolled_back = |schema_changes_kept| {
+            schema_edit_outcome(Ok(ScriptDone {
+                rolled_back: Some(crate::db::OpenTransaction {
+                    schema_changes_kept,
+                }),
+                connection_closed: false,
+            }))
+        };
+        assert!(rolled_back(false).is_err_and(|e| e.contains("nothing changed")));
+        assert!(rolled_back(true).is_err_and(|e| e.contains("Check the schema")));
+        assert_eq!(schema_edit_outcome(Ok(ScriptDone::default())), Ok(()));
+        assert_eq!(
+            schema_edit_outcome(Ok(ScriptDone {
+                rolled_back: None,
+                connection_closed: true,
+            })),
+            Ok(())
+        );
+        assert_eq!(
+            schema_edit_outcome(Err(ScriptError {
+                statement_index: 0,
+                preview: String::new(),
+                error: DbError::Query("refused".into()),
+                rollback: Rollback::None,
+            })),
+            Err(DbError::Query("refused".into()).to_string())
+        );
+    }
 
     fn table_ref(schema: Option<&str>, name: &str) -> TableRef {
         TableRef {

@@ -729,7 +729,8 @@ async fn sqlite_script_left_inside_its_transaction_is_rolled_back_and_says_so() 
         Ok(ScriptDone {
             rolled_back: Some(OpenTransaction {
                 schema_changes_kept: false
-            })
+            }),
+            connection_closed: false,
         }),
         "a script that ends inside its own transaction must say it was rolled back"
     );
@@ -856,7 +857,8 @@ async fn postgres_script_left_inside_its_transaction_is_rolled_back_and_says_so(
         Ok(ScriptDone {
             rolled_back: Some(OpenTransaction {
                 schema_changes_kept: false
-            })
+            }),
+            connection_closed: false,
         })
     );
     assert_eq!(pg_open_transactions(&pool).await, Vec::<String>::new());
@@ -948,5 +950,113 @@ async fn postgres_cancelled_script_does_not_return_its_transaction_to_the_pool()
         Value::Integer(0)
     );
     pool.execute("DROP TABLE cancelled_tx").await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_cancelled_script_does_not_return_its_transaction_to_the_pool() {
+    // A run cancelled mid-statement never reaches its end, so its connection
+    // must be closed: returned, it carried the script's transaction — and
+    // SQLite's write lock with it — back into the pool, where later edits
+    // failed with "database is locked".
+    let fixture = FixtureDb::with_sql(
+        "CREATE TABLE cancelled_tx (a INTEGER); CREATE TABLE edits (a INTEGER)",
+    )
+    .await;
+    let pool = fixture.open().await;
+    common::open_several_connections(&pool, SQLITE_SLOW).await;
+    let statements = split_statements(
+        &format!(
+            "BEGIN; INSERT INTO cancelled_tx VALUES (1); {SQLITE_SLOW}; {SQLITE_SLOW}; \
+             {SQLITE_SLOW}; {SQLITE_SLOW}"
+        ),
+        pool.dialect(),
+    );
+    let run = run_script(&pool, pool.backend_capabilities(), &statements, |_| {});
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(150), run)
+            .await
+            .is_err(),
+        "the run should still be busy when it is cancelled"
+    );
+    // Past the statements still running on the worker thread.
+    tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+
+    for n in 0..8 {
+        pool.execute_checked("INSERT INTO edits VALUES (?)", &[Value::Integer(n)], 1)
+            .await
+            .unwrap_or_else(|e| panic!("edit {n} failed on a pooled connection: {e}"));
+    }
+    let fresh = fixture.open().await;
+    assert_eq!(
+        count(&fresh, "SELECT count(*) FROM cancelled_tx").await,
+        Value::Integer(0),
+        "the cancelled script's uncommitted INSERT must be gone"
+    );
+    assert_eq!(
+        count(&fresh, "SELECT count(*) FROM edits").await,
+        Value::Integer(8)
+    );
+    fresh.close().await;
+    pool.close().await;
+}
+
+/// A read with far more rows than the cap — two billion, generated as they
+/// are sent (a set-returning function in the select list streams; in `FROM`
+/// it would be materialized first). Reading the rest of it after the cap
+/// would take minutes.
+const PG_ENDLESS_READ: &str = "SELECT generate_series(1, 2000000000)";
+
+#[tokio::test]
+async fn postgres_script_ending_in_a_capped_read_does_not_wait_for_the_rest() {
+    // Ending a run asks the connection whether the script left a transaction
+    // open. Asked after a read the row cap cut short, that question waited
+    // for the rest of the result to arrive and be thrown away — measured,
+    // 1.3 s for 3M rows on localhost, against 30 ms before the run held its
+    // connection. A one-statement SELECT is the commonest run there is.
+    let Some(url) = pg_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.execute("DROP TABLE IF EXISTS capped_tx")
+        .await
+        .unwrap();
+    pool.execute("CREATE TABLE capped_tx (a integer)")
+        .await
+        .unwrap();
+    common::open_several_connections(&pool, "SELECT pg_sleep(0.2)").await;
+    let bound = std::time::Duration::from_secs(30);
+
+    let (results, outcome) = tokio::time::timeout(bound, collect_script(&pool, PG_ENDLESS_READ))
+        .await
+        .expect("a capped read must not wait for the rest of its result");
+    assert_eq!(outcome, Ok(ScriptDone::default()));
+    assert!(results[0].truncated);
+
+    // The same read at the end of a script inside its own transaction: the
+    // transaction is still rolled back, and said to be.
+    let (results, outcome) = tokio::time::timeout(
+        bound,
+        collect_script(
+            &pool,
+            &format!("BEGIN; INSERT INTO capped_tx VALUES (1); {PG_ENDLESS_READ}"),
+        ),
+    )
+    .await
+    .expect("a capped read must not wait for the rest of its result");
+    assert!(results[2].truncated);
+    assert_eq!(
+        outcome,
+        Ok(ScriptDone {
+            rolled_back: Some(OpenTransaction {
+                schema_changes_kept: false
+            }),
+            connection_closed: false,
+        })
+    );
+    assert_eq!(pg_open_transactions(&pool).await, Vec::<String>::new());
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM capped_tx").await,
+        Value::Integer(0)
+    );
+    pool.execute("DROP TABLE capped_tx").await.unwrap();
     pool.close().await;
 }

@@ -793,6 +793,7 @@ fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
         RunStatus::Done {
             elapsed_ms,
             rolled_back,
+            connection_closed,
         } => rsx! {
             p { class: "px-4 py-2 text-xs text-slate-500",
                 if statement_count == 1 {
@@ -807,6 +808,12 @@ fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
             if let Some(open) = rolled_back {
                 p { class: "border-t border-amber-300 dark:border-amber-900/50 px-4 py-3 text-sm text-amber-700 dark:text-amber-300",
                     {left_open_note(open)}
+                }
+            }
+            if connection_closed {
+                p { class: "border-t border-amber-300 dark:border-amber-900/50 px-4 py-3 text-sm text-amber-700 dark:text-amber-300",
+                    "Hubro could not check whether the script left a transaction open, so it \
+                     closed the connection — anything the script had not committed was discarded."
                 }
             }
         },
@@ -826,7 +833,13 @@ fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
                         format!("Script rolled back after {elapsed_ms} ms — no changes were applied.")
                     }
                     Rollback::None => format!(
-                        "Script stopped after {elapsed_ms} ms; earlier statements were not rolled back.",
+                        "Script stopped after {elapsed_ms} ms; hubro rolled nothing back, so \
+                         earlier statements stand unless the server undid them itself.",
+                    ),
+                    Rollback::ConnectionClosed => format!(
+                        "Script stopped after {elapsed_ms} ms, and hubro closed the connection \
+                         rather than check what the script left open: the server discarded \
+                         anything it had not committed. Statements it committed stand.",
                     ),
                     // The claim this exists to stop hubro making:
                     // the rollback was real, but it did not reach the schema
@@ -876,7 +889,8 @@ fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
 fn left_open_note(open: OpenTransaction) -> String {
     format!(
         "The script ended inside a transaction it opened and never committed, so hubro \
-         rolled it back — nothing it changed after its BEGIN was kept.{}",
+         rolled it back — nothing it changed after its BEGIN was kept. A transaction can't \
+         span runs: each run ends with none open, so run BEGIN … COMMIT together.{}",
         schema_kept_note(open),
     )
 }

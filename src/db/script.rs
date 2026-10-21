@@ -1546,6 +1546,11 @@ pub enum Rollback {
     /// script: statements before its `BEGIN`, and anything it had committed,
     /// stand.
     OpenTransaction(OpenTransaction),
+    /// The sequential path could not check what the script left open, so it
+    /// closed the connection instead of returning it to the pool. The server
+    /// discards anything uncommitted on a closed connection; whether there was
+    /// anything, hubro cannot say.
+    ConnectionClosed,
 }
 
 /// A transaction a script opened itself and had not ended when the run did,
@@ -1573,6 +1578,10 @@ pub struct ScriptDone {
     /// (a `BEGIN` with no `COMMIT`) and hubro rolled it back, so the run is
     /// not mistaken for one whose changes took effect.
     pub rolled_back: Option<OpenTransaction>,
+    /// Hubro could not check whether the script left a transaction open, and
+    /// closed the connection rather than return it to the pool — see
+    /// [`Rollback::ConnectionClosed`].
+    pub connection_closed: bool,
 }
 
 /// Where and how a script failed.
@@ -1777,7 +1786,7 @@ async fn run_script_sequential(
     statements: &[String],
     mut on_result: impl FnMut(StatementResult),
 ) -> Result<ScriptDone, ScriptError> {
-    let mut conn = match pool.acquire_script_conn().await {
+    let conn = match pool.acquire_script_conn().await {
         Ok(conn) => conn,
         Err(error) => {
             return Err(ScriptError {
@@ -1791,12 +1800,31 @@ async fn run_script_sequential(
             })
         }
     };
+    let last = statements.len().saturating_sub(1);
+    let mut conn = Some(conn);
+    // Set when the last statement ended the hold itself (a read: see
+    // `ScriptConn::finish_with_read`).
+    let mut ended = None;
     let mut failure = None;
     for (statement_index, statement) in statements.iter().enumerate() {
+        let Some(held) = conn.as_mut() else { break };
         // Reads stream through the row cap so a huge result never buffers in
         // full; writes report an affected-row count as before.
-        let outcome = if classify_statement(statement, pool.dialect()).returns_rows() {
-            conn.query_capped_to(
+        let reads = classify_statement(statement, pool.dialect()).returns_rows();
+        let outcome = if reads && statement_index == last {
+            let (read, end) = conn
+                .take()
+                .expect("held until the last statement")
+                .finish_with_read(
+                    statement,
+                    MAX_QUERY_ROWS,
+                    cell_cap(statement, pool.dialect()),
+                )
+                .await;
+            ended = Some(end);
+            read.map(|(result, truncated)| (StatementOutcome::Rows(result), truncated))
+        } else if reads {
+            held.query_capped_to(
                 statement,
                 MAX_QUERY_ROWS,
                 cell_cap(statement, pool.dialect()),
@@ -1804,7 +1832,7 @@ async fn run_script_sequential(
             .await
             .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated))
         } else {
-            conn.execute(statement)
+            held.execute(statement)
                 .await
                 .map(|affected| (StatementOutcome::Affected(affected), false))
         };
@@ -1824,21 +1852,32 @@ async fn run_script_sequential(
         Some((statement_index, _)) => &statements[..=*statement_index],
         None => statements,
     };
-    let ended = conn.end().await;
+    let ended = match (ended, conn) {
+        (Some(ended), _) => ended,
+        (None, Some(conn)) => conn.end().await,
+        (None, None) => unreachable!("the hold is ended by the last statement or here"),
+    };
     sequential_outcome(caps, pool.dialect(), statements, ran, failure, ended)
 }
 
 /// How a sequential run reports, given how its statements went (`failure`)
-/// and how [`ScriptConn::end`](super::registry::ScriptConn::end) went (`ended`: whether it rolled back a
-/// transaction the script had left open). Over plain data so a test can
-/// execute every combination.
+/// and how ending its hold on the connection went (`ended`: whether a
+/// transaction the script had left open was rolled back — see
+/// [`ScriptConn::end`](super::registry::ScriptConn::end)). Over plain data so
+/// a test can execute every combination.
 ///
 /// A failed end closed the connection, which ends whatever was open on it
-/// server-side, but hubro cannot say whether anything was: after a failed
-/// statement the statement's error is the one to report and nothing is
-/// claimed about a rollback; after a clean run the failure to end is itself
-/// the error, so the run is never reported as done when a transaction it
-/// opened may have been discarded.
+/// server-side, but hubro cannot say whether anything was. After a clean run
+/// that is [`ScriptDone::connection_closed`], not an error: every statement
+/// did run, and blaming the last one would be false. After a failed statement
+/// the statement's error stands, with [`Rollback::ConnectionClosed`] saying
+/// what hubro does and doesn't know.
+///
+/// `schema_changes_kept` is decided over everything that ran, including
+/// statements before the script's `BEGIN` and the one that failed — more than
+/// the rolled-back transaction held. That can only claim a schema change
+/// survived when it was committed anyway or never applied, never the reverse,
+/// which is the side [`rollback_cover`] errs on too.
 fn sequential_outcome(
     caps: Capabilities,
     dialect: Dialect,
@@ -1856,20 +1895,22 @@ fn sequential_outcome(
     match (failure, ended) {
         (None, Ok(rolled_back)) => Ok(ScriptDone {
             rolled_back: open_transaction(rolled_back),
+            connection_closed: false,
         }),
-        (None, Err(error)) => Err(ScriptError {
-            statement_index: statements.len().saturating_sub(1),
-            preview: "end of script".to_string(),
-            error,
-            rollback: Rollback::None,
+        (None, Err(_)) => Ok(ScriptDone {
+            rolled_back: None,
+            connection_closed: true,
         }),
         (Some((statement_index, error)), ended) => Err(ScriptError {
             statement_index,
             preview: statement_preview(&statements[statement_index]),
             error,
-            rollback: match open_transaction(ended.unwrap_or(false)) {
-                Some(open) => Rollback::OpenTransaction(open),
-                None => Rollback::None,
+            rollback: match ended {
+                Ok(rolled_back) => match open_transaction(rolled_back) {
+                    Some(open) => Rollback::OpenTransaction(open),
+                    None => Rollback::None,
+                },
+                Err(_) => Rollback::ConnectionClosed,
             },
         }),
     }
@@ -2124,11 +2165,21 @@ fn is_non_transactional(dialect: Dialect, stripped: &str) -> bool {
 /// [`is_bare_transaction_control`]), which the backend sends as a plain batch:
 /// through `sp_executesql` a statement that changes `@@TRANCOUNT` fails with
 /// error 266.
+///
+/// Stricter than the gate's test, because a plain batch is where a `SET`
+/// outlives its statement. The gate's name slot takes any word of the
+/// stripped text, so `BEGIN TRAN EXEC('SET NOCOUNT ON')` and `BEGIN TRAN
+/// SETUSER 'guest'` pass it; here a reserved word in the name's place
+/// ([`TSQL_OPAQUE_WORDS`]), a parenthesis, or anything but words and the
+/// characters a name is spelled with turns the statement away, and it goes
+/// through `sp_executesql` like any other.
 pub(crate) fn tsql_is_transaction_control(sql: &str) -> bool {
-    is_bare_transaction_control(
-        Dialect::SqlServer,
-        &strip_strings_and_comments(sql, Dialect::SqlServer),
-    )
+    let stripped = strip_strings_and_comments(sql, Dialect::SqlServer);
+    is_bare_transaction_control(Dialect::SqlServer, &stripped)
+        && !has_opaque_word(Dialect::SqlServer, &stripped)
+        && stripped
+            .chars()
+            .all(|c| c.is_alphanumeric() || c.is_whitespace() || matches!(c, '_' | '@' | '#' | ';'))
 }
 
 /// Whether SQL Server accepts `sql` only as the first statement of a batch —
@@ -4408,6 +4459,11 @@ mod tests {
             assert!(tsql_is_transaction_control(sql), "{sql:?}");
         }
         for sql in [
+            // A name slot holding a statement: measured, a SET inside EXEC()
+            // reverts when the EXEC returns, but nothing here depends on it.
+            "BEGIN TRAN EXEC('SET NOCOUNT ON')",
+            "BEGIN TRAN SETUSER 'guest'",
+            "COMMIT TRAN EXECUTE('SET NOCOUNT ON')",
             "BEGIN TRAN SET NOCOUNT ON",
             "BEGIN TRAN\nSET NOCOUNT ON",
             "BEGIN TRY SELECT 1 END TRY BEGIN CATCH SELECT 2 END CATCH",
@@ -4441,14 +4497,12 @@ mod tests {
             schema_changes_kept: false,
         };
 
-        assert_eq!(
-            outcome(None, Ok(false)),
-            Ok(ScriptDone { rolled_back: None })
-        );
+        assert_eq!(outcome(None, Ok(false)), Ok(ScriptDone::default()));
         assert_eq!(
             outcome(None, Ok(true)),
             Ok(ScriptDone {
-                rolled_back: Some(open)
+                rolled_back: Some(open),
+                connection_closed: false,
             })
         );
         assert_eq!(
@@ -4458,15 +4512,20 @@ mod tests {
         let err = outcome(failed(), Ok(false)).unwrap_err();
         assert_eq!((err.statement_index, err.rollback), (1, Rollback::None));
         // A failed end after a failed statement: the statement's error stands,
-        // and nothing is claimed about a rollback.
+        // and the rollback says only that the connection was closed.
         let err = outcome(failed(), Err(DbError::Query("gone".into()))).unwrap_err();
         assert_eq!(err.error, DbError::Query("boom".into()));
-        assert_eq!(err.rollback, Rollback::None);
-        // A failed end after a clean run is the run's error: it must not be
-        // reported as done when a transaction it opened may have been dropped.
-        let err = outcome(None, Err(DbError::Query("gone".into()))).unwrap_err();
-        assert_eq!(err.error, DbError::Query("gone".into()));
-        assert_eq!(err.statement_index, 2);
+        assert_eq!(err.rollback, Rollback::ConnectionClosed);
+        // A failed end after a clean run: every statement ran, so none is
+        // blamed, but the run says the connection was closed rather than
+        // claim nothing was lost.
+        assert_eq!(
+            outcome(None, Err(DbError::Query("gone".into()))),
+            Ok(ScriptDone {
+                rolled_back: None,
+                connection_closed: true,
+            })
+        );
     }
 
     #[test]
@@ -4480,6 +4539,7 @@ mod tests {
             match sequential_outcome(caps, Dialect::Postgres, &ran, &ran, None, Ok(true)) {
                 Ok(ScriptDone {
                     rolled_back: Some(open),
+                    ..
                 }) => open.schema_changes_kept,
                 other => panic!("expected a rolled-back transaction, got {other:?}"),
             }

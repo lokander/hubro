@@ -2228,7 +2228,8 @@ async fn sqlserver_script_left_inside_its_transaction_is_rolled_back_and_says_so
         Ok(ScriptDone {
             rolled_back: Some(OpenTransaction {
                 schema_changes_kept: false
-            })
+            }),
+            connection_closed: false,
         }),
         "{}",
         common::script_outcome(&outcome)
@@ -2306,5 +2307,154 @@ async fn sqlserver_script_failing_inside_its_transaction_rolls_it_back() {
         .unwrap();
     assert_eq!(rows.rows[0][0], Value::Integer(0));
     run_all(&pool, &["DROP TABLE dbo.failed_tx"]).await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_cancelled_script_does_not_return_its_transaction_to_the_pool() {
+    // A run cancelled mid-statement never reaches its end, so its connection
+    // must be discarded: returned, it went back at `@@TRANCOUNT = 1`, where
+    // a later edit reported success and was lost with the connection.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.cancelled_tx",
+            "DROP TABLE IF EXISTS dbo.cancelled_tx_edit",
+            "CREATE TABLE dbo.cancelled_tx (a int)",
+            "CREATE TABLE dbo.cancelled_tx_edit (a int)",
+        ],
+    )
+    .await;
+    common::open_several_connections(&pool, MSSQL_SLOW).await;
+    let statements = split_statements(
+        "BEGIN TRAN\nGO\nINSERT INTO dbo.cancelled_tx VALUES (1)\nGO\nWAITFOR DELAY '00:00:01.500'",
+        pool.dialect(),
+    );
+    let run = run_script(&pool, pool.backend_capabilities(), &statements, |_| {});
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), run)
+            .await
+            .is_err(),
+        "the run should still be waiting when it is cancelled"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+    assert_eq!(
+        mssql_open_transactions(&pool).await,
+        Vec::<Value>::new(),
+        "a connection went back inside a transaction"
+    );
+    for n in 0..4 {
+        pool.execute_checked(
+            "INSERT INTO dbo.cancelled_tx_edit VALUES (@P1)",
+            &[Value::Integer(n)],
+            1,
+        )
+        .await
+        .unwrap();
+    }
+    pool.close().await;
+    let fresh = DbPool::open_mssql(&url).await.unwrap();
+    let edits = fresh
+        .query("SELECT count(*) FROM dbo.cancelled_tx_edit")
+        .await
+        .unwrap();
+    assert_eq!(
+        edits.rows[0][0],
+        Value::Integer(4),
+        "every edit must be kept"
+    );
+    let cancelled = fresh
+        .query("SELECT count(*) FROM dbo.cancelled_tx")
+        .await
+        .unwrap();
+    assert_eq!(cancelled.rows[0][0], Value::Integer(0));
+    run_all(
+        &fresh,
+        &[
+            "DROP TABLE dbo.cancelled_tx",
+            "DROP TABLE dbo.cancelled_tx_edit",
+        ],
+    )
+    .await;
+    fresh.close().await;
+}
+
+/// Far more rows than the cap, produced as they are sent; reading the rest
+/// after the cap would take minutes.
+const MSSQL_ENDLESS_READ: &str = "SELECT TOP (2000000000) a.object_id FROM sys.all_columns a \
+                                  CROSS JOIN sys.all_columns b CROSS JOIN sys.all_columns c";
+
+#[tokio::test]
+async fn sqlserver_script_ending_in_a_capped_read_does_not_wait_for_the_rest() {
+    // Ending a run asks the connection for `@@TRANCOUNT`. Asked after a read
+    // the row cap cut short, tiberius first drained the rest of the result —
+    // measured, 1.55 s for 3M rows on localhost, where discarding the
+    // connection took 100 ms. A one-statement SELECT is the commonest run.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.capped_tx",
+            "CREATE TABLE dbo.capped_tx (a int)",
+        ],
+    )
+    .await;
+    common::open_several_connections(&pool, MSSQL_SLOW).await;
+    let bound = std::time::Duration::from_secs(30);
+    let run = |sql: String| {
+        let pool = &pool;
+        async move {
+            let statements = split_statements(&sql, pool.dialect());
+            let mut truncated = Vec::new();
+            let outcome = run_script(pool, pool.backend_capabilities(), &statements, |r| {
+                truncated.push(r.truncated)
+            })
+            .await;
+            (truncated, outcome)
+        }
+    };
+
+    let (truncated, outcome) = tokio::time::timeout(bound, run(MSSQL_ENDLESS_READ.to_string()))
+        .await
+        .expect("a capped read must not wait for the rest of its result");
+    assert_eq!(
+        outcome,
+        Ok(ScriptDone::default()),
+        "{}",
+        common::script_outcome(&outcome)
+    );
+    assert_eq!(truncated, [true]);
+
+    let (truncated, outcome) = tokio::time::timeout(
+        bound,
+        run(format!(
+            "BEGIN TRAN\nGO\nINSERT INTO dbo.capped_tx VALUES (1)\nGO\n{MSSQL_ENDLESS_READ}"
+        )),
+    )
+    .await
+    .expect("a capped read must not wait for the rest of its result");
+    assert_eq!(truncated, [false, false, true]);
+    assert_eq!(
+        outcome,
+        Ok(ScriptDone {
+            rolled_back: Some(OpenTransaction {
+                schema_changes_kept: false
+            }),
+            connection_closed: false,
+        }),
+        "{}",
+        common::script_outcome(&outcome)
+    );
+    assert_eq!(mssql_open_transactions(&pool).await, Vec::<Value>::new());
+    let rows = pool
+        .query("SELECT count(*) FROM dbo.capped_tx")
+        .await
+        .unwrap();
+    assert_eq!(rows.rows[0][0], Value::Integer(0));
+    run_all(&pool, &["DROP TABLE dbo.capped_tx"]).await;
     pool.close().await;
 }
