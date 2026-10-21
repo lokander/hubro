@@ -2200,14 +2200,21 @@ pub(crate) fn tsql_is_transaction_control(sql: &str) -> bool {
 /// - **SQL Server**: a statement is a whole batch, and one led by `SELECT`
 ///   can carry `COMMIT` or `BEGIN TRAN` — both measured — so no `BEGIN`,
 ///   `COMMIT`, `ROLLBACK` or `SAVE` word anywhere in it, no
-///   `IMPLICIT_TRANSACTIONS` (under which a `SELECT` opens a transaction),
+///   `IMPLICIT_TRANSACTIONS` or `ANSI_DEFAULTS` (which turns it on; under
+///   it a `SELECT` opens a transaction),
 ///   and no opaque word ([`TSQL_OPAQUE_WORDS`]: an `EXEC`'d procedure can
 ///   change `@@TRANCOUNT`).
 /// - **Both**: nothing [`statement_needs`] charges as a write. A
 ///   data-modifying CTE that returns rows (`WITH w AS (INSERT … RETURNING a)
 ///   SELECT a FROM w`, T-SQL's `OUTPUT`) writes only as fast as its rows are
-///   read, so abandoning them abandons the write — measured on Postgres, 0
-///   rows kept of 3M where reading to the end keeps all of them.
+///   read. On SQL Server, where a cut-short read's connection is discarded,
+///   that is what keeps the write: discarded, it was aborted with the
+///   session. On Postgres it changes no data outcome — a cut-short read with
+///   nothing open goes back to the pool to be read to the end in the
+///   background, and one inside an open transaction is rolled back either
+///   way — and decides only whether a write that fails after the cap is
+///   reported, read to the end before the run ends, or lost in the
+///   background read.
 /// - **SQLite** never asks: its read is followed by the ordinary end.
 ///
 /// A false "no" costs only the wait for the rest of the result, as every
@@ -2228,7 +2235,12 @@ pub(crate) fn final_read_may_close(sql: &str, dialect: Dialect) -> bool {
                 && !has_word(&stripped, |word| {
                     matches!(
                         word.to_ascii_lowercase().as_str(),
-                        "begin" | "commit" | "rollback" | "save" | "implicit_transactions"
+                        "begin"
+                            | "commit"
+                            | "rollback"
+                            | "save"
+                            | "implicit_transactions"
+                            | "ansi_defaults"
                     )
                 })
         }
@@ -4646,6 +4658,7 @@ mod tests {
             "SELECT 1 AS a ROLLBACK",
             "SELECT 1 SAVE TRAN p",
             "SET IMPLICIT_TRANSACTIONS ON SELECT 1",
+            "SET ANSI_DEFAULTS ON SELECT 1",
             "SELECT 1 EXEC dbo.p",
             "WITH c AS (SELECT 1 AS a) INSERT INTO t OUTPUT inserted.a SELECT a FROM c",
             "SELECT TOP (5) a FROM t INSERT INTO t VALUES (1)",

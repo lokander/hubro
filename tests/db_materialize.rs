@@ -559,3 +559,62 @@ async fn materialize_reports_a_transaction_only_when_a_script_leaves_one_open() 
     assert_eq!(run("SELECT 1").await, nothing, "the next run starts clean");
     pool.close().await;
 }
+
+#[tokio::test]
+async fn materialize_write_only_transaction_left_open_is_rolled_back_and_said_to_be() {
+    // An INSERT makes Materialize's transaction write-only: a table read in
+    // it is refused with 25000 (measured), the code CockroachDB uses after a
+    // commit. The end-of-run probe must still report the INSERT it discards,
+    // with or without a read after it, and keep one the script committed.
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let _ = pool.execute("DROP TABLE IF EXISTS write_only").await;
+    pool.execute("CREATE TABLE write_only (a int)")
+        .await
+        .unwrap();
+    let caps = pool.backend_capabilities();
+    let run = |sql: &str| {
+        let statements = hubro::db::split_statements(sql, pool.dialect());
+        let pool = &pool;
+        async move { hubro::db::run_script(pool, caps, &statements, |_| {}).await }
+    };
+    let rows = || async {
+        pool.query("SELECT count(*) FROM write_only")
+            .await
+            .unwrap()
+            .rows[0][0]
+            .clone()
+    };
+    let rolled_back = hubro::db::OpenTransaction {
+        schema_changes_kept: false,
+    };
+
+    let outcome = run("BEGIN; INSERT INTO write_only VALUES (1)").await;
+    assert_eq!(outcome.map(|done| done.rolled_back), Ok(Some(rolled_back)));
+    assert_eq!(rows().await, Value::Integer(0));
+
+    let outcome = run("BEGIN; INSERT INTO write_only VALUES (2); SELECT 1").await;
+    assert_eq!(outcome.map(|done| done.rolled_back), Ok(Some(rolled_back)));
+    assert_eq!(rows().await, Value::Integer(0));
+
+    let err = run("BEGIN; INSERT INTO write_only VALUES (3); SELECT * FROM write_only")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.statement_index, 2,
+        "the table read is refused: {}",
+        err.error
+    );
+    assert_eq!(
+        err.rollback,
+        hubro::db::Rollback::OpenTransaction(rolled_back)
+    );
+    assert_eq!(rows().await, Value::Integer(0));
+
+    let outcome = run("BEGIN; INSERT INTO write_only VALUES (4); COMMIT").await;
+    assert_eq!(outcome, Ok(hubro::db::ScriptDone::default()));
+    assert_eq!(rows().await, Value::Integer(1));
+
+    pool.execute("DROP TABLE write_only").await.unwrap();
+    pool.close().await;
+}
