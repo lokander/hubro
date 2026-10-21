@@ -1562,9 +1562,10 @@ pub fn script_refusal(
     dialect: Dialect,
 ) -> Option<(usize, &'static str)> {
     // Before anything else, and whatever the capabilities: measured,
-    // sqlx-sqlite spins forever at full CPU on any statement holding a NUL,
-    // SQL Server runs straight past one, and Postgres fails the protocol
-    // message. Nothing a script needs is spelled with one.
+    // sqlx-sqlite spins forever at full CPU on a statement followed by a NUL
+    // (one inside a quoted token fails cleanly; the SQLite backend refuses
+    // both, see `SqlText`), SQL Server runs straight past one, and Postgres
+    // fails the protocol message. Nothing a script needs is spelled with one.
     if let Some(statement_index) = statements.iter().position(|s| s.contains('\0')) {
         return Some((statement_index, NUL_IN_SCRIPT));
     }
