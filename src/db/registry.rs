@@ -301,7 +301,11 @@ pub(super) struct ScriptConn {
 
 enum HeldConn {
     Sqlite(sqlx::pool::PoolConnection<sqlx::Sqlite>),
-    Postgres(sqlx::pool::PoolConnection<sqlx::Postgres>),
+    Postgres {
+        conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
+        /// Read by the end-of-run probe — see [`postgres::end_script_conn`].
+        flavor: postgres::PgFlavor,
+    },
     SqlServer(Box<sqlserver::MssqlScriptConn>),
 }
 
@@ -312,7 +316,7 @@ impl Drop for ScriptConn {
         }
         match &mut self.held {
             HeldConn::Sqlite(conn) => conn.close_on_drop(),
-            HeldConn::Postgres(conn) => conn.close_on_drop(),
+            HeldConn::Postgres { conn, .. } => conn.close_on_drop(),
             HeldConn::SqlServer(conn) => conn.discard(),
         }
     }
@@ -332,7 +336,7 @@ impl ScriptConn {
             HeldConn::Sqlite(conn) => {
                 sqlite::query_capped_conn(conn, sql, max_rows, cell_cap).await
             }
-            HeldConn::Postgres(conn) => {
+            HeldConn::Postgres { conn, .. } => {
                 postgres::query_capped_conn(conn, sql, max_rows, cell_cap).await
             }
             HeldConn::SqlServer(conn) => {
@@ -345,7 +349,7 @@ impl ScriptConn {
     pub(super) async fn execute(&mut self, sql: &str) -> Result<u64, DbError> {
         match &mut self.held {
             HeldConn::Sqlite(conn) => sqlite::execute_conn(conn, sql).await,
-            HeldConn::Postgres(conn) => postgres::execute_conn(conn, sql).await,
+            HeldConn::Postgres { conn, .. } => postgres::execute_conn(conn, sql).await,
             HeldConn::SqlServer(conn) => sqlserver::execute_script_conn(conn, sql).await,
         }
     }
@@ -357,7 +361,7 @@ impl ScriptConn {
     pub(super) async fn end(mut self) -> Result<bool, DbError> {
         let ended = match &mut self.held {
             HeldConn::Sqlite(conn) => sqlite::end_script_conn(conn).await,
-            HeldConn::Postgres(conn) => postgres::end_script_conn(conn).await,
+            HeldConn::Postgres { conn, flavor } => postgres::end_script_conn(conn, *flavor).await,
             HeldConn::SqlServer(conn) => sqlserver::end_script_conn(conn).await,
         };
         self.ended = ended.is_ok();
@@ -405,8 +409,8 @@ impl ScriptConn {
             return (read, self.end().await);
         }
         let finished = match &mut self.held {
-            HeldConn::Postgres(conn) => {
-                postgres::finish_script_conn_with_read(conn, sql, max_rows, cell_cap).await
+            HeldConn::Postgres { conn, flavor } => {
+                postgres::finish_script_conn_with_read(conn, *flavor, sql, max_rows, cell_cap).await
             }
             HeldConn::SqlServer(conn) => {
                 sqlserver::finish_script_conn_with_read(conn, sql, max_rows, cell_cap).await
@@ -709,12 +713,14 @@ impl DbPool {
                     .await
                     .map_err(|e| DbError::Query(e.to_string()))?,
             ),
-            DbPool::Postgres(pg) => HeldConn::Postgres(
-                pg.pool()
+            DbPool::Postgres(pg) => HeldConn::Postgres {
+                conn: pg
+                    .pool()
                     .acquire()
                     .await
                     .map_err(|e| DbError::Query(e.to_string()))?,
-            ),
+                flavor: pg.flavor(),
+            },
             DbPool::SqlServer(pool) => {
                 HeldConn::SqlServer(Box::new(sqlserver::acquire_script_conn(pool).await?))
             }

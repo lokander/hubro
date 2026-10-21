@@ -496,13 +496,16 @@ pub async fn execute_conn(
 /// connection is broken; a `ROLLBACK` follows either way, ends whatever block
 /// the session is in, and fails only on a broken connection — then an error is
 /// returned, the connection's state is unknown, and the caller must not return
-/// it to the pool. Whether the `ROLLBACK` undid anything is the refusal's
-/// SQLSTATE ([`refused_inside_aborted_transaction`]): an aborted transaction
-/// was rolled back, but CockroachDB's `SHOW COMMIT TIMESTAMP` leaves the
-/// session in a block whose transaction is already *committed* (status
-/// `CommitWait`, refusing statements with `25000`), and reporting that as a
-/// rollback claimed the script's committed rows were gone.
-pub async fn end_script_conn(conn: &mut sqlx::postgres::PgConnection) -> Result<bool, DbError> {
+/// it to the pool. Whether the `ROLLBACK` undid anything is decided by
+/// [`refused_probe_rolled_back`]: yes, except for the one refusal known to
+/// follow a commit — CockroachDB's `SHOW COMMIT TIMESTAMP` leaves the session
+/// in a block whose transaction is already *committed* (status `CommitWait`,
+/// refusing statements with `25000`), and reporting that as a rollback claimed
+/// the script's committed rows were gone.
+pub async fn end_script_conn(
+    conn: &mut sqlx::postgres::PgConnection,
+    flavor: PgFlavor,
+) -> Result<bool, DbError> {
     let rolled_back = match sqlx::Connection::begin_with(&mut *conn, "SELECT 1").await {
         Ok(open) => {
             return open
@@ -512,7 +515,8 @@ pub async fn end_script_conn(conn: &mut sqlx::postgres::PgConnection) -> Result<
                 .map_err(|e| DbError::Query(e.to_string()))
         }
         Err(sqlx::Error::BeginFailed) => return Ok(false),
-        Err(refused) => refused_inside_aborted_transaction(
+        Err(refused) => refused_probe_rolled_back(
+            flavor,
             refused
                 .as_database_error()
                 .and_then(|e| e.code())
@@ -522,16 +526,23 @@ pub async fn end_script_conn(conn: &mut sqlx::postgres::PgConnection) -> Result<
     execute_conn(conn, "ROLLBACK").await.map(|_| rolled_back)
 }
 
-/// Whether a statement refused with `sqlstate` was refused because the
-/// session is inside a transaction an error aborted (`25P02`,
-/// `in_failed_sql_transaction`, which PostgreSQL and CockroachDB both send),
-/// so that ending the block rolls something back. Any other refusal is not
-/// claimed as one: a `25000` from CockroachDB's commit-wait block follows a
-/// transaction that already committed, and a probe refused for a reason not
-/// known at all is better reported as undoing nothing than as undoing the
-/// script's work.
-fn refused_inside_aborted_transaction(sqlstate: Option<&str>) -> bool {
-    sqlstate == Some("25P02")
+/// Whether the `ROLLBACK` sent after the end-of-run probe was refused with
+/// `sqlstate` undid something.
+///
+/// Yes for every refusal but one, because the `ROLLBACK` discards whatever an
+/// open transaction holds, and a clean report over discarded work is the
+/// silent loss this path exists to stop. An aborted transaction refuses with
+/// `25P02`; Materialize's write-only transaction (opened by an `INSERT`)
+/// refuses a table read with `25000` — measured, though it takes the probe's
+/// `SELECT 1`, and after refusing the read it is aborted anyway.
+///
+/// The one exception is CockroachDB's commit-wait block: `SHOW COMMIT
+/// TIMESTAMP` commits the transaction and leaves the session refusing every
+/// statement with `25000` until the block ends, so ending it undoes nothing.
+/// Decided by the flavor as well as the code, since the code alone also means
+/// Materialize's refusal of uncommitted work.
+fn refused_probe_rolled_back(flavor: PgFlavor, sqlstate: Option<&str>) -> bool {
+    !(flavor == PgFlavor::CockroachDB && sqlstate == Some("25000"))
 }
 
 /// A script's last statement, when it returns rows, and the end of the
@@ -555,6 +566,7 @@ fn refused_inside_aborted_transaction(sqlstate: Option<&str>) -> bool {
 ///   and costs a reconnect.
 pub async fn finish_script_conn_with_read(
     conn: &mut sqlx::postgres::PgConnection,
+    flavor: PgFlavor,
     sql: &str,
     max_rows: u64,
     cell_cap: usize,
@@ -602,7 +614,7 @@ pub async fn finish_script_conn_with_read(
             reusable: true,
         };
     }
-    let ended = end_script_conn(conn).await;
+    let ended = end_script_conn(conn, flavor).await;
     let reusable = ended.is_ok();
     FinishedRead {
         read,
@@ -2405,14 +2417,18 @@ fn format_interval(iv: &PgInterval) -> String {
 mod tests {
     use super::*;
 
-    /// Only an aborted transaction is reported as rolled back when the probe
-    /// is refused; CockroachDB's commit-wait block (`25000`) followed a commit.
+    /// A refused probe counts as a rollback — the `ROLLBACK` after it discards
+    /// whatever was open — except CockroachDB's commit-wait block, which
+    /// follows a commit. The same `25000` from Materialize is uncommitted work.
     #[test]
-    fn only_an_aborted_transaction_counts_as_rolled_back_when_the_probe_is_refused() {
-        assert!(refused_inside_aborted_transaction(Some("25P02")));
-        assert!(!refused_inside_aborted_transaction(Some("25000")));
-        assert!(!refused_inside_aborted_transaction(Some("57P01")));
-        assert!(!refused_inside_aborted_transaction(None));
+    fn a_refused_probe_is_a_rollback_unless_cockroach_already_committed() {
+        use PgFlavor::*;
+        assert!(!refused_probe_rolled_back(CockroachDB, Some("25000")));
+        assert!(refused_probe_rolled_back(CockroachDB, Some("25P02")));
+        assert!(refused_probe_rolled_back(Materialize, Some("25000")));
+        assert!(refused_probe_rolled_back(Postgres, Some("25000")));
+        assert!(refused_probe_rolled_back(Postgres, Some("25P02")));
+        assert!(refused_probe_rolled_back(Postgres, None));
     }
 
     /// A bit-string wire value: big-endian `i32` count, then packed bytes.
