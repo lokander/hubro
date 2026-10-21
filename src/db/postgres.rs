@@ -756,6 +756,41 @@ fn column_query(shape: ColumnQuery) -> String {
     )
 }
 
+/// The text of `columns`, in order, from each row of a best-effort catalog
+/// query that decodes — Citus's shards, Timescale's labels, Materialize's
+/// reserved schemas.
+///
+/// Each of those queries already discards its own failure, because a badge or
+/// a hidden schema is not worth failing a whole introspection over. Decoding
+/// its rows is the same bet one step later: a NULL or a retyped column in a
+/// future release would otherwise have returned from [`introspect`] through a
+/// `?` and taken the schema tree with it, over a row the query was allowed to
+/// lose. So a row that does not decode is skipped, and only that row.
+///
+/// Returning plain values rather than a `Result` is what makes that hold at
+/// the call sites: there is nothing left for them to propagate. Generic over
+/// the row type because a `PgRow` cannot be built without a server, and the
+/// skipping is worth a test that runs everywhere.
+fn best_effort_names<'r, R, const N: usize>(
+    rows: &'r [R],
+    columns: [&'r str; N],
+) -> Vec<[String; N]>
+where
+    R: sqlx::Row,
+    &'r str: sqlx::ColumnIndex<R>,
+    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+{
+    rows.iter()
+        .filter_map(|row| {
+            let mut names: [String; N] = std::array::from_fn(|_| String::new());
+            for (name, column) in names.iter_mut().zip(columns) {
+                *name = row.try_get(column).ok()?;
+            }
+            Some(names)
+        })
+        .collect()
+}
+
 /// Full multi-schema introspection: every user schema's tables and views
 /// with columns, primary keys, indexes (incl. unique), and foreign keys —
 /// parity with the SQLite metadata model. Six batched queries regardless
@@ -922,9 +957,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
         .fetch_all(pool)
         .await;
         if let Ok(rows) = shards {
-            for row in &rows {
-                let schema: String = get(row, "schema_name")?;
-                let object: String = get(row, "object_name")?;
+            for [schema, object] in best_effort_names(&rows, ["schema_name", "object_name"]) {
                 // Same precedence as the branches above: naming the extension
                 // beats naming the shape, so a shard that is also a partition
                 // reports the extension rather than disagreeing with them.
@@ -957,9 +990,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
             let Ok(rows) = sqlx::query(sql).fetch_all(pool).await else {
                 continue;
             };
-            for row in &rows {
-                let schema: String = get(row, "s")?;
-                let name: String = get(row, "n")?;
+            for [schema, name] in best_effort_names(&rows, ["s", "n"]) {
                 kind_labels.insert((schema, name), label.to_string());
             }
         }
@@ -995,8 +1026,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
             .fetch_all(pool)
             .await
         {
-            for row in &rows {
-                let schema: String = get(row, "name")?;
+            for [schema] in best_effort_names(&rows, ["name"]) {
                 internal_schemas.insert(schema, Internal::System);
             }
         }
@@ -1031,10 +1061,25 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     // once whole, once as a duplicate that later grouping left empty.
     // The second half therefore takes only what the first did not, which is a
     // no-op on any server that behaves like stock Postgres.
+    //
+    // Temporary tables are left out, and this is the one place that decides
+    // it: columns, indexes and foreign keys attach only to a table listed
+    // here. A temp table belongs to the session that made it, and hubro's
+    // sessions are a pool with no affinity — each query below, and every
+    // later browse, lands on whichever connection is idle. Measured against
+    // PostgreSQL 17 with a temp table made through the pool: listed by one
+    // introspection and not the next, listed with its columns but not its
+    // unique index (that query had already landed elsewhere), and, once the
+    // pool had grown, listed with no columns at all while every attempt to
+    // open it failed with "cannot access temporary tables of other sessions".
+    // `LOCAL TEMPORARY` is the server's own classification, reported by
+    // CockroachDB too, so no schema-name pattern is needed; the index and
+    // foreign-key queries' `pg\_%` filter excludes the same schemas.
     let table_rows = sqlx::query(
         "SELECT table_schema, table_name, table_type \
          FROM information_schema.tables \
          WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
+           AND table_type <> 'LOCAL TEMPORARY' \
          UNION ALL \
          SELECT n.nspname, c.relname, 'MATERIALIZED VIEW' \
          FROM pg_class c \
@@ -1634,8 +1679,9 @@ fn pg_standing_caveats() -> Vec<String> {
 
 /// Reads the per-table facts a faithful `CREATE TABLE` needs: exact column
 /// types, defaults, identity/generated clauses, non-default collations, every
-/// constraint as the server renders it, and the indexes that do not back a
-/// constraint (those are already covered by their constraint).
+/// constraint as the server renders it, and the indexes that do not back one
+/// of this table's own constraints (those are already covered by their
+/// constraint).
 async fn table_ddl_extras(pool: &PgPool, params: &[Value]) -> Result<TableExtras, DbError> {
     // A column's collation only matters when it differs from its type's
     // default; emitting the default one everywhere would be noise.
@@ -1678,6 +1724,14 @@ async fn table_ddl_extras(pool: &PgPool, params: &[Value]) -> Result<TableExtras
     )
     .await?;
 
+    // An index is skipped only when one of the three constraint kinds that
+    // *own* an index is built on it. `conindid` is set on a foreign key too,
+    // but there it names the index on the *referenced* table that the key
+    // leans on — so asking "does any constraint name this index" dropped a
+    // bare `CREATE UNIQUE INDEX` from its own table's DDL the moment another
+    // table referenced it, and replaying that DDL could not recreate the
+    // referencing table. A unique *constraint* on the referenced side is
+    // unaffected: it is skipped here and rendered by its own `u` row above.
     let index_rows = query_with(
         pool,
         "SELECT pg_get_indexdef(i.indexrelid) AS def \
@@ -1687,7 +1741,8 @@ async fn table_ddl_extras(pool: &PgPool, params: &[Value]) -> Result<TableExtras
          JOIN pg_namespace n ON n.oid = c.relnamespace \
          WHERE n.nspname::text = $1 AND c.relname::text = $2 AND i.indisvalid \
            AND NOT EXISTS ( \
-             SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid \
+             SELECT 1 FROM pg_constraint con \
+             WHERE con.conindid = i.indexrelid AND con.contype IN ('p', 'u', 'x') \
            ) \
          ORDER BY ic.relname",
         params,
@@ -1794,8 +1849,22 @@ fn decode_typed(row: &PgRow, idx: usize, raw: &PgValueRef) -> Option<Value> {
         "INT8" => Some(Value::Integer(row.try_get::<i64, _>(idx).ok()?)),
         "FLOAT4" => Some(Value::Real(row.try_get::<f32, _>(idx).ok()? as f64)),
         "FLOAT8" => Some(Value::Real(row.try_get::<f64, _>(idx).ok()?)),
-        "TEXT" | "VARCHAR" | "BPCHAR" | "NAME" | "CHAR" => {
+        // `CHAR` is sqlx's name for `bpchar`, the type behind `char(n)` —
+        // there is no `BPCHAR` to match. The single-byte catalog type
+        // `"char"` (`pg_class.relkind` and most catalog flags) is a different
+        // type that sqlx names with the quotes kept, and has its own arm.
+        "TEXT" | "VARCHAR" | "CHAR" | "NAME" => {
             Some(Value::Text(row.try_get::<String, _>(idx).ok()?))
+        }
+        "\"CHAR\"" => {
+            let bytes = raw.as_bytes().ok()?;
+            match raw.format() {
+                PgValueFormat::Text => Some(Value::Text(std::str::from_utf8(bytes).ok()?.into())),
+                PgValueFormat::Binary => match bytes {
+                    [byte] => Some(Value::Text(internal_char_text(*byte))),
+                    _ => None,
+                },
+            }
         }
         "BYTEA" => Some(Value::Blob(row.try_get::<Vec<u8>, _>(idx).ok()?)),
         // Date/time family. `%.f` prints fractional seconds only when
@@ -1866,7 +1935,8 @@ fn decode_typed(row: &PgRow, idx: usize, raw: &PgValueRef) -> Option<Value> {
         // literal. NULL elements render as NULL; text elements are not
         // quoted/escaped (this is a display form, not parseable syntax).
         // sqlx only decodes one-dimensional arrays; others degrade.
-        "TEXT[]" | "VARCHAR[]" | "BPCHAR[]" | "NAME[]" => decode_array::<String>(row, idx, |v| v),
+        "TEXT[]" | "VARCHAR[]" | "CHAR[]" | "NAME[]" => decode_array::<String>(row, idx, |v| v),
+        "\"CHAR\"[]" => decode_array::<i8>(row, idx, |v| internal_char_text(v as u8)),
         "INT2[]" => decode_array::<i16>(row, idx, |v| v.to_string()),
         "INT4[]" => decode_array::<i32>(row, idx, |v| v.to_string()),
         "INT8[]" => decode_array::<i64>(row, idx, |v| v.to_string()),
@@ -1876,6 +1946,19 @@ fn decode_typed(row: &PgRow, idx: usize, raw: &PgValueRef) -> Option<Value> {
         "UUID[]" => decode_array::<Uuid>(row, idx, |v| v.to_string()),
         "NUMERIC[]" => decode_array::<Decimal>(row, idx, |v| v.to_string()),
         _ => None,
+    }
+}
+
+/// One byte of Postgres's internal `"char"` type, as the server's own output
+/// function prints it: nothing for a zero byte, a backslash and three octal
+/// digits for one with the high bit set (it is a byte, not a character, so the
+/// first byte of a multi-byte UTF-8 character lands here), the character
+/// itself otherwise.
+fn internal_char_text(byte: u8) -> String {
+    match byte {
+        0 => String::new(),
+        0x80.. => format!("\\{byte:03o}"),
+        _ => char::from(byte).to_string(),
     }
 }
 
@@ -2118,6 +2201,55 @@ mod tests {
             bits_from_binary(&wire(8, &[0xFF])).as_deref(),
             Some("11111111")
         );
+    }
+
+    #[test]
+    fn an_internal_char_prints_as_the_server_prints_it() {
+        assert_eq!(internal_char_text(b'r'), "r");
+        assert_eq!(internal_char_text(b' '), " ");
+        assert_eq!(internal_char_text(0x7f), "\u{7f}");
+        // A byte, not a character: the high half is octal-escaped, which
+        // is what `psql` shows for the same value.
+        assert_eq!(internal_char_text(0x80), "\\200");
+        assert_eq!(internal_char_text(0xc3), "\\303");
+        assert_eq!(internal_char_text(0xff), "\\377");
+        assert_eq!(internal_char_text(0), "");
+    }
+
+    /// A best-effort catalog row that does not decode costs that row and
+    /// nothing else. Run on SQLite rows because a `PgRow` cannot be built
+    /// without a server; the helper is generic for exactly this.
+    ///
+    /// The bad row is a retyped column rather than a NULL, because SQLite's
+    /// driver decodes a NULL into a `String` as empty text instead of failing.
+    /// On Postgres a NULL fails the same `try_get` as a type mismatch does
+    /// (`UnexpectedNullError`), so it takes the same path.
+    #[tokio::test]
+    async fn a_best_effort_row_that_does_not_decode_is_skipped_alone() {
+        use sqlx::Connection as _;
+        let mut conn = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let rows = sqlx::query(
+            "SELECT 'a' AS s, 'b' AS n \
+             UNION ALL SELECT 'integer name', 7 \
+             UNION ALL SELECT 'e', 'f'",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 3);
+        // The bad row is in the middle, so stopping at it would lose the
+        // last row as well.
+        assert_eq!(
+            best_effort_names(&rows, ["s", "n"]),
+            [["a", "b"], ["e", "f"]].map(|row| row.map(String::from))
+        );
+        // Every column of a row is read: the schema alone decodes on all three.
+        assert_eq!(best_effort_names(&rows, ["s"]).len(), 3);
+        // A column the query does not have is a decode failure like any
+        // other — every row goes, and still nothing is returned as an error.
+        assert!(best_effort_names(&rows, ["s", "missing"]).is_empty());
     }
 
     #[test]

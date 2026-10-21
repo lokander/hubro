@@ -420,6 +420,43 @@ async fn postgres_rich_types_render_correctly() {
     pool.close().await;
 }
 
+/// The character types by the names sqlx really reports: `char(n)` is
+/// `CHAR` and its array `CHAR[]`, while the catalog's one-byte `"char"` keeps
+/// its quotes. Matching `BPCHAR` (the name Postgres itself uses) left
+/// `char(n)[]` rendering as the `<char[]>` marker, and `"char"` — every
+/// `relkind` and `contype` a catalog query returns — as `<"char">`.
+#[tokio::test]
+async fn postgres_character_types_render_as_their_text() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let result = pool
+        .query(
+            "SELECT 'ab'::char(3) AS fixed, \
+                    ARRAY['a', 'bc', NULL]::char(2)[] AS fixed_array, \
+                    'r'::\"char\" AS byte, \
+                    '\\303'::\"char\" AS high_byte, \
+                    ARRAY['r', 'v']::\"char\"[] AS byte_array, \
+                    (SELECT relkind FROM pg_class WHERE relname = 'pg_class') AS relkind",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.rows[0],
+        [
+            // Padded to its declared width, as the server stores it.
+            Value::Text("ab ".into()),
+            Value::Text("{a ,bc,NULL}".into()),
+            Value::Text("r".into()),
+            // What psql prints for the same byte.
+            Value::Text("\\303".into()),
+            Value::Text("{r,v}".into()),
+            Value::Text("r".into()),
+        ]
+    );
+
+    pool.close().await;
+}
+
 #[tokio::test]
 async fn postgres_undecodable_cells_degrade_without_erroring_the_page() {
     let Some(url) = test_url().await else { return };
@@ -961,6 +998,31 @@ async fn postgres_empty_results_keep_their_column_headers() {
     assert!(result.rows.is_empty());
     assert!(result.columns.is_empty());
 
+    pool.close().await;
+}
+
+/// A temp table lives on the one pooled connection that made it, so the
+/// schema tree cannot list it honestly: the queries that describe it, and
+/// every later browse, land on whichever connection is idle. A fresh pool
+/// with nothing running concurrently is the case most likely to list it — one
+/// connection, so the first introspection's every query sees the table —
+/// which is why the test is built that way: before temp tables were left out,
+/// it was listed by the first introspection here and not by the second.
+#[tokio::test]
+async fn postgres_temporary_tables_are_not_listed() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.execute("CREATE TEMP TABLE temp_unlisted (email text UNIQUE)")
+        .await
+        .unwrap();
+    for attempt in 0..4 {
+        let tables = pool.introspect().await.unwrap();
+        let listed: Vec<_> = tables
+            .iter()
+            .filter(|t| t.name == "temp_unlisted")
+            .collect();
+        assert!(listed.is_empty(), "introspection {attempt}: {listed:?}");
+    }
     pool.close().await;
 }
 
