@@ -28,25 +28,25 @@ use super::value::QueryResult;
 enum RegionKind {
     /// Plain SQL: keywords, identifiers, operators, whitespace.
     Code,
-    /// A single- or double-quoted string (`'…'`, `"…"`), quotes included.
-    /// Doubled quotes need no special casing: `'it''s'` lexes as two
-    /// adjacent String regions, which every consumer treats the same as
-    /// one.
+    /// A quoted string or identifier, quotes included: `'…'` and `"…"`
+    /// everywhere, `` `…` `` on SQLite, and a Postgres escape string
+    /// (`E'…'`, whose backslashes escape). Doubled quotes need no special
+    /// casing: `'it''s'` lexes as two adjacent String regions, which every
+    /// consumer treats the same as one.
     String,
-    /// A line comment (`-- …`, excluding the terminating newline — the
-    /// splitter's GO line tracking must see that newline as code) or a
-    /// block comment (`/* … */`, nesting like Postgres; SQLite never nests
-    /// but treating `/*` inside a comment as nested is harmless there).
+    /// A line comment (`-- …`, excluding the line end — the splitter's GO
+    /// line tracking must see that newline as code) or a block comment
+    /// (`/* … */`). Where each ends is the engine's own rule: see
+    /// [`region_at`].
     Comment,
-    /// A `[bracketed identifier]`, brackets included (`]]` is an escaped
-    /// `]`), so `[a;b]` or `[a--b]` never split or start comments. Only
-    /// produced for [`Dialect::SqlServer`]: SQLite also accepts
-    /// `[brackets]` as a compat quirk, but this lexer has never bracketed
-    /// them there and identifiers with `;`/`--` inside are vanishingly
-    /// rare outside T-SQL scripts — bracket lexing is deliberately SQL
-    /// Server-only, keeping SQLite/Postgres behavior unchanged.
+    /// A `[bracketed identifier]`, brackets included, so `[a;b]` or `[a--b]`
+    /// never split or start comments. SQL Server (where `]]` is an escaped
+    /// `]`) and SQLite (no escape). Not Postgres, where `[` subscripts an
+    /// array. SQLite used to be left out as a compat quirk nobody would
+    /// write `;` inside, but a quote in one (`[']`) then opened a "string"
+    /// the gate could not see past while SQLite ran everything after it.
     Bracket,
-    /// A dollar-quoted string (`$$…$$`, `$tag$…$tag$` — Postgres),
+    /// A dollar-quoted string (`$$…$$`, `$tag$…$tag$`) — Postgres only,
     /// delimiters included. A bare `$` (e.g. a `$1` parameter placeholder)
     /// is code, not a delimiter.
     DollarQuote,
@@ -56,9 +56,9 @@ enum RegionKind {
 ///
 /// Unterminated strings, comments, brackets, and dollar quotes swallow the
 /// rest of the input as their region — the graceful degradation every
-/// consumer wants. Known limitation: Postgres `E'…'` escape-string
-/// backslash quoting is not understood (`E'\''` misparses); standard SQL
-/// doubling (`''`) is fine.
+/// consumer wants. Known limitation: a Postgres session with
+/// `standard_conforming_strings` off reads backslashes in every string;
+/// this lexer assumes the default (on), honouring them only in `E'…'`.
 fn lex_regions(
     sql: &str,
     dialect: Dialect,
@@ -87,22 +87,36 @@ fn lex_regions(
 /// If a non-code region opens at byte `i` of `sql`, returns its end offset
 /// (one past the closing delimiter, or end of input when unterminated) and
 /// its kind.
+///
+/// **Every boundary here must be the engine's own, in both directions.** The
+/// capability gate reads the stripped code this lexer leaves, and the
+/// splitter's statements are what run: text the lexer calls a string or
+/// comment while the engine calls it code is a statement the gate never
+/// sees, and text the lexer calls code while the engine calls it a string
+/// can open a "string" that hides the real code after it. Each rule below is
+/// measured against SQLite 3.53, PostgreSQL 17 and SQL Server 2022.
 fn region_at(sql: &str, i: usize, dialect: Dialect) -> Option<(usize, RegionKind)> {
     let bytes = sql.as_bytes();
+    let previous = i.checked_sub(1).map(|p| bytes[p]);
     match bytes[i] {
-        quote @ (b'\'' | b'"') => {
-            let mut j = i + 1;
-            while j < bytes.len() && bytes[j] != quote {
-                j += 1;
-            }
-            // Past the closing quote; unterminated, the rest is the string.
-            Some(((j + 1).min(bytes.len()), RegionKind::String))
+        b'\'' if dialect == Dialect::Postgres && opens_escape_string(bytes, i) => {
+            Some((escape_string_end(bytes, i), RegionKind::String))
         }
-        b'[' if dialect == Dialect::SqlServer => {
+        // `'…'` strings everywhere; `"…"` identifiers everywhere; `` `…` ``
+        // identifiers on SQLite only (Postgres and SQL Server reject the
+        // character). A doubled quote lexes as two adjacent regions.
+        quote @ (b'\'' | b'"') => Some((quoted_end(bytes, i, quote), RegionKind::String)),
+        b'`' if dialect == Dialect::Sqlite => {
+            Some((quoted_end(bytes, i, b'`'), RegionKind::String))
+        }
+        // `[…]` identifiers: SQL Server escapes `]` as `]]`; SQLite has no
+        // escape at all (measured: `[a]]b]` is "unrecognized token: ]").
+        // Postgres uses `[` for array subscripts, so it is code there.
+        b'[' if dialect != Dialect::Postgres => {
             let mut j = i + 1;
             while j < bytes.len() {
                 if bytes[j] == b']' {
-                    if bytes.get(j + 1) == Some(&b']') {
+                    if dialect == Dialect::SqlServer && bytes.get(j + 1) == Some(&b']') {
                         j += 2; // escaped ]] stays inside
                     } else {
                         j += 1; // past the closing bracket
@@ -114,18 +128,25 @@ fn region_at(sql: &str, i: usize, dialect: Dialect) -> Option<(usize, RegionKind
             }
             Some((j, RegionKind::Bracket))
         }
+        // A line comment ends at `\n` on SQLite, and at `\n` or a bare `\r`
+        // on Postgres and SQL Server (measured: `--c<CR>, 2 AS b` returns two
+        // columns on both, one on SQLite).
         b'-' if bytes.get(i + 1) == Some(&b'-') => {
+            let ends_line = |b: u8| b == b'\n' || (b == b'\r' && dialect != Dialect::Sqlite);
             let mut j = i + 2;
-            while j < bytes.len() && bytes[j] != b'\n' {
+            while j < bytes.len() && !ends_line(bytes[j]) {
                 j += 1;
             }
             Some((j, RegionKind::Comment))
         }
+        // Block comments nest on Postgres and SQL Server and not on SQLite
+        // (measured: SQLite ends `/* /* */` at the first `*/`).
         b'/' if bytes.get(i + 1) == Some(&b'*') => {
+            let nests = dialect != Dialect::Sqlite;
             let mut depth = 1usize;
             let mut j = i + 2;
             while j < bytes.len() && depth > 0 {
-                if bytes[j] == b'/' && bytes.get(j + 1) == Some(&b'*') {
+                if nests && bytes[j] == b'/' && bytes.get(j + 1) == Some(&b'*') {
                     depth += 1;
                     j += 2;
                 } else if bytes[j] == b'*' && bytes.get(j + 1) == Some(&b'/') {
@@ -137,7 +158,12 @@ fn region_at(sql: &str, i: usize, dialect: Dialect) -> Option<(usize, RegionKind
             }
             Some((j, RegionKind::Comment))
         }
-        b'$' => {
+        // Dollar quotes are Postgres only, and never straight after an
+        // identifier byte: Postgres reads `x$y$` as one identifier, as SQLite
+        // and SQL Server read any `$` inside a name. (`$1$q$` is a parameter
+        // then a quote there, but a script binds no parameters, so a
+        // statement holding `$1` cannot run at all.)
+        b'$' if dialect == Dialect::Postgres && !previous.is_some_and(is_word_byte) => {
             let open_end = dollar_tag_end(bytes, i)?;
             let delimiter = &sql[i..open_end];
             let end = match sql[open_end..].find(delimiter) {
@@ -150,10 +176,80 @@ fn region_at(sql: &str, i: usize, dialect: Dialect) -> Option<(usize, RegionKind
     }
 }
 
+/// One past the closing `quote` of the region opening at `bytes[at]`, or the
+/// end of input when it never closes.
+fn quoted_end(bytes: &[u8], at: usize, quote: u8) -> usize {
+    let mut j = at + 1;
+    while j < bytes.len() && bytes[j] != quote {
+        j += 1;
+    }
+    (j + 1).min(bytes.len())
+}
+
+/// Whether the `'` at `bytes[at]` opens a Postgres escape string: it follows
+/// an `E`/`e` that starts a token (one after an identifier byte, as in
+/// `nameE'…'`, is the end of that name, and the string is a plain one).
+fn opens_escape_string(bytes: &[u8], at: usize) -> bool {
+    at >= 1 && matches!(bytes[at - 1], b'E' | b'e') && !(at >= 2 && is_word_byte(bytes[at - 2]))
+}
+
+/// One past the end of a Postgres escape string opening at `bytes[at]`,
+/// including any continuation segments.
+///
+/// Inside, `\` escapes the next byte and `''` is a quote, so `E'\''` is one
+/// string holding a quote — a plain-string reading would close it at the
+/// second quote and open a new "string" at the third, hiding the code after
+/// it. A segment followed by whitespace holding a newline (comments
+/// allowed) and another `'` continues the same string, still with escapes.
+fn escape_string_end(bytes: &[u8], at: usize) -> usize {
+    let mut j = at + 1;
+    loop {
+        while j < bytes.len() {
+            match bytes[j] {
+                b'\\' => j += 2,
+                b'\'' if bytes.get(j + 1) == Some(&b'\'') => j += 2,
+                b'\'' => break,
+                _ => j += 1,
+            }
+        }
+        if j >= bytes.len() {
+            return bytes.len();
+        }
+        j += 1; // past the closing quote
+        match continuation_quote(bytes, j) {
+            Some(next) => j = next + 1,
+            None => return j,
+        }
+    }
+}
+
+/// If Postgres continues a string ending just before `bytes[from]` — only
+/// whitespace and `--` comments follow, with at least one newline, then a
+/// `'` — returns the index of that `'`.
+fn continuation_quote(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut j = from;
+    let mut newline = false;
+    loop {
+        match bytes.get(j)? {
+            b'\n' | b'\r' => {
+                newline = true;
+                j += 1;
+            }
+            b' ' | b'\t' | b'\x0b' | b'\x0c' => j += 1,
+            b'-' if newline && bytes.get(j + 1) == Some(&b'-') => {
+                while j < bytes.len() && !matches!(bytes[j], b'\n' | b'\r') {
+                    j += 1;
+                }
+            }
+            b'\'' if newline => return Some(j),
+            _ => return None,
+        }
+    }
+}
+
 /// Splits a script into individual statements on `;`, respecting quoted
-/// strings, comments, dollar quotes, and (on SQL Server) `[bracketed
-/// identifiers]` — see [`lex_regions`] for the exact lexing rules and the
-/// known `E'…'` limitation. A trailing statement without a semicolon is
+/// strings and identifiers, comments, and dollar quotes, each by the
+/// dialect's own rules — see [`region_at`]. A trailing statement without a semicolon is
 /// kept; statements that are empty (only whitespace and/or comments) are
 /// skipped.
 ///
@@ -584,10 +680,12 @@ fn dollar_tag_end(bytes: &[u8], at: usize) -> Option<usize> {
     if bytes.get(j) == Some(&b'$') {
         return Some(j + 1); // $$
     }
-    if !matches!(bytes.get(j), Some(c) if c.is_ascii_alphabetic() || *c == b'_') {
+    // Postgres tag characters: letters, `_` and any non-ASCII byte to start,
+    // digits too after that — never `$`.
+    if !matches!(bytes.get(j), Some(c) if c.is_ascii_alphabetic() || *c == b'_' || *c >= 0x80) {
         return None;
     }
-    while matches!(bytes.get(j), Some(c) if c.is_ascii_alphanumeric() || *c == b'_') {
+    while matches!(bytes.get(j), Some(c) if c.is_ascii_alphanumeric() || *c == b'_' || *c >= 0x80) {
         j += 1;
     }
     (bytes.get(j) == Some(&b'$')).then_some(j + 1)
@@ -628,8 +726,8 @@ impl StatementKind {
 /// the rows such a statement returns are still worth showing, and `fetch`
 /// executes it all the same (the confirmation banner and the capability
 /// check handle the embedded write separately).
-pub fn classify_statement(sql: &str) -> StatementKind {
-    match first_keyword(sql).to_ascii_lowercase().as_str() {
+pub fn classify_statement(sql: &str, dialect: Dialect) -> StatementKind {
+    match first_keyword(sql, dialect).to_ascii_lowercase().as_str() {
         "select" | "with" | "values" | "show" | "explain" | "pragma" | "table" => {
             StatementKind::Read
         }
@@ -664,10 +762,13 @@ fn embedded_dml_keywords(dialect: Dialect) -> &'static [&'static str] {
 }
 
 /// T-SQL words that change the schema wherever they stand: `GRANT`, `DENY`,
-/// `REVOKE`, and `TRIGGER` (`ENABLE`/`DISABLE TRIGGER`, which start with
-/// words nothing else here knows). All four are reserved keywords in T-SQL,
-/// so a bare one is never an identifier.
-const TSQL_EMBEDDED_DDL_KEYWORDS: [&str; 4] = ["grant", "deny", "revoke", "trigger"];
+/// `REVOKE`, `TRIGGER` (`ENABLE`/`DISABLE TRIGGER`, which start with words
+/// nothing else here knows) and `ADD` (`ADD SIGNATURE`, `ADD COUNTER
+/// SIGNATURE`, `ADD SENSITIVITY CLASSIFICATION`). All five are reserved
+/// keywords in T-SQL (measured for `ADD`: `SELECT 1 AS add` is a syntax
+/// error), so a bare one is never an identifier — which is why `ADD` and not
+/// the unreserved `SIGNATURE`, a plausible column name.
+const TSQL_EMBEDDED_DDL_KEYWORDS: [&str; 5] = ["grant", "deny", "revoke", "trigger", "add"];
 
 /// T-SQL words that start a statement whose effect nothing here can name,
 /// so wherever one appears the statement needs **both** capabilities —
@@ -682,8 +783,13 @@ const TSQL_EMBEDDED_DDL_KEYWORDS: [&str; 4] = ["grant", "deny", "revoke", "trigg
 ///
 /// The reserved ones (`EXEC`/`EXECUTE`, `DBCC`, `KILL`, `SHUTDOWN`,
 /// `RECONFIGURE`, `CHECKPOINT`, `BACKUP`, `RESTORE`, `SETUSER`, `WRITETEXT`,
-/// `UPDATETEXT`) can never be a bare identifier, so no read ever trips
-/// them. The Service Broker words (`RECEIVE`, `CONVERSATION`, `DIALOG` —
+/// `UPDATETEXT`, and the pass-through functions `OPENQUERY`, `OPENROWSET`,
+/// `OPENDATASOURCE`, whose remote text is a string this module blanks before
+/// any scan and another server runs) can never be a bare identifier, so no
+/// read ever trips them by accident; a linked-server read is charged both,
+/// on purpose. `OPENXML` is reserved too but left out: it reads a document
+/// already prepared by `sp_xml_preparedocument` (an EXEC, charged) and runs
+/// no text of its own. The Service Broker words (`RECEIVE`, `CONVERSATION`, `DIALOG` —
 /// `SEND`/`MOVE`/`END CONVERSATION`, `BEGIN DIALOG`, `GET CONVERSATION
 /// GROUP` all carry one; `BEGIN DIALOG` may leave out `CONVERSATION`) are
 /// not reserved: a column with one of those names makes a read need both
@@ -691,9 +797,8 @@ const TSQL_EMBEDDED_DDL_KEYWORDS: [&str; 4] = ["grant", "deny", "revoke", "trigg
 ///
 /// What is still not caught: a statement after a read that starts with an
 /// unreserved word and carries none of these (none is known that changes
-/// data), and linked-server pass-through (`OPENQUERY(srv, '…')`), whose
-/// remote text is a string and is blanked before any scan.
-const TSQL_OPAQUE_WORDS: [&str; 15] = [
+/// data).
+const TSQL_OPAQUE_WORDS: [&str; 18] = [
     "exec",
     "execute",
     "dbcc",
@@ -706,6 +811,9 @@ const TSQL_OPAQUE_WORDS: [&str; 15] = [
     "setuser",
     "writetext",
     "updatetext",
+    "openquery",
+    "openrowset",
+    "opendatasource",
     "receive",
     "conversation",
     "dialog",
@@ -808,7 +916,7 @@ pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
     // opener needs no separate check — and an *unrecognized* one is
     // correctly left unattributed rather than assumed to be a row write.
     let mutate = has(embedded_dml_keywords(dialect));
-    let ddl = classify_statement(sql) == StatementKind::Ddl
+    let ddl = classify_statement(sql, dialect) == StatementKind::Ddl
         || has(&EMBEDDED_DDL_KEYWORDS)
         || (dialect == Dialect::SqlServer && has(&TSQL_EMBEDDED_DDL_KEYWORDS));
     if !mutate && !ddl {
@@ -873,7 +981,7 @@ pub fn needs_confirmation(sql: &str, dialect: Dialect) -> bool {
 /// [`statement_needs`] can strip once and share the result with its own
 /// keyword scans.
 fn confirmation_needed(sql: &str, stripped: &str, dialect: Dialect) -> bool {
-    if classify_statement(sql) != StatementKind::Read {
+    if classify_statement(sql, dialect) != StatementKind::Read {
         return true;
     }
     let embedded_write = || {
@@ -886,7 +994,7 @@ fn confirmation_needed(sql: &str, stripped: &str, dialect: Dialect) -> bool {
                     && TSQL_EMBEDDED_DDL_KEYWORDS.contains(&word.as_str()))
         }) || has_opaque_word(dialect, stripped)
     };
-    match first_keyword(sql).to_ascii_lowercase().as_str() {
+    match first_keyword(sql, dialect).to_ascii_lowercase().as_str() {
         "with" => embedded_write(),
         "explain" => {
             // The body is a slice of the *stripped* text, so it is passed as
@@ -992,8 +1100,12 @@ fn explain_body(stripped: &str) -> &str {
 /// Whether `sql` is written as an `EXPLAIN`. The plan view asks so
 /// it can leave such a statement alone instead of prefixing a second
 /// `EXPLAIN` onto it.
+///
+/// Lexed as SQLite: the plan view has no dialect to pass, and the answer only
+/// decides whether a prefix is added — the statement that results goes
+/// through the capability gate with its real dialect either way.
 pub fn is_explain(sql: &str) -> bool {
-    first_keyword(sql).eq_ignore_ascii_case("explain")
+    first_keyword(sql, Dialect::Sqlite).eq_ignore_ascii_case("explain")
 }
 
 /// Whether any word-ish token (identifier characters) of an
@@ -1007,12 +1119,10 @@ fn has_word(stripped: &str, matches: impl Fn(&str) -> bool) -> bool {
 }
 
 /// The statement text with everything [`lex_regions`] calls a non-code
-/// region — quoted strings (single, double, dollar), comments, and (on SQL
-/// Server) `[bracketed identifiers]` — blanked out to spaces, so token
-/// scans can't be fooled by literals like `'please do not DELETE me'`, a
-/// quote inside a bracketed identifier can't invert string tracking, and a
-/// keyword inside one can't masquerade as a token. Brackets stay inert on
-/// SQLite/Postgres, matching the splitter.
+/// region — quoted strings and identifiers, comments, dollar quotes — blanked
+/// out to spaces, so token scans can't be fooled by literals like `'please do
+/// not DELETE me'`, a quote inside a bracketed identifier can't invert string
+/// tracking, and a keyword inside one can't masquerade as a token.
 fn strip_strings_and_comments(sql: &str, dialect: Dialect) -> String {
     let bytes = sql.as_bytes();
     let mut out = vec![b' '; bytes.len()];
@@ -1034,13 +1144,12 @@ fn strip_strings_and_comments(sql: &str, dialect: Dialect) -> String {
 /// statement opening with one has no first keyword and classifies as a
 /// write, the safe side.
 ///
-/// Lexes without a dialect (as SQLite) because [`classify_statement`] has
-/// none to pass, and the answer is dialect-independent anyway: a leading
-/// `[` ends the scan with an empty keyword whether it opens a bracket
-/// region or sits in code as a non-keyword byte.
-fn first_keyword(sql: &str) -> &str {
+/// Lexes with the statement's dialect, because where a comment ends is the
+/// engine's own rule: lexed as SQLite, a Postgres `--c<CR>WITH e AS (DELETE
+/// …) …<LF>SELECT …` read as a SELECT whose comment hid the DELETE.
+fn first_keyword(sql: &str, dialect: Dialect) -> &str {
     let bytes = sql.as_bytes();
-    for (range, kind) in lex_regions(sql, Dialect::Sqlite) {
+    for (range, kind) in lex_regions(sql, dialect) {
         match kind {
             RegionKind::Comment => {}
             RegionKind::Code => {
@@ -1275,7 +1384,7 @@ async fn run_script_sequential(
     for (statement_index, statement) in statements.iter().enumerate() {
         // Reads stream through the row cap so a huge result never buffers in
         // full; writes report an affected-row count as before.
-        let outcome = if classify_statement(statement).returns_rows() {
+        let outcome = if classify_statement(statement, pool.dialect()).returns_rows() {
             pool.query_capped(statement, &[], MAX_QUERY_ROWS)
                 .await
                 .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated))
@@ -1331,7 +1440,7 @@ async fn run_script_atomic(
         }
     };
     for (statement_index, statement) in statements.iter().enumerate() {
-        let outcome = if classify_statement(statement).returns_rows() {
+        let outcome = if classify_statement(statement, pool.dialect()).returns_rows() {
             tx.query_capped(statement, MAX_QUERY_ROWS)
                 .await
                 .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated))
@@ -1934,6 +2043,19 @@ mod tests {
                 "SELECT 3"
             ]
         );
+        // An implicit alias named `begin` (legal: measured) opens nothing
+        // either, since only `BEGIN ATOMIC` does.
+        assert_eq!(
+            split(
+                "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC \
+                 SELECT 1 begin; END; SELECT 2"
+            ),
+            [
+                "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC \
+                 SELECT 1 begin; END",
+                "SELECT 2"
+            ]
+        );
         // Outside a routine, BEGIN is a transaction (see
         // `bare_transaction_control_still_splits`) and PL/pgSQL bodies are
         // dollar-quoted, so nothing else is tracked.
@@ -2017,6 +2139,79 @@ mod tests {
             (Lite, "PRAGMA optimize", BOTH),
             (Lite, "PRAGMA incremental_vacuum", BOTH),
             (Lite, "PRAGMA main.wal_checkpoint", BOTH),
+            // Pass-through: the remote text is a string another server runs.
+            (Ms, "SELECT * FROM OPENQUERY(lnk, 'DELETE FROM t')", BOTH),
+            (
+                Ms,
+                "SELECT * FROM OPENROWSET('SQLNCLI', 'srv', 'EXEC p')",
+                BOTH,
+            ),
+            (
+                Ms,
+                "SELECT * FROM OPENDATASOURCE('SQLNCLI', 'x').db.dbo.t",
+                BOTH,
+            ),
+            (Ms, "ADD SIGNATURE TO p BY CERTIFICATE c", DDL),
+            (
+                Ms,
+                "SELECT 1 ADD COUNTER SIGNATURE TO p BY CERTIFICATE c",
+                DDL,
+            ),
+            // Lexing that disagrees with the engine hides a statement: each
+            // of these was a read needing nothing (see `region_at`).
+            (
+                Lite,
+                "SELECT 1 AS `'`; DELETE FROM t; SELECT 1 AS `'`",
+                MUTATE,
+            ),
+            (
+                Lite,
+                "SELECT 1 AS [']; DELETE FROM t; SELECT 1 AS [']",
+                MUTATE,
+            ),
+            (Lite, "SELECT 1 /* /* */ ; DELETE FROM t; /* */", MUTATE),
+            (
+                Lite,
+                "SELECT 1 AS x$y$; DELETE FROM t; SELECT 1 AS x$y$",
+                MUTATE,
+            ),
+            (Ms, "SELECT 1 --c\rDELETE FROM t", MUTATE),
+            (
+                Ms,
+                "SELECT 1 AS x$y$ DELETE FROM t SELECT 1 AS x$y$",
+                MUTATE,
+            ),
+            (
+                Pg,
+                "WITH d AS (SELECT 1) --c\r, e AS (DELETE FROM t RETURNING 1) SELECT 1",
+                MUTATE,
+            ),
+            (
+                Pg,
+                "--c\rWITH e AS (DELETE FROM t RETURNING 1)\nSELECT 1",
+                MUTATE,
+            ),
+            (
+                Pg,
+                "WITH d AS (SELECT E'\\'' AS a), e AS (DELETE FROM t RETURNING 1) SELECT 1 --'",
+                MUTATE,
+            ),
+            (
+                Pg,
+                "WITH d AS (SELECT E'a'\n'\\'' AS a), e AS (DELETE FROM t RETURNING 1) \
+                 SELECT 1 --'",
+                MUTATE,
+            ),
+            (
+                Pg,
+                "WITH d AS (SELECT 1 AS x$y$), e AS (DELETE FROM t RETURNING 1) SELECT 1 AS x$y$",
+                MUTATE,
+            ),
+            (
+                Pg,
+                "WITH d AS (SELECT $é$'$é$ AS a), e AS (DELETE FROM t RETURNING 1) SELECT 1 --'",
+                MUTATE,
+            ),
             // Allowed: transaction control alone, and plain reads.
             (Ms, "BEGIN TRAN", NONE),
             (Ms, "BEGIN TRANSACTION", NONE),
@@ -2034,6 +2229,12 @@ mod tests {
             (Pg, "SELECT 1", NONE),
             (Lite, "BEGIN", NONE),
             (Lite, "PRAGMA integrity_check", NONE),
+            // ...and quoted text that only looks like a write.
+            (Lite, "SELECT 1 AS `x;DELETE`", NONE),
+            (Lite, "SELECT 1 AS [x;DELETE]", NONE),
+            (Pg, "SELECT E'it''s \\' DELETE'", NONE),
+            (Pg, "SELECT $q$ DELETE $q$", NONE),
+            (Ms, "SELECT 1 /* /* */ DELETE FROM t */", NONE),
         ];
         let caps_sets = [
             ("full", Capabilities::FULL),
@@ -2260,17 +2461,17 @@ mod tests {
     }
 
     #[test]
-    fn brackets_stay_inert_on_other_dialects() {
-        // Bracket lexing is deliberately SQL Server-only: SQLite accepts
-        // [brackets] as a compat quirk but this splitter never lexed them
-        // there, and that behavior is unchanged — a `;` inside still splits.
-        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
-            assert_eq!(
-                split_statements("SELECT [a;b] FROM t", dialect),
-                ["SELECT [a", "b] FROM t"],
-                "{dialect:?}"
-            );
-        }
+    fn brackets_are_identifiers_on_sqlite_and_subscripts_on_postgres() {
+        // SQLite reads `[…]` as a quoted identifier, so a `;` inside is part
+        // of the name. Postgres uses `[` for array subscripts: plain code.
+        assert_eq!(
+            split_statements("SELECT [a;b] FROM t", Dialect::Sqlite),
+            ["SELECT [a;b] FROM t"]
+        );
+        assert_eq!(
+            split_statements("SELECT [a;b] FROM t", Dialect::Postgres),
+            ["SELECT [a", "b] FROM t"]
+        );
     }
 
     #[test]
@@ -2299,7 +2500,13 @@ mod tests {
             "-- comment first\nSELECT 1",
             "/* block */ SELECT 1",
         ] {
-            assert_eq!(classify_statement(sql), StatementKind::Read, "{sql:?}");
+            for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
+                assert_eq!(
+                    classify_statement(sql, dialect),
+                    StatementKind::Read,
+                    "{sql:?}"
+                );
+            }
         }
     }
 
@@ -2315,7 +2522,13 @@ mod tests {
             "REVOKE ALL ON t FROM x",
             "-- comment first\nDROP TABLE t",
         ] {
-            assert_eq!(classify_statement(sql), StatementKind::Ddl, "{sql:?}");
+            for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
+                assert_eq!(
+                    classify_statement(sql, dialect),
+                    StatementKind::Ddl,
+                    "{sql:?}"
+                );
+            }
         }
     }
 
@@ -2330,7 +2543,13 @@ mod tests {
             "COPY t FROM stdin",
             "", // unclassifiable: err on the safe side
         ] {
-            assert_eq!(classify_statement(sql), StatementKind::Write, "{sql:?}");
+            for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
+                assert_eq!(
+                    classify_statement(sql, dialect),
+                    StatementKind::Write,
+                    "{sql:?}"
+                );
+            }
         }
     }
 
@@ -2916,15 +3135,14 @@ mod tests {
     }
 
     #[test]
-    fn brackets_stay_inert_for_confirmation_on_other_dialects() {
-        // Pre-existing behavior preserved: without bracket lexing, `[into]`
-        // still tokenizes as the word `into` and over-prompts (fail-safe).
-        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
-            assert!(
-                needs_confirmation("SELECT [into] FROM t", dialect),
-                "{dialect:?}"
-            );
-        }
+    fn brackets_are_lexed_for_confirmation_on_sqlite_only() {
+        // `[into]` is a name on SQLite, as on SQL Server; on Postgres it is
+        // code, so the word `into` over-prompts (the fail-safe side).
+        assert!(!needs_confirmation("SELECT [into] FROM t", Dialect::Sqlite));
+        assert!(needs_confirmation(
+            "SELECT [into] FROM t",
+            Dialect::Postgres
+        ));
     }
 
     #[test]
@@ -2962,6 +3180,71 @@ mod tests {
         // On other dialects brackets are plain text and stay in place.
         let stripped = strip_strings_and_comments("SELECT [into] FROM t", Dialect::Postgres);
         assert!(stripped.contains("[into]"));
+    }
+
+    /// Each region boundary is the engine's own (measured; see `region_at`).
+    #[test]
+    fn lexer_boundaries_follow_each_engine() {
+        use Dialect::{Postgres as Pg, SqlServer as Ms, Sqlite as Lite};
+        use RegionKind::*;
+        // Backticks quote names on SQLite only.
+        assert_eq!(regions("`a'b` x", Lite), [("`a'b`", String), (" x", Code)]);
+        assert_eq!(regions("`a` x", Pg), [("`a` x", Code)]);
+        // SQLite brackets have no `]]` escape.
+        assert_eq!(regions("[a]]b", Lite), [("[a]", Bracket), ("]b", Code)]);
+        // Block comments nest on Postgres and SQL Server, not SQLite.
+        for dialect in [Pg, Ms] {
+            assert_eq!(
+                regions("/* /* */ x */ y", dialect),
+                [("/* /* */ x */", Comment), (" y", Code)],
+                "{dialect:?}"
+            );
+        }
+        assert_eq!(
+            regions("/* /* */ x */ y", Lite),
+            [("/* /* */", Comment), (" x */ y", Code)]
+        );
+        // A bare CR ends a line comment on Postgres and SQL Server only.
+        for dialect in [Pg, Ms] {
+            assert_eq!(
+                regions("--c\rx", dialect),
+                [("--c", Comment), ("\rx", Code)],
+                "{dialect:?}"
+            );
+        }
+        assert_eq!(regions("--c\rx", Lite), [("--c\rx", Comment)]);
+        // Dollar quotes: Postgres only, never inside a name, any tag bytes.
+        assert_eq!(
+            regions("$q$;$q$ x", Pg),
+            [("$q$;$q$", DollarQuote), (" x", Code)]
+        );
+        assert_eq!(regions("x$q$ y", Pg), [("x$q$ y", Code)]);
+        assert_eq!(regions("$é$;$é$", Pg), [("$é$;$é$", DollarQuote)]);
+        for dialect in [Lite, Ms] {
+            assert_eq!(
+                regions("$q$;$q$", dialect),
+                [("$q$;$q$", Code)],
+                "{dialect:?}"
+            );
+        }
+        // Postgres escape strings honour backslashes and continue across a
+        // newline; a name ending in E does not start one.
+        assert_eq!(
+            regions("E'\\'' x", Pg),
+            [("E", Code), ("'\\''", String), (" x", Code)]
+        );
+        assert_eq!(
+            regions("e'a'\n -- c\n '\\'' x", Pg),
+            [("e", Code), ("'a'\n -- c\n '\\''", String), (" x", Code)]
+        );
+        assert_eq!(
+            regions("nameE'\\' x", Pg),
+            [("nameE", Code), ("'\\'", String), (" x", Code)]
+        );
+        assert_eq!(
+            regions("E'\\'' x", Lite),
+            [("E", Code), ("'\\'", String), ("' x", String)]
+        );
     }
 
     /// The lexed regions of `sql` as text slices, for asserting on directly.

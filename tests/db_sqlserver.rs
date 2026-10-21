@@ -23,8 +23,8 @@ mod common;
 
 use hubro::db::{
     apply_staged, detect_row_identity, mssql_url_with_password, run_script, split_statements,
-    wrap_atomically, Capabilities, DbError, DbPool, Dialect, ExportFormat, Filter, Generated,
-    PageRequest, Restriction, Rollback, RowCount, RowIdentity, RowLocator, SortDir, StagedChange,
+    Capabilities, DbError, DbPool, Dialect, ExportFormat, Filter, Generated, PageRequest,
+    Restriction, Rollback, RowCount, RowIdentity, RowLocator, SortDir, StagedChange,
     StatementOutcome, TableKind, TableMeta, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
@@ -868,11 +868,6 @@ async fn sqlserver_script_creates_modules_that_must_lead_a_batch() {
                SELECT id FROM dbo.script_lead_probe";
     let statements = split_statements(sql, pool.dialect());
     assert_eq!(statements.len(), 4);
-    assert!(wrap_atomically(
-        pool.backend_capabilities(),
-        pool.dialect(),
-        &statements
-    ));
     let mut results = Vec::new();
     run_script(&pool, pool.backend_capabilities(), &statements, |r| {
         results.push(r)
@@ -887,15 +882,11 @@ async fn sqlserver_script_creates_modules_that_must_lead_a_batch() {
 
     // A module sent as a plain batch joins the script transaction: when a
     // later statement fails, the rollback takes the procedure with it.
+    // (`Rollback::Full` is only ever reported by the wrapped path.)
     let sql = "CREATE PROCEDURE dbo.script_lead_gone AS SELECT 1 AS one\n\
                GO\n\
                SELECT * FROM dbo.script_lead_missing";
     let statements = split_statements(sql, pool.dialect());
-    assert!(wrap_atomically(
-        pool.backend_capabilities(),
-        pool.dialect(),
-        &statements
-    ));
     let err = run_script(&pool, pool.backend_capabilities(), &statements, |_| {})
         .await
         .expect_err("the missing table must fail the script");

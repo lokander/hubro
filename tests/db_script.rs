@@ -468,3 +468,128 @@ async fn postgres_script_creates_a_begin_atomic_function() {
     pool.execute("DROP TABLE script_atomic").await.unwrap();
     pool.close().await;
 }
+
+/// Runs each script twice against a table holding one row: on a fully
+/// capable connection, where it must delete the row (proving the engine runs
+/// the hidden DELETE, so the case is real), and on a read-only one, where the
+/// gate must refuse it before anything runs.
+async fn assert_hidden_writes_are_refused(pool: &DbPool, table: &str, scripts: &[&str]) {
+    let count = format!("SELECT COUNT(*) FROM {table}");
+    for script in scripts {
+        pool.execute(&format!("DELETE FROM {table}")).await.unwrap();
+        pool.execute(&format!("INSERT INTO {table} VALUES (1)"))
+            .await
+            .unwrap();
+        let statements = split_statements(script, pool.dialect());
+        let full = pool.backend_capabilities();
+        let _ = run_script(pool, full, &statements, |_| {}).await;
+        let rows = pool.query(&count).await.unwrap();
+        assert_eq!(
+            rows.rows,
+            vec![vec![Value::Integer(0)]],
+            "{script:?} should delete the row when allowed"
+        );
+
+        pool.execute(&format!("INSERT INTO {table} VALUES (1)"))
+            .await
+            .unwrap();
+        let outcome = run_script(pool, full.read_only(), &statements, |_| {}).await;
+        match outcome {
+            Err(err) => assert!(
+                matches!(err.error, DbError::Unsupported(_)),
+                "{script:?} must be refused by the gate, not fail at the server: {err:?}"
+            ),
+            Ok(()) => panic!("{script:?} ran on a read-only connection, split as {statements:?}"),
+        }
+        let rows = pool.query(&count).await.unwrap();
+        assert_eq!(rows.rows, vec![vec![Value::Integer(1)]], "{script:?}");
+    }
+}
+
+/// SQLite reads `` `…` `` and `[…]` as quoted identifiers, never nests block
+/// comments, has no dollar quotes, and runs every statement in a string
+/// (measured: each script below deleted the row through a "read"). A lexer
+/// that disagreed on any of these read the script as one SELECT that needed
+/// nothing.
+#[tokio::test]
+async fn sqlite_scripts_cannot_hide_a_write_from_the_gate() {
+    let fixture = FixtureDb::with_sql("CREATE TABLE t (a INTEGER)").await;
+    let pool = fixture.open().await;
+    assert_hidden_writes_are_refused(
+        &pool,
+        "t",
+        &[
+            "SELECT 1 AS `'`; DELETE FROM t; SELECT 1 AS `'`",
+            "SELECT 1 AS [']; DELETE FROM t; SELECT 1 AS [']",
+            "SELECT 1 /* /* */ ; DELETE FROM t; /* */",
+            "SELECT 1 AS x$y$; DELETE FROM t; SELECT 1 AS x$y$",
+        ],
+    )
+    .await;
+    pool.close().await;
+}
+
+/// Postgres ends a line comment at a bare CR, reads backslash escapes in
+/// `E'…'`, continues one across a newline, never opens a dollar quote inside
+/// a name, and takes non-ASCII dollar-quote tags. Each script below is one
+/// statement — a data-modifying CTE — that a lexer disagreeing on any of
+/// these read as a read with nothing to charge.
+#[tokio::test]
+async fn postgres_scripts_cannot_hide_a_write_from_the_gate() {
+    let Some(url) = pg_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.execute("DROP TABLE IF EXISTS script_hidden")
+        .await
+        .unwrap();
+    pool.execute("CREATE TABLE script_hidden (a integer)")
+        .await
+        .unwrap();
+    assert_hidden_writes_are_refused(
+        &pool,
+        "script_hidden",
+        &[
+            "WITH d AS (SELECT 1 AS a) --c\r, e AS (DELETE FROM script_hidden RETURNING a) \
+             SELECT * FROM d",
+            "--c\rWITH e AS (DELETE FROM script_hidden RETURNING a)\nSELECT 1",
+            "WITH d AS (SELECT E'\\'' AS a), e AS (DELETE FROM script_hidden RETURNING a) \
+             SELECT 1 --'",
+            "WITH d AS (SELECT E'a'\n'\\'' AS a), e AS (DELETE FROM script_hidden RETURNING a) \
+             SELECT 1 --'",
+            "WITH d AS (SELECT 1 AS x$y$), e AS (DELETE FROM script_hidden RETURNING a) \
+             SELECT 1 AS x$y$",
+            "WITH d AS (SELECT $é$'$é$ AS a), e AS (DELETE FROM script_hidden RETURNING a) \
+             SELECT 1 --'",
+        ],
+    )
+    .await;
+    pool.execute("DROP TABLE script_hidden").await.unwrap();
+    pool.close().await;
+}
+
+/// SQL Server ends a line comment at a bare CR and has no dollar quotes; it
+/// also needs no `;` between statements, so each script below is a SELECT
+/// and a DELETE that a lexer disagreeing on either read as one SELECT.
+#[tokio::test]
+async fn sqlserver_scripts_cannot_hide_a_write_from_the_gate() {
+    let Some(url) = common::mssql_test_url().await else {
+        return;
+    };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    pool.execute("DROP TABLE IF EXISTS dbo.script_hidden")
+        .await
+        .unwrap();
+    pool.execute("CREATE TABLE dbo.script_hidden (a int)")
+        .await
+        .unwrap();
+    assert_hidden_writes_are_refused(
+        &pool,
+        "dbo.script_hidden",
+        &[
+            "SELECT 1 AS a --c\rDELETE FROM dbo.script_hidden",
+            "SELECT 1 AS x$y$ DELETE FROM dbo.script_hidden SELECT 1 AS x$y$",
+        ],
+    )
+    .await;
+    pool.execute("DROP TABLE dbo.script_hidden").await.unwrap();
+    pool.close().await;
+}
