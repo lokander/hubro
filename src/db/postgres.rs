@@ -1421,7 +1421,7 @@ pub async fn fetch_ddl(
                 "no index named {name} in {schema}"
             )));
         };
-        return Ok(Ddl::native(terminate(&def)));
+        return Ok(Ddl::native(terminate(&def, Dialect::Postgres)));
     }
 
     let params = [params[0].clone(), Value::Text(table.name.clone())];
@@ -1442,7 +1442,11 @@ pub async fn fetch_ddl(
         };
         // Only the CREATE header is ours; the body is the server's own text,
         // so this stays native (no "reconstructed" warning).
-        return Ok(Ddl::native(create_view_sql(table, &body)));
+        return Ok(Ddl::native(create_view_sql(
+            Dialect::Postgres,
+            table,
+            &body,
+        )));
     }
 
     // A catalog read that fails still yields usable output: the renderer falls

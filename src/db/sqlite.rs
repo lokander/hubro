@@ -866,7 +866,7 @@ pub async fn fetch_ddl(
     match object {
         DdlObject::Index(name) => {
             match object_sql(pool, name, &["index"]).await? {
-                Some(Some(sql)) => Ok(Ddl::native(terminate(&sql))),
+                Some(Some(sql)) => Ok(Ddl::native(terminate(&sql, Dialect::Sqlite))),
                 // No such index in the database, whatever the (possibly
                 // stale) metadata says: dropped since the tree was read. Only
                 // the catalog row can tell this from the implicit index below,
@@ -898,14 +898,14 @@ pub async fn fetch_ddl(
                     table.name
                 )));
             };
-            let mut out = terminate(&sql);
+            let mut out = terminate(&sql, Dialect::Sqlite);
             // A table's own indexes belong with it: showing the CREATE TABLE
             // alone would hand the user a statement that silently loses them.
             // Constraint-backed indexes have a NULL sql and are already part
             // of the table text, so they drop out here on their own.
             for index in index_sql(pool, &table.name).await? {
                 out.push_str("\n\n");
-                out.push_str(&terminate(&index));
+                out.push_str(&terminate(&index, Dialect::Sqlite));
             }
             Ok(Ddl::native(out))
         }

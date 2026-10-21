@@ -21,9 +21,9 @@ use super::value::QueryResult;
 
 /// One lexed region of a SQL script. [`lex_regions`] is the single place
 /// that understands quote/comment/bracket/dollar-quote state — the statement
-/// splitter, the string/comment stripper, and the first-keyword scanner are
-/// all thin consumers of it, so a lexing edge case fixed here is fixed in
-/// all three at once.
+/// splitter, the string/comment stripper, the first-keyword scanner and the
+/// DDL terminator ([`super::ddl::terminate`]) are all thin consumers of it,
+/// so a lexing edge case fixed here is fixed in all of them at once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegionKind {
     /// Plain SQL: keywords, identifiers, operators, whitespace.
@@ -1314,6 +1314,27 @@ fn first_keyword(sql: &str, dialect: Dialect) -> &str {
         }
     }
     ""
+}
+
+/// Whether `sql` ends inside a `--` line comment on `dialect`, so that a `;`
+/// appended to it would be commented out. Only the last region decides: a
+/// comment closed earlier in the text says nothing about the end, and where
+/// a line comment stops (`\n`, or a bare `\r` off SQLite) is the engine's own
+/// rule, which [`region_at`] already keeps.
+pub(super) fn ends_in_line_comment(sql: &str, dialect: Dialect) -> bool {
+    lex_regions(sql, dialect)
+        .last()
+        .is_some_and(|(range, kind)| kind == RegionKind::Comment && sql[range].starts_with("--"))
+}
+
+/// Whether `sql` already ends in a `;` that `dialect` reads as a statement
+/// terminator — not one at the end of a comment, string or quoted name.
+pub(super) fn ends_with_terminator(sql: &str, dialect: Dialect) -> bool {
+    lex_regions(sql, dialect)
+        .last()
+        .is_some_and(|(range, kind)| {
+            kind == RegionKind::Code && sql[range].trim_end().ends_with(';')
+        })
 }
 
 /// Maximum characters in a statement preview.
