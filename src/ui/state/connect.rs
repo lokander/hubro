@@ -1632,8 +1632,12 @@ impl AppState {
         // row would never match its own progress.
         let key = connect_key(&locator, backend);
         // A second click while the first is still in flight would otherwise
-        // overwrite the task handle and strand the running connect.
-        if self.connect_requests.read().contains_key(&key) {
+        // overwrite the task handle and strand the running connect. What it
+        // can still change is where the tab opens: a plain click on a row
+        // whose connect runs in the background — a shift-click's, or a
+        // session restore's — asks for the tab in front, and gets it.
+        if let Some(request) = self.connect_requests.write().get_mut(&key) {
+            request.focus |= focus;
             return;
         }
         let task = spawn_forever(async move {
@@ -1729,13 +1733,22 @@ impl AppState {
                 //
                 // Only ours: a row-started connect to the same locator may
                 // already own the request, and stealing it would cost that
-                // one its Cancel button and its background-open intent.
+                // one its Cancel button.
+                //
+                // Someone else's request is the other way round: a connect
+                // with no request of its own — a form, the command line, a
+                // file the OS handed over — wants its tab in front, so the
+                // connect already running for it brings the tab forward.
                 let mine = dioxus::core::Runtime::current().current_task();
-                if let Some(mine) = mine {
-                    let mut requests = self.connect_requests.write();
-                    if requests.get(locator).is_some_and(|r| r.task == mine) {
+                let mut requests = self.connect_requests.write();
+                match requests.get_mut(locator) {
+                    Some(request) if Some(request.task) == mine => {
                         requests.remove(locator);
                     }
+                    // Not ours, so this connect has no request: one under
+                    // the same locator would be the one just matched.
+                    Some(request) => request.focus = true,
+                    None => {}
                 }
                 return true;
             }

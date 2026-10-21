@@ -756,4 +756,179 @@ mod tests {
             assert_eq!(persisted, order, "and saved in that order");
         });
     }
+
+    /// A saved Postgres connection to a server that accepts and never
+    /// answers, its locator, and the listener to keep alive meanwhile.
+    async fn hanging_postgres(
+        dom: &VirtualDom,
+        state: AppState,
+    ) -> (String, SavedConnection, tokio::net::TcpListener) {
+        let silent = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let url = format!(
+            "postgres://u@127.0.0.1:{}/db",
+            silent.local_addr().unwrap().port()
+        );
+        let connection = dom.in_runtime(|| {
+            let mut saved = state.saved;
+            let mut saved = saved.write();
+            saved.add(SavedConnection::Postgres {
+                name: "hanging".into(),
+                url,
+                tunnel: None,
+                auth: ServerAuth::Password,
+                protection: WriteProtection::Open,
+                color: None,
+                group: None,
+            });
+            saved.entries().last().unwrap().clone()
+        });
+        let locator = saved_open_locator(&connection);
+        dom.in_runtime(|| {
+            // Session memory, so the connect never reads the keyring.
+            let mut passwords = state.session_passwords;
+            passwords.write().insert(locator.clone(), "pw".into());
+        });
+        (locator, connection, silent)
+    }
+
+    #[tokio::test]
+    async fn opening_a_tab_whose_restore_is_in_flight_brings_it_forward() {
+        let mut dom = VirtualDom::new(empty);
+        let state = provide_state(&dom);
+        dom.rebuild_in_place();
+        let (locator, connection, _silent) = hanging_postgres(&dom, state).await;
+        let focus = |dom: &VirtualDom| {
+            dom.in_runtime(|| state.connect_requests.peek().get(&locator).map(|r| r.focus))
+        };
+        let restore = |dom: &VirtualDom| {
+            dom.in_runtime(|| {
+                let plan = vec![SessionTab {
+                    locator: locator.clone(),
+                    ..SessionTab::default()
+                }];
+                state.start_restore(plan, None, std::slice::from_ref(&connection), &[]);
+            })
+        };
+        restore(&dom);
+        run_until(&mut dom, Duration::from_secs(5), |dom| {
+            dom.in_runtime(|| state.connecting.peek().iter().any(|c| c.locator == locator))
+        })
+        .await;
+        assert_eq!(
+            focus(&dom),
+            Some(false),
+            "a restore opens in the background"
+        );
+
+        // A click on its row.
+        dom.in_runtime(|| {
+            state.start_connect(
+                connection.locator(),
+                "hanging".into(),
+                BackendKind::Postgres,
+                None,
+                ServerAuth::Password,
+                true,
+            )
+        });
+        assert_eq!(focus(&dom), Some(true), "a click asks for it in front");
+
+        // And a connect with no request of its own — the command line, a file
+        // the OS handed over — reaching the reserved locator.
+        dom.in_runtime(|| state.cancel_connect(&locator));
+        restore(&dom);
+        run_until(&mut dom, Duration::from_secs(5), |dom| {
+            dom.in_runtime(|| state.connecting.peek().iter().any(|c| c.locator == locator))
+        })
+        .await;
+        assert_eq!(focus(&dom), Some(false));
+        dom.in_runtime(|| {
+            spawn_forever(state.connect_server(
+                ServerBackend::of(BackendKind::Postgres),
+                locator.clone(),
+                "hanging".into(),
+                None,
+                ServerAuth::Password,
+            ));
+        });
+        run_until(&mut dom, Duration::from_secs(5), |dom| {
+            focus(dom) == Some(true)
+        })
+        .await;
+        dom.in_runtime(|| state.cancel_connect(&locator));
+    }
+
+    #[tokio::test]
+    async fn a_restore_that_fails_short_of_opening_forgets_its_tab() {
+        // A tunnel to a port nothing listens on fails in `open_tunnel`, which
+        // ends the connect without reaching `finish_connect`. The remembered
+        // view must go with it, or a later open of the same connection — a
+        // shift-click, say — would be pulled to the front and onto a stale
+        // table.
+        let closed = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let mut dom = VirtualDom::new(empty);
+        let state = provide_state(&dom);
+        dom.rebuild_in_place();
+        let connection = dom.in_runtime(|| {
+            let mut saved = state.saved;
+            let mut saved = saved.write();
+            saved.add(SavedConnection::Postgres {
+                name: "unreachable".into(),
+                url: "postgres://u@db.internal:5432/db".into(),
+                tunnel: Some(TunnelConfig {
+                    host: "127.0.0.1".into(),
+                    port,
+                    user: "u".into(),
+                    auth: TunnelAuth::Agent,
+                }),
+                auth: ServerAuth::Password,
+                protection: WriteProtection::Open,
+                color: None,
+                group: None,
+            });
+            saved.entries().last().unwrap().clone()
+        });
+        let locator = saved_open_locator(&connection);
+        dom.in_runtime(|| {
+            let plan = vec![SessionTab {
+                locator: locator.clone(),
+                selected_table: Some("t".into()),
+                ..SessionTab::default()
+            }];
+            state.start_restore(
+                plan,
+                Some(locator.clone()),
+                std::slice::from_ref(&connection),
+                &[],
+            );
+            assert!(state.restoring.peek().contains_key(&locator));
+        });
+        run_until(&mut dom, Duration::from_secs(10), |dom| {
+            dom.in_runtime(|| state.connect_error.peek().is_some())
+        })
+        .await;
+        dom.in_runtime(|| {
+            assert!(
+                state
+                    .connect_error
+                    .peek()
+                    .as_deref()
+                    .unwrap_or_default()
+                    .starts_with("SSH tunnel"),
+                "{:?}",
+                state.connect_error.peek()
+            );
+            assert!(state.connecting.peek().is_empty());
+            assert!(
+                state.restoring.peek().is_empty(),
+                "a connect that ended must take its remembered view with it"
+            );
+        });
+    }
 }
