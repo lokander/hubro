@@ -61,8 +61,116 @@ async fn stock_postgres_is_detected_as_stock_postgres() {
     // against real PostgreSQL. `tests/db_cockroach.rs` pins the other
     // direction, but that binary needs a Cockroach container and CI has none —
     // so without this, a detection change that swept stock Postgres into an
-    // engine branch would pass everything CI runs.
+    // engine branch would pass everything CI runs. CI's Linux leg starts the
+    // Postgres this needs and requires its variable (`ci.yml`,
+    // `tests/ci_workflow.rs`); before it did, this skipped there like the rest.
     assert_eq!(pool.pg_flavor(), Some(PgFlavor::Postgres));
+
+    pool.close().await;
+}
+
+/// Makes the server send a genuine `40001` on demand, with no race: a
+/// REPEATABLE READ transaction takes its snapshot, another session commits an
+/// update to the same row, and the transaction's own update of that row is
+/// then refused as a serialization failure. The order is enforced by the
+/// awaits, not by timing, so it fails the same way on every machine.
+///
+/// Returns the refused statement's error, as hubro reported it.
+async fn force_serialization_failure(pool: &DbPool, table: &str) -> DbError {
+    pool.execute(&format!("DROP TABLE IF EXISTS {table}"))
+        .await
+        .unwrap();
+    pool.execute(&format!("CREATE TABLE {table} (id int PRIMARY KEY, v int)"))
+        .await
+        .unwrap();
+    pool.execute(&format!("INSERT INTO {table} VALUES (1, 0)"))
+        .await
+        .unwrap();
+
+    let mut tx = pool.begin_script_tx().await.unwrap();
+    tx.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .unwrap();
+    // The snapshot is taken by the first query, not by BEGIN.
+    tx.query_capped(&format!("SELECT v FROM {table} WHERE id = 1"), 1)
+        .await
+        .unwrap();
+    pool.execute(&format!("UPDATE {table} SET v = 1 WHERE id = 1"))
+        .await
+        .unwrap();
+    let refused = tx
+        .execute(&format!("UPDATE {table} SET v = 2 WHERE id = 1"))
+        .await
+        .expect_err("a REPEATABLE READ update of a row changed since its snapshot must be refused");
+    tx.rollback().await;
+    pool.execute(&format!("DROP TABLE {table}")).await.unwrap();
+    refused
+}
+
+#[tokio::test]
+async fn a_server_sent_serialization_failure_classifies_as_transient() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+
+    // The transient classification (SQLSTATE `40001`) is what the catalog
+    // reads' one retry hangs off, and until this test it was pinned against a
+    // live server only by db_yugabyte.rs's DDL race — which needs a Yugabyte
+    // container CI does not have, and which asserts nothing on a run where
+    // neither statement happens to lose.
+    let refused = force_serialization_failure(&pool, "serial_conflict").await;
+    assert!(
+        refused.is_transient(),
+        "a server-sent 40001 must classify as transient, got: {refused:?}"
+    );
+    assert!(
+        refused.message().contains("could not serialize access"),
+        "{refused:?}"
+    );
+
+    // And the classification is the code's, not every failure's.
+    let other = pool.query("SELECT 1 / 0").await.unwrap_err();
+    assert!(!other.is_transient(), "{other:?}");
+
+    // Including the nearest neighbour: a deadlock (`40P01`) is retryable in
+    // the same sense, and postgres.rs leaves it out on purpose — it means
+    // genuine contention, not a racing schema change. Nothing pinned that
+    // choice: classifying `40P01` too passed the whole suite. Two transactions
+    // each lock one row and then reach for the other's, so the server must
+    // abort one of them; which one is its call, so whichever failed is read.
+    pool.execute("DROP TABLE IF EXISTS deadlock_pair")
+        .await
+        .unwrap();
+    pool.execute("CREATE TABLE deadlock_pair (id int PRIMARY KEY)")
+        .await
+        .unwrap();
+    pool.execute("INSERT INTO deadlock_pair VALUES (1), (2)")
+        .await
+        .unwrap();
+    let mut first = pool.begin_script_tx().await.unwrap();
+    let mut second = pool.begin_script_tx().await.unwrap();
+    let lock = |id: u8| format!("SELECT id FROM deadlock_pair WHERE id = {id} FOR UPDATE");
+    first.query_capped(&lock(1), 1).await.unwrap();
+    second.query_capped(&lock(2), 1).await.unwrap();
+    let (cross_first, cross_second) = (lock(2), lock(1));
+    let (a, b) = tokio::join!(
+        first.query_capped(&cross_first, 1),
+        second.query_capped(&cross_second, 1)
+    );
+    first.rollback().await;
+    second.rollback().await;
+    let deadlock = match (a, b) {
+        (Err(e), Ok(_)) | (Ok(_), Err(e)) => e,
+        (a, b) => panic!("expected exactly one deadlock victim, got {a:?} and {b:?}"),
+    };
+    assert!(
+        deadlock.message().contains("deadlock detected"),
+        "{deadlock:?}"
+    );
+    assert!(
+        !deadlock.is_transient(),
+        "a deadlock is deliberately not classified as transient: {deadlock:?}"
+    );
+    pool.execute("DROP TABLE deadlock_pair").await.unwrap();
 
     pool.close().await;
 }
