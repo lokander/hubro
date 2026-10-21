@@ -118,9 +118,11 @@ opening a file while hubro is already running starts a second copy.
 - **Write protection** per connection — allow writes, confirm each one, or
   refuse them. A connection marked read-only refuses writes in hubro and, on
   SQLite and the Postgres-family engines, in the database too: the SQL editor
-  runs there in the engine's own read-only mode. SQL Server has no such mode,
-  so there a write hidden in a function or procedure call gets through — use
-  a login without write permission when that matters.
+  runs there in the engine's own read-only mode. That mode covers the
+  database's own transaction, not a function that acts through a connection
+  of its own — `dblink_exec`, or Citus's `run_command_on_*`. SQL Server has no
+  such mode, so there a write hidden in a function or procedure call gets
+  through. Where either matters, use a login without write permission.
 - **Export** query and table results to CSV or JSON (streamed).
 - **Foreign-key navigation**, keyboard shortcuts (with a cheatsheet),
   dark/light theme, and window/session restore.

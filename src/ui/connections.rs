@@ -174,14 +174,21 @@ fn protection_hint(protection: WriteProtection, backend: BackendKind) -> &'stati
         WriteProtection::Confirm => {
             "Every write asks first, naming this connection. Colour only warns — it changes nothing."
         }
-        WriteProtection::ReadOnly if engine_has_read_only_mode(backend.into()) => {
-            "Writes are refused, including from the SQL editor, where the database itself \
-             refuses them too."
-        }
-        WriteProtection::ReadOnly => {
+        WriteProtection::ReadOnly if !engine_has_read_only_mode(backend.into()) => {
             "Writes are refused, including from the SQL editor. SQL Server has no read-only \
              mode, so a write hidden in a function or procedure call is not caught — use a \
              login without write permission for that."
+        }
+        // The read-only transaction covers this connection only; a function
+        // that writes over a connection of its own is beyond it.
+        WriteProtection::ReadOnly if backend == BackendKind::Postgres => {
+            "Writes are refused, including from the SQL editor, where the database itself \
+             refuses them too — except through a function that opens a connection of its \
+             own, such as dblink or Citus's run_command_on_*."
+        }
+        WriteProtection::ReadOnly => {
+            "Writes are refused, including from the SQL editor, where the database itself \
+             refuses them too."
         }
     }
 }
@@ -2103,6 +2110,11 @@ mod tests {
                 "{backend:?}: {hint}"
             );
         }
+        // Postgres's promise carries its exception: Citus writes through
+        // `run_command_on_*` on a marked connection (`tests/db_read_only.rs`).
+        let postgres = protection_hint(WriteProtection::ReadOnly, BackendKind::Postgres);
+        assert!(postgres.contains("except"), "{postgres}");
+        assert!(postgres.contains("run_command_on_"), "{postgres}");
     }
 
     #[test]

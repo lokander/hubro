@@ -307,3 +307,125 @@ async fn sql_server_has_no_backstop_behind_the_gate() {
     pool.execute(&format!("DROP SEQUENCE {s}")).await.unwrap();
     pool.close().await;
 }
+
+/// A marked run whose read-only connection cannot be opened fails, rather than
+/// falling back to the ordinary path — which would run the script on the
+/// pool's own, writable connections.
+///
+/// The SQLite file is renamed away under an open pool: the pool's connection
+/// keeps the inode (unix semantics, hence the `cfg`) and still reads, while
+/// opening a new, read-only connection by name fails.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_marked_run_that_cannot_open_its_read_only_connection_fails_closed() {
+    let fixture =
+        common::FixtureDb::with_sql("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1)").await;
+    let pool = fixture.open().await;
+    let moved = fixture.path().with_extension("moved");
+    std::fs::rename(fixture.path(), &moved).unwrap();
+    let script = stmts(&["SELECT count(*) FROM t"]);
+
+    let marked = WriteProtection::ReadOnly.apply(pool.backend_capabilities());
+    assert_eq!(script_refusal(marked, &script, Dialect::Sqlite), None);
+    let refused = run_script(&pool, marked, &script, |_| {})
+        .await
+        .expect_err("a marked run must not fall back to the pool's own connections");
+    assert!(matches!(refused.error, DbError::Connect(_)), "{refused:?}");
+
+    // The fallback it refused is real: unmarked, the pool still runs it.
+    run_script(&pool, pool.backend_capabilities(), &script, |_| {})
+        .await
+        .expect("the pool's own connection still reads the renamed file");
+
+    std::fs::rename(&moved, fixture.path()).unwrap();
+    pool.close().await;
+}
+
+/// A statement that ends its own connection — the gate passes
+/// `pg_terminate_backend`, which acts on another process — fails with its own
+/// error, and the next marked run gets a working connection that is still
+/// read-only: the failed rollback left nothing behind in the pool.
+#[tokio::test]
+async fn a_marked_connection_recovers_from_a_statement_that_kills_it() {
+    let Some(url) = common::pg_test_url().await else {
+        return;
+    };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let marked = WriteProtection::ReadOnly.apply(pool.backend_capabilities());
+    let s = format!("hubro_ro_kill_{}", std::process::id());
+    let _ = pool.execute(&format!("DROP SEQUENCE IF EXISTS {s}")).await;
+    pool.execute(&format!("CREATE SEQUENCE {s}")).await.unwrap();
+
+    let killed = run_script(
+        &pool,
+        marked,
+        &stmts(&["SELECT pg_terminate_backend(pg_backend_pid())"]),
+        |_| {},
+    )
+    .await
+    .expect_err("a statement that ends its connection cannot succeed");
+    assert!(
+        killed.error.to_string().contains("terminat"),
+        "the statement's own error, not the rollback's: {killed:?}"
+    );
+
+    for _ in 0..4 {
+        run_script(&pool, marked, &stmts(&["SELECT 1"]), |_| {})
+            .await
+            .expect("the pool recovers");
+        let refused = run_script(
+            &pool,
+            marked,
+            &stmts(&[&format!("SELECT setval('{s}', 77)")]),
+            |_| {},
+        )
+        .await
+        .expect_err("and is still read-only");
+        assert!(matches!(refused.error, DbError::Query(_)), "{refused:?}");
+    }
+    assert_ne!(last_value(&pool, &s).await, Value::Integer(77));
+
+    pool.execute(&format!("DROP SEQUENCE {s}")).await.unwrap();
+    pool.close().await;
+}
+
+/// The other documented limit, measured: Citus's `run_command_on_*`
+/// functions run their command over a connection of Citus's own, outside the
+/// read-only transaction, so a marked connection whose login may call them
+/// still writes — to this very database, through `run_command_on_coordinator`.
+/// Same class as `dblink_exec`; if this test fails, Citus started refusing and
+/// the documentation saying it does not is out of date.
+#[tokio::test]
+async fn citus_writes_through_run_command_on_coordinator_despite_the_marking() {
+    let Some(url) = url("HUBRO_CITUS_TEST_URL") else {
+        return;
+    };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let t = format!("hubro_ro_citus_{}", std::process::id());
+    let _ = pool.execute(&format!("DROP TABLE IF EXISTS {t}")).await;
+    pool.execute(&format!("CREATE TABLE {t} (a int)"))
+        .await
+        .unwrap();
+    let marked = WriteProtection::ReadOnly.apply(pool.backend_capabilities());
+    let script = stmts(&[&format!(
+        "SELECT run_command_on_coordinator($$INSERT INTO {t} VALUES (1)$$)"
+    )]);
+    assert_eq!(script_refusal(marked, &script, Dialect::Postgres), None);
+
+    run_script(&pool, marked, &script, |_| {})
+        .await
+        .expect("nothing in the read-only transaction refuses a write made elsewhere");
+    let rows = pool
+        .query(&format!("SELECT count(*) FROM {t}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.rows,
+        vec![vec![Value::Integer(1)]],
+        "the row is not there — Citus refused a write on a marked connection, so the \
+         documented limit is out of date"
+    );
+
+    pool.execute(&format!("DROP TABLE {t}")).await.unwrap();
+    pool.close().await;
+}
