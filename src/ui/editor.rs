@@ -5,7 +5,7 @@ use serde_json::json;
 
 use crate::db::{
     needs_confirmation, plan_reached_cell_cap, ConnectionId, Dialect, ExportFormat, PlanDisplay,
-    PlanNode, PlanTree, QueryResult, Rollback, StatementOutcome, TableMeta, Value, EXPENSIVE_SHARE,
+    PlanNode, PlanTree, Rollback, StatementOutcome, TableMeta, Value, EXPENSIVE_SHARE,
     MARKED_READ_ONLY, MAX_QUERY_ROWS, NO_DDL, NO_EXPLAIN, NO_MUTATE, NO_QUERY, PLAN_CELL_CAP,
 };
 
@@ -14,7 +14,7 @@ use super::js::js_string;
 use super::notice::{Banner, BannerKind, EmptyState, LoadingLine};
 use super::saved_panel::SavedQueriesPanel;
 use super::state::{
-    AppState, ExportPane, ExportStatus, RunStatus, SchemaLoad, SharedStatement, SqlBuffer,
+    sql_export_status, AppState, ExportStatus, RunStatus, SchemaLoad, SharedStatement, SqlBuffer,
 };
 
 /// Cap on rendered result rows (per statement). The query layer keeps up to
@@ -886,11 +886,12 @@ fn StatementSection(id: ConnectionId, index: usize, result: SharedStatement) -> 
     // capture the shared statement and snapshot it when pressed.
     let exportable =
         matches!(&result.outcome, StatementOutcome::Rows(rows) if !rows.rows.is_empty());
-    let export_status: Option<ExportStatus> = state
-        .export_status
-        .read()
-        .get(&(id, ExportPane::Sql))
-        .cloned();
+    let export_status: Option<ExportStatus> = sql_export_status(
+        &state.export_status.read(),
+        &state.sql_export_sources.read(),
+        id,
+        &result,
+    );
     rsx! {
         div { class: "border-b border-slate-200 dark:border-slate-800",
             p { class: "flex items-baseline gap-2 bg-slate-100 dark:bg-slate-900/60 px-4 py-1.5 text-xs",
@@ -915,11 +916,7 @@ fn StatementSection(id: ConnectionId, index: usize, result: SharedStatement) -> 
                             title: "Export this result to {label}",
                             onclick: {
                                 let statement = result.clone();
-                                move |_| {
-                                    if let StatementOutcome::Rows(rows) = &statement.outcome {
-                                        spawn_result_export(state, id, rows.clone(), format);
-                                    }
-                                }
+                                move |_| spawn_result_export(state, id, statement.clone(), format)
                             },
                             "Export {label}"
                         }
@@ -956,12 +953,12 @@ fn StatementSection(id: ConnectionId, index: usize, result: SharedStatement) -> 
 }
 
 /// Opens a native save dialog and, on a chosen path, writes the held
-/// [`QueryResult`] to it in `format` via [`AppState::export_result`] (a
-/// background task; the UI never blocks).
+/// result to it in `format` via [`AppState::export_result`] (a background
+/// task; the UI never blocks).
 fn spawn_result_export(
     state: AppState,
     id: ConnectionId,
-    result: QueryResult,
+    statement: SharedStatement,
     format: ExportFormat,
 ) {
     let (filter_name, ext) = match format {
@@ -977,7 +974,7 @@ fn spawn_result_export(
             .save_file()
             .await;
         if let Some(file) = picked {
-            state.export_result(id, result, format, file.path().to_path_buf());
+            state.export_result(id, statement, format, file.path().to_path_buf());
         }
     });
 }
