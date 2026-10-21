@@ -677,10 +677,14 @@ fn delete_statement(
 pub(super) fn locator_mismatch(identity: &RowIdentity, locator: &RowLocator) -> Option<String> {
     let key_len = identity.key_columns().len();
     let carried = locator.identity_values.len();
+    let plural =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
     (carried != key_len || key_len == 0).then(|| {
         format!(
-            "row locator carries {carried} key values but the row identity has {key_len} \
-             columns; the table's key has changed since the row was loaded, so reload it"
+            "the table's key has changed since this page was loaded — reload the table and \
+             try again (the row was read with {}, but the key now has {})",
+            plural(carried, "key value", "key values"),
+            plural(key_len, "column", "columns"),
         )
     })
 }
@@ -1118,7 +1122,8 @@ mod tests {
         let short = locator(1);
         let message = row_where(&table(), &composite, Dialect::Sqlite, &short).unwrap_err();
         assert!(
-            message.contains("1 key values") && message.contains("2 columns"),
+            message.starts_with("the table's key has changed since this page was loaded")
+                && message.contains("read with 1 key value, but the key now has 2 columns"),
             "{message}"
         );
         let long = RowLocator {
@@ -1456,7 +1461,11 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.change_index, Some(1));
         assert_eq!(err.change_summary, Some("delete of row ()".into()));
-        assert!(err.message.contains("locator"), "message: {}", err.message);
+        assert!(
+            err.message.contains("key has changed"),
+            "message: {}",
+            err.message
+        );
 
         let bad_insert = StagedChange::Insert {
             columns: vec!["a".into(), "b".into()],
