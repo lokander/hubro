@@ -329,7 +329,9 @@ fn WindowPersistence() -> Element {
             } => {
                 update_geometry(&mut latest, &window);
                 if let Some(path) = default_settings_path() {
-                    let _ = save_window_geometry(&path, latest.peek().sanitized());
+                    if let Err(err) = save_window_geometry(&path, latest.peek().sanitized()) {
+                        eprintln!("hubro: window geometry not saved: {err}");
+                    }
                 }
                 // This handler runs (via `app.tick`) *before* the built-in
                 // close handler reads the close behaviour, so setting it here
@@ -369,7 +371,9 @@ fn WindowPersistence() -> Element {
             if current != persisted {
                 persisted = current;
                 if let Some(path) = default_settings_path() {
-                    let _ = save_window_geometry(&path, current.sanitized());
+                    if let Err(err) = save_window_geometry(&path, current.sanitized()) {
+                        eprintln!("hubro: window geometry not saved: {err}");
+                    }
                 }
             }
         }
