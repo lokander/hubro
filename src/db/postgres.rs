@@ -250,8 +250,18 @@ async fn has_autocommit_before_ddl(pool: &PgPool, flavor: PgFlavor) -> bool {
 /// how CockroachDB creates tables by default, so it breaks a common operation
 /// to fix a rarer one. `tests/db_cockroach.rs` pins the resulting behaviour.
 pub async fn open_postgres(url: &str) -> Result<PgConn, DbError> {
+    open_postgres_sized(url, 4).await
+}
+
+/// [`open_postgres`] with a pool of at most `max_connections`. Only a test
+/// opens one smaller than the app's: session state such as a temp table is
+/// visible on the one connection that made it, and even a strictly sequential
+/// caller on a fresh pool gets two, because sqlx hands a finished connection
+/// back to the pool in a spawned task, so the very next acquire finds the idle
+/// queue empty and opens another.
+pub async fn open_postgres_sized(url: &str, max_connections: u32) -> Result<PgConn, DbError> {
     let pool = PgPoolOptions::new()
-        .max_connections(4)
+        .max_connections(max_connections)
         .connect(url)
         .await
         .map_err(|e| connect_error(&e))?;

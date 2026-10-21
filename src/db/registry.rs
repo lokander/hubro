@@ -304,6 +304,17 @@ impl DbPool {
         Ok(DbPool::Postgres(postgres::open_postgres(url).await?))
     }
 
+    /// Connects to a Postgres URL on a pool of exactly one connection, so every
+    /// statement shares one session. The app never opens this — one connection
+    /// would queue the grid behind introspection — but a test of session-local
+    /// state (a temp table) needs it to be deterministic: see
+    /// [`postgres::open_postgres_sized`].
+    pub async fn open_postgres_single_session(url: &str) -> Result<DbPool, DbError> {
+        Ok(DbPool::Postgres(
+            postgres::open_postgres_sized(url, 1).await?,
+        ))
+    }
+
     /// Connects to a SQL Server URL (password already spliced in if any).
     pub async fn open_mssql(url: &str) -> Result<DbPool, DbError> {
         Ok(DbPool::SqlServer(sqlserver::open_mssql(url).await?))

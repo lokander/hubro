@@ -1003,11 +1003,17 @@ async fn postgres_empty_results_keep_their_column_headers() {
 
 /// A temp table lives on the one pooled connection that made it, so the
 /// schema tree cannot list it honestly: the queries that describe it, and
-/// every later browse, land on whichever connection is idle. A fresh pool
-/// with nothing running concurrently is the case most likely to list it — one
-/// connection, so the first introspection's every query sees the table —
-/// which is why the test is built that way: before temp tables were left out,
-/// it was listed by the first introspection here and not by the second.
+/// every later browse, land on whichever connection is idle. The case most
+/// likely to list it is a pool whose every query sees the table, so the test
+/// opens exactly that: a single-session pool, where the CREATE, the probe and
+/// every query introspection runs share one connection. Without the filter,
+/// introspection here lists the table every time.
+///
+/// It used the app's four-connection pool and relied on a fresh one handing
+/// back the same connection, which it does not: sqlx returns a finished
+/// connection in a spawned task, so a strictly sequential caller still opens a
+/// second one, and which of the two each query got depended on timing. On CI
+/// every probe landed on the other connection and the test failed.
 ///
 /// The probe is what keeps this from passing vacuously. Introspection leaving
 /// the table out only means something if this pool could see it at all, so
@@ -1016,12 +1022,11 @@ async fn postgres_empty_results_keep_their_column_headers() {
 #[tokio::test]
 async fn postgres_temporary_tables_are_not_listed() {
     let Some(url) = test_url().await else { return };
-    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let pool = DbPool::open_postgres_single_session(&url).await.unwrap();
     pool.execute("CREATE TEMP TABLE temp_unlisted (email text UNIQUE)")
         .await
         .unwrap();
-    let mut seen_by_probe = 0;
-    for attempt in 0..4 {
+    for attempt in 0..2 {
         let probe = pool
             .query(
                 "SELECT 1 FROM information_schema.tables \
@@ -1029,7 +1034,11 @@ async fn postgres_temporary_tables_are_not_listed() {
             )
             .await
             .unwrap();
-        seen_by_probe += probe.rows.len();
+        assert_eq!(
+            probe.rows.len(),
+            1,
+            "round {attempt}: the pool did not see its own temp table, so nothing here is tested"
+        );
         let tables = pool.introspect().await.unwrap();
         let listed: Vec<_> = tables
             .iter()
@@ -1037,10 +1046,6 @@ async fn postgres_temporary_tables_are_not_listed() {
             .collect();
         assert!(listed.is_empty(), "introspection {attempt}: {listed:?}");
     }
-    assert!(
-        seen_by_probe > 0,
-        "the pool never saw its own temp table, so nothing above was tested"
-    );
     pool.close().await;
 }
 
