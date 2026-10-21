@@ -212,19 +212,26 @@ pub(crate) fn validate_bit_literal(text: &str) -> Result<(), String> {
 ///   never round-trips through `f64`.
 ///
 /// NaN and the infinities are accepted for the [`TypeClass::Float`] and
-/// [`TypeClass::Exact`] classes on [`Dialect::Postgres`] only — Postgres,
-/// CockroachDB and RisingWave store all three in `numeric`, `real` and
-/// `double precision`, and the grid shows them (`NaN`, `Infinity`), so a cell
-/// a user can see must be one they can type back. An exact column stages the
-/// server's own spelling (`NaN`, `Infinity`, `-Infinity`) whatever Rust
-/// spelling was typed (`nan`, `inf`, `+infinity`), so the pending cell reads
-/// as the saved one will — PostgreSQL 17 and CockroachDB were measured to
-/// accept those other spellings too, so this is display, not a fix for a
-/// refusal. SQL Server's `float` and
-/// `decimal` hold none of them and SQLite turns a NaN into NULL, so they stay
-/// rejected there, as they stay for an integer everywhere. An engine whose
-/// `numeric` lacks one (Materialize has no numeric infinity) refuses it with
-/// its own message at save time.
+/// [`TypeClass::Exact`] classes on [`Dialect::Postgres`] only — PostgreSQL
+/// and CockroachDB store all three in `numeric`, `real` and `double
+/// precision`, and RisingWave reads all three as those types (measured,
+/// though it offers no editing). The grid shows a `numeric` one as `NaN` or
+/// `Infinity`, so a cell a user can see must be one they can type back. An
+/// exact column stages the server's own spelling (`NaN`, `Infinity`,
+/// `-Infinity`) whatever spelling was typed (`nan`, `inf`, `+infinity`), so
+/// the pending cell reads as the saved one will — both engines accept those
+/// other spellings too, so this is display, not a fix for a refusal. SQL
+/// Server's `float` and `decimal` hold none of them and SQLite turns a NaN
+/// into NULL, so they stay rejected there, as they stay for an integer
+/// everywhere. An engine whose `numeric` lacks one (Materialize has no
+/// numeric infinity) refuses it with its own message at save time.
+///
+/// They are recognised by their *spelling* ([`non_finite`]), never by
+/// `f64` parsing to a non-finite value: Rust parses an overflow such as
+/// `1e400` as infinity, so that test turned a `numeric` holding `1e400`,
+/// committed unchanged, into a saved `Infinity`. An exact column stages any
+/// other number verbatim, however large — the server holds what was typed;
+/// a float one refuses a number past `f64`, as the server would.
 ///
 /// Other non-numbers are rejected everywhere. A class that is not numeric is
 /// a caller bug and is rejected too.
@@ -240,23 +247,46 @@ pub(crate) fn parse_numeric_text(
     if let Ok(i) = t.parse::<i64>() {
         return Ok(Value::Integer(i));
     }
-    let special = dialect == Dialect::Postgres;
+    if let Some(special) = non_finite(t) {
+        return match class {
+            TypeClass::Float | TypeClass::Exact if dialect == Dialect::Postgres => {
+                Ok(if class == TypeClass::Float {
+                    Value::Real(special)
+                } else if special.is_nan() {
+                    Value::Text("NaN".into())
+                } else if special > 0.0 {
+                    Value::Text("Infinity".into())
+                } else {
+                    Value::Text("-Infinity".into())
+                })
+            }
+            _ => Err(format!("not a number: {t}")),
+        };
+    }
     match (class, t.parse::<f64>()) {
         (TypeClass::Integer, Ok(f)) if f.is_finite() => Err(format!("not a whole number: {t}")),
-        (TypeClass::Float, Ok(f)) if f.is_finite() || special => Ok(Value::Real(f)),
-        (TypeClass::Exact, Ok(f)) if f.is_finite() => Ok(Value::Text(t.to_string())),
-        (TypeClass::Exact, Ok(f)) if special => Ok(Value::Text(
-            if f.is_nan() {
-                "NaN"
-            } else if f > 0.0 {
-                "Infinity"
-            } else {
-                "-Infinity"
-            }
-            .to_string(),
-        )),
+        (TypeClass::Float, Ok(f)) if f.is_finite() => Ok(Value::Real(f)),
+        (TypeClass::Float, Ok(_)) => Err(format!("out of range for a float: {t}")),
+        // Rust also reads a signed NaN (`-nan`), which no `numeric` takes.
+        (TypeClass::Exact, Ok(f)) if !f.is_nan() => Ok(Value::Text(t.to_string())),
         _ => Err(format!("not a number: {t}")),
     }
+}
+
+/// The NaN or infinity `t` spells — `nan`, `inf`, `infinity`, the last two
+/// with an optional sign, in any case — or `None` for anything else,
+/// including a number too large for an `f64`.
+fn non_finite(t: &str) -> Option<f64> {
+    let lower = t.to_ascii_lowercase();
+    if lower == "nan" {
+        return Some(f64::NAN);
+    }
+    let (sign, rest) = match lower.as_bytes().first() {
+        Some(b'-') => (-1.0, &lower[1..]),
+        Some(b'+') => (1.0, &lower[1..]),
+        _ => (1.0, lower.as_str()),
+    };
+    matches!(rest, "inf" | "infinity").then_some(sign * f64::INFINITY)
 }
 
 /// The boolean a piece of text spells, or `None` when it spells neither.
@@ -839,6 +869,13 @@ mod tests {
             coerce("numeric", &text("-inf")),
             Ok(Value::Text("-Infinity".into()))
         );
+        // A number past f64 is not an infinity: a numeric keeps it, a float
+        // refuses it as the server would.
+        assert_eq!(
+            coerce("numeric", &text("1e400")),
+            Ok(Value::Text("1e400".into()))
+        );
+        assert!(coerce("double precision", &text("1e400")).is_err());
     }
 
     #[test]

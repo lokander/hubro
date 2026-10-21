@@ -867,6 +867,16 @@ mod tests {
         }
         // Still not a number.
         assert!(exact("nanx").is_err());
+        assert!(exact("+nan").is_err());
+        // Overflowing f64 is not spelling infinity: `1e400` parses as an
+        // infinite f64, and that test saved a numeric's `1e400` as
+        // `Infinity`. It stays the number typed, and a float refuses it.
+        let huge = format!("1{}", "0".repeat(400));
+        for big in ["1e400", "-1e400", huge.as_str()] {
+            assert_eq!(exact(big), Ok(Value::Text(big.into())), "{big}");
+            assert!(float(big).is_err(), "{big}");
+            assert!(on(Dialect::SqlServer, NumericKind::Float, big).is_err());
+        }
     }
 
     #[test]

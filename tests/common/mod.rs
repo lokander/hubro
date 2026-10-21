@@ -1215,7 +1215,11 @@ pub async fn real_round_trip_failures(pool: &DbPool, prefix: &str) -> Vec<String
 /// is committed unchanged through the editor's own parse (`editor_kind` and
 /// `parse_input`, as the grid calls them) and saved: it must save and still
 /// hold NaN. Row 2 holds zeros, and `Infinity`, `-inf` and `nan` are typed
-/// into it the same way; the server must then hold what was typed.
+/// into it the same way; the server must then hold what was typed. Row 3's
+/// `numeric` holds `1e400`, past `f64`: shown as its 401 digits, committed
+/// unchanged and typed as `1e400`, it must stay that number — `1e400` parses
+/// as an infinite `f64`, and treating that as typed infinity saved
+/// `Infinity` over it.
 pub async fn non_finite_edit_failures(pool: &DbPool, prefix: &str) -> Vec<String> {
     use hubro::db::{apply_staged, detect_row_identity, RowLocator, StagedChange, Value};
     use hubro::ui::editing::{editor_kind, parse_input};
@@ -1228,7 +1232,7 @@ pub async fn non_finite_edit_failures(pool: &DbPool, prefix: &str) -> Vec<String
     .await
     .unwrap();
     pool.query(&format!(
-        "INSERT INTO {prefix} VALUES (1, 'NaN', 'NaN', 'NaN'), (2, 0, 0, 0)"
+        "INSERT INTO {prefix} VALUES (1, 'NaN', 'NaN', 'NaN'), (2, 0, 0, 0), (3, 1e400, 0, 0)"
     ))
     .await
     .unwrap();
@@ -1243,6 +1247,13 @@ pub async fn non_finite_edit_failures(pool: &DbPool, prefix: &str) -> Vec<String
         .query(&format!("SELECT n, d, r FROM {prefix} WHERE k = 1"))
         .await
         .unwrap();
+    let huge = pool
+        .query(&format!("SELECT n FROM {prefix} WHERE k = 3"))
+        .await
+        .unwrap()
+        .rows[0][0]
+        .display();
+    let digits = format!("1{}", "0".repeat(400));
     let mut failures = Vec::new();
     let edits = ["n", "d", "r"]
         .iter()
@@ -1252,6 +1263,8 @@ pub async fn non_finite_edit_failures(pool: &DbPool, prefix: &str) -> Vec<String
             (2, "n", "Infinity".to_string(), "Infinity"),
             (2, "d", "-inf".to_string(), "-Infinity"),
             (2, "r", "nan".to_string(), "NaN"),
+            (3, "n", huge, digits.as_str()),
+            (3, "n", "1e400".to_string(), digits.as_str()),
         ]);
     for (k, column, typed, stored) in edits {
         let meta = table.columns.iter().find(|c| c.name == column).unwrap();
@@ -1276,13 +1289,16 @@ pub async fn non_finite_edit_failures(pool: &DbPool, prefix: &str) -> Vec<String
             failures.push(format!("{column} = {typed:?}: the save failed: {e}"));
             continue;
         }
+        // Compared by the column's own equality, not by its text: CockroachDB
+        // prints a decimal typed as `1e400` as `1E+400`. Both engines count
+        // NaN equal to NaN, as they must for a NaN key to be found at all.
         let held = pool
             .query(&format!(
-                "SELECT {column}::text FROM {prefix} WHERE k = {k}"
+                "SELECT {column}::text, {column} = '{stored}' FROM {prefix} WHERE k = {k}"
             ))
             .await
             .unwrap();
-        if held.rows[0][0] != Value::Text(stored.into()) {
+        if held.rows[0][1] != Value::Text("true".into()) {
             failures.push(format!(
                 "{column} = {typed:?}: the server holds {:?}, not {stored}",
                 held.rows[0][0]
