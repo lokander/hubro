@@ -3359,7 +3359,9 @@ mod tests {
     }
 
     /// Whether `code` rebinds `ident`: `let ident`, `let mut ident`, or an
-    /// assignment `ident = …` (not `==`).
+    /// assignment `ident = …` (not `==`). Only those shapes: a binding inside
+    /// another pattern — a tuple or struct `let`, `if let`, `while let`, a
+    /// `match` arm, `for`, a closure parameter — is not seen.
     fn rebinds(code: &str, ident: &str) -> bool {
         let is_ident = |c: char| c.is_alphanumeric() || c == '_';
         code.match_indices(ident).any(|(at, _)| {
@@ -3467,6 +3469,25 @@ mod tests {
         let mut built = Vec::new();
         for (rel, text) in &sources {
             let code = collapsed(&code_only(&shipped(text)));
+            // The variant used as a function — `.map_err(DbError::
+            // CredentialsRejected)` — builds one without a `(` after the name,
+            // where `constructions_of` would not see it. So every use must be
+            // followed by `(`, and is then a construction or a pattern.
+            let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+            for (at, name) in code.match_indices("CredentialsRejected") {
+                let before = code[..at].chars().next_back();
+                let after = code[at + name.len()..].chars().next();
+                if before.is_some_and(is_ident) || after.is_some_and(is_ident) {
+                    continue;
+                }
+                assert_eq!(
+                    after,
+                    Some('('),
+                    "src/{rel} uses CredentialsRejected without `(` — as a function, \
+                     e.g. `.map_err(DbError::CredentialsRejected)`, which constructs it \
+                     outside the classifiers"
+                );
+            }
             let n = constructions_of(&code, "CredentialsRejected(");
             if n > 0 {
                 built.push((rel.clone(), n));
