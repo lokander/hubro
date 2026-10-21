@@ -267,8 +267,13 @@ pub(crate) fn parse_numeric_text(
         (TypeClass::Integer, Ok(f)) if f.is_finite() => Err(format!("not a whole number: {t}")),
         (TypeClass::Float, Ok(f)) if f.is_finite() => Ok(Value::Real(f)),
         (TypeClass::Float, Ok(_)) => Err(format!("out of range for a float: {t}")),
-        // Rust also reads a signed NaN (`-nan`), which no `numeric` takes.
-        (TypeClass::Exact, Ok(f)) if !f.is_nan() => Ok(Value::Text(t.to_string())),
+        // Past f64 only where a `numeric` holds it (SQLite stores `1e400` as
+        // Inf); Rust also reads a signed NaN (`-nan`), which no `numeric` takes.
+        (TypeClass::Exact, Ok(f))
+            if f.is_finite() || (dialect == Dialect::Postgres && !f.is_nan()) =>
+        {
+            Ok(Value::Text(t.to_string()))
+        }
         _ => Err(format!("not a number: {t}")),
     }
 }
