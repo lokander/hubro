@@ -334,3 +334,41 @@ async fn the_redirect_is_found_among_the_browser_s_other_connections() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_silent_connection_cannot_hold_the_sign_in_past_its_deadline() {
+    // A preconnect the browser never uses, and no redirect: the wait ends at
+    // its deadline rather than reading the silent connection for ever.
+    let endpoints = Endpoints {
+        login: "http://127.0.0.1:1".to_string(),
+        imds: "http://127.0.0.1:1".to_string(),
+    };
+    let started = std::time::Instant::now();
+    let acquired = tokio::time::timeout(
+        Duration::from_secs(10),
+        acquire_token(
+            &EntraAuth::interactive_default(),
+            OSSRDBMS_RESOURCE,
+            None,
+            &endpoints,
+            Duration::from_secs(1),
+            |auth_url: &str| {
+                let parsed = url::Url::parse(auth_url).unwrap();
+                let pairs: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+                let port = url::Url::parse(&pairs["redirect_uri"])
+                    .unwrap()
+                    .port()
+                    .unwrap();
+                tokio::spawn(async move {
+                    let _held = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+                Ok(())
+            },
+        ),
+    )
+    .await
+    .expect("a silent connection held the sign-in past its deadline");
+    assert!(matches!(acquired.token, Err(AzureError::Timeout)));
+    assert!(started.elapsed() < Duration::from_secs(5));
+}

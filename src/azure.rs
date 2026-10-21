@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 /// The Azure Database for PostgreSQL OAuth resource; tokens are requested for
 /// its `/.default` scope.
@@ -312,49 +312,52 @@ async fn acquire_interactive(
     .await
 }
 
-/// Accepts the single loopback redirect, returns a small "done" page to the
+/// Waits for the loopback redirect, returns a small "done" page to the
 /// browser, validates `state`, and yields the authorization `code`.
+///
+/// The redirect is rarely the only connection the listener gets: a browser
+/// opens speculative preconnects it may never use, and fetches the favicon.
+/// So every connection is read on its own task — one that is held open and
+/// silent cannot stall the one carrying the redirect, which a single
+/// accept-then-read did indefinitely — and only a request carrying `code` or
+/// `error` ([`carries_redirect`]) ends the wait. Anything else is answered
+/// 404 and the wait goes on, until `timeout` from now.
 async fn wait_for_redirect(
     listener: TcpListener,
     expected_state: &str,
     timeout: Duration,
 ) -> Result<String, AzureError> {
-    let (mut stream, _) = tokio::time::timeout(timeout, listener.accept())
-        .await
-        .map_err(|_| AzureError::Timeout)?
-        .map_err(|e| AzureError::Http(format!("accepting the redirect: {e}")))?;
+    let (requests, mut arrived) = tokio::sync::mpsc::unbounded_channel();
+    // Dropping the reader set when this task is aborted ends every read still
+    // waiting on a silent connection, so none outlives the sign-in.
+    let acceptor = tokio::spawn(async move {
+        let mut readers = tokio::task::JoinSet::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            while readers.try_join_next().is_some() {}
+            let requests = requests.clone();
+            readers.spawn(async move {
+                if let Some(request) = read_request_target(stream).await {
+                    let _ = requests.send(request);
+                }
+            });
+        }
+    });
+    let found = tokio::time::timeout(timeout, async {
+        while let Some((stream, target)) = arrived.recv().await {
+            if carries_redirect(&target) {
+                return Ok((stream, target));
+            }
+            respond(stream, "404 Not Found", "").await;
+        }
+        Err(AzureError::Http(
+            "the sign-in listener stopped accepting connections".to_string(),
+        ))
+    })
+    .await;
+    acceptor.abort();
+    let (stream, target) = found.map_err(|_| AzureError::Timeout)??;
 
-    // Read until the request line (ends at the first CRLF) is complete — a long
-    // authorization code could span more than one TCP segment. Capped so a
-    // rogue client can't stream forever.
-    let mut buf: Vec<u8> = Vec::with_capacity(2048);
-    let mut chunk = [0u8; 2048];
-    loop {
-        if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
-            buf.truncate(pos);
-            break;
-        }
-        if buf.len() > 64 * 1024 {
-            return Err(AzureError::Http("redirect request too large".to_string()));
-        }
-        let n = stream
-            .read(&mut chunk)
-            .await
-            .map_err(|e| AzureError::Http(format!("reading the redirect: {e}")))?;
-        if n == 0 {
-            break; // connection closed before a full request line
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    let request_line = String::from_utf8_lossy(&buf);
-    let target = request_line
-        .split_whitespace()
-        .nth(1)
-        .unwrap_or("/")
-        .to_string();
-    let target = target.as_str();
-
-    let result = parse_redirect(target, expected_state);
+    let result = parse_redirect(&target, expected_state);
     // Always answer the browser, whether the redirect was good or not.
     let body = match &result {
         Ok(_) => {
@@ -366,15 +369,61 @@ async fn wait_for_redirect(
                    <p>Return to Hubro for details.</p></body></html>"
         }
     };
+    respond(stream, "200 OK", body).await;
+    result
+}
+
+/// Reads one connection's request line and returns its target, with the
+/// stream to answer on. `None` for a connection closed before sending one, or
+/// one streaming more than any redirect could carry — noise either way.
+async fn read_request_target(mut stream: TcpStream) -> Option<(TcpStream, String)> {
+    // Read until the request line (ends at the first CRLF) is complete — a long
+    // authorization code could span more than one TCP segment. Capped so a
+    // rogue client can't stream forever.
+    let mut buf: Vec<u8> = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 2048];
+    loop {
+        if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
+            buf.truncate(pos);
+            break;
+        }
+        if buf.len() > 64 * 1024 {
+            return None;
+        }
+        let n = stream.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let target = String::from_utf8_lossy(&buf)
+        .split_whitespace()
+        .nth(1)?
+        .to_string();
+    Some((stream, target))
+}
+
+/// Whether a request target is the sign-in's redirect: one carrying the
+/// authorization `code`, or the `error` Entra sends instead. A favicon fetch,
+/// a bare `/`, anything unparseable is not, and must not end the wait.
+fn carries_redirect(target: &str) -> bool {
+    url::Url::parse(&format!("http://localhost{target}")).is_ok_and(|parsed| {
+        parsed
+            .query_pairs()
+            .any(|(key, _)| key == "code" || key == "error")
+    })
+}
+
+/// Answers the browser and closes the connection; best-effort.
+async fn respond(mut stream: TcpStream, status: &str, body: &str) {
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.flush().await;
-    result
 }
 
 /// Parses the redirect's request target (`/?code=…&state=…` or an `error`
@@ -729,6 +778,22 @@ mod tests {
             scope(SQLDB_RESOURCE),
             "https://database.windows.net/.default offline_access"
         );
+    }
+
+    #[test]
+    fn only_a_code_or_an_error_ends_the_wait_for_the_redirect() {
+        assert!(carries_redirect("/?code=C&state=S"));
+        assert!(carries_redirect("/?error=access_denied&state=S"));
+        // What else a browser sends the listener.
+        for noise in [
+            "/",
+            "/favicon.ico",
+            "/?state=S",
+            "/?codes=1",
+            "not a target",
+        ] {
+            assert!(!carries_redirect(noise), "{noise}");
+        }
     }
 
     #[test]
