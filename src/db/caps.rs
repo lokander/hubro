@@ -196,6 +196,20 @@ pub const INSTEAD_OF_TRIGGER: Restriction = Restriction::Declared(
      hubro can't check that an edit or import changed the rows it meant to.",
 );
 
+/// Why editing and import are refused on a Postgres-wire table with a
+/// `DO INSTEAD` rule — the same hole as [`INSTEAD_OF_TRIGGER`], reached by the
+/// rewriter rather than a trigger.
+///
+/// The command tag of a rewritten statement is that of the last statement of
+/// the same type the rule ran, wherever it ran. Measured on PostgreSQL 17.10,
+/// TimescaleDB, Citus and YugabyteDB: an `UPDATE` redirected to another
+/// table reports `UPDATE 1` and leaves this table unchanged. A `DO ALSO`
+/// rule keeps the original statement and its tag, so it restricts nothing.
+pub const INSTEAD_RULE: Restriction = Restriction::Declared(
+    "This table has a DO INSTEAD rule, which replaces each write with its own, so hubro \
+     can't check that an edit or import changed the rows it meant to.",
+);
+
 /// What the user chose, as opposed to what the backend imposes — worded so the
 /// two are never confused. A backend that can't write says "is read-only"; a
 /// connection the user marked says "you marked".

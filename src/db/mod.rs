@@ -50,8 +50,8 @@ mod value;
 
 pub use caps::{
     unreadable_reason, Capabilities, Restriction, TableAccess, WriteProtection,
-    CONNECTION_READ_ONLY, INSTEAD_OF_TRIGGER, MARKED_READ_ONLY, NO_DDL, NO_GUARDED_WRITE,
-    NO_MUTATE, NO_OFFSET_PAGING, NO_QUERY, UNGUARDED_WRITES, USER_READ_ONLY,
+    CONNECTION_READ_ONLY, INSTEAD_OF_TRIGGER, INSTEAD_RULE, MARKED_READ_ONLY, NO_DDL,
+    NO_GUARDED_WRITE, NO_MUTATE, NO_OFFSET_PAGING, NO_QUERY, UNGUARDED_WRITES, USER_READ_ONLY,
 };
 pub use clipboard::{raw_cell_text, render_copy, CopyBlock, CopyFormat};
 pub use coerce::{bool_checked, bool_value, classify_type, TypeClass};
