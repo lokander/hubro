@@ -945,13 +945,14 @@ async fn mssql_a_bit_column_takes_the_boolean_spellings_people_export() {
 /// has no `DEFAULT` keyword and leaves such a column out of the statement
 /// instead, consecutive rows disagree about which columns to name. Line 6
 /// leaves a NOT NULL column with *no* default empty, which is still the
-/// error skip mode exists for.
+/// error skip mode exists for — and its blank `qty`, being on a skipped row,
+/// is not counted as a value that took its default.
 const DEFAULTS_CSV: &str = "id,qty,status,note,label\n\
                             1,,,,a\n\
                             2,3,open,x,b\n\
                             3,,open,,c\n\
                             4,5,,y,d\n\
-                            5,6,done,z,\n\
+                            5,,done,z,\n\
                             6,,,,f\n";
 
 /// Imports [`DEFAULTS_CSV`] into `import_defaults` (already created by the
@@ -986,6 +987,9 @@ async fn assert_empty_fields_take_the_column_default(pool: &DbPool) {
     .unwrap_or_else(|err| panic!("{:?}: {err}", pool.dialect()));
 
     assert_eq!(report.inserted_rows, 5, "{:?}", pool.dialect());
+    // Two on line 2, one each on lines 4 and 5, two on line 7: what the
+    // status line reports as values the file did not contain.
+    assert_eq!(report.defaulted_cells, 6, "{:?}", pool.dialect());
     assert_eq!(
         report.skipped.iter().map(|s| s.line).collect::<Vec<_>>(),
         vec![6],
@@ -1026,6 +1030,7 @@ async fn assert_empty_fields_take_the_column_default(pool: &DbPool) {
     .await
     .unwrap_or_else(|err| panic!("{:?}: {err}", pool.dialect()));
     assert_eq!(report.inserted_rows, 4, "{:?}", pool.dialect());
+    assert_eq!(report.defaulted_cells, 3, "{:?}", pool.dialect());
     let qty: Vec<String> = snapshot(pool, table, "id")
         .await
         .into_iter()
@@ -1089,6 +1094,46 @@ async fn sqlite_a_batch_split_into_statements_counts_every_row_it_undid() {
 }
 
 #[tokio::test]
+async fn sqlite_a_short_statement_in_a_split_batch_counts_every_row_it_undid() {
+    // The row-count guard's other arm, inside a split batch: a trigger
+    // silently drops one row of the SECOND statement, so it affects fewer
+    // rows than it carried. The import must abort, roll back, and count the
+    // first statement's rows as well as the second's — `RAISE(IGNORE)`
+    // leaves the dropped row out of `changes()`, which is exactly the
+    // mismatch the guard exists to catch.
+    let fixture = FixtureDb::with_sql("").await;
+    let pool = fixture.open().await;
+    pool.execute("CREATE TABLE split_ign (id INTEGER PRIMARY KEY, qty INTEGER NOT NULL DEFAULT 7)")
+        .await
+        .unwrap();
+    pool.execute(
+        "CREATE TRIGGER split_ign_drop BEFORE INSERT ON split_ign WHEN NEW.id = 4 \
+         BEGIN SELECT RAISE(IGNORE); END",
+    )
+    .await
+    .unwrap();
+    let tables = pool.introspect().await.unwrap();
+    let table = find(&tables, "split_ign");
+    // Statement 1: rows 1-2 with `qty` left out (2 land). Statement 2: rows
+    // 3-4 naming it, where row 4 is ignored (1 of 2 lands).
+    let err = import(
+        &pool,
+        table,
+        &options(vec![bind(0, "id"), bind(1, "qty")], ErrorMode::Abort),
+        csv("id,qty\n1,\n2,\n3,5\n4,6\n").as_mut(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.message.contains("affected 1 rows, expected 2"),
+        "{}",
+        err.message
+    );
+    assert_eq!(err.undone_rows, 3);
+    assert_eq!(pool.count_table_rows(table).await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn postgres_an_empty_field_in_a_not_null_column_takes_its_default() {
     let Some(url) = pg_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
@@ -1148,10 +1193,14 @@ async fn postgres_an_empty_field_in_a_not_null_column_takes_its_default() {
     .unwrap();
     assert_eq!(report.inserted_rows, 2);
     assert_eq!(report.skipped_rows, 0);
+    // id, created_at and seq on the first row; id and seq on the second.
+    assert_eq!(report.defaulted_cells, 5);
     let stored = pool
         .query(
-            "SELECT id, seq, created_at IS NOT NULL, created_at = '2024-01-01 00:00:00+00' \
-             FROM import_events ORDER BY id",
+            // `id IS NOT NULL` rather than the id itself: a serial's value is
+            // the engine's (CockroachDB's is `unique_rowid()`, not 1, 2).
+            "SELECT id IS NOT NULL, seq, created_at IS NOT NULL, \
+             created_at = '2024-01-01 00:00:00+00' FROM import_events ORDER BY seq",
         )
         .await
         .unwrap();
@@ -1163,8 +1212,13 @@ async fn postgres_an_empty_field_in_a_not_null_column_takes_its_default() {
     assert_eq!(
         rows,
         vec![
-            vec!["1".to_string(), "1".into(), "true".into(), "false".into()],
-            vec!["2".to_string(), "2".into(), "true".into(), "true".into()],
+            vec![
+                "true".to_string(),
+                "1".into(),
+                "true".into(),
+                "false".into()
+            ],
+            vec!["true".to_string(), "2".into(), "true".into(), "true".into()],
         ]
     );
 

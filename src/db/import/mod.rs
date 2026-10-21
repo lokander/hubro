@@ -314,7 +314,22 @@ pub fn sniff_file(path: &Path) -> io::Result<FileSniff> {
     File::open(path)?
         .take(SNIFF_BYTES as u64)
         .read_to_end(&mut head)?;
-    let encoding = sniff_encoding(&head);
+    Ok(sniff_head(path, without_bom(&head)))
+}
+
+/// `sample` without a leading UTF-8 byte-order mark. The readers drop it
+/// ([`cursor`]), so the sniffers have to as well, or they judge a different
+/// file than the one that will be read: a BOM'd JSON array (PowerShell's
+/// `Out-File`) starts with `0xEF` rather than `[`, so it was sniffed as CSV —
+/// or, by its extension, as JSON *Lines* — and a BOM'd first field never
+/// parses as a number, so a headerless CSV was taken to have a header.
+fn without_bom(sample: &[u8]) -> &[u8] {
+    sample.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(sample)
+}
+
+/// [`sniff_file`]'s decision over a sample already read (and BOM-stripped).
+fn sniff_head(path: &Path, head: &[u8]) -> FileSniff {
+    let encoding = sniff_encoding(head);
     let extension = path
         .extension()
         .and_then(|e| e.to_str())
@@ -326,30 +341,41 @@ pub fn sniff_file(path: &Path) -> io::Result<FileSniff> {
         .find(|b| !b.is_ascii_whitespace())
         .is_some_and(|b| matches!(b, b'[' | b'{'));
     let format = if json_by_extension || looks_like_json {
-        SourceFormat::Json(sniff_shape(&head))
+        SourceFormat::Json(sniff_shape(head))
     } else {
-        SourceFormat::Csv(sniff_dialect(&head, encoding))
+        SourceFormat::Csv(sniff_dialect(head, encoding))
     };
-    Ok(FileSniff { format, encoding })
+    FileSniff { format, encoding }
 }
 
 /// How an empty CSV field becomes a column value — an explicit choice, never
 /// a silent convention. See [`coerce_field`](super::coerce::coerce_field).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EmptyField {
-    /// An empty field is SQL NULL. The default, and what round-trips hubro's
-    /// own CSV export, which writes NULL as an empty field.
+    /// An empty field is SQL NULL — or, in a NOT NULL column the database
+    /// fills in itself, that column's default (see [`null_cell`]). The
+    /// default option, and what round-trips NULLs in hubro's own CSV export,
+    /// which writes NULL as an empty field.
+    ///
+    /// It does **not** round-trip an empty *string*: the export writes `''`
+    /// as an empty field too, so a NOT NULL text column holding `''` under a
+    /// non-empty default (`status … DEFAULT 'new'`) re-imports as `'new'`.
+    /// That is the case [`Self::EmptyText`] is for, and why
+    /// [`ImportReport::defaulted_cells`] reports how often it happened.
     #[default]
     Null,
     /// An empty field is the empty string — for a NOT NULL text column whose
-    /// blanks really are blanks.
+    /// blanks really are blanks, including one with a default that would
+    /// otherwise replace them.
     EmptyText,
 }
 
 impl EmptyField {
     pub fn label(self) -> &'static str {
         match self {
-            EmptyField::Null => "empty fields become NULL",
+            EmptyField::Null => {
+                "empty fields become NULL (or the column's default where NULL isn't allowed)"
+            }
             EmptyField::EmptyText => "empty fields become an empty string",
         }
     }
@@ -397,6 +423,12 @@ pub struct ImportReport {
     /// How many rows were skipped in total, which can exceed
     /// `skipped.len()`.
     pub skipped_rows: u64,
+    /// How many values of the inserted rows were empty or absent in the file
+    /// and took their NOT NULL column's default instead ([`null_cell`]).
+    /// Reported because it is a value the file did not contain: the dialog
+    /// states the rule before the import, and this keeps the consequence
+    /// visible after it.
+    pub defaulted_cells: u64,
 }
 
 impl ImportReport {
@@ -811,6 +843,11 @@ fn insert_sql(
     (sql, params.into_values())
 }
 
+/// How many of `row`'s cells are sent as their column's default.
+fn defaulted_cells(row: &[Cell]) -> u64 {
+    row.iter().filter(|cell| **cell == Cell::Default).count() as u64
+}
+
 /// Coerces one record into the cells for the planned columns, or reports the
 /// first reason it cannot.
 fn coerce_row(
@@ -877,7 +914,10 @@ pub async fn run_import(
         };
         let Some(record) = next else { break };
         match coerce_row(&planned, dialect, &record, options.empty_field) {
-            Ok(row) => batch.push(row),
+            Ok(row) => {
+                report.defaulted_cells += defaulted_cells(&row);
+                batch.push(row);
+            }
             Err(reason) => match options.on_error {
                 ErrorMode::Abort => {
                     return Err(abort(tx, report.inserted_rows, Some(record.line), reason).await)
@@ -1504,8 +1544,35 @@ mod tests {
                 MAX_REPORTED_SKIPS
             ],
             skipped_rows: MAX_REPORTED_SKIPS as u64 + 5,
+            defaulted_cells: 0,
         };
         assert!(report.skips_truncated());
+    }
+
+    #[test]
+    fn a_byte_order_mark_does_not_change_what_a_file_is_sniffed_as() {
+        let bom = |body: &[u8]| [&[0xEF, 0xBB, 0xBF][..], body].concat();
+        // A BOM'd JSON array, as PowerShell writes it, with and without an
+        // extension that says JSON.
+        let array = bom(br#"[{"id":1}]"#);
+        for name in ["export.json", "export.txt"] {
+            assert_eq!(
+                sniff_head(Path::new(name), without_bom(&array)).format,
+                SourceFormat::Json(JsonShape::Array),
+                "{name}"
+            );
+        }
+        // A BOM'd headerless CSV: its first field is the number 1, not
+        // "\u{feff}1", so it is not mistaken for a header.
+        let numbers = bom(b"1,2\n3,4\n");
+        let SourceFormat::Csv(dialect) =
+            sniff_head(Path::new("n.csv"), without_bom(&numbers)).format
+        else {
+            panic!("not sniffed as CSV");
+        };
+        assert!(!dialect.has_header);
+        // Only a leading mark is dropped.
+        assert_eq!(without_bom(b"a\xEF\xBB\xBF"), b"a\xEF\xBB\xBF");
     }
 
     #[test]
