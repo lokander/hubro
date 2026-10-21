@@ -746,3 +746,20 @@ fn export_temp_path(path: &Path) -> PathBuf {
     name.push(".part");
     path.with_file_name(name)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn export_work_runs_on_a_thread_other_than_the_callers() {
+        // The caller stands in for the UI task: Dioxus desktop polls tasks on
+        // the thread that draws the window, so work done on the caller's
+        // thread holds the window for as long as it takes.
+        let caller = std::thread::current().id();
+        let worker = off_the_ui_thread(|| Ok(std::thread::current().id()))
+            .await
+            .unwrap();
+        assert_ne!(caller, worker);
+    }
+}

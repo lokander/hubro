@@ -1857,4 +1857,106 @@ mod tests {
             json!({ "label": "_hyper_1_1_chunk", "type": "type", "boost": -99 })
         );
     }
+
+    /// The results a [`Sections`] tree shows, kept in the root scope so the
+    /// test can swap them between renders.
+    #[derive(Clone, Copy)]
+    struct Shown(Signal<Vec<SharedStatement>>);
+
+    /// One [`StatementSection`] per shown result, keyed by its preview, so a
+    /// result that appears is mounted fresh and renders all of its text.
+    #[component]
+    fn Sections(id: ConnectionId) -> Element {
+        let shown = use_context::<Shown>().0;
+        rsx! {
+            for (index, statement) in shown.read().iter().cloned().enumerate() {
+                StatementSection { key: "{statement.preview}", id, index, result: statement }
+            }
+        }
+    }
+
+    fn rows_statement(preview: &str) -> SharedStatement {
+        SharedStatement::new(crate::db::StatementResult {
+            preview: preview.into(),
+            outcome: StatementOutcome::Rows(crate::db::QueryResult {
+                columns: vec![crate::db::ColumnInfo { name: "a".into() }],
+                rows: vec![vec![Value::Integer(1)]],
+            }),
+            truncated: false,
+        })
+    }
+
+    /// The whole wire of a SQL-result export's status line, through the real
+    /// `export_result` and the real section: the line is drawn beside the
+    /// result that was exported and nowhere else — not beside the other
+    /// result of the same run, and not beside a later run's identical one.
+    /// Every section used to read the connection's one status, so both
+    /// results of a two-`SELECT` run claimed the export.
+    #[tokio::test]
+    async fn an_export_status_shows_beside_the_exported_result_alone() {
+        use crate::db::{ConnectionRegistry, DbPool, WriteProtection};
+        use crate::ui::state::ExportPane;
+        use crate::ui::test_dom::{provide_state, texts};
+        use dioxus::core::{NoOpMutations, VirtualDom};
+
+        let pool =
+            DbPool::Sqlite(sqlx::sqlite::SqlitePool::connect_lazy("sqlite::memory:").unwrap());
+        let id = ConnectionRegistry::default().insert("t.db", pool, WriteProtection::Open);
+        let mut dom = VirtualDom::new_with_props(Sections, SectionsProps { id });
+        let state = provide_state(&dom);
+        let shown = dom.in_runtime(|| Shown(Signal::new_in_scope(Vec::new(), ScopeId::ROOT)));
+        dom.provide_root_context(shown);
+        dom.rebuild(&mut NoOpMutations);
+
+        let (first, second) = (rows_statement("first"), rows_statement("second"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.csv");
+        dom.in_runtime(|| state.export_result(id, first.clone(), ExportFormat::Csv, path.clone()));
+        let done = Some(ExportStatus::Done { rows: 1 });
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while dom.in_runtime(|| {
+                state
+                    .export_status
+                    .peek()
+                    .get(&(id, ExportPane::Sql))
+                    .cloned()
+            }) != done
+            {
+                // Bounded: once the task has landed its status there is no
+                // work left to wait for, and the check above must run again.
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), dom.wait_for_work())
+                        .await;
+            }
+        })
+        .await;
+        assert!(
+            finished.is_ok(),
+            "the export never finished: {:?}",
+            dom.in_runtime(|| state
+                .export_status
+                .peek()
+                .get(&(id, ExportPane::Sql))
+                .cloned())
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
+
+        let mut show = |statements: Vec<SharedStatement>| {
+            let mut shown = shown.0;
+            dom.in_runtime(|| shown.set(Vec::new()));
+            dom.render_immediate(&mut NoOpMutations);
+            dom.in_runtime(|| shown.set(statements));
+            let edits = dom.render_immediate_to_vec().edits;
+            texts(&edits)
+                .iter()
+                .filter(|text| text.starts_with("Exported"))
+                .count()
+        };
+        assert_eq!(show(vec![first.clone(), second.clone()]), 1);
+        assert_eq!(show(vec![second.clone()]), 0);
+        assert_eq!(show(vec![first.clone()]), 1);
+        // A rerun's result with the same preview and rows is not the one
+        // the file was written from.
+        assert_eq!(show(vec![rows_statement("first")]), 0);
+    }
 }
