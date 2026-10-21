@@ -1372,7 +1372,9 @@ impl AppState {
             return;
         };
         spawn_forever(async move {
-            let _ = save_theme(&path, theme);
+            if let Err(err) = save_theme(&path, theme) {
+                eprintln!("hubro: theme not saved: {err}");
+            }
         });
     }
 
@@ -1385,7 +1387,9 @@ impl AppState {
             return;
         };
         spawn_forever(async move {
-            let _ = save_show_internal_objects(&path, show);
+            if let Err(err) = save_show_internal_objects(&path, show) {
+                eprintln!("hubro: internal-object visibility not saved: {err}");
+            }
         });
     }
 
