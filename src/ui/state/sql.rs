@@ -808,4 +808,117 @@ mod tests {
             "{outcome:?}"
         );
     }
+
+    /// A [`VirtualDom`] with an [`AppState`] holding one in-memory SQLite
+    /// connection.
+    fn state_with_connection() -> (dioxus::core::VirtualDom, AppState, ConnectionId) {
+        use crate::db::WriteProtection;
+        let dom = dioxus::core::VirtualDom::new(|| rsx! {});
+        let state = crate::ui::test_dom::provide_state(&dom);
+        let id = dom.in_runtime(|| {
+            let pool =
+                DbPool::Sqlite(sqlx::sqlite::SqlitePool::connect_lazy("sqlite::memory:").unwrap());
+            let mut registry = state.registry;
+            let id = registry.write().insert("t.db", pool, WriteProtection::Open);
+            id
+        });
+        (dom, state, id)
+    }
+
+    /// The real grid export records the table it was taken from, so its
+    /// line names that table once another is on screen — rather than putting
+    /// "Exported 1 row" under a table it says nothing about.
+    #[tokio::test]
+    async fn a_grid_export_names_its_table_under_another_one() {
+        let (mut dom, state, id) = state_with_connection();
+        let albums = TableRef {
+            schema: None,
+            name: "albums".into(),
+        };
+        let tracks = TableRef {
+            schema: None,
+            name: "tracks".into(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("albums.csv");
+        dom.in_runtime(|| {
+            state.export_query(
+                id,
+                albums.clone(),
+                "SELECT 1 AS a".into(),
+                Vec::new(),
+                ExportFormat::Csv,
+                path.clone(),
+            )
+        });
+        let done = Some(ExportStatus::Done { rows: 1 });
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while dom.in_runtime(|| {
+                state
+                    .export_status
+                    .peek()
+                    .get(&(id, ExportPane::Grid))
+                    .cloned()
+            }) != done
+            {
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), dom.wait_for_work())
+                        .await;
+            }
+        })
+        .await;
+        assert!(finished.is_ok(), "the export never finished");
+        let line = dom.in_runtime(|| {
+            grid_export_line(
+                &state.export_status.peek(),
+                &state.grid_export_tables.peek(),
+                id,
+                &tracks,
+            )
+        });
+        assert_eq!(
+            line.map(|(text, ..)| text),
+            Some("albums: Exported 1 row".into())
+        );
+    }
+
+    /// A run in the tab a finished SQL export came from retires its line —
+    /// through the real `run_sql`, which is where a run claims its slot — and
+    /// a run in another tab leaves it alone.
+    #[tokio::test]
+    async fn a_run_retires_a_finished_sql_export_from_its_own_tab_only() {
+        let (dom, state, id) = state_with_connection();
+        let statement = SharedStatement::new(StatementResult {
+            preview: "SELECT 1".into(),
+            outcome: StatementOutcome::Rows(crate::db::QueryResult {
+                columns: Vec::new(),
+                rows: vec![vec![Value::Integer(1)]],
+            }),
+            truncated: false,
+        });
+        dom.in_runtime(|| {
+            let (mut sources, mut statuses) = (state.sql_export_sources, state.export_status);
+            sources.write().insert(
+                id,
+                SqlExportSource {
+                    buffer: 1,
+                    statement: statement.downgrade(),
+                },
+            );
+            statuses
+                .write()
+                .insert((id, ExportPane::Sql), ExportStatus::Done { rows: 1 });
+
+            state.run_sql(id, 2, "SELECT 1".into());
+            assert!(
+                state.sql_export_sources.peek().contains_key(&id),
+                "another tab's run"
+            );
+            state.run_sql(id, 1, "SELECT 1".into());
+            assert!(
+                !state.sql_export_sources.peek().contains_key(&id),
+                "its own tab's run"
+            );
+        });
+    }
 }

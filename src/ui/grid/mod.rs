@@ -1508,7 +1508,7 @@ fn pick_import_file(
     state: AppState,
     id: ConnectionId,
     table: TableRef,
-    mut target: Signal<Option<std::path::PathBuf>>,
+    target: Signal<Option<std::path::PathBuf>>,
 ) {
     dioxus::core::spawn_forever(async move {
         let picked = rfd::AsyncFileDialog::new()
@@ -1521,12 +1521,30 @@ fn pick_import_file(
             .pick_file()
             .await;
         if let Some(file) = picked {
-            match target.try_write() {
-                Ok(mut slot) => *slot = Some(file.path().to_path_buf()),
-                Err(_) => state.report_import_pick_dropped(id, table.label()),
-            }
+            deliver_import_pick(state, id, &table, target, file.path().to_path_buf());
         }
     });
+}
+
+/// Hands a picked import file to the grid that asked for it — or, when that
+/// grid has unmounted, reports the pick as a cancelled import. Its `target`
+/// signal went with it and refuses the write, which is how a gone grid is
+/// told from a live one.
+///
+/// Split out of [`pick_import_file`] so it can be tested: dropping the
+/// report here is exactly the silent loss the task's `spawn_forever` exists
+/// to end, and the dialog in front of it cannot run in a test.
+fn deliver_import_pick(
+    state: AppState,
+    id: ConnectionId,
+    table: &TableRef,
+    mut target: Signal<Option<std::path::PathBuf>>,
+    path: std::path::PathBuf,
+) {
+    match target.try_write() {
+        Ok(mut slot) => *slot = Some(path),
+        Err(_) => state.report_import_pick_dropped(id, table.label()),
+    }
 }
 
 /// The skipped lines a finished import reported, as one line — `None` when
@@ -1637,7 +1655,10 @@ fn GridToolbar(
                 let skipped = import_skipped(status);
                 rsx! {
                     div { class: "flex items-start gap-2 border-b border-slate-200 dark:border-slate-800 px-3 py-1.5 text-xs",
-                        span { class: "shrink-0 font-medium {class}", "{text}" }
+                        // Wraps rather than clips: a failure or a cancelled
+                        // pick is a sentence, wider than the row at a normal
+                        // window width.
+                        span { class: "min-w-0 break-words font-medium {class}", "{text}" }
                         if let Some(skipped) = skipped {
                             span { class: "min-w-0 flex-1 truncate text-slate-500 dark:text-slate-400",
                                 title: "{skipped}",
@@ -1661,7 +1682,7 @@ fn GridToolbar(
         // export finished with no visible outcome at all.
         if let Some((text, class, finished)) = export_line {
             div { class: "flex items-start gap-2 border-b border-slate-200 dark:border-slate-800 px-3 py-1.5 text-xs",
-                span { class: "min-w-0 truncate font-medium {class}", title: "{text}", "{text}" }
+                span { class: "min-w-0 break-words font-medium {class}", "{text}" }
                 div { class: "flex-1" }
                 if finished {
                     button {
@@ -2613,38 +2634,42 @@ mod tests {
         );
     }
 
-    /// What `pick_import_file` tells a live grid from a gone one by: the
-    /// grid's own `import_file` signal, written once the picker returns.
-    /// A signal whose component has unmounted must refuse the write rather
-    /// than accept it into nothing — otherwise a dropped pick would vanish
-    /// silently again, and nothing else here would notice.
-    #[test]
-    fn a_signal_refuses_writes_once_its_component_unmounts() {
-        use dioxus::core::{NoOpMutations, VirtualDom};
+    /// A grid stand-in: owns an import-target signal the way [`DataGrid`]
+    /// owns `import_file`, and hands it out through the root context.
+    #[derive(Clone, Copy)]
+    struct Slot(Signal<Option<Signal<Option<std::path::PathBuf>>>>);
+    #[derive(Clone, Copy)]
+    struct Mounted(Signal<bool>);
 
-        #[derive(Clone, Copy)]
-        struct Slot(Signal<Option<Signal<Option<u8>>>>);
-        #[derive(Clone, Copy)]
-        struct Mounted(Signal<bool>);
+    #[component]
+    fn TargetOwner() -> Element {
+        let own = use_signal(|| None::<std::path::PathBuf>);
+        let mut slot = use_context::<Slot>().0;
+        use_hook(move || slot.set(Some(own)));
+        rsx! {}
+    }
 
-        #[component]
-        fn Child() -> Element {
-            let own = use_signal(|| None::<u8>);
-            let mut slot = use_context::<Slot>().0;
-            use_hook(move || slot.set(Some(own)));
-            rsx! {}
-        }
-        #[component]
-        fn Root() -> Element {
-            let mounted = use_context::<Mounted>().0;
-            rsx! {
-                if mounted() {
-                    Child {}
-                }
+    #[component]
+    fn MaybeOwner() -> Element {
+        let mounted = use_context::<Mounted>().0;
+        rsx! {
+            if mounted() {
+                TargetOwner {}
             }
         }
+    }
 
-        let mut dom = VirtualDom::new(Root);
+    /// A mounted [`TargetOwner`] with an [`AppState`] in the root context:
+    /// the dom, the state, the owner's signal, and the switch that unmounts it.
+    fn mounted_owner() -> (
+        dioxus::core::VirtualDom,
+        AppState,
+        Signal<Option<std::path::PathBuf>>,
+        Signal<bool>,
+    ) {
+        use dioxus::core::{NoOpMutations, VirtualDom};
+        let mut dom = VirtualDom::new(MaybeOwner);
+        let state = crate::ui::test_dom::provide_state(&dom);
         let (slot, mounted) = dom.in_runtime(|| {
             (
                 Slot(Signal::new_in_scope(None, ScopeId::ROOT)),
@@ -2654,18 +2679,123 @@ mod tests {
         dom.provide_root_context(slot);
         dom.provide_root_context(mounted);
         dom.rebuild(&mut NoOpMutations);
+        let own = dom.in_runtime(|| slot.0.peek().expect("the owner mounted"));
+        (dom, state, own, mounted.0)
+    }
 
-        let mut own = dom.in_runtime(|| slot.0.peek().expect("the child mounted"));
+    fn unmount(dom: &mut dioxus::core::VirtualDom, mut mounted: Signal<bool>) {
+        dom.in_runtime(|| mounted.set(false));
+        dom.render_immediate(&mut dioxus::core::NoOpMutations);
+    }
+
+    fn connection() -> ConnectionId {
+        use crate::db::{ConnectionRegistry, DbPool, WriteProtection};
+        let pool =
+            DbPool::Sqlite(sqlx::sqlite::SqlitePool::connect_lazy("sqlite::memory:").unwrap());
+        ConnectionRegistry::default().insert("t.db", pool, WriteProtection::Open)
+    }
+
+    fn people() -> TableRef {
+        TableRef {
+            schema: Some("main".into()),
+            name: "people".into(),
+        }
+    }
+
+    /// The Dioxus behaviour [`deliver_import_pick`] rests on: a signal whose
+    /// component has unmounted refuses the write rather than accepting it
+    /// into nothing.
+    #[tokio::test]
+    async fn a_signal_refuses_writes_once_its_component_unmounts() {
+        let (mut dom, _state, mut own, mounted) = mounted_owner();
         assert!(
             dom.in_runtime(|| own.try_write().is_ok()),
             "a live signal takes the write"
         );
-        let mut flag = mounted.0;
-        dom.in_runtime(|| flag.set(false));
-        dom.render_immediate(&mut NoOpMutations);
+        unmount(&mut dom, mounted);
         assert!(
             dom.in_runtime(|| own.try_write().is_err()),
             "an unmounted component's signal must refuse the write"
         );
+    }
+
+    /// The whole of what happens after the picker returns: a live grid gets
+    /// the file and no status line; a gone one gets nothing and the
+    /// connection says the import was cancelled, naming the table; and a
+    /// running import's line is never replaced by that message.
+    #[tokio::test]
+    async fn a_picked_file_reaches_a_live_grid_and_a_gone_one_reports_it_cancelled() {
+        let id = connection();
+        let path = std::path::PathBuf::from("/tmp/people.csv");
+
+        let (dom, state, own, _) = mounted_owner();
+        dom.in_runtime(|| {
+            deliver_import_pick(state, id, &people(), own, path.clone());
+            assert_eq!(*own.peek(), Some(path.clone()));
+            assert_eq!(state.import_status.peek().get(&id), None);
+        });
+
+        let (mut dom, state, own, mounted) = mounted_owner();
+        unmount(&mut dom, mounted);
+        dom.in_runtime(|| {
+            deliver_import_pick(state, id, &people(), own, path.clone());
+            assert_eq!(
+                state.import_status.peek().get(&id),
+                Some(&ImportStatus::Cancelled {
+                    table: "main.people".into()
+                })
+            );
+        });
+
+        let (mut dom, state, own, mounted) = mounted_owner();
+        unmount(&mut dom, mounted);
+        dom.in_runtime(|| {
+            let running = ImportStatus::Running {
+                table: "orders".into(),
+            };
+            let mut statuses = state.import_status;
+            statuses.write().insert(id, running.clone());
+            deliver_import_pick(state, id, &people(), own, path.clone());
+            assert_eq!(state.import_status.peek().get(&id), Some(&running));
+        });
+    }
+
+    /// The three save/open dialogs must outlive the component that opened
+    /// them: each is async and leaves the window usable, so the component can
+    /// unmount (a rerun, a table switch) while it is open — and a scoped
+    /// `spawn` then took the user's choice and did nothing with it. Read from
+    /// the source because the dialogs cannot run in a test; comments are
+    /// stripped so a doc mentioning either call cannot satisfy the check.
+    #[test]
+    fn every_dialog_task_outlives_its_component() {
+        let code = |source: &str, function: &str| -> String {
+            let start = source
+                .find(&format!("fn {function}("))
+                .unwrap_or_else(|| panic!("{function} must still exist"));
+            let end = start + source[start..].find("\n}\n").expect("its body ends");
+            source[start..end]
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .map(|line| line.split(" //").next().unwrap_or(line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        for (source, function) in [
+            (include_str!("mod.rs"), "spawn_grid_export"),
+            (include_str!("mod.rs"), "pick_import_file"),
+            (include_str!("../editor.rs"), "spawn_result_export"),
+        ] {
+            let body = code(source, function);
+            assert!(body.contains("rfd::AsyncFileDialog"), "{function}: {body}");
+            assert!(
+                body.contains("spawn_forever(async move"),
+                "{function}: {body}"
+            );
+            let scoped = body.replace("spawn_forever(", "");
+            assert!(
+                !scoped.contains("spawn("),
+                "{function} spawns a scoped task: {body}"
+            );
+        }
     }
 }
