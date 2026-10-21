@@ -164,9 +164,24 @@ impl AppState {
         // without transactional DDL is not a rollback, just an unobserved
         // outcome.
         let task = spawn_forever(async move {
-            let outcome = run_script(&pool, caps, &statements, |_| {})
-                .await
-                .map_err(|err| err.error.to_string());
+            let outcome = match run_script(&pool, caps, &statements, |_| {}).await {
+                // The statement is editable, so it can open a transaction and
+                // not commit it. The run rolled that back, and reporting the
+                // edit as done would claim a change that is not there.
+                Ok(ScriptDone {
+                    rolled_back: Some(open),
+                }) => Err(if open.schema_changes_kept {
+                    "The statement opened a transaction and never committed it, so it was \
+                     rolled back — but this server keeps schema changes through a rollback. \
+                     Check the schema."
+                } else {
+                    "The statement opened a transaction and never committed it, so it was \
+                     rolled back — nothing changed."
+                }
+                .to_string()),
+                Ok(ScriptDone { rolled_back: None }) => Ok(()),
+                Err(err) => Err(err.error.to_string()),
+            };
             self.finish_schema_edit(id, generation, outcome, &request);
         });
         self.schema_edit_tasks.write().insert(id, task);

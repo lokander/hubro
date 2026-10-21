@@ -1201,3 +1201,26 @@ pub fn like_hostile_rows(prefix: &str) -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
+
+/// Makes `pool` open several connections, by running `slow_sql` on four at
+/// once, so the next statements have more than one idle connection to land
+/// on. A pool that has only ever needed one connection hands every statement
+/// that same one, which is how a script whose statements each took a pooled
+/// connection could look as if they shared a session.
+pub async fn open_several_connections(pool: &DbPool, slow_sql: &str) {
+    let reads: Vec<_> = (0..4).map(|_| pool.query(slow_sql)).collect();
+    for read in futures_util::future::join_all(reads).await {
+        read.expect("the read that opens a pooled connection");
+    }
+}
+
+/// What a script returned, in one line for an assertion message.
+pub fn script_outcome(outcome: &Result<hubro::db::ScriptDone, hubro::db::ScriptError>) -> String {
+    match outcome {
+        Ok(done) => format!("{done:?}"),
+        Err(err) => format!(
+            "statement {} ({}) failed: {} [{:?}]",
+            err.statement_index, err.preview, err.error, err.rollback
+        ),
+    }
+}

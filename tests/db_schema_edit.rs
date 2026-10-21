@@ -131,6 +131,7 @@ async fn apply(pool: &DbPool, meta: &TableMeta, op: &SchemaOp) -> Result<(), Str
     let statements = split_statements(&sql, pool.dialect());
     run_script(pool, caps, &statements, |_| {})
         .await
+        .map(|_| ())
         .map_err(|err| format!("{}\n---\n{sql}", err.error))
 }
 

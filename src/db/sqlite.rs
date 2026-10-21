@@ -434,6 +434,37 @@ pub async fn execute_conn(
     SqlText::new(sql)?.execute(conn).await
 }
 
+/// Ends a script's hold on its connection
+/// ([`ScriptConn`](super::registry::ScriptConn)): rolls back any transaction
+/// the script left open, and reports whether there was one.
+///
+/// SQLite says whether a transaction is open only through
+/// `sqlite3_get_autocommit`, which sqlx keeps to itself, so the probe is a
+/// `BEGIN`: SQLite refuses one inside a transaction. Either way a `ROLLBACK`
+/// follows — of the script's transaction when the `BEGIN` was refused, of the
+/// probe's own (which took no lock: a deferred `BEGIN` reads nothing) when it
+/// was not. See [`script_end`] for what the two outcomes mean together.
+pub async fn end_script_conn(conn: &mut sqlx::sqlite::SqliteConnection) -> Result<bool, DbError> {
+    let probe = execute_conn(&mut *conn, "BEGIN").await;
+    let rollback = execute_conn(&mut *conn, "ROLLBACK").await;
+    script_end(probe.is_ok(), rollback)
+}
+
+/// What [`end_script_conn`]'s probe and rollback mean together, over plain
+/// outcomes so a test can execute every combination.
+///
+/// - `BEGIN` refused, `ROLLBACK` taken: the script had left a transaction
+///   open, and it is now rolled back — `true`.
+/// - `BEGIN` taken, `ROLLBACK` taken: nothing was open, and the probe's own
+///   transaction is closed again — `false`.
+/// - `ROLLBACK` refused, whatever the `BEGIN` did: the connection may still be
+///   inside a transaction — the probe's, or one nothing could end — so the
+///   error is returned and the caller closes the connection rather than
+///   return it to the pool.
+pub(super) fn script_end(begun: bool, rollback: Result<u64, DbError>) -> Result<bool, DbError> {
+    rollback.map(|_| !begun)
+}
+
 /// [`execute_conn`] with bound parameters — the write path for a batch of
 /// imported rows, which must run inside the caller's transaction
 /// and must not interpolate its values into the SQL.
@@ -1160,6 +1191,18 @@ fn decode_value(row: &SqliteRow, idx: usize) -> Result<Value, DbError> {
 mod tests {
     use super::super::sql::quote_ident;
     use super::*;
+
+    /// The probe's two outcomes, and what [`end_script_conn`] makes of them.
+    /// Only a refused `BEGIN` says a transaction was open; a refused
+    /// `ROLLBACK` leaves the connection's state unknown, whatever came first.
+    #[test]
+    fn a_refused_begin_is_the_one_sign_of_an_open_transaction() {
+        let refused = || Err(DbError::Query("refused".into()));
+        assert_eq!(script_end(false, Ok(0)), Ok(true));
+        assert_eq!(script_end(true, Ok(0)), Ok(false));
+        assert!(script_end(true, refused()).is_err());
+        assert!(script_end(false, refused()).is_err());
+    }
 
     #[test]
     fn quote_ident_escapes_embedded_quotes() {

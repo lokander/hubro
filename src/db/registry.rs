@@ -266,6 +266,105 @@ impl ReadOnlyRun {
     }
 }
 
+/// One pooled connection held for a whole script that runs outside hubro's own
+/// transaction — the sequential path of
+/// [`run_script`](super::script::run_script): a script that manages its own
+/// transactions (`BEGIN` … `COMMIT`), holds a statement that cannot run inside
+/// one, or runs on a connection without transactions.
+///
+/// Every statement goes to this one connection. Taking a pooled connection
+/// per statement split a script's own transaction across sessions — measured
+/// on PostgreSQL 17 and CockroachDB, `BEGIN` and the statements after it
+/// reported different `pg_backend_pid()`s — so its `INSERT` committed on one
+/// session while its `ROLLBACK` ended an empty transaction on another, and the
+/// script's transaction went back to the pool still open.
+///
+/// [`Self::end`] rolls back whatever transaction the script left open, so no
+/// connection returns to the pool inside one. What that prevents was measured
+/// on all four engines: later, unrelated statements ran inside the abandoned
+/// transaction — on SQL Server an edit that reported success was lost when the
+/// connection closed, on CockroachDB a read from another connection waited on
+/// the abandoned transaction's locks indefinitely, on SQLite an edit failed
+/// with "cannot start a transaction within a transaction" on that connection
+/// and "database is locked" on the others, and on Postgres and
+/// CockroachDB a transaction an error had aborted failed every query that
+/// landed on that connection afterwards.
+///
+/// A hold dropped without [`Self::end`] — the run was cancelled mid-statement
+/// — closes its connection instead of returning it, which ends any
+/// transaction on it server-side.
+pub(super) struct ScriptConn {
+    held: HeldConn,
+    /// Set once [`Self::end`] has left the connection outside any transaction.
+    ended: bool,
+}
+
+enum HeldConn {
+    Sqlite(sqlx::pool::PoolConnection<sqlx::Sqlite>),
+    Postgres(sqlx::pool::PoolConnection<sqlx::Postgres>),
+    SqlServer(Box<sqlserver::MssqlScriptConn>),
+}
+
+impl Drop for ScriptConn {
+    fn drop(&mut self) {
+        if self.ended {
+            return;
+        }
+        match &mut self.held {
+            HeldConn::Sqlite(conn) => conn.close_on_drop(),
+            HeldConn::Postgres(conn) => conn.close_on_drop(),
+            HeldConn::SqlServer(conn) => conn.discard(),
+        }
+    }
+}
+
+impl ScriptConn {
+    /// Runs a row-returning statement, bounded like [`DbPool::query_capped`]
+    /// but with the per-cell cap chosen by the caller — the script path's
+    /// `cell_cap`, which gives a plan document a larger one than a row.
+    pub(super) async fn query_capped_to(
+        &mut self,
+        sql: &str,
+        max_rows: u64,
+        cell_cap: usize,
+    ) -> Result<(QueryResult, bool), DbError> {
+        match &mut self.held {
+            HeldConn::Sqlite(conn) => {
+                sqlite::query_capped_conn(conn, sql, max_rows, cell_cap).await
+            }
+            HeldConn::Postgres(conn) => {
+                postgres::query_capped_conn(conn, sql, max_rows, cell_cap).await
+            }
+            HeldConn::SqlServer(conn) => {
+                sqlserver::query_capped_script_conn(conn, sql, max_rows, cell_cap).await
+            }
+        }
+    }
+
+    /// Runs a non-row statement, returning affected rows.
+    pub(super) async fn execute(&mut self, sql: &str) -> Result<u64, DbError> {
+        match &mut self.held {
+            HeldConn::Sqlite(conn) => sqlite::execute_conn(conn, sql).await,
+            HeldConn::Postgres(conn) => postgres::execute_conn(conn, sql).await,
+            HeldConn::SqlServer(conn) => sqlserver::execute_script_conn(conn, sql).await,
+        }
+    }
+
+    /// Lets go of the connection: rolls back any transaction the script left
+    /// open, and says whether there was one. On an error the connection's
+    /// transaction state is unknown, so it is closed rather than returned to
+    /// the pool — which, server-side, ends whatever was open on it.
+    pub(super) async fn end(mut self) -> Result<bool, DbError> {
+        let ended = match &mut self.held {
+            HeldConn::Sqlite(conn) => sqlite::end_script_conn(conn).await,
+            HeldConn::Postgres(conn) => postgres::end_script_conn(conn).await,
+            HeldConn::SqlServer(conn) => sqlserver::end_script_conn(conn).await,
+        };
+        self.ended = ended.is_ok();
+        ended
+    }
+}
+
 /// A read-only statement's outcome, given how its rollback went: the
 /// statement's own error first — it is the one that says what happened, where
 /// a failed rollback after it usually only says the connection is gone (a
@@ -533,6 +632,28 @@ impl DbPool {
                 .await
                 .map(|tx| ScriptTx::SqlServer(Box::new(tx))),
         }
+    }
+
+    /// Takes one connection for a whole script that runs outside hubro's
+    /// transaction — see [`ScriptConn`].
+    pub(super) async fn acquire_script_conn(&self) -> Result<ScriptConn, DbError> {
+        let held = match self {
+            DbPool::Sqlite(pool) => HeldConn::Sqlite(
+                pool.acquire()
+                    .await
+                    .map_err(|e| DbError::Query(e.to_string()))?,
+            ),
+            DbPool::Postgres(pg) => HeldConn::Postgres(
+                pg.pool()
+                    .acquire()
+                    .await
+                    .map_err(|e| DbError::Query(e.to_string()))?,
+            ),
+            DbPool::SqlServer(pool) => {
+                HeldConn::SqlServer(Box::new(sqlserver::acquire_script_conn(pool).await?))
+            }
+        };
+        Ok(ScriptConn { held, ended: false })
     }
 
     /// Takes a connection for one read-only script — see [`ReadOnlyRun`].

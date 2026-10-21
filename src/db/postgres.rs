@@ -477,6 +477,40 @@ pub async fn execute_conn(
     sqlx_common::execute(conn, sql, |e| query_error(e, sql)).await
 }
 
+/// Ends a script's hold on its connection
+/// ([`ScriptConn`](super::registry::ScriptConn)): rolls back any transaction
+/// the script left open, and reports whether there was one.
+///
+/// Whether one is open is the server's word, not hubro's reading of the
+/// script: every `ReadyForQuery` message carries the session's transaction
+/// status, on every Postgres-wire engine, and sqlx keeps the latest. Its only
+/// public window onto it is the check `begin_with` makes after sending its
+/// statement — a custom statement that leaves the session outside a
+/// transaction fails with [`sqlx::Error::BeginFailed`]. So the probe is
+/// `SELECT 1` sent as a "begin": it succeeds exactly when the session was
+/// already inside a transaction, and the handle it returns then rolls that
+/// transaction back.
+///
+/// A probe that fails outright means the session is in a transaction an error
+/// has aborted (`SELECT 1` is refused until it ends) or the connection is
+/// broken; a `ROLLBACK` tells the two apart. An error is returned only when
+/// the rollback fails too, and then the connection's state is unknown and the
+/// caller must not return it to the pool.
+pub async fn end_script_conn(conn: &mut sqlx::postgres::PgConnection) -> Result<bool, DbError> {
+    match sqlx::Connection::begin_with(&mut *conn, "SELECT 1").await {
+        Ok(open) => {
+            return open
+                .rollback()
+                .await
+                .map(|()| true)
+                .map_err(|e| DbError::Query(e.to_string()))
+        }
+        Err(sqlx::Error::BeginFailed) => return Ok(false),
+        Err(_) => {}
+    }
+    execute_conn(conn, "ROLLBACK").await.map(|_| true)
+}
+
 /// Opens the read-only transaction one statement of a read-only script runs
 /// in — see [`read_only_begin`] for the statement, and
 /// [`ReadOnlyRun`](super::registry::ReadOnlyRun) for why it is one per

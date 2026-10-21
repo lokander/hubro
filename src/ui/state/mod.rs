@@ -56,9 +56,9 @@ use crate::db::{
     run_script, script_refusal, split_statements, statement_preview, url_target,
     url_via_local_port, url_with_password, write_result, Capabilities, CellFetch, Connection,
     ConnectionId, ConnectionRegistry, DbError, DbPool, Ddl, DdlObject, Encoding, ExportFormat,
-    Filter, ForeignKeyMeta, ImportOptions, ImportReport, MssqlAuth, Rollback, RowLocator, SchemaOp,
-    SourceFormat, StagedChange, StatementOutcome, StatementResult, TableAccess, TableMeta,
-    TableStats, Value, WriteProtection, NOTHING_TO_RUN,
+    Filter, ForeignKeyMeta, ImportOptions, ImportReport, MssqlAuth, OpenTransaction, Rollback,
+    RowLocator, SchemaOp, ScriptDone, SourceFormat, StagedChange, StatementOutcome,
+    StatementResult, TableAccess, TableMeta, TableStats, Value, WriteProtection, NOTHING_TO_RUN,
 };
 use crate::history::{HistoryStore, SaveOutcome};
 use crate::tunnel::{HostKeyInfo, Tunnel, TunnelAuth, TunnelConfig, TunnelError};
@@ -481,14 +481,18 @@ pub enum RunStatus {
     Running,
     Done {
         elapsed_ms: u64,
+        /// The script ended inside a transaction it had opened itself, and
+        /// the run rolled it back — see [`ScriptDone::rolled_back`].
+        rolled_back: Option<OpenTransaction>,
     },
     /// The statement at `statement_index` (0-based, into the script)
     /// failed. Outcomes of the statements before it stay visible in
     /// [`SqlRun::statements`]. `rollback` says what the failure undid — an
     /// atomic run (the whole script), a run that undid nothing (the sequential
     /// path, where earlier statements persisted, or a failure before the
-    /// transaction opened), or an atomic run on an engine whose rollback
-    /// doesn't reach schema changes.
+    /// transaction opened), an atomic run on an engine whose rollback
+    /// doesn't reach schema changes, or a sequential run that failed inside a
+    /// transaction the script had opened itself, which the run rolled back.
     Failed {
         error: String,
         statement_index: usize,
