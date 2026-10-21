@@ -330,8 +330,9 @@ pub struct KeyEquality {
     pub column: String,
     pub value: Value,
     /// The compared column's introspected metadata, which decides how the
-    /// value binds: its Postgres cast and the spellings `staged` adjusts for
-    /// the server (a CockroachDB `real`, a SQL Server `datetime`). `None`
+    /// value binds: its cast (every plain Postgres type, a SQL Server `real`)
+    /// and the spelling `staged` adjusts for the server (a SQL Server
+    /// `datetime`). `None`
     /// binds the value as it is.
     pub target: Option<ColumnMeta>,
 }
