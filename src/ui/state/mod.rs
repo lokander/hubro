@@ -48,7 +48,7 @@ use crate::config::{
     default_config_path, default_session_path, default_settings_path, load_session, load_settings,
     plan_session_restore, save_session, save_show_internal_objects, save_theme, BackendKind,
     ConnectionColor, GroupError, RestoreCandidate, SavedConnection, SavedList, ServerAuth, Session,
-    SessionPane, SessionTab, Theme,
+    SessionPane, SessionTab, Settings, Theme,
 };
 use crate::db::{
     apply_staged, build_fk_filter, explain_statement, mssql_url_target, mssql_url_via_local_port,
@@ -1047,6 +1047,21 @@ impl AppState {
         let settings = default_settings_path()
             .map(|path| load_settings(&path))
             .unwrap_or_default();
+        let state = Self::unstarted(saved, load_error, settings);
+        state.start_background_tasks();
+        state
+    }
+
+    /// The state built from already-loaded config, with nothing started:
+    /// no background task and no file touched. [`Self::new`] is this plus
+    /// the disk reads before it and the startup tasks after it; tests that
+    /// mount components in a `VirtualDom` use it directly, so they read
+    /// none of the user's config and open no history store.
+    pub(crate) fn unstarted(
+        saved: SavedList,
+        load_error: Option<String>,
+        settings: Settings,
+    ) -> Self {
         let theme = settings.theme;
         // Every signal is root-scoped, without exception.
         //
@@ -1073,7 +1088,7 @@ impl AppState {
         // more than a correct exception that has to be re-verified forever.)
         //
         // `every_app_state_signal_is_root_scoped` enforces this.
-        let state = Self {
+        Self {
             registry: Signal::new_in_scope(ConnectionRegistry::default(), ScopeId::ROOT),
             active: Signal::new_in_scope(ActiveView::Connections, ScopeId::ROOT),
             saved: Signal::new_in_scope(saved, ScopeId::ROOT),
@@ -1131,11 +1146,16 @@ impl AppState {
             pending_focus: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             nav_history: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             show_cheatsheet: Signal::new_in_scope(false, ScopeId::ROOT),
-        };
+        }
+    }
+
+    /// The tasks [`Self::new`] starts once the state exists: the OS theme
+    /// read and the history store's opening.
+    fn start_background_tasks(self) {
         // Resolve the OS dark-mode preference once at startup. Reacting to
         // live OS theme changes is out of scope (a startup read suffices);
         // an explicit Light/Dark choice overrides it regardless.
-        let mut state_for_theme = state;
+        let mut state_for_theme = self;
         spawn_forever(async move {
             if *state_for_theme.theme.peek() != Theme::System {
                 return;
@@ -1149,7 +1169,7 @@ impl AppState {
         // Open the history store in the background; a failure only disables
         // the history panel, never the app. spawn_forever: the opening must
         // not be tied to whichever component happened to create the state.
-        let mut state_for_open = state;
+        let mut state_for_open = self;
         spawn_forever(async move {
             match HistoryStore::open().await {
                 Ok(store) => {
@@ -1171,7 +1191,6 @@ impl AppState {
         // and `ScopeId::ROOT` is an ancestor of every scope, so no reader is
         // foreign to them. The placement is a structural preference now, not a
         // constraint.
-        state
     }
 
     /// This connection's *effective* capabilities resolved for one object —
@@ -1801,13 +1820,17 @@ mod tests {
         // scope, and building an `AppState` needs a Dioxus runtime. The
         // constructor is one contiguous struct literal, so slicing it suffices.
         let source = include_str!("mod.rs");
-        let start = source
-            .find("let state = Self {")
-            .expect("AppState's constructor must still be one struct literal");
+        let ctor_fn = source
+            .find("pub(crate) fn unstarted(")
+            .expect("AppState's signals must still all be built in `unstarted`");
+        let start = ctor_fn
+            + source[ctor_fn..]
+                .find("        Self {")
+                .expect("...as one struct literal");
         let end = start
             + source[start..]
-                .find("\n        };")
-                .expect("...and must still end where it always has");
+                .find("\n        }\n")
+                .expect("...that ends where it always has");
         let ctor = &source[start..end];
         let strays: Vec<&str> = ctor
             .lines()
