@@ -2974,6 +2974,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "toml_edit 0.20.2",
  "url",
  "webbrowser",
 ]

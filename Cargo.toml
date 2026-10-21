@@ -28,6 +28,10 @@ tokio-util = { version = "0.7", features = ["compat"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# The version `toml` 0.8 already builds, so this adds no crate. Settings are
+# written by editing the user's document in place rather than by serializing
+# the struct over it — see `config::settings::set_settings_key`.
+toml_edit = "0.20"
 dirs = "7"
 # dioxus-desktop depends on rfd 0.17 too, so cargo builds one copy with the
 # union of both feature sets. Default features off drops `wayland`, which rfd

@@ -1,15 +1,18 @@
 //! User preferences: `$XDG_CONFIG_HOME/hubro/settings.toml`.
 //!
-//! Error policy: **lenient**. These are non-critical UI preferences,
-//! persisted separately from the connections list so a corrupt settings file
-//! never blocks connecting to databases — a missing *or* malformed file
-//! yields defaults instead of an error.
+//! Error policy: **lenient to read, careful to write**. These are
+//! non-critical UI preferences, persisted separately from the connections
+//! list so a corrupt settings file never blocks connecting to databases — a
+//! missing *or* malformed file yields defaults instead of an error. Those
+//! defaults are never written back over the file, though: each `save_*`
+//! edits its one key in the user's document and leaves the rest alone (see
+//! [`set_settings_key`]).
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::{write_toml_atomic, ConfigError};
+use super::{load_lenient, write_text_atomic, ConfigError};
 
 /// Which theme the app uses. `System` follows the OS preference; `Light`
 /// and `Dark` are manual overrides. Serialized lowercase in settings.toml.
@@ -144,56 +147,123 @@ fn is_false(value: &bool) -> bool {
 
 /// Default location: `$XDG_CONFIG_HOME/hubro/settings.toml`.
 pub fn default_settings_path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("hubro").join("settings.toml"))
+    super::app_config_file("settings.toml")
 }
 
 /// Loads settings. A missing *or* malformed file yields defaults — these are
 /// non-critical UI preferences, so (unlike the connections list) a bad file
 /// never surfaces an error or blocks the app; the user just gets defaults.
 pub fn load_settings(path: &Path) -> Settings {
-    match std::fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text).unwrap_or_default(),
-        Err(_) => Settings::default(),
+    load_lenient(path)
+}
+
+/// Sets one top-level key of the settings file to `value`, or removes it
+/// when `value` is `None`, leaving the rest of the document as it was.
+///
+/// This is how every `save_*` below writes, and it is deliberately *not*
+/// "load the struct, change a field, save the struct". [`load_settings`] is
+/// lenient, so a file it could not interpret comes back as defaults, and
+/// writing those back is how one hand-edited typo (`theme = "drak"`) used to
+/// cost the user every other setting on the next window move. Editing the
+/// document instead keeps whatever this build cannot interpret — a bad value,
+/// a key from a newer build, a comment — exactly as the user left it.
+///
+/// A file that is not TOML at all cannot be edited, so it is not replaced
+/// either: the write is refused and the file left untouched, the trade
+/// `SavedList` makes for connections. The change still applies for the rest
+/// of the session; it is just not persisted until the file parses again.
+fn set_settings_key(
+    path: &Path,
+    key: &str,
+    item: Option<toml_edit::Item>,
+) -> Result<(), ConfigError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(ConfigError(format!("reading {}: {err}", path.display()))),
+    };
+    let mut document: toml_edit::Document = text.parse().map_err(|err| {
+        ConfigError(format!(
+            "{}: not rewriting a file that does not parse: {err}",
+            path.display()
+        ))
+    })?;
+    match item {
+        Some(mut item) => {
+            keep_layout(document.get(key), document.is_empty(), &mut item);
+            document[key] = item;
+        }
+        None => {
+            document.remove(key);
+        }
+    }
+    write_text_atomic(path, &document.to_string())
+}
+
+/// Gives a replacement `item` the place and surroundings of the one it
+/// replaces — a trailing comment on a value, the blank line above a
+/// section, a section's position among the others — so an edit changes the
+/// value and nothing else. A section added to a non-empty file gets a blank
+/// line above it.
+fn keep_layout(old: Option<&toml_edit::Item>, empty: bool, item: &mut toml_edit::Item) {
+    use toml_edit::Item;
+    match (old, item) {
+        (Some(Item::Value(old)), Item::Value(new)) => *new.decor_mut() = old.decor().clone(),
+        (Some(Item::Table(old)), Item::Table(new)) => {
+            *new.decor_mut() = old.decor().clone();
+            if let Some(position) = old.position() {
+                new.set_position(position);
+            }
+        }
+        (None, Item::Table(new)) if !empty => new.decor_mut().set_prefix("\n"),
+        _ => {}
     }
 }
 
-/// Persists settings, creating parent dirs and writing via a temp file +
-/// rename so a crash mid-write can't corrupt the file.
-pub fn save_settings(path: &Path, settings: &Settings) -> Result<(), ConfigError> {
-    write_toml_atomic(path, settings)
+/// `value` as the document item for `key`, rendered as a whole-file save
+/// would render it: a table becomes a `[key]` section rather than an inline
+/// table, with its fields in declaration order.
+fn settings_item<T: Serialize>(key: &str, value: &T) -> Result<toml_edit::Item, ConfigError> {
+    let single = std::collections::BTreeMap::from([(key, value)]);
+    let text = toml::to_string_pretty(&single).map_err(|err| ConfigError(err.to_string()))?;
+    let mut rendered: toml_edit::Document = text
+        .parse()
+        .map_err(|err: toml_edit::TomlError| ConfigError(err.to_string()))?;
+    rendered
+        .remove(key)
+        .ok_or_else(|| ConfigError(format!("rendering settings key {key}")))
 }
 
-/// Loads the current settings, applies `f`, and saves the result — the one
-/// read-modify-write path behind every single-field `save_*`. Re-reading the
-/// file first is what keeps a concurrent field from being lost: theme, window
-/// geometry and sidebar visibility are written from different code paths.
-pub fn update_settings(path: &Path, f: impl FnOnce(&mut Settings)) -> Result<(), ConfigError> {
-    let mut settings = load_settings(path);
-    f(&mut settings);
-    save_settings(path, &settings)
-}
-
-/// Persists just the theme, preserving the rest of the settings file (see
-/// [`update_settings`] for why the file is re-read first).
+/// Persists just the theme, leaving the rest of the file as it is.
 pub fn save_theme(path: &Path, theme: Theme) -> Result<(), ConfigError> {
-    update_settings(path, |settings| settings.theme = theme)
+    set_settings_key(path, "theme", Some(settings_item("theme", &theme)?))
 }
 
-/// Persists just the internal-object visibility, preserving the
-/// rest (see [`update_settings`] for why the file is re-read first).
+/// Persists just the internal-object visibility, leaving the rest of the
+/// file as it is. Off removes the key rather than writing `false`, as the
+/// field's `skip_serializing_if` does, so a file from before the flag gains
+/// nothing until it is turned on.
 pub fn save_show_internal_objects(path: &Path, show: bool) -> Result<(), ConfigError> {
-    update_settings(path, |settings| settings.show_internal_objects = show)
+    const KEY: &str = "show_internal_objects";
+    let item = show.then(|| settings_item(KEY, &true)).transpose()?;
+    set_settings_key(path, KEY, item)
 }
 
-/// Persists just the window geometry, preserving the theme (see
-/// [`update_settings`] for why the file is re-read first).
+/// Persists just the window geometry, leaving the rest of the file as it is.
 pub fn save_window_geometry(path: &Path, geometry: WindowGeometry) -> Result<(), ConfigError> {
-    update_settings(path, |settings| settings.window = Some(geometry))
+    set_settings_key(path, "window", Some(settings_item("window", &geometry)?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A whole-struct write, for round-trip tests. Not offered outside
+    /// them: overwriting the file with a struct is the write
+    /// [`set_settings_key`] exists to avoid.
+    fn save_settings(path: &Path, settings: &Settings) -> Result<(), ConfigError> {
+        super::super::write_toml_atomic(path, settings)
+    }
 
     #[test]
     fn theme_serde_round_trips_lowercase() {
@@ -328,6 +398,104 @@ mod tests {
         let loaded = load_settings(&path);
         assert_eq!(loaded.theme, Theme::Light);
         assert_eq!(loaded.window, Some(geo));
+    }
+
+    /// A hand-edited file this build cannot interpret: a comment, a key from
+    /// some other build, and a typo that sends [`load_settings`] to defaults —
+    /// alongside a setting the user does want kept.
+    const HAND_EDITED: &str = "# my settings\n\
+                               theme = \"drak\"\n\
+                               show_internal_objects = true\n\
+                               from_a_newer_build = [1, 2]\n";
+
+    #[test]
+    fn a_setting_write_keeps_what_the_load_could_not_interpret() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+        // The typo costs the whole load, which is the lenient policy…
+        assert_eq!(load_settings(&path), Settings::default());
+
+        // …but not the file: a window move adds its section, set off by a
+        // blank line, and changes nothing that was already there.
+        let geo = WindowGeometry {
+            width: 900.0,
+            height: 600.0,
+            x: None,
+            y: None,
+            maximized: false,
+        };
+        save_window_geometry(&path, geo).unwrap();
+        let after_move = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after_move,
+            format!("{HAND_EDITED}\n[window]\nwidth = 900.0\nheight = 600.0\n")
+        );
+
+        // A theme write replaces the typo, and only the typo.
+        save_theme(&path, Theme::Dark).unwrap();
+        let after_theme = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after_theme,
+            after_move.replace("theme = \"drak\"", "theme = \"dark\""),
+        );
+        // With the typo gone, the setting the user kept is back in effect.
+        let loaded = load_settings(&path);
+        assert_eq!(loaded.theme, Theme::Dark);
+        assert!(loaded.show_internal_objects);
+        assert_eq!(loaded.window, Some(geo));
+        assert!(after_theme.contains("from_a_newer_build = [1, 2]"));
+
+        // Turning the flag off removes its key — the file's other lines stay.
+        save_show_internal_objects(&path, false).unwrap();
+        let after_off = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after_off,
+            after_theme.replace("show_internal_objects = true\n", "")
+        );
+        assert!(!load_settings(&path).show_internal_objects);
+    }
+
+    #[test]
+    fn a_replaced_setting_keeps_its_comment_and_its_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            "theme = \"light\" # for the office\n\n\
+             [window]\nwidth = 1.0\nheight = 2.0\n\n\
+             [later]\na = 1\n",
+        )
+        .unwrap();
+        save_theme(&path, Theme::Dark).unwrap();
+        save_window_geometry(&path, WindowGeometry::default()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "theme = \"dark\" # for the office\n\n\
+             [window]\nwidth = 1200.0\nheight = 800.0\n\n\
+             [later]\na = 1\n",
+        );
+    }
+
+    #[test]
+    fn a_settings_file_that_is_not_toml_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let broken = "theme = \"dark\"\nshow_internal_objects = true\n[window\n";
+        std::fs::write(&path, broken).unwrap();
+        assert_eq!(load_settings(&path), Settings::default());
+
+        assert!(save_window_geometry(&path, WindowGeometry::default()).is_err());
+        assert!(save_theme(&path, Theme::Light).is_err());
+        assert!(save_show_internal_objects(&path, false).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), broken.as_bytes());
+
+        // Nor is one that cannot even be read as text: a read failure is not
+        // a missing file, and must not be written over as if it were.
+        let binary = [b't', b'h', 0xff, 0xfe, b'\n'];
+        std::fs::write(&path, binary).unwrap();
+        assert!(save_theme(&path, Theme::Light).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), binary);
     }
 
     #[test]
