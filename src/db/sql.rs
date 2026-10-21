@@ -99,14 +99,20 @@ pub(crate) fn text_compare_expr(dialect: Dialect, column: &str) -> String {
 /// strategy the equals filter and foreign-key navigation use, so exotic key
 /// types (uuid, enums, timestamps) still compare. An empty list matches
 /// every row (no clause). Used by the equalities page filter
-/// ([`Filter::Equalities`](super::page::Filter)), whose values are user text
-/// or a foreign-key jump's.
+/// ([`Filter::Equalities`](super::page::Filter)), which foreign-key jumps
+/// build.
 ///
 /// **Not for re-addressing a grid row.** A row's own key values are typed,
 /// and comparing them as text depends on hubro spelling every value exactly as
 /// the server does, which it does not for floats, blobs or SQL Server's
 /// date/time types. That path goes through `staged::row_where`, the predicate
 /// writes use.
+///
+/// **Known gap:** a foreign-key jump has the same problem. Its values are the
+/// source row's typed cells, not text the user typed, so a jump along a
+/// float, blob or (on SQL Server) date/time foreign key lands on an empty
+/// page for the same reason a cell fetch used to load NULL. It still goes
+/// through here until it gets a typed predicate of its own.
 pub(crate) fn equalities_where(
     pairs: &[(String, Value)],
     dialect: Dialect,
@@ -330,12 +336,12 @@ mod tests {
                 &table,
                 ColumnClass::Text,
                 "c",
-                " WHERE \"id\"::text = $1",
+                " WHERE \"id\" = $1::integer",
                 FETCH_CELL_MAX_BYTES,
             ),
             format!(
                 "SELECT left(\"c\"::text, {cap}), length(\"c\"::text) \
-                 FROM \"t\" WHERE \"id\"::text = $1 LIMIT 1"
+                 FROM \"t\" WHERE \"id\" = $1::integer LIMIT 1"
             )
         );
         assert_eq!(
@@ -378,13 +384,13 @@ mod tests {
                 &table,
                 ColumnClass::Text,
                 "c",
-                " WHERE CAST(\"id\" AS nvarchar(max)) = @P1",
+                " WHERE \"id\" = @P1",
                 FETCH_CELL_MAX_BYTES,
             ),
             format!(
                 "SELECT TOP 1 SUBSTRING(CAST(\"c\" AS nvarchar(max)), 1, {cap}), \
                  DATALENGTH(CAST(\"c\" AS nvarchar(max))) / 2 \
-                 FROM \"dbo\".\"t\" WHERE CAST(\"id\" AS nvarchar(max)) = @P1"
+                 FROM \"dbo\".\"t\" WHERE \"id\" = @P1"
             )
         );
         // Binary: raw SUBSTRING + DATALENGTH (bytes).
