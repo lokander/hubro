@@ -1,29 +1,27 @@
 name: CI
 
-# Changes that can't affect a build never start one: docs, the license, and
-# image/source-art assets. (assets/tailwind.css and assets/codemirror.js are
-# committed build inputs, so they are deliberately *not* ignored; the icon
-# PNGs only feed `dx bundle`, which CI doesn't run.)
+# Changes that can't affect a build or a test never start one — and that is a
+# short list, because the tests read far more than code. tests/no_issue_ids.rs
+# scans every tracked text file, tests/support_matrix.rs reads README.md, and
+# tests/file_associations.rs walks packaging/, README included. So no text file
+# is ignored, docs and CLAUDE.md included: a docs-only commit straight to main
+# is exactly the change those tests exist to check, and `**/*.md` used to let
+# it land with no run at all. What is left is binary art only `dx bundle`
+# reads, which CI doesn't run. Not every .ico: assets/favicon.ico goes through
+# `asset!()`, so it is a compile input. tests/ci_triggers.rs checks each
+# pattern below against what git tracks and what the code names.
 on:
   push:
     branches: [main]
     paths-ignore:
-      - "**/*.md"
-      - "docs/**"
-      - "LICENSE"
-      - ".gitignore"
-      - "assets/**/*.png"
-      - "assets/**/*.ico"
-      - "assets/**/*.xcf"
+      - "**/*.png"
+      - "**/*.xcf"
+      - "assets/icons/*.ico"
   pull_request:
     paths-ignore:
-      - "**/*.md"
-      - "docs/**"
-      - "LICENSE"
-      - ".gitignore"
-      - "assets/**/*.png"
-      - "assets/**/*.ico"
-      - "assets/**/*.xcf"
+      - "**/*.png"
+      - "**/*.xcf"
+      - "assets/icons/*.ico"
   # Escape hatch for a PR that touches platform-specific code: run the full
   # matrix on its branch with `gh workflow run ci.yml --ref <branch>`.
   workflow_dispatch:
