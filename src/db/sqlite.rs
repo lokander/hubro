@@ -1518,6 +1518,7 @@ mod tests {
     /// - A `use` of either — `pub` or not, anywhere in the file — that
     ///   imports anything off them, renames anything (`use sqlx as driver`),
     ///   or globs (`use sqlx::prelude::*`).
+    /// - A macro metavariable straight after either (`sqlx::$m`).
     /// - `extern crate sqlx as …`, and the `Executor` trait by any route:
     ///   it is what lets a pool or connection run a bare `&str`.
     fn reaches_driver(code: &str) -> Vec<(usize, String)> {
@@ -1545,7 +1546,11 @@ mod tests {
                 }
                 let named = checked.iter().all(|segment| allowed.contains(segment))
                     || (root == "sqlx" && checked == ["query", "Query"]);
-                if !path.is_empty() && (macro_call || !named) {
+                // A macro metavariable (`sqlx::$m($s)`) names whatever its
+                // caller passes, so no allowlist can vouch for it.
+                if rest.starts_with('$') {
+                    found.push((at, format!("{root}::$ in a macro")));
+                } else if !path.is_empty() && (macro_call || !named) {
                     found.push((at, format!("{root}::{path}")));
                 }
             }
@@ -1643,6 +1648,8 @@ mod tests {
             "extern crate sqlx as driver;",
             "fn f<E: Executor<'static>>() {}",
             "sqlx::Executor::execute(pool, sql)",
+            "macro_rules! via { ($m:ident, $s:expr) => { sqlx::$m($s) } }",
+            "macro_rules! via { ($f:ident, $s:expr) => { sqlx_common::$f(c, $s, e) } }",
         ] {
             assert!(!reaches_driver(code).is_empty(), "missed: {code}");
         }
