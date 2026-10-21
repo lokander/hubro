@@ -398,12 +398,9 @@ async fn postgres_bad_password_is_an_authentication_error() {
     }
 }
 
-/// Opens `url`, which must fail, and returns how.
-async fn connect_failure(url: &str) -> DbError {
-    DbPool::open_postgres(url)
-        .await
-        .err()
-        .unwrap_or_else(|| panic!("{url} connected"))
+/// How opening `url` failed — `None` if it connected.
+async fn connect_failure(url: &str) -> Option<DbError> {
+    DbPool::open_postgres(url).await.err()
 }
 
 #[tokio::test]
@@ -437,6 +434,7 @@ async fn postgres_only_a_refused_password_is_a_credential_rejection() {
     let mut forbidden = url::Url::parse(&url).unwrap();
     forbidden.set_username(&role).unwrap();
     forbidden.set_password(Some(PASSWORD)).unwrap();
+    let mut kept = Vec::new();
     for (what, target) in [
         ("a database that does not exist", missing.clone()),
         (
@@ -444,18 +442,15 @@ async fn postgres_only_a_refused_password_is_a_credential_rejection() {
             forbidden.to_string(),
         ),
     ] {
-        let err = connect_failure(&target).await;
-        assert!(
-            matches!(err, DbError::Connect(_)) && !err.credentials_rejected(),
-            "{what} must keep the password, got {err:?}"
-        );
+        kept.push((what, connect_failure(&target).await));
     }
-
     // Authentication is checked before the database: a wrong password naming
     // a missing database is still the password's fault, and must still prompt.
-    let err = connect_failure(&url_with_password(&missing, "definitely-wrong").unwrap()).await;
-    assert!(err.credentials_rejected(), "got {err:?}");
+    let wrong_and_missing =
+        connect_failure(&url_with_password(&missing, "definitely-wrong").unwrap()).await;
 
+    // Undone before any assertion can panic: a role outlives the test binary,
+    // and nothing else sweeps them.
     admin
         .query(&format!(
             "GRANT CONNECT ON DATABASE \"{database}\" TO PUBLIC"
@@ -464,6 +459,16 @@ async fn postgres_only_a_refused_password_is_a_credential_rejection() {
         .unwrap();
     admin.query(&format!("DROP ROLE {role}")).await.unwrap();
     admin.close().await;
+
+    for (what, err) in kept {
+        let err = err.unwrap_or_else(|| panic!("{what} connected"));
+        assert!(
+            matches!(err, DbError::Connect(_)) && !err.credentials_rejected(),
+            "{what} must keep the password, got {err:?}"
+        );
+    }
+    let err = wrong_and_missing.expect("a wrong password connected");
+    assert!(err.credentials_rejected(), "got {err:?}");
 }
 
 #[tokio::test]

@@ -224,9 +224,10 @@ fn connect_error(err: &sqlx::Error) -> DbError {
 /// The classification itself, over plain data so a test can execute it.
 ///
 /// Decided on the SQLSTATE and nothing else, because the connect flow deletes
-/// the stored password on [`DbError::CredentialsRejected`]: server messages
-/// follow `lc_messages`, so a text match is a guess about the server's
-/// language as well as about what failed. An unknown database (`3D000`) or a
+/// the stored password on [`DbError::CredentialsRejected`]: a SQLSTATE is the
+/// part of the error PostgreSQL defines as stable, where the message is
+/// translatable (`lc_messages`) and free to change wording between releases.
+/// An unknown database (`3D000`) or a
 /// missing `CONNECT` privilege (`42501`) is a [`DbError::Connect`] — the
 /// password worked, and asking for another cannot help.
 fn connect_error_from(sqlstate: Option<&str>, message: String) -> DbError {

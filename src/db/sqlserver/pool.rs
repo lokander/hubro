@@ -430,9 +430,8 @@ fn connect_error(err: &TdsError) -> DbError {
 ///
 /// Decided on the server's error code and nothing else: the connect flow
 /// deletes the stored password on [`DbError::CredentialsRejected`], and text
-/// is both localized (a login's default language sets it) and shared between
-/// codes — 4060's own message ends in "The login failed.", which is how a
-/// missing database used to delete a working password. Only 18456 qualifies.
+/// is shared between codes — 4060's own message ends in "The login failed.",
+/// which is how a missing database used to delete a working password. Only 18456 qualifies.
 /// Other codes in that family — a disabled account (18470, measured) — refuse
 /// a password that is still correct, so they keep it and report.
 fn connect_error_from(code: Option<u32>, message: String) -> DbError {

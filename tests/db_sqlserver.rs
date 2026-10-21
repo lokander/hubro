@@ -133,12 +133,9 @@ fn as_login(url: &str, user: &str, password: &str) -> String {
     parsed.to_string()
 }
 
-/// Opens `url`, which must fail, and returns how.
-async fn connect_failure(url: &str) -> DbError {
-    DbPool::open_mssql(url)
-        .await
-        .err()
-        .unwrap_or_else(|| panic!("{url} connected"))
+/// How opening `url` failed — `None` if it connected.
+async fn connect_failure(url: &str) -> Option<DbError> {
+    DbPool::open_mssql(url).await.err()
 }
 
 #[tokio::test]
@@ -178,6 +175,7 @@ async fn sqlserver_only_a_refused_password_is_a_credential_rejection() {
     // The last flag: whether the words may say "authentication failed". A
     // disabled account's refusal is one, truthfully, and carries its reason;
     // a database that cannot be opened is not, whatever 4060's text says.
+    let mut kept = Vec::new();
     for (what, target, words_may_blame_the_login) in [
         ("a database that does not exist", missing.clone(), false),
         ("a database this login may not open", forbidden, false),
@@ -187,7 +185,26 @@ async fn sqlserver_only_a_refused_password_is_a_credential_rejection() {
             true,
         ),
     ] {
-        let err = connect_failure(&target).await;
+        kept.push((
+            what,
+            connect_failure(&target).await,
+            words_may_blame_the_login,
+        ));
+    }
+    // Authentication is checked before the database: a wrong password naming
+    // a missing database is still the password's fault, and must still prompt.
+    let wrong_and_missing =
+        connect_failure(&mssql_url_with_password(&missing, "definitely-wrong").unwrap()).await;
+
+    // Dropped before any assertion can panic: a login outlives the test
+    // binary, and nothing else sweeps them.
+    for login in [&outsider, &disabled] {
+        admin.query(&format!("DROP LOGIN [{login}]")).await.unwrap();
+    }
+    admin.close().await;
+
+    for (what, err, words_may_blame_the_login) in kept {
+        let err = err.unwrap_or_else(|| panic!("{what} connected"));
         assert!(
             matches!(err, DbError::Connect(_)) && !err.credentials_rejected(),
             "{what} must keep the password, got {err:?}"
@@ -197,17 +214,8 @@ async fn sqlserver_only_a_refused_password_is_a_credential_rejection() {
             "{what} is described as a password problem: {err}"
         );
     }
-
-    // Authentication is checked before the database: a wrong password naming
-    // a missing database is still the password's fault, and must still prompt.
-    let err =
-        connect_failure(&mssql_url_with_password(&missing, "definitely-wrong").unwrap()).await;
+    let err = wrong_and_missing.expect("a wrong password connected");
     assert!(err.credentials_rejected(), "got {err:?}");
-
-    for login in [&outsider, &disabled] {
-        admin.query(&format!("DROP LOGIN [{login}]")).await.unwrap();
-    }
-    admin.close().await;
 }
 
 #[tokio::test]
