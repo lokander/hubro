@@ -372,3 +372,56 @@ async fn a_silent_connection_cannot_hold_the_sign_in_past_its_deadline() {
     assert!(matches!(acquired.token, Err(AzureError::Timeout)));
     assert!(started.elapsed() < Duration::from_secs(5));
 }
+
+/// An opener that records the loopback port and sends nothing.
+fn port_recorder(
+    port: std::sync::Arc<std::sync::Mutex<Option<u16>>>,
+) -> impl FnOnce(&str) -> Result<(), AzureError> {
+    move |auth_url: &str| {
+        let parsed = url::Url::parse(auth_url).unwrap();
+        let pairs: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+        *port.lock().unwrap() = url::Url::parse(&pairs["redirect_uri"]).unwrap().port();
+        Ok(())
+    }
+}
+
+/// Whether anything still listens on the loopback `port`, once the runtime
+/// has had a moment to drop what was aborted.
+async fn still_listening(port: u16) -> bool {
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    TcpStream::connect(("127.0.0.1", port)).await.is_ok()
+}
+
+#[tokio::test]
+async fn the_loopback_listener_closes_with_the_sign_in() {
+    // Cancelling a connect drops the sign-in mid-wait. The listener must go
+    // with it: left bound, it accepts from any local process for the rest of
+    // the run, and every cancelled attempt leaks another.
+    let endpoints = Endpoints {
+        login: "http://127.0.0.1:1".to_string(),
+        imds: "http://127.0.0.1:1".to_string(),
+    };
+    for (case, wait) in [
+        ("cancelled mid-wait", Duration::from_secs(30)),
+        ("timed out", Duration::from_millis(300)),
+    ] {
+        let port = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            acquire_token(
+                &EntraAuth::interactive_default(),
+                OSSRDBMS_RESOURCE,
+                None,
+                &endpoints,
+                wait,
+                port_recorder(port.clone()),
+            ),
+        )
+        .await;
+        let port = port.lock().unwrap().expect("the browser was opened");
+        assert!(
+            !still_listening(port).await,
+            "{case}: the sign-in's loopback listener outlived it"
+        );
+    }
+}
