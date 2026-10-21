@@ -2595,3 +2595,16 @@ async fn sqlserver_capped_row_returning_write_keeps_its_write() {
     .await;
     pool.close().await;
 }
+
+/// A `real` once read as the `f32` widened to `f64` — `0.1` showed as
+/// `0.10000000149011612` in the grid, the export and the clipboard. It reads
+/// as its shortest decimal now, and that decimal must still store the same
+/// value when written back.
+#[tokio::test]
+async fn sqlserver_a_real_reads_as_its_shortest_decimal_and_writes_back_unchanged() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    let failures = common::real_round_trip_failures(&pool, "real_trip").await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    pool.close().await;
+}

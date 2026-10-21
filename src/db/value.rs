@@ -90,6 +90,23 @@ pub(crate) fn row_flag(row: &[Value], idx: usize) -> bool {
     row_int(row, idx) != 0
 }
 
+/// The [`Value::Real`] a 4-byte float (`real`, `float4`, `float(24)`) cell
+/// reads as: the `f64` nearest the shortest decimal that is that `f32`, so
+/// `0.1f32` shows as `0.1` — what the server prints — rather than as the
+/// `0.10000000149011612` that widening it with `as f64` printed in the grid,
+/// the export and the clipboard.
+///
+/// The value bound back is that decimal too, which is why each backend that
+/// produces one compares it *as* a `real`: a `real` key column carries a cast
+/// to `real` on PostgreSQL and SQL Server alike (`staged::cast_targets`), and
+/// CockroachDB, whose `real` is a 64-bit float, holds the decimal the row was
+/// written with — `0.1`, not the widened `f32`. Rust's `f32` `Display` is the
+/// shortest spelling that reads back as the same `f32`, and its NaN and
+/// infinities parse back as themselves.
+pub(crate) fn real_from_f32(narrow: f32) -> f64 {
+    narrow.to_string().parse().unwrap_or(f64::from(narrow))
+}
+
 /// Trims trailing zeros from a chrono-formatted fractional second: `%.f`
 /// pads to 3/6/9 digits ("09.500"), both Postgres and the SQL Server display
 /// print minimal ("09.5"). The input must end with the seconds field; the
@@ -198,6 +215,29 @@ mod tests {
         assert_eq!(row_opt_int(&row, 2), Some(0));
         assert!(!row_flag(&row, 2));
         assert!(row_flag(&row, 3));
+    }
+
+    #[test]
+    fn a_four_byte_float_reads_as_its_shortest_decimal() {
+        assert_eq!(real_from_f32(0.1), 0.1);
+        assert_eq!(Value::Real(real_from_f32(0.1)).display(), "0.1");
+        assert_eq!(real_from_f32(1e20), 1e20);
+        assert_eq!(real_from_f32(3.402_823_5e38), 3.402_823_5e38);
+        assert_eq!(real_from_f32(-2.5), -2.5);
+        // The decimal still reads back as the very same f32.
+        for narrow in [
+            0.1f32,
+            1e20,
+            f32::MAX,
+            f32::MIN_POSITIVE,
+            1e-45,
+            16_777_217.0,
+        ] {
+            assert_eq!(real_from_f32(narrow) as f32, narrow, "{narrow}");
+        }
+        assert!(real_from_f32(f32::NAN).is_nan());
+        assert_eq!(real_from_f32(f32::INFINITY), f64::INFINITY);
+        assert_eq!(real_from_f32(f32::NEG_INFINITY), f64::NEG_INFINITY);
     }
 
     #[test]

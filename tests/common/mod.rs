@@ -1111,6 +1111,98 @@ pub async fn fk_jump_failures(
 }
 
 // ---------------------------------------------------------------------------
+// A `real` reads as its shortest decimal and writes back as the same value
+// ---------------------------------------------------------------------------
+
+/// `real` literals for [`real_round_trip_failures`], each with the text the
+/// grid must show for it: the shortest decimal that is its `f32`, never the
+/// widened `0.10000000149011612`.
+pub const REAL_VALUES: &[(&str, &str)] = &[
+    ("0.1", "0.1"),
+    ("1e20", "100000000000000000000"),
+    ("3.4028235e38", "340282350000000000000000000000000000000"),
+    ("-2.5", "-2.5"),
+];
+
+/// Every way a `real` cell fails to read as its shortest decimal, or fails
+/// to store the same value when written back — one line each, empty when
+/// none does.
+///
+/// Builds `{prefix}_src (k int PRIMARY KEY, r real)` holding [`REAL_VALUES`]
+/// and an empty `{prefix}_dst` of the same shape, in the connection's default
+/// schema. Each row is read the way the grid reads it, checked against its
+/// expected text, then inserted into `{prefix}_dst` through the staged writer
+/// with the value exactly as read; the server then compares the two tables
+/// column for column. Plain `int`/`real` DDL, so it runs unchanged on
+/// PostgreSQL, CockroachDB and SQL Server.
+pub async fn real_round_trip_failures(pool: &DbPool, prefix: &str) -> Vec<String> {
+    use hubro::db::{apply_staged, detect_row_identity, StagedChange, Value};
+    let (src, dst) = (format!("{prefix}_src"), format!("{prefix}_dst"));
+    for table in [&src, &dst] {
+        pool.query(&format!("DROP TABLE IF EXISTS {table}"))
+            .await
+            .unwrap();
+        pool.query(&format!("CREATE TABLE {table} (k int PRIMARY KEY, r real)"))
+            .await
+            .unwrap();
+    }
+    let rows: Vec<String> = REAL_VALUES
+        .iter()
+        .enumerate()
+        .map(|(k, (literal, _))| format!("({k}, {literal})"))
+        .collect();
+    pool.query(&format!("INSERT INTO {src} VALUES {}", rows.join(", ")))
+        .await
+        .unwrap();
+
+    let read = pool
+        .query(&format!("SELECT k, r FROM {src} ORDER BY k"))
+        .await
+        .unwrap();
+    let mut failures = Vec::new();
+    let tables = pool.introspect().await.unwrap();
+    let target = tables
+        .iter()
+        .find(|t| t.name == dst)
+        .unwrap_or_else(|| panic!("{dst} missing from introspection"));
+    let identity = detect_row_identity(target, pool.dialect()).expect("a keyed table");
+    let access = pool.backend_access(target);
+    for (row, (literal, shown)) in read.rows.iter().zip(REAL_VALUES) {
+        if row[1].display() != *shown {
+            failures.push(format!(
+                "real {literal} shows as {} instead of {shown}",
+                row[1].display()
+            ));
+        }
+        let insert = StagedChange::Insert {
+            columns: vec!["k".into(), "r".into()],
+            values: vec![row[0].clone(), row[1].clone()],
+        };
+        if let Err(e) = apply_staged(pool, &access, target, &identity, &[insert]).await {
+            failures.push(format!("real {literal} could not be written back: {e}"));
+        }
+    }
+    let same = pool
+        .query(&format!(
+            "SELECT s.k FROM {src} s JOIN {dst} d ON d.k = s.k AND d.r = s.r ORDER BY s.k"
+        ))
+        .await
+        .unwrap();
+    for (k, (literal, _)) in REAL_VALUES.iter().enumerate() {
+        if !same
+            .rows
+            .iter()
+            .any(|row| row[0] == Value::Integer(k as i64))
+        {
+            failures.push(format!(
+                "real {literal} stored a different value when written back"
+            ));
+        }
+    }
+    failures
+}
+
+// ---------------------------------------------------------------------------
 // The contains filter is a substring search, whatever the needle holds
 // ---------------------------------------------------------------------------
 

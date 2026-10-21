@@ -32,7 +32,7 @@ use super::sql::Dialect;
 use super::sqlx_common::{self, get};
 use super::staged::CheckedStatement;
 use super::stats::{size_bytes, RowCount, TableStats};
-use super::value::{row_opt_text, row_text, QueryResult, Value};
+use super::value::{real_from_f32, row_opt_text, row_text, QueryResult, Value};
 
 /// Splices a password into a Postgres URL — see [`super::url::with_password`].
 pub fn url_with_password(url: &str, password: &str) -> Result<String, DbError> {
@@ -2115,7 +2115,7 @@ fn decode_typed(row: &PgRow, idx: usize, raw: &PgValueRef) -> Option<Value> {
         "INT2" => Some(Value::Integer(row.try_get::<i16, _>(idx).ok()? as i64)),
         "INT4" => Some(Value::Integer(row.try_get::<i32, _>(idx).ok()? as i64)),
         "INT8" => Some(Value::Integer(row.try_get::<i64, _>(idx).ok()?)),
-        "FLOAT4" => Some(Value::Real(row.try_get::<f32, _>(idx).ok()? as f64)),
+        "FLOAT4" => Some(Value::Real(real_from_f32(row.try_get::<f32, _>(idx).ok()?))),
         "FLOAT8" => Some(Value::Real(row.try_get::<f64, _>(idx).ok()?)),
         // `CHAR` is sqlx's name for `bpchar`, the type behind `char(n)` —
         // there is no `BPCHAR` to match. The single-byte catalog type
