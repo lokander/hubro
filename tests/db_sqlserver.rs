@@ -951,6 +951,108 @@ async fn sqlserver_a_trigger_row_cannot_vouch_for_an_edit_that_matched_nothing()
 }
 
 #[tokio::test]
+async fn sqlserver_a_script_cannot_turn_row_counts_off_for_later_writes() {
+    // Guarded writes read the statement's own count, which a session under
+    // NOCOUNT ON never sends. A script runs on the same pooled connections,
+    // so whatever it sets must not outlive it. Most statements go through
+    // `sp_executesql`, where a SET lapses when the call returns; one that must
+    // lead its batch goes as a plain batch, where a SET would stick — there a
+    // trailing SET is either a syntax error or part of the module's body.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.nocount_target",
+            "DROP PROCEDURE IF EXISTS dbo.nocount_proc",
+            "DROP FUNCTION IF EXISTS dbo.nocount_function",
+            "DROP VIEW IF EXISTS dbo.nocount_view",
+            "DROP DEFAULT IF EXISTS dbo.nocount_default",
+            "DROP RULE IF EXISTS dbo.nocount_rule",
+            "DROP SCHEMA IF EXISTS nocount_schema",
+            "CREATE TABLE dbo.nocount_target (id int NOT NULL PRIMARY KEY, n int NOT NULL)",
+            "INSERT INTO dbo.nocount_target VALUES (1, 0)",
+        ],
+    )
+    .await;
+
+    // Each script, and whether the server takes it: the SET becomes a
+    // module's body (`true`) or is refused as a syntax error, 156 (`false`).
+    let scripts = [
+        ("SET NOCOUNT ON", true),
+        (
+            "CREATE PROCEDURE dbo.nocount_proc AS SELECT 1\nSET NOCOUNT ON",
+            true,
+        ),
+        (
+            "CREATE TRIGGER dbo.nocount_trigger ON dbo.nocount_target AFTER INSERT AS SELECT 1\n\
+             SET NOCOUNT ON",
+            true,
+        ),
+        (
+            "CREATE FUNCTION dbo.nocount_function() RETURNS int AS BEGIN RETURN 1 END\n\
+             SET NOCOUNT ON",
+            false,
+        ),
+        (
+            "CREATE VIEW dbo.nocount_view AS SELECT 1 AS a\nSET NOCOUNT ON",
+            false,
+        ),
+        ("CREATE SCHEMA nocount_schema\nSET NOCOUNT ON", false),
+        (
+            "CREATE DEFAULT dbo.nocount_default AS 0\nSET NOCOUNT ON",
+            false,
+        ),
+        (
+            "CREATE RULE dbo.nocount_rule AS @x > 0\nSET NOCOUNT ON",
+            false,
+        ),
+    ];
+    for (script, accepted) in scripts {
+        let statements = split_statements(script, pool.dialect());
+        let outcome = run_script(&pool, pool.backend_capabilities(), &statements, |_| {}).await;
+        match outcome {
+            Ok(()) => assert!(accepted, "{script:?} was accepted"),
+            Err(e) => assert!(
+                !accepted && e.error.to_string().contains("code: 156"),
+                "{script:?}: {e:?}"
+            ),
+        }
+        // The pool hands out the connection returned last, so these run on
+        // the one the script just used.
+        let options = pool.query("SELECT @@OPTIONS & 512").await.unwrap();
+        assert_eq!(
+            options.rows,
+            vec![vec![Value::Integer(0)]],
+            "after {script:?}"
+        );
+        let written = pool
+            .execute_checked(
+                "UPDATE dbo.nocount_target SET n = n + 1 WHERE id = 1",
+                &[],
+                1,
+            )
+            .await;
+        assert_eq!(written.ok(), Some(1), "after {script:?}");
+    }
+
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE dbo.nocount_target",
+            "DROP PROCEDURE IF EXISTS dbo.nocount_proc",
+            "DROP FUNCTION IF EXISTS dbo.nocount_function",
+            "DROP VIEW IF EXISTS dbo.nocount_view",
+            "DROP DEFAULT IF EXISTS dbo.nocount_default",
+            "DROP RULE IF EXISTS dbo.nocount_rule",
+            "DROP SCHEMA IF EXISTS nocount_schema",
+        ],
+    )
+    .await;
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn sqlserver_an_instead_of_trigger_that_makes_the_edit_can_be_saved() {
     // An INSTEAD OF trigger replaces the statement: the server reports the
     // trigger's own DML first, then the rows the trigger fired for as the

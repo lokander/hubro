@@ -59,8 +59,17 @@ const MAX_CONNECTIONS: usize = 4;
 /// ([`statement_rows`]). A server whose `user options` turn NOCOUNT on for
 /// new sessions sends no counts at all — measured, with 512 configured, a
 /// one-row update reported none, so every edit read as zero rows and was
-/// refused. Statements cannot undo this pin for later ones: a script's `SET`
-/// runs inside `sp_executesql` and lapses with it, as does a trigger's.
+/// refused.
+///
+/// No statement can undo this pin for the ones after it. A trigger's `SET`
+/// lapses when the trigger returns, and so does a script's: scripts run
+/// through `sp_executesql`, and a `SET` inside it ends with the call. The one
+/// exception is a statement that must lead its batch ([`tsql_leads_own_batch`]:
+/// `CREATE`/`ALTER` of a procedure, function, trigger or view, `CREATE
+/// SCHEMA`/`DEFAULT`/`RULE`), which runs as a plain batch, where a `SET` would
+/// stick. It is safe because a `SET` trailing one of those never runs as the
+/// session's own: measured, a procedure or trigger takes it into its body, and
+/// the rest refuse it as a syntax error (156).
 const SESSION_SETUP: &str = "SET QUOTED_IDENTIFIER ON; \
      SET NOCOUNT OFF; \
      SET ANSI_NULLS ON; \
@@ -670,6 +679,12 @@ async fn run_execute(
 /// the trigger fired for — what the WHERE clause matched, not what the
 /// trigger went on to write.
 ///
+/// Not every count is a count. A statement that completes without counting
+/// rows — inside a trigger, a `SET` for one — still sends a `DONEINPROC`, and
+/// tiberius reports it as 0, so zeros are mixed in among the triggers'
+/// counts. They come from inside the triggers, so they always arrive before
+/// the statement's own count, which is still the last.
+///
 /// Only sound while the session reports counts at all: under `NOCOUNT ON`
 /// the statement sends none, and the last count would be a trigger's that
 /// turned `NOCOUNT` off for itself. [`SESSION_SETUP`] pins it off. No count
@@ -1051,8 +1066,9 @@ impl<W: Write> RowSink for ExportRows<'_, W> {
 }
 
 /// Smuggles a writer I/O failure through the driver error type so the export
-/// sink and the result loop it runs in share a single error channel; unwrapped by [`query_error`] into
-/// the same message [`export_io_err`] would produce.
+/// sink and the result loop it runs in share a single error channel;
+/// unwrapped by [`query_error`] into the same message [`export_io_err`] would
+/// produce.
 fn io_to_tds(err: std::io::Error) -> TdsError {
     let db_err = export_io_err(err);
     TdsError::Io {
@@ -1367,6 +1383,13 @@ mod tests {
                 1,
             ),
             ("a nested trigger", &[1, 1, 1, 1], 1),
+            // Count-less tokens inside triggers arrive as zeros, ahead of the
+            // statement's own count.
+            (
+                "triggers mixing counts and count-less tokens",
+                &[7, 1, 0, 0, 0, 2, 0, 1],
+                1,
+            ),
             ("an instead-of trigger writing other rows", &[5, 1], 1),
             // The summed count read this as the one row the edit expected.
             (
