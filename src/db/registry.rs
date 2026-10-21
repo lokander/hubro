@@ -157,6 +157,138 @@ impl ScriptTx<'_> {
     }
 }
 
+/// One script's hold on a connection the *server* will not let write: what
+/// [`run_script`](super::script::run_script) runs a script through when the
+/// connection's effective capabilities forbid writing
+/// ([`engine_enforces_read_only`]).
+///
+/// The capability gate ([`script_refusal`](super::script::script_refusal))
+/// refuses a write by reading the statement, and so can be wrong about it:
+/// a write it cannot see (`SELECT setval(…)`), or one hidden by a place where
+/// hubro's lexer and the engine's disagree about where a string or comment
+/// ends. This is the backstop that does not depend on reading anything — the
+/// engine refuses the write itself.
+///
+/// - **SQLite**: a separate connection opened read-only
+///   ([`sqlite::open_read_only`]).
+/// - **Postgres-wire**: one pooled connection, with **each statement in a
+///   read-only transaction of its own**, opened by hubro and always rolled
+///   back. Per statement rather than per script, because the backstop must not
+///   depend on anything a statement can change. A session default
+///   (`default_transaction_read_only`) was measured to be undone by
+///   `SELECT set_config('default_transaction_read_only', 'off', false)`, and
+///   to be overridden by `BEGIN READ WRITE` — both of which the gate passes as
+///   reads and transaction control — and a script-long transaction ends at the
+///   script's own `COMMIT`. A statement inside hubro's transaction can end it
+///   or change its mode (`SET TRANSACTION READ WRITE` before any query is
+///   allowed), but only as the whole of that statement: the extended protocol
+///   sqlx uses takes exactly one command per statement, so nothing of the
+///   script's runs before hubro's rollback closes the transaction and the
+///   next statement gets a new one.
+///
+/// SQL Server has no read-only session or transaction mode at all, so
+/// [`DbPool::begin_read_only_run`] has nothing to return there and a marked
+/// SQL Server connection is still protected by the gate alone.
+pub(super) enum ReadOnlyRun {
+    Sqlite(sqlx::SqliteConnection),
+    Postgres {
+        conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
+        /// [`postgres::read_only_begin`] for this server.
+        begin: &'static str,
+    },
+}
+
+impl ReadOnlyRun {
+    /// Runs a row-returning statement, bounded like [`DbPool::query_capped`].
+    pub(super) async fn query_capped(
+        &mut self,
+        sql: &str,
+        max_rows: u64,
+    ) -> Result<(QueryResult, bool), DbError> {
+        match self {
+            ReadOnlyRun::Sqlite(conn) => {
+                sqlite::query_capped_conn(conn, sql, max_rows, QUERY_CELL_CAP).await
+            }
+            ReadOnlyRun::Postgres { conn, begin } => {
+                let mut tx = postgres::begin_read_only(conn, begin).await?;
+                let result =
+                    postgres::query_capped_conn(&mut tx, sql, max_rows, QUERY_CELL_CAP).await;
+                let ended = postgres::end_read_only(tx).await;
+                ended_read_only(conn, ended)?;
+                result
+            }
+        }
+    }
+
+    /// Runs a non-row statement, returning affected rows. On a connection
+    /// that may not write, only a statement the gate passed reaches this —
+    /// transaction control, say — and the engine refuses one that writes.
+    pub(super) async fn execute(&mut self, sql: &str) -> Result<u64, DbError> {
+        match self {
+            ReadOnlyRun::Sqlite(conn) => sqlite::execute_conn(conn, sql).await,
+            ReadOnlyRun::Postgres { conn, begin } => {
+                let mut tx = postgres::begin_read_only(conn, begin).await?;
+                let result = postgres::execute_conn(&mut tx, sql).await;
+                let ended = postgres::end_read_only(tx).await;
+                ended_read_only(conn, ended)?;
+                result
+            }
+        }
+    }
+
+    /// Lets go of the connection: closes SQLite's own, returns the pooled one.
+    pub(super) async fn close(self) {
+        match self {
+            ReadOnlyRun::Sqlite(conn) => {
+                let _ = sqlx::Connection::close(conn).await;
+            }
+            ReadOnlyRun::Postgres { .. } => {}
+        }
+    }
+}
+
+/// Passes on how a read-only statement's rollback went, closing the
+/// connection rather than returning it to the pool when it failed — its
+/// transaction state is no longer known.
+fn ended_read_only(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    ended: Result<(), DbError>,
+) -> Result<(), DbError> {
+    if ended.is_err() {
+        conn.close_on_drop();
+    }
+    ended
+}
+
+/// Whether this dialect's engine has a read-only mode a marked connection's
+/// scripts run in ([`ReadOnlyRun`]) — the one answer both the run path and the
+/// connection form's promise to the user read, so the two cannot disagree.
+///
+/// False for SQL Server: T-SQL has no read-only session or transaction mode.
+/// `ApplicationIntent=ReadOnly` is the nearest thing and is not one — it
+/// routes an availability-group connection to a readable secondary, and on
+/// an ordinary server it refuses nothing (measured on SQL Server 2022:
+/// `sqlcmd -K ReadOnly` created a table and inserted a row).
+pub fn engine_has_read_only_mode(dialect: Dialect) -> bool {
+    match dialect {
+        Dialect::Sqlite | Dialect::Postgres => true,
+        Dialect::SqlServer => false,
+    }
+}
+
+/// Whether a script on a connection with these effective capabilities runs
+/// through a [`ReadOnlyRun`], where the engine refuses writes as well as the
+/// gate.
+///
+/// Keyed on `mutate` alone: a server's read-only mode refuses row changes and
+/// schema changes together, and today `mutate` is false exactly when the user
+/// marked the connection read-only ([`WriteProtection::apply`] clears both).
+/// A connection permitted schema changes but not row changes would lose its
+/// schema changes here — no backend declares one.
+pub(super) fn engine_enforces_read_only(caps: Capabilities) -> bool {
+    !caps.mutate
+}
+
 impl DbPool {
     /// Opens an existing SQLite database file.
     pub async fn open_sqlite(path: &Path) -> Result<DbPool, DbError> {
@@ -362,6 +494,29 @@ impl DbPool {
             DbPool::SqlServer(pool) => sqlserver::begin_tx(pool)
                 .await
                 .map(|tx| ScriptTx::SqlServer(Box::new(tx))),
+        }
+    }
+
+    /// Takes a connection for one read-only script — see [`ReadOnlyRun`].
+    /// `Ok(None)` on SQL Server, which has no read-only mode to hold one in.
+    pub(super) async fn begin_read_only_run(&self) -> Result<Option<ReadOnlyRun>, DbError> {
+        if !engine_has_read_only_mode(self.dialect()) {
+            return Ok(None);
+        }
+        match self {
+            DbPool::Sqlite(pool) => Ok(Some(ReadOnlyRun::Sqlite(
+                sqlite::open_read_only(pool).await?,
+            ))),
+            DbPool::Postgres(pg) => Ok(Some(ReadOnlyRun::Postgres {
+                conn: pg
+                    .pool()
+                    .acquire()
+                    .await
+                    .map_err(|e| DbError::Query(e.to_string()))?,
+                begin: pg.read_only_begin(),
+            })),
+            // Turned away above; kept as an arm so a new variant must decide.
+            DbPool::SqlServer(_) => Ok(None),
         }
     }
 

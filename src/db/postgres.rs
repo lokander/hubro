@@ -159,6 +159,9 @@ fn detect_flavor(version: &str) -> PgFlavor {
 pub struct PgConn {
     pool: PgPool,
     flavor: PgFlavor,
+    /// What opens each statement's transaction on a connection that may not
+    /// write — see [`read_only_begin`].
+    read_only_begin: &'static str,
 }
 
 impl PgConn {
@@ -171,6 +174,68 @@ impl PgConn {
     pub fn flavor(&self) -> PgFlavor {
         self.flavor
     }
+
+    /// The statement [`run_read_only`] opens each transaction with — see
+    /// [`read_only_begin`].
+    pub fn read_only_begin(&self) -> &'static str {
+        self.read_only_begin
+    }
+}
+
+/// `BEGIN READ ONLY`: the engine-side half of a connection the user marked
+/// read-only. Measured on all seven Postgres-wire engines, a write inside it
+/// is refused by the server (`nextval()`, `setval()`, `INSERT`, `CREATE
+/// TABLE`, …) while catalog reads, `EXPLAIN` and `SHOW` still run.
+pub const BEGIN_READ_ONLY: &str = "BEGIN READ ONLY";
+
+/// [`BEGIN_READ_ONLY`] for a server whose DDL leaves the transaction it was
+/// issued in.
+///
+/// CockroachDB's `autocommit_before_ddl` (on by default) *commits* the open
+/// transaction before a schema change and runs the change outside it, so a
+/// `CREATE TABLE` inside `BEGIN READ ONLY` was measured to succeed, read-only
+/// transaction or not. Turning the setting off for the one transaction makes
+/// the same statement fail with "cannot execute CREATE TABLE in a read-only
+/// transaction". `SET LOCAL` ends with the transaction it was issued in, so
+/// the rest of the pool keeps the default — which matters, because turning it
+/// off session-wide breaks `ALTER TABLE` on schema-locked tables (see
+/// [`open_postgres`]).
+pub const BEGIN_READ_ONLY_KEEPING_DDL: &str =
+    "BEGIN READ ONLY; SET LOCAL autocommit_before_ddl = off";
+
+/// Which statement opens a read-only transaction on a server, given whether
+/// it has the `autocommit_before_ddl` setting.
+///
+/// Decided by the setting's presence in `pg_settings` rather than by flavor:
+/// a CockroachDB older than the setting has nothing to turn off (its DDL stays
+/// inside the transaction), and `SET LOCAL` of a setting the server does not
+/// know would fail every read-only statement.
+pub fn read_only_begin(has_autocommit_before_ddl: bool) -> &'static str {
+    if has_autocommit_before_ddl {
+        BEGIN_READ_ONLY_KEEPING_DDL
+    } else {
+        BEGIN_READ_ONLY
+    }
+}
+
+/// Whether the server has CockroachDB's `autocommit_before_ddl` setting.
+///
+/// Asked only of CockroachDB — the one engine known to have it — so the other
+/// flavors pay no extra round trip at connect; the flavor picks whether to ask,
+/// and the catalog answers. A failed probe answers *yes*: the cost of a wrong
+/// yes is a read-only statement that fails visibly, where a wrong no lets a
+/// schema change escape the read-only transaction without a word.
+async fn has_autocommit_before_ddl(pool: &PgPool, flavor: PgFlavor) -> bool {
+    if flavor != PgFlavor::CockroachDB {
+        return false;
+    }
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM pg_catalog.pg_settings WHERE name = 'autocommit_before_ddl'",
+    )
+    .fetch_one(pool)
+    .await
+    .map(|n| n > 0)
+    .unwrap_or(true)
 }
 
 /// Connects to Postgres from a URL (`postgres://user@host:port/db?sslmode=…`).
@@ -198,9 +263,12 @@ pub async fn open_postgres(url: &str) -> Result<PgConn, DbError> {
         .fetch_one(&pool)
         .await
         .map_err(|e| connect_error(&e))?;
+    let flavor = detect_flavor(&version);
+    let read_only_begin = read_only_begin(has_autocommit_before_ddl(&pool, flavor).await);
     Ok(PgConn {
         pool,
-        flavor: detect_flavor(&version),
+        flavor,
+        read_only_begin,
     })
 }
 
@@ -390,6 +458,32 @@ pub async fn execute_conn(
     sql: &str,
 ) -> Result<u64, DbError> {
     sqlx_common::execute(conn, sql, |e| query_error(e, sql)).await
+}
+
+/// Opens the read-only transaction one statement of a read-only script runs
+/// in — see [`read_only_begin`] for the statement, and
+/// [`ReadOnlyRun`](super::registry::ReadOnlyRun) for why it is one per
+/// statement.
+pub async fn begin_read_only<'c>(
+    conn: &'c mut sqlx::postgres::PgConnection,
+    begin: &'static str,
+) -> Result<sqlx::Transaction<'c, sqlx::Postgres>, DbError> {
+    sqlx::Connection::begin_with(conn, begin)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))
+}
+
+/// Ends a read-only statement's transaction. Always a rollback: nothing in it
+/// may stay, and on Materialize — whose read-only transaction accepts a
+/// `CREATE TABLE` and was measured to make it permanent on `COMMIT` — the
+/// rollback is what keeps it out.
+///
+/// Unlike [`sqlx_common::rollback_tx`] this reports a failure, so the caller
+/// stops using a connection whose transaction state is no longer known.
+pub async fn end_read_only(tx: sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(), DbError> {
+    tx.rollback()
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))
 }
 
 /// [`execute_conn`] with bound parameters — the write path for a batch of

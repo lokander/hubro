@@ -79,8 +79,8 @@ pub use postgres::{
     build_url, normalize_pg_url, url_target, url_via_local_port, url_with_password, PgFlavor,
 };
 pub use registry::{
-    CellFetch, Connection, ConnectionId, ConnectionRegistry, DbPool, FETCH_CELL_MAX_BYTES,
-    MAX_QUERY_ROWS, QUERY_CELL_CAP,
+    engine_has_read_only_mode, CellFetch, Connection, ConnectionId, ConnectionRegistry, DbPool,
+    FETCH_CELL_MAX_BYTES, MAX_QUERY_ROWS, QUERY_CELL_CAP,
 };
 pub use rowkey::{detect_row_identity, RowIdentity};
 pub use schema::{

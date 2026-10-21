@@ -217,14 +217,31 @@ pub enum WriteProtection {
     /// the connection — the point is to make you read which database you are
     /// about to change.
     Confirm,
-    /// Writes are refused at the `db/` layer.
+    /// Writes are refused at the `db/` layer, and on SQLite and every
+    /// Postgres-wire engine by the engine too.
     ///
-    /// Enforcement is by statement classification (see
-    /// [`script::statement_needs`](super::script::statement_needs)), not by
-    /// the engine, so a write reached through a function call inside a
-    /// `SELECT` is not caught. Refusing those needs a server-side read-only
-    /// transaction per backend; until then this is a guard against mistakes,
-    /// not against a determined user.
+    /// Two layers. Statement classification
+    /// ([`script::statement_needs`](super::script::statement_needs)) refuses
+    /// a write before anything runs and says why; it reads the statement, so
+    /// it misses a write reached through a function call (`SELECT setval(…)`)
+    /// or hidden by a lexer mismatch. Beneath it the SQL editor's scripts run
+    /// on a connection the engine will not let write
+    /// ([`ReadOnlyRun`](super::registry::ReadOnlyRun)): a read-only SQLite
+    /// open, or a read-only transaction per statement on Postgres.
+    ///
+    /// **SQL Server has only the first layer**: T-SQL has no read-only session
+    /// or transaction mode, so a write the classification misses —
+    /// `SELECT NEXT VALUE FOR s`, a procedure called from a function — runs
+    /// (`tests/db_read_only.rs` pins that). There the marking is a guard
+    /// against mistakes, and a login without write permissions is what stops a
+    /// determined user.
+    ///
+    /// On Postgres the engine's read-only mode is about *this database*: it
+    /// does not stop a function that acts elsewhere — `dblink_exec` writing
+    /// through a connection of its own, `pg_terminate_backend`, advisory
+    /// locks, `pg_notify` — nor, on SQLite, `VACUUM INTO` writing a copy to a new
+    /// file (measured to run on a read-only connection). The classification
+    /// refuses `VACUUM` and `COPY`; the functions it cannot see.
     ReadOnly,
 }
 
