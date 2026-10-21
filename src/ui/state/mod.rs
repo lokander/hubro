@@ -667,6 +667,34 @@ pub fn orphaned_sql_export_status(
     statuses.get(&(id, ExportPane::Sql)).cloned()
 }
 
+/// The grid toolbar's export line for the table `shown`: the connection's
+/// latest grid export, named by its table when that is not the one on
+/// screen.
+///
+/// The status is kept per connection, so it follows the user from table to
+/// table — and the export now outlives the grid that started it, so it can
+/// finish while another table is shown. "Exported 500000 rows" under a table
+/// with forty would be a claim about the wrong table.
+///
+/// The third field says whether the export has finished, so the line can be
+/// dismissed: it stays until then rather than following every table.
+pub fn grid_export_line(
+    statuses: &HashMap<(ConnectionId, ExportPane), ExportStatus>,
+    tables: &HashMap<ConnectionId, TableRef>,
+    id: ConnectionId,
+    shown: &TableRef,
+) -> Option<(String, &'static str, bool)> {
+    let status = statuses.get(&(id, ExportPane::Grid))?;
+    let finished = *status != ExportStatus::Running;
+    let (text, class) = status.line();
+    match tables.get(&id) {
+        Some(source) if source != shown => {
+            Some((format!("{}: {text}", source.label()), class, finished))
+        }
+        _ => Some((text, class, finished)),
+    }
+}
+
 /// Whether a run starting in `buffer` retires the connection's SQL export
 /// line: the export was taken from this tab and has finished.
 ///
@@ -1081,6 +1109,9 @@ pub struct AppState {
     /// so only that result's section shows the status
     /// ([`sql_export_status`]).
     pub sql_export_sources: Signal<HashMap<ConnectionId, SqlExportSource>>,
+    /// The table each connection's latest grid export was taken from, so
+    /// the line names it under any other table ([`grid_export_line`]).
+    pub grid_export_tables: Signal<HashMap<ConnectionId, TableRef>>,
     /// Monotonic id per export slot; a finishing task only records its
     /// outcome while it is still the slot's latest export, so a slow export
     /// can't overwrite the status of one started after it.
@@ -1256,6 +1287,7 @@ impl AppState {
             pending_edit: Signal::new_in_scope(None, ScopeId::ROOT),
             export_status: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             sql_export_sources: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            grid_export_tables: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             export_generations: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             import_status: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             import_generations: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
@@ -1834,6 +1866,7 @@ impl AppState {
             .write()
             .retain(|(conn, _), _| *conn != id);
         self.sql_export_sources.write().remove(&id);
+        self.grid_export_tables.write().remove(&id);
         self.export_generations
             .write()
             .retain(|(conn, _), _| *conn != id);
@@ -2069,6 +2102,34 @@ mod tests {
         assert_eq!(orphaned(4, std::slice::from_ref(&rerun)), None);
         assert_eq!(
             orphaned_sql_export_status(&statuses, &sources, other, 3, &[rerun]),
+            None
+        );
+
+        // The grid's line names its table whenever another one is shown.
+        let albums = TableRef {
+            schema: Some("main".into()),
+            name: "albums".into(),
+        };
+        let tracks = TableRef {
+            schema: Some("main".into()),
+            name: "tracks".into(),
+        };
+        let grid = HashMap::from([((id, ExportPane::Grid), ExportStatus::Done { rows: 7 })]);
+        let tables = HashMap::from([(id, albums.clone())]);
+        assert_eq!(
+            grid_export_line(&grid, &tables, id, &albums).unwrap().0,
+            "Exported 7 rows"
+        );
+        assert_eq!(
+            grid_export_line(&grid, &tables, id, &tracks).unwrap().0,
+            "main.albums: Exported 7 rows"
+        );
+        assert!(grid_export_line(&grid, &tables, id, &albums).unwrap().2);
+        let running = HashMap::from([((id, ExportPane::Grid), ExportStatus::Running)]);
+        assert!(!grid_export_line(&running, &tables, id, &albums).unwrap().2);
+        assert_eq!(grid_export_line(&grid, &tables, other, &albums), None);
+        assert_eq!(
+            grid_export_line(&HashMap::new(), &tables, id, &albums),
             None
         );
 
