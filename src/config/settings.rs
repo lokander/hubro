@@ -157,8 +157,15 @@ pub fn load_settings(path: &Path) -> Settings {
     load_lenient(path)
 }
 
-/// Sets one top-level key of the settings file to `value`, or removes it
-/// when `value` is `None`, leaving the rest of the document as it was.
+/// Sets one top-level key of the settings file to `item`, or removes it
+/// when `item` is `None`, leaving the rest of the document as it was.
+///
+/// For a key holding a table, `owned` names the fields this build writes
+/// there, and only those are touched: each is set, or removed when `item`
+/// leaves it out (a skipped `None`), while any other field the user's table
+/// has — one a newer build added, say — stays. Replacing the table whole
+/// would drop it, which is this function's whole reason to exist one level
+/// down. Scalars pass an empty `owned`.
 ///
 /// This is how every `save_*` below writes, and it is deliberately *not*
 /// "load the struct, change a field, save the struct". [`load_settings`] is
@@ -176,6 +183,7 @@ fn set_settings_key(
     path: &Path,
     key: &str,
     item: Option<toml_edit::Item>,
+    owned: &[&str],
 ) -> Result<(), ConfigError> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -189,15 +197,58 @@ fn set_settings_key(
         ))
     })?;
     match item {
-        Some(mut item) => {
-            keep_layout(document.get(key), document.is_empty(), &mut item);
-            document[key] = item;
-        }
+        Some(item) => put_item(document.as_table_mut(), key, item, owned),
         None => {
             document.remove(key);
         }
     }
     write_text_atomic(path, &document.to_string())
+}
+
+/// Puts `item` at `key` in `document`: merged field by field into a table
+/// already there (whatever form it is written in — a `[key]` section, an
+/// inline table, dotted keys) when `owned` names its fields, and otherwise
+/// in place of what was there.
+fn put_item(document: &mut toml_edit::Table, key: &str, mut item: toml_edit::Item, owned: &[&str]) {
+    if !owned.is_empty() {
+        if let (Some(new), Some(existing)) = (
+            item.as_table_like(),
+            document
+                .get_mut(key)
+                .and_then(toml_edit::Item::as_table_like_mut),
+        ) {
+            merge_fields(existing, new, owned);
+            return;
+        }
+    }
+    keep_layout(document.get(key), document.is_empty(), &mut item);
+    document[key] = item;
+}
+
+/// Writes each `owned` field of `new` into `existing` — replacing a value in
+/// its slot, so its key, place and trailing comment stay — and removes the
+/// `owned` fields `new` leaves out. Fields outside `owned` are not touched.
+fn merge_fields(
+    existing: &mut dyn toml_edit::TableLike,
+    new: &dyn toml_edit::TableLike,
+    owned: &[&str],
+) {
+    for field in owned {
+        let Some(value) = new.get(field) else {
+            existing.remove(field);
+            continue;
+        };
+        let mut value = value.clone();
+        match existing.get_mut(field) {
+            Some(slot) => {
+                keep_layout(Some(slot), false, &mut value);
+                *slot = value;
+            }
+            None => {
+                existing.insert(field, value);
+            }
+        }
+    }
 }
 
 /// Gives a replacement `item` the place and surroundings of the one it
@@ -236,7 +287,7 @@ fn settings_item<T: Serialize>(key: &str, value: &T) -> Result<toml_edit::Item, 
 
 /// Persists just the theme, leaving the rest of the file as it is.
 pub fn save_theme(path: &Path, theme: Theme) -> Result<(), ConfigError> {
-    set_settings_key(path, "theme", Some(settings_item("theme", &theme)?))
+    set_settings_key(path, "theme", Some(settings_item("theme", &theme)?), &[])
 }
 
 /// Persists just the internal-object visibility, leaving the rest of the
@@ -246,12 +297,20 @@ pub fn save_theme(path: &Path, theme: Theme) -> Result<(), ConfigError> {
 pub fn save_show_internal_objects(path: &Path, show: bool) -> Result<(), ConfigError> {
     const KEY: &str = "show_internal_objects";
     let item = show.then(|| settings_item(KEY, &true)).transpose()?;
-    set_settings_key(path, KEY, item)
+    set_settings_key(path, KEY, item, &[])
 }
 
-/// Persists just the window geometry, leaving the rest of the file as it is.
+/// The fields of [`WindowGeometry`] as the file spells them: what a geometry
+/// write owns inside `[window]`. Anything else in that table is left alone.
+/// Pinned to the struct's serialization by
+/// `window_fields_name_every_geometry_field`.
+const WINDOW_FIELDS: [&str; 5] = ["width", "height", "x", "y", "maximized"];
+
+/// Persists just the window geometry, leaving the rest of the file — the
+/// rest of `[window]` included — as it is.
 pub fn save_window_geometry(path: &Path, geometry: WindowGeometry) -> Result<(), ConfigError> {
-    set_settings_key(path, "window", Some(settings_item("window", &geometry)?))
+    let item = settings_item("window", &geometry)?;
+    set_settings_key(path, "window", Some(item), &WINDOW_FIELDS)
 }
 
 #[cfg(test)]
@@ -475,6 +534,81 @@ mod tests {
              [window]\nwidth = 1200.0\nheight = 800.0\n\n\
              [later]\na = 1\n",
         );
+    }
+
+    #[test]
+    fn window_fields_name_every_geometry_field() {
+        // Every field set, so none is skipped from the serialization.
+        let full = WindowGeometry {
+            width: 1.0,
+            height: 2.0,
+            x: Some(3.0),
+            y: Some(4.0),
+            maximized: true,
+        };
+        let toml::Value::Table(table) = toml::Value::try_from(full).unwrap() else {
+            panic!("geometry serializes as a table");
+        };
+        let mut serialized: Vec<&str> = table.keys().map(String::as_str).collect();
+        let mut owned = WINDOW_FIELDS.to_vec();
+        serialized.sort_unstable();
+        owned.sort_unstable();
+        assert_eq!(serialized, owned);
+    }
+
+    #[test]
+    fn a_geometry_write_keeps_the_window_fields_it_does_not_own() {
+        let geo = WindowGeometry {
+            width: 900.0,
+            height: 600.0,
+            x: None,
+            y: None,
+            maximized: false,
+        };
+        // The same table in each of the forms TOML allows. A newer build's
+        // field (`monitor`) must survive; a stale `x` the new geometry leaves
+        // out must not.
+        for (form, before, after) in [
+            (
+                "section",
+                "[window]\nwidth = 1.0 # wide\nheight = 2.0\nx = 5.0\nmonitor = 2\n",
+                "[window]\nwidth = 900.0 # wide\nheight = 600.0\nmonitor = 2\n",
+            ),
+            (
+                "inline",
+                "window = { width = 1.0, height = 2.0, x = 5.0, monitor = 2 }\n",
+                "window = { width = 900.0, height = 600.0, monitor = 2 }\n",
+            ),
+            (
+                "dotted",
+                "window.width = 1.0\nwindow.height = 2.0\nwindow.x = 5.0\nwindow.monitor = 2\n",
+                "window.width = 900.0\nwindow.height = 600.0\nwindow.monitor = 2\n",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.toml");
+            std::fs::write(&path, before).unwrap();
+            save_window_geometry(&path, geo).unwrap();
+            let written = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(written, after, "{form}");
+            assert_eq!(load_settings(&path).window, Some(geo), "{form}");
+
+            // A field the old table lacked is added in the same form, and
+            // the result still reads back.
+            let moved = WindowGeometry {
+                x: Some(-40.0),
+                maximized: true,
+                ..geo
+            };
+            save_window_geometry(&path, moved).unwrap();
+            let written = std::fs::read_to_string(&path).unwrap();
+            assert!(written.contains("monitor = 2"), "{form}: {written}");
+            assert_eq!(
+                load_settings(&path).window,
+                Some(moved),
+                "{form}: {written}"
+            );
+        }
     }
 
     #[test]
