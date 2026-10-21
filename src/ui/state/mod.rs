@@ -55,7 +55,7 @@ use crate::db::{
     mssql_url_with_password, needs_confirmation, open_source, run_import, run_script,
     script_refusal, split_statements, statement_preview, url_target, url_via_local_port,
     url_with_password, write_result, Capabilities, CellFetch, Connection, ConnectionId,
-    ConnectionRegistry, DbError, DbPool, Ddl, DdlObject, Encoding, ExportFormat, Filter,
+    ConnectionRegistry, DbError, DbPool, Ddl, DdlObject, Dialect, Encoding, ExportFormat, Filter,
     ForeignKeyMeta, ImportOptions, ImportReport, MssqlAuth, Rollback, RowLocator, SchemaOp,
     SourceFormat, StagedChange, StatementOutcome, StatementResult, TableAccess, TableMeta,
     TableStats, Value, WriteProtection, NOTHING_TO_RUN,
@@ -1157,6 +1157,34 @@ pub struct AppState {
     pub show_cheatsheet: Signal<bool>,
 }
 
+/// Where a foreign-key jump from `source_row` along `fk` lands: the
+/// referenced table, under the filter that pins the referenced row. `None`
+/// when no jump can be built — see [`build_fk_filter`] — or when the
+/// referenced table is missing from `load` (the schema is still loading, or
+/// the reference dangles).
+///
+/// The *referenced* table's metadata types the filter — its columns' casts
+/// are what the source values are compared against, and its primary key
+/// resolves a reference to the implicit key — so it is looked up here by the
+/// foreign key's own target, never taken from the table the jump starts in.
+pub(crate) fn fk_jump_focus(
+    load: Option<&SchemaLoad>,
+    fk: &ForeignKeyMeta,
+    source_row: &HashMap<String, Value>,
+    dialect: Dialect,
+) -> Option<FocusTarget> {
+    let table = TableRef {
+        schema: fk.referenced_schema.clone(),
+        name: fk.referenced_table.clone(),
+    };
+    let target = find_table_meta(load, &table)?;
+    let filter = build_fk_filter(fk, source_row, target, dialect)?;
+    Some(FocusTarget {
+        table,
+        filter: Some(filter),
+    })
+}
+
 /// Finds one table's metadata in a loaded schema — the single
 /// `(schema, name)` match behind every "which table is this?" lookup in the
 /// app.
@@ -1639,20 +1667,14 @@ impl AppState {
         origin: &TableRef,
         origin_filter: Option<Filter>,
     ) {
-        let target = TableRef {
-            schema: fk.referenced_schema.clone(),
-            name: fk.referenced_table.clone(),
-        };
-        // The target PK is only consulted for FK columns that reference the
-        // target's implicit primary key (`referenced_columns[i] == None`).
-        let target_pk = self.table_primary_key(id, &target);
-        let Some(filter) = build_fk_filter(fk, source_row, &target_pk) else {
+        let Some(dialect) = self.registry.read().get(id).map(|c| c.pool.dialect()) else {
             return;
         };
-        let focus = FocusTarget {
-            table: target.clone(),
-            filter: Some(filter),
+        let Some(focus) = fk_jump_focus(self.schemas.read().get(&id), fk, source_row, dialect)
+        else {
+            return;
         };
+        let target = focus.table.clone();
         let origin_focus = FocusTarget {
             table: origin.clone(),
             filter: origin_filter,
@@ -1793,15 +1815,6 @@ impl AppState {
         pool.count_table_rows(&meta)
             .await
             .map_err(|e| e.to_string())
-    }
-
-    /// The primary-key column names of `table` in key order, from the loaded
-    /// schema (empty when the schema isn't ready or the table has no PK).
-    fn table_primary_key(&self, id: ConnectionId, table: &TableRef) -> Vec<String> {
-        let schemas = self.schemas.read();
-        find_table_meta(schemas.get(&id), table)
-            .map(|t| t.primary_key().iter().map(|c| c.name.clone()).collect())
-            .unwrap_or_default()
     }
 
     /// One table's metadata from the loaded schema, cloned out of the signal.
@@ -1959,6 +1972,72 @@ pub fn tab_title(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_jump_is_typed_by_the_table_it_lands_in() {
+        // The source row's `ratio` is `real`; the column it references is
+        // `double precision`. The jump compares against the referenced column,
+        // so its cast must come from the target — the origin's would bind
+        // `::real` and round a double key that is no f32 to one.
+        use crate::db::{ColumnMeta, Generated, KeyEquality, TableKind, TypeDetail};
+        let table =
+            |name: &str, column: &str, type_name: &str, fk: Option<ForeignKeyMeta>| TableMeta {
+                schema: Some("app".into()),
+                name: name.into(),
+                kind: TableKind::Table,
+                columns: vec![ColumnMeta {
+                    name: column.into(),
+                    type_name: type_name.into(),
+                    nullable: false,
+                    primary_key_position: fk.is_none().then_some(1),
+                    default: None,
+                    generated: Generated::Never,
+                    type_detail: TypeDetail::Plain,
+                }],
+                indexes: vec![],
+                foreign_keys: fk.into_iter().collect(),
+                restriction: None,
+                internal: None,
+                kind_label: None,
+            };
+        let fk = ForeignKeyMeta {
+            columns: vec!["ratio".into()],
+            referenced_schema: Some("app".into()),
+            referenced_table: "rates".into(),
+            // The implicit primary key: resolved from the target too.
+            referenced_columns: vec![None],
+        };
+        let load = SchemaLoad::Ready(vec![
+            table("readings", "ratio", "real", Some(fk.clone())),
+            table("rates", "r", "double precision", None),
+        ]);
+        let row = HashMap::from([("ratio".to_string(), Value::Real(0.5))]);
+        assert_eq!(
+            fk_jump_focus(Some(&load), &fk, &row, Dialect::Postgres),
+            Some(FocusTarget {
+                table: TableRef {
+                    schema: Some("app".into()),
+                    name: "rates".into(),
+                },
+                filter: Some(Filter::Equalities(vec![KeyEquality {
+                    column: "r".into(),
+                    value: Value::Real(0.5),
+                    cast: Some("double precision".into()),
+                }])),
+            })
+        );
+        // A target missing from the schema (still loading, or a dangling
+        // reference) is no jump at all.
+        assert_eq!(
+            fk_jump_focus(Some(&SchemaLoad::Loading), &fk, &row, Dialect::Postgres),
+            None
+        );
+        let without_target = SchemaLoad::Ready(vec![table("readings", "ratio", "real", None)]);
+        assert_eq!(
+            fk_jump_focus(Some(&without_target), &fk, &row, Dialect::Postgres),
+            None
+        );
+    }
 
     #[test]
     fn every_app_state_signal_is_root_scoped() {

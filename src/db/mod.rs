@@ -69,8 +69,8 @@ pub use import::{
     SourceFormat, SourcePreview, SourceValue, MAX_REPORTED_SKIPS,
 };
 pub use page::{
-    classify_column, ColumnClass, Filter, FilterOp, Page, PageRequest, PreviewInfo, SortDir,
-    PREVIEW_BYTES,
+    classify_column, ColumnClass, Filter, FilterOp, KeyEquality, Page, PageRequest, PreviewInfo,
+    SortDir, PREVIEW_BYTES,
 };
 pub use plan::{
     explain_statement, plan_reached_cell_cap, ExplainSupport, PlanDisplay, PlanNode, PlanTree,

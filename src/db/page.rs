@@ -12,9 +12,8 @@
 //!   addressing and navigation stay exact.
 
 use super::schema::ColumnMeta;
-use super::sql::{
-    equalities_where, preview_exprs, qualified, quote_ident, text_compare_expr, Dialect,
-};
+use super::sql::{preview_exprs, qualified, quote_ident, text_compare_expr, Dialect};
+use super::staged::equalities_where;
 use super::value::Value;
 
 /// Max characters (text/json) or bytes (blob) of a large-cell preview fetched
@@ -300,7 +299,9 @@ pub enum FilterOp {
 /// - [`Filter::Equalities`] is a conjunction of `column = value` equalities,
 ///   installed by foreign-key navigation to pin the referenced row
 ///   across one or more columns. Values come from the source row, so they are
-///   already typed [`Value`]s rather than user text.
+///   already typed [`Value`]s rather than user text, and they are compared
+///   as typed values — the predicate a row's own key is re-addressed by —
+///   not as text the way the filter bar compares.
 ///
 /// (No `Eq`: [`Value::Real`] holds an `f64`. Nothing keys a map on a filter.)
 #[derive(Debug, Clone, PartialEq)]
@@ -312,7 +313,37 @@ pub enum Filter {
     },
     /// AND'd `column = value` equalities. An empty list matches every row
     /// (no WHERE clause) — callers never build one.
-    Equalities(Vec<(String, Value)>),
+    Equalities(Vec<KeyEquality>),
+}
+
+/// One `column = value` term of [`Filter::Equalities`]: a typed value
+/// compared against a column of the filtered table under that column's
+/// Postgres cast, exactly as a key value is when a row is re-addressed for a
+/// read or a write.
+///
+/// The cast is resolved when the filter is built ([`super::build_fk_filter`]
+/// reads it off the target table), so every consumer of the filter — the
+/// page, its row count, an export — renders the same predicate from the
+/// filter alone, with nothing of its own to supply.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyEquality {
+    pub column: String,
+    pub value: Value,
+    /// The column's Postgres cast target (`"double precision"`, `"bpchar"`,
+    /// …), or `None` on a dialect that casts nothing or a column whose type
+    /// is unknown, where the value binds uncast.
+    pub cast: Option<String>,
+}
+
+impl KeyEquality {
+    /// An uncast term — for a dialect that casts nothing, or a test.
+    pub fn uncast(column: impl Into<String>, value: Value) -> KeyEquality {
+        KeyEquality {
+            column: column.into(),
+            value,
+            cast: None,
+        }
+    }
 }
 
 impl Filter {
@@ -546,7 +577,8 @@ impl PageRequest {
                     ),
                 }
             }
-            Some(Filter::Equalities(pairs)) => equalities_where(pairs, dialect),
+            // Typed, never as text: see [`equalities_where`].
+            Some(Filter::Equalities(terms)) => equalities_where(terms, dialect),
         }
     }
 }
@@ -788,24 +820,22 @@ mod tests {
     }
 
     #[test]
-    fn sqlserver_equalities_filter_casts_and_numbers_placeholders() {
+    fn sqlserver_equalities_filter_binds_typed_values_and_numbers_placeholders() {
+        // A jump's values are the source row's typed cells: they bind as what
+        // they are, never as hubro's text spelling against the column cast
+        // to `nvarchar` — `CAST(float AS nvarchar)` keeps six digits.
         let mut req = base();
         req.filter = Some(Filter::Equalities(vec![
-            ("region".into(), Value::Text("eu".into())),
-            ("slot".into(), Value::Integer(3)),
+            KeyEquality::uncast("region", Value::Text("eu".into())),
+            KeyEquality::uncast("ratio", Value::Real(1e20)),
         ]));
         let (sql, params) = req.select_sql(Dialect::SqlServer);
         assert_eq!(
             sql,
-            "SELECT * FROM \"tracks\" \
-             WHERE CAST(\"region\" AS nvarchar(max)) = @P1 \
-             AND CAST(\"slot\" AS nvarchar(max)) = @P2 \
+            "SELECT * FROM \"tracks\" WHERE \"region\" = @P1 AND \"ratio\" = @P2 \
              ORDER BY (SELECT NULL) OFFSET 200 ROWS FETCH NEXT 100 ROWS ONLY"
         );
-        assert_eq!(
-            params,
-            vec![Value::Text("eu".into()), Value::Text("3".into())]
-        );
+        assert_eq!(params, vec![Value::Text("eu".into()), Value::Real(1e20)]);
     }
 
     #[test]
@@ -835,54 +865,60 @@ mod tests {
     fn equalities_filter_ands_the_pairs_sqlite() {
         let mut req = base();
         req.filter = Some(Filter::Equalities(vec![
-            ("artist_id".into(), Value::Integer(1)),
-            ("seq".into(), Value::Integer(2)),
+            KeyEquality::uncast("artist_id", Value::Integer(1)),
+            KeyEquality::uncast("blob_key", Value::Blob(vec![0, 255])),
         ]));
         let (sql, params) = req.select_sql(Dialect::Sqlite);
         assert_eq!(
             sql,
-            "SELECT * FROM \"tracks\" WHERE \"artist_id\" = ? AND \"seq\" = ? \
+            "SELECT * FROM \"tracks\" WHERE \"artist_id\" = ? AND \"blob_key\" = ? \
              LIMIT 100 OFFSET 200"
         );
-        // Values bind as text and rely on SQLite affinity, like the equals
-        // filter.
-        assert_eq!(
-            params,
-            vec![Value::Text("1".into()), Value::Text("2".into())]
-        );
+        // Values bind as what they are: a blob as bytes, not the display
+        // marker `<blob 2>` the text comparison used to bind.
+        assert_eq!(params, vec![Value::Integer(1), Value::Blob(vec![0, 255])]);
     }
 
     #[test]
-    fn equalities_filter_casts_and_numbers_placeholders_on_postgres() {
+    fn equalities_filter_casts_the_bind_not_the_column_on_postgres() {
         let mut req = base();
         req.filter = Some(Filter::Equalities(vec![
-            ("region".into(), Value::Text("eu".into())),
-            ("slot".into(), Value::Integer(3)),
+            KeyEquality {
+                column: "region".into(),
+                value: Value::Text("eu ".into()),
+                cast: Some("bpchar".into()),
+            },
+            KeyEquality {
+                column: "ratio".into(),
+                value: Value::Real(1e20),
+                cast: Some("double precision".into()),
+            },
         ]));
         let (sql, params) = req.select_sql(Dialect::Postgres);
+        let clause = " WHERE \"region\" = $1::bpchar AND \"ratio\" = $2::double precision";
         assert_eq!(
             sql,
-            "SELECT * FROM \"tracks\" WHERE \"region\"::text = $1 AND \"slot\"::text = $2 \
-             LIMIT 100 OFFSET 200"
+            format!("SELECT * FROM \"tracks\"{clause} LIMIT 100 OFFSET 200")
         );
-        assert_eq!(
-            params,
-            vec![Value::Text("eu".into()), Value::Text("3".into())]
-        );
-        // COUNT shares the same clause and binds.
+        assert_eq!(params, vec![Value::Text("eu ".into()), Value::Real(1e20)]);
+        // The count and the export share the same clause and binds — every
+        // consumer of the jump renders the one predicate.
         let (count_sql, count_params) = req.count_sql(Dialect::Postgres);
         assert_eq!(
             count_sql,
-            "SELECT COUNT(*) FROM \"tracks\" WHERE \"region\"::text = $1 AND \"slot\"::text = $2"
+            format!("SELECT COUNT(*) FROM \"tracks\"{clause}")
         );
-        assert_eq!(count_params.len(), 2);
+        assert_eq!(count_params, params);
+        let (export_sql, export_params) = req.export_sql(Dialect::Postgres);
+        assert_eq!(export_sql, format!("SELECT * FROM \"tracks\"{clause}"));
+        assert_eq!(export_params, params);
     }
 
     #[test]
     fn equalities_filter_quotes_weird_identifiers() {
         let mut req = base();
-        req.filter = Some(Filter::Equalities(vec![(
-            "col\"name".into(),
+        req.filter = Some(Filter::Equalities(vec![KeyEquality::uncast(
+            "col\"name",
             Value::Text("x".into()),
         )]));
         let (sql, _) = req.select_sql(Dialect::Sqlite);

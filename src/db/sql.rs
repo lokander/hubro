@@ -81,67 +81,22 @@ pub(crate) fn qualified(schema: Option<&str>, name: &str) -> String {
 }
 
 /// The left-hand side of a text comparison against `column` — the "filters
-/// compare as text" strategy shared by the filter bar, the equality filters,
-/// and foreign-key jumps: Postgres and SQL Server compare strictly by type,
-/// so the column is cast to text to match the text value the filter binds,
-/// letting exotic types (uuid, enums, timestamps) still compare. SQLite's
-/// affinity coerces implicitly, so the bare quoted column suffices there.
-/// Fine for a viewer; indexes aren't a concern yet.
+/// compare as text" strategy of the filter bar: Postgres and SQL Server
+/// compare strictly by type, so the column is cast to text to match the text
+/// the user typed, letting exotic types (uuid, enums, timestamps) still
+/// compare. SQLite's affinity coerces implicitly, so the bare quoted column
+/// suffices there. Fine for a viewer; indexes aren't a concern yet.
+///
+/// **Only for text the user typed.** A value read off a row — a foreign-key
+/// jump's, a row's own key — is typed, and comparing it as text depends on
+/// hubro spelling every value exactly as the server does, which it does not
+/// for floats, blobs, `timestamptz`, padded `character(n)` or SQL Server's
+/// date/time types. Those compare through `staged::equalities_where` and
+/// `staged::row_where`.
 pub(crate) fn text_compare_expr(dialect: Dialect, column: &str) -> String {
     match dialect {
         Dialect::Sqlite => quote_ident(column),
         Dialect::Postgres | Dialect::SqlServer => dialect.cast_expr(&quote_ident(column), "text"),
-    }
-}
-
-/// A ` WHERE k1 = ? AND k2 = ?` clause pinning one row by its identity
-/// columns, with each value bound as text ([`text_compare_expr`]) — the same
-/// strategy the equals filter and foreign-key navigation use, so exotic key
-/// types (uuid, enums, timestamps) still compare. An empty list matches
-/// every row (no clause). Used by the equalities page filter
-/// ([`Filter::Equalities`](super::page::Filter)), which foreign-key jumps
-/// build.
-///
-/// **Not for re-addressing a grid row.** A row's own key values are typed,
-/// and comparing them as text depends on hubro spelling every value exactly as
-/// the server does, which it does not for floats, blobs or SQL Server's
-/// date/time types. That path goes through `staged::row_where`, the predicate
-/// writes use.
-///
-/// **Known gap:** a foreign-key jump has the same problem. Its values are the
-/// source row's typed cells, not text the user typed, so a jump along a
-/// float, blob or (on SQL Server) date/time foreign key lands on an empty
-/// page for the same reason a cell fetch used to load NULL. It still goes
-/// through here until it gets a typed predicate of its own.
-pub(crate) fn equalities_where(
-    pairs: &[(String, Value)],
-    dialect: Dialect,
-) -> (String, Vec<Value>) {
-    if pairs.is_empty() {
-        return (String::new(), Vec::new());
-    }
-    let mut clauses = Vec::with_capacity(pairs.len());
-    let mut params = Vec::with_capacity(pairs.len());
-    for (column, value) in pairs {
-        let quoted = text_compare_expr(dialect, column);
-        let placeholder = dialect.placeholder(params.len() + 1);
-        clauses.push(format!("{quoted} = {placeholder}"));
-        params.push(Value::Text(equality_text(value)));
-    }
-    (format!(" WHERE {}", clauses.join(" AND ")), params)
-}
-
-/// The text form bound for an equality comparison. Mirrors how the equals
-/// filter binds text and lets SQLite affinity / the Postgres `::text` cast do
-/// the matching. FK values are realistically integers or text; NULL is
-/// guarded out before a jump is built, and blobs never key a foreign key.
-fn equality_text(value: &Value) -> String {
-    match value {
-        Value::Integer(i) => i.to_string(),
-        Value::Real(r) => r.to_string(),
-        Value::Text(t) => t.clone(),
-        Value::Null => String::new(),
-        Value::Blob(_) => value.display(),
     }
 }
 

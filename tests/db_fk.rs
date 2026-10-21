@@ -107,11 +107,6 @@ async fn child_row(pool: &DbPool, id: i64) -> HashMap<String, Value> {
     row_map(&page, row)
 }
 
-/// A table's primary-key column names in key order, from introspection.
-fn primary_key(meta: &TableMeta) -> Vec<String> {
-    meta.primary_key().iter().map(|c| c.name.clone()).collect()
-}
-
 /// Finds `child`'s FK whose referencing columns match `columns`.
 fn child_fk<'a>(child: &'a TableMeta, columns: &[&str]) -> &'a ForeignKeyMeta {
     child
@@ -133,7 +128,7 @@ async fn jump(
         .iter()
         .find(|t| t.name == fk.referenced_table && t.schema == fk.referenced_schema)
         .expect("target table is introspected");
-    let filter = build_fk_filter(fk, source, &primary_key(target))
+    let filter = build_fk_filter(fk, source, target, pool.dialect())
         .expect("a fully-populated FK builds a jump filter");
     let req = PageRequest {
         schema: target.schema.clone(),
@@ -195,10 +190,18 @@ async fn assert_fk_navigation(pool: &DbPool) {
     assert_eq!(rows[0][label_idx], Value::Text("Shelf A".into()));
 
     // An all-NULL child row references nothing: no jump is built.
-    let target_pk = primary_key(tables.iter().find(|t| t.name == "category").unwrap());
-    assert!(build_fk_filter(child_fk(child, &["category_id"]), &row11, &target_pk).is_none());
+    let dialect = pool.dialect();
     assert!(
-        build_fk_filter(child_fk(child, &["region", "slot"]), &row11, &[]).is_none(),
+        build_fk_filter(child_fk(child, &["category_id"]), &row11, category, dialect).is_none()
+    );
+    assert!(
+        build_fk_filter(
+            child_fk(child, &["region", "slot"]),
+            &row11,
+            parent,
+            dialect
+        )
+        .is_none(),
         "a partial/whole NULL composite FK builds no jump"
     );
 }
