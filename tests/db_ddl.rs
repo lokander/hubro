@@ -564,6 +564,78 @@ async fn postgres_plain_table_claims_no_missing_constraints() {
 }
 
 #[tokio::test]
+async fn postgres_a_unique_index_another_table_references_stays_in_the_ddl() {
+    let Some(url) = pg_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    for statement in [
+        "DROP TABLE IF EXISTS ddl_ref_child",
+        "DROP TABLE IF EXISTS ddl_ref_parent",
+        // A bare unique index rather than a UNIQUE constraint: the index is
+        // then the only thing in the parent's DDL that a foreign key can
+        // lean on. The unique *constraint* beside it is the contrast — its
+        // index must not be emitted a second time, or the replay below fails
+        // on a relation that already exists.
+        "CREATE TABLE ddl_ref_parent (\
+             id integer PRIMARY KEY, \
+             email text NOT NULL, \
+             code text NOT NULL CONSTRAINT ddl_ref_parent_code_key UNIQUE)",
+        "CREATE UNIQUE INDEX ddl_ref_parent_email_idx ON ddl_ref_parent (email)",
+        "CREATE TABLE ddl_ref_child (\
+             id integer PRIMARY KEY, \
+             parent_email text REFERENCES ddl_ref_parent (email), \
+             parent_code text REFERENCES ddl_ref_parent (code), \
+             parent_id integer REFERENCES ddl_ref_parent (id))",
+    ] {
+        run_one(&pool, statement).await;
+    }
+    let tables = pool.introspect().await.unwrap();
+    let parent = pool
+        .fetch_ddl(
+            table(&tables, Some("public"), "ddl_ref_parent"),
+            &DdlObject::Object,
+        )
+        .await
+        .unwrap();
+    let child = pool
+        .fetch_ddl(
+            table(&tables, Some("public"), "ddl_ref_child"),
+            &DdlObject::Object,
+        )
+        .await
+        .unwrap();
+    assert!(
+        parent
+            .sql
+            .contains("CREATE UNIQUE INDEX ddl_ref_parent_email_idx"),
+        "{}",
+        parent.sql
+    );
+
+    // The property that matters, stated as behaviour: the parent's DDL,
+    // replayed on its own, is enough to create the child against it.
+    run_one(&pool, "DROP TABLE ddl_ref_child").await;
+    run_one(&pool, "DROP TABLE ddl_ref_parent").await;
+    run_ddl(&pool, &parent.text()).await;
+    run_ddl(&pool, &child.text()).await;
+    let regenerated = pool
+        .fetch_ddl(
+            table(
+                &pool.introspect().await.unwrap(),
+                Some("public"),
+                "ddl_ref_parent",
+            ),
+            &DdlObject::Object,
+        )
+        .await
+        .unwrap();
+    assert_eq!(regenerated.text(), parent.text());
+
+    run_one(&pool, "DROP TABLE ddl_ref_child").await;
+    run_one(&pool, "DROP TABLE ddl_ref_parent").await;
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn postgres_view_and_index_ddl_are_the_servers_own() {
     let Some(url) = pg_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
