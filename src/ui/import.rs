@@ -316,12 +316,12 @@ pub fn ImportDialog(
                                 option {
                                     value: "null",
                                     selected: empty_field() == EmptyField::Null,
-                                    "become NULL (or the column's default where NULL isn't allowed)"
+                                    "{EmptyField::Null.choice()}"
                                 }
                                 option {
                                     value: "text",
                                     selected: empty_field() == EmptyField::EmptyText,
-                                    "become an empty string"
+                                    "{EmptyField::EmptyText.choice()}"
                                 }
                             }
                         }
