@@ -63,7 +63,8 @@ async fn stock_postgres_is_detected_as_stock_postgres() {
     // so without this, a detection change that swept stock Postgres into an
     // engine branch would pass everything CI runs. CI's Linux leg starts the
     // Postgres this needs and requires its variable (`ci.yml`,
-    // `tests/ci_workflow.rs`); before it did, this skipped there like the rest.
+    // `ci_linux_runs_the_postgres_suites` in tests/common); before it did, this
+    // skipped there like the rest.
     assert_eq!(pool.pg_flavor(), Some(PgFlavor::Postgres));
 
     pool.close().await;
@@ -131,7 +132,15 @@ async fn a_server_sent_serialization_failure_classifies_as_transient() {
     let other = pool.query("SELECT 1 / 0").await.unwrap_err();
     assert!(!other.is_transient(), "{other:?}");
 
-    // Including the nearest neighbour: a deadlock (`40P01`) is retryable in
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn a_deadlock_is_not_classified_as_transient() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+
+    // The nearest neighbour of `40001`: a deadlock (`40P01`) is retryable in
     // the same sense, and postgres.rs leaves it out on purpose — it means
     // genuine contention, not a racing schema change. Nothing pinned that
     // choice: classifying `40P01` too passed the whole suite. Two transactions

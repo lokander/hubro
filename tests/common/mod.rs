@@ -688,6 +688,34 @@ fn a_required_url_names_an_engine_that_honours_it() {
     }
 }
 
+#[test]
+fn ci_linux_runs_the_postgres_suites() {
+    // CI's Linux leg starts a Postgres for the suites (ci.yml), and this is
+    // what notices if the URL stops reaching `cargo test` — the step's output
+    // not written to $GITHUB_ENV, its `if:` flipped, the step moved below
+    // Test, the requirement's name misspelled. Every one of those leaves the
+    // Postgres tests skipping and CI green, and every one leaves an `echo`
+    // line in ci.yml for a source-reading test to find, which is why this
+    // asks the running process instead. Inert everywhere else: `RUNNER_OS`
+    // and `GITHUB_ACTIONS` are set by the Actions runner, and a developer
+    // running without Postgres should still skip.
+    let set_to = |name: &str, value: &str| std::env::var(name).is_ok_and(|v| v == value);
+    if !(set_to("GITHUB_ACTIONS", "true") && set_to("RUNNER_OS", "Linux")) {
+        return;
+    }
+    assert!(
+        std::env::var(Engine::Postgres.env()).is_ok(),
+        "CI's Linux leg has no {}, so every Postgres suite skips",
+        Engine::Postgres.env()
+    );
+    assert!(
+        required_test_urls().contains(&Engine::Postgres.env()),
+        "CI's Linux leg does not list {} in {REQUIRE_TEST_URLS}, so losing it \
+         would skip the Postgres suites and pass",
+        Engine::Postgres.env()
+    );
+}
+
 /// Builds this process a database of its own and returns the URL naming it.
 ///
 /// # Why
