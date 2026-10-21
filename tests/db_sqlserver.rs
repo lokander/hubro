@@ -2051,6 +2051,56 @@ async fn sqlserver_every_key_type_jumps_to_the_row_it_references() {
 }
 
 #[tokio::test]
+async fn sqlserver_key_types_re_address_under_a_british_login() {
+    // SQL Server reads a `datetime` or `smalldatetime` spelled
+    // `2024-02-29 13:45:01.123` by the session's DATEFORMAT, and a British
+    // (or German, French, …) login's is dmy: that spelling becomes year-day-
+    // month, so 29 February is out of range and 2 January is 1 February.
+    // The grid spells every row's key that way, so under such a login the
+    // row could not be re-addressed and a jump into it landed nowhere. The
+    // fixtures are written by the usual login; the keys are read back and
+    // used by a login whose default language is British.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    let slugs = create_key_type_fixtures(&pool, "brit").await;
+    run_all(
+        &pool,
+        &[
+            "IF SUSER_ID(N'hubro_british') IS NULL \
+             CREATE LOGIN hubro_british WITH PASSWORD = N'Br1tish!Passw0rd', \
+             CHECK_POLICY = OFF, DEFAULT_LANGUAGE = British",
+            "IF USER_ID(N'hubro_british') IS NULL \
+             CREATE USER hubro_british FOR LOGIN hubro_british",
+            "ALTER ROLE db_owner ADD MEMBER hubro_british",
+        ],
+    )
+    .await;
+    let scheme_end = url.find("://").expect("a URL") + 3;
+    let at = scheme_end + url[scheme_end..].find('@').expect("credentials");
+    let british_url = format!(
+        "{}hubro_british:Br1tish!Passw0rd{}",
+        &url[..scheme_end],
+        &url[at..]
+    );
+    let british = DbPool::open_mssql(&british_url).await.unwrap();
+    // The session really reads dates day-first, or this proves nothing.
+    let language = british.query("SELECT @@LANGUAGE").await.unwrap();
+    assert_eq!(language.rows[0][0], Value::Text("British".into()));
+
+    let mut failures = Vec::new();
+    for slug in &slugs {
+        let parent = introspect_table(&british, &format!("brit_{slug}")).await;
+        let child = introspect_table(&british, &format!("britfk_{slug}")).await;
+        failures.extend(common::row_addressing_failures(&british, &parent).await);
+        failures.extend(common::fk_jump_failures(&british, &child, &parent).await);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    british.close().await;
+    drop_key_type_fixtures(&pool, "brit", &slugs).await;
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn sqlserver_contains_filter_is_a_substring_search_whatever_the_needle_holds() {
     // T-SQL's `LIKE` reads `[…]` as a character class: unescaped, `[a]`
     // matched every value holding an `a`, and a lone `[` matched nothing.

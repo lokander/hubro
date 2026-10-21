@@ -530,7 +530,46 @@ pub async fn introspect(pool: &SqlitePool) -> Result<Vec<TableMeta>, DbError> {
             kind_label: None,
         });
     }
+    canonicalize_foreign_keys(&mut tables);
     Ok(tables)
+}
+
+/// Rewrites every foreign key's referenced table and columns to the names
+/// they resolve to, as `sqlite_master` and the table's columns spell them.
+///
+/// `pragma_foreign_key_list` reports a reference *as written* in the
+/// `REFERENCES` clause, and SQLite resolves those names case-insensitively
+/// (ASCII only): `REFERENCES Parent(ID)` is a working key into `parent(id)`.
+/// Left as written, the jump looked for a table named `Parent` in the loaded
+/// schema, found none, and the key's link led nowhere. A name that resolves
+/// to nothing is left as it is — that reference really is dangling.
+fn canonicalize_foreign_keys(tables: &mut [TableMeta]) {
+    let columns_of: HashMap<String, (String, Vec<String>)> = tables
+        .iter()
+        .map(|t| {
+            (
+                t.name.to_ascii_lowercase(),
+                (
+                    t.name.clone(),
+                    t.columns.iter().map(|c| c.name.clone()).collect(),
+                ),
+            )
+        })
+        .collect();
+    for table in tables.iter_mut() {
+        for fk in &mut table.foreign_keys {
+            let Some((name, columns)) = columns_of.get(&fk.referenced_table.to_ascii_lowercase())
+            else {
+                continue;
+            };
+            fk.referenced_table = name.clone();
+            for referenced in fk.referenced_columns.iter_mut().flatten() {
+                if let Some(real) = columns.iter().find(|c| c.eq_ignore_ascii_case(referenced)) {
+                    *referenced = real.clone();
+                }
+            }
+        }
+    }
 }
 
 /// One object the schema tree lists, as `sqlite_master` describes it.

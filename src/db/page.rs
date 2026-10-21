@@ -317,31 +317,32 @@ pub enum Filter {
 }
 
 /// One `column = value` term of [`Filter::Equalities`]: a typed value
-/// compared against a column of the filtered table under that column's
-/// Postgres cast, exactly as a key value is when a row is re-addressed for a
-/// read or a write.
+/// compared against a column of the filtered table, bound by that column's
+/// type exactly as a key value is when a row is re-addressed for a read or a
+/// write.
 ///
-/// The cast is resolved when the filter is built ([`super::build_fk_filter`]
-/// reads it off the target table), so every consumer of the filter — the
-/// page, its row count, an export — renders the same predicate from the
-/// filter alone, with nothing of its own to supply.
+/// The column's metadata is resolved when the filter is built
+/// ([`super::build_fk_filter`] reads it off the target table), so every
+/// consumer of the filter — the page, its row count, an export — renders the
+/// same predicate from the filter alone, with nothing of its own to supply.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeyEquality {
     pub column: String,
     pub value: Value,
-    /// The column's Postgres cast target (`"double precision"`, `"bpchar"`,
-    /// …), or `None` on a dialect that casts nothing or a column whose type
-    /// is unknown, where the value binds uncast.
-    pub cast: Option<String>,
+    /// The compared column's introspected metadata, which decides how the
+    /// value binds: its Postgres cast and the spellings `staged` adjusts for
+    /// the server (a CockroachDB `real`, a SQL Server `datetime`). `None`
+    /// binds the value as it is.
+    pub target: Option<ColumnMeta>,
 }
 
 impl KeyEquality {
-    /// An uncast term — for a dialect that casts nothing, or a test.
-    pub fn uncast(column: impl Into<String>, value: Value) -> KeyEquality {
+    /// A term with no column metadata — bound as the value is.
+    pub fn untyped(column: impl Into<String>, value: Value) -> KeyEquality {
         KeyEquality {
             column: column.into(),
             value,
-            cast: None,
+            target: None,
         }
     }
 }
@@ -826,8 +827,8 @@ mod tests {
         // to `nvarchar` — `CAST(float AS nvarchar)` keeps six digits.
         let mut req = base();
         req.filter = Some(Filter::Equalities(vec![
-            KeyEquality::uncast("region", Value::Text("eu".into())),
-            KeyEquality::uncast("ratio", Value::Real(1e20)),
+            KeyEquality::untyped("region", Value::Text("eu".into())),
+            KeyEquality::untyped("ratio", Value::Real(1e20)),
         ]));
         let (sql, params) = req.select_sql(Dialect::SqlServer);
         assert_eq!(
@@ -865,8 +866,8 @@ mod tests {
     fn equalities_filter_ands_the_pairs_sqlite() {
         let mut req = base();
         req.filter = Some(Filter::Equalities(vec![
-            KeyEquality::uncast("artist_id", Value::Integer(1)),
-            KeyEquality::uncast("blob_key", Value::Blob(vec![0, 255])),
+            KeyEquality::untyped("artist_id", Value::Integer(1)),
+            KeyEquality::untyped("blob_key", Value::Blob(vec![0, 255])),
         ]));
         let (sql, params) = req.select_sql(Dialect::Sqlite);
         assert_eq!(
@@ -886,12 +887,12 @@ mod tests {
             KeyEquality {
                 column: "region".into(),
                 value: Value::Text("eu ".into()),
-                cast: Some("bpchar".into()),
+                target: Some(col("region", "character", None)),
             },
             KeyEquality {
                 column: "ratio".into(),
                 value: Value::Real(1e20),
-                cast: Some("double precision".into()),
+                target: Some(col("ratio", "double precision", None)),
             },
         ]));
         let (sql, params) = req.select_sql(Dialect::Postgres);
@@ -900,7 +901,12 @@ mod tests {
             sql,
             format!("SELECT * FROM \"tracks\"{clause} LIMIT 100 OFFSET 200")
         );
-        assert_eq!(params, vec![Value::Text("eu ".into()), Value::Real(1e20)]);
+        // Under a cast every value binds as text the cast parses, so one
+        // statement has one bind shape whatever the source column was.
+        assert_eq!(
+            params,
+            vec![Value::Text("eu ".into()), Value::Text("1e20".into())]
+        );
         // The count and the export share the same clause and binds — every
         // consumer of the jump renders the one predicate.
         let (count_sql, count_params) = req.count_sql(Dialect::Postgres);
@@ -917,7 +923,7 @@ mod tests {
     #[test]
     fn equalities_filter_quotes_weird_identifiers() {
         let mut req = base();
-        req.filter = Some(Filter::Equalities(vec![KeyEquality::uncast(
+        req.filter = Some(Filter::Equalities(vec![KeyEquality::untyped(
             "col\"name",
             Value::Text("x".into()),
         )]));

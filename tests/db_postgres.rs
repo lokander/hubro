@@ -16,11 +16,11 @@
 mod common;
 
 use hubro::db::{
-    detect_row_identity, explain_statement, needs_confirmation, plan_reached_cell_cap, run_script,
-    script_refusal, url_with_password, Capabilities, DbError, DbPool, Dialect, Filter, Internal,
-    PageRequest, PgFlavor, PlanDisplay, Restriction, Rollback, RowCount, RowLocator, SortDir,
-    StatementOutcome, TableKind, TableMeta, TypeDetail, TypeRef, Value, WriteProtection,
-    PREVIEW_BYTES, QUERY_CELL_CAP,
+    apply_staged, detect_row_identity, explain_statement, needs_confirmation,
+    plan_reached_cell_cap, run_script, script_refusal, url_with_password, Capabilities, DbError,
+    DbPool, Dialect, Filter, Internal, PageRequest, PgFlavor, PlanDisplay, Restriction, Rollback,
+    RowCount, RowLocator, SortDir, StagedChange, StatementOutcome, TableKind, TableMeta,
+    TypeDetail, TypeRef, Value, WriteProtection, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 async fn test_url() -> Option<String> {
@@ -2045,6 +2045,134 @@ async fn postgres_every_key_type_jumps_to_the_row_it_references() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 
     pool.query("DROP SCHEMA fk_keys CASCADE").await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_jumps_from_differently_typed_sources_share_no_statement() {
+    // sqlx caches a prepared statement by its SQL text alone, with the
+    // parameter types of the first execution. A jump's SQL is decided by the
+    // *target* column, its bind by the *source* column, so two foreign keys
+    // of different types into one column render the same statement with
+    // different binds: an `int` key into `numeric` and then a `numeric` one
+    // failed outright, and a `double precision` key after an `int` one had
+    // its bits read as an int8 and silently landed on an empty page. One
+    // session, several rounds, so every jump meets the others' statements.
+    // (CockroachDB refuses a foreign key whose type differs from the column
+    // it references, so there this shape cannot be built.)
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres_single_session(&url).await.unwrap();
+    for sql in [
+        "DROP SCHEMA IF EXISTS mixed_fk CASCADE",
+        "CREATE SCHEMA mixed_fk",
+        "CREATE TABLE mixed_fk.pnum (id numeric PRIMARY KEY, body text)",
+        "INSERT INTO mixed_fk.pnum VALUES (1, '0:'), (2, '1:')",
+        "CREATE TABLE mixed_fk.pdbl (id double precision PRIMARY KEY, body text)",
+        "INSERT INTO mixed_fk.pdbl VALUES (1, '0:'), (2.5, '1:')",
+        "CREATE TABLE mixed_fk.a_int (pid int REFERENCES mixed_fk.pnum, expect text)",
+        "INSERT INTO mixed_fk.a_int VALUES (1, '0:')",
+        "CREATE TABLE mixed_fk.b_num (pid numeric REFERENCES mixed_fk.pnum, expect text)",
+        "INSERT INTO mixed_fk.b_num VALUES (2, '1:')",
+        "CREATE TABLE mixed_fk.c_int (pid int REFERENCES mixed_fk.pdbl, expect text)",
+        "INSERT INTO mixed_fk.c_int VALUES (1, '0:')",
+        "CREATE TABLE mixed_fk.d_dbl (pid double precision REFERENCES mixed_fk.pdbl, expect text)",
+        "INSERT INTO mixed_fk.d_dbl VALUES (2.5, '1:')",
+    ] {
+        pool.query(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let tables = pool.introspect().await.unwrap();
+    let named = |name: &str| {
+        tables
+            .iter()
+            .find(|t| t.schema.as_deref() == Some("mixed_fk") && t.name == name)
+            .unwrap_or_else(|| panic!("{name} was not introspected"))
+    };
+    let mut failures = Vec::new();
+    for round in 0..3 {
+        for (child, parent) in [
+            ("a_int", "pnum"),
+            ("b_num", "pnum"),
+            ("c_int", "pdbl"),
+            ("d_dbl", "pdbl"),
+        ] {
+            for failure in common::fk_jump_failures(&pool, named(child), named(parent)).await {
+                failures.push(format!("round {round}: {failure}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    pool.query("DROP SCHEMA mixed_fk CASCADE").await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_writes_of_differently_typed_values_share_no_statement() {
+    // The same cache, reached by Save: the cell editor stages `42` typed
+    // into a `double precision` cell as an integer and `1.5` as a float,
+    // and both render `SET "f" = $1::double precision WHERE …`. Whichever
+    // ran second on a session was bound against the first one's types — a
+    // float's bits read as an int8, or an integer refused by a numeric bind.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres_single_session(&url).await.unwrap();
+    for sql in [
+        "DROP TABLE IF EXISTS mixed_writes",
+        "CREATE TABLE mixed_writes (id int PRIMARY KEY, f double precision, n numeric)",
+        "INSERT INTO mixed_writes VALUES (1, 0, 0), (2, 0, 0)",
+    ] {
+        pool.query(sql).await.unwrap();
+    }
+    let tables = pool.introspect().await.unwrap();
+    let table = tables
+        .iter()
+        .find(|t| t.name == "mixed_writes")
+        .expect("introspected");
+    let identity = detect_row_identity(table, pool.dialect()).unwrap();
+    let access = pool.backend_access(table);
+    let set = |id: i64, f: Value, n: Value| {
+        let locator = RowLocator {
+            identity_values: vec![Value::Integer(id)],
+        };
+        vec![
+            StagedChange::Update {
+                locator: locator.clone(),
+                column: "f".into(),
+                value: f,
+            },
+            StagedChange::Update {
+                locator,
+                column: "n".into(),
+                value: n,
+            },
+        ]
+    };
+    for round in 0..2 {
+        for (id, f, n) in [
+            (1, Value::Integer(42), Value::Integer(7)),
+            (2, Value::Real(1.5), Value::Text("12345.678".into())),
+        ] {
+            apply_staged(&pool, &access, table, &identity, &set(id, f, n))
+                .await
+                .unwrap_or_else(|e| panic!("round {round}, row {id}: {e}"));
+        }
+        let rows = pool
+            .query("SELECT f, n::text FROM mixed_writes ORDER BY id")
+            .await
+            .unwrap()
+            .rows;
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Real(42.0), Value::Text("7".into())],
+                vec![Value::Real(1.5), Value::Text("12345.678".into())],
+            ],
+            "round {round}"
+        );
+    }
+
+    pool.query("DROP TABLE mixed_writes").await.unwrap();
     pool.close().await;
 }
 

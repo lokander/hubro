@@ -1383,9 +1383,15 @@ mod tests {
             "INSERT INTO \"public\".\"people\" (\"id\", \"qty\") \
              VALUES ($1::integer, DEFAULT), ($2::integer, $3::integer)"
         );
+        // Under a cast every value binds as text the cast parses (see
+        // `ParamSql::value_sql`), so batches with the same text bind alike.
         assert_eq!(
             params,
-            vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)]
+            vec![
+                Value::Text("1".into()),
+                Value::Text("2".into()),
+                Value::Text("3".into())
+            ]
         );
         let (mssql, _) = insert_sql(&table, Dialect::SqlServer, &planned, &rows);
         assert!(
@@ -1461,9 +1467,9 @@ mod tests {
         assert_eq!(
             params,
             vec![
-                Value::Integer(1),
+                Value::Text("1".into()),
                 Value::Text("ada".into()),
-                Value::Integer(2)
+                Value::Text("2".into())
             ]
         );
 

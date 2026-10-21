@@ -128,8 +128,8 @@ async fn jump(
         .iter()
         .find(|t| t.name == fk.referenced_table && t.schema == fk.referenced_schema)
         .expect("target table is introspected");
-    let filter = build_fk_filter(fk, source, target, pool.dialect())
-        .expect("a fully-populated FK builds a jump filter");
+    let filter =
+        build_fk_filter(fk, source, target).expect("a fully-populated FK builds a jump filter");
     let req = PageRequest {
         schema: target.schema.clone(),
         table: target.name.clone(),
@@ -190,18 +190,9 @@ async fn assert_fk_navigation(pool: &DbPool) {
     assert_eq!(rows[0][label_idx], Value::Text("Shelf A".into()));
 
     // An all-NULL child row references nothing: no jump is built.
-    let dialect = pool.dialect();
+    assert!(build_fk_filter(child_fk(child, &["category_id"]), &row11, category).is_none());
     assert!(
-        build_fk_filter(child_fk(child, &["category_id"]), &row11, category, dialect).is_none()
-    );
-    assert!(
-        build_fk_filter(
-            child_fk(child, &["region", "slot"]),
-            &row11,
-            parent,
-            dialect
-        )
-        .is_none(),
+        build_fk_filter(child_fk(child, &["region", "slot"]), &row11, parent).is_none(),
         "a partial/whole NULL composite FK builds no jump"
     );
 }
@@ -225,5 +216,40 @@ async fn postgres_fk_jump_selects_the_referenced_rows() {
         pool.query(sql).await.unwrap();
     }
     assert_fk_navigation(&pool).await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_references_resolve_whatever_case_they_were_written_in() {
+    // SQLite resolves `REFERENCES Parent(ID)` against `parent(id)`
+    // case-insensitively, but reports the reference as written; the jump
+    // looked for a table named `Parent`, found none and led nowhere. The
+    // implicit-key form (`REFERENCES PARENT`) never jumped at all.
+    let fixture = FixtureDb::with_sql(
+        "CREATE TABLE parent (id INTEGER PRIMARY KEY, body TEXT);
+         INSERT INTO parent VALUES (1, '0:'), (2, '1:');
+         CREATE TABLE explicit_ref (pid INTEGER REFERENCES Parent(ID), expect TEXT);
+         INSERT INTO explicit_ref VALUES (1, '0:'), (2, '1:');
+         CREATE TABLE implicit_ref (pid INTEGER REFERENCES PARENT, expect TEXT);
+         INSERT INTO implicit_ref VALUES (2, '1:');",
+    )
+    .await;
+    let pool = fixture.open().await;
+    let tables = pool.introspect().await.unwrap();
+    let named = |name: &str| tables.iter().find(|t| t.name == name).unwrap();
+    let parent = named("parent");
+    let mut failures = Vec::new();
+    for child in ["explicit_ref", "implicit_ref"] {
+        let fk = &named(child).foreign_keys[0];
+        assert_eq!(fk.referenced_table, "parent", "{child}");
+        assert!(
+            fk.referenced_columns
+                .iter()
+                .all(|c| c.as_deref().is_none_or(|c| c == "id")),
+            "{child}: {fk:?}"
+        );
+        failures.extend(common::fk_jump_failures(&pool, named(child), parent).await);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
     pool.close().await;
 }
