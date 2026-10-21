@@ -880,27 +880,6 @@ fn key_equality_sql(
 /// `value` itself, except where the server would read hubro's spelling of
 /// it as some other value.
 ///
-/// - **A `real` holding an `f32` widened to `f64`** binds as the shortest
-///   decimal spelling of that `f32` (`'1e-1'::real`) instead of the widened
-///   digits (`0.10000000149011612`). A cell read off the wire no longer
-///   arrives widened — it reads as that shortest decimal already
-///   ([`super::value::real_from_f32`]), which [`cast_text`] spells the same
-///   way — so this arm is what keeps a widened value from any other source
-///   from missing its row. CockroachDB keeps a
-///   `real` as a 64-bit float, so `::real` rounds nothing there — measured
-///   on v26.2.5, a key stored as `0.1` holds the float64 `0.1`,
-///   `0.10000000149011612::float8::real` stays that float64 and matches
-///   nothing, and `'0.1'::real` matches. The wire still sends the column as
-///   a 4-byte `float4`, so the grid only ever holds the `f32`; its shortest
-///   spelling is the decimal the row was written with whenever it was
-///   written with no more digits than a `real` holds. On PostgreSQL (and the
-///   engines that keep a true 4-byte `real`) the spelling reads back as the
-///   very same `f32`. An `f64` that is no `f32` — a `double precision`
-///   foreign key into a `real` column, which CockroachDB's 64-bit `real` can
-///   match digit for digit — is left to [`cast_text`], which spells it as
-///   itself. A `real` key on CockroachDB written with more digits than an
-///   `f32` holds stays unreachable: the wire rounded them away before hubro
-///   saw the row, and no bind can put them back.
 /// - **A SQL Server `datetime` or `smalldatetime`** binds in the ISO 8601
 ///   form with a `T` (`2024-02-29T13:45:01.123`) instead of the grid's
 ///   `2024-02-29 13:45:01.123`. SQL Server reads the space-separated form by
@@ -914,16 +893,6 @@ fn key_equality_sql(
 fn key_spelling<'a>(meta: &ColumnMeta, dialect: Dialect, value: &'a Value) -> Cow<'a, Value> {
     let type_name = meta.type_name.trim();
     match (dialect, value) {
-        (Dialect::Postgres, Value::Real(wide))
-            if type_name.eq_ignore_ascii_case("real") && f64::from(*wide as f32) == *wide =>
-        {
-            let narrow = *wide as f32;
-            Cow::Owned(Value::Text(if narrow.is_finite() {
-                format!("{narrow:e}")
-            } else {
-                float_spelling(*wide)
-            }))
-        }
         (Dialect::SqlServer, Value::Text(text))
             if type_name.eq_ignore_ascii_case("datetime")
                 || type_name.eq_ignore_ascii_case("smalldatetime") =>
@@ -1421,95 +1390,6 @@ mod tests {
         // A locator that fits is accepted.
         assert_eq!(locator_mismatch(&identity(), &locator(1)), None);
         assert!(row_where(&table(), &identity(), Dialect::Sqlite, &locator(1)).is_ok());
-    }
-
-    #[test]
-    fn a_real_key_binds_as_the_shortest_spelling_of_its_f32() {
-        // CockroachDB keeps a `real` as a float64, so the widened read-back
-        // `0.10000000149011612::real` matched nothing there; `'1e-1'::real`
-        // is the decimal the row was written with, and on PostgreSQL the
-        // same f32. Pinned here because no CI leg runs CockroachDB.
-        let col = |name: &str, type_name: &str, pk: Option<u32>| ColumnMeta {
-            type_name: type_name.into(),
-            ..col(name, pk)
-        };
-        let floats = TableMeta {
-            columns: vec![
-                col("r", "real", Some(1)),
-                col("d", "double precision", Some(2)),
-                col("other", "real", None),
-            ],
-            ..pg_table()
-        };
-        let both = RowIdentity::PrimaryKey {
-            columns: vec!["r".into(), "d".into()],
-        };
-        let key = |r: f64| RowLocator {
-            identity_values: vec![Value::Real(r), Value::Real(f64::from(0.1f32))],
-        };
-        let text = |t: &str| Value::Text(t.into());
-        let spelled = |r: f64| {
-            let (clause, params) = row_where(&floats, &both, Dialect::Postgres, &key(r)).unwrap();
-            assert_eq!(
-                clause,
-                " WHERE \"r\" = $1::real AND \"d\" = $2::double precision"
-            );
-            // A `double precision` key spells as its own f64, even when it
-            // happens to hold an f32's exact value.
-            assert_eq!(params[1], text("1.0000000149011612e-1"));
-            params[0].clone()
-        };
-        assert_eq!(spelled(f64::from(0.1f32)), text("1e-1"));
-        assert_eq!(spelled(f64::from(1e20f32)), text("1e20"));
-        assert_eq!(spelled(f64::from(f32::MAX)), text("3.4028235e38"));
-        assert_eq!(spelled(f64::from(f32::from_bits(1))), text("1e-45"));
-        // The non-finite values in the spelling every Postgres-family engine
-        // reads, not Rust's `inf`.
-        assert_eq!(spelled(f64::NAN), text("NaN"));
-        assert_eq!(spelled(f64::INFINITY), text("Infinity"));
-        assert_eq!(spelled(f64::NEG_INFINITY), text("-Infinity"));
-        // An f64 that is no f32 (a `double precision` foreign key into a
-        // `real` column) spells as itself.
-        assert_eq!(spelled(0.1), text("1e-1"));
-        assert_eq!(spelled(0.123456789012), text("1.23456789012e-1"));
-
-        // The foreign-key jump binds through the same rendering.
-        let jump = [KeyEquality {
-            column: "r".into(),
-            value: Value::Real(f64::from(0.1f32)),
-            target: Some(floats.columns[0].clone()),
-        }];
-        assert_eq!(
-            equalities_where(&jump, Dialect::Postgres),
-            (" WHERE \"r\" = $1::real".to_string(), vec![text("1e-1")])
-        );
-
-        // A SET writes the value as staged — as its own f64, never narrowed
-        // to an f32's spelling: only key positions respell.
-        let (statements, _) = build_statements(
-            &floats,
-            &both,
-            Dialect::Postgres,
-            &[StagedChange::Update {
-                locator: key(f64::from(0.5f32)),
-                column: "other".into(),
-                value: Value::Real(f64::from(0.1f32)),
-            }],
-        )
-        .unwrap();
-        assert_eq!(
-            statements[0].params,
-            [
-                text("1.0000000149011612e-1"),
-                text("5e-1"),
-                text("1.0000000149011612e-1")
-            ]
-        );
-        // No other dialect respells: SQL Server casts a `real` key instead,
-        // and binds it typed.
-        let (clause, params) = row_where(&floats, &both, Dialect::SqlServer, &key(0.5)).unwrap();
-        assert_eq!(clause, " WHERE \"r\" = CAST(@P1 AS real) AND \"d\" = @P2");
-        assert_eq!(params, key(0.5).identity_values);
     }
 
     #[test]
