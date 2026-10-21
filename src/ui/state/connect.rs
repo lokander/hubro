@@ -1664,14 +1664,22 @@ impl AppState {
             request.task.cancel();
         }
         self.connecting.write().retain(|c| c.locator != locator);
+        self.restoring.write().remove(locator);
     }
 
     /// Clears a connect's in-flight state. Returns whether the tab it
-    /// produced should be focused — false only when a shift-click asked for
-    /// the background. Connects with no request (started from a form, or
-    /// resumed after a password prompt) focus as before.
+    /// produced should be focused — false only when a shift-click or a
+    /// session restore asked for the background. Connects with no request
+    /// (started from a form, or resumed after a password prompt) focus as
+    /// before.
+    ///
+    /// A restored tab's remembered view goes too: a connect that ends
+    /// anywhere but [`Self::finish_connect`]'s success — an error, a prompt —
+    /// reopens nothing, and the tab a later attempt opens starts fresh, as it
+    /// always has.
     fn release_connect(mut self, locator: &str) -> bool {
         self.connecting.write().retain(|c| c.locator != locator);
+        self.restoring.write().remove(locator);
         let request = self.connect_requests.write().remove(locator);
         request.is_none_or(|r| r.focus)
     }
@@ -1766,6 +1774,8 @@ impl AppState {
         result: Result<DbPool, DbError>,
         tunnel: Option<Tunnel>,
     ) {
+        // Taken before `release_connect`, which discards it.
+        let restored = self.restoring.write().remove(&locator);
         let focus = self.release_connect(&locator);
         match result {
             Ok(pool) => {
@@ -1779,11 +1789,15 @@ impl AppState {
                     self.connection_colors.write().insert(id, color);
                 }
                 if let Some(tunnel) = tunnel {
+                    self.watch_tunnel(id, &tunnel);
                     self.tunnels.write().insert(id, tunnel);
                 }
                 self.open_locators.write().push((id, locator));
                 if focus {
                     self.active.set(ActiveView::Connection(id));
+                }
+                if let Some(restored) = restored {
+                    self.apply_restored(id, restored);
                 }
                 // Runs either way: a background tab should be ready to use
                 // the moment the user switches to it.
@@ -1794,6 +1808,40 @@ impl AppState {
                 self.connect_error.set(Some(err.to_string()));
             }
         }
+    }
+
+    /// Marks connection `id` as cut off once its tunnel's SSH session ends
+    /// ([`Tunnel::session_ended`]), so its tab can say so.
+    fn watch_tunnel(self, id: ConnectionId, tunnel: &Tunnel) {
+        let message = format!(
+            "{}, so this connection can no longer reach the database. Close the tab and \
+             connect again.",
+            tunnel.ended_message()
+        );
+        self.mark_lost_when(id, tunnel.session_ended(), message);
+    }
+
+    /// Records `message` for connection `id` once `ended` resolves, if the
+    /// connection is still open then.
+    ///
+    /// Closing the tab drops its tunnel, which ends the session too; by then
+    /// the connection has left the registry, and that absence is what tells
+    /// the two apart. The watch ends with the session either way, so nothing
+    /// outlives the tab.
+    fn mark_lost_when(
+        self,
+        id: ConnectionId,
+        ended: impl std::future::Future<Output = ()> + 'static,
+        message: String,
+    ) {
+        let mut lost = self.lost_tunnels;
+        let registry = self.registry;
+        spawn_forever(async move {
+            ended.await;
+            if registry.peek().get(id).is_some() {
+                lost.write().insert(id, message);
+            }
+        });
     }
 
     /// The write protection and accent colour saved for `locator`,
@@ -3758,5 +3806,63 @@ mod tests {
                 "{var}: a server that wants a password must still be asked for one"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_tab_is_flagged_when_its_session_ends_but_not_once_it_has_closed() {
+        use dioxus::core::{NoOpMutations, VirtualDom};
+
+        use crate::ui::test_dom::provide_state;
+
+        fn empty() -> Element {
+            rsx! {}
+        }
+        let mut dom = VirtualDom::new(empty);
+        let state = provide_state(&dom);
+        dom.rebuild_in_place();
+        let open = |name: &str| {
+            let pool =
+                DbPool::Sqlite(sqlx::sqlite::SqlitePool::connect_lazy("sqlite::memory:").unwrap());
+            dom.in_runtime(|| {
+                let mut registry = state.registry;
+                let id = registry.write().insert(name, pool, WriteProtection::Open);
+                id
+            })
+        };
+        let (still_open, closed) = (open("a"), open("b"));
+        let (end_open, ended_open) = tokio::sync::oneshot::channel::<()>();
+        let (end_closed, ended_closed) = tokio::sync::oneshot::channel::<()>();
+        dom.in_runtime(|| {
+            state.mark_lost_when(
+                still_open,
+                async {
+                    let _ = ended_open.await;
+                },
+                "a lost".into(),
+            );
+            state.mark_lost_when(
+                closed,
+                async {
+                    let _ = ended_closed.await;
+                },
+                "b lost".into(),
+            );
+        });
+        // Closing a tab ends its session; that is not news to report.
+        dom.in_runtime(|| state.close_connection(closed));
+        drop(end_closed);
+        drop(end_open);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while dom.in_runtime(|| state.lost_tunnels.peek().is_empty()) {
+            assert!(tokio::time::Instant::now() < deadline, "never flagged");
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), dom.wait_for_work())
+                .await;
+            dom.render_immediate(&mut NoOpMutations);
+        }
+        // One more round, so the closed tab's watch has had its chance too.
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_millis(50), dom.wait_for_work()).await;
+        let lost = dom.in_runtime(|| state.lost_tunnels.peek().clone());
+        assert_eq!(lost, HashMap::from([(still_open, "a lost".to_string())]));
     }
 }

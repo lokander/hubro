@@ -17,6 +17,7 @@ use super::connections::ConnectionsScreen;
 use super::editor::SqlEditor;
 use super::grid::DataGrid;
 use super::icons::BackendIcon;
+use super::notice::{Banner, BannerKind};
 use super::schema::SchemaPane;
 use super::schema_edit::SchemaEditLine;
 use super::sidebar::SchemaSidebar;
@@ -125,12 +126,17 @@ pub fn Shell() -> Element {
     // than in argv; the queue is unbounded, so one delivered before the first
     // render is opened rather than dropped).
     //
-    // All of it runs after `restore_session().await` and one at a time, which
-    // is a property of this being one sequence rather than of any comment:
-    // restore ends by activating whichever tab was in front last time, so
-    // anything opened alongside it would be silently pushed to the background
-    // — the very thing the user asked for, behind a tab they did not.
-    // `next_startup_target` holds the ordering, and its tests hold it.
+    // `restore_session().await` returns once the restored tabs' connects have
+    // *started*; they run in the background, each cancellable from its row,
+    // and what follows does not wait for them — a restored tab whose server
+    // never answers used to hold the command-line target up behind it. The
+    // targets themselves still open one at a time, in order:
+    // `next_startup_target` holds that ordering, and its tests hold it.
+    //
+    // Running beside the restore cannot cost a target the foreground: the
+    // restored tab that was in front last time comes forward only while the
+    // connections screen is still showing (`restored_tab_takes_focus`), and a
+    // target the user asked for has replaced it by then.
     use_hook(|| {
         let mut startup = try_consume_context::<Startup>().and_then(|Startup(target)| target);
         let mut opened = crate::cli::take_opened();
@@ -601,6 +607,9 @@ fn ConnectionView(id: ConnectionId) -> Element {
             div { class: "p-8 text-slate-500 dark:text-slate-400", "This connection is closed." }
         };
     };
+    // Its SSH session ended under it: say so above every pane, since every
+    // pane's own errors would otherwise be all there is to go on.
+    let lost = state.lost_tunnels.read().get(&id).cloned();
     let (selected, pane) = {
         let tab_ui = state.tab_ui.read();
         let ui = tab_ui.get(&id);
@@ -618,6 +627,11 @@ fn ConnectionView(id: ConnectionId) -> Element {
                 SchemaSidebar { id }
             }
             section { class: "flex min-w-0 flex-1 flex-col",
+                if let Some(message) = lost {
+                    div { class: "border-b border-slate-200 dark:border-slate-800 px-3 py-2",
+                        Banner { kind: BannerKind::Error, message }
+                    }
+                }
                 div { class: "flex gap-1 border-b border-slate-200 dark:border-slate-800 px-3 py-1.5",
                     PaneButton { id, pane, target: super::state::Pane::Browser, label: "Data" }
                     PaneButton { id, pane, target: super::state::Pane::Sql, label: "SQL" }
