@@ -30,38 +30,94 @@
 //!
 //! **That the Postgres suites run.** Every engine suite skips, and passes,
 //! when its variable is unset. The Linux leg starts a Postgres, and
-//! `HUBRO_REQUIRE_TEST_URLS` turns a lost `HUBRO_PG_TEST_URL` into a failure —
-//! but only while ci.yml still sets it, which is what the last test pins.
+//! `HUBRO_REQUIRE_TEST_URLS` turns a lost `HUBRO_PG_TEST_URL` into a failure.
+//! That is checked at run time rather than here, by
+//! `ci_linux_runs_the_postgres_suites` in `tests/common/mod.rs`: reading
+//! ci.yml's text could only pin that an `echo` line exists, not that its
+//! value reaches `cargo test`.
 
 use std::process::Command;
 
 const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
 
 /// Every pattern under a `paths-ignore:` key, in file order. A scanner over
-/// the one shape the file uses — a block list of quoted strings — for the
-/// reason `file_associations.rs` gives for its own: one property of one
-/// checked-in file does not repay a YAML dependency.
+/// the one shape the file uses — a block list of strings — for the reason
+/// `file_associations.rs` gives for its own: one property of one checked-in
+/// file does not repay a YAML dependency.
+///
+/// Anything outside that shape panics rather than being read loosely. The
+/// first version trimmed `"` off each item and nothing else, so `'docs/**'`
+/// and `"docs/**" # why` both became patterns no file could match — read as
+/// harmless, while GitHub honoured them and skipped CI for all of `docs/`.
 fn ignored_patterns(workflow: &str) -> Vec<String> {
     let mut patterns = Vec::new();
     let mut in_list = false;
     for line in workflow.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('#') || trimmed.is_empty() {
+        let code = strip_comment(line);
+        let trimmed = code.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        if trimmed == "paths-ignore:" {
-            in_list = true;
-            continue;
+        if let Some((key, value)) = trimmed.split_once(':') {
+            if key.trim().trim_matches(|c| c == '"' || c == '\'') == "paths-ignore" {
+                assert!(
+                    value.trim().is_empty(),
+                    "ci.yml writes paths-ignore inline ({line:?}); this scanner reads only \
+                     a block list, one `- pattern` per line"
+                );
+                in_list = true;
+                continue;
+            }
         }
         if !in_list {
             continue;
         }
-        match trimmed.strip_prefix("- ") {
-            Some(item) => patterns.push(item.trim().trim_matches('"').to_string()),
+        match trimmed.strip_prefix('-') {
+            Some(item) => patterns.push(yaml_scalar(item.trim(), line)),
             None => in_list = false,
         }
     }
     patterns
+}
+
+/// `line` up to an unquoted ` #` — YAML's comment marker needs the space (or
+/// the start of the line) before it, which is what keeps `#` inside a value.
+fn strip_comment(line: &str) -> &str {
+    let mut quote = None;
+    let mut previous = ' ';
+    for (at, c) in line.char_indices() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(open), _) if c == open => quote = None,
+            (None, '#') if previous.is_whitespace() => return &line[..at],
+            _ => {}
+        }
+        previous = c;
+    }
+    line
+}
+
+/// One list item's value: double-quoted, single-quoted or plain. Escapes and
+/// anything after a closing quote panic — this file never needs them, and a
+/// scanner that guessed would be guessing about what CI skips.
+fn yaml_scalar(item: &str, line: &str) -> String {
+    let unreadable = || -> ! { panic!("cannot read the paths-ignore item in {line:?}") };
+    match item.chars().next() {
+        Some(quote @ ('"' | '\'')) => {
+            let inner = &item[1..];
+            let close = inner.find(quote).unwrap_or_else(|| unreadable());
+            if !inner[close + 1..].trim().is_empty() || inner[..close].contains('\\') {
+                unreadable();
+            }
+            inner[..close].to_string()
+        }
+        // A plain scalar may not *start* with YAML's indicators — `*` there
+        // is an alias, so `- **/*.png` unquoted is not a pattern at all.
+        Some(first) if !"[]{}&*!|>%@`".contains(first) && !item.contains(['"', '\'']) => {
+            item.to_string()
+        }
+        _ => unreadable(),
+    }
 }
 
 /// Whether a GitHub filter pattern matches `path`, for the subset of the
@@ -139,12 +195,40 @@ fn the_workflow_has_no_include_filter_this_cannot_read() {
     // to list is skipped — and this file only checks `paths-ignore`. Mixing
     // the two would let the first one through unexamined.
     for line in CI_WORKFLOW.lines() {
+        let key = strip_comment(line)
+            .split_once(':')
+            .map(|(key, _)| key.trim());
         assert_ne!(
-            line.trim(),
-            "paths:",
+            key,
+            Some("paths"),
             "ci.yml uses an include filter; tests/ci_workflow.rs checks only paths-ignore"
         );
     }
+}
+
+#[test]
+fn the_list_scanner_reads_every_way_an_item_can_be_written() {
+    let workflow = "\
+on:
+  push:
+    paths-ignore: # binary art
+      - \"a/**\"
+      - 'b/**'
+      - c/**
+      - \"d/**\" # why
+      - e/x.png # why
+    branches: [main]
+";
+    assert_eq!(
+        ignored_patterns(workflow),
+        ["a/**", "b/**", "c/**", "d/**", "e/x.png"]
+    );
+}
+
+#[test]
+#[should_panic(expected = "cannot read")]
+fn the_list_scanner_refuses_what_it_cannot_read() {
+    ignored_patterns("on:\n  push:\n    paths-ignore:\n      - \"a\\\"b\"\n");
 }
 
 #[test]
@@ -168,11 +252,19 @@ fn ci_ignores_no_file_a_test_or_the_build_reads() {
         })
         .collect();
 
-    let mut matched = 0;
     let mut problems = Vec::new();
     for pattern in &patterns {
-        for file in files.iter().filter(|f| glob_matches(pattern, f)) {
-            matched += 1;
+        // Per pattern, not in total: a pattern that matches nothing is either
+        // stale or misread here, and a misread one is exactly how a real
+        // ignore slips past every check below. Counting matches across the
+        // whole list let one good pattern vouch for a broken one.
+        let matched: Vec<&String> = files.iter().filter(|f| glob_matches(pattern, f)).collect();
+        if matched.is_empty() {
+            problems.push(format!(
+                "{pattern:?} matches no tracked file — stale, or read wrongly by this test"
+            ));
+        }
+        for file in matched {
             if std::fs::read_to_string(file).is_ok() {
                 problems.push(format!(
                     "{pattern:?} skips CI for {file}, which is text — and \
@@ -195,7 +287,6 @@ fn ci_ignores_no_file_a_test_or_the_build_reads() {
         !patterns.is_empty(),
         "no paths-ignore patterns found in ci.yml"
     );
-    assert!(matched > 0, "no tracked file matches {patterns:?}");
     assert!(
         problems.is_empty(),
         "ci.yml's paths-ignore skips CI for files a test or the build \
@@ -218,30 +309,4 @@ fn push_and_pull_request_ignore_the_same_files() {
         "the push trigger's list was not found"
     );
     assert_eq!(ignored_patterns(push_side), ignored_patterns(pr_side));
-}
-
-#[test]
-fn the_linux_leg_requires_the_postgres_it_starts() {
-    // Without the requirement, deleting the container step leaves every
-    // Postgres test skipping and CI green — the state this replaced, where a
-    // comment in db_postgres.rs called stock-Postgres detection "the side CI
-    // can actually reach" and CI reached none of it.
-    let code: Vec<&str> = CI_WORKFLOW
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.starts_with('#'))
-        .collect();
-    let sets = |assignment: &str| {
-        code.iter()
-            .any(|line| line.contains(&format!("echo \"{assignment}")))
-    };
-    assert!(
-        sets("HUBRO_PG_TEST_URL=postgres://"),
-        "ci.yml no longer points the Postgres suites at a server"
-    );
-    assert!(
-        sets("HUBRO_REQUIRE_TEST_URLS=HUBRO_PG_TEST_URL"),
-        "ci.yml no longer requires HUBRO_PG_TEST_URL, so losing it would skip \
-         the Postgres suites and pass"
-    );
 }
