@@ -211,7 +211,12 @@ pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<String> {
                             continue;
                         }
                     }
-                    if let Some((word_end, bare)) = word_at(bytes, i, range.end) {
+                    let space = unicode_space_len(sql, i, dialect);
+                    if space > 0 {
+                        i += space;
+                        continue;
+                    }
+                    if let Some((word_end, bare)) = word_at(sql, i, range.end, dialect) {
                         significant = true;
                         body.feed(if bare {
                             BodyToken::Word(&sql[i..word_end])
@@ -236,11 +241,7 @@ pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<String> {
                         other => {
                             if !other.is_ascii_whitespace() {
                                 significant = true;
-                                body.feed(match other {
-                                    b'(' => BodyToken::Open,
-                                    b')' => BodyToken::Close,
-                                    _ => BodyToken::Other,
-                                });
+                                body.feed(BodyToken::Other);
                             }
                         }
                     }
@@ -262,21 +263,53 @@ fn is_word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'@' | b'#') || byte >= 0x80
 }
 
-/// If a word starts at `bytes[at]` — a letter or `_` not continuing an
+/// The byte length of a non-ASCII whitespace character at `sql[at..]` that
+/// `dialect` treats as whitespace, or 0.
+///
+/// Only SQL Server does: measured, `SELECT 1<U+00A0>AS x` and the same with
+/// U+3000 run there, while Postgres ("trailing junk after numeric literal")
+/// and SQLite ("unrecognized token") take the character as part of a name.
+fn unicode_space_len(sql: &str, at: usize, dialect: Dialect) -> usize {
+    if dialect != Dialect::SqlServer || sql.as_bytes()[at] < 0x80 || !sql.is_char_boundary(at) {
+        return 0;
+    }
+    match sql[at..].chars().next() {
+        Some(c) if c.is_whitespace() => c.len_utf8(),
+        _ => 0,
+    }
+}
+
+/// If a word starts at `sql[at..]` — a letter or `_` not continuing an
 /// identifier that began earlier — returns where it ends (never past `end`,
 /// the end of its code region) and whether it is *bare*.
 ///
 /// A word straight after `.`, `@`, `#` or `$` is not bare: it names a column
 /// (`t.end`, legal on Postgres), a T-SQL variable or temp table (`@begin`,
-/// `#begin`), so it can never be the keyword it is spelled like.
-fn word_at(bytes: &[u8], at: usize, end: usize) -> Option<(usize, bool)> {
+/// `#begin`), so it can never be the keyword it is spelled like. Non-ASCII
+/// characters belong to words (`Ébegin` is one identifier), except the
+/// whitespace SQL Server treats as such ([`unicode_space_len`]).
+fn word_at(sql: &str, at: usize, end: usize, dialect: Dialect) -> Option<(usize, bool)> {
+    let bytes = sql.as_bytes();
     let starts = bytes[at].is_ascii_alphabetic() || bytes[at] == b'_';
     let previous = at.checked_sub(1).map(|p| bytes[p]);
-    if !starts || previous.is_some_and(|b| is_word_byte(b) && !matches!(b, b'@' | b'#' | b'$')) {
+    let continues = previous.is_some_and(|b| {
+        if b >= 0x80 {
+            // The character ending at `at`: a word byte unless it is
+            // whitespace to this dialect.
+            let start = (0..at)
+                .rev()
+                .find(|&i| sql.is_char_boundary(i))
+                .unwrap_or(0);
+            unicode_space_len(sql, start, dialect) == 0
+        } else {
+            is_word_byte(b) && !matches!(b, b'@' | b'#' | b'$')
+        }
+    });
+    if !starts || continues {
         return None;
     }
     let mut j = at + 1;
-    while j < end && is_word_byte(bytes[j]) {
+    while j < end && is_word_byte(bytes[j]) && unicode_space_len(sql, j, dialect) == 0 {
         j += 1;
     }
     let bare = !matches!(previous, Some(b'.' | b'@' | b'#' | b'$'));
@@ -290,8 +323,6 @@ enum BodyToken<'a> {
     /// A bare word (see [`word_at`]), in its original case.
     Word(&'a str),
     Semicolon,
-    Open,
-    Close,
     Other,
 }
 
@@ -308,9 +339,14 @@ enum BodyRule {
     /// can only close it — a CASE's `END` always follows an expression.
     SqliteTrigger,
     /// SQL Server `CREATE`/`ALTER` [`OR ALTER`] `PROC`/`PROCEDURE`/
-    /// `FUNCTION`/`TRIGGER`: the body runs to the end of the batch, so no
-    /// `;` ends it — only GO does. Measured: the server stores everything
-    /// up to the batch's end as the body, with or without `BEGIN … END`.
+    /// `FUNCTION`/`TRIGGER`: the statement runs to the end of the batch, so
+    /// no `;` ends it — only GO does. Measured: for a procedure or trigger
+    /// the server stores everything up to the batch's end as the body, with
+    /// or without `BEGIN … END`. A function's body cannot run past its own
+    /// end — a statement after it in the same batch is a server error
+    /// ("Incorrect syntax near the keyword 'SELECT'") and nothing is created
+    /// — so for functions this is not about the body: keeping the batch whole
+    /// sends what SSMS would, and the server reports the mistake itself.
     WholeBatch,
     /// `;` ends the statement only outside `BEGIN … END` blocks (and the
     /// CASEs inside them). Postgres `CREATE [OR REPLACE] FUNCTION`/
@@ -326,9 +362,13 @@ enum BodyRule {
 /// Errs toward *not* splitting only where that is the server's own unit: on
 /// SQL Server a merged statement is just more of the batch SSMS would have
 /// sent whole, and GO resets the tracker, so a miscount never crosses a
-/// batch. On SQLite and Postgres the rules are the clients' own
-/// (`sqlite3_complete`, psql), narrowed on Postgres to `BEGIN ATOMIC` —
-/// `begin` is an unreserved word there and can name a parameter.
+/// batch. On SQLite the rule is `sqlite3_complete`'s own. On Postgres it
+/// starts from psql's and narrows it twice: only `BEGIN ATOMIC` opens a
+/// block (`begin` is an unreserved word there and can name a parameter), and
+/// a word straight after `AS` is a label, not a keyword. With both, psql's
+/// third rule — count nothing inside parentheses — was found to change no
+/// legal statement (its one case, `(SELECT 1 AS end)`, is a label), so it is
+/// not kept as a guard nothing can trip.
 #[derive(Debug)]
 struct BodyTracker {
     dialect: Dialect,
@@ -338,10 +378,13 @@ struct BodyTracker {
     leading: Vec<String>,
     /// Open `BEGIN … END` blocks and CASEs inside them ([`BodyRule::Blocks`]).
     depth: usize,
-    /// Parentheses open; blocks are only counted at zero, as psql does.
-    parens: usize,
     /// A keyword whose meaning depends on the word after it.
     pending: Option<Pending>,
+    /// The last token was a bare `AS` (Postgres only): the next word is a
+    /// column label, which Postgres allows to be any keyword — `SELECT 1 AS
+    /// case` and `AS end` are legal (measured) and must count for nothing.
+    /// T-SQL reserves BEGIN, CASE and END, so a label there can't be one.
+    after_as: bool,
     /// [`BodyRule::SqliteTrigger`]: the last two tokens were `;` (and
     /// then `END`).
     after_semicolon: bool,
@@ -423,8 +466,8 @@ impl BodyTracker {
             rule: BodyRule::Undecided,
             leading: Vec::new(),
             depth: 0,
-            parens: 0,
             pending: None,
+            after_as: false,
             after_semicolon: false,
             after_semicolon_end: false,
         }
@@ -463,6 +506,10 @@ impl BodyTracker {
     fn blocks(&mut self, token: BodyToken) -> bool {
         let is =
             |keyword: &str| matches!(token, BodyToken::Word(w) if w.eq_ignore_ascii_case(keyword));
+        let labelled = std::mem::replace(
+            &mut self.after_as,
+            self.dialect == Dialect::Postgres && is("as"),
+        );
         if let Some(pending) = self.pending.take() {
             let opens_or_closes = match (pending, self.dialect) {
                 (Pending::Begin, Dialect::SqlServer) => {
@@ -478,13 +525,10 @@ impl BodyTracker {
                 }
             }
         }
-        match token {
-            BodyToken::Open => self.parens += 1,
-            BodyToken::Close => self.parens = self.parens.saturating_sub(1),
-            BodyToken::Semicolon => return self.depth == 0,
-            BodyToken::Word(_) | BodyToken::Other => {}
+        if token == BodyToken::Semicolon {
+            return self.depth == 0;
         }
-        if self.parens == 0 {
+        if !labelled {
             if is("begin") {
                 self.pending = Some(Pending::Begin);
             } else if is("case") && self.depth > 0 {
@@ -607,6 +651,87 @@ const EMBEDDED_DML_KEYWORDS: [&str; 6] =
     ["insert", "update", "delete", "merge", "replace", "truncate"];
 const EMBEDDED_DDL_KEYWORDS: [&str; 4] = ["create", "drop", "alter", "truncate"];
 
+/// [`EMBEDDED_DML_KEYWORDS`] for a dialect. T-SQL has a `REPLACE()` string
+/// function and no `REPLACE` statement (measured: `REPLACE INTO t VALUES (1)`
+/// is a syntax error on SQL Server 2022), so there the word is a read — and
+/// SQL Server scans every read for these words, where `SELECT REPLACE(…)`
+/// is common.
+fn embedded_dml_keywords(dialect: Dialect) -> &'static [&'static str] {
+    match dialect {
+        Dialect::SqlServer => &["insert", "update", "delete", "merge", "truncate"],
+        Dialect::Sqlite | Dialect::Postgres => &EMBEDDED_DML_KEYWORDS,
+    }
+}
+
+/// T-SQL words that change the schema wherever they stand: `GRANT`, `DENY`,
+/// `REVOKE`, and `TRIGGER` (`ENABLE`/`DISABLE TRIGGER`, which start with
+/// words nothing else here knows). All four are reserved keywords in T-SQL,
+/// so a bare one is never an identifier.
+const TSQL_EMBEDDED_DDL_KEYWORDS: [&str; 4] = ["grant", "deny", "revoke", "trigger"];
+
+/// T-SQL words that start a statement whose effect nothing here can name,
+/// so wherever one appears the statement needs **both** capabilities —
+/// whatever else it is charged for.
+///
+/// This is needed because one hubro statement is not one T-SQL statement:
+/// T-SQL needs no `;` between statements, so `SELECT 1 EXEC sp_rename 'a',
+/// 'b'`, `BEGIN TRAN EXEC p COMMIT` and a `BEGIN … END` block are each one
+/// statement here and several on the server. A first-keyword reading, or a
+/// keyword scan that charges only what it can name, sees the half it
+/// recognizes and misses the rest.
+///
+/// The reserved ones (`EXEC`/`EXECUTE`, `DBCC`, `KILL`, `SHUTDOWN`,
+/// `RECONFIGURE`, `CHECKPOINT`, `BACKUP`, `RESTORE`, `SETUSER`, `WRITETEXT`,
+/// `UPDATETEXT`) can never be a bare identifier, so no read ever trips
+/// them. The Service Broker words (`RECEIVE`, `CONVERSATION`, `DIALOG` —
+/// `SEND`/`MOVE`/`END CONVERSATION`, `BEGIN DIALOG`, `GET CONVERSATION
+/// GROUP` all carry one; `BEGIN DIALOG` may leave out `CONVERSATION`) are
+/// not reserved: a column with one of those names makes a read need both
+/// too, which is the side to err on.
+///
+/// What is still not caught: a statement after a read that starts with an
+/// unreserved word and carries none of these (none is known that changes
+/// data), and linked-server pass-through (`OPENQUERY(srv, '…')`), whose
+/// remote text is a string and is blanked before any scan.
+const TSQL_OPAQUE_WORDS: [&str; 15] = [
+    "exec",
+    "execute",
+    "dbcc",
+    "kill",
+    "shutdown",
+    "reconfigure",
+    "checkpoint",
+    "backup",
+    "restore",
+    "setuser",
+    "writetext",
+    "updatetext",
+    "receive",
+    "conversation",
+    "dialog",
+];
+
+/// Whether an already-stripped statement holds a word that makes it need
+/// both capabilities whatever else it is charged for — see
+/// [`TSQL_OPAQUE_WORDS`]. Only SQL Server has such words: a Postgres or
+/// SQLite statement is one statement (both drivers send it alone), so an
+/// opaque statement there is its first keyword, and the unattributed rule in
+/// [`statement_needs`] already charges it both.
+fn has_opaque_word(dialect: Dialect, stripped: &str) -> bool {
+    dialect == Dialect::SqlServer
+        && has_word(stripped, |word| {
+            let word = word.to_ascii_lowercase();
+            TSQL_OPAQUE_WORDS.contains(&word.as_str())
+        })
+}
+
+/// SQLite pragmas that write to the database file with no argument at all,
+/// so the `=`/`(` test cannot see them: `incremental_vacuum` frees pages,
+/// `optimize` runs `ANALYZE` (writing `sqlite_stat1`), and `wal_checkpoint`
+/// moves the WAL into the database. Charged like `VACUUM` and `ANALYZE`,
+/// whose effect nothing here names either: both capabilities.
+const SQLITE_WRITE_PRAGMAS: [&str; 3] = ["incremental_vacuum", "optimize", "wal_checkpoint"];
+
 /// First keywords that make a statement schema-changing rather than a plain
 /// write. `grant`/`revoke` and `comment` are included: they change the
 /// database's definition, not its rows, so a connection that permits data
@@ -642,13 +767,35 @@ pub struct StatementNeeds {
 /// this module lets an unwanted change through. Note this covers unknown
 /// first keywords too: [`classify_statement`] calls them writes for
 /// dispatch, but nothing here knows they are *only* writes.
+///
+/// On SQL Server one statement here can be several on the server, so the
+/// rule is additive there: a word from [`TSQL_OPAQUE_WORDS`] anywhere
+/// charges both, whatever else the statement is charged for, and only a
+/// statement that is transaction control *and nothing else* needs nothing
+/// ([`is_bare_transaction_control`]). That list says exactly which forms
+/// are still not caught.
 pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
     // Stripped once here; every scan below works on the stripped form.
     // Each helper used to re-strip the same statement, up to ~6
     // times per capability check.
     let stripped = strip_strings_and_comments(sql, dialect);
-    if !confirmation_needed(sql, &stripped) {
+    if !confirmation_needed(sql, &stripped, dialect) {
         return StatementNeeds::default();
+    }
+    let both = StatementNeeds {
+        mutate: true,
+        ddl: true,
+    };
+    // Additive, and checked before anything can return less: a statement
+    // that runs something nothing here can name needs both, *whatever else*
+    // its keywords attribute. A merged T-SQL block such as `BEGIN DELETE
+    // FROM a; EXEC sp_rename 'x', 'y'; END` would otherwise be charged only
+    // for its DELETE. That includes a SQL Server procedure, function or
+    // trigger definition whose body holds an EXEC, although the body does
+    // not run at create time: the same over-charge every definition already
+    // pays for DML in its body, and the conservative side of it.
+    if has_opaque_word(dialect, &stripped) {
+        return both;
     }
     let has = |set: &[&str]| {
         has_word(&stripped, |word| {
@@ -660,23 +807,21 @@ pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
     // covered by the same scan (it is a top-level word), so a recognized
     // opener needs no separate check — and an *unrecognized* one is
     // correctly left unattributed rather than assumed to be a row write.
-    let mutate = has(&EMBEDDED_DML_KEYWORDS);
-    let ddl = classify_statement(sql) == StatementKind::Ddl || has(&EMBEDDED_DDL_KEYWORDS);
+    let mutate = has(embedded_dml_keywords(dialect));
+    let ddl = classify_statement(sql) == StatementKind::Ddl
+        || has(&EMBEDDED_DDL_KEYWORDS)
+        || (dialect == Dialect::SqlServer && has(&TSQL_EMBEDDED_DDL_KEYWORDS));
     if !mutate && !ddl {
-        // Bare transaction control (`BEGIN`, `COMMIT`, `ROLLBACK`, …) changes
-        // nothing by itself, and the statements it brackets are each checked
-        // on their own — so it needs nothing, rather than being refused with
-        // a reason that doesn't describe it. This is only reached when no
-        // write token appears anywhere in the statement, and a T-SQL
-        // `BEGIN … END` block is not transaction control at all, so a block
-        // running `EXEC some_proc` is charged like `EXEC some_proc` alone.
+        // Bare transaction control changes nothing by itself, and the
+        // statements it brackets are each checked on their own — so it needs
+        // nothing, rather than being refused with a reason that doesn't
+        // describe it. "Bare" means the *whole* statement is transaction
+        // control (see `is_bare_transaction_control`), not merely that it
+        // starts with BEGIN or COMMIT.
         if is_bare_transaction_control(dialect, &stripped) {
             return StatementNeeds::default();
         }
-        return StatementNeeds {
-            mutate: true,
-            ddl: true,
-        };
+        return both;
     }
     StatementNeeds { mutate, ddl }
 }
@@ -706,33 +851,40 @@ pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
 ///   classification; `explaining_never_loosens_the_gate` pins that as a
 ///   property rather than a promise.
 /// - `SELECT`: an `INTO` token — `SELECT … INTO new_table` creates a table.
-/// - `PRAGMA`: a `=` or `(` — the value-setting forms. This deliberately
+/// - `PRAGMA`: a `=` or `(` — the value-setting forms — or one of the
+///   [`SQLITE_WRITE_PRAGMAS`] that write with no argument. This deliberately
 ///   over-prompts call-form read pragmas like `PRAGMA table_info(t)`: some
 ///   pragmas accept both spellings for setting, and prompting is the
 ///   fail-safe side.
+/// - **Any read on SQL Server** gets the `WITH` scan, plus
+///   [`TSQL_EMBEDDED_DDL_KEYWORDS`] and [`TSQL_OPAQUE_WORDS`]: T-SQL needs
+///   no `;` between statements, so `SELECT 1 DELETE FROM t` is a SELECT and
+///   a DELETE.
 ///
 /// The dialect matters on SQL Server, where `[bracketed identifiers]` are
 /// lexed (see [`strip_strings_and_comments`]): a quote inside one
 /// (`SELECT [o'brien] * INTO t2 FROM t`) must not invert string tracking
 /// and hide the `INTO`, and `SELECT [into]` must not over-prompt.
 pub fn needs_confirmation(sql: &str, dialect: Dialect) -> bool {
-    confirmation_needed(sql, &strip_strings_and_comments(sql, dialect))
+    confirmation_needed(sql, &strip_strings_and_comments(sql, dialect), dialect)
 }
 
 /// [`needs_confirmation`] against an already-stripped statement, so
 /// [`statement_needs`] can strip once and share the result with its own
 /// keyword scans.
-fn confirmation_needed(sql: &str, stripped: &str) -> bool {
+fn confirmation_needed(sql: &str, stripped: &str, dialect: Dialect) -> bool {
     if classify_statement(sql) != StatementKind::Read {
         return true;
     }
     let embedded_write = || {
         has_word(stripped, |word| {
             let word = word.to_ascii_lowercase();
-            EMBEDDED_DML_KEYWORDS.contains(&word.as_str())
+            embedded_dml_keywords(dialect).contains(&word.as_str())
                 || EMBEDDED_DDL_KEYWORDS.contains(&word.as_str())
                 || word == "into"
-        })
+                || (dialect == Dialect::SqlServer
+                    && TSQL_EMBEDDED_DDL_KEYWORDS.contains(&word.as_str()))
+        }) || has_opaque_word(dialect, stripped)
     };
     match first_keyword(sql).to_ascii_lowercase().as_str() {
         "with" => embedded_write(),
@@ -743,10 +895,22 @@ fn confirmation_needed(sql: &str, stripped: &str) -> bool {
             // through. It is strictly shorter than `stripped` (the `EXPLAIN`
             // keyword is consumed), so the recursion terminates.
             let body = explain_body(stripped);
-            embedded_write() || confirmation_needed(body, body)
+            embedded_write() || confirmation_needed(body, body, dialect)
         }
+        // On SQL Server one statement here can be several on the server — T-SQL
+        // needs no `;` between them — so a read is only a read if nothing in
+        // it can change anything: `SELECT 1 DELETE FROM t` is a SELECT and a
+        // DELETE. Postgres and SQLite drivers send a statement alone, so there
+        // the first keyword does speak for all of it.
+        _ if dialect == Dialect::SqlServer => embedded_write(),
         "select" => has_word(stripped, |word| word.eq_ignore_ascii_case("into")),
-        "pragma" => stripped.contains('=') || stripped.contains('('),
+        "pragma" => {
+            stripped.contains('=')
+                || stripped.contains('(')
+                || has_word(stripped, |word| {
+                    SQLITE_WRITE_PRAGMAS.contains(&word.to_ascii_lowercase().as_str())
+                })
+        }
         _ => false,
     }
 }
@@ -1245,25 +1409,41 @@ fn manages_own_transaction(stripped: &str) -> bool {
 /// Stricter than [`manages_own_transaction`], deliberately: that one decides
 /// whether to *decline wrapping*, where a false yes only costs atomicity, so
 /// any leading `BEGIN` or `END` will do. Here a false yes waves a statement
-/// past the capability gate. On SQL Server `BEGIN` opens a statement block
-/// unless `TRAN`, `TRANSACTION` or `DISTRIBUTED` follows (measured: `BEGIN;
-/// SELECT 1; END` runs as a block, and `BEGIN;` alone is a syntax error), and
-/// a block runs whatever is inside it; `END` is never transaction control
-/// there at all — alone it is a syntax error, and `END CONVERSATION` closes a
-/// Service Broker conversation.
+/// past the capability gate.
+///
+/// - **SQL Server**: the whole statement must be `BEGIN|COMMIT|ROLLBACK
+///   [TRAN|TRANSACTION [name]]`, `COMMIT|ROLLBACK WORK`, or `BEGIN
+///   DISTRIBUTED TRAN|TRANSACTION [name]` — nothing after. T-SQL needs no
+///   `;` between statements, so measured, `COMMIT SELECT 5` reports error
+///   3902 and runs the SELECT anyway; `BEGIN TRAN EXEC p COMMIT` is three
+///   statements. A `BEGIN` that opens a block, `END` (alone a syntax error;
+///   `END CONVERSATION` closes a broker conversation), `WITH MARK`, and
+///   anything else fall through to "needs both". A name can only be a word
+///   or `@variable`; a reserved statement there (`BEGIN TRAN CHECKPOINT`,
+///   measured to run the CHECKPOINT) is already charged by
+///   [`has_opaque_word`], which runs first.
+/// - **Postgres and SQLite**: a statement is one statement, so its leading
+///   word speaks for it — except `COMMIT PREPARED` / `ROLLBACK PREPARED`,
+///   which finish another session's prepared transaction and so make (or
+///   discard) writes this statement never showed.
 fn is_bare_transaction_control(dialect: Dialect, stripped: &str) -> bool {
     if !manages_own_transaction(stripped) {
         return false;
     }
+    let words = leading_words(stripped, usize::MAX);
     if dialect != Dialect::SqlServer {
-        return true;
+        return !words.iter().any(|w| w == "prepared");
     }
-    let words = leading_words(stripped, 2);
-    match (words[0].as_str(), words.get(1).map(String::as_str)) {
-        ("end", _) => false,
-        ("begin", Some(next)) => matches!(next, "tran" | "transaction" | "distributed"),
-        _ => true,
-    }
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    matches!(
+        words.as_slice(),
+        ["begin" | "commit" | "rollback"]
+            | ["begin" | "commit" | "rollback", "tran" | "transaction"]
+            | ["begin" | "commit" | "rollback", "tran" | "transaction", _]
+            | ["commit" | "rollback", "work"]
+            | ["begin", "distributed", "tran" | "transaction"]
+            | ["begin", "distributed", "tran" | "transaction", _]
+    )
 }
 
 /// Whether an already-stripped statement can't run (or won't take effect)
@@ -1478,6 +1658,13 @@ mod tests {
                 "SELECT 2"
             ]
         );
+        assert_eq!(
+            sqlite("CREATE TEMPORARY TRIGGER t AFTER INSERT ON a BEGIN SELECT 1; END; SELECT 2"),
+            [
+                "CREATE TEMPORARY TRIGGER t AFTER INSERT ON a BEGIN SELECT 1; END",
+                "SELECT 2"
+            ]
+        );
         // A trailing trigger without its final `;` is kept whole.
         assert_eq!(
             sqlite("CREATE TRIGGER IF NOT EXISTS t AFTER INSERT ON a BEGIN SELECT 1; END"),
@@ -1566,6 +1753,18 @@ mod tests {
             ),
             ["CREATE FUNCTION f() RETURNS int AS BEGIN DECLARE @x int = 1; RETURN @x; END"]
         );
+        // A function's body cannot run past its END — measured, a statement
+        // after one in the same batch is a server error and nothing is
+        // created — but it is still kept with the function, so the server
+        // sees what SSMS would send and reports that error itself.
+        assert_eq!(
+            split_mssql(
+                "CREATE FUNCTION f() RETURNS @t TABLE (a int) AS \
+                 BEGIN INSERT @t VALUES (1); RETURN; END; SELECT 2"
+            ),
+            ["CREATE FUNCTION f() RETURNS @t TABLE (a int) AS \
+                 BEGIN INSERT @t VALUES (1); RETURN; END; SELECT 2"]
+        );
         // Statements before the module in the same batch still split off.
         assert_eq!(
             split_mssql("DROP PROCEDURE IF EXISTS p; CREATE PROCEDURE p AS SELECT 1; SELECT 2"),
@@ -1618,6 +1817,25 @@ mod tests {
             split_mssql("SELECT @begin, [begin], 'begin', #begin; SELECT 2"),
             ["SELECT @begin, [begin], 'begin', #begin", "SELECT 2"]
         );
+        // A keyword spelled at the end of a longer identifier is not one
+        // (measured: `Ébegin` is a legal name on SQL Server).
+        assert_eq!(
+            split_mssql("SELECT 1 AS Ébegin; SELECT 2"),
+            ["SELECT 1 AS Ébegin", "SELECT 2"]
+        );
+        // SQL Server takes Unicode whitespace as whitespace (measured with
+        // U+00A0 and U+3000), so it separates keywords like a space does.
+        assert_eq!(
+            split_mssql(
+                "IF 1 = 1 BEGIN\u{a0}SELECT 1;\u{3000}END\u{a0}; \
+                 BEGIN\u{a0}TRAN; SELECT 2"
+            ),
+            [
+                "IF 1 = 1 BEGIN\u{a0}SELECT 1;\u{3000}END",
+                "BEGIN\u{a0}TRAN",
+                "SELECT 2"
+            ]
+        );
         // An unclosed block cannot swallow the next batch: GO ends it.
         assert_eq!(
             split_mssql("BEGIN SELECT 1;\nGO\nSELECT 2; SELECT 3"),
@@ -1627,9 +1845,9 @@ mod tests {
 
     #[test]
     fn postgres_sql_standard_bodies_do_not_split() {
-        // `BEGIN ATOMIC … END` (Postgres 14+) is not dollar-quoted. psql's
-        // rule: inside CREATE [OR REPLACE] FUNCTION/PROCEDURE, at paren depth
-        // zero, BEGIN and (inside a block) CASE open, END closes.
+        // `BEGIN ATOMIC … END` (Postgres 14+) is not dollar-quoted. Inside
+        // CREATE [OR REPLACE] FUNCTION/PROCEDURE, BEGIN ATOMIC and (inside a
+        // block) CASE open, END closes.
         assert_eq!(
             split(
                 "CREATE OR REPLACE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC \
@@ -1656,7 +1874,7 @@ mod tests {
         );
         // `begin` is unreserved in Postgres: a parameter or a qualified column
         // of that name opens nothing — only `BEGIN ATOMIC` does, which is
-        // stricter than psql (it counts any BEGIN at paren depth zero, and
+        // stricter than psql (it counts any BEGIN outside parentheses, and
         // would merge these two).
         assert_eq!(
             split(
@@ -1679,8 +1897,7 @@ mod tests {
                 "SELECT 2"
             ]
         );
-        // Inside parentheses nothing is counted, as in psql: `end` is a legal
-        // column label there (measured), and must not close the body.
+        // A label inside parentheses is a label too (measured legal).
         assert_eq!(
             split(
                 "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC \
@@ -1692,52 +1909,181 @@ mod tests {
                 "SELECT 2"
             ]
         );
+        // Postgres takes any keyword as a column label after AS (measured
+        // with both of these), so a label counts for nothing: `AS case` would
+        // otherwise never close, and `AS end` would close early.
+        assert_eq!(
+            split(
+                "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC \
+                 SELECT 1 AS case; END; SELECT 2"
+            ),
+            [
+                "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC \
+                 SELECT 1 AS case; END",
+                "SELECT 2"
+            ]
+        );
+        assert_eq!(
+            split(
+                "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC \
+                 SELECT 1 AS end; SELECT 2; END; SELECT 3"
+            ),
+            [
+                "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC \
+                 SELECT 1 AS end; SELECT 2; END",
+                "SELECT 3"
+            ]
+        );
         // Outside a routine, BEGIN is a transaction (see
         // `bare_transaction_control_still_splits`) and PL/pgSQL bodies are
         // dollar-quoted, so nothing else is tracked.
     }
 
+    /// The whole wire from script text to the refusal: split, charge each
+    /// statement, refuse under each capability set. On SQL Server one
+    /// statement here can be several on the server (T-SQL needs no `;`
+    /// between them), so nothing may be charged by its first word alone, nor
+    /// for only the half of it a keyword names.
     #[test]
-    fn a_tsql_block_is_charged_for_what_it_runs() {
-        // A block that opens with BEGIN is not transaction control: whatever
-        // it runs is charged, and what nothing can attribute needs both
-        // capabilities, exactly as it would on its own. Nor is a T-SQL
-        // statement opening with END, which ends a broker conversation.
-        for sql in [
-            "BEGIN EXEC sp_rename 'a', 'b'; END",
-            "BEGIN EXEC sp_rename 'a', 'b' END",
-            "BEGIN TRY EXEC do_the_thing; END TRY BEGIN CATCH END CATCH",
-            "END CONVERSATION @h",
-        ] {
-            assert_eq!(
-                statement_needs(sql, Dialect::SqlServer),
-                StatementNeeds {
-                    mutate: true,
-                    ddl: true
+    fn a_script_is_charged_for_everything_it_runs() {
+        const NONE: (bool, bool) = (false, false);
+        const MUTATE: (bool, bool) = (true, false);
+        const DDL: (bool, bool) = (false, true);
+        const BOTH: (bool, bool) = (true, true);
+        use Dialect::{Postgres as Pg, SqlServer as Ms, Sqlite as Lite};
+        let cases: &[(Dialect, &str, (bool, bool))] = &[
+            // Transaction words followed by more than transaction control.
+            (Ms, "BEGIN TRAN EXEC sp_rename 'a', 'b' COMMIT", BOTH),
+            (Ms, "BEGIN TRANSACTION t1 EXEC('DROP TABLE t') COMMIT", BOTH),
+            (Ms, "COMMIT EXEC sp_rename 'a', 'b'", BOTH),
+            (Ms, "ROLLBACK EXEC p", BOTH),
+            (
+                Ms,
+                "BEGIN TRAN BEGIN EXEC sp_rename 'a', 'b'; END COMMIT",
+                BOTH,
+            ),
+            (Ms, "BEGIN TRAN CHECKPOINT", BOTH),
+            (Ms, "BEGIN TRAN t1 WITH MARK 'm'", BOTH),
+            // A merged block is charged for everything in it.
+            (
+                Ms,
+                "BEGIN DELETE FROM a; EXEC sp_rename 'x', 'y'; END",
+                BOTH,
+            ),
+            (
+                Ms,
+                "IF 1 = 1 BEGIN DELETE FROM a; EXEC('DROP TABLE x'); END",
+                BOTH,
+            ),
+            (Ms, "BEGIN CREATE TABLE t (a int); EXEC dml_proc; END", BOTH),
+            (Ms, "BEGIN EXEC sp_rename 'a', 'b'; END", BOTH),
+            (Ms, "BEGIN EXEC sp_rename 'a', 'b' END", BOTH),
+            (
+                Ms,
+                "BEGIN TRY EXEC do_it; END TRY BEGIN CATCH END CATCH",
+                BOTH,
+            ),
+            (Ms, "INSERT INTO t EXEC p", BOTH),
+            // A definition whose body calls something: over-charged, declared.
+            (Ms, "CREATE PROCEDURE p AS EXEC q", BOTH),
+            // Reads followed by something else.
+            (Ms, "SELECT 1 EXEC sp_rename 'a', 'b'", BOTH),
+            (Ms, "SELECT 1 EXEC('DELETE FROM t')", BOTH),
+            (Ms, "SELECT 1 DELETE FROM t", MUTATE),
+            (Ms, "SELECT 1 BEGIN DELETE FROM t; END", MUTATE),
+            (Ms, "SELECT 1 CREATE TABLE x (a int)", DDL),
+            (Ms, "SELECT 1 DISABLE TRIGGER tr ON t", DDL),
+            (Ms, "SELECT 1 DENY SELECT ON t TO u", DDL),
+            (Ms, "SELECT 1 RECEIVE * FROM q", BOTH),
+            (Ms, "SELECT 1 SEND ON CONVERSATION @h", BOTH),
+            (
+                Ms,
+                "SELECT 1 BEGIN DIALOG @h FROM SERVICE s TO SERVICE 't'",
+                BOTH,
+            ),
+            // Service Broker: exempt as "transaction control" before, now not.
+            (Ms, "END CONVERSATION @h", BOTH),
+            (
+                Ms,
+                "BEGIN DIALOG CONVERSATION @h FROM SERVICE s TO SERVICE 't'",
+                BOTH,
+            ),
+            (Ms, "BEGIN DIALOG @h FROM SERVICE s TO SERVICE 't'", BOTH),
+            (Ms, "BEGIN CONVERSATION TIMER (@h) TIMEOUT = 5", BOTH),
+            // Postgres: finishing another session's prepared transaction.
+            (Pg, "COMMIT PREPARED 'x'", BOTH),
+            (Pg, "ROLLBACK PREPARED 'x'", BOTH),
+            // SQLite pragmas that write with no argument.
+            (Lite, "PRAGMA optimize", BOTH),
+            (Lite, "PRAGMA incremental_vacuum", BOTH),
+            (Lite, "PRAGMA main.wal_checkpoint", BOTH),
+            // Allowed: transaction control alone, and plain reads.
+            (Ms, "BEGIN TRAN", NONE),
+            (Ms, "BEGIN TRANSACTION", NONE),
+            (Ms, "BEGIN DISTRIBUTED TRANSACTION", NONE),
+            (Ms, "COMMIT", NONE),
+            (Ms, "COMMIT TRAN", NONE),
+            (Ms, "COMMIT WORK", NONE),
+            (Ms, "ROLLBACK TRANSACTION t1", NONE),
+            (Ms, "ROLLBACK TRAN @t", NONE),
+            (Ms, "SELECT 1", NONE),
+            (Ms, "SELECT REPLACE(name, 'a', 'b') FROM t", NONE),
+            (Ms, "WITH x AS (SELECT 1 AS a) SELECT * FROM x", NONE),
+            (Pg, "COMMIT", NONE),
+            (Pg, "ROLLBACK TO SAVEPOINT s", NONE),
+            (Pg, "SELECT 1", NONE),
+            (Lite, "BEGIN", NONE),
+            (Lite, "PRAGMA integrity_check", NONE),
+        ];
+        let caps_sets = [
+            ("full", Capabilities::FULL),
+            ("read-only", Capabilities::FULL.read_only()),
+            (
+                "mutate without ddl",
+                Capabilities {
+                    ddl: false,
+                    ..Capabilities::FULL
                 },
-                "{sql:?}"
-            );
-            assert!(
-                script_refusal(
-                    Capabilities::FULL.read_only(),
-                    &split_mssql(sql),
-                    Dialect::SqlServer
-                )
-                .is_some(),
-                "{sql:?}"
-            );
-        }
-        // Real transaction control on SQL Server still needs nothing.
-        for sql in [
-            "BEGIN TRAN",
-            "BEGIN TRANSACTION t1",
-            "BEGIN DISTRIBUTED TRANSACTION",
-        ] {
-            assert_eq!(
-                statement_needs(sql, Dialect::SqlServer),
+            ),
+            (
+                "ddl without mutate",
+                Capabilities {
+                    mutate: false,
+                    ..Capabilities::FULL
+                },
+            ),
+        ];
+        // Every opaque word charges both after a read, one by one.
+        let opaque: Vec<(Dialect, String, (bool, bool))> = TSQL_OPAQUE_WORDS
+            .iter()
+            .map(|word| (Ms, format!("SELECT 1 {word} x"), BOTH))
+            .collect();
+        let cases = cases
+            .iter()
+            .map(|&(dialect, sql, needs)| (dialect, sql, needs))
+            .chain(opaque.iter().map(|(d, sql, n)| (*d, sql.as_str(), *n)));
+        for (dialect, sql, (mutate, ddl)) in cases {
+            let statements = split_statements(sql, dialect);
+            let charged = statements.iter().map(|s| statement_needs(s, dialect)).fold(
                 StatementNeeds::default(),
-                "{sql:?}"
+                |a, b| StatementNeeds {
+                    mutate: a.mutate || b.mutate,
+                    ddl: a.ddl || b.ddl,
+                },
             );
+            assert_eq!(
+                charged,
+                StatementNeeds { mutate, ddl },
+                "{sql:?} on {dialect:?}, split as {statements:?}"
+            );
+            for (name, caps) in caps_sets {
+                let refused = (mutate && !caps.mutate) || (ddl && !caps.ddl);
+                assert_eq!(
+                    script_refusal(caps, &statements, dialect).is_some(),
+                    refused,
+                    "{sql:?} on {dialect:?} under {name}"
+                );
+            }
         }
     }
 
@@ -2081,13 +2427,14 @@ mod tests {
     #[test]
     fn bare_transaction_control_needs_nothing_but_its_contents_still_count() {
         for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
-            for sql in [
-                "BEGIN",
-                "COMMIT",
-                "ROLLBACK",
-                "SAVEPOINT s",
-                "BEGIN TRANSACTION",
-            ] {
+            // `SAVEPOINT` is not T-SQL (its spelling is `SAVE TRAN`), so on
+            // SQL Server it is a syntax error and is charged like any word
+            // nothing here knows.
+            let savepoint = (dialect != Dialect::SqlServer).then_some("SAVEPOINT s");
+            for sql in ["BEGIN", "COMMIT", "ROLLBACK", "BEGIN TRANSACTION"]
+                .into_iter()
+                .chain(savepoint)
+            {
                 assert_eq!(
                     statement_needs(sql, dialect),
                     StatementNeeds::default(),

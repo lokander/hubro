@@ -92,8 +92,8 @@ pub use schema_edit::{
 };
 pub use script::{
     classify_statement, needs_confirmation, run_script, script_refusal, split_statements,
-    statement_needs, statement_preview, Rollback, ScriptError, StatementKind, StatementNeeds,
-    StatementOutcome, StatementResult,
+    statement_needs, statement_preview, wrap_atomically, Rollback, ScriptError, StatementKind,
+    StatementNeeds, StatementOutcome, StatementResult,
 };
 pub use sql::Dialect;
 pub use sqlite::{check_sqlite_file, open_sqlite, SqliteFileError, SqliteFileErrorKind};
