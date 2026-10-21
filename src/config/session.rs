@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::{write_toml_atomic, BackendKind, ConfigError};
+use super::{load_lenient, write_toml_atomic, BackendKind, ConfigError};
 
 /// Which pane a restored tab shows. Mirrors `ui::state::Pane`, but kept here
 /// so the config layer never depends on the UI; serialized lowercase.
@@ -101,17 +101,14 @@ pub struct Session {
 /// lose — whereas a corrupt settings file must not take user preferences with
 /// it.
 pub fn default_session_path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("hubro").join("session.toml"))
+    super::app_config_file("session.toml")
 }
 
 /// Loads the last session. A missing *or* malformed file yields an empty
 /// session (never an error): restore is best-effort and must never block or
 /// crash startup.
 pub fn load_session(path: &Path) -> Session {
-    match std::fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text).unwrap_or_default(),
-        Err(_) => Session::default(),
-    }
+    load_lenient(path)
 }
 
 /// Persists the session, creating parent dirs and writing via a temp file +

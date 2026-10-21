@@ -162,7 +162,7 @@ enum HostKeyStatus {
 /// New trust decisions are recorded here; the user's `~/.ssh/known_hosts` is
 /// read but never modified.
 pub fn app_known_hosts_path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("hubro").join("known_hosts"))
+    crate::config::app_config_file("known_hosts")
 }
 
 /// The app's default set of files consulted to decide whether a server host
