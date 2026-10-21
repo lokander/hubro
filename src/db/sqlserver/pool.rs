@@ -407,11 +407,22 @@ async fn connect_once(config: Config, addr: &(String, u16)) -> Result<TdsClient,
     Client::connect(config, tcp.compat_write()).await
 }
 
-/// SQL Server's "Login failed for user '…'": the server refused the
-/// credentials. Sent for a wrong password, an unknown login, and an empty
-/// password where one is required — measured, all three — and, ahead of
-/// anything about the database, for a wrong password naming a database that
-/// would also have failed.
+/// SQL Server's "Login failed for user '…'", its wrong-credentials code. Sent
+/// for a wrong password, an unknown login, and an empty password where one is
+/// required — measured, all three — and, ahead of anything about the
+/// database, for a wrong password naming a database that would also have
+/// failed. Also sent, measured, where the password was right: a
+/// contained-database user naming a missing database, and a login denied
+/// `CONNECT SQL` (see [`DbError::CredentialsRejected`]).
+///
+/// **The fix for 4060 depends on tiberius keeping the first ERROR token.** A
+/// database that cannot be opened draws *two*: 4060, then "Login failed for
+/// user '…'", 18456's text (sqlcmd prints both against SQL Server 2022). tiberius
+/// 0.13 keeps the first — `TokenStream::flush_done`, `tds/stream/token.rs`
+/// lines 197-199 — so `Error::code()` is 4060. A tiberius that kept the last
+/// token instead would make every such failure an 18456 and put the deletion
+/// back, with only the engine suite (`tests/db_sqlserver.rs`, not run by CI)
+/// to notice.
 const LOGIN_FAILED: u32 = 18456;
 
 /// "Cannot open database "…" requested by the login. The login failed." Sent
@@ -431,9 +442,11 @@ fn connect_error(err: &TdsError) -> DbError {
 /// Decided on the server's error code and nothing else: the connect flow
 /// deletes the stored password on [`DbError::CredentialsRejected`], and text
 /// is shared between codes — 4060's own message ends in "The login failed.",
-/// which is how a missing database used to delete a working password. Only 18456 qualifies.
-/// Other codes in that family — a disabled account (18470, measured) — refuse
-/// a password that is still correct, so they keep it and report.
+/// which is how a missing database used to delete a working password. Only
+/// 18456 — the server's wrong-credentials code, not a guarantee the password
+/// was wrong (see [`LOGIN_FAILED`]) — qualifies. Other codes in that family —
+/// a disabled account (18470, measured) — refuse a password that is still
+/// correct, so they keep it and report.
 fn connect_error_from(code: Option<u32>, message: String) -> DbError {
     if code == Some(LOGIN_FAILED) {
         DbError::CredentialsRejected(message)

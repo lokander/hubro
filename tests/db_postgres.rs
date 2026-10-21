@@ -413,6 +413,13 @@ async fn postgres_only_a_refused_password_is_a_credential_rejection() {
     // Roles are cluster-wide, so named per process.
     let role = format!("hubro_outsider_{}", std::process::id());
     const PASSWORD: &str = "outsider-pass";
+    // Every URL is built before the role and the revoke exist, so nothing
+    // between them and their undo can panic but a connect that succeeded.
+    let missing = common::with_database(&url, "hubro_no_such_database");
+    let mut forbidden = url::Url::parse(&url).unwrap();
+    forbidden.set_username(&role).unwrap();
+    forbidden.set_password(Some(PASSWORD)).unwrap();
+    let wrong_and_missing_url = url_with_password(&missing, "definitely-wrong").unwrap();
     admin
         .query(&format!("DROP ROLE IF EXISTS {role}"))
         .await
@@ -430,10 +437,6 @@ async fn postgres_only_a_refused_password_is_a_credential_rejection() {
         .await
         .unwrap();
 
-    let missing = common::with_database(&url, "hubro_no_such_database");
-    let mut forbidden = url::Url::parse(&url).unwrap();
-    forbidden.set_username(&role).unwrap();
-    forbidden.set_password(Some(PASSWORD)).unwrap();
     let mut kept = Vec::new();
     for (what, target) in [
         ("a database that does not exist", missing.clone()),
@@ -446,8 +449,7 @@ async fn postgres_only_a_refused_password_is_a_credential_rejection() {
     }
     // Authentication is checked before the database: a wrong password naming
     // a missing database is still the password's fault, and must still prompt.
-    let wrong_and_missing =
-        connect_failure(&url_with_password(&missing, "definitely-wrong").unwrap()).await;
+    let wrong_and_missing = connect_failure(&wrong_and_missing_url).await;
 
     // Undone before any assertion can panic: a role outlives the test binary,
     // and nothing else sweeps them.

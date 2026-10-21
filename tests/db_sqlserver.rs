@@ -153,6 +153,14 @@ async fn sqlserver_only_a_refused_password_is_a_credential_rejection() {
     let outsider = format!("hubro_outsider_{pid}");
     let disabled = format!("hubro_disabled_{pid}");
     const PASSWORD: &str = "Outs1der!Passw0rd";
+    // Every URL is built before the logins exist, so nothing between their
+    // creation and their drop can panic but a connect that succeeded.
+    let missing = common::with_database(&url, "hubro_no_such_database");
+    // The login exists and its password is right, but it has no user in this
+    // binary's database (and `guest` is off in a user database).
+    let forbidden = as_login(&url, &outsider, PASSWORD);
+    let disabled_login = as_login(&common::with_database(&url, "master"), &disabled, PASSWORD);
+    let wrong_and_missing_url = mssql_url_with_password(&missing, "definitely-wrong").unwrap();
     for login in [&outsider, &disabled] {
         admin
             .query(&format!(
@@ -167,11 +175,6 @@ async fn sqlserver_only_a_refused_password_is_a_credential_rejection() {
         .await
         .unwrap();
 
-    let missing = common::with_database(&url, "hubro_no_such_database");
-    // The login exists and its password is right, but it has no user in this
-    // binary's database (and `guest` is off in a user database).
-    let forbidden = as_login(&url, &outsider, PASSWORD);
-    let disabled_login = as_login(&common::with_database(&url, "master"), &disabled, PASSWORD);
     // The last flag: whether the words may say "authentication failed". A
     // disabled account's refusal is one, truthfully, and carries its reason;
     // a database that cannot be opened is not, whatever 4060's text says.
@@ -193,8 +196,7 @@ async fn sqlserver_only_a_refused_password_is_a_credential_rejection() {
     }
     // Authentication is checked before the database: a wrong password naming
     // a missing database is still the password's fault, and must still prompt.
-    let wrong_and_missing =
-        connect_failure(&mssql_url_with_password(&missing, "definitely-wrong").unwrap()).await;
+    let wrong_and_missing = connect_failure(&wrong_and_missing_url).await;
 
     // Dropped before any assertion can panic: a login outlives the test
     // binary, and nothing else sweeps them.

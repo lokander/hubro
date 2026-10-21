@@ -29,17 +29,29 @@ pub enum DbError {
     /// [`DbPool`](super::DbPool) retry once, every other path reports it like
     /// any other failure.
     Transient(String),
-    /// The server refused the *credentials* — the password, or the user it
-    /// was offered for — and said so with a code: SQL Server error 18456,
-    /// PostgreSQL SQLSTATE `28P01`. Only ever built from that code, never
-    /// from message text, for the same reason as [`DbError::Transient`].
+    /// The server answered the login with its wrong-credentials code: SQL
+    /// Server error 18456, PostgreSQL SQLSTATE `28P01`. Only ever built from
+    /// that code, never from message text, for the same reason as
+    /// [`DbError::Transient`].
     ///
     /// This is the one connect failure that may cost a stored secret: the
     /// connect flow reads it as "the remembered password has gone stale",
     /// deletes that password from the keyring and asks for a new one. So
-    /// everything else the server can refuse at login stays a
+    /// every other code the server can refuse a login with stays a
     /// [`DbError::Connect`], including failures whose text mentions a failed
-    /// login. SQL Server's error 4060 ("Cannot open database … requested by
+    /// login.
+    ///
+    /// The code is the server's word, not proof that the password was wrong.
+    /// Measured cases where it is sent for a password that was right: a SQL
+    /// Server *contained-database* user (the usual Azure SQL Database setup)
+    /// naming a database that does not exist, since the user lives in that
+    /// database and cannot be found (an *offline* one is 942, and kept); a
+    /// login denied `CONNECT SQL`; a PostgreSQL role whose `VALID UNTIL` has
+    /// passed, which `auth_failed` reports as a wrong password. SQL
+    /// authentication switched off on the server, and a pooler such as
+    /// pgbouncer refusing on the server's behalf, are expected to look the
+    /// same but were not measured. These are known residuals of deciding on
+    /// the wire, where they cannot be told apart from a wrong password. SQL Server's error 4060 ("Cannot open database … requested by
     /// the login. The login failed.") is the case that made this a variant:
     /// it is sent for a database that does not exist, is offline or
     /// restoring, or that this login may not open — measured, all four — and

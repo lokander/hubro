@@ -286,6 +286,21 @@ pub(super) fn password_retry(err: &DbError, had_password: bool) -> Option<Passwo
     })
 }
 
+/// The credential a saved connection offers from memory, and whether that is a
+/// remembered password — derived from the credential itself, so the two cannot
+/// disagree. [`password_retry`] deletes the stored password on the strength of
+/// the flag, so a flag that said "remembered" while the open sent nothing
+/// would delete every stored password on its first use: the server refuses
+/// the empty login, and the refusal is pinned on the password.
+fn remembered_credential(remembered: Option<&str>) -> (ServerCredential<'_>, bool) {
+    let credential = match remembered {
+        Some(password) => ServerCredential::Password(password),
+        None => ServerCredential::None,
+    };
+    let offered = matches!(credential, ServerCredential::Password(_));
+    (credential, offered)
+}
+
 /// A secret to hand a server backend at connect time. Which variant a connect
 /// carries decides how the backend uses it: Postgres takes a password and an
 /// Entra token the same way — spliced into the URL — while SQL Server splices
@@ -1055,12 +1070,12 @@ impl AppState {
                 .ok()
                 .flatten();
         }
-        let had_password = session_password.is_some();
         self.set_step(&url, ConnectStep::Opening);
-        let credential = match &session_password {
-            Some(password) => ServerCredential::Password(password),
-            None => ServerCredential::None,
-        };
+        // One value for what is offered and whether it was a remembered
+        // password, so the decision below cannot be told about a password the
+        // open never sent — which would read the server's refusal of an empty
+        // login as a stale password, and delete it.
+        let (credential, had_password) = remembered_credential(session_password.as_deref());
         let result = backend
             .open(&connect_url, credential, tls_host.as_deref())
             .await;
@@ -3197,13 +3212,25 @@ mod tests {
 
     #[test]
     fn only_a_credential_rejection_prompts_and_only_a_remembered_one_is_forgotten() {
-        // The exact message SQL Server's classifier used to produce for error
-        // 4060 — a database name that does not exist. A text match on it
-        // deleted the stored password; the decision must not see the words.
-        const MISSING_DATABASE: &str = "authentication failed — Token error: 'Cannot open \
-             database \"no_such_db\" requested by the login. The login failed.' on server x \
-             executing  on line 1 (code: 4060, state: 1, class: 11)";
-        for message in [MISSING_DATABASE, "anything else"] {
+        // Every wording a text rule could key on, each under every variant:
+        // whatever the message says, only the variant decides. The first is
+        // the message SQL Server's classifier used to produce for error 4060
+        // — a database that does not exist — whose text match deleted the
+        // stored password.
+        let messages = [
+            "authentication failed — Token error: 'Cannot open database \"no_such_db\" \
+             requested by the login. The login failed.' on server x executing  on line 1 \
+             (code: 4060, state: 1, class: 11)",
+            // The 4060 label as it reads now.
+            "cannot open the database — it may not exist, be offline or restoring, or this \
+             login may lack access to it; the credentials were accepted — Token error: \
+             'Cannot open database \"x\" requested by the login. The login failed.'",
+            "Login failed for user 'x'.",
+            "authentication failed — error returned from database: password authentication \
+             failed for user \"x\"",
+            "anything else",
+        ];
+        for message in messages {
             for err in every_db_error(message) {
                 let rejected = matches!(err, DbError::CredentialsRejected(_));
                 assert_eq!(
@@ -3222,19 +3249,114 @@ mod tests {
         }
     }
 
-    /// `source` without comment lines, so a test reading code cannot be
-    /// satisfied — or tripped — by prose that names what it looks for.
+    #[test]
+    fn a_remembered_password_is_both_what_is_offered_and_what_is_reported() {
+        // The flag is what licenses the delete, so it must describe the
+        // credential actually sent: "remembered" with nothing offered turns the
+        // server's refusal of an empty login into the deletion of a good
+        // password.
+        let (credential, remembered) = remembered_credential(Some("s3cret"));
+        assert!(matches!(credential, ServerCredential::Password("s3cret")));
+        assert!(remembered, "a remembered password that was offered");
+        // An empty remembered password is still one that was offered.
+        let (credential, remembered) = remembered_credential(Some(""));
+        assert!(matches!(credential, ServerCredential::Password("")));
+        assert!(remembered);
+        // Nothing remembered — including a keyring read that failed, which the
+        // caller reads as nothing: nothing is offered, and a refusal can only
+        // prompt.
+        let (credential, remembered) = remembered_credential(None);
+        assert!(matches!(credential, ServerCredential::None));
+        assert!(
+            !remembered,
+            "nothing was offered, so nothing may be forgotten"
+        );
+    }
+
+    /// `line` without a trailing `//` comment. A `//` inside a string literal
+    /// (a URL) is kept: it counts as a comment only where the quotes before it
+    /// are balanced. Approximate — escaped quotes are skipped, char literals
+    /// are not handled — which is enough for the shipped code it reads.
+    fn strip_trailing_comment(line: &str) -> &str {
+        let bytes = line.as_bytes();
+        let mut in_string = false;
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' if in_string => i += 1,
+                b'"' => in_string = !in_string,
+                b'/' if !in_string && bytes.get(i + 1) == Some(&b'/') => return &line[..i],
+                _ => {}
+            }
+            i += 1;
+        }
+        line
+    }
+
+    /// `source` without comments — whole comment lines and trailing ones — so
+    /// a test reading code cannot be satisfied, or tripped, by prose that names
+    /// what it looks for.
     fn code_only(source: &str) -> String {
         source
             .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
+            .map(strip_trailing_comment)
+            .filter(|line| !line.trim().is_empty())
             .collect::<Vec<_>>()
             .join("\n")
     }
 
-    /// `source` up to its `#[cfg(test)]` module: the shipped code alone.
-    fn shipped(source: &str) -> &str {
-        &source[..source.find("#[cfg(test)]").unwrap_or(source.len())]
+    /// `source` up to its test module (`#[cfg(test)]` followed by `mod`): the
+    /// shipped code alone. A `#[cfg(test)]` on anything else — `cli.rs` has
+    /// one on a `use` — does not end it. Line-based, so a CRLF checkout reads
+    /// the same.
+    fn shipped(source: &str) -> String {
+        let lines: Vec<&str> = source.lines().collect();
+        let end = lines
+            .windows(2)
+            .position(|w| w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod "))
+            .unwrap_or(lines.len());
+        lines[..end].join("\n")
+    }
+
+    /// How often `ident` occurs in `code` as a whole identifier — `retry` in
+    /// `Some(retry)`, not in `password_retry`.
+    fn ident_count(code: &str, ident: &str) -> usize {
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+        code.match_indices(ident)
+            .filter(|(at, _)| {
+                let before = code[..*at].chars().next_back();
+                let after = code[at + ident.len()..].chars().next();
+                !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+            })
+            .count()
+    }
+
+    /// Every `.rs` file under `src/`, as `(path relative to src, contents)`.
+    fn all_sources() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.push((rel, std::fs::read_to_string(&path).unwrap()));
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        walk(&root, &root, &mut out);
+        assert!(
+            out.len() > 20,
+            "found only {} source files under {root:?}",
+            out.len()
+        );
+        out
     }
 
     #[test]
@@ -3244,103 +3366,196 @@ mod tests {
         // The engine suites execute the first hops against real servers
         // (`*_only_a_refused_password_is_a_credential_rejection`), as does
         // `real_server_failures_reach_the_decision_intact` below through
-        // `ServerBackend::open`; the decision itself is executed above. What
-        // is left needs a keyring and a Dioxus runtime to run, so it is read.
-        let whitespace = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        // `ServerBackend::open`; the decision and the credential pairing are
+        // executed above. What is left needs a keyring and a Dioxus runtime to
+        // run, so it is read — pinned as written, not as "mentions".
+        let sources = all_sources();
+        let file = |rel: &str| {
+            let (_, text) = sources
+                .iter()
+                .find(|(path, _)| path == rel)
+                .unwrap_or_else(|| panic!("no src/{rel}"));
+            collapsed(&code_only(&shipped(text)))
+        };
 
         // 1. The classifiers: every connect-time error goes through the one
         //    function that reads the code. A second `DbError::Connect(friendly…)`
         //    beside it would be a login failure that can never prompt — or,
         //    written the other way round, one that always deletes.
-        for (file, source, code_read) in [
+        for (rel, code_read) in [
             (
-                "sqlserver/pool.rs",
-                include_str!("../../db/sqlserver/pool.rs"),
-                "connect_error_from(err.code(), friendly_connect_error(err))",
+                "db/sqlserver/pool.rs",
+                "fn connect_error(err: &TdsError) -> DbError { \
+                 connect_error_from(err.code(), friendly_connect_error(err)) }",
             ),
             (
-                "postgres.rs",
-                include_str!("../../db/postgres.rs"),
-                "connect_error_from(sqlstate.as_deref(), friendly_connect_error(err))",
+                "db/postgres.rs",
+                "fn connect_error(err: &sqlx::Error) -> DbError { \
+                 let sqlstate = err.as_database_error().and_then(|db| db.code()); \
+                 connect_error_from(sqlstate.as_deref(), friendly_connect_error(err)) }",
             ),
         ] {
-            let code = whitespace(&code_only(shipped(source)));
+            let code = file(rel);
             assert!(
                 code.contains(code_read),
-                "{file}: the classifier must decide on the code"
+                "{rel}: the classifier must decide on the code"
             );
             assert_eq!(
                 code.matches("friendly_connect_error(").count(),
                 2,
-                "{file}: friendly_connect_error is defined once and called only by \
+                "{rel}: friendly_connect_error is defined once and called only by \
                  connect_error — any other caller builds a connect error the \
                  classifier never saw"
             );
-            // Built in exactly one place: the function that reads the code.
-            assert_eq!(
-                code.matches("DbError::CredentialsRejected(").count(),
-                1,
-                "{file}: CredentialsRejected is built somewhere other than the \
-                 code-reading classifier"
-            );
             assert!(
                 method_body(&code, "fn connect_error_from(")
-                    .contains("DbError::CredentialsRejected("),
-                "{file}: CredentialsRejected is not built by the classifier"
+                    .contains("DbError::CredentialsRejected(message)"),
+                "{rel}: CredentialsRejected is not built by the classifier"
             );
         }
 
-        // 2. The registry passes the error through untouched.
-        let registry = code_only(include_str!("../../db/registry.rs"));
-        for open in [
-            "pub async fn open_postgres(",
-            "pub async fn open_mssql(",
-            "pub async fn open_mssql_with(",
+        // 1b. Built nowhere else in the shipped code: those two constructions
+        //     are every occurrence outside error.rs, and error.rs holds only
+        //     the declaration and the three match arms — no `From` that
+        //     would build it from a driver error.
+        let mut outside = Vec::new();
+        for (rel, text) in &sources {
+            let code = collapsed(&code_only(&shipped(text)));
+            let n = code.matches("CredentialsRejected(").count();
+            if rel == "db/error.rs" {
+                for arm in [
+                    "CredentialsRejected(String),",
+                    "| DbError::CredentialsRejected(m) => m,",
+                    "matches!(self, DbError::CredentialsRejected(_))",
+                    "DbError::Connect(m) | DbError::CredentialsRejected(m) => {",
+                ] {
+                    assert!(code.contains(arm), "error.rs no longer has `{arm}`");
+                }
+                assert_eq!(n, 4, "error.rs builds or matches CredentialsRejected anew");
+            } else if n > 0 {
+                outside.push((rel.clone(), n));
+            }
+        }
+        outside.sort();
+        assert_eq!(
+            outside,
+            vec![
+                ("db/postgres.rs".to_string(), 1),
+                ("db/sqlserver/pool.rs".to_string(), 1)
+            ],
+            "CredentialsRejected is built outside the two code-reading classifiers"
+        );
+
+        // 2. The registry passes the error through untouched — each body as
+        //    written, so no `map_err`, `or_else` or `match` can remap it.
+        let registry = file("db/registry.rs");
+        for (open, body) in [
+            (
+                "pub async fn open_postgres(",
+                "pub async fn open_postgres(url: &str) -> Result<DbPool, DbError> { \
+                 Ok(DbPool::Postgres(postgres::open_postgres(url).await?)) }",
+            ),
+            (
+                "pub async fn open_mssql(",
+                "pub async fn open_mssql(url: &str) -> Result<DbPool, DbError> { \
+                 Ok(DbPool::SqlServer(sqlserver::open_mssql(url).await?)) }",
+            ),
+            (
+                "pub async fn open_mssql_with(",
+                "pub async fn open_mssql_with( url: &str, auth: &sqlserver::MssqlAuth, \
+                 tls_host: Option<&str>, ) -> Result<DbPool, DbError> { \
+                 Ok(DbPool::SqlServer( sqlserver::open_mssql_with(url, auth, tls_host).await?, )) }",
+            ),
         ] {
-            let body = method_body(&registry, open);
-            assert!(
-                !body.contains("map_err"),
-                "{open} remaps the connect error:\n{body}"
-            );
+            assert_eq!(method_body(&registry, open), body, "{open} changed");
         }
 
-        // 3. So does `ServerBackend::open`.
-        let source = code_only(shipped(include_str!("connect.rs")));
-        let open = method_body(&source, "async fn open(");
-        assert!(
-            !open.contains("map_err"),
-            "ServerBackend::open remaps the error:\n{open}"
+        // 3. So does `ServerBackend::open`, as written.
+        let source = file("ui/state/connect.rs");
+        assert_eq!(
+            method_body(&source, "async fn open("),
+            "async fn open( &self, connect_url: &str, credential: ServerCredential<'_>, \
+             tls_host: Option<&str>, ) -> Result<DbPool, DbError> { \
+             let ServerLogin { url, aad_token } = self.login(connect_url, credential)?; \
+             match self.kind { BackendKind::SqlServer => { let auth = match aad_token { \
+             Some(token) => MssqlAuth::AadToken(token), None => MssqlAuth::Password, }; \
+             DbPool::open_mssql_with(&url, &auth, tls_host).await } _ => { \
+             debug_assert!(aad_token.is_none(), \"a Postgres token belongs in the URL\"); \
+             DbPool::open_postgres(&url).await } } }",
+            "ServerBackend::open changed — it may be remapping the error"
         );
 
-        // 4. `connect_server` asks the decision, and nothing but the decision.
+        // 4. `connect_server`: the decision's inputs and its consequence, in
+        //    order. The credential and the flag come from one call, the open
+        //    gets that credential, the verdict gets that flag, and the delete
+        //    gets the connection's own key.
         let connect = method_body(&source, "pub async fn connect_server(");
-        assert!(
-            whitespace(&connect).contains("password_retry(err, had_password)"),
-            "connect_server must route the failure through password_retry"
-        );
-        // No consumer anywhere in the shipped code matches the words.
-        for words in ["authentication failed", "login failed", "Login failed"] {
-            assert!(
-                !source.contains(&format!("\"{words}")),
-                "connect.rs decides on the message text `{words}` again"
+        let mut from = 0;
+        for step in [
+            "let (credential, had_password) = remembered_credential(session_password.as_deref());",
+            ".open(&connect_url, credential, tls_host.as_deref())",
+            "if let Err(err) = &result {",
+            "if let Some(retry) = password_retry(err, had_password) {",
+            "if retry == PasswordRetry::ForgetStoredAndPrompt {",
+            "self.forget_stale_secret(url.clone(), err.to_string()).await;",
+        ] {
+            let at = connect[from..].find(step).unwrap_or_else(|| {
+                panic!("connect_server no longer has, after the previous step: `{step}`")
+            });
+            from += at + step.len();
+        }
+        // Each input bound once and used once — a rebinding (`let had_password
+        // = true`, a second `credential`) adds an occurrence.
+        for (ident, uses) in [
+            ("had_password", 2),
+            ("credential", 2),
+            ("session_password", 4),
+        ] {
+            assert_eq!(
+                ident_count(&connect, ident),
+                uses,
+                "`{ident}` is bound or used somewhere new in connect_server"
             );
         }
+        assert!(
+            !connect.contains("ServerCredential::"),
+            "connect_server builds a credential of its own instead of the paired one"
+        );
 
-        // 5. The keyring delete happens only behind the verdict that permits
-        //    it, and the prompt only behind a verdict at all.
+        // 5. The verdict reaches the gate unaltered — no `let retry = …`, no
+        //    `retry = …` — the delete sits inside the gate, and nothing else in
+        //    connect_server deletes, forgets or writes session memory.
         let verdict = method_body(&connect, "if let Some(retry) = password_retry(");
+        assert_eq!(
+            ident_count(&verdict, "retry"),
+            2,
+            "the verdict is rebound or overridden before the gate:\n{verdict}"
+        );
         let gate = method_body(
             &verdict,
             "if retry == PasswordRetry::ForgetStoredAndPrompt {",
         );
-        assert!(
-            gate.contains("self.forget_stale_secret("),
-            "the stored password must be forgotten inside the ForgetStoredAndPrompt gate"
-        );
         assert_eq!(
-            source.matches("self.forget_stale_secret(").count(),
-            1,
-            "a second caller of forget_stale_secret is a second, ungated delete"
+            gate,
+            "if retry == PasswordRetry::ForgetStoredAndPrompt { \
+             self.forget_stale_secret(url.clone(), err.to_string()).await; }",
+            "the gate holds something other than the one delete"
+        );
+        let outside_gate = connect.replacen(&gate, "", 1);
+        for delete in [
+            "forget_stale_secret",
+            "delete_password_async",
+            "session_passwords.write()",
+        ] {
+            assert!(
+                !outside_gate.contains(delete),
+                "connect_server reaches `{delete}` outside the gate"
+            );
+        }
+        assert_eq!(
+            source.matches("forget_stale_secret(").count(),
+            2,
+            "forget_stale_secret has a caller besides connect_server's gate"
         );
         assert!(
             verdict.contains("PromptKind::DbPassword"),
@@ -3352,31 +3567,41 @@ mod tests {
             "a second database-password prompt is a second, undecided path"
         );
 
-        // 6. And `forget_stale_secret` is the delete — from session memory and
-        //    the keyring both, under the key it was handed.
+        // 6. `forget_stale_secret` is the delete — from session memory and the
+        //    keyring both, under the key it was handed.
         let forget = method_body(&source, "async fn forget_stale_secret(");
-        assert!(forget.contains("session_passwords.write().remove(&key)"));
-        assert!(forget.contains("delete_password_async(key)"));
+        assert!(forget.contains("self.session_passwords.write().remove(&key);"));
+        assert!(forget.contains("crate::secrets::delete_password_async(key).await;"));
+
+        // 7. And no code in the UI decides on the words: no string literal in
+        //    any shipped file under src/ui names a login or password failure.
+        for (rel, text) in sources.iter().filter(|(rel, _)| rel.starts_with("ui/")) {
+            let code = code_only(&shipped(text)).to_lowercase();
+            for words in ["authentication failed", "login failed"] {
+                assert!(
+                    !code.contains(words),
+                    "src/{rel} names `{words}` in code — a decision on message text"
+                );
+            }
+        }
     }
 
     /// Opens through `ServerBackend::open` — the call `connect_server` makes —
-    /// and asks the decision what follows. A password stands for a remembered
-    /// one; `None` is the trust-auth attempt made when nothing is remembered.
+    /// with the credential `remembered_credential` pairs, and asks the decision
+    /// what follows. `None` is the trust-auth attempt made when nothing is
+    /// remembered.
     async fn retry_after(
         backend: ServerBackend,
         url: &str,
-        password: Option<&str>,
+        remembered: Option<&str>,
     ) -> Option<PasswordRetry> {
-        let credential = match password {
-            Some(password) => ServerCredential::Password(password),
-            None => ServerCredential::None,
-        };
+        let (credential, had_password) = remembered_credential(remembered);
         let err = backend
             .open(url, credential, None)
             .await
             .err()
             .unwrap_or_else(|| panic!("{url} connected"));
-        password_retry(&err, password.is_some())
+        password_retry(&err, had_password)
     }
 
     #[tokio::test]
