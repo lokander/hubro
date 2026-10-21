@@ -19,8 +19,8 @@ use hubro::db::{
     detect_row_identity, explain_statement, needs_confirmation, plan_reached_cell_cap, run_script,
     script_refusal, url_with_password, Capabilities, DbError, DbPool, Dialect, Filter, Internal,
     PageRequest, PgFlavor, PlanDisplay, Restriction, Rollback, RowCount, RowLocator, SortDir,
-    StatementOutcome, TableKind, TypeDetail, TypeRef, Value, WriteProtection, PREVIEW_BYTES,
-    QUERY_CELL_CAP,
+    StatementOutcome, TableKind, TableMeta, TypeDetail, TypeRef, Value, WriteProtection,
+    PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 async fn test_url() -> Option<String> {
@@ -1874,7 +1874,20 @@ const PG_KEY_TYPES: &[(&str, &str, &[&str])] = &[
         "double precision",
         &["1e20", "0.1", "123456789.123456789", "-2.5e-300"],
     ),
-    ("float4", "real", &["1e20", "0.1", "3.4028235e38"]),
+    // A `real` key binds as its f32's shortest spelling; the non-finite
+    // values and a subnormal are the spellings an engine might not share.
+    (
+        "float4",
+        "real",
+        &[
+            "1e20",
+            "0.1",
+            "3.4028235e38",
+            "1e-45",
+            "'NaN'",
+            "'-Infinity'",
+        ],
+    ),
     ("numeric", "numeric", &["12345.678901", "0.10", "1e20"]),
     ("int8", "bigint", &["9223372036854775807", "-1"]),
     ("uuid", "uuid", &["'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'"]),
@@ -1893,8 +1906,106 @@ const PG_KEY_TYPES: &[(&str, &str, &[&str])] = &[
     ("char3", "character(3)", &["'ab'", "'abc'"]),
     ("bool", "boolean", &["true", "false"]),
     ("bit4", "bit(4)", &["B'1010'"]),
-    ("mood", "addr_keys.mood", &["'happy'", "'Sad'"]),
+    // `{schema}` is the fixture schema, where the enum is created.
+    ("mood", "{schema}.mood", &["'happy'", "'Sad'"]),
 ];
+
+/// Creates one table per [`PG_KEY_TYPES`] entry in `schema` — `k_<slug>`,
+/// keyed by that type, with a long `body` and a short `tag` — plus a
+/// composite-keyed `k_composite`, and beside each a `fk_<slug>` whose rows
+/// reference every key through a foreign key of the same type, with
+/// `expect` naming the body each one must land on.
+async fn create_key_type_fixtures(pool: &DbPool, schema: &str) {
+    for sql in [
+        format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+        format!("CREATE SCHEMA {schema}"),
+        format!("CREATE TYPE {schema}.mood AS ENUM ('happy', 'Sad')"),
+    ] {
+        pool.query(&sql).await.unwrap();
+    }
+    for (slug, type_name, literals) in PG_KEY_TYPES {
+        let type_name = type_name.replace("{schema}", schema);
+        pool.query(&format!(
+            "CREATE TABLE {schema}.k_{slug} (k {type_name} PRIMARY KEY, body text, tag text)"
+        ))
+        .await
+        .unwrap();
+        pool.query(&format!(
+            "CREATE TABLE {schema}.fk_{slug} (
+                ref {type_name} REFERENCES {schema}.k_{slug} (k), expect text)"
+        ))
+        .await
+        .unwrap();
+        let rows: Vec<String> = literals
+            .iter()
+            .enumerate()
+            .map(|(n, lit)| format!("({lit}, '{n}:' || repeat('x', 5000), 't')"))
+            .collect();
+        pool.query(&format!(
+            "INSERT INTO {schema}.k_{slug} VALUES {}",
+            rows.join(", ")
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("{slug}: {e}"));
+        let refs: Vec<String> = literals
+            .iter()
+            .enumerate()
+            .map(|(n, lit)| format!("({lit}, '{n}:')"))
+            .collect();
+        pool.query(&format!(
+            "INSERT INTO {schema}.fk_{slug} VALUES {}",
+            refs.join(", ")
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("fk_{slug}: {e}"));
+    }
+    // A composite key mixing a float with text: the clause covers every
+    // column, not just the first.
+    for sql in [
+        format!(
+            "CREATE TABLE {schema}.k_composite (
+                a double precision, b text, body text, tag text, PRIMARY KEY (a, b))"
+        ),
+        format!(
+            "INSERT INTO {schema}.k_composite VALUES
+                (1e20, 'x', '0:' || repeat('x', 5000), 't'),
+                (1e20, 'y', '1:' || repeat('x', 5000), 't')"
+        ),
+        format!(
+            "CREATE TABLE {schema}.fk_composite (
+                a double precision, b text, expect text,
+                FOREIGN KEY (a, b) REFERENCES {schema}.k_composite (a, b))"
+        ),
+        format!("INSERT INTO {schema}.fk_composite VALUES (1e20, 'x', '0:'), (1e20, 'y', '1:')"),
+    ] {
+        pool.query(&sql).await.unwrap();
+    }
+}
+
+/// The `k_<slug>` tables [`create_key_type_fixtures`] made in `schema`, each
+/// with its `fk_<slug>` referencing table, checked to be all of them.
+fn key_type_fixture_pairs<'a>(
+    tables: &'a [TableMeta],
+    schema: &str,
+) -> Vec<(&'a TableMeta, &'a TableMeta)> {
+    let in_schema = |name: &str| {
+        tables
+            .iter()
+            .find(|t| t.schema.as_deref() == Some(schema) && t.name == name)
+            .unwrap_or_else(|| panic!("{schema}.{name} was not introspected"))
+    };
+    PG_KEY_TYPES
+        .iter()
+        .map(|(slug, _, _)| *slug)
+        .chain(["composite"])
+        .map(|slug| {
+            (
+                in_schema(&format!("k_{slug}")),
+                in_schema(&format!("fk_{slug}")),
+            )
+        })
+        .collect()
+}
 
 #[tokio::test]
 async fn postgres_every_key_type_reads_and_writes_the_same_row() {
@@ -1905,65 +2016,35 @@ async fn postgres_every_key_type_reads_and_writes_the_same_row() {
     // key that saved but expanded to NULL was the bug this pins.
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
-    for sql in [
-        "DROP SCHEMA IF EXISTS addr_keys CASCADE",
-        "CREATE SCHEMA addr_keys",
-        "CREATE TYPE addr_keys.mood AS ENUM ('happy', 'Sad')",
-    ] {
-        pool.query(sql).await.unwrap();
-    }
-    for (slug, type_name, literals) in PG_KEY_TYPES {
-        pool.query(&format!(
-            "CREATE TABLE addr_keys.k_{slug} (k {type_name} PRIMARY KEY, body text, tag text)"
-        ))
-        .await
-        .unwrap();
-        let rows: Vec<String> = literals
-            .iter()
-            .enumerate()
-            .map(|(n, lit)| format!("({lit}, '{n}:' || repeat('x', 5000), 't')"))
-            .collect();
-        pool.query(&format!(
-            "INSERT INTO addr_keys.k_{slug} VALUES {}",
-            rows.join(", ")
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("{slug}: {e}"));
-    }
-    // A composite key mixing a float with text: the clause covers every
-    // column, not just the first.
-    pool.query(
-        "CREATE TABLE addr_keys.k_composite (
-            a double precision, b text, body text, tag text, PRIMARY KEY (a, b))",
-    )
-    .await
-    .unwrap();
-    pool.query(
-        "INSERT INTO addr_keys.k_composite VALUES
-            (1e20, 'x', '0:' || repeat('x', 5000), 't'),
-            (1e20, 'y', '1:' || repeat('x', 5000), 't')",
-    )
-    .await
-    .unwrap();
-
+    create_key_type_fixtures(&pool, "addr_keys").await;
     let tables = pool.introspect().await.unwrap();
     let mut failures = Vec::new();
-    let mut checked = 0;
-    for table in tables
-        .iter()
-        .filter(|t| t.schema.as_deref() == Some("addr_keys"))
-    {
+    for (table, _) in key_type_fixture_pairs(&tables, "addr_keys") {
         failures.extend(common::row_addressing_failures(&pool, table).await);
-        checked += 1;
     }
-    assert_eq!(
-        checked,
-        PG_KEY_TYPES.len() + 1,
-        "every fixture introspected"
-    );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 
     pool.query("DROP SCHEMA addr_keys CASCADE").await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_every_key_type_jumps_to_the_row_it_references() {
+    // A foreign-key jump pins the referenced row from the source row's own
+    // typed values, so it is the same question as re-addressing a row: a
+    // float, blob or date/time key compared as hubro's text spelling of it
+    // landed on an empty page.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    create_key_type_fixtures(&pool, "fk_keys").await;
+    let tables = pool.introspect().await.unwrap();
+    let mut failures = Vec::new();
+    for (parent, child) in key_type_fixture_pairs(&tables, "fk_keys") {
+        failures.extend(common::fk_jump_failures(&pool, child, parent).await);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    pool.query("DROP SCHEMA fk_keys CASCADE").await.unwrap();
     pool.close().await;
 }
 

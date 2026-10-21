@@ -69,6 +69,20 @@
 //!     the column is still auto-assigned and inserts still omit it — but it is
 //!     the assumption most likely to surprise.
 //!
+//! One more was found, and fixed, after the verification:
+//!
+//!  6. **A `real` is a 64-bit float.** `::real` rounds nothing — a column
+//!     declared `real` holding `0.1` holds the float64 `0.1` — but the wire
+//!     sends it as a 4-byte `float4`, so the grid reads `0.1f32`. Bound back
+//!     widened (`0.10000000149011612::real`) that key matched no row: its long
+//!     cells loaded as NULL, Save refused it, and a foreign key into it jumped
+//!     to an empty page. Key positions now bind a `real` as the shortest
+//!     spelling of its `f32` (`'0.1'::real`), which is the decimal the row was
+//!     written with — see `cockroach_real_keys_are_re_addressed_by_their_shortest_spelling`.
+//!     A `real` key written with more digits than an `f32` holds stays
+//!     unreachable: the wire rounded them away before hubro saw the row. That
+//!     test pins it too.
+//!
 //! ## Absent features, confirmed to fail sensibly rather than corrupt
 //!
 //! Declarative partitioning, `VACUUM`, range types, nested arrays, and
@@ -77,6 +91,8 @@
 //! the message without the "(line L, column C)" suffix. The rest of the
 //! Postgres suite passes against this container — point `HUBRO_PG_TEST_URL` at
 //! it to re-run it there, minus the cases resting on those five features.
+
+mod common;
 
 use hubro::db::{
     apply_staged, detect_row_identity, run_script, split_statements, Capabilities, DbPool, Filter,
@@ -758,6 +774,78 @@ async fn cockroach_keeps_no_statistics_this_can_read_so_the_pane_stays_empty() {
     assert_eq!(pool.count_table_rows(meta).await.unwrap(), 16);
 
     pool.query(&format!("DROP TABLE IF EXISTS {readings} CASCADE"))
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn cockroach_real_keys_are_re_addressed_by_their_shortest_spelling() {
+    // Cockroach keeps a `real` as a 64-bit float — `::real` rounds nothing —
+    // while the wire sends it as a 4-byte `float4`. A key read back as
+    // `0.1f32` and bound widened (`0.10000000149011612::real`) matched no row,
+    // so the cell expanded to NULL, Save refused the row and a foreign key
+    // into it jumped to an empty page. Bound as the f32's shortest spelling
+    // (`'0.1'::real`) it is the decimal the row was written with.
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let body = |n: usize| format!("'{n}:' || repeat('x', 5000)");
+    let literals = [
+        "0.1",
+        "1e20",
+        "3.4028235e38",
+        "1e-45",
+        "'NaN'",
+        "'-Infinity'",
+    ];
+    let keys: Vec<String> = literals
+        .iter()
+        .enumerate()
+        .map(|(n, lit)| format!("({lit}, {}, 't')", body(n)))
+        .collect();
+    let refs: Vec<String> = literals
+        .iter()
+        .enumerate()
+        .map(|(n, lit)| format!("({lit}, '{n}:')"))
+        .collect();
+    for sql in [
+        "DROP TABLE IF EXISTS real_refs, real_keys, real_precise".to_string(),
+        "CREATE TABLE real_keys (k real PRIMARY KEY, body text, tag text)".to_string(),
+        format!("INSERT INTO real_keys VALUES {}", keys.join(", ")),
+        "CREATE TABLE real_refs (ref real REFERENCES real_keys (k), expect text)".to_string(),
+        format!("INSERT INTO real_refs VALUES {}", refs.join(", ")),
+        // More digits than an f32 holds, which this engine's `real` keeps.
+        "CREATE TABLE real_precise (k real PRIMARY KEY, body text, tag text)".to_string(),
+        format!(
+            "INSERT INTO real_precise VALUES (0.123456789012, {}, 't')",
+            body(0)
+        ),
+    ] {
+        pool.query(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let tables = pool.introspect().await.unwrap();
+    let (keyed, refs) = (find(&tables, "real_keys"), find(&tables, "real_refs"));
+    let mut failures = common::row_addressing_failures(&pool, keyed).await;
+    failures.extend(common::fk_jump_failures(&pool, refs, keyed).await);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    // The known residual, pinned so it stays one: the wire rounded the extra
+    // digits away before hubro saw the row, so no bind can find it again —
+    // its long cell does not load and its edit is refused (never applied to
+    // another row). If this starts passing, the engine changed and the
+    // comment on `key_bind_value` is out of date.
+    let precise = common::row_addressing_failures(&pool, find(&tables, "real_precise")).await;
+    assert_eq!(precise.len(), 2, "{}", precise.join("\n"));
+    assert!(
+        precise[0].contains("fetch_cell returned Null")
+            && precise[1].contains("the write did not address its row"),
+        "{}",
+        precise.join("\n")
+    );
+
+    pool.query("DROP TABLE real_refs, real_keys, real_precise")
         .await
         .unwrap();
     pool.close().await;

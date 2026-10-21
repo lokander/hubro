@@ -7,8 +7,8 @@ mod common;
 
 use common::FixtureDb;
 use hubro::db::{
-    detect_row_identity, DbError, Generated, PageRequest, RowLocator, Value, PREVIEW_BYTES,
-    QUERY_CELL_CAP,
+    detect_row_identity, DbError, Generated, PageRequest, RowLocator, TableMeta, Value,
+    PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 fn request(table: &str) -> PageRequest {
@@ -283,23 +283,32 @@ async fn query_capped_bounds_huge_cells() {
     pool.close().await;
 }
 
-#[tokio::test]
-async fn every_key_type_reads_and_writes_the_same_row() {
-    // The expand popup, the truncated-cell editor and the clipboard load a
-    // long cell's full value through `fetch_cell`; Save re-addresses the row
-    // through the staged writer. Both start from the same locator, so both
-    // must find the same row for every key type — a blob key, bound as the
-    // text `<blob N>`, used to expand to NULL while it saved.
+/// One table per key storage class SQLite has — `k_real`, `k_blob`,
+/// `k_text` and a composite `k_composite` — each with a long `body`, and
+/// beside each an `fk_<slug>` whose rows reference every key through a
+/// foreign key, with `expect` naming the body each one must land on.
+const KEY_TYPE_SLUGS: &[&str] = &["real", "blob", "text", "composite"];
+
+async fn key_type_fixture() -> FixtureDb {
     let body = |n: usize| format!("'{n}:' || printf('%.5000c', 'x')");
     let sql = format!(
         "CREATE TABLE k_real (k REAL PRIMARY KEY, body TEXT, tag TEXT);
          INSERT INTO k_real VALUES (1e20, {}, 't'), (0.1, {}, 't'), (-2.5e-300, {}, 't');
+         CREATE TABLE fk_real (ref REAL REFERENCES k_real (k), expect TEXT);
+         INSERT INTO fk_real VALUES (1e20, '0:'), (0.1, '1:'), (-2.5e-300, '2:');
          CREATE TABLE k_blob (k BLOB PRIMARY KEY, body TEXT, tag TEXT);
          INSERT INTO k_blob VALUES (x'00ff10', {}, 't'), (x'', {}, 't');
+         CREATE TABLE fk_blob (ref BLOB REFERENCES k_blob (k), expect TEXT);
+         INSERT INTO fk_blob VALUES (x'00ff10', '0:'), (x'', '1:');
          CREATE TABLE k_text (k TEXT PRIMARY KEY, body TEXT, tag TEXT);
          INSERT INTO k_text VALUES ('plain', {}, 't'), ('trailing  ', {}, 't');
+         CREATE TABLE fk_text (ref TEXT REFERENCES k_text (k), expect TEXT);
+         INSERT INTO fk_text VALUES ('plain', '0:'), ('trailing  ', '1:');
          CREATE TABLE k_composite (a REAL, b TEXT, body TEXT, tag TEXT, PRIMARY KEY (a, b));
-         INSERT INTO k_composite VALUES (1e20, 'x', {}, 't'), (1e20, 'y', {}, 't');",
+         INSERT INTO k_composite VALUES (1e20, 'x', {}, 't'), (1e20, 'y', {}, 't');
+         CREATE TABLE fk_composite (a REAL, b TEXT, expect TEXT,
+             FOREIGN KEY (a, b) REFERENCES k_composite (a, b));
+         INSERT INTO fk_composite VALUES (1e20, 'x', '0:'), (1e20, 'y', '1:');",
         body(0),
         body(1),
         body(2),
@@ -310,13 +319,53 @@ async fn every_key_type_reads_and_writes_the_same_row() {
         body(0),
         body(1),
     );
-    let fixture = FixtureDb::with_sql(&sql).await;
+    FixtureDb::with_sql(&sql).await
+}
+
+/// Each `k_<slug>` table with its `fk_<slug>` referencing table.
+fn key_type_pairs(tables: &[TableMeta]) -> Vec<(&TableMeta, &TableMeta)> {
+    assert_eq!(tables.len(), KEY_TYPE_SLUGS.len() * 2);
+    let named = |name: String| {
+        tables
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} was not introspected"))
+    };
+    KEY_TYPE_SLUGS
+        .iter()
+        .map(|slug| (named(format!("k_{slug}")), named(format!("fk_{slug}"))))
+        .collect()
+}
+
+#[tokio::test]
+async fn every_key_type_reads_and_writes_the_same_row() {
+    // The expand popup, the truncated-cell editor and the clipboard load a
+    // long cell's full value through `fetch_cell`; Save re-addresses the row
+    // through the staged writer. Both start from the same locator, so both
+    // must find the same row for every key type — a blob key, bound as the
+    // text `<blob N>`, used to expand to NULL while it saved.
+    let fixture = key_type_fixture().await;
     let pool = fixture.open().await;
     let tables = pool.introspect().await.unwrap();
-    assert_eq!(tables.len(), 4);
     let mut failures = Vec::new();
-    for table in &tables {
+    for (table, _) in key_type_pairs(&tables) {
         failures.extend(common::row_addressing_failures(&pool, table).await);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn every_key_type_jumps_to_the_row_it_references() {
+    // A foreign-key jump pins the referenced row from the source row's typed
+    // values. Compared as text, a blob key was bound as the marker
+    // `<blob N>` and jumped to an empty page.
+    let fixture = key_type_fixture().await;
+    let pool = fixture.open().await;
+    let tables = pool.introspect().await.unwrap();
+    let mut failures = Vec::new();
+    for (parent, child) in key_type_pairs(&tables) {
+        failures.extend(common::fk_jump_failures(&pool, child, parent).await);
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     pool.close().await;

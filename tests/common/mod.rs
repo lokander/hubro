@@ -984,6 +984,132 @@ pub async fn row_addressing_failures(pool: &DbPool, table: &hubro::db::TableMeta
     failures
 }
 
+/// Every way a foreign-key jump from `child`'s rows fails to land on the row
+/// it references in `parent`, as one line each — empty when every jump finds
+/// exactly its row.
+///
+/// `child` must carry one foreign key into `parent` and a text column
+/// `expect` holding the prefix of the referenced row's `body` (`'0:'`,
+/// `'1:'`, …, as [`row_addressing_failures`]'s fixtures write it). Each child
+/// row is read the way the grid reads it — a bounded page with the key
+/// columns whole — and the jump's filter is built from that row exactly as
+/// the grid's link builds it. The filter then runs through every consumer
+/// the grid hands it to: the page, the row count and the export. All three
+/// must find exactly the referenced row, so a jump that shows the row but
+/// counts zero (or exports nothing) is a failure as much as an empty page.
+pub async fn fk_jump_failures(
+    pool: &DbPool,
+    child: &hubro::db::TableMeta,
+    parent: &hubro::db::TableMeta,
+) -> Vec<String> {
+    use hubro::db::{build_fk_filter, ColumnInfo, PageRequest, Value};
+    use std::collections::HashMap;
+    let fk = child
+        .foreign_keys
+        .first()
+        .unwrap_or_else(|| panic!("{}: no foreign key", child.name));
+    let source = PageRequest {
+        schema: child.schema.clone(),
+        table: child.name.clone(),
+        limit: 1000,
+        offset: 0,
+        sort: None,
+        filter: None,
+        extra_key_column: None,
+    };
+    let fk_columns: Vec<&str> = fk.columns.iter().map(String::as_str).collect();
+    let page = pool
+        .fetch_page_bounded(&source, &child.columns, &fk_columns)
+        .await
+        .unwrap_or_else(|e| panic!("{}: page fetch failed: {e}", child.name));
+    assert!(!page.result.rows.is_empty(), "{}: no rows", child.name);
+    let parent_pk: Vec<String> = parent
+        .primary_key()
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    let keys: Vec<&str> = parent_pk.iter().map(String::as_str).collect();
+    // An empty page carries no column headers (an internal read does not
+    // describe its statement), so the column is looked up only on a row.
+    let body_of = |columns: &[ColumnInfo], row: &[Value]| {
+        let at = columns
+            .iter()
+            .position(|c| c.name == "body")
+            .unwrap_or_else(|| panic!("{}: no column body", parent.name));
+        row[at].clone()
+    };
+    let mut failures = Vec::new();
+    for row in &page.result.rows {
+        let source_row: HashMap<String, Value> = page
+            .result
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .zip(row.iter().cloned())
+            .collect();
+        let label = format!(
+            "{} {:?}",
+            child.name,
+            fk.columns
+                .iter()
+                .map(|c| &source_row[c])
+                .collect::<Vec<_>>()
+        );
+        let Some(Value::Text(expect)) = source_row.get("expect") else {
+            panic!("{label}: expect must be a text cell");
+        };
+        let Some(filter) = build_fk_filter(fk, &source_row, parent, pool.dialect()) else {
+            failures.push(format!("{label}: no jump was built"));
+            continue;
+        };
+        let request = PageRequest {
+            schema: parent.schema.clone(),
+            table: parent.name.clone(),
+            limit: 1000,
+            offset: 0,
+            sort: None,
+            filter: Some(filter),
+            extra_key_column: None,
+        };
+        match pool
+            .fetch_page_bounded(&request, &parent.columns, &keys)
+            .await
+        {
+            Ok(landed) => {
+                let bodies: Vec<Value> = landed
+                    .result
+                    .rows
+                    .iter()
+                    .map(|row| body_of(&landed.result.columns, row))
+                    .collect();
+                match bodies.as_slice() {
+                    [Value::Text(body)] if body.starts_with(expect.as_str()) => {}
+                    other => failures.push(format!(
+                        "{label}: the page held {} rows instead of the one starting {expect:?}",
+                        other.len()
+                    )),
+                }
+            }
+            Err(e) => failures.push(format!("{label}: the page failed: {e}")),
+        }
+        match pool.count_rows(&request).await {
+            Ok(1) => {}
+            Ok(n) => failures.push(format!("{label}: the count was {n}")),
+            Err(e) => failures.push(format!("{label}: the count failed: {e}")),
+        }
+        let (sql, params) = request.export_sql(pool.dialect());
+        match pool.query_capped(&sql, &params, 1000).await {
+            Ok((result, _)) if result.rows.len() == 1 => {}
+            Ok((result, _)) => failures.push(format!(
+                "{label}: the export held {} rows",
+                result.rows.len()
+            )),
+            Err(e) => failures.push(format!("{label}: the export failed: {e}")),
+        }
+    }
+    failures
+}
+
 // ---------------------------------------------------------------------------
 // The contains filter is a substring search, whatever the needle holds
 // ---------------------------------------------------------------------------

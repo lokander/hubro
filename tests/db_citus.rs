@@ -443,7 +443,8 @@ async fn fk_navigation_crosses_from_distributed_to_reference() {
 
     let source_row: HashMap<String, Value> =
         HashMap::from([("country".to_string(), Value::Text("se".into()))]);
-    let filter = build_fk_filter(fk, &source_row, &["code".to_string()])
+    let countries_meta = find(&tables, &countries);
+    let filter = build_fk_filter(fk, &source_row, countries_meta, pool.dialect())
         .expect("a filter pinning the referenced row");
 
     let page = pool

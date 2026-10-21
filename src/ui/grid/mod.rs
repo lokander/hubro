@@ -2324,10 +2324,10 @@ fn spawn_grid_export(
 /// bar filter (which the inputs already show).
 fn equality_filter_label(filter: Option<&Filter>) -> Option<String> {
     match filter? {
-        Filter::Equalities(pairs) => Some(
-            pairs
+        Filter::Equalities(terms) => Some(
+            terms
                 .iter()
-                .map(|(column, value)| format!("{column} = {}", value.display()))
+                .map(|term| format!("{} = {}", term.column, term.value.display()))
                 .collect::<Vec<_>>()
                 .join(", "),
         ),

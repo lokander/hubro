@@ -1904,6 +1904,7 @@ const MSSQL_KEY_TYPES: &[(&str, &str, &[&str])] = &[
         &["'2024-02-29 13:45:01.1234567'", "'2024-01-01 00:00:00'"],
     ),
     ("datetime", "datetime", &["'2024-02-29 13:45:01.123'"]),
+    ("smalldt", "smalldatetime", &["'2024-02-29 13:45:00'"]),
     (
         "dto",
         "datetimeoffset",
@@ -1913,6 +1914,7 @@ const MSSQL_KEY_TYPES: &[(&str, &str, &[&str])] = &[
     ("time", "time", &["'13:45:01.5'"]),
     // A blob key used to be bound as the text `<blob N>`.
     ("varbinary", "varbinary(16)", &["0x00FF10", "0x"]),
+    ("binary", "binary(3)", &["0x00FF10", "0x01"]),
     (
         "nvarchar",
         "nvarchar(20)",
@@ -1923,6 +1925,91 @@ const MSSQL_KEY_TYPES: &[(&str, &str, &[&str])] = &[
     ("money", "money", &["12.3456"]),
 ];
 
+/// Creates one table per [`MSSQL_KEY_TYPES`] entry — `<prefix>_<slug>`,
+/// keyed by that type, with a long `body` and a short `tag` — plus a
+/// composite-keyed `<prefix>_composite`, and beside each a
+/// `<prefix>fk_<slug>` whose rows reference every key through a foreign key
+/// of the same type, with `expect` naming the body each one must land on.
+/// Returns the slugs, in the order the tables were made.
+async fn create_key_type_fixtures(pool: &DbPool, prefix: &str) -> Vec<&'static str> {
+    let body = |n: usize| format!("CONCAT(N'{n}:', REPLICATE(CAST(N'x' AS nvarchar(max)), 5000))");
+    let mut fixtures: Vec<String> = Vec::new();
+    for (slug, type_name, literals) in MSSQL_KEY_TYPES {
+        let rows: Vec<String> = literals
+            .iter()
+            .enumerate()
+            .map(|(n, lit)| format!("({lit}, {}, N't')", body(n)))
+            .collect();
+        let refs: Vec<String> = literals
+            .iter()
+            .enumerate()
+            .map(|(n, lit)| format!("({lit}, N'{n}:')"))
+            .collect();
+        fixtures.extend([
+            format!("DROP TABLE IF EXISTS dbo.{prefix}fk_{slug}"),
+            format!("DROP TABLE IF EXISTS dbo.{prefix}_{slug}"),
+            format!(
+                "CREATE TABLE dbo.{prefix}_{slug} (k {type_name} NOT NULL PRIMARY KEY, \
+                 body nvarchar(max), tag nvarchar(20))"
+            ),
+            format!("INSERT INTO dbo.{prefix}_{slug} VALUES {}", rows.join(", ")),
+            format!(
+                "CREATE TABLE dbo.{prefix}fk_{slug} (\
+                 ref {type_name} REFERENCES dbo.{prefix}_{slug} (k), expect nvarchar(10))"
+            ),
+            format!(
+                "INSERT INTO dbo.{prefix}fk_{slug} VALUES {}",
+                refs.join(", ")
+            ),
+        ]);
+    }
+    // A composite key mixing a float with text: the clause covers every
+    // column, not just the first.
+    fixtures.extend([
+        format!("DROP TABLE IF EXISTS dbo.{prefix}fk_composite"),
+        format!("DROP TABLE IF EXISTS dbo.{prefix}_composite"),
+        format!(
+            "CREATE TABLE dbo.{prefix}_composite (a float NOT NULL, b nvarchar(5) NOT NULL, \
+             body nvarchar(max), tag nvarchar(20), PRIMARY KEY (a, b))"
+        ),
+        format!(
+            "INSERT INTO dbo.{prefix}_composite VALUES \
+             (1e20, N'x', {}, N't'), (1e20, N'y', {}, N't')",
+            body(0),
+            body(1)
+        ),
+        format!(
+            "CREATE TABLE dbo.{prefix}fk_composite (a float, b nvarchar(5), \
+             expect nvarchar(10), FOREIGN KEY (a, b) REFERENCES dbo.{prefix}_composite (a, b))"
+        ),
+        format!(
+            "INSERT INTO dbo.{prefix}fk_composite VALUES (1e20, N'x', N'0:'), (1e20, N'y', N'1:')"
+        ),
+    ]);
+    let fixtures: Vec<&str> = fixtures.iter().map(String::as_str).collect();
+    run_all(pool, &fixtures).await;
+    MSSQL_KEY_TYPES
+        .iter()
+        .map(|(slug, _, _)| *slug)
+        .chain(["composite"])
+        .collect()
+}
+
+/// Drops what [`create_key_type_fixtures`] made, referencing tables first.
+async fn drop_key_type_fixtures(pool: &DbPool, prefix: &str, slugs: &[&str]) {
+    let drops: Vec<String> = slugs
+        .iter()
+        .flat_map(|slug| {
+            [
+                format!("DROP TABLE dbo.{prefix}fk_{slug}"),
+                format!("DROP TABLE dbo.{prefix}_{slug}"),
+            ]
+        })
+        .collect();
+    let drops: Vec<&str> = drops.iter().map(String::as_str).collect();
+    run_all(pool, &drops).await;
+}
+
 #[tokio::test]
 async fn sqlserver_every_key_type_reads_and_writes_the_same_row() {
     // The expand popup, the truncated-cell editor and the clipboard load a
@@ -1932,58 +2019,34 @@ async fn sqlserver_every_key_type_reads_and_writes_the_same_row() {
     // key that saved but expanded to NULL was the bug this pins.
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
-    let mut fixtures: Vec<String> = Vec::new();
-    for (slug, type_name, literals) in MSSQL_KEY_TYPES {
-        let rows: Vec<String> = literals
-            .iter()
-            .enumerate()
-            .map(|(n, lit)| {
-                format!(
-                    "({lit}, CONCAT(N'{n}:', REPLICATE(CAST(N'x' AS nvarchar(max)), 5000)), N't')"
-                )
-            })
-            .collect();
-        fixtures.push(format!("DROP TABLE IF EXISTS dbo.addr_{slug}"));
-        fixtures.push(format!(
-            "CREATE TABLE dbo.addr_{slug} (k {type_name} NOT NULL PRIMARY KEY, \
-             body nvarchar(max), tag nvarchar(20))"
-        ));
-        fixtures.push(format!(
-            "INSERT INTO dbo.addr_{slug} VALUES {}",
-            rows.join(", ")
-        ));
-    }
-    // A composite key mixing a float with text: the clause covers every
-    // column, not just the first.
-    fixtures.extend([
-        "DROP TABLE IF EXISTS dbo.addr_composite".to_string(),
-        "CREATE TABLE dbo.addr_composite (a float NOT NULL, b nvarchar(5) NOT NULL, \
-         body nvarchar(max), tag nvarchar(20), PRIMARY KEY (a, b))"
-            .to_string(),
-        "INSERT INTO dbo.addr_composite VALUES
-            (1e20, N'x', CONCAT(N'0:', REPLICATE(CAST(N'x' AS nvarchar(max)), 5000)), N't'),
-            (1e20, N'y', CONCAT(N'1:', REPLICATE(CAST(N'x' AS nvarchar(max)), 5000)), N't')"
-            .to_string(),
-    ]);
-    let fixtures: Vec<&str> = fixtures.iter().map(String::as_str).collect();
-    run_all(&pool, &fixtures).await;
-
+    let slugs = create_key_type_fixtures(&pool, "addr").await;
     let mut failures = Vec::new();
-    let slugs = MSSQL_KEY_TYPES
-        .iter()
-        .map(|(slug, _, _)| *slug)
-        .chain(["composite"]);
-    for slug in slugs.clone() {
+    for slug in &slugs {
         let table = introspect_table(&pool, &format!("addr_{slug}")).await;
         failures.extend(common::row_addressing_failures(&pool, &table).await);
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+    drop_key_type_fixtures(&pool, "addr", &slugs).await;
+    pool.close().await;
+}
 
-    let drops: Vec<String> = slugs
-        .map(|slug| format!("DROP TABLE dbo.addr_{slug}"))
-        .collect();
-    let drops: Vec<&str> = drops.iter().map(String::as_str).collect();
-    run_all(&pool, &drops).await;
+#[tokio::test]
+async fn sqlserver_every_key_type_jumps_to_the_row_it_references() {
+    // A foreign-key jump pins the referenced row from the source row's own
+    // typed values. Compared as `nvarchar` text, a float (six significant
+    // digits), a binary key (bound as the marker `<blob N>`) and every
+    // date/time type and `money` jumped to an empty page.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    let slugs = create_key_type_fixtures(&pool, "jump").await;
+    let mut failures = Vec::new();
+    for slug in &slugs {
+        let parent = introspect_table(&pool, &format!("jump_{slug}")).await;
+        let child = introspect_table(&pool, &format!("jumpfk_{slug}")).await;
+        failures.extend(common::fk_jump_failures(&pool, &child, &parent).await);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    drop_key_type_fixtures(&pool, "jump", &slugs).await;
     pool.close().await;
 }
 
