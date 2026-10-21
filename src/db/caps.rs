@@ -98,7 +98,8 @@ pub enum Restriction {
     /// The backend or the connection itself refuses writes, with its own
     /// explanation — a read-only engine, an object kind the driver knows is
     /// not writable (a DuckDB view over a Parquet file, a StarRocks
-    /// duplicate-key table), or the user's own read-only marking.
+    /// duplicate-key table, a SQL Server table whose INSTEAD OF trigger the
+    /// write guard cannot see through), or the user's own read-only marking.
     Declared(&'static str),
     /// The object has no rows hubro can show, so it is neither writable nor
     /// browsable. Two cases today: a RisingWave sink, which writes outward to
@@ -179,6 +180,21 @@ pub const CONNECTION_READ_ONLY: Restriction = Restriction::Declared(NO_MUTATE);
 /// The connection-level explanation when a backend can write but cannot make
 /// the write safe — see [`NO_GUARDED_WRITE`].
 pub const UNGUARDED_WRITES: Restriction = Restriction::Declared(NO_GUARDED_WRITE);
+
+/// Why editing and import are refused on a SQL Server table with an enabled
+/// INSTEAD OF trigger.
+///
+/// The trigger runs in place of hubro's statement, and the count SQL Server
+/// reports for that statement is the rows the trigger *fired for*, not the
+/// rows it wrote. Measured: an INSTEAD OF INSERT keeping only even ids,
+/// four rows imported, two landed, and the guard behind
+/// [`NO_GUARDED_WRITE`] saw 4 of 4. No row count can tell, so the guard
+/// cannot hold and the table is not offered for writing. Any of the three
+/// kinds restricts the whole table, since editing is one capability here.
+pub const INSTEAD_OF_TRIGGER: Restriction = Restriction::Declared(
+    "This table has an INSTEAD OF trigger, which replaces each write with its own, so \
+     hubro can't check that an edit or import changed the rows it meant to.",
+);
 
 /// What the user chose, as opposed to what the backend imposes — worded so the
 /// two are never confused. A backend that can't write says "is read-only"; a
