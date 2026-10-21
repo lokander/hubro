@@ -742,6 +742,266 @@ async fn sqlserver_staged_row_count_mismatch_rolls_the_batch_back() {
     pool.close().await;
 }
 
+/// Creates a trigger. Through the driver's `sp_executesql` call, which is
+/// how [`run_all`] sends its statements, `CREATE TRIGGER` fails with error
+/// 156; [`DbPool::execute`] sends it as a plain batch instead.
+async fn create_trigger(pool: &DbPool, sql: &str) {
+    retry_deadlocks(|| pool.execute(sql))
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+}
+
+/// One staged update addressing row `id` of `table`, setting `title`.
+fn retitle(id: i64, title: &str) -> StagedChange {
+    StagedChange::Update {
+        locator: RowLocator {
+            identity_values: vec![Value::Integer(id)],
+        },
+        column: "title".into(),
+        value: Value::Text(title.into()),
+    }
+}
+
+#[tokio::test]
+async fn sqlserver_guarded_writes_count_the_statement_not_its_triggers() {
+    // SQL Server reports a trigger's DML in the same response as the
+    // statement that fired it, with the same token kind. Summed, one edit to a
+    // table whose trigger writes an audit row read as two affected rows, and
+    // every edit to it was refused. These triggers deliberately leave
+    // NOCOUNT off, write more rows than the statement does, and fire a nested
+    // trigger of their own: none of that may count against the guard.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.trig_items",
+            "DROP TABLE IF EXISTS dbo.trig_audit",
+            "DROP TABLE IF EXISTS dbo.trig_audit_copy",
+            "CREATE TABLE dbo.trig_items (id int NOT NULL PRIMARY KEY, title nvarchar(100) NOT NULL)",
+            "CREATE TABLE dbo.trig_audit (n int IDENTITY PRIMARY KEY, note nvarchar(20) NOT NULL)",
+            "CREATE TABLE dbo.trig_audit_copy (n int IDENTITY PRIMARY KEY, note nvarchar(20) NOT NULL)",
+            "INSERT INTO dbo.trig_items VALUES (1, N'first'), (2, N'second')",
+        ],
+    )
+    .await;
+    create_trigger(
+        &pool,
+        "CREATE TRIGGER dbo.trig_items_audit ON dbo.trig_items AFTER INSERT, UPDATE, DELETE AS
+             BEGIN
+                 INSERT INTO dbo.trig_audit (note) SELECT N'new' FROM inserted;
+                 INSERT INTO dbo.trig_audit (note) SELECT N'old' FROM deleted;
+                 INSERT INTO dbo.trig_audit (note) VALUES (N'statement'), (N'statement');
+             END",
+    )
+    .await;
+    create_trigger(
+        &pool,
+        "CREATE TRIGGER dbo.trig_audit_copy_rows ON dbo.trig_audit AFTER INSERT AS
+             INSERT INTO dbo.trig_audit_copy (note) SELECT note FROM inserted",
+    )
+    .await;
+
+    let table = introspect_table(&pool, "trig_items").await;
+    let identity = detect_row_identity(&table, Dialect::SqlServer).unwrap();
+    let changes = vec![
+        retitle(1, "renamed"),
+        StagedChange::Insert {
+            columns: vec!["id".into(), "title".into()],
+            values: vec![Value::Integer(3), Value::Text("third".into())],
+        },
+        StagedChange::Delete {
+            locator: RowLocator {
+                identity_values: vec![Value::Integer(2)],
+            },
+        },
+    ];
+    let counts = apply_staged(
+        &pool,
+        &pool.backend_access(&table),
+        &table,
+        &identity,
+        &changes,
+    )
+    .await
+    .expect("trigger rows must not count against the edit's own");
+    assert_eq!(counts.updated_rows, 1);
+    assert_eq!(counts.inserted_rows, 1);
+    assert_eq!(counts.deleted_rows, 1);
+
+    let result = pool
+        .query("SELECT id, title FROM dbo.trig_items ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Integer(1), Value::Text("renamed".into())],
+            vec![Value::Integer(3), Value::Text("third".into())],
+        ]
+    );
+    // The triggers really ran, so their rows really were in the response:
+    // per statement, 2 'statement' rows plus one per new or old row image —
+    // 4 for the update, 3 for the insert, 3 for the delete — and the nested
+    // trigger copied each of them.
+    let audit = pool
+        .query(
+            "SELECT (SELECT COUNT(*) FROM dbo.trig_audit), \
+             (SELECT COUNT(*) FROM dbo.trig_audit_copy)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        audit.rows,
+        vec![vec![Value::Integer(10), Value::Integer(10)]]
+    );
+
+    // A script statement reports every count its batch carried, trigger
+    // rows included: 1 for the update, 4 audit rows and their 4 copies.
+    let affected = pool
+        .execute("UPDATE dbo.trig_items SET title = title WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(affected, 9);
+
+    // The guard still holds the statement to its own count.
+    let err = apply_staged(
+        &pool,
+        &pool.backend_access(&table),
+        &table,
+        &identity,
+        &[retitle(999, "ghost")],
+    )
+    .await
+    .expect_err("an update matching no row must be refused");
+    assert!(
+        err.message.contains("affected 0 rows, expected 1"),
+        "unexpected message: {}",
+        err.message
+    );
+
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE dbo.trig_items",
+            "DROP TABLE dbo.trig_audit",
+            "DROP TABLE dbo.trig_audit_copy",
+        ],
+    )
+    .await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_a_trigger_row_cannot_vouch_for_an_edit_that_matched_nothing() {
+    // The summed count's other face: a statement-level trigger writes its
+    // audit row whether or not the statement matched anything, so an update
+    // addressing a vanished row read as one affected row — exactly what the
+    // guard expected — and was reported saved having changed nothing.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.trig_vouch",
+            "DROP TABLE IF EXISTS dbo.trig_vouch_log",
+            "CREATE TABLE dbo.trig_vouch (id int NOT NULL PRIMARY KEY, title nvarchar(100) NOT NULL)",
+            "CREATE TABLE dbo.trig_vouch_log (n int IDENTITY PRIMARY KEY)",
+            "INSERT INTO dbo.trig_vouch VALUES (1, N'first')",
+        ],
+    )
+    .await;
+    create_trigger(
+        &pool,
+        "CREATE TRIGGER dbo.trig_vouch_audit ON dbo.trig_vouch AFTER UPDATE AS
+             INSERT INTO dbo.trig_vouch_log DEFAULT VALUES",
+    )
+    .await;
+
+    let table = introspect_table(&pool, "trig_vouch").await;
+    let identity = detect_row_identity(&table, Dialect::SqlServer).unwrap();
+    let err = apply_staged(
+        &pool,
+        &pool.backend_access(&table),
+        &table,
+        &identity,
+        &[retitle(999, "ghost")],
+    )
+    .await
+    .expect_err("the trigger's row is not the edit's");
+    assert_eq!(err.change_index, Some(0));
+    assert!(
+        err.message.contains("affected 0 rows, expected 1"),
+        "unexpected message: {}",
+        err.message
+    );
+    // Rolled back: the trigger's own row went with it.
+    let log = pool
+        .query("SELECT COUNT(*) FROM dbo.trig_vouch_log")
+        .await
+        .unwrap();
+    assert_eq!(log.rows, vec![vec![Value::Integer(0)]]);
+
+    run_all(
+        &pool,
+        &["DROP TABLE dbo.trig_vouch", "DROP TABLE dbo.trig_vouch_log"],
+    )
+    .await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_an_instead_of_trigger_that_makes_the_edit_can_be_saved() {
+    // An INSTEAD OF trigger replaces the statement: the server reports the
+    // trigger's own DML first, then the rows the trigger fired for as the
+    // statement's count. The trigger's write must not be added to it.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.trig_instead",
+            "CREATE TABLE dbo.trig_instead (id int NOT NULL PRIMARY KEY, title nvarchar(100) NOT NULL)",
+            "INSERT INTO dbo.trig_instead VALUES (1, N'first'), (2, N'second')",
+        ],
+    )
+    .await;
+    create_trigger(
+        &pool,
+        "CREATE TRIGGER dbo.trig_instead_update ON dbo.trig_instead INSTEAD OF UPDATE AS
+             UPDATE t SET title = UPPER(i.title)
+             FROM dbo.trig_instead t JOIN inserted i ON i.id = t.id",
+    )
+    .await;
+
+    let table = introspect_table(&pool, "trig_instead").await;
+    let identity = detect_row_identity(&table, Dialect::SqlServer).unwrap();
+    let counts = apply_staged(
+        &pool,
+        &pool.backend_access(&table),
+        &table,
+        &identity,
+        &[retitle(1, "renamed")],
+    )
+    .await
+    .expect("the trigger's update must not count twice");
+    assert_eq!(counts.updated_rows, 1);
+    let result = pool
+        .query("SELECT id, title FROM dbo.trig_instead ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Integer(1), Value::Text("RENAMED".into())],
+            vec![Value::Integer(2), Value::Text("second".into())],
+        ]
+    );
+
+    run_all(&pool, &["DROP TABLE dbo.trig_instead"]).await;
+    pool.close().await;
+}
+
 #[tokio::test]
 async fn sqlserver_script_go_batches_split_and_execute() {
     let Some(url) = test_url().await else { return };
