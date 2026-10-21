@@ -142,21 +142,7 @@ fn region_at(sql: &str, i: usize, dialect: Dialect) -> Option<(usize, RegionKind
         // Block comments nest on Postgres and SQL Server and not on SQLite
         // (measured: SQLite ends `/* /* */` at the first `*/`).
         b'/' if bytes.get(i + 1) == Some(&b'*') => {
-            let nests = dialect != Dialect::Sqlite;
-            let mut depth = 1usize;
-            let mut j = i + 2;
-            while j < bytes.len() && depth > 0 {
-                if nests && bytes[j] == b'/' && bytes.get(j + 1) == Some(&b'*') {
-                    depth += 1;
-                    j += 2;
-                } else if bytes[j] == b'*' && bytes.get(j + 1) == Some(&b'/') {
-                    depth -= 1;
-                    j += 2;
-                } else {
-                    j += 1;
-                }
-            }
-            Some((j, RegionKind::Comment))
+            Some((block_comment_end(bytes, i, dialect).0, RegionKind::Comment))
         }
         // Dollar quotes are Postgres only, and never straight after an
         // identifier byte: Postgres reads `x$y$` as one identifier, as SQLite
@@ -174,6 +160,27 @@ fn region_at(sql: &str, i: usize, dialect: Dialect) -> Option<(usize, RegionKind
         }
         _ => None, // a code byte
     }
+}
+
+/// One past the end of the block comment opening at `bytes[at]` (or the end
+/// of input when it never closes), and how many levels are still open there:
+/// 0 for a closed comment, more than 1 only where comments nest.
+fn block_comment_end(bytes: &[u8], at: usize, dialect: Dialect) -> (usize, usize) {
+    let nests = dialect != Dialect::Sqlite;
+    let mut depth = 1usize;
+    let mut j = at + 2;
+    while j < bytes.len() && depth > 0 {
+        if nests && bytes[j] == b'/' && bytes.get(j + 1) == Some(&b'*') {
+            depth += 1;
+            j += 2;
+        } else if bytes[j] == b'*' && bytes.get(j + 1) == Some(&b'/') {
+            depth -= 1;
+            j += 2;
+        } else {
+            j += 1;
+        }
+    }
+    (j, depth)
 }
 
 /// One past the closing `quote` of the region opening at `bytes[at]`, or the
@@ -1325,6 +1332,22 @@ pub(super) fn ends_in_line_comment(sql: &str, dialect: Dialect) -> bool {
     lex_regions(sql, dialect)
         .last()
         .is_some_and(|(range, kind)| kind == RegionKind::Comment && sql[range].starts_with("--"))
+}
+
+/// How many block comments are still open where `sql` ends on `dialect`: 0
+/// unless the last region is a `/* … */` that never closed, and more than 1
+/// only where comments nest (Postgres, SQL Server: `/* a /* b` leaves two).
+/// SQLite accepts one at the end of input and stores it with an index, view
+/// or `STRICT` table (`CREATE INDEX i ON t(a) /* note`), and a `;` appended
+/// to it, on any line, is still inside it. (Postgres refuses the text:
+/// "unterminated /* comment".)
+pub(super) fn open_block_comments_at_end(sql: &str, dialect: Dialect) -> usize {
+    match lex_regions(sql, dialect).last() {
+        Some((range, RegionKind::Comment)) if sql[range.clone()].starts_with("/*") => {
+            block_comment_end(sql.as_bytes(), range.start, dialect).1
+        }
+        _ => 0,
+    }
 }
 
 /// Whether `sql` already ends in a `;` that `dialect` reads as a statement
