@@ -817,3 +817,180 @@ fn a_rewritten_url_keeps_everything_but_the_database() {
         "postgres://u@h:5432/db?sslmode=disable"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Row addressing: the read and the write must find the same row
+// ---------------------------------------------------------------------------
+
+/// Every way the grid's own locators fail to re-address their rows in
+/// `table`, as one line each — empty when every row reads *and* writes back.
+///
+/// `table` must be keyed by its primary key and have a long text column
+/// `body` (longer than the preview, so the grid holds only a prefix and has to
+/// go back to the server for the rest) and a short text column `tag`. Each
+/// row's locator is taken from the bounded page exactly as the grid takes it,
+/// then used twice: `fetch_cell` must return that row's full `body`, and an
+/// `apply_staged` update of `tag` must hit exactly one row. The two are the
+/// same question asked by the expand popup and by Save, so a key type that
+/// one answers and the other does not is a cell that expands to NULL but
+/// saves — or the reverse.
+///
+/// Collected rather than asserted one at a time, so a single run reports the
+/// whole key-type matrix instead of stopping at its first gap.
+pub async fn row_addressing_failures(pool: &DbPool, table: &hubro::db::TableMeta) -> Vec<String> {
+    use hubro::db::{
+        apply_staged, detect_row_identity, PageRequest, RowLocator, StagedChange, Value,
+    };
+    let identity = detect_row_identity(table, pool.dialect()).expect("a keyed table");
+    let keys = identity.key_columns();
+    let request = PageRequest {
+        schema: table.schema.clone(),
+        table: table.name.clone(),
+        limit: 1000,
+        offset: 0,
+        sort: None,
+        filter: None,
+        extra_key_column: None,
+    };
+    let page = pool
+        .fetch_page_bounded(&request, &table.columns, &keys)
+        .await
+        .unwrap_or_else(|e| panic!("{}: page fetch failed: {e}", table.name));
+    let column = |name: &str| {
+        page.result
+            .columns
+            .iter()
+            .position(|c| c.name == name)
+            .unwrap_or_else(|| panic!("{}: no column {name}", table.name))
+    };
+    let key_at: Vec<usize> = keys.iter().map(|k| column(k)).collect();
+    let body_at = column("body");
+    assert!(!page.result.rows.is_empty(), "{}: no rows", table.name);
+    let access = pool.backend_access(table);
+    let mut failures = Vec::new();
+    for (row, previews) in page.result.rows.iter().zip(&page.previews) {
+        let locator = RowLocator {
+            identity_values: key_at.iter().map(|&at| row[at].clone()).collect(),
+        };
+        let label = format!("{} {:?}", table.name, locator.identity_values);
+        let (Value::Text(prefix), Some(preview)) = (&row[body_at], previews[body_at]) else {
+            panic!("{label}: body must be a previewed text cell");
+        };
+        match pool.fetch_cell(table, &identity, &locator, "body").await {
+            Ok(cell) => match &cell.value {
+                Value::Text(full)
+                    if full.chars().count() as u64 == preview.full_len
+                        && full.starts_with(prefix.as_str()) => {}
+                other => failures.push(format!(
+                    "{label}: fetch_cell returned {} instead of its body",
+                    match other {
+                        Value::Text(t) => format!("text of {} chars", t.chars().count()),
+                        other => format!("{other:?}"),
+                    }
+                )),
+            },
+            Err(e) => failures.push(format!("{label}: fetch_cell failed: {e}")),
+        }
+        let change = StagedChange::Update {
+            locator: locator.clone(),
+            column: "tag".into(),
+            value: Value::Text("edited".into()),
+        };
+        if let Err(e) = apply_staged(pool, &access, table, &identity, &[change]).await {
+            failures.push(format!("{label}: the write did not address its row: {e}"));
+        }
+    }
+    failures
+}
+
+// ---------------------------------------------------------------------------
+// The contains filter is a substring search, whatever the needle holds
+// ---------------------------------------------------------------------------
+
+/// Values for [`contains_filter_mismatches`]: every character some engine's
+/// `LIKE` gives a meaning — the standard `%` and `_`, the escape character
+/// itself, and SQL Server's bracket class (`[`, `]`, `^`). Lowercase only, so
+/// the collations that compare case-insensitively agree with Rust's
+/// case-sensitive `contains`.
+pub const LIKE_HOSTILE_VALUES: &[&str] = &[
+    "a",
+    "x[a]y",
+    "[b",
+    "b]c",
+    "^q",
+    "p_r",
+    "p%r",
+    "back\\slash",
+    "xy",
+    "[^a]",
+    "[]",
+];
+
+/// Needles for [`contains_filter_mismatches`].
+pub const LIKE_HOSTILE_NEEDLES: &[&str] = &[
+    "[a]", "[", "]", "^", "_", "%", "\\", "[^a]", "[]", "a]", "[b",
+];
+
+/// Every needle for which the grid's contains filter over column `v` of
+/// `table` disagrees with a plain substring search, as one line each.
+///
+/// `table` holds `(id, v)` with `v` = [`LIKE_HOSTILE_VALUES`]`[id - 1]`. The
+/// oracle is Rust's `str::contains` over those values, so the check states the
+/// promise of a "contains" filter directly instead of restating each engine's
+/// `LIKE` rules.
+pub async fn contains_filter_mismatches(
+    pool: &DbPool,
+    schema: Option<&str>,
+    table: &str,
+) -> Vec<String> {
+    use hubro::db::{Filter, PageRequest, Value};
+    let mut mismatches = Vec::new();
+    for needle in LIKE_HOSTILE_NEEDLES {
+        let request = PageRequest {
+            schema: schema.map(str::to_string),
+            table: table.to_string(),
+            limit: 1000,
+            offset: 0,
+            sort: Some(("id".into(), hubro::db::SortDir::Asc)),
+            filter: Some(Filter::contains("v", *needle)),
+            extra_key_column: None,
+        };
+        let got: Vec<i64> = match pool.fetch_page(&request).await {
+            Ok(page) => page
+                .rows
+                .iter()
+                .map(|row| match row[0] {
+                    Value::Integer(id) => id,
+                    ref other => panic!("id decoded as {other:?}"),
+                })
+                .collect(),
+            Err(e) => {
+                mismatches.push(format!("{needle:?}: {e}"));
+                continue;
+            }
+        };
+        let want: Vec<i64> = LIKE_HOSTILE_VALUES
+            .iter()
+            .zip(1..)
+            .filter(|(value, _)| value.contains(needle))
+            .map(|(_, id)| id)
+            .collect();
+        if got != want {
+            mismatches.push(format!("{needle:?}: matched ids {got:?}, want {want:?}"));
+        }
+    }
+    mismatches
+}
+
+/// `INSERT … VALUES` rows for [`LIKE_HOSTILE_VALUES`], ids from 1, as
+/// standard string literals (`'` doubled; backslash is not special in any of
+/// the three dialects' standard literals). `prefix` is prepended to each
+/// literal — `N` for SQL Server's Unicode strings.
+pub fn like_hostile_rows(prefix: &str) -> String {
+    LIKE_HOSTILE_VALUES
+        .iter()
+        .zip(1..)
+        .map(|(v, id)| format!("({id}, {prefix}'{}')", v.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}

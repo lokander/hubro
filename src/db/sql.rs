@@ -98,9 +98,15 @@ pub(crate) fn text_compare_expr(dialect: Dialect, column: &str) -> String {
 /// columns, with each value bound as text ([`text_compare_expr`]) — the same
 /// strategy the equals filter and foreign-key navigation use, so exotic key
 /// types (uuid, enums, timestamps) still compare. An empty list matches
-/// every row (no clause). Shared by the equalities page filter
-/// ([`Filter::Equalities`](super::page::Filter)) and
-/// [`DbPool::fetch_cell`](super::DbPool::fetch_cell).
+/// every row (no clause). Used by the equalities page filter
+/// ([`Filter::Equalities`](super::page::Filter)), whose values are user text
+/// or a foreign-key jump's.
+///
+/// **Not for re-addressing a grid row.** A row's own key values are typed,
+/// and comparing them as text depends on hubro spelling every value exactly as
+/// the server does, which it does not for floats, blobs or SQL Server's
+/// date/time types. That path goes through `staged::row_where`, the predicate
+/// writes use.
 pub(crate) fn equalities_where(
     pairs: &[(String, Value)],
     dialect: Dialect,

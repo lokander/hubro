@@ -12,11 +12,11 @@ use super::plan;
 use super::postgres;
 use super::rowkey::{detect_row_identity, RowIdentity};
 use super::schema::{ColumnMeta, TableMeta};
-use super::sql::{cell_fetch_sql, equalities_where, value_len, Dialect};
+use super::sql::{cell_fetch_sql, value_len, Dialect};
 use super::sqlite;
 use super::sqlserver::{self, MssqlPool, MssqlTx};
 use super::sqlx_common;
-use super::staged::{CheckedStatement, RowLocator};
+use super::staged::{self, CheckedStatement, RowLocator};
 use super::stats::TableStats;
 use super::value::{QueryResult, Value};
 
@@ -472,6 +472,10 @@ impl DbPool {
     /// multi-GB cell returns a bounded prefix (flagged [`CellFetch::capped`])
     /// rather than the whole thing. Used by cell expand and by the editor when
     /// opening a truncated cell (so a preview is never staged as an edit).
+    ///
+    /// A locator whose arity no longer matches `identity` is a
+    /// [`DbError::Query`], not a lookup over the columns that happen to pair
+    /// up — see [`staged::locator_mismatch`].
     pub async fn fetch_cell(
         &self,
         table: &TableMeta,
@@ -486,15 +490,11 @@ impl DbPool {
             .find(|c| c.name == column)
             .map(|c| classify_column(&c.type_name))
             .unwrap_or(ColumnClass::Text);
-        // Bind the row's key values as text, mirroring how the equalities page
-        // filter / foreign-key jumps pin a row (exotic key types compare too).
-        let pairs: Vec<(String, Value)> = identity
-            .key_columns()
-            .iter()
-            .zip(locator.identity_values.iter())
-            .map(|(col, value)| ((*col).to_string(), value.clone()))
-            .collect();
-        let (where_clause, params) = equalities_where(&pairs, dialect);
+        // The same predicate Save writes the row through — see
+        // [`staged::row_where`] for why it is not a text comparison. A locator
+        // that no longer fits the key is an error, never a narrower WHERE.
+        let (where_clause, params) =
+            staged::row_where(table, identity, dialect, locator).map_err(DbError::Query)?;
         let sql = cell_fetch_sql(
             dialect,
             table,

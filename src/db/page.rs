@@ -542,7 +542,7 @@ impl PageRequest {
                     ),
                     FilterOp::Contains => (
                         format!(" WHERE {quoted} LIKE {placeholder} ESCAPE '\\'"),
-                        vec![Value::Text(format!("%{}%", escape_like(value)))],
+                        vec![Value::Text(format!("%{}%", escape_like(value, dialect)))],
                     ),
                 }
             }
@@ -551,12 +551,25 @@ impl PageRequest {
     }
 }
 
-/// Escapes LIKE wildcards in user input so "50%" matches literally.
-fn escape_like(needle: &str) -> String {
-    needle
+/// Escapes LIKE wildcards in user input so "50%" matches literally, for the
+/// `ESCAPE '\\'` clause the contains filter is built with.
+///
+/// SQL Server's `LIKE` has a third wildcard the standard lacks: `[…]` is a
+/// character class, so `[a]` matched every value containing an `a`, and a lone
+/// `[` opened a class that never closed and matched nothing. Escaping the
+/// opening bracket is enough — measured on SQL Server 2022, `]` and `^` are
+/// literal outside a class, and `\[a]` matches only the text `[a]`. Postgres
+/// and SQLite have no bracket syntax and are left alone: both read `\[` as a
+/// literal `[` too, but nothing there needs it.
+fn escape_like(needle: &str, dialect: Dialect) -> String {
+    let escaped = needle
         .replace('\\', "\\\\")
         .replace('%', "\\%")
-        .replace('_', "\\_")
+        .replace('_', "\\_");
+    match dialect {
+        Dialect::SqlServer => escaped.replace('[', "\\["),
+        Dialect::Sqlite | Dialect::Postgres => escaped,
+    }
 }
 
 #[cfg(test)]
@@ -747,6 +760,31 @@ mod tests {
             count_sql,
             "SELECT COUNT(*) FROM \"tracks\" WHERE CAST(\"name\" AS nvarchar(max)) = @P1"
         );
+    }
+
+    #[test]
+    fn contains_escapes_sql_server_brackets_and_only_there() {
+        // T-SQL reads `[…]` as a character class, so `[a]` would match every
+        // value holding an `a`. The opening bracket is escaped with the
+        // clause's own escape character, after the backslash itself is.
+        let mut req = base();
+        req.filter = Some(Filter::contains("name", "x[a]\\%_["));
+        let (sql, params) = req.count_sql(Dialect::SqlServer);
+        assert_eq!(
+            sql,
+            "SELECT COUNT(*) FROM \"tracks\" \
+             WHERE CAST(\"name\" AS nvarchar(max)) LIKE @P1 ESCAPE '\\'"
+        );
+        assert_eq!(params, vec![Value::Text("%x\\[a]\\\\\\%\\_\\[%".into())]);
+        // Postgres and SQLite have no bracket wildcard: `[` stays as typed.
+        for dialect in [Dialect::Postgres, Dialect::Sqlite] {
+            let (_, params) = req.count_sql(dialect);
+            assert_eq!(
+                params,
+                vec![Value::Text("%x[a]\\\\\\%\\_[%".into())],
+                "{dialect:?}"
+            );
+        }
     }
 
     #[test]

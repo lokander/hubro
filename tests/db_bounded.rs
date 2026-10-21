@@ -7,7 +7,8 @@ mod common;
 
 use common::FixtureDb;
 use hubro::db::{
-    detect_row_identity, Generated, PageRequest, RowLocator, Value, PREVIEW_BYTES, QUERY_CELL_CAP,
+    detect_row_identity, DbError, Generated, PageRequest, RowLocator, Value, PREVIEW_BYTES,
+    QUERY_CELL_CAP,
 };
 
 fn request(table: &str) -> PageRequest {
@@ -278,6 +279,86 @@ async fn query_capped_bounds_huge_cells() {
     } else {
         panic!("expected text");
     }
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn every_key_type_reads_and_writes_the_same_row() {
+    // The expand popup, the truncated-cell editor and the clipboard load a
+    // long cell's full value through `fetch_cell`; Save re-addresses the row
+    // through the staged writer. Both start from the same locator, so both
+    // must find the same row for every key type — a blob key, bound as the
+    // text `<blob N>`, used to expand to NULL while it saved.
+    let body = |n: usize| format!("'{n}:' || printf('%.5000c', 'x')");
+    let sql = format!(
+        "CREATE TABLE k_real (k REAL PRIMARY KEY, body TEXT, tag TEXT);
+         INSERT INTO k_real VALUES (1e20, {}, 't'), (0.1, {}, 't'), (-2.5e-300, {}, 't');
+         CREATE TABLE k_blob (k BLOB PRIMARY KEY, body TEXT, tag TEXT);
+         INSERT INTO k_blob VALUES (x'00ff10', {}, 't'), (x'', {}, 't');
+         CREATE TABLE k_text (k TEXT PRIMARY KEY, body TEXT, tag TEXT);
+         INSERT INTO k_text VALUES ('plain', {}, 't'), ('trailing  ', {}, 't');
+         CREATE TABLE k_composite (a REAL, b TEXT, body TEXT, tag TEXT, PRIMARY KEY (a, b));
+         INSERT INTO k_composite VALUES (1e20, 'x', {}, 't'), (1e20, 'y', {}, 't');",
+        body(0),
+        body(1),
+        body(2),
+        body(0),
+        body(1),
+        body(0),
+        body(1),
+        body(0),
+        body(1),
+    );
+    let fixture = FixtureDb::with_sql(&sql).await;
+    let pool = fixture.open().await;
+    let tables = pool.introspect().await.unwrap();
+    assert_eq!(tables.len(), 4);
+    let mut failures = Vec::new();
+    for table in &tables {
+        failures.extend(common::row_addressing_failures(&pool, table).await);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn fetch_cell_refuses_a_locator_that_does_not_fit_the_key() {
+    // A locator built against an older identity (the key gained or lost a
+    // column after a re-introspection) used to pair up with the key by
+    // position: one value against `albums (artist_id, seq)` became
+    // `WHERE artist_id = 1`, and the first of that artist's albums came back
+    // as if it were the row asked for — shown, and editable.
+    let fixture = FixtureDb::full().await;
+    let pool = fixture.open().await;
+    let tables = pool.introspect().await.unwrap();
+    let albums = tables.iter().find(|t| t.name == "albums").unwrap();
+    let identity = detect_row_identity(albums, pool.dialect()).unwrap();
+    assert_eq!(identity.key_columns(), ["artist_id", "seq"]);
+
+    for values in [
+        vec![Value::Integer(1)],
+        vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)],
+    ] {
+        let locator = RowLocator {
+            identity_values: values,
+        };
+        match pool.fetch_cell(albums, &identity, &locator, "title").await {
+            Err(DbError::Query(message)) => {
+                assert!(message.contains("reload"), "{message}")
+            }
+            other => panic!("{locator:?} must be refused, got {other:?}"),
+        }
+    }
+    // The full key still reads its row.
+    let locator = RowLocator {
+        identity_values: vec![Value::Integer(1), Value::Integer(2)],
+    };
+    let cell = pool
+        .fetch_cell(albums, &identity, &locator, "title")
+        .await
+        .unwrap();
+    assert_eq!(cell.value, Value::Text("Second".into()));
 
     pool.close().await;
 }

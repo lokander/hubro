@@ -296,21 +296,17 @@ fn build_statements(
     dialect: Dialect,
     changes: &[StagedChange],
 ) -> Result<(Vec<CheckedStatement>, Vec<StatementMeta>), StagedError> {
-    let key_len = identity.key_columns().len();
-    let check_locator = |locator: &RowLocator, index: usize, change: &StagedChange| {
-        if locator.identity_values.len() == key_len {
-            Ok(())
-        } else {
-            Err(StagedError {
+    let check_locator =
+        |locator: &RowLocator, index: usize, change: &StagedChange| match locator_mismatch(
+            identity, locator,
+        ) {
+            None => Ok(()),
+            Some(message) => Err(StagedError {
                 change_index: Some(index),
                 change_summary: Some(change.describe()),
-                message: format!(
-                    "row locator carries {} values but the row identity needs {key_len}",
-                    locator.identity_values.len()
-                ),
-            })
-        }
-    };
+                message,
+            }),
+        };
     let casts = cast_targets(table, dialect);
     let mut slots: Vec<Slot> = Vec::new();
     // Row key → index into `slots` of the row's UpdateGroup. The Vec keeps
@@ -522,27 +518,30 @@ pub(super) fn cast_targets(table: &TableMeta, dialect: Dialect) -> HashMap<&str,
 ///   outside `[a-z0-9 _.]` after lowercasing — `.` is allowed because the
 ///   materialized-view half of the introspection UNION fills `type_name`
 ///   from `format_type()`, which can legitimately emit `myschema.mytype`
-///   (the charset gate also guarantees the interpolated cast text is inert);
-/// - for `character`, whose **bare form implies a restrictive default
-///   modifier**: `data_type` drops length modifiers, so a `character(3)`
-///   column reports just "character" — and `::character` means `char(1)`,
-///   which would silently TRUNCATE the value to one character on SET (and
-///   make a `char(n)` key column never match its row, aborting every
-///   save). `character varying` and `numeric` stay castable because their
-///   bare forms are unbounded/unconstrained. For `character` the uncast
-///   text parameter is correct: Postgres's assignment coercion handles
-///   text → char(n) with the column's true modifier (verified against
-///   Postgres 17 — an uncast text parameter assigns to `character(3)`).
+///   (the charset gate also guarantees the interpolated cast text is inert).
 ///
-/// `bit` is the one bare name that is **rewritten rather than skipped**.
-/// It has the same restrictive default — `::bit` means `bit(1)`
-/// — but unlike `character` it has no assignment coercion from text, so
-/// skipping the cast made `bit(n)` columns unwritable outright: the server
-/// answers *"column is of type bit but expression is of type text"*. It
-/// casts to `bit varying` instead, which is unbounded and which Postgres
-/// then assigns into `bit(n)` under the column's true modifier. A `bit
-/// varying` column already worked, since its `data_type` is not the bare
-/// name and passes through verbatim.
+/// Two bare names are **rewritten**, because each implies a restrictive
+/// default modifier: `data_type` drops length modifiers, so a `bit(4)` or
+/// `character(3)` column reports just "bit" or "character", and `::bit` means
+/// `bit(1)`, `::character` means `char(1)` — a cast that would silently
+/// TRUNCATE the value on SET. Each casts to the unbounded member of its family
+/// instead, which the server then assigns into the column under its true
+/// modifier. `character varying` and `numeric` pass through verbatim because
+/// their bare forms are already unbounded.
+///
+/// - `bit` → `bit varying`. Leaving it uncast is not an option: text has no
+///   assignment coercion to `bit`, so `bit(n)` columns were unwritable
+///   outright (*"column is of type bit but expression is of type text"*).
+/// - `character` → `bpchar`, the blank-padded type with no length. This one
+///   used to be left uncast, which assigns correctly but does not *compare*
+///   correctly: the grid reads a `character(3)` holding `ab` as `"ab "`, and
+///   `char = text` resolves to a text comparison that strips the column's
+///   padding and keeps the parameter's, so a key shorter than its width
+///   never matched its row and every save of it was refused. `bpchar`
+///   compares blank-insensitively, as the column does. Measured on
+///   PostgreSQL 17 and CockroachDB, SET through `$1::bpchar` and through an
+///   uncast text parameter store the same bytes and refuse the same
+///   over-long value.
 fn cast_target(column: &ColumnMeta) -> Option<String> {
     // An enum/array column casts to its real type name, which `data_type`
     // doesn't carry. Both halves are arbitrary identifiers — a
@@ -557,15 +556,16 @@ fn cast_target(column: &ColumnMeta) -> Option<String> {
         ));
     }
     let lowered = column.type_name.trim().to_ascii_lowercase();
-    // Bare `bit` is `bit(n)`, whose modifier `data_type` dropped. `::bit`
-    // would mean `bit(1)`, so it casts to the unbounded member of the family
-    // and lets the column's own modifier apply on assignment.
-    if lowered == "bit" {
-        return Some("bit varying".to_string());
+    // Bare `bit` and `character` are `bit(n)` and `character(n)`, whose
+    // modifier `data_type` dropped. Cast to the unbounded member of the
+    // family and let the column's own modifier apply on assignment.
+    match lowered.as_str() {
+        "bit" => return Some("bit varying".to_string()),
+        "character" => return Some("bpchar".to_string()),
+        _ => {}
     }
     let plain = !lowered.is_empty()
         && lowered != "array"
-        && lowered != "character"
         && lowered.chars().all(|c| {
             c.is_ascii_lowercase() || c.is_ascii_digit() || c == ' ' || c == '_' || c == '.'
         });
@@ -665,11 +665,63 @@ fn delete_statement(
     }
 }
 
+/// Why `locator` cannot address a row of `identity`, or `None` when it can.
+///
+/// It needs exactly one value per key column. [`key_clause`] pairs the two up
+/// by position, so a locator built against an older identity — the key gained
+/// or lost a column after a re-introspection — would otherwise pin fewer
+/// columns than the key has and match any row sharing that prefix: a write
+/// would be refused by its row-count guard, but a read has no guard and would
+/// return whichever row came first as if it were the one asked for. An empty
+/// key is refused for the same reason, since it pins nothing at all.
+pub(super) fn locator_mismatch(identity: &RowIdentity, locator: &RowLocator) -> Option<String> {
+    let key_len = identity.key_columns().len();
+    let carried = locator.identity_values.len();
+    (carried != key_len || key_len == 0).then(|| {
+        format!(
+            "row locator carries {carried} key values but the row identity has {key_len} \
+             columns; the table's key has changed since the row was loaded, so reload it"
+        )
+    })
+}
+
+/// ` WHERE "k1" = ? AND "k2" = ?` and its parameters: the predicate that
+/// re-addresses one grid row from its [`RowLocator`], for reading as well as
+/// writing.
+///
+/// [`DbPool::fetch_cell`](super::DbPool::fetch_cell) builds its WHERE here
+/// rather than through the text-comparing `equalities_where`, so the expand
+/// popup, the truncated-cell editor and the clipboard find a row by the very
+/// predicate Save then writes it through. Comparing as text was a second
+/// answer to the same question, and a wrong one wherever the server spells a
+/// value differently from hubro: a float key (`float8::text` of 1e20 is
+/// `1e+20`, SQL Server's `CAST(float AS nvarchar)` keeps six significant
+/// digits), a blob key (bound as the marker `<blob N>`), and on SQL Server
+/// every date/time type and `money`. Each of those matched no row, so the
+/// full value loaded as NULL while the same row saved fine.
+pub(super) fn row_where(
+    table: &TableMeta,
+    identity: &RowIdentity,
+    dialect: Dialect,
+    locator: &RowLocator,
+) -> Result<(String, Vec<Value>), String> {
+    if let Some(message) = locator_mismatch(identity, locator) {
+        return Err(message);
+    }
+    let casts = cast_targets(table, dialect);
+    let mut params = ParamSql::new(dialect);
+    let clause = key_clause(identity, &casts, locator, &mut params);
+    Ok((format!(" WHERE {clause}"), params.into_values()))
+}
+
 /// `"k1" = ? AND "k2" = NULL` over the full key, pairing the identity's key
-/// columns with the locator's values (arity is validated by the caller).
-/// Key placeholders carry column casts too ([`cast_targets`]) — identity
-/// values of rich Postgres types (uuid, timestamp, numeric keys) arrive
-/// from the grid as text and must coerce in the WHERE clause as well.
+/// columns with the locator's values (arity is validated by the caller, with
+/// [`locator_mismatch`]). Each value binds as what it is — a float as a
+/// float, a blob as bytes — so it compares by the column's own equality
+/// rather than by a text spelling. Key placeholders carry column casts too
+/// ([`cast_targets`]) — identity values of rich Postgres types (uuid,
+/// timestamp, numeric keys) arrive from the grid as text and must coerce in
+/// the WHERE clause as well.
 fn key_clause(
     identity: &RowIdentity,
     casts: &HashMap<&str, String>,
@@ -1006,6 +1058,84 @@ mod tests {
         assert!(cast_targets(&keyed, Dialect::SqlServer).is_empty());
     }
 
+    #[test]
+    fn a_row_is_re_addressed_by_its_typed_key_not_by_its_text() {
+        // The read predicate is the write predicate: each key value binds as
+        // what it is, so a float or a blob compares by the column's own
+        // equality instead of by a text spelling the server does not share.
+        let composite = RowIdentity::PrimaryKey {
+            columns: vec!["id".into(), "a".into()],
+        };
+        let key = RowLocator {
+            identity_values: vec![Value::Real(1e20), Value::Blob(vec![0, 255])],
+        };
+        let (clause, params) = row_where(&table(), &composite, Dialect::SqlServer, &key).unwrap();
+        assert_eq!(clause, " WHERE \"id\" = @P1 AND \"a\" = @P2");
+        assert_eq!(params, key.identity_values);
+
+        // Postgres keys carry the column's cast, `character` widened to the
+        // blank-insensitive `bpchar` so a padded key still finds its row.
+        let mut keyed = typed_pg_table();
+        for column in &mut keyed.columns {
+            column.primary_key_position = (column.name == "code").then_some(1);
+        }
+        let by_code = RowIdentity::PrimaryKey {
+            columns: vec!["code".into()],
+        };
+        let padded = RowLocator {
+            identity_values: vec![Value::Text("ab ".into())],
+        };
+        let (clause, params) = row_where(&keyed, &by_code, Dialect::Postgres, &padded).unwrap();
+        assert_eq!(clause, " WHERE \"code\" = $1::bpchar");
+        assert_eq!(params, padded.identity_values);
+
+        // It is the clause the staged DELETE writes through, character for
+        // character — the two cannot drift apart.
+        let (statements, _) = build_statements(
+            &keyed,
+            &by_code,
+            Dialect::Postgres,
+            &[StagedChange::Delete {
+                locator: padded.clone(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            statements[0].sql,
+            format!("DELETE FROM \"app\".\"typed\"{clause}")
+        );
+        assert_eq!(statements[0].params, params);
+    }
+
+    #[test]
+    fn a_locator_that_does_not_fit_the_key_addresses_nothing() {
+        // A locator built against an older identity must not pair up by
+        // position and pin a prefix of the key: that WHERE matches every row
+        // sharing the prefix, and a read has no row-count guard to catch it.
+        let composite = RowIdentity::PrimaryKey {
+            columns: vec!["id".into(), "a".into()],
+        };
+        let short = locator(1);
+        let message = row_where(&table(), &composite, Dialect::Sqlite, &short).unwrap_err();
+        assert!(
+            message.contains("1 key values") && message.contains("2 columns"),
+            "{message}"
+        );
+        let long = RowLocator {
+            identity_values: vec![Value::Integer(1), Value::Integer(2)],
+        };
+        assert!(row_where(&table(), &identity(), Dialect::Sqlite, &long).is_err());
+        // An empty key pins nothing at all.
+        let keyless = RowIdentity::PrimaryKey { columns: vec![] };
+        let empty = RowLocator {
+            identity_values: vec![],
+        };
+        assert!(locator_mismatch(&keyless, &empty).is_some());
+        // A locator that fits is accepted.
+        assert_eq!(locator_mismatch(&identity(), &locator(1)), None);
+        assert!(row_where(&table(), &identity(), Dialect::Sqlite, &locator(1)).is_ok());
+    }
+
     fn typed_pg_table() -> TableMeta {
         let typed = |name: &str, type_name: &str, pk: Option<u32>| ColumnMeta {
             name: name.into(),
@@ -1164,12 +1294,11 @@ mod tests {
         );
 
         // Bare "character" implies a restrictive default modifier
-        // (`::character` = char(1) would TRUNCATE a character(3) value) — no
-        // cast; assignment coercion handles the uncast text correctly, which
-        // is verified against a live server in tests/db_postgres.rs.
+        // (`::character` = char(1) would TRUNCATE a character(3) value), so
+        // it casts to the unbounded `bpchar` — which, unlike an uncast text
+        // parameter, also compares blank-insensitively in a key clause.
+        // Verified against a live server in tests/db_staged.rs.
         // "character varying" is unbounded when bare and keeps its cast.
-        // "bit" is the exception that is rewritten rather than skipped
-        // — see the test below.
         let (statements, _) = build_statements(
             &typed_pg_table(),
             &identity(),
@@ -1183,7 +1312,7 @@ mod tests {
         assert_eq!(
             statements[0].sql,
             "UPDATE \"app\".\"typed\" SET \
-             \"code\" = $1, \"nick\" = $2::character varying \
+             \"code\" = $1::bpchar, \"nick\" = $2::character varying \
              WHERE \"id\" = $3::integer"
         );
 

@@ -1564,3 +1564,131 @@ async fn postgres_accepts_every_explain_header_hubro_tolerates() {
 
     pool.close().await;
 }
+
+/// Key types whose locator has to find its row again — the matrix
+/// [`common::row_addressing_failures`] walks. Each entry is a slug, the
+/// column type and the key literals stored under it.
+///
+/// Absent on purpose: a key whose type the grid cannot decode at all (`inet`
+/// reads as the marker `<inet>`), which no predicate can re-address; that is
+/// a decoding gap, not a disagreement between the read and the write.
+const PG_KEY_TYPES: &[(&str, &str, &[&str])] = &[
+    // A float's text spelling is the server's, not Rust's: `float8::text` of
+    // 1e20 is `1e+20`, which a key bound as Rust's `Display` never equals.
+    (
+        "float8",
+        "double precision",
+        &["1e20", "0.1", "123456789.123456789", "-2.5e-300"],
+    ),
+    ("float4", "real", &["1e20", "0.1", "3.4028235e38"]),
+    ("numeric", "numeric", &["12345.678901", "0.10", "1e20"]),
+    ("int8", "bigint", &["9223372036854775807", "-1"]),
+    ("uuid", "uuid", &["'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'"]),
+    (
+        "ts",
+        "timestamp",
+        &["'2024-02-29 13:45:01.123456'", "'2024-01-01 00:00:00'"],
+    ),
+    ("tstz", "timestamptz", &["'2024-02-29 13:45:01.123456+02'"]),
+    ("date", "date", &["'2024-02-29'"]),
+    ("time", "time", &["'13:45:01.5'"]),
+    ("interval", "interval", &["'1 day 02:03:04'"]),
+    // A blob key used to be bound as the text `<blob N>`.
+    ("bytea", "bytea", &["'\\x00ff10'", "''"]),
+    ("text", "text", &["'plain'", "'trailing  '", "'quote''s'"]),
+    ("char3", "character(3)", &["'ab'", "'abc'"]),
+    ("bool", "boolean", &["true", "false"]),
+    ("bit4", "bit(4)", &["B'1010'"]),
+    ("mood", "addr_keys.mood", &["'happy'", "'Sad'"]),
+];
+
+#[tokio::test]
+async fn postgres_every_key_type_reads_and_writes_the_same_row() {
+    // The expand popup, the truncated-cell editor and the clipboard load a
+    // long cell's full value through `fetch_cell`; Save re-addresses the row
+    // through the staged writer. Both start from the same locator, so both
+    // must find the same row for every key type the grid can hold — a float
+    // key that saved but expanded to NULL was the bug this pins.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    for sql in [
+        "DROP SCHEMA IF EXISTS addr_keys CASCADE",
+        "CREATE SCHEMA addr_keys",
+        "CREATE TYPE addr_keys.mood AS ENUM ('happy', 'Sad')",
+    ] {
+        pool.query(sql).await.unwrap();
+    }
+    for (slug, type_name, literals) in PG_KEY_TYPES {
+        pool.query(&format!(
+            "CREATE TABLE addr_keys.k_{slug} (k {type_name} PRIMARY KEY, body text, tag text)"
+        ))
+        .await
+        .unwrap();
+        let rows: Vec<String> = literals
+            .iter()
+            .enumerate()
+            .map(|(n, lit)| format!("({lit}, '{n}:' || repeat('x', 5000), 't')"))
+            .collect();
+        pool.query(&format!(
+            "INSERT INTO addr_keys.k_{slug} VALUES {}",
+            rows.join(", ")
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("{slug}: {e}"));
+    }
+    // A composite key mixing a float with text: the clause covers every
+    // column, not just the first.
+    pool.query(
+        "CREATE TABLE addr_keys.k_composite (
+            a double precision, b text, body text, tag text, PRIMARY KEY (a, b))",
+    )
+    .await
+    .unwrap();
+    pool.query(
+        "INSERT INTO addr_keys.k_composite VALUES
+            (1e20, 'x', '0:' || repeat('x', 5000), 't'),
+            (1e20, 'y', '1:' || repeat('x', 5000), 't')",
+    )
+    .await
+    .unwrap();
+
+    let tables = pool.introspect().await.unwrap();
+    let mut failures = Vec::new();
+    let mut checked = 0;
+    for table in tables
+        .iter()
+        .filter(|t| t.schema.as_deref() == Some("addr_keys"))
+    {
+        failures.extend(common::row_addressing_failures(&pool, table).await);
+        checked += 1;
+    }
+    assert_eq!(
+        checked,
+        PG_KEY_TYPES.len() + 1,
+        "every fixture introspected"
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    pool.query("DROP SCHEMA addr_keys CASCADE").await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_contains_filter_is_a_substring_search_whatever_the_needle_holds() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    for sql in [
+        "DROP TABLE IF EXISTS like_hostile".to_string(),
+        "CREATE TABLE like_hostile (id integer PRIMARY KEY, v text)".to_string(),
+        format!(
+            "INSERT INTO like_hostile VALUES {}",
+            common::like_hostile_rows("")
+        ),
+    ] {
+        pool.query(&sql).await.unwrap();
+    }
+    let mismatches = common::contains_filter_mismatches(&pool, None, "like_hostile").await;
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    pool.query("DROP TABLE like_hostile").await.unwrap();
+    pool.close().await;
+}
