@@ -2458,3 +2458,140 @@ async fn sqlserver_script_ending_in_a_capped_read_does_not_wait_for_the_rest() {
     run_all(&pool, &["DROP TABLE dbo.capped_tx"]).await;
     pool.close().await;
 }
+
+/// One script run to its end, with nothing but its outcome kept.
+async fn mssql_script(pool: &DbPool, sql: &str) -> Result<ScriptDone, hubro::db::ScriptError> {
+    let statements = split_statements(sql, pool.dialect());
+    run_script(pool, pool.backend_capabilities(), &statements, |_| {}).await
+}
+
+#[tokio::test]
+async fn sqlserver_a_batch_led_by_select_that_ends_or_opens_a_transaction_is_reported_as_it_did() {
+    // A batch that starts with SELECT counts as a read, and can carry
+    // anything after it. Measured when the run asked about the transaction
+    // before such a batch: a COMMIT in it was reported as a rollback of rows
+    // it had committed, and a BEGIN TRAN in it was reported clean while the
+    // close discarded its INSERT.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.select_led",
+            "CREATE TABLE dbo.select_led (a int)",
+        ],
+    )
+    .await;
+    common::open_several_connections(&pool, MSSQL_SLOW).await;
+
+    let outcome = mssql_script(
+        &pool,
+        "BEGIN TRAN\nGO\nINSERT INTO dbo.select_led VALUES (1)\nGO\nSELECT 1 AS a COMMIT SELECT 2 AS b",
+    )
+    .await;
+    let rows = pool
+        .query("SELECT count(*) FROM dbo.select_led")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.rows[0][0],
+        Value::Integer(1),
+        "the COMMIT committed the row"
+    );
+    assert_eq!(
+        outcome,
+        Ok(ScriptDone::default()),
+        "a committed transaction must not be reported as rolled back: {}",
+        common::script_outcome(&outcome)
+    );
+
+    let outcome = mssql_script(
+        &pool,
+        "SELECT 1 AS a BEGIN TRAN INSERT INTO dbo.select_led VALUES (2) SELECT 2 AS b",
+    )
+    .await;
+    let rows = pool
+        .query("SELECT count(*) FROM dbo.select_led")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.rows[0][0],
+        Value::Integer(1),
+        "the transaction left open is gone"
+    );
+    assert_eq!(
+        outcome,
+        Ok(ScriptDone {
+            rolled_back: Some(OpenTransaction {
+                schema_changes_kept: false
+            }),
+            connection_closed: false,
+        }),
+        "a transaction the batch opened must be rolled back and said to be: {}",
+        common::script_outcome(&outcome)
+    );
+    assert_eq!(mssql_open_transactions(&pool).await, Vec::<Value>::new());
+    run_all(&pool, &["DROP TABLE dbo.select_led"]).await;
+    pool.close().await;
+}
+
+/// A write that returns more rows than the cap: `OUTPUT` sends each row as it
+/// is inserted, so the write ends only once its rows are read.
+fn capped_output_write(table: &str) -> String {
+    format!(
+        "WITH c AS (SELECT TOP (30000) a.object_id AS a FROM sys.all_columns a \
+         CROSS JOIN sys.all_columns b) INSERT INTO dbo.{table} OUTPUT inserted.a SELECT a FROM c"
+    )
+}
+
+#[tokio::test]
+async fn sqlserver_capped_row_returning_write_keeps_its_write() {
+    // Discarding the connection after the row cap — what every capped read
+    // on SQL Server did — aborted the write with the session.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.capped_write",
+            "DROP TABLE IF EXISTS dbo.capped_write_pool",
+            "CREATE TABLE dbo.capped_write (a int)",
+            "CREATE TABLE dbo.capped_write_pool (a int)",
+        ],
+    )
+    .await;
+
+    let outcome = mssql_script(&pool, &capped_output_write("capped_write")).await;
+    assert_eq!(
+        outcome,
+        Ok(ScriptDone::default()),
+        "{}",
+        common::script_outcome(&outcome)
+    );
+    let rows = pool
+        .query("SELECT count(*) FROM dbo.capped_write")
+        .await
+        .unwrap();
+    assert_eq!(rows.rows[0][0], Value::Integer(30_000), "through a script");
+
+    let (_, truncated) = pool
+        .query_capped(&capped_output_write("capped_write_pool"), &[], 10_000)
+        .await
+        .unwrap();
+    assert!(truncated);
+    let rows = pool
+        .query("SELECT count(*) FROM dbo.capped_write_pool")
+        .await
+        .unwrap();
+    assert_eq!(rows.rows[0][0], Value::Integer(30_000), "through the pool");
+
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE dbo.capped_write",
+            "DROP TABLE dbo.capped_write_pool",
+        ],
+    )
+    .await;
+    pool.close().await;
+}

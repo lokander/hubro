@@ -373,10 +373,23 @@ impl ScriptConn {
     /// run the ordinary way, with a question after the read, made a capped
     /// `SELECT` over 3M rows return in 1.3 s on Postgres and 1.55 s on SQL
     /// Server instead of 30 and 100 ms — on localhost; over a network, minutes.
-    /// So a cut-short read is not followed by anything: the connection is
-    /// closed, which also ends whatever was open on it. Whether anything was
-    /// is asked *before* the read, which can neither open a transaction nor
-    /// end one, so the answer still holds after it.
+    /// So a cut-short read is not followed by anything, and whether a
+    /// transaction is open is asked *before* it instead.
+    ///
+    /// That is only sound for a statement that can neither touch the
+    /// transaction nor write ([`final_read_may_close`]
+    /// (super::script::final_read_may_close)): a "read" is whatever its first
+    /// keyword says, and measured, CockroachDB's `SHOW COMMIT TIMESTAMP` and
+    /// a SQL Server batch led by `SELECT` can commit or open a transaction,
+    /// and a row-returning write is aborted by abandoning its rows. Any other
+    /// final read is followed by the ordinary end and pays the wait.
+    ///
+    /// For one that qualifies, a cut-short read inside an open transaction
+    /// closes the connection, which ends the transaction server-side — the
+    /// rollback that is reported. With nothing open, Postgres hands the
+    /// connection back for sqlx to read the rest in the background, as capped
+    /// reads always did, and SQL Server discards it, as its capped reads
+    /// always did (the cost is a reconnect next time the pool needs one).
     ///
     /// SQLite has no stream to wait for (its worker stops stepping when the
     /// read is dropped), so there the read is simply followed by
@@ -400,8 +413,9 @@ impl ScriptConn {
             }
             HeldConn::Sqlite(_) => unreachable!("handled above"),
         };
-        // Left false when the connection must not go back to the pool — the
-        // read was cut short, or ending failed — so the drop closes it.
+        // Left false when the connection must not go back to the pool — a
+        // cut-short read inside a transaction, or a failed end — so the drop
+        // closes it.
         self.ended = finished.reusable;
         (finished.read, finished.ended)
     }

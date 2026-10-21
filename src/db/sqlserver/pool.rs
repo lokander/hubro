@@ -38,7 +38,9 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt as _};
 use super::{column_infos, decode_row};
 use crate::db::error::DbError;
 use crate::db::export::{export_io_err, ExportFormat, ExportSink};
-use crate::db::script::{tsql_is_transaction_control, tsql_leads_own_batch};
+use crate::db::script::{
+    final_read_may_close, statement_needs, tsql_is_transaction_control, tsql_leads_own_batch,
+};
 use crate::db::staged::CheckedStatement;
 use crate::db::value::{cap_value, ColumnInfo, QueryResult, Value};
 
@@ -767,7 +769,9 @@ pub async fn execute(pool: &MssqlPool, sql: &str) -> Result<u64, DbError> {
 /// the server's response mid-stream; tiberius would silently drain it before
 /// the *next* query on that connection, which for a huge result would defer
 /// the whole download to some innocent later query — so the connection is
-/// discarded instead (one reconnect is far cheaper).
+/// discarded instead (one reconnect is far cheaper). Unless the statement may
+/// write: a write that returns rows ends only once its response is read, so
+/// then the rest is read here.
 pub async fn query_capped(
     pool: &MssqlPool,
     sql: &str,
@@ -779,7 +783,17 @@ pub async fn query_capped(
     let result = run_query_capped(conn.client(), sql, params, max_rows, cell_cap).await;
     let (result, truncated, abandoned) = settle(&mut conn, result, sql)?;
     if truncated || abandoned {
-        conn.discard();
+        let needs = statement_needs(sql, crate::db::sql::Dialect::SqlServer);
+        if needs.mutate || needs.ddl {
+            // A write that returns rows (`INSERT … OUTPUT`, or a batch that
+            // writes after a long SELECT) only finishes once its response has
+            // been read; discarding the connection here aborted it. Read the
+            // rest, and report an error it ends in.
+            let drained = run_batch(conn.client(), "SELECT 1").await;
+            settle(&mut conn, drained, sql)?;
+        } else {
+            conn.discard();
+        }
     }
     Ok((result, truncated))
 }
@@ -1122,12 +1136,20 @@ pub async fn end_script_conn(conn: &mut MssqlScriptConn) -> Result<bool, DbError
 /// script's hold on its connection — see
 /// [`ScriptConn::finish_with_read`](crate::db::registry::ScriptConn::finish_with_read).
 ///
-/// `@@TRANCOUNT` is read *before* the read, which cannot change it. A read
-/// the row cap cut short, or one that left a second result set unread, is not
-/// followed by anything: tiberius would first drain the rest of the response
-/// — measured, 1.55 s for a capped `SELECT` over 3M rows on localhost, where
-/// discarding the connection takes 100 ms — so the connection is discarded
-/// instead, and the server rolls back whatever was open on it.
+/// Unless [`final_read_may_close`] says the batch can neither touch the
+/// transaction nor write, the read is followed by the ordinary end, which
+/// first reads and discards whatever of the response is left — a batch led by
+/// a `SELECT` can carry `COMMIT`, `BEGIN TRAN` or an `INSERT … OUTPUT`, and
+/// every one of them only finishes once its response has been read.
+///
+/// Otherwise `@@TRANCOUNT` is read *before* the read. A read the row cap cut
+/// short, or one that left a second result set unread, is then followed by
+/// nothing: tiberius would first drain the rest of the response — measured,
+/// 1.55 s for a capped `SELECT` over 3M rows on localhost, where discarding
+/// the connection takes 100 ms — so the connection is discarded instead, as a
+/// capped read's always was, and the server rolls back whatever was open on
+/// it. The cost is a reconnect (a TLS login; over an SSH tunnel, a new
+/// channel) the next time the pool needs that connection.
 pub async fn finish_script_conn_with_read(
     conn: &mut MssqlScriptConn,
     sql: &str,
@@ -1135,6 +1157,16 @@ pub async fn finish_script_conn_with_read(
     cell_cap: usize,
 ) -> crate::db::registry::FinishedRead {
     use crate::db::registry::FinishedRead;
+    if !final_read_may_close(sql, crate::db::sql::Dialect::SqlServer) {
+        let read = query_capped_held(&mut conn.conn, sql, max_rows, cell_cap).await;
+        let ended = end_script_conn(conn).await;
+        let reusable = ended.is_ok();
+        return FinishedRead {
+            read,
+            ended,
+            reusable,
+        };
+    }
     let held = &mut conn.conn;
     if held.is_discarded() {
         return FinishedRead {
@@ -1157,6 +1189,11 @@ pub async fn finish_script_conn_with_read(
         Ok(open) => open,
         Err(error) => {
             held.discard();
+            // Not the statement's own error: it never ran.
+            let error = DbError::Query(format!(
+                "the statement was not run: checking the connection's transaction before it \
+                 failed: {error}"
+            ));
             return FinishedRead {
                 read: Err(error.clone()),
                 ended: Err(error),

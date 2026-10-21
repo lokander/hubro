@@ -2182,6 +2182,60 @@ pub(crate) fn tsql_is_transaction_control(sql: &str) -> bool {
             .all(|c| c.is_alphanumeric() || c.is_whitespace() || matches!(c, '_' | '@' | '#' | ';'))
 }
 
+/// Whether a row-returning statement that ends a script may have its result
+/// cut off at the row cap without being read to the end: it can neither
+/// change the session's transaction state nor write anything this module can
+/// see. Only then does what the connection said *before* the statement still
+/// hold after it, and only then does abandoning the rest of its result lose
+/// nothing but rows — see
+/// [`ScriptConn::finish_with_read`](super::registry::ScriptConn::finish_with_read).
+///
+/// "Returns rows" is decided by the first keyword alone, so it says nothing
+/// about the rest, and measured, the rest can do anything:
+///
+/// - **Postgres-wire**: only a statement led by `SELECT`, `WITH`, `VALUES`,
+///   `TABLE` or `EXPLAIN`. Not `SHOW`: CockroachDB's `SHOW COMMIT TIMESTAMP`
+///   commits the open transaction. Nothing a Postgres function runs can end
+///   one (only a procedure can, and `CALL` is not a read).
+/// - **SQL Server**: a statement is a whole batch, and one led by `SELECT`
+///   can carry `COMMIT` or `BEGIN TRAN` — both measured — so no `BEGIN`,
+///   `COMMIT`, `ROLLBACK` or `SAVE` word anywhere in it, no
+///   `IMPLICIT_TRANSACTIONS` (under which a `SELECT` opens a transaction),
+///   and no opaque word ([`TSQL_OPAQUE_WORDS`]: an `EXEC`'d procedure can
+///   change `@@TRANCOUNT`).
+/// - **Both**: nothing [`statement_needs`] charges as a write. A
+///   data-modifying CTE that returns rows (`WITH w AS (INSERT … RETURNING a)
+///   SELECT a FROM w`, T-SQL's `OUTPUT`) writes only as fast as its rows are
+///   read, so abandoning them abandons the write — measured on Postgres, 0
+///   rows kept of 3M where reading to the end keeps all of them.
+/// - **SQLite** never asks: its read is followed by the ordinary end.
+///
+/// A false "no" costs only the wait for the rest of the result, as every
+/// read paid before; a false "yes" reports the wrong transaction state.
+pub(crate) fn final_read_may_close(sql: &str, dialect: Dialect) -> bool {
+    let needs = statement_needs(sql, dialect);
+    if needs.mutate || needs.ddl {
+        return false;
+    }
+    match dialect {
+        Dialect::Postgres => matches!(
+            first_keyword(sql, dialect).to_ascii_lowercase().as_str(),
+            "select" | "with" | "values" | "table" | "explain"
+        ),
+        Dialect::SqlServer => {
+            let stripped = strip_strings_and_comments(sql, dialect);
+            !has_opaque_word(dialect, &stripped)
+                && !has_word(&stripped, |word| {
+                    matches!(
+                        word.to_ascii_lowercase().as_str(),
+                        "begin" | "commit" | "rollback" | "save" | "implicit_transactions"
+                    )
+                })
+        }
+        Dialect::Sqlite => false,
+    }
+}
+
 /// Whether SQL Server accepts `sql` only as the first statement of a batch —
 /// `CREATE`/`ALTER`/`CREATE OR ALTER` of a procedure, function, trigger or
 /// view, and `CREATE SCHEMA`/`DEFAULT`/`RULE`.
@@ -4553,6 +4607,52 @@ mod tests {
         assert!(kept(no_ddl_rollback, &with_ddl));
         assert!(!kept(no_ddl_rollback, &without));
         assert!(!kept(Capabilities::FULL, &with_ddl));
+    }
+
+    #[test]
+    fn only_a_read_that_cannot_touch_the_transaction_or_write_may_be_cut_off() {
+        let pg = |sql| final_read_may_close(sql, Dialect::Postgres);
+        let ms = |sql| final_read_may_close(sql, Dialect::SqlServer);
+        for sql in [
+            "SELECT * FROM big",
+            "with t as (select 1) select * from t",
+            "VALUES (1), (2)",
+            "TABLE big",
+            "EXPLAIN SELECT 1",
+            "SELECT f()",
+        ] {
+            assert!(pg(sql), "{sql:?}");
+        }
+        for sql in [
+            "SHOW COMMIT TIMESTAMP",
+            "SHOW search_path",
+            "WITH w AS (INSERT INTO t SELECT 1 RETURNING a) SELECT a FROM w",
+            "EXPLAIN ANALYZE DELETE FROM t",
+            "SELECT * INTO copy FROM t",
+            "PRAGMA table_info(t)",
+        ] {
+            assert!(!pg(sql), "{sql:?}");
+        }
+        for sql in [
+            "SELECT * FROM big",
+            "SELECT TOP (5) a FROM t",
+            "WITH c AS (SELECT 1 AS a) SELECT a FROM c",
+        ] {
+            assert!(ms(sql), "{sql:?}");
+        }
+        for sql in [
+            "SELECT 1 AS a COMMIT SELECT 2 AS b",
+            "SELECT 1 AS a BEGIN TRAN INSERT INTO t VALUES (2) SELECT 2 AS b",
+            "SELECT 1 AS a ROLLBACK",
+            "SELECT 1 SAVE TRAN p",
+            "SET IMPLICIT_TRANSACTIONS ON SELECT 1",
+            "SELECT 1 EXEC dbo.p",
+            "WITH c AS (SELECT 1 AS a) INSERT INTO t OUTPUT inserted.a SELECT a FROM c",
+            "SELECT TOP (5) a FROM t INSERT INTO t VALUES (1)",
+        ] {
+            assert!(!ms(sql), "{sql:?}");
+        }
+        assert!(!final_read_may_close("SELECT 1", Dialect::Sqlite));
     }
 
     #[test]

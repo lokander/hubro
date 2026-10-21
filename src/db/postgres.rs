@@ -27,6 +27,7 @@ use super::schema::{
     ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, Internal, TableKind, TableMeta, TypeDetail,
     TypeRef,
 };
+use super::script::final_read_may_close;
 use super::sql::Dialect;
 use super::sqlx_common::{self, get};
 use super::staged::CheckedStatement;
@@ -491,16 +492,18 @@ pub async fn execute_conn(
 /// already inside a transaction, and the handle it returns then rolls that
 /// transaction back.
 ///
-/// A probe that fails outright means the session is in a transaction an error
-/// has aborted (`SELECT 1` is refused until it ends) or the connection is
-/// broken; a `ROLLBACK` tells those two apart. An error is returned only when
-/// the rollback fails too, and then the connection's state is unknown and the
-/// caller must not return it to the pool. What the `ROLLBACK` cannot tell is a
-/// probe that failed for some third reason on a session with nothing open — it
-/// would succeed with a warning and the run would report a rollback that
-/// undid nothing. No such failure of `SELECT 1` on a live session is known.
+/// A probe that fails outright is refused by the session's state, or the
+/// connection is broken; a `ROLLBACK` follows either way, ends whatever block
+/// the session is in, and fails only on a broken connection — then an error is
+/// returned, the connection's state is unknown, and the caller must not return
+/// it to the pool. Whether the `ROLLBACK` undid anything is the refusal's
+/// SQLSTATE ([`refused_inside_aborted_transaction`]): an aborted transaction
+/// was rolled back, but CockroachDB's `SHOW COMMIT TIMESTAMP` leaves the
+/// session in a block whose transaction is already *committed* (status
+/// `CommitWait`, refusing statements with `25000`), and reporting that as a
+/// rollback claimed the script's committed rows were gone.
 pub async fn end_script_conn(conn: &mut sqlx::postgres::PgConnection) -> Result<bool, DbError> {
-    match sqlx::Connection::begin_with(&mut *conn, "SELECT 1").await {
+    let rolled_back = match sqlx::Connection::begin_with(&mut *conn, "SELECT 1").await {
         Ok(open) => {
             return open
                 .rollback()
@@ -509,22 +512,47 @@ pub async fn end_script_conn(conn: &mut sqlx::postgres::PgConnection) -> Result<
                 .map_err(|e| DbError::Query(e.to_string()))
         }
         Err(sqlx::Error::BeginFailed) => return Ok(false),
-        Err(_) => {}
-    }
-    execute_conn(conn, "ROLLBACK").await.map(|_| true)
+        Err(refused) => refused_inside_aborted_transaction(
+            refused
+                .as_database_error()
+                .and_then(|e| e.code())
+                .as_deref(),
+        ),
+    };
+    execute_conn(conn, "ROLLBACK").await.map(|_| rolled_back)
+}
+
+/// Whether a statement refused with `sqlstate` was refused because the
+/// session is inside a transaction an error aborted (`25P02`,
+/// `in_failed_sql_transaction`, which PostgreSQL and CockroachDB both send),
+/// so that ending the block rolls something back. Any other refusal is not
+/// claimed as one: a `25000` from CockroachDB's commit-wait block follows a
+/// transaction that already committed, and a probe refused for a reason not
+/// known at all is better reported as undoing nothing than as undoing the
+/// script's work.
+fn refused_inside_aborted_transaction(sqlstate: Option<&str>) -> bool {
+    sqlstate == Some("25P02")
 }
 
 /// A script's last statement, when it returns rows, and the end of the
 /// script's hold on its connection — see
 /// [`ScriptConn::finish_with_read`](super::registry::ScriptConn::finish_with_read).
 ///
-/// The same probe as [`end_script_conn`], sent *before* the read: a read
-/// cannot change the answer. When a transaction is open the read runs inside
-/// the handle the probe returned, so the script still sees its own
-/// uncommitted rows, and the handle's rollback ends it afterwards. When the
-/// read was cut short by the row cap, nothing follows it — the caller closes
-/// the connection, which ends the transaction server-side, rather than wait
-/// for the rest of the result.
+/// Unless [`final_read_may_close`] says the statement can neither touch the
+/// transaction nor write, the read is followed by the ordinary end and its
+/// rest is read and discarded first, as before. Otherwise the probe of
+/// [`end_script_conn`] is sent *before* the read:
+///
+/// - A transaction is open: the read runs inside the handle the probe
+///   returned, so the script still sees its own uncommitted rows, and the
+///   handle's rollback ends it afterwards. A read the row cap cut short is
+///   followed by nothing — the caller closes the connection, which ends the
+///   transaction server-side and is reported as the rollback it is.
+/// - Nothing is open: a cut-short read goes back to the pool unfinished, and
+///   sqlx reads the rest in the background before reusing it, as every capped
+///   read did before scripts held a connection. Closing instead would abort
+///   a write the gate cannot see (`SELECT f()` for a function that writes),
+///   and costs a reconnect.
 pub async fn finish_script_conn_with_read(
     conn: &mut sqlx::postgres::PgConnection,
     sql: &str,
@@ -533,44 +561,49 @@ pub async fn finish_script_conn_with_read(
 ) -> super::registry::FinishedRead {
     use super::registry::FinishedRead;
     let cut_short = |read: &Result<(QueryResult, bool), DbError>| matches!(read, Ok((_, true)));
-    let idle = match sqlx::Connection::begin_with(&mut *conn, "SELECT 1").await {
-        Ok(mut open) => {
-            let read = query_capped_conn(&mut open, sql, max_rows, cell_cap).await;
-            if cut_short(&read) {
+    let probed = final_read_may_close(sql, Dialect::Postgres);
+    let idle = if !probed {
+        false
+    } else {
+        match sqlx::Connection::begin_with(&mut *conn, "SELECT 1").await {
+            Ok(mut open) => {
+                let read = query_capped_conn(&mut open, sql, max_rows, cell_cap).await;
+                if cut_short(&read) {
+                    return FinishedRead {
+                        read,
+                        ended: Ok(true),
+                        reusable: false,
+                    };
+                }
+                let ended = open
+                    .rollback()
+                    .await
+                    .map(|()| true)
+                    .map_err(|e| DbError::Query(e.to_string()));
+                let reusable = ended.is_ok();
                 return FinishedRead {
                     read,
-                    ended: Ok(true),
-                    reusable: false,
+                    ended,
+                    reusable,
                 };
             }
-            let ended = open
-                .rollback()
-                .await
-                .map(|()| true)
-                .map_err(|e| DbError::Query(e.to_string()));
-            let reusable = ended.is_ok();
-            return FinishedRead {
-                read,
-                ended,
-                reusable,
-            };
+            Err(sqlx::Error::BeginFailed) => true,
+            // An aborted transaction (which refuses the read too, with the
+            // server's own message) or a broken connection: the ordinary end
+            // sorts them out.
+            Err(_) => false,
         }
-        Err(sqlx::Error::BeginFailed) => true,
-        // An aborted transaction (which refuses the read too, with the
-        // server's own message) or a broken connection: the ordinary end
-        // sorts them out.
-        Err(_) => false,
     };
     let read = query_capped_conn(conn, sql, max_rows, cell_cap).await;
     if idle && cut_short(&read) {
         return FinishedRead {
             read,
             ended: Ok(false),
-            reusable: false,
+            reusable: true,
         };
     }
     let ended = end_script_conn(conn).await;
-    let reusable = ended.is_ok() && !cut_short(&read);
+    let reusable = ended.is_ok();
     FinishedRead {
         read,
         ended,
@@ -2371,6 +2404,16 @@ fn format_interval(iv: &PgInterval) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only an aborted transaction is reported as rolled back when the probe
+    /// is refused; CockroachDB's commit-wait block (`25000`) followed a commit.
+    #[test]
+    fn only_an_aborted_transaction_counts_as_rolled_back_when_the_probe_is_refused() {
+        assert!(refused_inside_aborted_transaction(Some("25P02")));
+        assert!(!refused_inside_aborted_transaction(Some("25000")));
+        assert!(!refused_inside_aborted_transaction(Some("57P01")));
+        assert!(!refused_inside_aborted_transaction(None));
+    }
 
     /// A bit-string wire value: big-endian `i32` count, then packed bytes.
     fn wire(count: i32, packed: &[u8]) -> Vec<u8> {

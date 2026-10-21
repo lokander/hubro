@@ -948,3 +948,35 @@ async fn cockroach_script_keeps_its_own_transaction_on_one_session() {
     pool.execute("DROP TABLE own_tx").await.unwrap();
     pool.close().await;
 }
+
+#[tokio::test]
+async fn cockroach_a_row_returning_statement_that_commits_is_not_reported_rolled_back() {
+    // `SHOW COMMIT TIMESTAMP` returns a row and commits the open transaction.
+    // Asked before it whether a transaction was open, the run said yes and
+    // reported the script's writes as rolled back while they were committed.
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.execute("DROP TABLE IF EXISTS show_commit")
+        .await
+        .unwrap();
+    pool.execute("CREATE TABLE show_commit (a INT8)")
+        .await
+        .unwrap();
+    let statements = split_statements(
+        "BEGIN; INSERT INTO show_commit VALUES (1); SHOW COMMIT TIMESTAMP",
+        pool.dialect(),
+    );
+    let outcome = run_script(&pool, pool.backend_capabilities(), &statements, |_| {}).await;
+    assert_eq!(outcome, Ok(ScriptDone::default()));
+    let rows = pool
+        .query("SELECT count(*) FROM show_commit")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.rows[0][0],
+        Value::Integer(1),
+        "the INSERT was committed"
+    );
+    pool.execute("DROP TABLE show_commit").await.unwrap();
+    pool.close().await;
+}
