@@ -32,6 +32,7 @@ use super::schema::{
     ColumnMeta, ForeignKeyMeta, Generated, IndexConstraint, IndexMeta, TableKind, TableMeta,
     TypeDetail,
 };
+use super::script::first_keyword;
 use super::sql::Dialect;
 use super::sqlx_common::{self, get};
 use super::staged::CheckedStatement;
@@ -225,25 +226,44 @@ pub const NUL_IN_SQL: &str =
 
 use door::SqlText;
 
-/// The affected-row count to report for a statement, given the connection's
+/// The affected-row count to report for `sql`, given the connection's
 /// `total_changes()` before and after it and the count the driver reported.
 ///
 /// The driver reports `sqlite3_changes()`, which only an `INSERT`, `UPDATE` or
-/// `DELETE` sets: any other statement leaves it at the last such statement's
-/// count. Measured after a two-row `INSERT`: `BEGIN`, `ROLLBACK`, `SAVEPOINT`,
-/// `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`, `ANALYZE` and `VACUUM` each
-/// reported 2. `total_changes()` counts every row an `INSERT`, `UPDATE` or
-/// `DELETE` changed on the connection, so when it did not move, the statement
-/// changed nothing — whatever its kind, without classifying it — and the
-/// count is 0. When it moved, the statement was one that sets the driver's
-/// count, which is then the true one. The difference itself is not reported:
+/// `DELETE` sets (`REPLACE` is an `INSERT`; any of them may be led by `WITH`):
+/// any other statement leaves it at the last such statement's count. Measured
+/// after a two-row `INSERT`: `BEGIN`, `ROLLBACK`, `SAVEPOINT`, `CREATE TABLE`,
+/// `CREATE INDEX`, `DROP TABLE`, `ANALYZE` and `VACUUM` each reported 2. So
+/// the count is the driver's only for a statement led by one of those words,
+/// and 0 for every other.
+///
+/// The keyword alone is not enough, because a `WITH` can lead a plain
+/// `SELECT`, which leaves the count stale too. `total_changes()` counts every
+/// row an `INSERT`, `UPDATE` or `DELETE` changed on the connection, so when
+/// it did not move, the statement changed no row and the count is 0.
+///
+/// The counter alone is not enough either. A virtual table's module writes
+/// its shadow tables with ordinary DML, which moves the counter and sets the
+/// driver's count, under a statement that is not a write. Measured on the
+/// bundled SQLite 3.46: `CREATE VIRTUAL TABLE … USING fts5(x)` moved it by 3
+/// and `… USING rtree(…)` by 1, `ALTER TABLE … RENAME` of an FTS5 table by 4
+/// and `DROP TABLE` of one holding a row by 4, and each left the driver's
+/// count at 1.
+///
+/// The counter's difference is not reported in place of the driver's count:
 /// it also counts the rows a trigger changed, which `sqlite3_changes()`, like
 /// Postgres's command tag, leaves out.
-fn affected_rows(total_before: i64, total_after: i64, reported: u64) -> u64 {
-    if total_after == total_before {
-        0
-    } else {
+fn affected_rows(sql: &str, total_before: i64, total_after: i64, reported: u64) -> u64 {
+    let writes = matches!(
+        first_keyword(sql, Dialect::Sqlite)
+            .to_ascii_lowercase()
+            .as_str(),
+        "insert" | "update" | "delete" | "replace" | "with"
+    );
+    if writes && total_after != total_before {
         reported
+    } else {
+        0
     }
 }
 
@@ -309,7 +329,7 @@ mod door {
             let before = total_changes(&mut conn).await?;
             let reported = sqlx_common::execute(&mut *conn, self.0, query_error).await?;
             let after = total_changes(&mut conn).await?;
-            Ok(super::affected_rows(before, after, reported))
+            Ok(super::affected_rows(self.0, before, after, reported))
         }
 
         /// See [`sqlx_common::fill_headers`].
@@ -1324,11 +1344,33 @@ mod tests {
     #[test]
     fn a_statement_that_changed_no_row_reports_none_whatever_the_driver_says() {
         // `BEGIN` after a two-row INSERT: the driver repeats the 2.
-        assert_eq!(affected_rows(7, 7, 2), 0);
+        assert_eq!(affected_rows("BEGIN", 7, 7, 2), 0);
         // A write: the driver's count, not the counter's difference, which
         // also holds the rows its triggers changed.
-        assert_eq!(affected_rows(7, 10, 1), 1);
-        assert_eq!(affected_rows(7, 9, 2), 2);
+        assert_eq!(affected_rows("INSERT INTO t VALUES (1)", 7, 10, 1), 1);
+        assert_eq!(
+            affected_rows("-- c\n replace INTO t VALUES (1)", 7, 9, 2),
+            2
+        );
+        assert_eq!(affected_rows("UPDATE t SET a = 1", 7, 8, 1), 1);
+        assert_eq!(affected_rows("DELETE FROM t", 7, 8, 1), 1);
+        assert_eq!(
+            affected_rows("WITH x AS (SELECT 1) DELETE FROM t", 7, 8, 1),
+            1
+        );
+        // A WITH-led read leaves the count stale and the counter still.
+        assert_eq!(
+            affected_rows("WITH x AS (SELECT 1) SELECT * FROM x", 7, 7, 2),
+            0
+        );
+        // A virtual table's module moves the counter and sets the driver's
+        // count under DDL: 3.46 reports 1 for each of these.
+        assert_eq!(
+            affected_rows("CREATE VIRTUAL TABLE f USING fts5(x)", 0, 3, 1),
+            0
+        );
+        assert_eq!(affected_rows("ALTER TABLE f RENAME TO g", 3, 7, 1), 0);
+        assert_eq!(affected_rows("DROP TABLE g", 7, 11, 1), 0);
     }
 
     /// The probe's two outcomes, and what [`end_script_conn`] makes of them.
