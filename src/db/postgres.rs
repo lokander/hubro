@@ -1040,14 +1040,27 @@ async fn catalog_shape(pool: &PgPool) -> CatalogShape {
 /// foreign key's `conindid` names the index on the *referenced* table it leans
 /// on (the trap `fetch_ddl`'s index query documents), so it must not be
 /// matched. Without those catalog columns the type is selected as a NULL, the
-/// constant it would decode to for an unowned index.
+/// constant it would decode to for an unowned index, and `pg_constraint` is not
+/// named at all.
+///
+/// **Joined once, never correlated.** `pg_constraint` has no index on
+/// `conindid`, and the query has a row per key column, so a scalar subquery
+/// per row scanned the whole of `pg_constraint` for each one — measured on
+/// PostgreSQL 17 with 3,000 tables (12,000 rows, 6,000 constraints): 7 ms
+/// without the column, 1,478 ms with a correlated subquery, 21 ms with this
+/// pre-aggregated join. `GROUP BY` with `min` keeps the subquery's at-most-one
+/// row per index without `DISTINCT ON`. Pinned by
+/// `the_constraint_type_is_joined_once_not_looked_up_per_row`.
 fn index_query(bound_keys: bool, constraint_indexes: bool) -> String {
-    let constraint_type = if constraint_indexes {
-        "(SELECT con.contype::text FROM pg_constraint con \
-          WHERE con.conindid = ix.indexrelid AND con.contype IN ('p', 'u', 'x') \
-          LIMIT 1)"
+    let (constraint_type, constraint_join) = if constraint_indexes {
+        (
+            "con.contype",
+            "LEFT JOIN (SELECT conindid, min(contype::text) AS contype \
+                        FROM pg_constraint WHERE contype IN ('p', 'u', 'x') \
+                        GROUP BY conindid) con ON con.conindid = ix.indexrelid",
+        )
     } else {
-        "NULL::text"
+        ("NULL::text", "")
     };
     let bound = if bound_keys {
         "AND k.ord <= ix.indnkeyatts"
@@ -1066,6 +1079,7 @@ fn index_query(bound_keys: bool, constraint_indexes: bool) -> String {
          JOIN pg_namespace n ON n.oid = t.relnamespace \
          CROSS JOIN unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) \
          LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
+         {constraint_join} \
          WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
            AND n.nspname NOT LIKE 'pg\\_%' \
            {bound} \
@@ -2947,8 +2961,57 @@ mod tests {
                 "{degraded}"
             );
             let rich = index_query(bound, true);
-            assert!(rich.contains("con.conindid = ix.indexrelid"), "{rich}");
-            assert!(rich.contains("con.contype IN ('p', 'u', 'x')"), "{rich}");
+            assert!(rich.contains("con.contype AS constraint_type"), "{rich}");
+            assert!(
+                rich.contains("con ON con.conindid = ix.indexrelid"),
+                "{rich}"
+            );
+            assert!(rich.contains("WHERE contype IN ('p', 'u', 'x')"), "{rich}");
         }
+    }
+
+    /// The source of [`index_query`], comment lines stripped and whitespace
+    /// collapsed, so a reformat is not a failure and a comment cannot satisfy
+    /// or trip an assertion.
+    fn index_query_source() -> String {
+        // `lines()` rather than a literal newline: a Windows checkout has
+        // CRLF endings, and `trim_end` takes the `\r` off the closing brace.
+        include_str!("postgres.rs")
+            .lines()
+            .skip_while(|line| !line.starts_with("fn index_query("))
+            .take_while(|line| line.trim_end() != "}")
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn the_constraint_type_is_joined_once_not_looked_up_per_row() {
+        // A scalar subquery on `pg_constraint` runs once per key-column row
+        // and scans the whole catalog each time (1,478 ms against 21 ms on
+        // 3,000 tables). The text the server receives must join it as one
+        // derived table, and name it exactly once.
+        for bound in [true, false] {
+            let sql = index_query(bound, true)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(sql.matches("pg_constraint").count(), 1, "{sql}");
+            assert!(
+                sql.contains(
+                    "LEFT JOIN (SELECT conindid, min(contype::text) AS contype FROM pg_constraint"
+                ),
+                "{sql}"
+            );
+            assert!(!sql.contains("(SELECT con."), "{sql}");
+            assert!(!sql.contains("LIMIT"), "{sql}");
+        }
+        // And the source carries no second, correlated spelling of it.
+        let source = index_query_source();
+        assert_eq!(source.matches("pg_constraint").count(), 1, "{source}");
+        assert!(!source.contains("= ix.indexrelid AND"), "{source}");
     }
 }
