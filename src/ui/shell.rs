@@ -225,10 +225,9 @@ pub fn Shell() -> Element {
             if show_cheatsheet() {
                 Cheatsheet {}
             }
-            // Also gated on `any_dirty`: if an in-flight save empties the stage
-            // while the prompt is up, it self-dismisses instead of offering to
-            // discard nothing.
-            if state.confirm_quit.read().to_owned() && state.any_dirty() {
+            // After the cheatsheet, so it is drawn over it: the two share a
+            // z-level, so the later one is on top.
+            if state.quit_confirm_showing() {
                 QuitConfirmDialog {}
             }
         }
@@ -792,6 +791,27 @@ mod tests {
             "if (underModal(e)) return;",
             "the gate is not the listener's first statement"
         );
+    }
+
+    /// The quit confirmation renders after the cheatsheet, so it is drawn
+    /// over it (both overlays share a z-level). The cheatsheet also refuses
+    /// to open while the confirmation is up; this is the second guard.
+    #[test]
+    fn the_quit_confirmation_is_drawn_over_the_cheatsheet() {
+        let source = include_str!("shell.rs");
+        let (code, _tests) = source.split_once("#[cfg(test)]").expect("a test module");
+        let lines = crate::ui::test_dom::code_lines(code);
+        let shell = lines
+            .iter()
+            .position(|line| line.starts_with("pub fn Shell("))
+            .expect("Shell is gone");
+        let at = |call: &str| {
+            lines[shell..]
+                .iter()
+                .position(|line| line == call)
+                .unwrap_or_else(|| panic!("Shell no longer renders `{call}`"))
+        };
+        assert!(at("Cheatsheet {}") < at("QuitConfirmDialog {}"));
     }
 
     /// The window listener has no Escape action: every Escape belongs to the
