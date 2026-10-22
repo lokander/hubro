@@ -423,3 +423,80 @@ async fn sqlite_script_session_state_stays_in_its_run() {
     pool.close().await;
     assert_nothing_leaked(engine, &leaks);
 }
+
+// ---------------------------------------------------------------------------
+// Cancelled runs
+// ---------------------------------------------------------------------------
+
+/// Starts `sql` as a script and cancels it the way the editor does — by
+/// dropping the run — while its last statement still sleeps server-side, then
+/// waits past the sleep, so a connection that was going back to the pool
+/// would have.
+async fn cancel_mid_sleep(pool: &DbPool, caps: Capabilities, sql: &str) {
+    let statements = split_statements(sql, pool.dialect());
+    let run = run_script(pool, caps, &statements, |_| {});
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), run)
+            .await
+            .is_err(),
+        "{sql:?} should still be sleeping when it is cancelled"
+    );
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+}
+
+/// A cancelled run's connection is closed too, on every path, and with it
+/// whatever the script had left on the session. Cancelling skips the run's
+/// own end, so this is the drop alone at work: a run's connections are marked
+/// to close on drop when they are checked out (`acquire_for_run`), and
+/// without that mark each of these went back to the pool. The atomic and
+/// read-only paths are probed with a lock, because their transaction's
+/// rollback undoes a `SET` but not a session advisory lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_cancelled_run_leaves_nothing_on_the_pool() {
+    let Some(url) = common::pg_test_url().await else {
+        return;
+    };
+    let pool = DbPool::open_postgres_single_session(&url).await.unwrap();
+    let other = DbPool::open_postgres_single_session(&url).await.unwrap();
+    let caps = pool.backend_capabilities();
+    let marked = WriteProtection::ReadOnly.apply(caps);
+    let mut leaks = Vec::new();
+
+    // Sequential (the script's own BEGIN): a SET before it outlives nothing
+    // but the session.
+    cancel_mid_sleep(
+        &pool,
+        caps,
+        "SET application_name = 'hubro_cancelled'; BEGIN; SELECT pg_sleep(2)",
+    )
+    .await;
+    if one(&pool, APP_NAME).await == Value::Text("hubro_cancelled".into()) {
+        leaks.push("a cancelled sequential run left its SET on the pooled connection".into());
+    }
+
+    for (key, caps, path) in [
+        (4_233_201, caps, "atomic"),
+        (4_233_202, marked, "read-only"),
+    ] {
+        cancel_mid_sleep(
+            &pool,
+            caps,
+            &format!("SELECT pg_advisory_lock({key}); SELECT pg_sleep(2)"),
+        )
+        .await;
+        let taken = eventually(
+            &other,
+            &format!("SELECT CAST(pg_try_advisory_lock({key}) AS int)"),
+            &Value::Integer(1),
+        )
+        .await;
+        if taken == Value::Integer(1) {
+            one(&other, &format!("SELECT pg_advisory_unlock({key})")).await;
+        } else {
+            leaks.push(format!("a cancelled {path} run left its lock held"));
+        }
+    }
+    other.close().await;
+    pool.close().await;
+    assert_nothing_leaked("HUBRO_PG_TEST_URL", &leaks);
+}
