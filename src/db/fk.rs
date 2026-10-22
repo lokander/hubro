@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use super::page::{Filter, KeyEquality};
+use super::rowkey::key_column_addressable;
 use super::schema::{ColumnMeta, ForeignKeyMeta, TableMeta};
 use super::value::Value;
 
@@ -66,9 +67,11 @@ pub fn build_fk_filter(
 /// The columns of `target` that `fk`'s key columns reference, in key order —
 /// or `None` when the foreign key leads nowhere hubro can show: it has no
 /// columns, a reference to the implicit primary key finds no primary-key
-/// column at its position, or a referenced column is missing from `target`
+/// column at its position, a referenced column is missing from `target`
 /// (a stale schema, or a reference SQLite accepted to a column that does
-/// not exist). Whether a row's link is offered at all is decided by this,
+/// not exist), or a referenced column's values cannot be bound back to find
+/// their row ([`key_column_addressable`]: a jump on a `sql_variant` key
+/// landed on an empty page). Whether a row's link is offered at all is decided by this,
 /// so a link is never a dead click.
 pub fn fk_target_columns<'a>(
     fk: &ForeignKeyMeta,
@@ -85,7 +88,11 @@ pub fn fk_target_columns<'a>(
     (0..fk.columns.len())
         .map(|index| {
             let name = resolve_referenced_column(fk, index, &target_pk)?;
-            target.columns.iter().find(|c| c.name == name)
+            target
+                .columns
+                .iter()
+                .find(|c| c.name == name)
+                .filter(|c| key_column_addressable(c))
         })
         .collect()
 }
@@ -272,6 +279,17 @@ mod tests {
                 term("c", Value::Text("ab ".into()), "character"),
             ])
         );
+    }
+
+    #[test]
+    fn a_reference_to_a_sql_variant_key_offers_no_jump() {
+        // A variant holding an `int` or a `date` matches no row when bound
+        // back, so the jump would land on an empty page; it is not offered.
+        let fk = make_fk(&["ref"], vec![Some("k")]);
+        let source = row(&[("ref", Value::Text("5".into()))]);
+        let parent = target(&[("k", "sql_variant", Some(1))]);
+        assert_eq!(fk_target_columns(&fk, &parent), None);
+        assert_eq!(build_fk_filter(&fk, &source, &parent), None);
     }
 
     #[test]

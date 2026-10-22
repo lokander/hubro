@@ -10,7 +10,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::postgres::types::PgInterval;
+use sqlx::postgres::types::{Oid, PgInterval};
 use sqlx::postgres::{
     PgDatabaseError, PgErrorPosition, PgHasArrayType, PgPool, PgPoolOptions, PgRow, PgTypeKind,
     PgValueFormat, PgValueRef,
@@ -2369,6 +2369,12 @@ fn decode_typed(row: &PgRow, idx: usize, raw: &PgValueRef) -> Option<Value> {
         // Exact, never through f64: every digit and the column's scale.
         "NUMERIC" => wire_text(raw, pg_wire::numeric),
         "UUID" => Some(Value::Text(row.try_get::<Uuid, _>(idx).ok()?.to_string())),
+        // An unsigned 32-bit number: as an integer it is shown as the server
+        // prints it and binds back through `::oid`. Without this arm it read
+        // as the marker `<oid>`, and so did every `oid` key's locator.
+        "OID" => Some(Value::Integer(i64::from(
+            row.try_get::<Oid, _>(idx).ok()?.0,
+        ))),
         // Bit strings, as the `0`/`1` text the server prints and the editor
         // accepts back. sqlx has no built-in decode for these
         // without the `bit-vec` feature, so without this arm they degraded to
