@@ -16,8 +16,10 @@ use crate::db::{
 };
 use crate::util::{human_bytes, human_count};
 
-use super::js::{focus_on_mount, write_clipboard};
-use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState, KindBadge};
+use super::js::write_clipboard;
+use super::notice::{
+    Banner, BannerKind, DelayedLoading, EmptyState, KindBadge, Overlay, OverlayAlign,
+};
 use super::schema_edit::SchemaEditDialog;
 use super::state::{AppState, SchemaLoad, TableRef};
 
@@ -490,9 +492,8 @@ fn TableStatsLine(id: ConnectionId, table: ReadSignal<TableRef>) -> Element {
 }
 
 /// The DDL overlay: one object's definition, read-only, with a copy
-/// action. Dismissed by the ✕, a backdrop click, or Escape — handled here
-/// rather than by the window listener, which ignores keys while the `<pre>`
-/// container has focus.
+/// action. Dismissed by the ✕, Escape, or a backdrop click: it holds nothing
+/// a stray click could lose.
 #[component]
 fn DdlOverlay(
     id: ConnectionId,
@@ -514,21 +515,12 @@ fn DdlOverlay(
     };
     let loaded = ddl.read();
     rsx! {
-        div {
-            // A modal over the app: see `js::MODAL_ATTR`.
-            "data-dv-modal": "true",
-            class: "fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-4 outline-none",
-            tabindex: "-1",
-            onmounted: focus_on_mount,
-            onkeydown: move |evt: KeyboardEvent| {
-                if evt.code() == Code::Escape {
-                    on_close.call(());
-                }
-            },
-            onclick: move |_| on_close.call(()),
+        Overlay {
+            on_close,
+            dismiss_on_backdrop: true,
+            align: OverlayAlign::Center,
             div {
                 class: "max-h-[80vh] w-full max-w-3xl overflow-auto rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 p-4 shadow-xl",
-                onclick: move |evt| evt.stop_propagation(),
                 div { class: "mb-2 flex items-center gap-2",
                     span { class: "text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400",
                         "DDL"

@@ -89,7 +89,8 @@ pub fn focus_by_id_next_frame(id: &str) {
 /// The attribute every modal overlay's backdrop carries
 /// (`"data-dv-modal": "true"`), so a reclaim can tell that one is open. RSX
 /// needs the attribute name as a literal, so this is what the overlays'
-/// registry test (`every_modal_overlay_is_marked`) checks them against.
+/// registry test (`every_modal_is_an_overlay`, in `notice.rs`) checks the
+/// one backdrop that carries it, `notice::Overlay`'s, against.
 pub const MODAL_ATTR: &str = "data-dv-modal";
 
 /// Where keyboard focus is, as [`reclaim_focus_by_id_next_frame`] reads it
@@ -147,6 +148,35 @@ fn focus_facts_js(id: &str) -> String {
     ))
 }
 
+/// Moves focus into a just-mounted overlay `#id`, and hands it back to
+/// whatever held it before once the overlay is gone.
+///
+/// One eval, so the element that had focus is read before the overlay takes
+/// it. The hand-back is the same rule as [`may_reclaim`]: only when focus fell
+/// to the body with the overlay, never away from something that took it on
+/// purpose (the grid's popup refocuses the grid itself; a prompt card that
+/// replaces the connect form autofocuses its field). Without it, closing the
+/// cheatsheet would leave the grid behind it deaf to the arrow keys.
+pub fn take_overlay_focus(id: &str) {
+    document::eval(&overlay_focus_js(id));
+}
+
+/// The eval behind [`take_overlay_focus`].
+fn overlay_focus_js(id: &str) -> String {
+    format!(
+        "(() => {{ const el = document.getElementById({}); if (!el) return; \
+         const back = document.activeElement; el.focus(); \
+         const watch = new MutationObserver(() => {{ if (el.isConnected) return; \
+         watch.disconnect(); {} }}); \
+         watch.observe(document.body, {{ childList: true, subtree: true }}); }})();",
+        js_string(id),
+        next_frame(
+            "const now = document.activeElement; \
+             if (back && back.isConnected && (!now || now === document.body)) back.focus();"
+        )
+    )
+}
+
 /// [`focus_by_id_next_frame`] for a text input, leaving the caret at the end
 /// of the current value.
 pub fn focus_input_end_next_frame(id: &str) {
@@ -165,7 +195,7 @@ fn next_frame(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::test_dom::ui_sources;
+    use crate::ui::test_dom::{code_lines, ui_sources};
 
     #[test]
     fn js_string_escapes_what_would_break_out_of_a_literal() {
@@ -349,96 +379,6 @@ mod tests {
                     "js.rs has a second clipboard path outside clipboard_js: {line}"
                 );
             }
-        }
-    }
-
-    /// `source` with comment lines dropped and each line's whitespace
-    /// collapsed: one entry per remaining line.
-    fn code_lines(source: &str) -> Vec<String> {
-        source
-            .lines()
-            .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
-            .filter(|line| !line.is_empty() && !line.starts_with("//"))
-            .collect()
-    }
-
-    /// Every modal overlay, by the component that renders it. Each backdrop
-    /// must carry [`MODAL_ATTR`] — that is how [`may_reclaim`] knows it is
-    /// open.
-    ///
-    /// And every full-screen layer anywhere under `src/ui` (walked at test
-    /// time, so a new file is covered without being listed) is either marked
-    /// or named below as not a modal. A layer is any code line containing
-    /// `fixed inset-0` — a plain `class:` literal, a branch of a conditional
-    /// `class: if …`, or a `format!` — and each one must be matched by a
-    /// marker line. What the scan cannot see: a full-screen layer spelled
-    /// without `fixed inset-0` on one line (`fixed top-0 left-0 h-full
-    /// w-full`, an inline style, or the two classes split across lines or
-    /// strings), and a layer in this file, whose tests quote the class.
-    #[test]
-    fn every_modal_overlay_is_marked() {
-        let marker_line = format!(r#""{MODAL_ATTR}": "true","#);
-        let layer = "fixed inset-0";
-        let sources = ui_sources();
-        let source_of = |file: &[&str]| -> Vec<String> {
-            let (_, source) = sources
-                .iter()
-                .find(|(path, _)| path.iter().map(String::as_str).eq(file.iter().copied()))
-                .unwrap_or_else(|| panic!("{file:?} is gone"));
-            code_lines(source)
-        };
-        let overlays: [(&[&str], &str); 7] = [
-            (&["shell.rs"], "fn QuitConfirmDialog("),
-            (&["shell.rs"], "fn Cheatsheet("),
-            (&["connections.rs"], "fn ConnectFormModal("),
-            (&["schema_edit.rs"], "fn SchemaEditDialog("),
-            (&["import.rs"], "pub fn ImportDialog("),
-            (&["schema.rs"], "fn DdlOverlay("),
-            // The cell-value popup, inside the grid's own component.
-            (
-                &["grid", "mod.rs"],
-                "if let Some(view) = expanded.read().clone() {",
-            ),
-        ];
-        for (file, start) in overlays {
-            let lines = source_of(file);
-            let from = lines
-                .iter()
-                .position(|line| line.contains(start))
-                .unwrap_or_else(|| panic!("{file:?}: `{start}` is gone"));
-            let backdrop = lines[from..]
-                .iter()
-                .position(|line| line.contains(layer))
-                .map(|i| from + i)
-                .unwrap_or_else(|| panic!("{file:?}: no backdrop after `{start}`"));
-            assert!(
-                backdrop > 0 && lines[backdrop - 1] == marker_line,
-                "{file:?}: the overlay at `{start}` does not carry {MODAL_ATTR}"
-            );
-        }
-        // Not a modal: the copy menu's click-catcher closes a dropdown and
-        // never holds focus.
-        let not_modal: [(&[&str], &str); 1] =
-            [(&["grid", "mod.rs"], r#"class: "fixed inset-0 z-30","#)];
-        for (path, source) in &sources {
-            if path.len() == 1 && path[0] == "js.rs" {
-                continue;
-            }
-            let lines = code_lines(source);
-            let layers = lines.iter().filter(|line| line.contains(layer)).count();
-            let marked = lines.iter().filter(|line| **line == marker_line).count();
-            let excused = not_modal
-                .iter()
-                .filter(|(file, excused)| {
-                    path.iter().map(String::as_str).eq(file.iter().copied())
-                        && lines.iter().any(|line| line == excused)
-                })
-                .count();
-            assert_eq!(
-                layers,
-                marked + excused,
-                "{path:?}: a full-screen layer is neither marked as a modal nor named as not one"
-            );
         }
     }
 }

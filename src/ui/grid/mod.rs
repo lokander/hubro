@@ -52,10 +52,8 @@ use crate::util::human_bytes;
 
 use super::editing::{editor_kind, CellEditor, EditNav, EditorKind};
 use super::import::ImportDialog;
-use super::js::{
-    focus_by_id_next_frame, focus_on_mount, reclaim_focus_by_id_next_frame, write_clipboard,
-};
-use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState};
+use super::js::{focus_by_id_next_frame, reclaim_focus_by_id_next_frame, write_clipboard};
+use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState, Overlay, OverlayAlign};
 use super::schema::display_type;
 use super::selection::Selection;
 use super::shell::accel_held;
@@ -1539,7 +1537,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             // truncated cell. Dismissed by a backdrop click, the ✕,
             // or Escape.
             //
-            // The popup owns its Escape, like the DDL overlay: it renders
+            // The popup owns its Escape, like every `Overlay`: it renders
             // beside `#dv-grid`, not inside it, so once a click on its text or
             // its Copy raw button has taken focus the grid's handler never
             // sees the key. The backdrop takes focus when it opens and holds
@@ -1547,22 +1545,12 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             // hands focus back to the grid, since the element that had it is
             // gone.
             if let Some(view) = expanded.read().clone() {
-                div {
-                    // A modal over the app: see `js::MODAL_ATTR`.
-                    "data-dv-modal": "true",
-                    class: "fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-4 outline-none",
-                    tabindex: "-1",
-                    onmounted: focus_on_mount,
-                    onkeydown: move |evt: KeyboardEvent| {
-                        if evt.code() == Code::Escape {
-                            evt.prevent_default();
-                            close_expanded();
-                        }
-                    },
-                    onclick: move |_| close_expanded(),
+                Overlay {
+                    on_close: move |_| close_expanded(),
+                    dismiss_on_backdrop: true,
+                    align: OverlayAlign::Center,
                     div {
                         class: "max-h-[70vh] w-full max-w-2xl overflow-auto rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 p-4 shadow-xl",
-                        onclick: move |evt| evt.stop_propagation(),
                         div { class: "mb-2 flex items-center justify-between",
                             span { class: "text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400",
                                 "Cell value"

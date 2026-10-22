@@ -1737,8 +1737,9 @@ impl AppState {
         self.show_cheatsheet.set(!showing);
     }
 
-    /// Closes the shortcut cheatsheet if it is open (Escape). Kept
-    /// idempotent so a stray Escape never churns the signal.
+    /// Closes the shortcut cheatsheet if it is open (Escape, the ✕, or a
+    /// backdrop click). Kept idempotent so a repeated close never churns the
+    /// signal.
     pub fn close_cheatsheet(mut self) {
         if *self.show_cheatsheet.read() {
             self.show_cheatsheet.set(false);

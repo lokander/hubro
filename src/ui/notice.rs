@@ -7,11 +7,13 @@
 //! All classes follow the light-base + `dark:` override pattern the rest of
 //! the app uses, so both themes stay legible.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use dioxus::prelude::*;
 use dioxus_icons::lucide::{Info, TriangleAlert, X};
 
+use super::js::take_overlay_focus;
 use crate::db::TableKind;
 
 /// The severity of a [`Banner`], picking its icon and color scheme.
@@ -145,29 +147,6 @@ pub fn LoadingLine(label: String) -> Element {
 /// under this and never flash an indicator; only genuinely slow ones show it.
 pub(crate) const SPINNER_DELAY: Duration = Duration::from_millis(300);
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn each_banner_kind_maps_to_a_distinct_theme_aware_style() {
-        for kind in [BannerKind::Error, BannerKind::Warning, BannerKind::Info] {
-            let classes = kind.container_classes();
-            // Every kind carries a light base and a dark override, so no
-            // theme is left with a bare/invisible surface.
-            assert!(classes.contains("dark:"), "{kind:?} lacks a dark: override");
-            assert!(
-                classes.contains("bg-") && classes.contains("border-") && classes.contains("text-"),
-                "{kind:?} is missing a border/background/text class"
-            );
-        }
-        // The three kinds are visually distinct (different palettes).
-        assert!(BannerKind::Error.container_classes().contains("red-"));
-        assert!(BannerKind::Warning.container_classes().contains("amber-"));
-        assert!(BannerKind::Info.container_classes().contains("sky-"));
-    }
-}
-
 /// A [`LoadingLine`] that only appears once a load has been running for
 /// [`SPINNER_DELAY`]. Mount this while a query/introspection is pending: fast
 /// results replace it before the timer fires (no flash), slow ones reveal the
@@ -209,5 +188,341 @@ pub fn KindBadge(kind: TableKind) -> Element {
     };
     rsx! {
         span { class, "{label}" }
+    }
+}
+
+/// Where an [`Overlay`] puts its panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayAlign {
+    /// Centered in the window; for panels that fit (or scroll themselves).
+    Center,
+    /// Top-aligned, and the backdrop scrolls, so a form taller than the
+    /// window stays reachable instead of clipping at the top. A panel with
+    /// `my-auto` still centers while it fits.
+    Top,
+}
+
+impl OverlayAlign {
+    /// The backdrop's classes. Whole literals rather than a shared prefix,
+    /// so the Tailwind scanner sees every class.
+    fn backdrop_classes(self) -> &'static str {
+        match self {
+            OverlayAlign::Center => {
+                "fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 outline-none"
+            }
+            OverlayAlign::Top => {
+                "fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4 outline-none"
+            }
+        }
+    }
+}
+
+/// The ids [`Overlay`]s focus themselves by, one per mount.
+static NEXT_OVERLAY: AtomicUsize = AtomicUsize::new(0);
+
+/// The one modal scaffold: a dimmed full-window backdrop with `children` as
+/// its panel. Every modal in the app is one of these —
+/// `every_modal_is_an_overlay` fails on a hand-rolled backdrop — so they all
+/// dismiss the same way:
+///
+/// - **Escape always closes**, handled here. The backdrop takes focus when it
+///   mounts, so Escape works before anything inside is clicked, and keydowns
+///   from the fields bubble up to it. The window key listener deliberately
+///   has no Escape action: it ignores keys while a text field has focus, and
+///   `dioxus-desktop` 0.7 does not stop the real event when a handler calls
+///   `stop_propagation`, so a second, global Escape path would see the same
+///   key and close something else. With one path, one Escape closes only the
+///   overlay that holds focus — the topmost, since each takes focus on mount.
+/// - **A backdrop click closes only when `dismiss_on_backdrop`.** Pass it for
+///   overlays that only show something; not for one holding typed input or a
+///   decision, where a stray click would throw the work away.
+/// - **A click inside never reaches the backdrop.** The panel sits in a
+///   `contents` wrapper (no box of its own, so `children` lay out against the
+///   backdrop as before) that stops the click there.
+///
+/// Focus goes back where it was once the overlay closes, when nothing else
+/// has taken it (see [`take_overlay_focus`]).
+#[component]
+pub fn Overlay(
+    on_close: EventHandler<()>,
+    dismiss_on_backdrop: bool,
+    align: OverlayAlign,
+    children: Element,
+) -> Element {
+    let id = use_hook(|| {
+        format!(
+            "dv-overlay-{}",
+            NEXT_OVERLAY.fetch_add(1, Ordering::Relaxed)
+        )
+    });
+    let mount_id = id.clone();
+    rsx! {
+        div {
+            id,
+            // A modal over the app: see `js::MODAL_ATTR`.
+            "data-dv-modal": "true",
+            class: align.backdrop_classes(),
+            tabindex: "-1",
+            onmounted: move |_| take_overlay_focus(&mount_id),
+            onkeydown: move |evt: KeyboardEvent| {
+                if evt.code() == Code::Escape {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    on_close.call(());
+                }
+            },
+            onclick: move |_| {
+                if dismiss_on_backdrop {
+                    on_close.call(());
+                }
+            },
+            div {
+                class: "contents",
+                onclick: move |evt| evt.stop_propagation(),
+                {children}
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::any::Any;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use dioxus::core::{ElementId, Event, VirtualDom};
+    use dioxus::html::{
+        set_event_converter, Location, Modifiers, PlatformEventData, SerializedHtmlEventConverter,
+        SerializedKeyboardData, SerializedMouseData,
+    };
+
+    use super::*;
+    use crate::ui::js::MODAL_ATTR;
+    use crate::ui::test_dom::{code_lines, listeners, ui_sources};
+
+    #[test]
+    fn each_banner_kind_maps_to_a_distinct_theme_aware_style() {
+        for kind in [BannerKind::Error, BannerKind::Warning, BannerKind::Info] {
+            let classes = kind.container_classes();
+            // Every kind carries a light base and a dark override, so no
+            // theme is left with a bare/invisible surface.
+            assert!(classes.contains("dark:"), "{kind:?} lacks a dark: override");
+            assert!(
+                classes.contains("bg-") && classes.contains("border-") && classes.contains("text-"),
+                "{kind:?} is missing a border/background/text class"
+            );
+        }
+        // The three kinds are visually distinct (different palettes).
+        assert!(BannerKind::Error.container_classes().contains("red-"));
+        assert!(BannerKind::Warning.container_classes().contains("amber-"));
+        assert!(BannerKind::Info.container_classes().contains("sky-"));
+    }
+
+    /// An [`Overlay`] around one button, counting its closes in a root
+    /// context cell.
+    #[component]
+    fn Harness(dismiss_on_backdrop: bool) -> Element {
+        let closes = use_context::<Rc<Cell<usize>>>();
+        rsx! {
+            Overlay {
+                on_close: move |_| closes.set(closes.get() + 1),
+                dismiss_on_backdrop,
+                align: OverlayAlign::Center,
+                button { "inside" }
+            }
+        }
+    }
+
+    /// Delivers `name` with `data` to `element`, bubbling as the webview
+    /// would.
+    fn fire(dom: &VirtualDom, name: &str, data: PlatformEventData, element: ElementId) {
+        set_event_converter(Box::new(SerializedHtmlEventConverter));
+        let data: Rc<dyn Any> = Rc::new(data);
+        dom.runtime()
+            .handle_event(name, Event::new(data, true), element);
+    }
+
+    fn key(key: Key, code: Code) -> PlatformEventData {
+        PlatformEventData::new(Box::new(SerializedKeyboardData::new(
+            key,
+            code,
+            Location::Standard,
+            false,
+            Modifiers::empty(),
+            false,
+        )))
+    }
+
+    fn click() -> PlatformEventData {
+        PlatformEventData::new(Box::new(SerializedMouseData::default()))
+    }
+
+    /// The dismissal policy every modal shares, run through a real
+    /// `VirtualDom`: Escape closes, any other key does not; a backdrop click
+    /// closes only when `dismiss_on_backdrop` says so; a click inside the
+    /// panel never does, whatever it says.
+    #[test]
+    fn an_overlay_closes_on_escape_and_on_the_backdrop_only_when_asked() {
+        for dismiss_on_backdrop in [false, true] {
+            let mut dom = VirtualDom::new_with_props(
+                Harness,
+                HarnessProps {
+                    dismiss_on_backdrop,
+                },
+            );
+            let closes = Rc::new(Cell::new(0));
+            dom.provide_root_context(closes.clone());
+            let edits = dom.rebuild_to_vec().edits;
+            let keydown = listeners(&edits, "keydown");
+            let clicks = listeners(&edits, "click");
+            assert_eq!(keydown.len(), 1, "{edits:#?}");
+            // Mount order: the backdrop, then the panel's wrapper.
+            let [backdrop, inside] = clicks[..] else {
+                panic!("expected two click listeners: {edits:#?}");
+            };
+            assert_eq!(keydown[0], backdrop, "Escape is heard on the backdrop");
+
+            fire(
+                &dom,
+                "keydown",
+                key(Key::Character("a".into()), Code::KeyA),
+                backdrop,
+            );
+            assert_eq!(closes.get(), 0, "a key other than Escape closed it");
+            fire(&dom, "keydown", key(Key::Escape, Code::Escape), backdrop);
+            assert_eq!(closes.get(), 1, "Escape did not close it");
+
+            fire(&dom, "click", click(), inside);
+            assert_eq!(
+                closes.get(),
+                1,
+                "a click inside the panel reached the backdrop (dismiss_on_backdrop: {dismiss_on_backdrop})"
+            );
+            fire(&dom, "click", click(), backdrop);
+            assert_eq!(
+                closes.get(),
+                1 + usize::from(dismiss_on_backdrop),
+                "a backdrop click with dismiss_on_backdrop: {dismiss_on_backdrop}"
+            );
+        }
+    }
+
+    /// Every modal in the app is an [`Overlay`], and each one's backdrop
+    /// policy is the one stated here, with the reason.
+    ///
+    /// Three checks over every file under `src/ui` (walked at test time, so a
+    /// new file is covered without being listed): nothing outside this file
+    /// carries [`MODAL_ATTR`] or a full-screen `fixed inset-0` layer, bar the
+    /// one named below — so no modal hand-rolls its backdrop and with it its
+    /// own Escape and click rules; every `Overlay {` call is one of the
+    /// modals listed; and each listed modal passes the `dismiss_on_backdrop`
+    /// listed for it. What the scan cannot see is a full-screen layer spelled
+    /// another way (`fixed top-0 left-0 h-full w-full`, an inline style, the
+    /// two classes split across lines or strings).
+    #[test]
+    fn every_modal_is_an_overlay() {
+        let marker_line = format!(r#""{MODAL_ATTR}": "true","#);
+        let layer = "fixed inset-0";
+        let sources = ui_sources();
+        // (file, where the modal starts, dismiss_on_backdrop)
+        let modals: [(&[&str], &str, bool); 7] = [
+            // Holding a half-typed connection.
+            (&["connections.rs"], "fn ConnectFormModal(", false),
+            // Holding a column mapping and import options.
+            (&["import.rs"], "pub fn ImportDialog(", false),
+            // Holding a drafted change, maybe a hand-edited statement.
+            (&["schema_edit.rs"], "fn SchemaEditDialog(", false),
+            // A decision about unsaved edits: Escape cancels, a missed
+            // button does nothing.
+            (&["shell.rs"], "fn QuitConfirmDialog(", false),
+            // The rest only show something.
+            (&["shell.rs"], "fn Cheatsheet(", true),
+            (&["schema.rs"], "fn DdlOverlay(", true),
+            (
+                &["grid", "mod.rs"],
+                "if let Some(view) = expanded.read().clone() {",
+                true,
+            ),
+        ];
+        let lines_of = |file: &[&str]| -> Vec<String> {
+            let (_, source) = sources
+                .iter()
+                .find(|(path, _)| path.iter().map(String::as_str).eq(file.iter().copied()))
+                .unwrap_or_else(|| panic!("{file:?} is gone"));
+            code_lines(source)
+        };
+        for (file, start, dismiss) in modals {
+            let lines = lines_of(file);
+            let from = lines
+                .iter()
+                .position(|line| line.contains(start))
+                .unwrap_or_else(|| panic!("{file:?}: `{start}` is gone"));
+            let overlay = lines[from..]
+                .iter()
+                .position(|line| line == "Overlay {")
+                .map(|i| from + i)
+                .unwrap_or_else(|| panic!("{file:?}: `{start}` renders no Overlay"));
+            // The props come first, before the panel's own lines.
+            let props = &lines[overlay + 1..(overlay + 4).min(lines.len())];
+            let policy = format!("dismiss_on_backdrop: {dismiss},");
+            assert!(
+                props.contains(&policy),
+                "{file:?}: the overlay at `{start}` should pass `{policy}`, has {props:?}"
+            );
+        }
+
+        // Not a modal: the copy menu's click-catcher closes a dropdown and
+        // never holds focus.
+        let not_modal: (&[&str], &str) = (&["grid", "mod.rs"], r#"class: "fixed inset-0 z-30","#);
+        let mut calls = 0;
+        for (path, source) in &sources {
+            if path.len() == 1 && path[0] == "notice.rs" {
+                continue;
+            }
+            let lines = code_lines(source);
+            calls += lines.iter().filter(|line| *line == "Overlay {").count();
+            for line in &lines {
+                assert!(
+                    *line != marker_line,
+                    "{path:?} marks a modal of its own instead of using Overlay"
+                );
+                let excused = path
+                    .iter()
+                    .map(String::as_str)
+                    .eq(not_modal.0.iter().copied())
+                    && line == not_modal.1;
+                assert!(
+                    !line.contains(layer) || excused,
+                    "{path:?} hand-rolls a full-screen layer instead of using Overlay: {line}"
+                );
+            }
+        }
+        assert_eq!(
+            calls,
+            modals.len(),
+            "an Overlay is rendered that the list above does not name, with its backdrop policy"
+        );
+
+        // And the one backdrop is marked, so a reclaim sees it open.
+        let own = include_str!("notice.rs");
+        let (code, _tests) = own
+            .split_once("#[cfg(test)]")
+            .expect("notice.rs has a test module");
+        let lines = code_lines(code);
+        let overlay = lines
+            .iter()
+            .position(|line| line.starts_with("pub fn Overlay("))
+            .expect("Overlay is gone");
+        let marked: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| **line == marker_line)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            marked.len() == 1 && marked[0] > overlay,
+            "Overlay's backdrop should be the one element carrying {MODAL_ATTR}: {marked:?}"
+        );
     }
 }
