@@ -54,6 +54,14 @@ async fn sqlite_execute_reports_rows_affected() {
     assert_eq!(pool.execute("DELETE FROM t WHERE a = 1").await.unwrap(), 1);
     // Not the DELETE's count again: a statement that changes no row reports 0.
     assert_eq!(pool.execute("CREATE TABLE u (a)").await.unwrap(), 0);
+    // Nor does a read that a `WITH` leads, as a write's can be.
+    assert_eq!(pool.execute("UPDATE t SET b = 'r'").await.unwrap(), 2);
+    assert_eq!(
+        pool.execute("WITH x AS (SELECT 1) SELECT * FROM x")
+            .await
+            .unwrap(),
+        0
+    );
     // Errors surface as query errors, not panics.
     assert!(matches!(
         pool.execute("UPDATE nope SET a = 1").await,
@@ -1179,8 +1187,8 @@ async fn postgres_capped_read_with_a_write_the_gate_cannot_see_keeps_it() {
 /// SQLite's driver count is `sqlite3_changes()`, which only an `INSERT`,
 /// `UPDATE` or `DELETE` sets, so every other statement used to repeat the last
 /// write's count: here `BEGIN` reported the 2 of the `INSERT` before it,
-/// `ROLLBACK` the 1 of the one inside, and the DDL and `SAVEPOINT` the same.
-/// Each now reports 0, and the writes keep their own counts — the trigger's
+/// `ROLLBACK TO` and what follows it the 3 of the one inside the savepoint,
+/// and the DDL and `SAVEPOINT` the same. Each now reports 0, and the writes keep their own counts — the trigger's
 /// two extra rows left out of the `INSERT`'s, a write that matched nothing
 /// reporting 0 rather than the count before it.
 #[tokio::test]
@@ -1194,14 +1202,16 @@ async fn sqlite_script_reports_no_rows_for_statements_that_change_none() {
     .await;
     let pool = fixture.open().await;
 
-    // Both paths a script runs on: one the script's own transaction steers,
-    // and one hubro wraps.
+    // Both paths a script runs on: the first script's own transaction steers
+    // it, and hubro wraps the others.
     for (script, expected) in [
         (
             "INSERT INTO t (b) VALUES ('a'), ('b'); \
              BEGIN; \
              INSERT INTO t (b) VALUES ('c'); \
              SAVEPOINT s; \
+             INSERT INTO t (b) VALUES ('d'), ('e'), ('f'); \
+             ROLLBACK TO s; \
              RELEASE s; \
              ROLLBACK",
             vec![
@@ -1209,8 +1219,29 @@ async fn sqlite_script_reports_no_rows_for_statements_that_change_none() {
                 ("BEGIN", 0),
                 ("INSERT", 1),
                 ("SAVEPOINT", 0),
+                ("INSERT", 3),
+                ("ROLLBACK TO", 0),
                 ("RELEASE", 0),
                 ("ROLLBACK", 0),
+            ],
+        ),
+        // A virtual table's module writes its shadow tables with ordinary
+        // DML, which set the driver's count to 1 under each of these DDL
+        // statements on the bundled SQLite 3.46.
+        (
+            "CREATE VIRTUAL TABLE f USING fts5(x); \
+             INSERT INTO f VALUES ('a'), ('b'); \
+             ALTER TABLE f RENAME TO f2; \
+             DROP TABLE f2; \
+             CREATE VIRTUAL TABLE r USING rtree(id, x0, x1); \
+             DROP TABLE r",
+            vec![
+                ("CREATE VIRTUAL", 0),
+                ("INSERT", 2),
+                ("ALTER", 0),
+                ("DROP", 0),
+                ("CREATE VIRTUAL", 0),
+                ("DROP", 0),
             ],
         ),
         (

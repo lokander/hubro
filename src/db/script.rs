@@ -1402,7 +1402,7 @@ fn strip_strings_and_comments(sql: &str, dialect: Dialect) -> String {
 /// Lexes with the statement's dialect, because where a comment ends is the
 /// engine's own rule: lexed as SQLite, a Postgres `--c<CR>WITH e AS (DELETE
 /// …) …<LF>SELECT …` read as a SELECT whose comment hid the DELETE.
-fn first_keyword(sql: &str, dialect: Dialect) -> &str {
+pub(super) fn first_keyword(sql: &str, dialect: Dialect) -> &str {
     let bytes = sql.as_bytes();
     for (range, kind) in lex_regions(sql, dialect) {
         match kind {
