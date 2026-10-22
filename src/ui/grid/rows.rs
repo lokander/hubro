@@ -130,10 +130,10 @@ pub(super) struct TableRenderMeta {
 
 impl TableRenderMeta {
     /// Reduces one table's introspected metadata to what rendering needs.
-    /// `dialect` feeds the required-column rules and the one editor kind that
-    /// a type name alone cannot decide — Postgres `bit` versus SQL Server's.
-    /// Without a live connection neither applies, and there is
-    /// nothing to save through either. Empty when the schema isn't loaded yet.
+    /// `dialect` feeds the one editor kind that a type name alone cannot
+    /// decide — Postgres `bit` versus SQL Server's — and stands for a live
+    /// connection: without one, no column is required, since there is
+    /// nothing to save through. Empty when the schema isn't loaded yet.
     ///
     /// `lands` answers whether a jump along a foreign key has somewhere to go
     /// (`state::fk_jump_target`); a key it refuses gets no link.
@@ -161,7 +161,7 @@ impl TableRenderMeta {
             foreign_keys: meta.foreign_keys.clone(),
             col_to_fk,
             required: dialect
-                .map(|dialect| required_insert_columns(meta, dialect))
+                .map(|_| required_insert_columns(meta))
                 .unwrap_or_default(),
         }
     }

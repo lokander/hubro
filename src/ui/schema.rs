@@ -639,6 +639,15 @@ fn ColumnRow(column: ColumnMeta, editing: Signal<Option<SchemaOp>>, rename: Rena
                     Generated::ByDefault => rsx! {
                         span { class: "italic", "identity" }
                     },
+                    // Any `DEFAULT` it declares is never used, so it is not
+                    // shown either.
+                    Generated::RowidAlias => rsx! {
+                        span {
+                            class: "italic",
+                            title: "Left empty, SQLite stores the next rowid",
+                            "rowid"
+                        }
+                    },
                     Generated::Never => rsx! {
                         div { class: "max-w-xs truncate",
                             title: column.default.clone().unwrap_or_default(),
