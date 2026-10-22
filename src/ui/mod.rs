@@ -46,3 +46,23 @@ pub fn App() -> Element {
         Shell {}
     }
 }
+
+/// Asks where to save an export, offering `{stem}.{extension}` under a filter
+/// for the format alone. `None` when the dialog is cancelled.
+///
+/// Only the dialog: whoever awaits it must already be outliving the component
+/// that asked (see the grid's `every_dialog_task_outlives_its_component`).
+async fn pick_export_path(
+    title: &str,
+    stem: &str,
+    format: crate::db::ExportFormat,
+) -> Option<std::path::PathBuf> {
+    let ext = format.extension();
+    rfd::AsyncFileDialog::new()
+        .set_title(title)
+        .set_file_name(format!("{stem}.{ext}"))
+        .add_filter(format.filter_label(), &[ext])
+        .save_file()
+        .await
+        .map(|file| file.path().to_path_buf())
+}

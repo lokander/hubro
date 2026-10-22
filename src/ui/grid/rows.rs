@@ -1028,6 +1028,83 @@ pub(super) fn InsertCellSlot(
     }
 }
 
+/// Loads one cell's complete value through [`AppState::load_cell`] — the one
+/// path the expand popup, the truncated-cell editor and the row detail panel
+/// share, so a row that has gone since the page was fetched reads as the same
+/// error on all three.
+///
+/// The arguments are captured once, like the plain props they come from: each
+/// caller is mounted per cell, so a different cell is a different instance
+/// rather than a re-run of this one.
+pub(super) fn use_loaded_cell(
+    id: ConnectionId,
+    table: TableRef,
+    locator: RowLocator,
+    column: String,
+) -> Resource<Result<CellFetch, String>> {
+    let state = use_context::<AppState>();
+    use_resource(move || {
+        let table = table.clone();
+        let locator = locator.clone();
+        let column = column.clone();
+        async move { state.load_cell(id, table, locator, column).await }
+    })
+}
+
+/// A cell's complete value, loaded by [`use_loaded_cell`]: draws the loading
+/// and error states itself and hands a loaded value to `loaded`.
+///
+/// With `on_close` the two states are drawn as a grid cell with a Close
+/// button — the shape of the in-place editor, which has nowhere else to put a
+/// way out. Without it they are drawn bare, for the popup and the panel.
+#[component]
+pub(super) fn LoadedCell(
+    id: ConnectionId,
+    table: TableRef,
+    locator: RowLocator,
+    column: String,
+    on_close: Option<EventHandler<()>>,
+    loaded: Callback<CellFetch, Element>,
+) -> Element {
+    let cell = use_loaded_cell(id, table, locator, column);
+    // Cloned out so the borrow is released before `loaded` runs: it renders
+    // the caller's subtree, which may read signals of its own.
+    let fetched = cell.read().clone();
+    match (fetched, on_close) {
+        (Some(Ok(fetch)), _) => loaded.call(fetch),
+        (Some(Err(err)), Some(on_close)) => rsx! {
+            RowCellNotice { kind: BannerKind::Error, message: err, on_close }
+        },
+        (Some(Err(err)), None) => rsx! {
+            Banner { kind: BannerKind::Error, message: err }
+        },
+        (None, Some(_)) => rsx! {
+            td { class: "px-2 py-1", DelayedLoading { label: "Loading full value…" } }
+        },
+        (None, None) => rsx! {
+            DelayedLoading { label: "Loading full value…" }
+        },
+    }
+}
+
+/// A banner standing in for the in-place editor inside a grid row, with the
+/// Close button that is the only way back out of it.
+#[component]
+fn RowCellNotice(kind: BannerKind, message: String, on_close: EventHandler<()>) -> Element {
+    rsx! {
+        td { class: "px-2 py-1",
+            div { class: "flex items-center gap-2",
+                Banner { kind, message }
+                button {
+                    class: "shrink-0 rounded border border-slate-400 dark:border-slate-600 px-2 py-0.5 text-xs",
+                    onclick: move |_| on_close.call(()),
+                    "Close"
+                }
+            }
+        }
+    }
+}
+
 /// The in-place editor for a TRUNCATED cell: loads the full current
 /// value via [`AppState::load_cell`] first, then hands it to the shared
 /// [`CellEditor`] so the edit starts from the complete value — a preview is
@@ -1048,83 +1125,59 @@ pub(super) fn TruncatedCellEditor(
     mut editing: Signal<Option<ActiveEdit>>,
 ) -> Element {
     let state = use_context::<AppState>();
-    let fetch_table = table.clone();
-    let fetch_locator = locator.clone();
-    let fetch_column = column.clone();
-    let cell = use_resource(move || {
-        let table = fetch_table.clone();
-        let locator = fetch_locator.clone();
-        let column = fetch_column.clone();
-        async move { state.load_cell(id, table, locator, column).await }
-    });
-    let loaded = cell.read();
-    match loaded.as_ref() {
-        None => rsx! {
-            td { class: "px-2 py-1", DelayedLoading { label: "Loading full value…" } }
-        },
-        Some(Err(err)) => {
-            let err = err.clone();
-            rsx! {
-                td { class: "px-2 py-1",
-                    div { class: "flex items-center gap-2",
-                        Banner { kind: BannerKind::Error, message: err }
-                        button {
-                            class: "shrink-0 rounded border border-slate-400 dark:border-slate-600 px-2 py-0.5 text-xs",
-                            onclick: move |_| editing.set(None),
-                            "Close"
+    let loaded_table = table.clone();
+    let loaded_locator = locator.clone();
+    let loaded_column = column.clone();
+    rsx! {
+        LoadedCell {
+            id,
+            table,
+            locator,
+            column,
+            on_close: move |_| editing.set(None),
+            loaded: move |fetch: CellFetch| {
+                if fetch.capped {
+                    let note = format!(
+                        "This value is too large to edit inline (over {}). Open it with Expand to view it.",
+                        human_bytes(FETCH_CELL_MAX_BYTES as u64),
+                    );
+                    return rsx! {
+                        RowCellNotice {
+                            kind: BannerKind::Warning,
+                            message: note,
+                            on_close: move |_| editing.set(None),
                         }
+                    };
+                }
+                let draft = editing
+                    .read()
+                    .as_ref()
+                    .and_then(|active| active.draft.clone());
+                let (on_commit, on_draft) = edit_callbacks(
+                    editing,
+                    row_key.clone(),
+                    loaded_column.clone(),
+                    editable_columns.clone(),
+                    {
+                        let table = loaded_table.clone();
+                        let column = loaded_column.clone();
+                        let locator = loaded_locator.clone();
+                        move |value| state.stage_cell_edit(id, &table, locator.clone(), &column, value)
+                    },
+                );
+                rsx! {
+                    CellEditor {
+                        kind: kind.clone(),
+                        dialect,
+                        nullable,
+                        initial: fetch.value,
+                        draft,
+                        on_draft,
+                        on_commit,
+                        on_cancel: move |_| editing.set(None),
                     }
                 }
-            }
-        }
-        Some(Ok(fetch)) if fetch.capped => {
-            let note = format!(
-                "This value is too large to edit inline (over {}). Open it with Expand to view it.",
-                human_bytes(FETCH_CELL_MAX_BYTES as u64),
-            );
-            rsx! {
-                td { class: "px-2 py-1",
-                    div { class: "flex items-center gap-2",
-                        Banner { kind: BannerKind::Warning, message: note }
-                        button {
-                            class: "shrink-0 rounded border border-slate-400 dark:border-slate-600 px-2 py-0.5 text-xs",
-                            onclick: move |_| editing.set(None),
-                            "Close"
-                        }
-                    }
-                }
-            }
-        }
-        Some(Ok(fetch)) => {
-            let initial = fetch.value.clone();
-            let draft = editing
-                .read()
-                .as_ref()
-                .and_then(|active| active.draft.clone());
-            let (on_commit, on_draft) = edit_callbacks(
-                editing,
-                row_key.clone(),
-                column.clone(),
-                editable_columns.clone(),
-                {
-                    let table = table.clone();
-                    let column = column.clone();
-                    let locator = locator.clone();
-                    move |value| state.stage_cell_edit(id, &table, locator.clone(), &column, value)
-                },
-            );
-            rsx! {
-                CellEditor {
-                    kind,
-                    dialect,
-                    nullable,
-                    initial,
-                    draft,
-                    on_draft,
-                    on_commit,
-                    on_cancel: move |_| editing.set(None),
-                }
-            }
+            },
         }
     }
 }
@@ -1144,59 +1197,49 @@ pub(super) fn ExpandedValue(
     /// schema doesn't name it) — see [`TableRenderMeta::type_of`].
     type_name: String,
 ) -> Element {
-    let state = use_context::<AppState>();
-    let fetch_table = table.clone();
-    let fetch_locator = locator.clone();
-    let fetch_column = column.clone();
-    let cell = use_resource(move || {
-        let table = fetch_table.clone();
-        let locator = fetch_locator.clone();
-        let column = fetch_column.clone();
-        async move { state.load_cell(id, table, locator, column).await }
-    });
-    let loaded = cell.read();
-    match loaded.as_ref() {
-        None => rsx! {
-            DelayedLoading { label: "Loading full value…" }
-        },
-        Some(Err(err)) => rsx! {
-            Banner { kind: BannerKind::Error, message: err.clone() }
-        },
-        Some(Ok(fetch)) => {
-            let capped = fetch.capped;
-            // A capped fetch holds a prefix, so Copy raw is withdrawn rather
-            // than handed a truncated value — the same refusal `plan_copy`
-            // makes for this cell, worded identically. What is on
-            // screen is the viewer's to describe; this says only what was
-            // loaded and what that costs.
-            let capped_note = capped.then(|| {
-                format!(
-                    "Value is very large; only the first {} was loaded. {}",
-                    human_bytes(FETCH_CELL_MAX_BYTES as u64),
-                    CopyRefusal::TooLarge {
-                        column: column.clone(),
-                        full_len: fetch.full_len,
+    let refused_column = column.clone();
+    rsx! {
+        LoadedCell {
+            id,
+            table,
+            locator,
+            column,
+            loaded: move |fetch: CellFetch| {
+                let capped = fetch.capped;
+                // A capped fetch holds a prefix, so Copy raw is withdrawn rather
+                // than handed a truncated value — the same refusal `plan_copy`
+                // makes for this cell, worded identically. What is on
+                // screen is the viewer's to describe; this says only what was
+                // loaded and what that costs.
+                let capped_note = capped.then(|| {
+                    format!(
+                        "Value is very large; only the first {} was loaded. {}",
+                        human_bytes(FETCH_CELL_MAX_BYTES as u64),
+                        CopyRefusal::TooLarge {
+                            column: refused_column.clone(),
+                            full_len: fetch.full_len,
+                        }
+                        .message(),
+                    )
+                });
+                rsx! {
+                    if let Some(note) = capped_note {
+                        Banner { kind: BannerKind::Warning, message: note }
+                    } else {
+                        // The clipboard gets the value, never the rendering: a
+                        // blob copies as its hex, exactly as Ctrl+C over the cell.
+                        // Rendered on click — see [`CopyRawButton`].
+                        CopyRawButton { value: fetch.value.clone() }
                     }
-                    .message(),
-                )
-            });
-            rsx! {
-                if let Some(note) = capped_note {
-                    Banner { kind: BannerKind::Warning, message: note }
-                } else {
-                    // The clipboard gets the value, never the rendering: a
-                    // blob copies as its hex, exactly as Ctrl+C over the cell.
-                    // Rendered on click — see [`CopyRawButton`].
-                    CopyRawButton { value: fetch.value.clone() }
-                }
-                div { class: "mt-2",
-                    CellViewer {
-                        value: fetch.value.clone(),
-                        type_name: type_name.clone(),
-                        truncated: capped.then_some(fetch.full_len),
+                    div { class: "mt-2",
+                        CellViewer {
+                            value: fetch.value,
+                            type_name: type_name.clone(),
+                            truncated: capped.then_some(fetch.full_len),
+                        }
                     }
                 }
-            }
+            },
         }
     }
 }

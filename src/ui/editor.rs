@@ -13,6 +13,7 @@ use crate::db::{
 use super::history_panel::HistoryPanel;
 use super::js::js_string;
 use super::notice::{Banner, BannerKind, EmptyState, LoadingLine};
+use super::pick_export_path;
 use super::saved_panel::SavedQueriesPanel;
 use super::state::{
     orphaned_sql_export_status, sql_export_status, AppState, ExportStatus, RunStatus, SchemaLoad,
@@ -1055,20 +1056,10 @@ fn spawn_result_export(
     statement: SharedStatement,
     format: ExportFormat,
 ) {
-    let (filter_name, ext) = match format {
-        ExportFormat::Csv => ("CSV", "csv"),
-        ExportFormat::Json => ("JSON", "json"),
-    };
-    let suggested = format!("query-result.{ext}");
     dioxus::core::spawn_forever(async move {
-        let picked = rfd::AsyncFileDialog::new()
-            .set_title("Export query result")
-            .set_file_name(suggested)
-            .add_filter(filter_name, &[ext])
-            .save_file()
-            .await;
-        if let Some(file) = picked {
-            state.export_result(id, buffer, statement, format, file.path().to_path_buf());
+        let picked = pick_export_path("Export query result", "query-result", format).await;
+        if let Some(path) = picked {
+            state.export_result(id, buffer, statement, format, path);
         }
     });
 }
