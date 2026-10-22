@@ -175,7 +175,7 @@ pub(crate) fn load_lenient<T: DeserializeOwned + Default>(path: &Path) -> T {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::{Path, PathBuf};
 
     use super::AppPaths;
@@ -277,6 +277,39 @@ mod tests {
         found
     }
 
+    /// Every line of a `.rs` file under `dir` that names one of `words` as a
+    /// whole identifier, outside comments and string literals, as
+    /// `path:line: text`. Panics if `dir` holds suspiciously few files, so a
+    /// wrong path cannot pass by scanning nothing.
+    pub(crate) fn words_named_in(dir: &Path, words: &[&str]) -> Vec<String> {
+        let sources = sources(dir);
+        assert!(
+            sources.len() > 20,
+            "{} was not scanned: {}",
+            dir.display(),
+            sources.len()
+        );
+        let mut found = Vec::new();
+        for (path, code) in &sources {
+            for (number, line) in code.lines().enumerate() {
+                // Every other piece split on `"` is inside a string literal.
+                let named = line.split('"').step_by(2).any(|code| {
+                    code.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .any(|word| words.contains(&word))
+                });
+                if named {
+                    found.push(format!(
+                        "{}:{}: {}",
+                        path.display(),
+                        number + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+        found
+    }
+
     /// The guard holds only while [`AppPaths::platform`] is the one place the
     /// platform's directories are asked for: a `dirs::config_dir()` anywhere
     /// else would be a route to the real files the guard never sees.
@@ -324,34 +357,15 @@ mod tests {
     /// [`AppPaths::platform`] does not reach it. An integration test cannot
     /// build an `AppState` on paths of its own either — `loaded` and
     /// `unstarted` are crate-private — so the only states it could build
-    /// stand on the real files. Hence: no integration test names the real
-    /// paths, the state, or the `App` component that builds one.
+    /// stand on the real files. Hence: no integration test names the paths,
+    /// the state, or the `App` component that builds one.
     #[test]
     fn no_integration_test_names_the_real_paths() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let sources = sources(&root.join("tests"));
-        assert!(
-            sources.len() > 20,
-            "tests/ was not scanned: {}",
-            sources.len()
+        let found = words_named_in(
+            &root.join("tests"),
+            &["App", "AppState", "AppPaths", "from_platform_dirs"],
         );
-        let mut found = Vec::new();
-        for (path, code) in &sources {
-            for (number, line) in code.lines().enumerate() {
-                let named = line
-                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                    .any(|word| matches!(word, "App" | "AppState" | "from_platform_dirs"))
-                    || line.contains("AppPaths::platform");
-                if named {
-                    found.push(format!(
-                        "{}:{}: {}",
-                        path.display(),
-                        number + 1,
-                        line.trim()
-                    ));
-                }
-            }
-        }
         assert!(
             found.is_empty(),
             "these reach the user's real config and data; test through a unit \
