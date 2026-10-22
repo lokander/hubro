@@ -56,6 +56,9 @@
 
 mod common;
 
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+
 use common::FixtureDb;
 use hubro::db::{
     run_script, schema_edit_refusal, schema_op_sql, split_statements, Capabilities, DbPool,
@@ -531,16 +534,39 @@ async fn constraint_sweep(
 /// column, a two-column UNIQUE constraint, and two indexes the user made, one
 /// of them unique — so `unique` alone cannot be what decides. `extra` adds
 /// engine-specific columns or constraints.
+///
+/// A second table, `{name}_ref`, holds a foreign key to the primary key. On
+/// Postgres a foreign key's `pg_constraint.conindid` names the index it leans
+/// on — the *referenced* table's primary-key index — so a join that took any
+/// constraint naming an index, rather than only `p`/`u`/`x`, would see that
+/// index as owned by an `f` and offer to drop it. The sweep refuses the
+/// primary key's index only if the filter holds.
 fn constraint_fixture(name: &str, text_type: &str, extra: &str) -> Vec<String> {
-    vec![
-        format!("DROP TABLE IF EXISTS {name}"),
+    let mut setup = drop_constraint_fixture(name);
+    setup.extend([
         format!(
             "CREATE TABLE {name} (code {text_type} PRIMARY KEY, slug {text_type} UNIQUE, \
              a INT, b INT, UNIQUE (a, b){extra})"
         ),
+        format!("CREATE TABLE {name}_ref (code {text_type} REFERENCES {name} (code))"),
         format!("CREATE UNIQUE INDEX {name}_made_unique ON {name} (a)"),
         format!("CREATE INDEX {name}_made ON {name} (b)"),
+    ]);
+    setup
+}
+
+/// Drops [`constraint_fixture`]'s two tables, the referencing one first.
+fn drop_constraint_fixture(name: &str) -> Vec<String> {
+    vec![
+        format!("DROP TABLE IF EXISTS {name}_ref"),
+        format!("DROP TABLE IF EXISTS {name}"),
     ]
+}
+
+async fn teardown(pool: &DbPool, name: &str) {
+    for statement in drop_constraint_fixture(name) {
+        pool.execute(&statement).await.unwrap();
+    }
 }
 
 fn sorted(mut reasons: Vec<&'static str>) -> Vec<&'static str> {
@@ -552,8 +578,7 @@ fn sorted(mut reasons: Vec<&'static str>) -> Vec<&'static str> {
 async fn sqlite_an_index_built_for_a_constraint_is_not_offered_for_drop() {
     let fixture = FixtureDb::with_sql("").await;
     let pool = fixture.open().await;
-    let mut setup = constraint_fixture("ci_lite", "TEXT", "");
-    setup.remove(0);
+    let setup = constraint_fixture("ci_lite", "TEXT", "");
     let sweep = constraint_sweep(
         &pool,
         "ci_lite",
@@ -623,6 +648,31 @@ async fn seed(pool: &DbPool, name: &str, flavor: Flavor) {
     }
 }
 
+/// Holds `engine`'s lock for the rest of a test: every test in this file that
+/// talks to an engine takes it first, so two of them never run DDL against
+/// the same server at once.
+///
+/// Cargo runs one test binary at a time but the tests *inside* it in parallel,
+/// and these tests are DDL from start to finish. YugabyteDB refuses concurrent
+/// DDL outright — the constraint sweep's setup failed 4 of 4 full-file runs
+/// with "could not serialize access due to concurrent update" while the
+/// operation sequence ran beside it, and passed alone. The other engines took
+/// it, but nothing here is worth a race: the lock costs a few seconds of
+/// parallelism, per engine, inside one file. A tokio mutex, since the guard is
+/// held across awaits and each `#[tokio::test]` has a runtime of its own.
+async fn serialized(engine: &'static str) -> tokio::sync::OwnedMutexGuard<()> {
+    type Locks = std::sync::Mutex<HashMap<&'static str, Arc<tokio::sync::Mutex<()>>>>;
+    static LOCKS: OnceLock<Locks> = OnceLock::new();
+    let lock = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(engine)
+        .or_default()
+        .clone();
+    lock.lock_owned().await
+}
+
 fn url(var: &str) -> Option<String> {
     match std::env::var(var) {
         Ok(url) => Some(url),
@@ -644,6 +694,7 @@ async fn postgres_report(url: &str, name: &str, flavor: Flavor) -> Report {
 
 #[tokio::test]
 async fn postgres_applies_every_operation() {
+    let _engine = serialized("HUBRO_PG_TEST_URL").await;
     let Some(url) = common::pg_test_url().await else {
         return;
     };
@@ -655,6 +706,7 @@ async fn postgres_applies_every_operation() {
 
 #[tokio::test]
 async fn timescale_applies_every_operation() {
+    let _engine = serialized("HUBRO_TIMESCALE_TEST_URL").await;
     let Some(url) = url("HUBRO_TIMESCALE_TEST_URL") else {
         return;
     };
@@ -666,6 +718,7 @@ async fn timescale_applies_every_operation() {
 
 #[tokio::test]
 async fn citus_applies_every_operation() {
+    let _engine = serialized("HUBRO_CITUS_TEST_URL").await;
     let Some(url) = url("HUBRO_CITUS_TEST_URL") else {
         return;
     };
@@ -677,6 +730,7 @@ async fn citus_applies_every_operation() {
 
 #[tokio::test]
 async fn cockroach_applies_every_operation() {
+    let _engine = serialized("HUBRO_CRDB_TEST_URL").await;
     let Some(url) = url("HUBRO_CRDB_TEST_URL") else {
         return;
     };
@@ -688,6 +742,7 @@ async fn cockroach_applies_every_operation() {
 
 #[tokio::test]
 async fn yugabyte_applies_every_operation() {
+    let _engine = serialized("HUBRO_YUGABYTE_TEST_URL").await;
     let Some(url) = url("HUBRO_YUGABYTE_TEST_URL") else {
         return;
     };
@@ -703,6 +758,7 @@ async fn yugabyte_applies_every_operation() {
 
 #[tokio::test]
 async fn sqlserver_applies_every_operation() {
+    let _engine = serialized("HUBRO_MSSQL_TEST_URL").await;
     let Some(url) = common::mssql_test_url().await else {
         return;
     };
@@ -721,6 +777,7 @@ async fn sqlserver_renames_through_sp_rename() {
     // end to end: sp_rename takes its target inside a *string*, so the
     // bracket quoting is load-bearing in a way ordinary identifier quoting
     // is not.
+    let _engine = serialized("HUBRO_MSSQL_TEST_URL").await;
     let Some(url) = common::mssql_test_url().await else {
         return;
     };
@@ -786,12 +843,13 @@ async fn assert_postgres_constraint_sweep(url: &str, name: &str, engine: &str) {
     );
     assert_eq!(sweep.dropped, 2, "{engine}: {sweep:?}");
     assert!(sweep.offered_but_refused.is_empty(), "{engine}: {sweep:?}");
-    pool.execute(&format!("DROP TABLE {name}")).await.unwrap();
+    teardown(&pool, name).await;
     pool.close().await;
 }
 
 #[tokio::test]
 async fn postgres_an_index_built_for_a_constraint_is_not_offered_for_drop() {
+    let _engine = serialized("HUBRO_PG_TEST_URL").await;
     let Some(url) = common::pg_test_url().await else {
         return;
     };
@@ -800,6 +858,7 @@ async fn postgres_an_index_built_for_a_constraint_is_not_offered_for_drop() {
 
 #[tokio::test]
 async fn timescale_an_index_built_for_a_constraint_is_not_offered_for_drop() {
+    let _engine = serialized("HUBRO_TIMESCALE_TEST_URL").await;
     let Some(url) = url("HUBRO_TIMESCALE_TEST_URL") else {
         return;
     };
@@ -808,6 +867,7 @@ async fn timescale_an_index_built_for_a_constraint_is_not_offered_for_drop() {
 
 #[tokio::test]
 async fn citus_an_index_built_for_a_constraint_is_not_offered_for_drop() {
+    let _engine = serialized("HUBRO_CITUS_TEST_URL").await;
     let Some(url) = url("HUBRO_CITUS_TEST_URL") else {
         return;
     };
@@ -816,6 +876,7 @@ async fn citus_an_index_built_for_a_constraint_is_not_offered_for_drop() {
 
 #[tokio::test]
 async fn yugabyte_an_index_built_for_a_constraint_is_not_offered_for_drop() {
+    let _engine = serialized("HUBRO_YUGABYTE_TEST_URL").await;
     let Some(url) = url("HUBRO_YUGABYTE_TEST_URL") else {
         return;
     };
@@ -833,7 +894,7 @@ async fn yugabyte_an_index_built_for_a_constraint_is_not_offered_for_drop() {
     );
     assert_eq!(sweep.dropped, 2, "{sweep:?}");
     assert!(sweep.offered_but_refused.is_empty(), "{sweep:?}");
-    pool.execute("DROP TABLE ci_yb").await.unwrap();
+    teardown(&pool, "ci_yb").await;
     pool.close().await;
 }
 
@@ -845,6 +906,7 @@ async fn yugabyte_an_index_built_for_a_constraint_is_not_offered_for_drop() {
 /// unique index the user made really does drop.
 #[tokio::test]
 async fn cockroach_offers_a_unique_constraints_index_and_the_engine_refuses_it() {
+    let _engine = serialized("HUBRO_CRDB_TEST_URL").await;
     let Some(url) = url("HUBRO_CRDB_TEST_URL") else {
         return;
     };
@@ -857,12 +919,13 @@ async fn cockroach_offers_a_unique_constraints_index_and_the_engine_refuses_it()
     for err in &sweep.offered_but_refused {
         assert!(err.contains("is in use as unique constraint"), "{err}");
     }
-    pool.execute("DROP TABLE ci_crdb").await.unwrap();
+    teardown(&pool, "ci_crdb").await;
     pool.close().await;
 }
 
 #[tokio::test]
 async fn sqlserver_an_index_built_for_a_constraint_is_not_offered_for_drop() {
+    let _engine = serialized("HUBRO_MSSQL_TEST_URL").await;
     let Some(url) = common::mssql_test_url().await else {
         return;
     };
@@ -879,7 +942,7 @@ async fn sqlserver_an_index_built_for_a_constraint_is_not_offered_for_drop() {
     );
     assert_eq!(sweep.dropped, 2, "{sweep:?}");
     assert!(sweep.offered_but_refused.is_empty(), "{sweep:?}");
-    pool.execute("DROP TABLE ci_mssql").await.unwrap();
+    teardown(&pool, "ci_mssql").await;
     pool.close().await;
 }
 
@@ -896,6 +959,7 @@ async fn sqlserver_an_index_built_for_a_constraint_is_not_offered_for_drop() {
 /// applied here rather than as accepted-and-ignored.
 #[tokio::test]
 async fn materialize_applies_what_its_ddl_supports() {
+    let _engine = serialized("HUBRO_MATERIALIZE_TEST_URL").await;
     let Some(url) = url("HUBRO_MATERIALIZE_TEST_URL") else {
         return;
     };
@@ -921,6 +985,7 @@ async fn materialize_applies_what_its_ddl_supports() {
 /// and `TRUNCATE` are both "not yet implemented" and say so.
 #[tokio::test]
 async fn risingwave_applies_what_its_ddl_supports() {
+    let _engine = serialized("HUBRO_RISINGWAVE_TEST_URL").await;
     let Some(url) = url("HUBRO_RISINGWAVE_TEST_URL") else {
         return;
     };
@@ -957,6 +1022,7 @@ async fn risingwave_applies_what_its_ddl_supports() {
 /// true.
 #[tokio::test]
 async fn sqlserver_add_column_ignores_the_session_null_default() {
+    let _engine = serialized("HUBRO_MSSQL_TEST_URL").await;
     let Some(url) = common::mssql_test_url().await else {
         return;
     };
