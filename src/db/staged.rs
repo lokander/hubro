@@ -622,11 +622,14 @@ pub(super) fn column_cast(column: &ColumnMeta, dialect: Dialect) -> Option<Strin
 ///   outright (*"column is of type bit but expression is of type text"*).
 /// - `character` → `bpchar`, the blank-padded type with no length. This one
 ///   used to be left uncast, which assigns correctly but does not *compare*
-///   correctly: the grid reads a `character(3)` holding `ab` as `"ab "`, and
-///   `char = text` resolves to a text comparison that strips the column's
-///   padding and keeps the parameter's, so a key shorter than its width
-///   never matched its row and every save of it was refused. `bpchar`
-///   compares blank-insensitively, as the column does. Measured on
+///   correctly: the grid then read a `character(3)` key holding `ab` as
+///   `"ab "` (it now reads it through `::text`, as `"ab"`), and `char = text`
+///   resolves to a text comparison that strips the column's padding and keeps
+///   the parameter's, so a key shorter than its width never matched its row
+///   and every save of it was refused. A padded value can still arrive — the
+///   decoder reads `char(n)` padded wherever a column is not fetched through
+///   the text cast, and a user can type one — and `bpchar` compares
+///   blank-insensitively, as the column does. Measured on
 ///   PostgreSQL 17 and CockroachDB, SET through `$1::bpchar` and through an
 ///   uncast text parameter store the same bytes and refuse the same
 ///   over-long value.
@@ -852,8 +855,9 @@ fn key_clause(
 /// differently from the server's own cast to text: a float (`1e+20`), a blob
 /// (bound as the marker `<blob N>`), a `timestamptz` (`+00:00` against the
 /// server's `+00`), a `character(n)` key (the cast to text strips the padding
-/// the grid reads), CockroachDB's `numeric`, and on SQL Server every
-/// date/time type and `money`.
+/// the grid then read; a Postgres key is now read through that same cast, see
+/// [`super::page::fetched_as_server_text`]), CockroachDB's `numeric`, and on
+/// SQL Server every date/time type and `money`.
 pub(super) fn equalities_where(terms: &[KeyEquality], dialect: Dialect) -> (String, Vec<Value>) {
     if terms.is_empty() {
         return (String::new(), Vec::new());
