@@ -81,9 +81,9 @@ pub(crate) fn write_text_atomic(path: &Path, text: &str) -> Result<(), ConfigErr
 
 /// Loads a file under the **lenient** error policy: a missing, unreadable or
 /// malformed file yields `T::default()`, never an error. The read half of the
-/// settings and session domains; what a caller may then *write* back over a
-/// file this returned defaults for is its own business (see
-/// `settings::set_settings_key`, which must not).
+/// session domain; settings have their own loader, which falls back field by
+/// field (`settings::interpret_settings`). What a caller may then *write*
+/// back over a file this returned defaults for is its own business.
 pub(crate) fn load_lenient<T: DeserializeOwned + Default>(path: &Path) -> T {
     match std::fs::read_to_string(path) {
         Ok(text) => toml::from_str(&text).unwrap_or_default(),
