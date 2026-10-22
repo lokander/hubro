@@ -516,7 +516,7 @@ enum ServerCredential<'a> {
     /// A Microsoft Entra access token (never a refresh token). Owned, unlike
     /// its siblings: the token moves out of the acquisition and into the
     /// login, so a live access token is never copied into a second place.
-    EntraToken(String),
+    EntraToken(Secret),
 }
 
 /// How a credential logs in on one backend — everything [`ServerBackend::open`]
@@ -539,7 +539,7 @@ struct ServerLogin {
     /// the URL: SQL Server's AAD login. `None` in every other case, Postgres
     /// tokens included — those live in `url`, and there is no driver parameter
     /// they could go to instead.
-    aad_token: Option<String>,
+    aad_token: Option<Secret>,
 }
 
 /// The per-engine data the server connect flows are parameterized over.
@@ -645,7 +645,7 @@ impl ServerBackend {
             },
             // Postgres has no such login method: the token *is* the password.
             (_, ServerCredential::EntraToken(token)) => ServerLogin {
-                url: spliced(&token)?,
+                url: spliced(token.expose())?,
                 aad_token: None,
             },
         })
@@ -787,16 +787,16 @@ fn entra_renewal(
             azure::renew_silently(
                 &auth,
                 resource,
-                refresh.as_ref().map(Secret::expose),
+                refresh.as_ref(),
                 &azure::Endpoints::default(),
             )
             .await
             .map(|renewed| Renewed {
                 token: Token {
-                    secret: Secret::new(renewed.secret),
+                    secret: renewed.secret,
                     expires_at: renewed.expires_at,
                 },
-                refresh: renewed.refresh_token.map(Secret::new),
+                refresh: renewed.refresh_token,
             })
             .map_err(|err| {
                 if azure::rejects_refresh(&err) {
@@ -809,10 +809,10 @@ fn entra_renewal(
     });
     Arc::new(EntraTokens::on_system_clock(
         Token {
-            secret: Secret::new(token.secret.clone()),
+            secret: token.secret.clone(),
             expires_at: token.expires_at,
         },
-        token.refresh_token.clone().map(Secret::new),
+        token.refresh_token.clone(),
         matches!(entra, EntraAuth::ManagedIdentity { .. }),
         renew,
     ))
@@ -1572,7 +1572,8 @@ impl AppState {
         if connected {
             self.entra_prompt.set(None);
             // Kept for silent renewals: in the keyring only on `remember`.
-            if let Some(refresh) = token.refresh_token {
+            // Exposed only to be kept where the user's answer says.
+            if let Some(refresh) = token.refresh_token.map(|r| r.expose().to_string()) {
                 self.keep_entra_refresh(&url, refresh, remember).await;
             }
             self.save_server_if_open(backend, &url, &name, tunnel, ServerAuth::Entra(entra));
@@ -3123,7 +3124,7 @@ mod tests {
     #[tokio::test]
     async fn an_interactive_sign_in_without_a_refresh_token_is_never_renewed() {
         let token = azure::AccessToken {
-            secret: "expired".into(),
+            secret: Secret::new("expired"),
             expires_at: std::time::SystemTime::now() - std::time::Duration::from_secs(1),
             refresh_token: None,
         };
@@ -4205,7 +4206,7 @@ mod tests {
 
         // Postgres has no token login: the token goes in as the password.
         let login = pg
-            .login(PG, ServerCredential::EntraToken(TOKEN.to_string()))
+            .login(PG, ServerCredential::EntraToken(Secret::new(TOKEN)))
             .unwrap();
         assert_eq!(login.url, format!("postgres://u:{TOKEN}@h:5432/db"));
         assert!(
@@ -4216,14 +4217,14 @@ mod tests {
         // SQL Server does: the token goes to the driver and the URL is left
         // untouched — a token in the URL would be sent as a password.
         let login = ms
-            .login(MS, ServerCredential::EntraToken(TOKEN.to_string()))
+            .login(MS, ServerCredential::EntraToken(Secret::new(TOKEN)))
             .unwrap();
         assert_eq!(login.url, MS, "the URL must be unchanged");
         assert!(
             !login.url.contains(TOKEN),
             "the access token must never reach the URL on SQL Server"
         );
-        assert_eq!(login.aad_token.as_deref(), Some(TOKEN));
+        assert_eq!(login.aad_token.as_ref().map(Secret::expose), Some(TOKEN));
     }
 
     #[test]
@@ -4241,12 +4242,12 @@ mod tests {
         }
         // A Postgres token is spliced, so it fails here…
         assert!(ServerBackend::POSTGRES
-            .login("not a url", ServerCredential::EntraToken("t".to_string()))
+            .login("not a url", ServerCredential::EntraToken(Secret::new("t")))
             .is_err());
         // …while a SQL Server token never touches the URL, which is the whole
         // point: nothing can fail at this step.
         assert!(ServerBackend::SQL_SERVER
-            .login("not a url", ServerCredential::EntraToken("t".to_string()))
+            .login("not a url", ServerCredential::EntraToken(Secret::new("t")))
             .is_ok());
     }
 
