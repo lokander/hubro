@@ -96,6 +96,17 @@ const GLOBAL_KEYS_JS: &str = r#"
 })();
 "#;
 
+/// The gesture behind the pane shortcut's message from [`GLOBAL_KEYS_JS`],
+/// which sends `pane-repeat` for a held Ctrl+E's auto-repeats. Leaving the
+/// data pane with staged edits takes a second, confirming Ctrl+E (the
+/// unsaved-changes guard), and a held key's repeat must never be that press —
+/// a 1.5 s held Ctrl+E used to discard the edits.
+fn pane_shortcut(msg: &str) -> Gesture {
+    Gesture {
+        repeat: msg == "pane-repeat",
+    }
+}
+
 /// Whether a key event's modifiers count as "Ctrl" for the app's shortcuts:
 /// Ctrl or Cmd (⌘), on every platform.
 ///
@@ -136,12 +147,8 @@ pub fn Shell() -> Element {
             while let Ok(msg) = channel.recv::<String>().await {
                 match msg.as_str() {
                     "cheatsheet" => state.toggle_cheatsheet(),
-                    // A held Ctrl+E repeats, and says so; the unsaved-changes
-                    // guard must not take a repeat for a second, confirming
-                    // press.
-                    "pane" | "pane-repeat" => state.toggle_active_pane(Gesture {
-                        repeat: msg == "pane-repeat",
-                    }),
+                    // A held Ctrl+E repeats, and says so: see `pane_shortcut`.
+                    "pane" | "pane-repeat" => state.toggle_active_pane(pane_shortcut(&msg)),
                     "rowdetail" => state.toggle_row_detail(),
                     _ => {}
                 }
@@ -774,6 +781,22 @@ mod tests {
         assert!(!accel_held(Modifiers::SHIFT));
         assert!(!accel_held(Modifiers::ALT));
         assert!(!accel_held(Modifiers::empty()));
+    }
+
+    /// A held Ctrl+E reaches the navigation guard as a repeat, on the whole
+    /// wire: the listener sends `pane-repeat` for `e.repeat`, and that
+    /// message becomes a repeat gesture (which never confirms the guard —
+    /// `nav_guard_confirm_needs_a_matching_intent_and_the_time_floor`).
+    #[test]
+    fn a_held_pane_shortcut_arrives_as_a_repeat() {
+        let code = crate::ui::test_dom::code_lines(GLOBAL_KEYS_JS);
+        assert!(
+            code.iter()
+                .any(|line| line.contains("dioxus.send(e.repeat ? 'pane-repeat' : 'pane')")),
+            "the listener no longer says a Ctrl+E is held"
+        );
+        assert!(pane_shortcut("pane-repeat").repeat);
+        assert!(!pane_shortcut("pane").repeat);
     }
 
     /// The window listener stands aside while a modal overlay is open, for
