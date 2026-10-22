@@ -25,6 +25,17 @@ pub enum Generated {
     /// represented as `Never` with a `default` instead). Not required for
     /// inserts; still editable.
     ByDefault,
+    /// SQLite's rowid alias: the single-column `INTEGER PRIMARY KEY` of a
+    /// rowid table, which *is* the rowid. Left out or sent as NULL, SQLite
+    /// stores the next rowid and applies neither the column's NOT NULL nor
+    /// its `DEFAULT` (both measured); given a value, it stores that value. So
+    /// it behaves like [`Generated::ByDefault`] — not required, still
+    /// editable — and is a variant of its own only so the Schema view can
+    /// call it a rowid rather than badge most SQLite tables' keys "identity".
+    ///
+    /// Read from the catalog, never from the declared type: see
+    /// `sqlite::rowid_alias`.
+    RowidAlias,
     /// Always assigned by the database and not writable through ordinary
     /// INSERT/UPDATE: `GENERATED ALWAYS AS IDENTITY` and `GENERATED ALWAYS
     /// AS (expr) STORED`. Not required for inserts; read-only in the editor.

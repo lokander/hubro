@@ -876,7 +876,7 @@ async fn sqlite_staged_insert_leaves_defaults_to_the_database() {
 
     // Required-column boundary: only `label` is NOT NULL without a default
     // that the database won't auto-assign (id is the rowid alias).
-    let required = required_insert_columns(&items, Dialect::Sqlite);
+    let required = required_insert_columns(&items);
     assert_eq!(required, HashSet::from(["label".to_string()]));
 
     let mut stage = TableStage::default();
@@ -919,7 +919,7 @@ async fn sqlite_staged_insert_leaves_defaults_to_the_database() {
     let tables = pool.introspect().await.unwrap();
     let logs = find(&tables, None, "logs").clone();
     let logs_identity = detect_row_identity(&logs, Dialect::Sqlite).unwrap();
-    assert!(required_insert_columns(&logs, Dialect::Sqlite).is_empty());
+    assert!(required_insert_columns(&logs).is_empty());
     let mut stage = TableStage::default();
     stage.add_insert();
     assert_eq!(
@@ -994,7 +994,7 @@ async fn postgres_staged_insert_gets_serial_and_identity_values() {
 
     // Required-column boundary: only `label` must be filled — critically,
     // the NOT NULL `doubled` generated column is NOT required.
-    let required = required_insert_columns(&items, Dialect::Postgres);
+    let required = required_insert_columns(&items);
     assert_eq!(required, HashSet::from(["label".to_string()]));
 
     let mut stage = TableStage::default();
@@ -1201,4 +1201,29 @@ async fn confirm_marking_does_not_itself_block_a_write() {
     .expect("Confirm must not block the write once it reaches db/");
     assert_eq!(counts.updated_rows, 1);
     pool.close().await;
+}
+
+/// A single-column INTEGER key that is *not* the rowid alias must be filled
+/// before a new row can save. The guess from the declared type exempted both
+/// of these, so leaving the key empty failed at the server instead.
+#[tokio::test]
+async fn sqlite_an_integer_key_that_is_not_the_rowid_alias_is_required() {
+    let fixture = FixtureDb::with_sql(
+        "CREATE TABLE keyed (id INTEGER PRIMARY KEY NOT NULL, label TEXT) WITHOUT ROWID;
+         CREATE TABLE descending (id INTEGER PRIMARY KEY DESC NOT NULL, label TEXT);
+         CREATE TABLE aliased (id INTEGER NOT NULL, label TEXT, PRIMARY KEY(id DESC));",
+    )
+    .await;
+    let pool = fixture.open().await;
+    let tables = pool.introspect().await.unwrap();
+    for name in ["keyed", "descending"] {
+        let table = find(&tables, None, name);
+        assert_eq!(
+            required_insert_columns(table),
+            HashSet::from(["id".to_string()]),
+            "{name}"
+        );
+    }
+    // The table-constraint DESC form is still the alias, so nothing is.
+    assert!(required_insert_columns(find(&tables, None, "aliased")).is_empty());
 }

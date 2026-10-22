@@ -535,16 +535,30 @@ pub async fn introspect(pool: &SqlitePool) -> Result<Vec<TableMeta>, DbError> {
     }
 
     let (mut columns, unreadable) = table_columns(pool, &entries).await?;
-    let mut indexes = table_indexes(pool).await?;
+    let (mut indexes, pk_indexed) = table_indexes(pool).await?;
     let mut foreign_keys = table_foreign_keys(pool).await?;
 
     let mut tables = Vec::with_capacity(entries.len());
     for entry in entries {
         let restriction = restriction_for(&entry, !unreadable.contains(&entry.name));
+        let mut table_columns = columns.remove(&entry.name).unwrap_or_default();
+        let ordinary_table = !entry.view && !entry.virtual_table;
+        if let Some(alias) = rowid_alias(
+            ordinary_table,
+            &table_columns,
+            pk_indexed.contains(&entry.name),
+        ) {
+            let column = &mut table_columns[alias];
+            column.generated = Generated::RowidAlias;
+            // Whatever the declaration says: `UPDATE … SET id = NULL` is a
+            // datatype mismatch, so offering NULL in the editor would only
+            // offer a failure.
+            column.nullable = false;
+        }
         let MasterEntry { name, view, .. } = entry;
         tables.push(TableMeta {
             schema: None,
-            columns: columns.remove(&name).unwrap_or_default(),
+            columns: table_columns,
             indexes: indexes.remove(&name).unwrap_or_default(),
             foreign_keys: foreign_keys.remove(&name).unwrap_or_default(),
             name,
@@ -858,11 +872,51 @@ fn column_meta(row: &SqliteRow) -> Result<Option<ColumnMeta>, DbError> {
     }))
 }
 
-/// Indexes of every table, keyed by table name. Two queries: the per-table
-/// index list, and every index's key columns keyed by index name — index
-/// names are unique across a SQLite schema, so one flat map covers all
+/// Which of a table's columns is its rowid alias, if any — the column SQLite
+/// fills with the next rowid when an insert leaves it out or sends NULL.
+///
+/// Decided on a catalog fact rather than on the declared type: SQLite keeps
+/// a separate `origin = 'pk'` index behind every primary key *except* the
+/// rowid alias, which is the key of the table's own b-tree. That one fact
+/// sorts every shape the way SQLite behaves, which the type does not —
+/// measured on SQLite 3.46 (`tests/db_sqlite.rs` measures it again):
+///
+/// - the alias, no pk index: `id INTEGER PRIMARY KEY` in any case, with a
+///   quoted type, `AUTOINCREMENT` or `STRICT`; and the table constraints
+///   `PRIMARY KEY(id)` and `PRIMARY KEY(id DESC)`;
+/// - not the alias, a pk index: the column constraint `INTEGER PRIMARY KEY
+///   DESC` (SQLite's documented quirk), `INT`, `BIGINT`, `INTEGER(4)` and
+///   `TEXT` keys, any key of a `WITHOUT ROWID` table (where the old guess
+///   from the declared type went wrong), and every composite key.
+///
+/// Only an ordinary table can have one: a view or a virtual table has no
+/// index list, so the absent index would prove nothing.
+pub(super) fn rowid_alias(
+    ordinary_table: bool,
+    columns: &[ColumnMeta],
+    has_pk_index: bool,
+) -> Option<usize> {
+    if !ordinary_table || has_pk_index {
+        return None;
+    }
+    let mut key = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.primary_key_position.is_some());
+    match (key.next(), key.next()) {
+        (Some((index, _)), None) => Some(index),
+        _ => None,
+    }
+}
+
+/// Indexes of every table, keyed by table name, and the names of the tables
+/// that have an `origin = 'pk'` index (see [`rowid_alias`]). Two queries: the
+/// per-table index list, and every index's key columns keyed by index name —
+/// index names are unique across a SQLite schema, so one flat map covers all
 /// tables.
-async fn table_indexes(pool: &SqlitePool) -> Result<HashMap<String, Vec<IndexMeta>>, DbError> {
+async fn table_indexes(
+    pool: &SqlitePool,
+) -> Result<(HashMap<String, Vec<IndexMeta>>, HashSet<String>), DbError> {
     let sql = format!(
         "SELECT il.name AS index_name, ii.seqno AS seqno, ii.name AS column_name \
          FROM sqlite_master m \
@@ -888,7 +942,8 @@ async fn table_indexes(pool: &SqlitePool) -> Result<HashMap<String, Vec<IndexMet
     // table's indexes in the order the per-table pragma reported them.
     let sql = format!(
         "SELECT m.name AS table_name, il.name AS index_name, \
-                il.\"unique\" AS \"unique\", il.partial AS partial \
+                il.\"unique\" AS \"unique\", il.partial AS partial, \
+                il.origin AS origin \
          FROM sqlite_master m JOIN pragma_index_list(m.name) il \
          WHERE {MASTER_FILTER} \
          ORDER BY m.name, il.seq"
@@ -899,11 +954,16 @@ async fn table_indexes(pool: &SqlitePool) -> Result<HashMap<String, Vec<IndexMet
         .await
         .map_err(|e| DbError::Introspect(e.to_string()))?;
     let mut indexes: HashMap<String, Vec<IndexMeta>> = HashMap::new();
+    let mut pk_indexed = HashSet::new();
     for row in rows {
         let table: String = get(&row, "table_name")?;
         let name: String = get(&row, "index_name")?;
         let unique: i64 = get(&row, "unique")?;
         let partial: i64 = get(&row, "partial")?;
+        let origin: String = get(&row, "origin")?;
+        if origin == "pk" {
+            pk_indexed.insert(table.clone());
+        }
         let mut columns = index_columns.remove(&name).unwrap_or_default();
         columns.sort_by_key(|(seqno, _)| *seqno);
         indexes.entry(table).or_default().push(IndexMeta {
@@ -917,7 +977,7 @@ async fn table_indexes(pool: &SqlitePool) -> Result<HashMap<String, Vec<IndexMet
                 .collect(),
         });
     }
-    Ok(indexes)
+    Ok((indexes, pk_indexed))
 }
 
 /// One `pragma_foreign_key_list` row: (id, seq, referenced table, from, to).
@@ -1826,5 +1886,49 @@ mod tests {
             reaching,
             ["db/postgres.rs", "db/sqlx_common.rs", "history.rs"]
         );
+    }
+
+    fn key_column(name: &str, type_name: &str, pk: Option<u32>) -> ColumnMeta {
+        ColumnMeta {
+            name: name.into(),
+            type_name: type_name.into(),
+            nullable: false,
+            primary_key_position: pk,
+            default: None,
+            generated: Generated::Never,
+            type_detail: TypeDetail::Plain,
+        }
+    }
+
+    #[test]
+    fn the_rowid_alias_is_the_lone_key_column_without_a_pk_index() {
+        let columns = vec![
+            key_column("x", "TEXT", None),
+            key_column("id", "INTEGER", Some(1)),
+        ];
+        assert_eq!(rowid_alias(true, &columns, false), Some(1));
+        // A pk index means the key is stored apart from the rowid: a
+        // `WITHOUT ROWID` table, a column-constraint `DESC`, a non-INTEGER
+        // type. The type is not consulted either way.
+        assert_eq!(rowid_alias(true, &columns, true), None);
+        let int_key = vec![key_column("id", "INT", Some(1))];
+        assert_eq!(rowid_alias(true, &int_key, false), Some(0));
+        assert_eq!(rowid_alias(true, &int_key, true), None);
+    }
+
+    #[test]
+    fn no_rowid_alias_without_exactly_one_key_column_in_an_ordinary_table() {
+        let composite = vec![
+            key_column("a", "INTEGER", Some(1)),
+            key_column("b", "INTEGER", Some(2)),
+        ];
+        assert_eq!(rowid_alias(true, &composite, false), None);
+        let keyless = vec![key_column("a", "INTEGER", None)];
+        assert_eq!(rowid_alias(true, &keyless, false), None);
+        assert_eq!(rowid_alias(true, &[], false), None);
+        // A view or virtual table has no index list, so the missing pk index
+        // proves nothing about a key it declares.
+        let keyed = vec![key_column("id", "INTEGER", Some(1))];
+        assert_eq!(rowid_alias(false, &keyed, false), None);
     }
 }

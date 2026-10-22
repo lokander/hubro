@@ -4,9 +4,9 @@ mod common;
 
 use common::FixtureDb;
 use hubro::db::{
-    apply_staged, explain_statement, Capabilities, DbError, DbPool, ExportFormat, PageRequest,
-    PlanDisplay, Restriction, RowCount, RowIdentity, RowLocator, StagedChange, TableKind,
-    TableMeta, Value, NUL_IN_SQL,
+    apply_staged, explain_statement, Capabilities, DbError, DbPool, ExportFormat, Generated,
+    PageRequest, PlanDisplay, Restriction, RowCount, RowIdentity, RowLocator, StagedChange,
+    TableKind, TableMeta, Value, NUL_IN_SQL,
 };
 
 fn table<'a>(tables: &'a [TableMeta], name: &str) -> &'a TableMeta {
@@ -851,5 +851,196 @@ async fn a_table_whose_catalog_name_holds_a_nul_is_refused_not_hung() {
     // The row is still there, read under the name SQLite knows.
     let rows = within("count", pool.query("SELECT count(*) FROM t")).await;
     assert_eq!(rows.unwrap().rows, vec![vec![Value::Integer(1)]]);
+    pool.close().await;
+}
+
+/// Every primary-key shape SQLite has that could be mistaken for the rowid
+/// alias, or the alias written in a less obvious way: `(table, column
+/// definitions, table suffix, whether SQLite fills a NULL id)`. The last
+/// field is what SQLite 3.46 was measured to do; the test measures it again
+/// rather than trusting it, so a different SQLite fails here, not in a user's
+/// import.
+const ROWID_SHAPES: &[(&str, &str, &str, bool)] = &[
+    ("alias_plain", "id INTEGER PRIMARY KEY, x TEXT", "", true),
+    (
+        "alias_not_null",
+        "id INTEGER PRIMARY KEY NOT NULL, x TEXT",
+        "",
+        true,
+    ),
+    (
+        "alias_lowercase",
+        "id integer primary key, x TEXT",
+        "",
+        true,
+    ),
+    (
+        "alias_quoted_type",
+        "id \"INTEGER\" PRIMARY KEY NOT NULL, x TEXT",
+        "",
+        true,
+    ),
+    (
+        "alias_table_pk",
+        "id INTEGER NOT NULL, x TEXT, PRIMARY KEY(id)",
+        "",
+        true,
+    ),
+    // The table-constraint DESC form is still the alias…
+    (
+        "alias_table_pk_desc",
+        "id INTEGER NOT NULL, x TEXT, PRIMARY KEY(id DESC)",
+        "",
+        true,
+    ),
+    (
+        "alias_autoincrement",
+        "id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, x TEXT",
+        "",
+        true,
+    ),
+    (
+        "alias_strict",
+        "id INTEGER PRIMARY KEY NOT NULL, x TEXT",
+        " STRICT",
+        true,
+    ),
+    // …and the column-constraint DESC form is not (SQLite's documented quirk).
+    (
+        "column_pk_desc",
+        "id INTEGER PRIMARY KEY DESC NOT NULL, x TEXT",
+        "",
+        false,
+    ),
+    ("int_pk", "id INT PRIMARY KEY NOT NULL, x TEXT", "", false),
+    (
+        "bigint_pk",
+        "id BIGINT PRIMARY KEY NOT NULL, x TEXT",
+        "",
+        false,
+    ),
+    (
+        "integer4_pk",
+        "id INTEGER(4) PRIMARY KEY NOT NULL, x TEXT",
+        "",
+        false,
+    ),
+    ("text_pk", "id TEXT PRIMARY KEY NOT NULL, x TEXT", "", false),
+    (
+        "strict_int_pk",
+        "id INT PRIMARY KEY NOT NULL, x TEXT",
+        " STRICT",
+        false,
+    ),
+    (
+        "without_rowid",
+        "id INTEGER PRIMARY KEY NOT NULL, x TEXT",
+        " WITHOUT ROWID",
+        false,
+    ),
+    // A WITHOUT ROWID key is NOT NULL even when it doesn't say so.
+    (
+        "without_rowid_implicit",
+        "id INTEGER PRIMARY KEY, x TEXT",
+        " WITHOUT ROWID",
+        false,
+    ),
+    (
+        "composite",
+        "id INTEGER NOT NULL, b INTEGER NOT NULL, x TEXT, PRIMARY KEY(id, b)",
+        "",
+        false,
+    ),
+];
+
+/// Whether the statement ran and left `id` holding an integer SQLite chose —
+/// not a NULL it stored (a legacy nullable non-alias key takes one), and not
+/// a refusal.
+async fn assigns_an_id(pool: &DbPool, table: &str, insert: &str) -> bool {
+    if pool.execute(insert).await.is_err() {
+        return false;
+    }
+    let rows = pool
+        .query(&format!("SELECT typeof(id) FROM {table} WHERE x = 'probe'"))
+        .await
+        .unwrap()
+        .rows;
+    pool.execute(&format!("DELETE FROM {table}")).await.unwrap();
+    rows == vec![vec![Value::Text("integer".into())]]
+}
+
+#[tokio::test]
+async fn the_rowid_alias_is_database_filled_exactly_where_sqlite_fills_it() {
+    let fixture = FixtureDb::with_sql("").await;
+    let pool = fixture.open().await;
+    for (table, columns, suffix, _) in ROWID_SHAPES {
+        pool.execute(&format!("CREATE TABLE {table} ({columns}){suffix}"))
+            .await
+            .unwrap();
+    }
+    let tables = pool.introspect().await.unwrap();
+
+    for (name, columns, _, alias) in ROWID_SHAPES {
+        let (extra_col, extra_val) = if columns.contains(" b ") {
+            (", b", ", 1")
+        } else {
+            ("", "")
+        };
+        let null_fills = assigns_an_id(
+            &pool,
+            name,
+            &format!("INSERT INTO {name} (id{extra_col}, x) VALUES (NULL{extra_val}, 'probe')"),
+        )
+        .await;
+        let omission_fills = assigns_an_id(
+            &pool,
+            name,
+            &format!("INSERT INTO {name} (x{extra_col}) VALUES ('probe'{extra_val})"),
+        )
+        .await;
+        assert_eq!(null_fills, *alias, "{name}: SQLite itself changed");
+        assert_eq!(omission_fills, *alias, "{name}: SQLite itself changed");
+
+        let id = table(&tables, name)
+            .columns
+            .iter()
+            .find(|c| c.name == "id")
+            .unwrap();
+        // What import and the new-row form act on: a column the database
+        // fills is never demanded of the user, and a blank becomes an omission.
+        assert_eq!(id.is_auto_assigned(), *alias, "{name}: {id:?}");
+        let expected = if *alias {
+            Generated::RowidAlias
+        } else {
+            Generated::Never
+        };
+        assert_eq!(id.generated, expected, "{name}");
+        if *alias {
+            // The alias can never hold NULL — `UPDATE … SET id = NULL` is a
+            // datatype mismatch — whatever its declaration says.
+            assert!(!id.nullable, "{name}: {id:?}");
+        }
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn an_update_cannot_store_null_in_the_rowid_alias() {
+    // Why introspection reports the alias NOT NULL even when its declaration
+    // omits the constraint: the editor would otherwise offer a NULL the
+    // engine refuses.
+    let fixture = FixtureDb::with_sql("").await;
+    let pool = fixture.open().await;
+    pool.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)")
+        .await
+        .unwrap();
+    pool.execute("INSERT INTO t (x) VALUES ('a')")
+        .await
+        .unwrap();
+    let err = pool
+        .execute("UPDATE t SET id = NULL")
+        .await
+        .expect_err("the rowid alias cannot hold NULL");
+    assert!(err.to_string().contains("datatype mismatch"), "{err}");
     pool.close().await;
 }

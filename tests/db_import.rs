@@ -1402,3 +1402,72 @@ async fn mssql_import_a_committing_trigger_kept_is_not_reported_undone() {
         .unwrap();
     pool.close().await;
 }
+
+#[tokio::test]
+async fn sqlite_a_blank_rowid_alias_takes_the_next_rowid_and_a_blank_without_rowid_key_is_skipped()
+{
+    // SQLite fills a NULL rowid alias with the next rowid and never applies
+    // its NOT NULL. A WITHOUT ROWID table's INTEGER key has no rowid behind
+    // it, so a blank there really is a NOT NULL violation, and skip mode must
+    // be able to skip it rather than fail at the server.
+    let fixture = FixtureDb::with_sql("").await;
+    let pool = fixture.open().await;
+    pool.execute("CREATE TABLE alias (id INTEGER PRIMARY KEY NOT NULL, name TEXT NOT NULL)")
+        .await
+        .unwrap();
+    pool.execute(
+        "CREATE TABLE keyed (id INTEGER PRIMARY KEY NOT NULL, name TEXT NOT NULL) WITHOUT ROWID",
+    )
+    .await
+    .unwrap();
+    let tables = pool.introspect().await.unwrap();
+    let text = "id,name\n,ada\n5,grace\n,alan\n";
+    let mapping = vec![bind(0, "id"), bind(1, "name")];
+
+    let alias = find(&tables, "alias");
+    let report = import(
+        &pool,
+        alias,
+        &options(mapping.clone(), ErrorMode::Skip),
+        csv(text).as_mut(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.inserted_rows, 3, "{report:?}");
+    assert_eq!(report.skipped_rows, 0, "{report:?}");
+    assert_eq!(report.defaulted_cells, 2, "{report:?}");
+    assert_eq!(
+        snapshot(&pool, alias, "id").await,
+        vec![
+            vec!["1".to_string(), "ada".into()],
+            vec!["5".to_string(), "grace".into()],
+            vec!["6".to_string(), "alan".into()],
+        ]
+    );
+
+    let keyed = find(&tables, "keyed");
+    let report = import(
+        &pool,
+        keyed,
+        &options(mapping, ErrorMode::Skip),
+        csv(text).as_mut(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.inserted_rows, 1, "{report:?}");
+    assert_eq!(
+        report.skipped.iter().map(|s| s.line).collect::<Vec<_>>(),
+        vec![2, 4]
+    );
+    assert!(
+        report.skipped[0]
+            .reason
+            .contains("NOT NULL and has no default"),
+        "{:?}",
+        report.skipped[0]
+    );
+    assert_eq!(
+        snapshot(&pool, keyed, "id").await,
+        vec![vec!["5".to_string(), "grace".into()]]
+    );
+}
