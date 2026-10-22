@@ -79,7 +79,11 @@ fn settled_count<E>(pending: bool, count: Option<&Result<u64, E>>) -> Option<u64
 }
 
 /// Whether `page`, holding `loaded` rows, is the last one there is — the one
-/// rule both Next and PageDown obey.
+/// rule both Next and PageDown obey. `loaded` is `None` while the page is
+/// still being fetched, and that is the end for now: the rows on screen are
+/// the previous page's, and a full previous page would otherwise wave the
+/// user on past rows nobody has seen — measured on a view whose deep pages
+/// take seconds, PageDown queued a fetch per press, ahead of all of them.
 ///
 /// A known count decides it. An unknown one (see [`settled_count`]) does not
 /// block paging: a short page is the end whatever the count says, and a full
@@ -89,7 +93,10 @@ fn settled_count<E>(pending: bool, count: Option<&Result<u64, E>>) -> Option<u64
 /// table of exactly a multiple of [`PAGE_SIZE`] rows, whose last full page
 /// offers a next one that comes back empty; that page is short, so it is the
 /// end, and the clamp pulls it back once the count is known.
-fn at_end(count: Option<u64>, page: u64, loaded: u64) -> bool {
+fn at_end(count: Option<u64>, page: u64, loaded: Option<u64>) -> bool {
+    let Some(loaded) = loaded else {
+        return true;
+    };
     match count {
         Some(count) => page * PAGE_SIZE as u64 + loaded >= count,
         None => loaded < PAGE_SIZE as u64,
@@ -1211,7 +1218,8 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     count_resource.peek().as_ref(),
                 );
                 let p = *page.peek();
-                if !at_end(count, p, rows as u64) {
+                let loading = *rows_resource.state().peek() == UseResourceState::Pending;
+                if !at_end(count, p, (!loading).then_some(rows as u64)) {
                     page.set(p + 1);
                 }
             }
@@ -2073,7 +2081,8 @@ fn GridFooter(
                     let last = page() * PAGE_SIZE as u64 + loaded;
                     // While the total is unknown, Next is offered on a
                     // full page only — the same answer PageDown gets.
-                    let no_next = at_end(total, page(), loaded);
+                    let loading = *rows_resource.state().read() == UseResourceState::Pending;
+                    let no_next = at_end(total, page(), (!loading).then_some(loaded));
                     rsx! {
                         // Everything left of the stepper lives in one bounded
                         // group: `flex-1 min-w-0 overflow-hidden` fixes its
@@ -2615,22 +2624,22 @@ mod tests {
         assert_eq!(settled_count::<()>(false, None), None);
         // A stale count is not believed: the old one said 1 000 rows, yet a
         // short third page is the end while the new one runs.
-        assert!(!at_end(settled_count(false, Some(&stale)), 2, 40));
-        assert!(at_end(settled_count(true, Some(&stale)), 2, 40));
+        assert!(!at_end(settled_count(false, Some(&stale)), 2, Some(40)));
+        assert!(at_end(settled_count(true, Some(&stale)), 2, Some(40)));
     }
 
     #[test]
     fn the_last_page_is_where_the_rows_reach_the_count() {
         let full = PAGE_SIZE as u64;
         // Exactly two pages: the first has a next, the second does not.
-        assert!(!at_end(Some(2 * full), 0, full));
-        assert!(at_end(Some(2 * full), 1, full));
+        assert!(!at_end(Some(2 * full), 0, Some(full)));
+        assert!(at_end(Some(2 * full), 1, Some(full)));
         // One row past a page boundary is a page of its own.
-        assert!(!at_end(Some(full + 1), 0, full));
-        assert!(at_end(Some(full + 1), 1, 1));
+        assert!(!at_end(Some(full + 1), 0, Some(full)));
+        assert!(at_end(Some(full + 1), 1, Some(1)));
         // A short page is the last, and an empty table has no next page.
-        assert!(at_end(Some(40), 0, 40));
-        assert!(at_end(Some(0), 0, 0));
+        assert!(at_end(Some(40), 0, Some(40)));
+        assert!(at_end(Some(0), 0, Some(0)));
     }
 
     /// A slow count must not hold paging for its whole run, nor a failed
@@ -2639,21 +2648,29 @@ mod tests {
     #[test]
     fn an_unknown_count_lets_a_full_page_go_on_and_stops_a_short_one() {
         let full = PAGE_SIZE as u64;
-        assert!(!at_end(None, 0, full));
-        assert!(!at_end(None, 7, full));
-        assert!(at_end(None, 0, full - 1));
-        assert!(at_end(None, 3, 1));
+        assert!(!at_end(None, 0, Some(full)));
+        assert!(!at_end(None, 7, Some(full)));
+        assert!(at_end(None, 0, Some(full - 1)));
+        assert!(at_end(None, 3, Some(1)));
         // Rows an exact multiple of the page: the last full page offers a
         // next, which comes back empty — and that empty page is the end, so
         // PageDown stops there rather than walking on through empty pages.
-        assert!(!at_end(None, 1, full));
-        assert!(at_end(None, 2, 0));
+        assert!(!at_end(None, 1, Some(full)));
+        assert!(at_end(None, 2, Some(0)));
         // Once the count lands, the empty page is past the last and is
         // pulled back to it…
         assert_eq!(clamped_page(Some(2 * full), 2), Some(1));
         // …but while it is unknown, paging ahead of it is left alone.
         assert_eq!(clamped_page(None, 2), None);
         assert_eq!(clamped_page(None, 40), None);
+    }
+
+    /// While a page is being fetched the rows on screen are the previous
+    /// page's, so their being a full page says nothing about the next one.
+    #[test]
+    fn a_page_still_loading_is_the_end_for_now() {
+        assert!(at_end(None, 3, None));
+        assert!(at_end(Some(1_000_000), 3, None));
     }
 
     #[test]
