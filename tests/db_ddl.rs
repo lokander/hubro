@@ -461,7 +461,10 @@ async fn postgres_generated_column_storage_matches_the_catalog() {
     // happened to fail: swallowing the error used to mean a PG 18 server that
     // refused it for some other reason dropped the half silently, and the
     // test passed with only STORED checked. On 17 (the suite's documented
-    // image, and CI's) the skip is said out loud.
+    // image, and CI's first pass) the skip is said out loud. CI's second pass
+    // runs against 18 and declares it in HUBRO_PG_TEST_MAJOR, which
+    // tests/common refuses to let reach any other version, so that pass
+    // always takes the VIRTUAL branch.
     let version: i64 = probe(&pool, "SELECT current_setting('server_version_num')").await[0][0]
         .display()
         .parse()

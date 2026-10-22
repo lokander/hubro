@@ -688,6 +688,50 @@ fn a_required_url_names_an_engine_that_honours_it() {
     }
 }
 
+/// The Postgres major version this run's server must be, e.g.
+/// `HUBRO_PG_TEST_MAJOR=18`. Unset, nothing is checked.
+///
+/// CI's Linux leg runs the Postgres suites twice, against 17 and then 18,
+/// because some of what they check exists on one version only: the `VIRTUAL`
+/// half of db_ddl's generated-column test runs on 18 and skips on 17. Which
+/// server a pass reaches is decided by nothing more than a URL on a command
+/// line, and a pass pointed at the wrong one still goes green — just without
+/// the half it was added for. Each pass therefore declares its version, and
+/// [`per_process_database`] refuses a server that disagrees.
+const PG_TEST_MAJOR: &str = "HUBRO_PG_TEST_MAJOR";
+
+/// Why a server reporting `server_version_num` is not the `declared` major
+/// version, or `None` when it is. A free function over the two strings so the
+/// comparison is tested without a server.
+fn pg_major_mismatch(declared: &str, server_version_num: &str) -> Option<String> {
+    let Ok(declared_major) = declared.trim().parse::<u32>() else {
+        return Some(format!(
+            "{PG_TEST_MAJOR}={declared:?} is not a major version number"
+        ));
+    };
+    // Two digits per minor since 10: 170006 is 17.6, 180000 is 18.0.
+    match server_version_num.trim().parse::<u32>() {
+        Ok(num) if num / 10_000 == declared_major => None,
+        _ => Some(format!(
+            "{PG_TEST_MAJOR} says this run's Postgres is {declared_major}, but the \
+             server reports server_version_num {server_version_num}"
+        )),
+    }
+}
+
+#[test]
+fn a_declared_pg_major_must_match_the_server() {
+    assert_eq!(pg_major_mismatch("17", "170006"), None);
+    assert_eq!(pg_major_mismatch("18", "180000"), None);
+    assert_eq!(pg_major_mismatch(" 18\n", "180001"), None);
+    assert!(pg_major_mismatch("18", "170006").is_some());
+    assert!(pg_major_mismatch("17", "180000").is_some());
+    // Not "1": a prefix comparison would let 17 pass as 1.
+    assert!(pg_major_mismatch("1", "170006").is_some());
+    assert!(pg_major_mismatch("eighteen", "180000").is_some());
+    assert!(pg_major_mismatch("18", "").is_some());
+}
+
 #[test]
 fn ci_linux_runs_the_postgres_suites() {
     // CI's Linux leg starts a Postgres for the suites (ci.yml), and this is
@@ -713,6 +757,11 @@ fn ci_linux_runs_the_postgres_suites() {
         "CI's Linux leg does not list {} in {REQUIRE_TEST_URLS}, so losing it \
          would skip the Postgres suites and pass",
         Engine::Postgres.env()
+    );
+    assert!(
+        std::env::var(PG_TEST_MAJOR).is_ok(),
+        "CI's Linux leg does not set {PG_TEST_MAJOR}, so a Postgres pass could \
+         reach the wrong server version and still pass"
     );
 }
 
@@ -769,6 +818,21 @@ async fn per_process_database(engine: Engine) -> Option<String> {
         .open(&base)
         .await
         .unwrap_or_else(|e| panic!("{} must be connectable: {e}", engine.env()));
+    if let (Engine::Postgres, Ok(declared)) = (engine, std::env::var(PG_TEST_MAJOR)) {
+        let reported = admin
+            .query("SELECT current_setting('server_version_num')")
+            .await
+            .unwrap_or_else(|e| panic!("could not read server_version_num: {e}"));
+        let reported = reported
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .map(|value| value.display())
+            .unwrap_or_default();
+        if let Some(why) = pg_major_mismatch(&declared, &reported) {
+            panic!("{why}");
+        }
+    }
 
     // Best effort throughout: a sweep that fails leaves rubbish behind, which
     // is not a reason to fail the suite. Dropped one at a time and ignored
