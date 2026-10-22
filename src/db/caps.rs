@@ -17,9 +17,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::rowkey::{detect_row_identity, RowIdentity};
+use super::rowkey::{detect_row_identity, KeyRules, RowIdentity};
 use super::schema::{TableKind, TableMeta};
-use super::sql::Dialect;
 
 /// What a connection supports. Backends declare these at connect time; one
 /// object's effective set is this, narrowed by [`TableAccess::resolve`].
@@ -371,10 +370,14 @@ impl TableAccess {
     /// then the object's own [`TableMeta::restriction`], then its
     /// [`TableKind`], then whether its rows can be addressed at all. The
     /// first of those that forbids writes supplies the reason.
-    pub fn resolve(defaults: Capabilities, table: &TableMeta, dialect: Dialect) -> TableAccess {
+    pub fn resolve(
+        defaults: Capabilities,
+        table: &TableMeta,
+        rules: impl Into<KeyRules>,
+    ) -> TableAccess {
         // Identity is resolved even for objects that can't be written: the
         // grid's cell-fetch path pins a row by the same key.
-        let identity = detect_row_identity(table, dialect);
+        let identity = detect_row_identity(table, rules);
         // Read narrowing is taken from the object's own declaration and
         // nothing else, *before* the write chain below — which short-circuits
         // on a read-only connection and would otherwise never look at the
@@ -436,11 +439,11 @@ impl TableAccess {
         defaults: Capabilities,
         protection: WriteProtection,
         table: &TableMeta,
-        dialect: Dialect,
+        rules: impl Into<KeyRules>,
     ) -> TableAccess {
         // Resolved against the backend's own capabilities, so the object's
         // verdict is known independently of the marking.
-        let mut access = TableAccess::resolve(defaults, table, dialect);
+        let mut access = TableAccess::resolve(defaults, table, rules);
         let effective = protection.apply(defaults);
         if access.restriction.is_none() && !effective.mutate {
             access.restriction = Some(USER_READ_ONLY);
@@ -481,6 +484,7 @@ impl TableAccess {
 mod tests {
     use super::*;
     use crate::db::schema::{ColumnMeta, Generated, IndexMeta, TypeDetail};
+    use crate::db::sql::Dialect;
 
     fn col(name: &str, pk: Option<u32>) -> ColumnMeta {
         ColumnMeta {

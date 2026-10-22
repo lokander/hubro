@@ -18,9 +18,10 @@ mod common;
 use hubro::db::{
     apply_staged, detect_row_identity, explain_statement, needs_confirmation,
     plan_reached_cell_cap, run_script, script_refusal, url_with_password, Capabilities, DbError,
-    DbPool, Dialect, Filter, Internal, PageRequest, PgFlavor, PlanDisplay, Restriction, Rollback,
-    RowCount, RowLocator, SortDir, StagedChange, StatementOutcome, TableKind, TableMeta,
-    TypeDetail, TypeRef, Value, WriteProtection, INSTEAD_RULE, PREVIEW_BYTES, QUERY_CELL_CAP,
+    DbPool, Dialect, Filter, Internal, KeyTextPinned, PageRequest, PgFlavor, PlanDisplay,
+    Restriction, Rollback, RowCount, RowLocator, SortDir, StagedChange, StatementOutcome,
+    TableKind, TableMeta, TypeDetail, TypeRef, Value, WriteProtection, INSTEAD_RULE, PREVIEW_BYTES,
+    QUERY_CELL_CAP,
 };
 
 async fn test_url() -> Option<String> {
@@ -2371,9 +2372,10 @@ async fn postgres_a_role_default_never_respells_a_key_for_another_session() {
     // printed `[2024-02-01,2024-02-03)` as `[01/02/2024,03/02/2024)`, which an
     // older `ISO, MDY` session reads as the other row; `IntervalStyle =
     // 'sql_standard'` prints -1 day -2 hours as `-1 2:00:00`, which a
-    // `postgres` session reads as -1 day +2 hours. hubro's sessions are given
-    // both at login, which beats a role default: `DateStyle` by sqlx itself,
-    // `IntervalStyle` by `key_text_pins`.
+    // `postgres` session reads as -1 day +2 hours. `lc_monetary` decides how
+    // `money` prints. hubro's sessions are given all three at login, which
+    // beats a role default: `DateStyle` by sqlx itself, `IntervalStyle` and
+    // `lc_monetary` (the first session's value) by `key_text_pins`.
     let Some(url) = test_url().await else { return };
     let setup = DbPool::open_postgres(&url).await.unwrap();
     let who = setup
@@ -2397,7 +2399,7 @@ async fn postgres_a_role_default_never_respells_a_key_for_another_session() {
             .await
         })
         .await;
-    for setting in ["DateStyle", "IntervalStyle"] {
+    for setting in ["DateStyle", "IntervalStyle", "lc_monetary"] {
         setup
             .query(&format!("{scope} RESET {setting}"))
             .await
@@ -2411,6 +2413,11 @@ async fn postgres_a_role_default_never_respells_a_key_for_another_session() {
 
 async fn role_default_body(url: &str, scope: &str) {
     let pool = DbPool::open_postgres_two_sessions(url).await.unwrap();
+    assert_eq!(
+        pool.key_rules().pinned,
+        KeyTextPinned::ALL,
+        "PostgreSQL takes every pin"
+    );
     for sql in [
         "DROP TABLE IF EXISTS role_dates",
         "CREATE TABLE role_dates (k daterange PRIMARY KEY, v text, tag text)",
@@ -2426,12 +2433,24 @@ async fn role_default_body(url: &str, scope: &str) {
     }
     // Both sessions of the pool exist before the default changes.
     let probe = "SELECT pg_backend_pid()::int8, current_setting('DateStyle'), \
-                 current_setting('IntervalStyle'), pg_sleep(0.3)::text";
+                 current_setting('IntervalStyle'), current_setting('lc_monetary'), \
+                 pg_sleep(0.3)::text";
     let (a, b) = tokio::join!(pool.query(probe), pool.query(probe));
-    let before = [a.unwrap().rows[0][0].clone(), b.unwrap().rows[0][0].clone()];
+    let (a, b) = (a.unwrap().rows[0].clone(), b.unwrap().rows[0].clone());
+    let before = [a[0].clone(), b[0].clone()];
+    // What the pool's sessions were given, and another installed locale for
+    // the role to switch to: both `C` and `C.UTF-8` exist on every image.
+    let monetary = a[3].clone();
+    assert_eq!(b[3], monetary);
+    let other = if monetary == Value::Text("C".into()) {
+        "C.UTF-8"
+    } else {
+        "C"
+    };
     for sql in [
         format!("{scope} SET DateStyle = 'SQL, DMY'"),
         format!("{scope} SET IntervalStyle = 'sql_standard'"),
+        format!("{scope} SET lc_monetary = '{other}'"),
     ] {
         pool.query(&sql).await.unwrap();
     }
@@ -2449,10 +2468,11 @@ async fn role_default_body(url: &str, scope: &str) {
     );
     for session in &after {
         assert_eq!(
-            session[1..3],
+            session[1..4],
             [
                 Value::Text("ISO, MDY".into()),
-                Value::Text("postgres".into())
+                Value::Text("postgres".into()),
+                monetary.clone(),
             ],
             "a session took the role's default: {after:?}"
         );

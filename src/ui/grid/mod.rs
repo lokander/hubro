@@ -694,12 +694,17 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let render_table = table.clone();
     let render_meta = use_memo(move || {
         let schemas = state.schemas.read();
-        let dialect = state.registry.read().get(id).map(|c| c.pool.dialect());
+        let (dialect, rules) = state
+            .registry
+            .read()
+            .get(id)
+            .map(|c| (c.pool.dialect(), c.pool.key_rules()))
+            .unzip();
         let load = schemas.get(&id);
         Shared::new(TableRenderMeta::build(
             find_table_meta(load, &render_table),
             dialect,
-            |fk| dialect.is_some_and(|dialect| fk_jump_target(load, fk, dialect).is_some()),
+            |fk| rules.is_some_and(|rules| fk_jump_target(load, fk, rules).is_some()),
         ))
     });
 

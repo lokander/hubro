@@ -54,8 +54,8 @@ use crate::db::{
     mssql_url_via_local_port, mssql_url_with_password, needs_confirmation, open_source, run_import,
     run_script, script_refusal, split_statements, statement_preview, url_target,
     url_via_local_port, url_with_password, write_result, Capabilities, CellFetch, Connection,
-    ConnectionId, ConnectionRegistry, DbError, DbPool, Ddl, DdlObject, Dialect, Encoding,
-    ExportFormat, Filter, ForeignKeyMeta, ImportOptions, ImportReport, MssqlAuth, OpenTransaction,
+    ConnectionId, ConnectionRegistry, DbError, DbPool, Ddl, DdlObject, Encoding, ExportFormat,
+    Filter, ForeignKeyMeta, ImportOptions, ImportReport, KeyRules, MssqlAuth, OpenTransaction,
     Rollback, RowLocator, SchemaOp, ScriptDone, ScriptError, SourceFormat, StagedChange,
     StatementOutcome, StatementResult, TableAccess, TableMeta, TableStats, Value, WriteProtection,
     NOTHING_TO_RUN,
@@ -1321,10 +1321,10 @@ pub(crate) fn fk_jump_focus(
     load: Option<&SchemaLoad>,
     fk: &ForeignKeyMeta,
     source_row: &HashMap<String, Value>,
-    dialect: Dialect,
+    rules: KeyRules,
 ) -> Option<FocusTarget> {
-    let target = fk_jump_target(load, fk, dialect)?;
-    let filter = build_fk_filter(fk, source_row, target, dialect)?;
+    let target = fk_jump_target(load, fk, rules)?;
+    let filter = build_fk_filter(fk, source_row, target, rules)?;
     Some(FocusTarget {
         table: TableRef {
             schema: target.schema.clone(),
@@ -1336,7 +1336,7 @@ pub(crate) fn fk_jump_focus(
 
 /// The table a jump along `fk` lands in, when it lands anywhere: the
 /// referenced table is in `load` and has every column the key references
-/// ([`fk_target_columns`]), on `dialect`. `None` while the schema is loading,
+/// ([`fk_target_columns`]), under the connection's [`KeyRules`]. `None` while the schema is loading,
 /// for a reference to a table or column that does not exist, and for a key
 /// whose values cannot be bound back to find their row.
 ///
@@ -1346,14 +1346,14 @@ pub(crate) fn fk_jump_focus(
 pub(crate) fn fk_jump_target<'a>(
     load: Option<&'a SchemaLoad>,
     fk: &ForeignKeyMeta,
-    dialect: Dialect,
+    rules: KeyRules,
 ) -> Option<&'a TableMeta> {
     let table = TableRef {
         schema: fk.referenced_schema.clone(),
         name: fk.referenced_table.clone(),
     };
     let target = find_table_meta(load, &table)?;
-    fk_target_columns(fk, target, dialect).map(|_| target)
+    fk_target_columns(fk, target, rules).map(|_| target)
 }
 
 /// Finds one table's metadata in a loaded schema — the single
@@ -1895,11 +1895,10 @@ impl AppState {
         origin: &TableRef,
         origin_filter: Option<Filter>,
     ) {
-        let Some(dialect) = self.registry.read().get(id).map(|c| c.pool.dialect()) else {
+        let Some(rules) = self.registry.read().get(id).map(|c| c.pool.key_rules()) else {
             return;
         };
-        let Some(focus) = fk_jump_focus(self.schemas.read().get(&id), fk, source_row, dialect)
-        else {
+        let Some(focus) = fk_jump_focus(self.schemas.read().get(&id), fk, source_row, rules) else {
             return;
         };
         let target = focus.table.clone();
@@ -2195,6 +2194,7 @@ pub fn tab_title(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Dialect;
 
     #[test]
     fn the_settings_notice_is_raised_once_a_session() {
@@ -2365,7 +2365,7 @@ mod tests {
         ]);
         let row = HashMap::from([("ratio".to_string(), Value::Real(0.5))]);
         assert_eq!(
-            fk_jump_focus(Some(&load), &fk, &row, Dialect::Postgres),
+            fk_jump_focus(Some(&load), &fk, &row, Dialect::Postgres.into()),
             Some(FocusTarget {
                 table: TableRef {
                     schema: Some("app".into()),
@@ -2381,12 +2381,17 @@ mod tests {
         // A target missing from the schema (still loading, or a dangling
         // reference) is no jump at all.
         assert_eq!(
-            fk_jump_focus(Some(&SchemaLoad::Loading), &fk, &row, Dialect::Postgres),
+            fk_jump_focus(
+                Some(&SchemaLoad::Loading),
+                &fk,
+                &row,
+                Dialect::Postgres.into()
+            ),
             None
         );
         let without_target = SchemaLoad::Ready(vec![table("readings", "ratio", "real", None)]);
         assert_eq!(
-            fk_jump_focus(Some(&without_target), &fk, &row, Dialect::Postgres),
+            fk_jump_focus(Some(&without_target), &fk, &row, Dialect::Postgres.into()),
             None
         );
         // So is a reference to a column the target lacks — and the grid's
@@ -2395,13 +2400,13 @@ mod tests {
             referenced_columns: vec![Some("nope".into())],
             ..fk.clone()
         };
-        assert!(fk_jump_target(Some(&load), &fk, Dialect::Postgres).is_some());
+        assert!(fk_jump_target(Some(&load), &fk, Dialect::Postgres.into()).is_some());
         assert_eq!(
-            fk_jump_target(Some(&load), &to_missing, Dialect::Postgres),
+            fk_jump_target(Some(&load), &to_missing, Dialect::Postgres.into()),
             None
         );
         assert_eq!(
-            fk_jump_focus(Some(&load), &to_missing, &row, Dialect::Postgres),
+            fk_jump_focus(Some(&load), &to_missing, &row, Dialect::Postgres.into()),
             None
         );
     }
