@@ -2227,33 +2227,61 @@ pub(crate) fn tsql_is_transaction_control(sql: &str) -> bool {
             .all(|c| c.is_alphanumeric() || c.is_whitespace() || matches!(c, '_' | '@' | '#' | ';'))
 }
 
-/// Whether a SQL Server script statement runs as a plain batch rather than
-/// through `sp_executesql` — on a connection the run holds and then discards
-/// (`held_for_run`), or on a pooled one that goes back to the pool.
+/// How a SQL Server script statement goes to the server — see [`tsql_route`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TsqlRoute {
+    /// Through the driver's `sp_executesql` RPC, the usual vehicle. The
+    /// server refuses to return from it with `@@TRANCOUNT` changed (error
+    /// 266), whatever changed it.
+    Rpc,
+    /// As a plain batch: a statement `sp_executesql` refuses or fails.
+    Batch,
+    /// As a plain batch, with the connection's transaction state read before
+    /// and after it, and a change failing the statement as 266 would have
+    /// (`TransactionChanged` in the SQL Server backend). A plain batch has
+    /// no 266 of its own, and this is the guard that replaces it.
+    CheckedBatch,
+}
+
+/// How a SQL Server script statement is sent — on a connection the run holds
+/// and then discards (`held_for_run`), or on a pooled one that goes back to
+/// the pool.
 ///
 /// Everywhere: a statement that must lead its batch ([`tsql_leads_own_batch`])
-/// and bare transaction control ([`tsql_is_transaction_control`]), which
-/// `sp_executesql` refuses or fails. On a run's own connection, also a
-/// statement that creates a local temp table ([`tsql_creates_temp_table`]):
+/// and bare transaction control ([`tsql_is_transaction_control`]) are
+/// [`TsqlRoute::Batch`], since `sp_executesql` refuses or fails them. On a
+/// run's own connection, also a statement that creates a local temp table
+/// ([`tsql_creates_temp_table`]), as [`TsqlRoute::CheckedBatch`]:
 /// `sp_executesql` is a scope of its own, and a `#temp` table is dropped
 /// with the scope that created it, so the script's next statement could not
 /// see it. Created by a plain batch, it is the session's, and every later
 /// statement sees it from inside its own `sp_executesql` (measured: `INSERT`,
 /// `ALTER TABLE`, `CREATE INDEX`). Never on a pooled connection: the table
 /// would outlive the statement there and reach whoever borrows it next.
-pub(crate) fn tsql_runs_as_batch(sql: &str, held_for_run: bool) -> bool {
-    tsql_leads_own_batch(sql)
-        || tsql_is_transaction_control(sql)
-        || (held_for_run && tsql_creates_temp_table(sql))
+pub(crate) fn tsql_route(sql: &str, held_for_run: bool) -> TsqlRoute {
+    if tsql_leads_own_batch(sql) || tsql_is_transaction_control(sql) {
+        TsqlRoute::Batch
+    } else if held_for_run && tsql_creates_temp_table(sql) {
+        TsqlRoute::CheckedBatch
+    } else {
+        TsqlRoute::Rpc
+    }
 }
 
 /// Whether a SQL Server statement creates a local temp table — `CREATE
 /// TABLE #t`, `SELECT … INTO #t`, the name bare, bracketed or double-quoted
 /// — and carries nothing a plain batch would change the meaning of, so
-/// [`tsql_runs_as_batch`] may send it as one.
+/// [`tsql_route`] may send it as one.
 ///
-/// What a plain batch changes, and so what keeps a statement on
-/// `sp_executesql` even though its temp table then lasts only the statement:
+/// **What keeps hubro's transaction safe is not this list but the check
+/// after the batch** ([`TsqlRoute::CheckedBatch`]). Measured by the review of
+/// this route: a creator inside `BEGIN TRY … END TRY BEGIN CATCH … END CATCH`
+/// whose DDL a database trigger rolled back (3609) — or a deadlock victim
+/// (1205) — returned normally with the transaction gone, and a later `INSERT`
+/// ran in autocommit and persisted under a run reported as failed. No word
+/// announces that, and through `sp_executesql` error 266 had stopped it.
+/// The words here are a first filter, and say what a plain batch would
+/// change besides the transaction:
 ///
 /// - **`SET`**: an option set in a plain batch holds for the rest of the
 ///   session, where through `sp_executesql` it lapses with the call — the
@@ -2261,14 +2289,14 @@ pub(crate) fn tsql_runs_as_batch(sql: &str, held_for_run: bool) -> bool {
 ///   the SQL Server backend). `SET NOEXEC ON` would go on to skip hubro's own
 ///   `COMMIT`.
 /// - **Transaction words** (`BEGIN TRAN`, `COMMIT`, `ROLLBACK`, `SAVE TRAN`,
-///   `SET TRANSACTION`): through `sp_executesql`, a statement that changes
-///   `@@TRANCOUNT` fails with error 266, and that error is what stops a
-///   script whose batch ended hubro's transaction before the statements after
-///   it run outside it (`INSERT … COMMIT`). A plain batch raises nothing.
+///   `SET TRANSACTION`): kept on `sp_executesql`, whose own 266 says so first.
 /// - **Writes and opaque statements** (`INSERT`, `UPDATE`, `DELETE`,
-///   `MERGE`, `TRUNCATE`, [`TSQL_OPAQUE_WORDS`]): tiberius reports no
-///   affected-row counts for a plain batch, so a write in one would report 0
-///   rows affected.
+///   `MERGE`, `TRUNCATE`, [`TSQL_OPAQUE_WORDS`]), and **an `INTO` anywhere
+///   but a read's own temp table**: tiberius reports no affected-row counts
+///   for a plain batch, so a write in one would report 0 rows affected. A
+///   read (`SELECT … INTO #t`) never reported a count; anything else that
+///   fills a table through `INTO` — a permanent one, or a temp table in a
+///   statement led by `IF` or `DECLARE` — did.
 ///
 /// The words are read off the stripped text with the gate's own scan, so a
 /// word the gate sees, this sees. A false "no" costs only the temp table's
@@ -2294,17 +2322,32 @@ pub(crate) fn tsql_creates_temp_table(sql: &str) -> bool {
     if carries_more {
         return false;
     }
+    let read = classify_statement(sql, Dialect::SqlServer).returns_rows();
     let tokens = tsql_name_tokens(sql);
-    tokens.iter().enumerate().any(|(i, token)| {
-        let creates = match token {
+    let mut creates = false;
+    for (i, token) in tokens.iter().enumerate() {
+        match token {
             NameToken::Word(word) if word == "table" => {
-                i > 0 && tokens[i - 1] == NameToken::Word("create".into())
+                if i > 0
+                    && tokens[i - 1] == NameToken::Word("create".into())
+                    && names_temp_table(&tokens[i + 1..])
+                {
+                    creates = true;
+                }
             }
-            NameToken::Word(word) => word == "into",
-            _ => false,
-        };
-        creates && names_temp_table(&tokens[i + 1..])
-    })
+            // Rows written through `INTO` are counted unless the statement
+            // is a read, and are only a read's own when they fill its temp
+            // table.
+            NameToken::Word(word) if word == "into" => {
+                if !read || !names_temp_table(&tokens[i + 1..]) {
+                    return false;
+                }
+                creates = true;
+            }
+            _ => {}
+        }
+    }
+    creates
 }
 
 /// A token of a SQL Server statement as [`tsql_creates_temp_table`] reads
@@ -4820,8 +4863,8 @@ mod tests {
             "IF OBJECT_ID('tempdb..#t') IS NULL CREATE TABLE #t (a int)",
             "IF 1 = 1 BEGIN CREATE TABLE #t (a int) END",
             "BEGIN TRY CREATE TABLE #t (a int) END TRY BEGIN CATCH END CATCH",
-            "DECLARE @n int = 1 SELECT @n AS n INTO #t",
             "CREATE TABLE #t (a int) CREATE INDEX ix ON #t (a)",
+            "SELECT 1 AS a INTO #t SELECT 2 AS b INTO #u",
         ] {
             assert!(tsql_creates_temp_table(sql), "{sql:?}");
         }
@@ -4848,6 +4891,13 @@ mod tests {
             "SELECT 1 AS a INTO #t MERGE #t AS d USING #t AS s ON 1 = 0 \
              WHEN NOT MATCHED THEN INSERT (a) VALUES (1);",
             "SELECT 1 AS a INTO #t TRUNCATE TABLE #t",
+            // Rows filled through `INTO` that the count reported: into a
+            // permanent table, or by a statement that is not a read.
+            "CREATE TABLE #a (a int) SELECT * INTO dbo.p FROM sys.objects",
+            "SELECT 1 AS a INTO #t SELECT 2 AS b INTO dbo.p",
+            "CREATE TABLE #a (a int) SELECT 1 AS b INTO #b",
+            "DECLARE @n int = 1 SELECT @n AS n INTO #t",
+            "IF 1 = 1 SELECT 1 AS a INTO #t",
             "CREATE TABLE #t (a int) EXEC dbo.p",
             "CREATE TABLE #t (a int) EXECUTE ('SELECT 1')",
             // A setting that would outlive the statement.
@@ -4871,20 +4921,21 @@ mod tests {
     #[test]
     fn a_temp_table_is_created_by_a_plain_batch_only_on_a_runs_own_connection() {
         let creates = "CREATE TABLE #t (a int)";
-        assert!(tsql_runs_as_batch(creates, true));
-        assert!(!tsql_runs_as_batch(creates, false));
+        // A checked batch, and only on a run's own connection.
+        assert_eq!(tsql_route(creates, true), TsqlRoute::CheckedBatch);
+        assert_eq!(tsql_route(creates, false), TsqlRoute::Rpc);
         // What must be a plain batch is one wherever it runs.
         for sql in ["CREATE VIEW v AS SELECT 1 AS a", "BEGIN TRAN", "COMMIT"] {
-            assert!(tsql_runs_as_batch(sql, true), "{sql:?}");
-            assert!(tsql_runs_as_batch(sql, false), "{sql:?}");
+            assert_eq!(tsql_route(sql, true), TsqlRoute::Batch, "{sql:?}");
+            assert_eq!(tsql_route(sql, false), TsqlRoute::Batch, "{sql:?}");
         }
         for sql in [
             "INSERT INTO #t VALUES (1)",
             "SELECT * FROM #t",
             "SET NOCOUNT ON",
         ] {
-            assert!(!tsql_runs_as_batch(sql, true), "{sql:?}");
-            assert!(!tsql_runs_as_batch(sql, false), "{sql:?}");
+            assert_eq!(tsql_route(sql, true), TsqlRoute::Rpc, "{sql:?}");
+            assert_eq!(tsql_route(sql, false), TsqlRoute::Rpc, "{sql:?}");
         }
     }
 
