@@ -1123,6 +1123,12 @@ async fn postgres_capped_read_with_a_write_the_gate_cannot_see_keeps_it() {
     // may be cut off at the cap — but never by closing the connection, which
     // aborted the statement. The rest is read in the background before the
     // connection closes, and the statement commits, as capped reads always did.
+    //
+    // Each row carries 2 KB, so the 20,000 rows come to about 40 MB, far more
+    // than the socket buffers between client and server hold: the server
+    // cannot finish the statement before the client has read most of it.
+    // With small rows it could — 20,000 integers fit in the buffers whole —
+    // and a close that skipped the read kept every write about half the time.
     let Some(url) = pg_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pool.execute("DROP FUNCTION IF EXISTS capped_bump(integer)")
@@ -1135,8 +1141,8 @@ async fn postgres_capped_read_with_a_write_the_gate_cannot_see_keeps_it() {
         .await
         .unwrap();
     pool.execute(
-        "CREATE FUNCTION capped_bump(i integer) RETURNS integer LANGUAGE sql \
-         AS 'INSERT INTO capped_side VALUES (i) RETURNING a'",
+        "CREATE FUNCTION capped_bump(i integer) RETURNS text LANGUAGE sql \
+         AS 'INSERT INTO capped_side VALUES (i) RETURNING repeat(''x'', 2000)'",
     )
     .await
     .unwrap();
