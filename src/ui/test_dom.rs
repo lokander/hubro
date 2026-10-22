@@ -141,3 +141,15 @@ pub(crate) fn ui_sources() -> Vec<(Vec<String>, String)> {
     assert!(out.len() > 10, "src/ui was not found: {}", root.display());
     out
 }
+
+/// `source` with comment lines dropped and each line's whitespace
+/// collapsed: one entry per remaining line. A source-reading assertion
+/// matches against these, so a comment can neither satisfy nor trip it and a
+/// rustfmt reflow is not a failure.
+pub(crate) fn code_lines(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty() && !line.starts_with("//"))
+        .collect()
+}

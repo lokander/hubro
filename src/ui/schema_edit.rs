@@ -33,7 +33,7 @@ use crate::db::{
     TableMeta, NOTHING_TO_RUN,
 };
 
-use super::notice::{Banner, BannerKind};
+use super::notice::{Banner, BannerKind, Overlay, OverlayAlign};
 use super::state::{after_edit, AppState, SchemaEditRequest, TableRef};
 use super::text_field::{TextArea, TextInput};
 
@@ -287,21 +287,14 @@ pub fn SchemaEditDialog(
     };
 
     rsx! {
-        div {
-            // A modal over the app: see `js::MODAL_ATTR`.
-            "data-dv-modal": "true",
-            class: "fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4 outline-none",
-            tabindex: "-1",
-            onmounted: super::js::focus_on_mount,
-            onkeydown: move |evt: KeyboardEvent| {
-                if evt.code() == Code::Escape {
-                    evt.stop_propagation();
-                    on_close.call(());
-                }
-            },
+        // A backdrop click does not dismiss: the dialog holds the change
+        // being drafted, and possibly a hand-edited statement.
+        Overlay {
+            on_close,
+            dismiss_on_backdrop: false,
+            align: OverlayAlign::Top,
             div {
                 class: "w-full max-w-2xl rounded-lg bg-white dark:bg-slate-900 p-4 shadow-xl",
-                onclick: move |evt| evt.stop_propagation(),
                 div { class: "mb-3 flex items-baseline justify-between gap-2",
                     h2 { class: "text-sm font-semibold text-slate-900 dark:text-slate-100",
                         "{op().label()}"

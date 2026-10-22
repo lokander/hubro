@@ -14,7 +14,7 @@ use super::connections::ConnectionsScreen;
 use super::editor::SqlEditor;
 use super::grid::DataGrid;
 use super::icons::BackendIcon;
-use super::notice::{Banner, BannerKind};
+use super::notice::{Banner, BannerKind, Overlay, OverlayAlign};
 use super::schema::SchemaPane;
 use super::schema_edit::SchemaEditLine;
 use super::sidebar::SchemaSidebar;
@@ -58,7 +58,6 @@ const GLOBAL_KEYS_JS: &str = r#"
     }
     if (typing(el)) return;
     if (e.key === '?') { e.preventDefault(); dioxus.send('cheatsheet'); return; }
-    if (e.key === 'Escape') { dioxus.send('escape'); return; }
     if (e.key === '/') {
       const f = document.getElementById('dv-filter');
       if (f) { e.preventDefault(); f.focus(); }
@@ -126,7 +125,6 @@ pub fn Shell() -> Element {
             while let Ok(msg) = channel.recv::<String>().await {
                 match msg.as_str() {
                     "cheatsheet" => state.toggle_cheatsheet(),
-                    "escape" => state.close_cheatsheet(),
                     "pane" => state.toggle_active_pane(),
                     "rowdetail" => state.toggle_row_detail(),
                     _ => {}
@@ -239,10 +237,13 @@ fn QuitConfirmDialog() -> Element {
     let mut state = use_context::<AppState>();
     let window = use_window();
     rsx! {
-        div {
-            // A modal over the app: see `js::MODAL_ATTR`.
-            "data-dv-modal": "true",
-            class: "fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4",
+        // Escape cancels, the same as the Cancel button: it keeps the edits
+        // and the window. A backdrop click does not — a decision about
+        // unsaved work is not one to make by missing a button.
+        Overlay {
+            on_close: move |_| state.confirm_quit.set(false),
+            dismiss_on_backdrop: false,
+            align: OverlayAlign::Center,
             div { class: "w-full max-w-md rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 p-5 shadow-xl",
                 h2 { class: "text-base font-semibold text-slate-900 dark:text-slate-100",
                     "Discard unsaved changes?"
@@ -457,22 +458,17 @@ fn ShortcutGroup(title: &'static str, children: Element) -> Element {
 }
 
 /// The `?` shortcut cheatsheet: a modal overlay grouping every
-/// keybinding, dismissed by Escape (handled by the global listener), a click
-/// on the backdrop, or `?` again. Kept in sync by hand with the actual
+/// keybinding, dismissed by Escape, a click on the backdrop, or `?` again. Kept in sync by hand with the actual
 /// bindings in [`GLOBAL_KEYS_JS`] and the grid's key handler.
 #[component]
 fn Cheatsheet() -> Element {
     let state = use_context::<AppState>();
     rsx! {
-        // Backdrop: a click anywhere outside the panel closes.
-        div {
-            // A modal over the app: see `js::MODAL_ATTR`.
-            "data-dv-modal": "true",
-            class: "fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4",
-            onclick: move |_| state.close_cheatsheet(),
+        Overlay {
+            on_close: move |_| state.close_cheatsheet(),
+            dismiss_on_backdrop: true,
+            align: OverlayAlign::Center,
             div {
-                // Stop clicks inside the panel from reaching the backdrop.
-                onclick: move |evt| evt.stop_propagation(),
                 class: "max-h-[85vh] w-full max-w-lg overflow-y-auto rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 p-5 shadow-xl",
                 div { class: "mb-4 flex items-center justify-between",
                     h2 { class: "text-lg font-semibold text-slate-900 dark:text-slate-100",
@@ -760,6 +756,21 @@ mod tests {
         assert!(!accel_held(Modifiers::SHIFT));
         assert!(!accel_held(Modifiers::ALT));
         assert!(!accel_held(Modifiers::empty()));
+    }
+
+    /// The window listener has no Escape action: every Escape belongs to the
+    /// `Overlay` that holds focus. A global one sees the same key as the
+    /// overlay's own handler (`stop_propagation` does not reach the real
+    /// event), so one Escape would close two things — the cheatsheet and the
+    /// form under it, say.
+    #[test]
+    fn the_window_listener_leaves_escape_to_the_overlays() {
+        for line in GLOBAL_KEYS_JS
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+        {
+            assert!(!line.contains("Escape"), "a window Escape action: {line}");
+        }
     }
 
     /// The window-level shortcuts follow the same rule as [`accel_held`]:

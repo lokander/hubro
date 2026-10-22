@@ -37,7 +37,7 @@ use crate::db::{
     SourceField, SourceFormat, SourcePreview, TableMeta,
 };
 
-use super::notice::{Banner, BannerKind};
+use super::notice::{Banner, BannerKind, Overlay, OverlayAlign};
 use super::state::{AppState, ImportRequest};
 
 /// How many records the preview reads. Enough to show the shape of the file
@@ -164,24 +164,14 @@ pub fn ImportDialog(
     let armed = confirms && confirmed.read().is_some();
 
     rsx! {
-        div {
-            // A modal over the app: see `js::MODAL_ATTR`.
-            "data-dv-modal": "true",
-            class: "fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4 outline-none",
-            // Focused on mount so Escape works before anything is clicked,
-            // matching the connect form (the window key listener ignores
-            // keys while a field is focused).
-            tabindex: "-1",
-            onmounted: super::js::focus_on_mount,
-            onkeydown: move |evt: KeyboardEvent| {
-                if evt.code() == Code::Escape {
-                    evt.stop_propagation();
-                    on_close.call(());
-                }
-            },
+        // A backdrop click does not dismiss: the dialog holds the column
+        // mapping and options the user has set up.
+        Overlay {
+            on_close,
+            dismiss_on_backdrop: false,
+            align: OverlayAlign::Top,
             div {
                 class: "w-full max-w-3xl rounded-lg bg-white dark:bg-slate-900 p-4 shadow-xl",
-                onclick: move |evt| evt.stop_propagation(),
                 div { class: "mb-3 flex items-baseline justify-between gap-2",
                     h2 { class: "text-sm font-semibold text-slate-900 dark:text-slate-100",
                         "Import into {table.name}"

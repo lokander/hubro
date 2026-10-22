@@ -18,7 +18,7 @@ use crate::db::{engine_has_read_only_mode, Dialect, WriteProtection};
 
 use super::icons::BackendIcon;
 use super::js::focus_on_mount;
-use super::notice::{Banner, BannerKind, EmptyState, Spinner};
+use super::notice::{Banner, BannerKind, EmptyState, Overlay, OverlayAlign, Spinner};
 use super::state::{ActiveView, AppState, ConnectStep, ServerBackend};
 use super::text_field::TextInput;
 
@@ -466,26 +466,11 @@ enum ConnectForm {
     Edit(Box<SavedConnection>),
 }
 
-/// Modal shell for the add-connection forms. Follows the app's
-/// overlay pattern (`fixed inset-0 z-50`, dimmed backdrop, centered panel)
-/// with two deliberate differences from the stateless overlays (cheatsheet,
-/// cell viewer):
+/// Modal shell for the add-connection forms: an [`Overlay`] that a backdrop
+/// click does not dismiss, since these panels hold a half-typed connection —
+/// only Escape or an explicit Cancel/✕ closes them.
 ///
-/// - **A backdrop click does not dismiss.** These panels hold a half-typed
-///   connection, so only Escape or an explicit Cancel/✕ closes them.
-/// - **Escape is handled here, not by [`GLOBAL_KEYS_JS`].** That listener
-///   ignores keys while a text field has focus, which is most of the time in
-///   this form, so it would never fire for the modal. The keydown bubbles
-///   from the fields to this container instead.
-///
-/// Note that the same Escape still reaches `GLOBAL_KEYS_JS`:
-/// `dioxus-desktop` 0.7.9 (unchanged in 0.7.10) serializes only `preventDefault` back to the
-/// interpreter, so `stop_propagation` on a synthetic event does not stop the
-/// real one. Harmless here — the only global Escape action is
-/// `close_cheatsheet`, which no-ops unless the cheatsheet is open — and the
-/// call below documents the intent for when that changes.
-///
-/// The overlay scrolls (`overflow-y-auto` with the panel's `my-auto` margins
+/// Top-aligned ([`OverlayAlign::Top`], with the panel's `my-auto` margins
 /// collapsing on overflow) so the tall forms (auth plus SSH tunnel) stay
 /// reachable in a small window without clipping at the top.
 #[component]
@@ -499,22 +484,10 @@ fn ConnectFormModal(
     children: Element,
 ) -> Element {
     rsx! {
-        div {
-            // A modal over the app: see `js::MODAL_ATTR`.
-            "data-dv-modal": "true",
-            class: "fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4 outline-none",
-            // Focused on mount so Escape works before the user clicks into a
-            // field; keydowns from the fields bubble here either way.
-            tabindex: "-1",
-            onmounted: focus_on_mount,
-            onkeydown: move |evt: KeyboardEvent| {
-                if evt.code() == Code::Escape {
-                    // Intent only — see the note above on why this does not
-                    // actually stop the window listener today.
-                    evt.stop_propagation();
-                    on_close.call(());
-                }
-            },
+        Overlay {
+            on_close,
+            dismiss_on_backdrop: false,
+            align: OverlayAlign::Top,
             div { class: "my-auto w-full max-w-xl",
                 div { class: "flex justify-end",
                     button {
