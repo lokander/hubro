@@ -909,7 +909,7 @@ pub async fn run_import(
     let per_batch = batch_rows(dialect, planned.len());
 
     let mut tx = pool
-        .begin_script_tx()
+        .begin_pooled_tx()
         .await
         .map_err(|e| ImportError::at(None, e.to_string()))?;
     let mut report = ImportReport::default();
