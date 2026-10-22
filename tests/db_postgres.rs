@@ -2232,6 +2232,120 @@ async fn postgres_a_key_read_as_text_still_sorts_by_its_type() {
 }
 
 #[tokio::test]
+async fn postgres_a_scripts_datestyle_never_respells_a_key_for_another_session() {
+    // A key read through `::text` is spelled by the session that read it and
+    // parsed back by the session that writes. A script's `SET` used to stay
+    // on its pooled connection: measured, `[2024-02-01,2024-02-03)` read
+    // under `SQL, DMY` as `[01/02/2024,03/02/2024)`, which another session
+    // under `ISO, MDY` parses as January 2 to March 2 — exactly one other
+    // row, so the one-row guard passed and the save landed there. A script's
+    // connection now closes after its run, so no pooled session carries the
+    // script's settings, and the read and the write agree.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres_two_sessions(&url).await.unwrap();
+    for sql in [
+        "DROP TABLE IF EXISTS style_keys",
+        "CREATE TABLE style_keys (k daterange PRIMARY KEY, v text, tag text)",
+        "INSERT INTO style_keys VALUES \
+         ('[2024-02-01,2024-02-03)', 'feb', 't'), ('[2024-01-02,2024-03-02)', 'jan', 't')",
+    ] {
+        pool.query(sql).await.unwrap();
+    }
+    // Both ways a script runs: a lone statement on a held connection (the
+    // sequential path, which closes it explicitly), and several in hubro's
+    // transaction (the atomic one, whose committed `SET` outlives the
+    // transaction, and whose connection closes as the transaction drops it).
+    let caps = pool.backend_capabilities();
+    for script in [
+        vec!["SET datestyle = 'SQL, DMY'".to_string()],
+        vec![
+            "SET datestyle = 'SQL, DMY'".to_string(),
+            "SELECT 1".to_string(),
+        ],
+    ] {
+        let mut results = Vec::new();
+        run_script(&pool, caps, &script, |r| results.push(r))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), script.len(), "the script ran");
+    }
+
+    // Every session the pool holds: two reads kept open at once cannot share
+    // a connection on a pool of two.
+    let style = "SELECT current_setting('DateStyle'), pg_sleep(0.3)::text";
+    let (a, b) = tokio::join!(pool.query(style), pool.query(style));
+    for session in [a.unwrap(), b.unwrap()] {
+        assert_eq!(
+            session.rows[0][0],
+            Value::Text("ISO, MDY".into()),
+            "a pooled session kept the script's DateStyle"
+        );
+    }
+
+    // And end to end: the `feb` row is read, re-addressed and saved, and
+    // only it changes — several rounds, so reads and writes fall on both
+    // sessions.
+    let table = pool
+        .introspect()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == "style_keys")
+        .unwrap();
+    let identity = detect_row_identity(&table, pool.dialect()).unwrap();
+    let access = pool.backend_access(&table);
+    let request = PageRequest {
+        schema: table.schema.clone(),
+        table: table.name.clone(),
+        limit: 10,
+        offset: 0,
+        sort: None,
+        filter: None,
+        extra_key_column: None,
+    };
+    for round in 0..6 {
+        let page = pool
+            .fetch_page_bounded(&request, &table.columns, &["k"])
+            .await
+            .unwrap();
+        let feb = page
+            .result
+            .rows
+            .iter()
+            .find(|row| row[1] == Value::Text("feb".into()))
+            .unwrap();
+        let change = StagedChange::Update {
+            locator: RowLocator {
+                identity_values: vec![feb[0].clone()],
+            },
+            column: "tag".into(),
+            value: Value::Text(format!("edited {round}")),
+        };
+        apply_staged(&pool, &access, &table, &identity, &[change])
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: {e}"));
+        let tags = pool
+            .query("SELECT v, tag FROM style_keys ORDER BY v")
+            .await
+            .unwrap();
+        assert_eq!(
+            tags.rows,
+            [
+                vec![
+                    Value::Text("feb".into()),
+                    Value::Text(format!("edited {round}"))
+                ],
+                vec![Value::Text("jan".into()), Value::Text("t".into())],
+            ],
+            "round {round}: the save landed on the wrong row"
+        );
+    }
+
+    pool.query("DROP TABLE style_keys").await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn postgres_every_key_type_jumps_to_the_row_it_references() {
     // A foreign-key jump pins the referenced row from the source row's own
     // typed values, so it is the same question as re-addressing a row: a

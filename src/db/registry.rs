@@ -599,6 +599,16 @@ impl DbPool {
         ))
     }
 
+    /// Connects to a Postgres URL on a pool of exactly two connections. The app
+    /// never opens this either; a test of state that differs *between*
+    /// sessions needs it, so that two acquires held at once are certain to
+    /// cover every connection the pool has.
+    pub async fn open_postgres_two_sessions(url: &str) -> Result<DbPool, DbError> {
+        Ok(DbPool::Postgres(
+            postgres::open_postgres_sized(url, 2).await?,
+        ))
+    }
+
     /// Connects to a SQL Server URL (password already spliced in if any).
     pub async fn open_mssql(url: &str) -> Result<DbPool, DbError> {
         Ok(DbPool::SqlServer(sqlserver::open_mssql(url).await?))
