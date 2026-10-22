@@ -1639,7 +1639,13 @@ pub async fn finish_script_conn_with_read(
         Ok((result, truncated, abandoned)) if truncated || abandoned => {
             held.discard();
             FinishedRead {
-                read: Ok(Capped::from((result, truncated))),
+                // Ended with its connection: whatever its rest would have
+                // done is not done, and the editor says so.
+                read: Ok(Capped {
+                    result,
+                    truncated,
+                    rest_cancelled: truncated,
+                }),
                 ended: Ok(open),
                 after: AfterRead::Close,
             }

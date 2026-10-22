@@ -1222,6 +1222,127 @@ async fn postgres_capped_read_after_a_write_is_read_to_its_end() {
     pool.close().await;
 }
 
+/// How many notifications `listener` receives before half a second passes
+/// without one.
+async fn notifications_delivered(listener: &mut sqlx::postgres::PgListener) -> usize {
+    let mut got = 0;
+    while let Ok(Ok(_)) =
+        tokio::time::timeout(std::time::Duration::from_millis(500), listener.recv()).await
+    {
+        got += 1;
+    }
+    got
+}
+
+// Multi-threaded, as the app's runtime is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_capped_read_cancel_undoes_effects_that_take_no_xid() {
+    // Documented behaviour, not a wish: the cancel is allowed by "no
+    // transaction id", which says nothing of effects that take none, and it
+    // undoes the whole statement — rows before the cap included. A session
+    // setting the read made is gone afterwards, and the notifications it sent
+    // are never delivered. The editor's notice says so. If this fails, the
+    // gate grew a check for these, and the notice and `src/db/CLAUDE.md` are
+    // out of date.
+    let Some(url) = pg_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    for script in [
+        // Atomic.
+        "SELECT set_config('hubro.capped', '1', false), i FROM generate_series(1, 3000000) i; \
+         SELECT current_setting('hubro.capped', true)",
+        // Sequential, outside a transaction.
+        "SELECT set_config('hubro.capped', '1', false), i FROM generate_series(1, 3000000) i; \
+         COMMIT; SELECT current_setting('hubro.capped', true)",
+    ] {
+        let (results, outcome) = collect_promptly(&pool, script).await;
+        assert_eq!(outcome, Ok(ScriptDone::default()), "{script}");
+        assert!(
+            results[0].truncated && results[0].rest_cancelled,
+            "{script}"
+        );
+        match &results.last().unwrap().outcome {
+            StatementOutcome::Rows(rows) => assert_eq!(
+                rows.rows,
+                vec![vec![Value::Text(String::new())]],
+                "{script}: the setting outlived the cancel"
+            ),
+            other => panic!("{script}: {other:?}"),
+        }
+    }
+
+    let mut listener = sqlx::postgres::PgListener::connect(&url).await.unwrap();
+    listener.listen("hubro_capped").await.unwrap();
+    // The control: a notification from a read the cap does not cut short is
+    // delivered, so the listener is listening.
+    let (_, outcome) =
+        collect_script(&pool, "SELECT pg_notify('hubro_capped', 'x'); SELECT 1").await;
+    assert_eq!(outcome, Ok(ScriptDone::default()));
+    assert_eq!(notifications_delivered(&mut listener).await, 1);
+    for script in [
+        "SELECT pg_notify('hubro_capped', i::text), i FROM generate_series(1, 1500000) i; SELECT 1",
+        "SELECT pg_notify('hubro_capped', i::text), i FROM generate_series(1, 1500000) i; COMMIT",
+    ] {
+        let (results, outcome) = collect_promptly(&pool, script).await;
+        assert_eq!(outcome, Ok(ScriptDone::default()), "{script}");
+        assert!(results[0].rest_cancelled, "{script}");
+        assert_eq!(notifications_delivered(&mut listener).await, 0, "{script}");
+    }
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_capped_read_failing_past_the_cap_reports_its_error() {
+    // A read that has written is read to its end, and a failure past the cap
+    // — here a unique violation at row 15,000 of a function's inserts — is the
+    // read's, with nothing kept. Read in the background before, as the last
+    // statement, the same failure rolled the writes back while the run
+    // reported a successful truncated read.
+    let Some(url) = pg_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.execute("DROP FUNCTION IF EXISTS capped_unique(integer)")
+        .await
+        .unwrap();
+    pool.execute("DROP TABLE IF EXISTS capped_unique_side")
+        .await
+        .unwrap();
+    pool.execute("CREATE TABLE capped_unique_side (a integer UNIQUE)")
+        .await
+        .unwrap();
+    pool.execute(
+        "CREATE FUNCTION capped_unique(i integer) RETURNS integer LANGUAGE sql AS \
+         'INSERT INTO capped_unique_side VALUES (CASE WHEN i = 15000 THEN 1 ELSE i END) \
+          RETURNING a'",
+    )
+    .await
+    .unwrap();
+    let read = "SELECT capped_unique(g) FROM generate_series(1, 20000) g";
+    for script in [
+        // Last: the read and the end of the run.
+        read.to_string(),
+        // Before another statement, atomic and sequential.
+        format!("{read}; SELECT 1"),
+        format!("{read}; COMMIT"),
+    ] {
+        let (_, outcome) = collect_script(&pool, &script).await;
+        let error = outcome.expect_err(&format!("{script}: reported as a success"));
+        assert_eq!(error.statement_index, 0, "{script}");
+        assert!(
+            error.error.to_string().contains("capped_unique_side"),
+            "{script}: {error:?}"
+        );
+        assert_eq!(
+            count(&pool, "SELECT count(*) FROM capped_unique_side").await,
+            Value::Integer(0),
+            "{script}"
+        );
+    }
+    pool.execute("DROP FUNCTION capped_unique(integer)")
+        .await
+        .unwrap();
+    pool.execute("DROP TABLE capped_unique_side").await.unwrap();
+    pool.close().await;
+}
+
 #[test]
 fn postgres_reading_the_rest_of_a_capped_read_leaves_the_thread_to_others() {
     // The SQL tab's run is polled on the UI thread, beside everything else on
@@ -1329,8 +1450,8 @@ async fn postgres_capped_row_returning_write_keeps_its_write() {
 async fn postgres_capped_read_with_a_write_the_gate_cannot_see_keeps_it() {
     // `SELECT f()` for a function that writes looks like a plain read, so it
     // may be cut off at the cap — but never by closing the connection, which
-    // aborted the statement. The rest is read in the background before the
-    // connection closes, and the statement commits, as capped reads always did.
+    // aborted the statement, and never by a cancel, since it has written. The
+    // rest is read to its end, and the statement commits.
     //
     // Each row carries 2 KB, so the 20,000 rows come to about 40 MB, far more
     // than the socket buffers between client and server hold: the server
