@@ -859,7 +859,8 @@ async fn read_first_result_set<S: RowSink>(
 /// Runs a parameterized non-row statement via the driver's RPC path,
 /// returning every affected-row count its response carried, in arrival order:
 /// one per statement the server ran on its behalf that sent one (none does
-/// under `NOCOUNT ON`), *triggers included*. Read it with [`statement_rows`] or [`script_rows_affected`], and say which.
+/// under `NOCOUNT ON`), *triggers included*. Read it with [`statement_rows`]
+/// or [`script_rows_affected`], and say which.
 async fn run_execute(
     client: &mut TdsClient,
     sql: &str,
@@ -948,7 +949,8 @@ async fn run_statement(
 /// kinds to itself (`ExecuteResult` is a bare `Vec<u64>`; `TokenDone` is not
 /// exported), and they would not help: through `sp_executesql` every count
 /// is a `DONEINPROC`, the statement's own and its triggers' alike. So no rule
-/// over the counts can tell the statement's rows from its triggers'.
+/// over the counts can tell the statement's rows from its triggers' — except
+/// where the others add nothing.
 ///
 /// - **None**: [`RowsAffected::Unreported`]. Measured, a statement run under
 ///   `SET NOCOUNT ON` — `SET NOCOUNT ON` itself included — sends no count at
@@ -960,14 +962,22 @@ async fn run_statement(
 ///   `INSERT` whose trigger wrote two more rows elsewhere — the statement's
 ///   own row. The one way the count is not the statement's is a statement
 ///   under its own `NOCOUNT ON` whose trigger turns it off.
-/// - **Several**: [`RowsAffected::Summed`], their sum, which the result line
-///   says may hold trigger rows. Measured, `[3, 1]` for an `INSERT` of one
-///   row whose trigger wrote three. Zeros from statements that count nothing
-///   are among them and change nothing.
+/// - **Several, all but the last 0**: [`RowsAffected::Exact`], the last.
+///   Measured, the common trigger guard `IF @@ROWCOUNT = 0 RETURN` sends a 0
+///   of its own before the trigger's `SET NOCOUNT ON`, so a one-row `INSERT`
+///   came back `[0, 1]`. The zeros add nothing to any sum, and the last count
+///   is the statement's own ([`statement_rows`] rests on the same order), so
+///   the number is both.
+/// - **Several otherwise**: [`RowsAffected::Summed`], their sum, which the
+///   result line says may hold trigger rows. Measured, `[3, 1]` for an
+///   `INSERT` of one row whose trigger wrote three — and `[3, 0]` for an
+///   `UPDATE` matching nothing whose trigger wrote three anyway, which is
+///   why only the zeros *before* the last count can be set aside, not every
+///   zero.
 fn script_rows_affected(counts: &[u64]) -> RowsAffected {
     match counts {
         [] => RowsAffected::Unreported,
-        [only] => RowsAffected::Exact(*only),
+        [before @ .., last] if before.iter().all(|&n| n == 0) => RowsAffected::Exact(*last),
         several => RowsAffected::Summed(several.iter().sum()),
     }
 }
@@ -2089,7 +2099,21 @@ mod tests {
             (
                 "two creates in one statement",
                 &[0, 0],
-                RowsAffected::Summed(0),
+                RowsAffected::Exact(0),
+            ),
+            // A trigger's `IF @@ROWCOUNT = 0 RETURN` guard sends a 0 that adds
+            // nothing: the count is the statement's own.
+            (
+                "an insert whose guarded NOCOUNT trigger wrote two rows",
+                &[0, 1],
+                RowsAffected::Exact(1),
+            ),
+            // The last count is the statement's 0, and the trigger's 3 is
+            // still in the number: a sum, not "0 rows affected".
+            (
+                "an update matching nothing whose trigger wrote three",
+                &[3, 0],
+                RowsAffected::Summed(3),
             ),
             // Not 0: rows may have changed with nothing said about them.
             ("SET NOCOUNT ON", &[], RowsAffected::Unreported),
