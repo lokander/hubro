@@ -10,16 +10,17 @@
 //! so makes the SQL pane push the text in; a `setDoc` here as well would be a
 //! second way to do the same thing, and the one to fall behind.
 
+use std::future::Future;
+
 use chrono::{DateTime, Local};
 use dioxus::prelude::*;
 
 use crate::db::ConnectionId;
-use crate::history::{HistoryEntry, HISTORY_CAP};
+use crate::history::{HistoryEntry, HistoryStore, HISTORY_CAP};
 
 use super::js::write_clipboard;
-use super::notice::{Banner, BannerKind, LoadingLine};
+use super::notice::{Banner, BannerKind, ConfirmInline, LoadingLine, SearchBox, SidePanel};
 use super::state::AppState;
-use super::text_field::TextInput;
 
 /// Cap on entries the history panel fetches per query. Matches the store's
 /// retention cap so every persisted entry is reachable by scrolling, not only
@@ -32,10 +33,9 @@ const HISTORY_PANEL_LIMIT: i64 = HISTORY_CAP;
 #[component]
 pub(super) fn HistoryPanel(id: ConnectionId, buffer: u64) -> Element {
     let state = use_context::<AppState>();
-    // The controlled input; `search` only follows it on Enter (or when the
-    // input is cleared) so each keystroke doesn't hit the database.
-    let mut search_input = use_signal(String::new);
-    let mut search = use_signal(String::new);
+    // The committed filter; the search box sets it on Enter, so each
+    // keystroke doesn't hit the database.
+    let search = use_signal(String::new);
     let mut confirm_clear = use_signal(|| false);
     let store_ready = state.history.read().is_some();
     let history_error = state.history_error.read().clone();
@@ -43,105 +43,22 @@ pub(super) fn HistoryPanel(id: ConnectionId, buffer: u64) -> Element {
     let record_error = record_error_signal.read().clone();
     let recording = *state.history_recording.read();
 
-    let entries = use_resource(move || {
-        // Reactive dependencies, all cloned out before the await.
-        let store = state.history.read().clone();
-        let _refresh = *state.history_nonce.read();
-        let needle = search.read().clone();
-        let locator = state
-            .open_locators
-            .read()
-            .iter()
-            .find(|(open_id, _)| *open_id == id)
-            .map(|(_, locator)| locator.clone());
-        async move {
-            let (Some(store), Some(locator)) = (store, locator) else {
-                return Ok(Vec::new());
-            };
+    let entries = use_store_query(
+        id,
+        state.history_nonce,
+        search,
+        |store, locator, needle| async move {
             store
                 .list(&locator, Some(&needle), HISTORY_PANEL_LIMIT)
                 .await
-        }
-    });
+        },
+    );
     rsx! {
-        aside { class: "flex w-80 shrink-0 flex-col border-l border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/50",
-            div { class: "border-b border-slate-200 dark:border-slate-800 p-2",
-                TextInput {
-                    class: "w-full rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 text-xs text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600",
-                    placeholder: "Search history (Enter)",
-                    text: "{search_input}",
-                    oninput: move |evt: FormEvent| {
-                        let value = evt.value();
-                        // Clearing the box resets the filter immediately.
-                        if value.trim().is_empty() {
-                            search.set(String::new());
-                        }
-                        search_input.set(value);
-                    },
-                    onkeydown: move |evt: KeyboardEvent| {
-                        if evt.key() == Key::Enter {
-                            search.set(search_input.peek().clone());
-                        }
-                    },
-                }
-            }
-            div { class: "min-h-0 flex-1 overflow-y-auto",
-                // A failed write for a completed run: warn without hiding
-                // the still-readable list.
-                if let Some(err) = record_error {
-                    div { class: "p-2",
-                        Banner {
-                            kind: BannerKind::Warning,
-                            message: err,
-                            on_dismiss: move |_| record_error_signal.set(None),
-                        }
-                    }
-                }
-                if let Some(err) = history_error {
-                    div { class: "p-2",
-                        Banner { kind: BannerKind::Warning, message: format!("History is unavailable: {err}") }
-                    }
-                } else if !store_ready {
-                    LoadingLine { label: "Opening history…" }
-                } else {
-                    // Matched on the borrow, not a clone: up to HISTORY_CAP
-                    // entries would otherwise be deep-copied on every render
-                    // (each search keystroke). Only the rendered rows clone,
-                    // because HistoryRow needs owned props.
-                    match &*entries.read() {
-                        None => rsx! {
-                            LoadingLine { label: "Loading…" }
-                        },
-                        Some(Err(err)) => rsx! {
-                            div { class: "p-2",
-                                Banner { kind: BannerKind::Warning, message: format!("History query failed: {err}") }
-                            }
-                        },
-                        Some(Ok(entries)) if entries.is_empty() => rsx! {
-                            p { class: "px-3 py-2 text-xs text-slate-500",
-                                if search.read().trim().is_empty() {
-                                    "No queries recorded yet."
-                                } else {
-                                    "No matches."
-                                }
-                            }
-                        },
-                        Some(Ok(entries)) => rsx! {
-                            ul { class: "divide-y divide-slate-200 dark:divide-slate-800/60",
-                                for entry in entries.iter() {
-                                    HistoryRow {
-                                        key: "{entry.id}",
-                                        id,
-                                        buffer,
-                                        entry: entry.clone(),
-                                    }
-                                }
-                            }
-                        },
-                    }
-                }
-            }
-            div { class: "flex flex-col gap-2 border-t border-slate-200 dark:border-slate-800 p-2",
+        SidePanel {
+            header: rsx! {
+                SearchBox { placeholder: "Search history (Enter)", search }
+            },
+            footer: rsx! {
                 label { class: "flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
                     input {
                         r#type: "checkbox",
@@ -152,21 +69,14 @@ pub(super) fn HistoryPanel(id: ConnectionId, buffer: u64) -> Element {
                     "Record executed queries"
                 }
                 if confirm_clear() {
-                    div { class: "flex items-center gap-2",
-                        span { class: "text-xs text-amber-700 dark:text-amber-300", "Clear this connection's history?" }
-                        button {
-                            class: "rounded bg-amber-600 px-2 py-0.5 text-xs font-semibold text-slate-950 hover:bg-amber-500",
-                            onclick: move |_| {
-                                state.clear_history(id);
-                                confirm_clear.set(false);
-                            },
-                            "Clear"
-                        }
-                        button {
-                            class: "rounded border border-slate-400 dark:border-slate-600 px-2 py-0.5 text-xs text-slate-900 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
-                            onclick: move |_| confirm_clear.set(false),
-                            "Keep"
-                        }
+                    ConfirmInline {
+                        prompt: "Clear this connection's history?".to_string(),
+                        confirm_label: "Clear",
+                        on_confirm: move |_| {
+                            state.clear_history(id);
+                            confirm_clear.set(false);
+                        },
+                        on_cancel: move |_| confirm_clear.set(false),
                     }
                 } else {
                     button {
@@ -176,9 +86,98 @@ pub(super) fn HistoryPanel(id: ConnectionId, buffer: u64) -> Element {
                         "Clear history"
                     }
                 }
+            },
+            // A failed write for a completed run: warn without hiding
+            // the still-readable list.
+            if let Some(err) = record_error {
+                div { class: "p-2",
+                    Banner {
+                        kind: BannerKind::Warning,
+                        message: err,
+                        on_dismiss: move |_| record_error_signal.set(None),
+                    }
+                }
+            }
+            if let Some(err) = history_error {
+                div { class: "p-2",
+                    Banner { kind: BannerKind::Warning, message: format!("History is unavailable: {err}") }
+                }
+            } else if !store_ready {
+                LoadingLine { label: "Opening history…" }
+            } else {
+                // Matched on the borrow, not a clone: up to HISTORY_CAP
+                // entries would otherwise be deep-copied on every render
+                // (each search keystroke). Only the rendered rows clone,
+                // because HistoryRow needs owned props.
+                match &*entries.read() {
+                    None => rsx! {
+                        LoadingLine { label: "Loading…" }
+                    },
+                    Some(Err(err)) => rsx! {
+                        div { class: "p-2",
+                            Banner { kind: BannerKind::Warning, message: format!("History query failed: {err}") }
+                        }
+                    },
+                    Some(Ok(entries)) if entries.is_empty() => rsx! {
+                        p { class: "px-3 py-2 text-xs text-slate-500",
+                            if search.read().trim().is_empty() {
+                                "No queries recorded yet."
+                            } else {
+                                "No matches."
+                            }
+                        }
+                    },
+                    Some(Ok(entries)) => rsx! {
+                        ul { class: "divide-y divide-slate-200 dark:divide-slate-800/60",
+                            for entry in entries.iter() {
+                                HistoryRow {
+                                    key: "{entry.id}",
+                                    id,
+                                    buffer,
+                                    entry: entry.clone(),
+                                }
+                            }
+                        }
+                    },
+                }
             }
         }
     }
+}
+
+/// The list behind a history-store side panel (history, saved queries): runs
+/// `query` with the store, the connection's locator and the committed search,
+/// and again whenever the store opens, `nonce` is bumped or `search` changes.
+/// Empty rather than an error while the store is not open yet or the
+/// connection has no locator; the panels say "Opening…" for the first from
+/// state of their own.
+pub(super) fn use_store_query<T, Fut>(
+    id: ConnectionId,
+    nonce: Signal<u64>,
+    search: Signal<String>,
+    query: impl Fn(HistoryStore, String, String) -> Fut + 'static,
+) -> Resource<Result<Vec<T>, String>>
+where
+    T: 'static,
+    Fut: Future<Output = Result<Vec<T>, String>> + 'static,
+{
+    let state = use_context::<AppState>();
+    use_resource(move || {
+        // Reactive dependencies, all read before the await.
+        let store = state.history.read().clone();
+        let _refresh = *nonce.read();
+        let needle = search.read().clone();
+        let pending = match (store, state.connection_locator(id)) {
+            (Some(store), Some(locator)) => Some(query(store, locator, needle)),
+            _ => None,
+        };
+        async move {
+            match pending {
+                Some(pending) => pending.await,
+                None => Ok(Vec::new()),
+            }
+        }
+    })
 }
 
 /// One history entry: status dot, local-time stamp, one-line SQL preview

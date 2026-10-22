@@ -8,12 +8,13 @@
 //! the app uses, so both themes stay legible.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dioxus::prelude::*;
 use dioxus_icons::lucide::{Info, TriangleAlert, X};
 
-use super::js::take_overlay_focus;
+use super::js::{focus_on_mount, take_overlay_focus};
+use super::text_field::TextInput;
 use crate::db::TableKind;
 
 /// The severity of a [`Banner`], picking its icon and color scheme.
@@ -285,13 +286,129 @@ pub fn Overlay(
     }
 }
 
+/// How long a [`ConfirmInline`]'s confirm button ignores clicks after the
+/// confirmation appears. Longer than a double-click: the confirmation
+/// replaces the button that armed it, and a confirm button that happened to
+/// land under the pointer would otherwise take a double-click's second click
+/// (the saved-queries panel's "Delete for good" sat exactly where "Delete"
+/// had been).
+pub(crate) const CONFIRM_ARM_DELAY: Duration = Duration::from_millis(500);
+
+/// Whether a confirm click arriving `since` the confirmation appeared is
+/// taken. Anything sooner is the click that armed it, repeated.
+fn confirm_accepted(since: Duration) -> bool {
+    since >= CONFIRM_ARM_DELAY
+}
+
+/// The second step of a two-step destructive action: an optional question,
+/// the confirm button, and Keep. The caller owns whether it is armed and
+/// renders this in place of the button that armed it, so a screen can keep
+/// one row armed at a time.
+///
+/// One click never confirms. The confirm button ignores clicks for
+/// [`CONFIRM_ARM_DELAY`] after this mounts, and focus goes to **Keep**, so a
+/// repeating Enter from the arming button lands on the safe choice. Escape
+/// cancels, heard on the wrapper while focus is anywhere inside it. Nothing
+/// disarms it on its own (no blur, no timeout): it stays until answered,
+/// like every confirmation before this component.
+#[component]
+pub fn ConfirmInline(
+    /// The question beside the buttons; `None` when the confirm label says
+    /// it all ("Delete for good").
+    prompt: Option<String>,
+    confirm_label: String,
+    on_confirm: EventHandler<()>,
+    on_cancel: EventHandler<()>,
+) -> Element {
+    let shown_at = use_hook(Instant::now);
+    rsx! {
+        div {
+            class: "flex flex-wrap items-center gap-2",
+            onkeydown: move |evt: KeyboardEvent| {
+                if evt.code() == Code::Escape {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    on_cancel.call(());
+                }
+            },
+            if let Some(prompt) = prompt {
+                span { class: "text-xs text-amber-700 dark:text-amber-300", "{prompt}" }
+            }
+            button {
+                class: "cursor-pointer rounded bg-amber-600 px-2 py-0.5 text-xs font-semibold text-slate-950 hover:bg-amber-500",
+                onclick: move |_| {
+                    if confirm_accepted(shown_at.elapsed()) {
+                        on_confirm.call(());
+                    }
+                },
+                "{confirm_label}"
+            }
+            button {
+                class: "cursor-pointer rounded border border-slate-400 dark:border-slate-600 px-2 py-0.5 text-xs text-slate-900 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
+                onmounted: focus_on_mount,
+                onclick: move |_| on_cancel.call(()),
+                "Keep"
+            }
+        }
+    }
+}
+
+/// A side panel's search field. `search` is the committed filter: it follows
+/// the field only on Enter, or at once when the field is cleared, so a list
+/// backed by a database query is not re-queried on every keystroke.
+#[component]
+pub fn SearchBox(placeholder: String, search: Signal<String>) -> Element {
+    let mut search = search;
+    let mut draft = use_signal(String::new);
+    rsx! {
+        TextInput {
+            class: "w-full rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 text-xs text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600",
+            placeholder,
+            text: "{draft}",
+            oninput: move |evt: FormEvent| {
+                let value = evt.value();
+                // Clearing the box resets the filter immediately.
+                if value.trim().is_empty() {
+                    search.set(String::new());
+                }
+                draft.set(value);
+            },
+            onkeydown: move |evt: KeyboardEvent| {
+                if evt.key() == Key::Enter {
+                    search.set(draft.peek().clone());
+                }
+            },
+        }
+    }
+}
+
+/// The SQL editor's right-hand panel frame (history, saved queries): a fixed
+/// width column with `header` on top, `children` scrolling in the middle and
+/// an optional `footer` pinned at the bottom.
+#[component]
+pub fn SidePanel(header: Element, footer: Option<Element>, children: Element) -> Element {
+    rsx! {
+        aside { class: "flex w-80 shrink-0 flex-col border-l border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/50",
+            div { class: "flex flex-col gap-2 border-b border-slate-200 dark:border-slate-800 p-2",
+                {header}
+            }
+            div { class: "min-h-0 flex-1 overflow-y-auto", {children} }
+            if let Some(footer) = footer {
+                div { class: "flex flex-col gap-2 border-t border-slate-200 dark:border-slate-800 p-2",
+                    {footer}
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::any::Any;
     use std::cell::Cell;
     use std::rc::Rc;
 
-    use dioxus::core::{ElementId, Event, VirtualDom};
+    use dioxus::core::{ElementId, Event, Mutation, VirtualDom};
     use dioxus::html::{
         set_event_converter, Location, Modifiers, PlatformEventData, SerializedHtmlEventConverter,
         SerializedKeyboardData, SerializedMouseData,
@@ -413,6 +530,73 @@ mod tests {
                 "a backdrop click with dismiss_on_backdrop: {dismiss_on_backdrop}"
             );
         }
+    }
+
+    /// An arming button that a [`ConfirmInline`] replaces, counting
+    /// confirmations in a root context cell — the shape of every caller.
+    #[component]
+    fn ConfirmHarness() -> Element {
+        let confirms = use_context::<Rc<Cell<usize>>>();
+        let mut armed = use_signal(|| false);
+        rsx! {
+            if armed() {
+                ConfirmInline {
+                    prompt: "Sure?".to_string(),
+                    confirm_label: "Do it",
+                    on_confirm: move |_| confirms.set(confirms.get() + 1),
+                    on_cancel: move |_| armed.set(false),
+                }
+            } else {
+                button { onclick: move |_| armed.set(true), "arm" }
+            }
+        }
+    }
+
+    /// One click never confirms, run through a real `VirtualDom`: the click
+    /// that arms, repeated onto the confirm button that replaced the arming
+    /// one (a double-click), does nothing; focus goes to Keep, so a repeating
+    /// Enter answers "keep"; Escape cancels; and a deliberate click once the
+    /// delay has passed does confirm.
+    #[test]
+    fn one_click_never_confirms_an_inline_confirmation() {
+        let mut dom = VirtualDom::new(ConfirmHarness);
+        let confirms = Rc::new(Cell::new(0_usize));
+        dom.provide_root_context(confirms.clone());
+        let edits = dom.rebuild_to_vec().edits;
+        let arm = |dom: &mut VirtualDom, edits: &[Mutation]| {
+            let [arm] = listeners(edits, "click")[..] else {
+                panic!("expected the arming button alone: {edits:#?}");
+            };
+            fire(dom, "click", click(), arm);
+            let edits = dom.render_immediate_to_vec().edits;
+            let [confirm, keep] = listeners(&edits, "click")[..] else {
+                panic!("expected confirm and Keep: {edits:#?}");
+            };
+            let [wrapper] = listeners(&edits, "keydown")[..] else {
+                panic!("expected one Escape listener: {edits:#?}");
+            };
+            assert_eq!(
+                listeners(&edits, "mounted"),
+                [keep],
+                "focus should go to Keep, not to the confirm button"
+            );
+            (confirm, wrapper)
+        };
+
+        let (confirm, wrapper) = arm(&mut dom, &edits);
+        fire(&dom, "click", click(), confirm);
+        fire(&dom, "click", click(), confirm);
+        assert_eq!(confirms.get(), 0, "the arming click confirmed");
+
+        fire(&dom, "keydown", key(Key::Escape, Code::Escape), wrapper);
+        let edits = dom.render_immediate_to_vec().edits;
+        assert_eq!(confirms.get(), 0, "Escape confirmed");
+
+        // Escape disarmed it: the arming button is back, and arms afresh.
+        let (confirm, _) = arm(&mut dom, &edits);
+        std::thread::sleep(CONFIRM_ARM_DELAY + Duration::from_millis(50));
+        fire(&dom, "click", click(), confirm);
+        assert_eq!(confirms.get(), 1, "a deliberate click did not confirm");
     }
 
     /// Every modal in the app is an [`Overlay`], and each one's backdrop

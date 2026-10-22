@@ -18,7 +18,9 @@ use crate::db::{engine_has_read_only_mode, Dialect, WriteProtection};
 
 use super::icons::BackendIcon;
 use super::js::focus_on_mount;
-use super::notice::{Banner, BannerKind, EmptyState, Overlay, OverlayAlign, Spinner};
+use super::notice::{
+    Banner, BannerKind, ConfirmInline, EmptyState, Overlay, OverlayAlign, Spinner,
+};
 use super::state::{ActiveView, AppState, ConnectStep, ServerBackend};
 use super::text_field::TextInput;
 
@@ -349,25 +351,18 @@ fn GroupHeader(
             } else if confirm_delete_group() == Some(name.clone()) {
                 // Armed. Deleting a group is not deleting connections, and
                 // the confirmation is where that gets said.
-                div { class: "flex flex-1 flex-wrap items-center gap-2 px-3 py-1.5",
-                    span { class: "text-xs text-amber-700 dark:text-amber-300",
-                        "Delete “{name}”? Its connections stay, ungrouped."
-                    }
-                    button {
-                        class: "cursor-pointer rounded bg-amber-600 px-2 py-0.5 text-xs font-semibold text-slate-950 hover:bg-amber-500",
-                        onclick: {
+                div { class: "flex-1 px-3 py-1.5",
+                    ConfirmInline {
+                        prompt: format!("Delete “{name}”? Its connections stay, ungrouped."),
+                        confirm_label: "Delete",
+                        on_confirm: {
                             let name = name.clone();
                             move |_| {
                                 state.remove_saved_group(&name);
                                 confirm_delete_group.set(None);
                             }
                         },
-                        "Delete"
-                    }
-                    button {
-                        class: "cursor-pointer rounded border border-slate-400 dark:border-slate-600 px-2 py-0.5 text-xs text-slate-900 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
-                        onclick: move |_| confirm_delete_group.set(None),
-                        "Keep"
+                        on_cancel: move |_| confirm_delete_group.set(None),
                     }
                 }
             } else {
@@ -672,26 +667,19 @@ fn SavedConnectionRow(
                     }
                 } else if confirm_remove().as_deref() == Some(row.locator.as_str()) {
                     // Armed: the icons step aside for the
-                    // confirmation, same shape as the editor's
-                    // "Clear this connection's history?".
-                    div { class: "flex items-center gap-2",
-                        span { class: "text-xs text-amber-700 dark:text-amber-300", "Remove?" }
-                        button {
-                            class: "cursor-pointer rounded bg-amber-600 px-2 py-0.5 text-xs font-semibold text-slate-950 hover:bg-amber-500",
-                            onclick: {
-                                let locator = row.locator.clone();
-                                move |_| {
-                                    state.remove_saved(&locator);
-                                    confirm_remove.set(None);
-                                }
-                            },
-                            "Remove"
-                        }
-                        button {
-                            class: "cursor-pointer rounded border border-slate-400 dark:border-slate-600 px-2 py-0.5 text-xs text-slate-900 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
-                            onclick: move |_| confirm_remove.set(None),
-                            "Keep"
-                        }
+                    // confirmation, the same `ConfirmInline` as
+                    // every other two-step destructive action.
+                    ConfirmInline {
+                        prompt: "Remove?".to_string(),
+                        confirm_label: "Remove",
+                        on_confirm: {
+                            let locator = row.locator.clone();
+                            move |_| {
+                                state.remove_saved(&locator);
+                                confirm_remove.set(None);
+                            }
+                        },
+                        on_cancel: move |_| confirm_remove.set(None),
                     }
                 } else {
                     // Marking is offered for every backend,

@@ -17,8 +17,9 @@ use dioxus::prelude::*;
 use crate::db::ConnectionId;
 use crate::history::SavedQuery;
 
+use super::history_panel::use_store_query;
 use super::js::write_clipboard;
-use super::notice::{Banner, BannerKind, LoadingLine};
+use super::notice::{Banner, BannerKind, ConfirmInline, LoadingLine, SearchBox, SidePanel};
 use super::state::AppState;
 use super::text_field::TextInput;
 
@@ -31,10 +32,8 @@ pub(super) fn SavedQueriesPanel(
     buffer: u64,
 ) -> Element {
     let state = use_context::<AppState>();
-    // The controlled input; `search` only follows it on Enter (or when the
-    // input is cleared), like the history panel's.
-    let mut search_input = use_signal(String::new);
-    let mut search = use_signal(String::new);
+    // The committed filter, set on Enter like the history panel's.
+    let search = use_signal(String::new);
     let mut showing_form = use_signal(|| false);
     let store_ready = state.history.read().is_some();
     let history_error = state.history_error.read().clone();
@@ -45,23 +44,16 @@ pub(super) fn SavedQueriesPanel(
     // saying so on the button beats a red line after the fact.
     let buffer_empty = state.sql_buffer_text(id, buffer).trim().is_empty();
 
-    let entries = use_resource(move || {
-        // Reactive dependencies, all cloned out before the await.
-        let store = state.history.read().clone();
-        let _refresh = *state.saved_nonce.read();
-        let needle = search.read().clone();
-        let locator = state.connection_locator(id);
-        async move {
-            let (Some(store), Some(locator)) = (store, locator) else {
-                return Ok(Vec::new());
-            };
-            store.saved_queries(&locator, Some(&needle)).await
-        }
-    });
+    let entries = use_store_query(
+        id,
+        state.saved_nonce,
+        search,
+        |store, locator, needle| async move { store.saved_queries(&locator, Some(&needle)).await },
+    );
 
     rsx! {
-        aside { class: "flex w-80 shrink-0 flex-col border-l border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/50",
-            div { class: "flex flex-col gap-2 border-b border-slate-200 dark:border-slate-800 p-2",
+        SidePanel {
+            header: rsx! {
                 if showing_form() {
                     SaveForm {
                         id,
@@ -90,64 +82,45 @@ pub(super) fn SavedQueriesPanel(
                         rsx! { span { class: "text-xs {class}", "{text}" } }
                     }
                 }
-                TextInput {
-                    class: "w-full rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 text-xs text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600",
-                    placeholder: "Search saved queries (Enter)",
-                    text: "{search_input}",
-                    oninput: move |evt: FormEvent| {
-                        let value = evt.value();
-                        // Clearing the box resets the filter immediately.
-                        if value.trim().is_empty() {
-                            search.set(String::new());
-                        }
-                        search_input.set(value);
-                    },
-                    onkeydown: move |evt: KeyboardEvent| {
-                        if evt.key() == Key::Enter {
-                            search.set(search_input.peek().clone());
-                        }
-                    },
+                SearchBox { placeholder: "Search saved queries (Enter)", search }
+            },
+            if let Some(err) = history_error {
+                div { class: "p-2",
+                    Banner {
+                        kind: BannerKind::Warning,
+                        message: format!("Saved queries are unavailable: {err}"),
+                    }
                 }
-            }
-            div { class: "min-h-0 flex-1 overflow-y-auto",
-                if let Some(err) = history_error {
-                    div { class: "p-2",
-                        Banner {
-                            kind: BannerKind::Warning,
-                            message: format!("Saved queries are unavailable: {err}"),
+            } else if !store_ready {
+                LoadingLine { label: "Opening saved queries…" }
+            } else {
+                // Matched on the borrow, not a clone, for the same reason
+                // as the history list: only the rendered rows clone.
+                match &*entries.read() {
+                    None => rsx! {
+                        LoadingLine { label: "Loading…" }
+                    },
+                    Some(Err(err)) => rsx! {
+                        div { class: "p-2",
+                            Banner { kind: BannerKind::Warning, message: format!("Saved-query lookup failed: {err}") }
                         }
-                    }
-                } else if !store_ready {
-                    LoadingLine { label: "Opening saved queries…" }
-                } else {
-                    // Matched on the borrow, not a clone, for the same reason
-                    // as the history list: only the rendered rows clone.
-                    match &*entries.read() {
-                        None => rsx! {
-                            LoadingLine { label: "Loading…" }
-                        },
-                        Some(Err(err)) => rsx! {
-                            div { class: "p-2",
-                                Banner { kind: BannerKind::Warning, message: format!("Saved-query lookup failed: {err}") }
+                    },
+                    Some(Ok(entries)) if entries.is_empty() => rsx! {
+                        p { class: "px-3 py-2 text-xs text-slate-500",
+                            if search.read().trim().is_empty() {
+                                "Nothing saved yet. Write a query and press Save current query."
+                            } else {
+                                "No matches."
                             }
-                        },
-                        Some(Ok(entries)) if entries.is_empty() => rsx! {
-                            p { class: "px-3 py-2 text-xs text-slate-500",
-                                if search.read().trim().is_empty() {
-                                    "Nothing saved yet. Write a query and press Save current query."
-                                } else {
-                                    "No matches."
-                                }
+                        }
+                    },
+                    Some(Ok(entries)) => rsx! {
+                        ul { class: "divide-y divide-slate-200 dark:divide-slate-800/60",
+                            for entry in entries.iter() {
+                                SavedRow { key: "{entry.id}", id, entry: entry.clone() }
                             }
-                        },
-                        Some(Ok(entries)) => rsx! {
-                            ul { class: "divide-y divide-slate-200 dark:divide-slate-800/60",
-                                for entry in entries.iter() {
-                                    SavedRow { key: "{entry.id}", id, entry: entry.clone() }
-                                }
-                            }
-                        },
-                    }
+                        }
+                    },
                 }
             }
         }
@@ -286,18 +259,13 @@ fn SavedRow(id: ConnectionId, entry: SavedQuery) -> Element {
                     "Copy"
                 }
                 if confirm_delete() {
-                    button {
-                        class: "rounded bg-rose-600 px-1.5 py-0.5 text-xs font-semibold text-white hover:bg-rose-500",
-                        onclick: move |_| {
+                    ConfirmInline {
+                        confirm_label: "Delete for good",
+                        on_confirm: move |_| {
                             state.delete_saved_query(id, entry_id);
                             confirm_delete.set(false);
                         },
-                        "Delete for good"
-                    }
-                    button {
-                        class: "rounded border border-slate-400 dark:border-slate-600 px-1.5 py-0.5 text-xs text-slate-900 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
-                        onclick: move |_| confirm_delete.set(false),
-                        "Keep"
+                        on_cancel: move |_| confirm_delete.set(false),
                     }
                 } else {
                     button {
