@@ -21,7 +21,7 @@ use super::notice::{Banner, BannerKind};
 use super::schema::SchemaPane;
 use super::schema_edit::SchemaEditLine;
 use super::sidebar::SchemaSidebar;
-use super::state::{ActiveView, AppState};
+use super::state::{ActiveView, AppState, SettingsNotice};
 
 /// The window-level keyboard listener. Installed once as a plain
 /// `keydown` handler on `window` — a webview-robust way to capture app-global
@@ -94,6 +94,10 @@ pub fn Shell() -> Element {
     let active = *state.active.read();
     let dark = state.dark;
     let show_cheatsheet = state.show_cheatsheet;
+    let settings_notice = match &*state.settings_notice.read() {
+        SettingsNotice::Showing(message) => Some(message.clone()),
+        SettingsNotice::Quiet | SettingsNotice::Dismissed => None,
+    };
 
     // Install the window-level shortcut listener once and pump the keys it
     // forwards. The eval channel stays open for the app's lifetime; reading
@@ -176,6 +180,17 @@ pub fn Shell() -> Element {
             },
             WindowPersistence {}
             TabBar {}
+            // Above every view: a preference that does not stick is about
+            // the whole app, not whichever screen is showing.
+            if let Some(message) = settings_notice {
+                div { class: "border-b border-slate-200 dark:border-slate-800 px-3 py-2",
+                    Banner {
+                        kind: BannerKind::Warning,
+                        message,
+                        on_dismiss: move |_| state.dismiss_settings_notice(),
+                    }
+                }
+            }
             main { class: "min-h-0 flex-1",
                 match active {
                     ActiveView::Connections => rsx! { ConnectionsScreen {} },
@@ -335,9 +350,10 @@ fn WindowPersistence() -> Element {
             } => {
                 update_geometry(&mut latest, &window);
                 if let Some(path) = default_settings_path() {
-                    if let Err(err) = save_window_geometry(&path, latest.peek().sanitized()) {
-                        eprintln!("hubro: window geometry not saved: {err}");
-                    }
+                    state.report_settings_write(
+                        "window geometry",
+                        save_window_geometry(&path, latest.peek().sanitized()),
+                    );
                 }
                 // This handler runs (via `app.tick`) *before* the built-in
                 // close handler reads the close behaviour, so setting it here
@@ -377,9 +393,10 @@ fn WindowPersistence() -> Element {
             if current != persisted {
                 persisted = current;
                 if let Some(path) = default_settings_path() {
-                    if let Err(err) = save_window_geometry(&path, current.sanitized()) {
-                        eprintln!("hubro: window geometry not saved: {err}");
-                    }
+                    state.report_settings_write(
+                        "window geometry",
+                        save_window_geometry(&path, current.sanitized()),
+                    );
                 }
             }
         }

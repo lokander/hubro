@@ -3,16 +3,20 @@
 //! Error policy: **lenient to read, careful to write**. These are
 //! non-critical UI preferences, persisted separately from the connections
 //! list so a corrupt settings file never blocks connecting to databases — a
-//! missing *or* malformed file yields defaults instead of an error. Those
-//! defaults are never written back over the file, though: each `save_*`
-//! edits its one key in the user's document and leaves the rest alone (see
-//! [`set_settings_key`]).
+//! missing *or* malformed file yields defaults instead of an error, and a
+//! value this build cannot use costs only its own setting (see
+//! [`interpret_settings`]). Those defaults are never written back over the
+//! file, though: each `save_*` edits its one key in the user's document and
+//! leaves the rest alone (see [`set_settings_key`]). What the load could not
+//! use is reported as a [`SettingsProblem`], so the app can say why a
+//! preference is not what the file says.
 
 use std::path::{Path, PathBuf};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use super::{load_lenient, write_text_atomic, ConfigError};
+use super::{write_text_atomic, ConfigError};
 
 /// Which theme the app uses. `System` follows the OS preference; `Light`
 /// and `Dark` are manual overrides. Serialized lowercase in settings.toml.
@@ -152,9 +156,164 @@ pub fn default_settings_path() -> Option<PathBuf> {
 
 /// Loads settings. A missing *or* malformed file yields defaults — these are
 /// non-critical UI preferences, so (unlike the connections list) a bad file
-/// never surfaces an error or blocks the app; the user just gets defaults.
+/// never blocks the app — and one bad value yields the default for its own
+/// setting only. [`load_settings_checked`] also says what was not used.
 pub fn load_settings(path: &Path) -> Settings {
-    load_lenient(path)
+    load_settings_checked(path).0
+}
+
+/// Why the settings in effect differ from what settings.toml says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingsProblem {
+    /// The file exists but could not be read as text (permissions, not
+    /// UTF-8). Nothing in it applied, and no preference write will replace
+    /// it.
+    Unreadable(String),
+    /// The file is not TOML. Nothing in it applied, and every preference
+    /// write is refused until it parses again (see [`set_settings_key`]).
+    /// `line` is 1-based, when the parser could place the error.
+    NotToml {
+        line: Option<usize>,
+        message: String,
+    },
+    /// The file is TOML, but these keys (`window.width` for a field of a
+    /// table) hold values this build cannot use. Each fell back to its
+    /// default; every other setting applied, and writes work as usual.
+    BadValues(Vec<String>),
+}
+
+impl SettingsProblem {
+    /// The one-line notice for the user, naming the file at `path`.
+    pub fn notice(&self, path: &Path) -> String {
+        let file = path.display();
+        match self {
+            SettingsProblem::Unreadable(err) => format!(
+                "Preferences file {file} could not be read ({err}). Defaults are in use, \
+                 and preference changes will not be saved until it can be read."
+            ),
+            SettingsProblem::NotToml { line, message } => {
+                let at = line.map(|n| format!(" at line {n}")).unwrap_or_default();
+                format!(
+                    "Preferences file {file} is not valid TOML{at}: {message}. Defaults are \
+                     in use, and preference changes will not be saved until it is fixed."
+                )
+            }
+            SettingsProblem::BadValues(keys) => {
+                let (subject, owner) = match keys.as_slice() {
+                    [key] => (format!("the value of {key} is"), "its"),
+                    keys => (format!("the values of {} are", keys.join(", ")), "their"),
+                };
+                format!(
+                    "Preferences file {file}: {subject} not understood, so {owner} default \
+                     is in use until the preference is changed here."
+                )
+            }
+        }
+    }
+}
+
+/// [`load_settings`], plus what it could not use. A missing file is not a
+/// problem: it is how every install starts.
+pub fn load_settings_checked(path: &Path) -> (Settings, Option<SettingsProblem>) {
+    match std::fs::read_to_string(path) {
+        Ok(text) => interpret_settings(&text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (Settings::default(), None),
+        Err(err) => (
+            Settings::default(),
+            Some(SettingsProblem::Unreadable(err.to_string())),
+        ),
+    }
+}
+
+/// The settings `text` describes, field by field: a value this build cannot
+/// use falls back to that field's default and is named in the returned
+/// problem, and every other field keeps what the file says. Text that is not
+/// TOML at all yields every default.
+///
+/// The struct is built as a literal with no `..Default::default()`, so a
+/// field added to [`Settings`] does not compile until it is read here too —
+/// otherwise it would silently always load as its default.
+pub(crate) fn interpret_settings(text: &str) -> (Settings, Option<SettingsProblem>) {
+    let table: toml::Table = match toml::from_str(text) {
+        Ok(table) => table,
+        Err(err) => {
+            let line = err.span().map(|span| line_of(text, span.start));
+            let problem = SettingsProblem::NotToml {
+                line,
+                message: one_line(err.message()),
+            };
+            return (Settings::default(), Some(problem));
+        }
+    };
+    let mut bad = Vec::new();
+    let settings = Settings {
+        theme: field(&table, "", "theme", &mut bad).unwrap_or_default(),
+        window: interpret_window(&table, &mut bad),
+        show_internal_objects: field(&table, "", "show_internal_objects", &mut bad)
+            .unwrap_or_default(),
+    };
+    let problem = (!bad.is_empty()).then_some(SettingsProblem::BadValues(bad));
+    (settings, problem)
+}
+
+/// The `[window]` table, field by field like the top level: a bad `width`
+/// costs the width, not the remembered position. A `window` that is not a
+/// table at all is one bad value, and the window opens at the default size.
+fn interpret_window(table: &toml::Table, bad: &mut Vec<String>) -> Option<WindowGeometry> {
+    let window = match table.get("window")? {
+        toml::Value::Table(window) => window,
+        _ => {
+            bad.push("window".to_string());
+            return None;
+        }
+    };
+    let bad = &mut *bad;
+    Some(WindowGeometry {
+        width: field(window, "window.", "width", bad).unwrap_or(DEFAULT_WINDOW_WIDTH),
+        height: field(window, "window.", "height", bad).unwrap_or(DEFAULT_WINDOW_HEIGHT),
+        x: field(window, "window.", "x", bad),
+        y: field(window, "window.", "y", bad),
+        maximized: field(window, "window.", "maximized", bad).unwrap_or_default(),
+    })
+}
+
+/// `table[key]` as a `T`: `None` when the key is absent, and also when its
+/// value is not a `T` — in which case `prefix` + `key` is added to `bad`.
+fn field<T: DeserializeOwned>(
+    table: &toml::Table,
+    prefix: &str,
+    key: &str,
+    bad: &mut Vec<String>,
+) -> Option<T> {
+    let value = table.get(key)?.clone();
+    match value.try_into() {
+        Ok(value) => Some(value),
+        Err(_) => {
+            bad.push(format!("{prefix}{key}"));
+            None
+        }
+    }
+}
+
+/// A parser's message, which can run over several lines (`invalid table
+/// header` / ``expected `.`, `]` ``), as one line for a notice.
+fn one_line(message: &str) -> String {
+    message
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The 1-based line holding byte `offset` of `text`.
+fn line_of(text: &str, offset: usize) -> usize {
+    let offset = offset.min(text.len());
+    text.as_bytes()[..offset]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+        + 1
 }
 
 /// Sets one top-level key of the settings file to `item`, or removes it
@@ -190,10 +349,15 @@ fn set_settings_key(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(ConfigError(format!("reading {}: {err}", path.display()))),
     };
-    let mut document: toml_edit::Document = text.parse().map_err(|err| {
+    let mut document: toml_edit::Document = text.parse().map_err(|err: toml_edit::TomlError| {
+        let at = err
+            .span()
+            .map(|span| format!(" at line {}", line_of(&text, span.start)))
+            .unwrap_or_default();
         ConfigError(format!(
-            "{}: not rewriting a file that does not parse: {err}",
-            path.display()
+            "{} is not valid TOML{at} ({}), so it is left as it is",
+            path.display(),
+            one_line(err.message())
         ))
     })?;
     match item {
@@ -459,8 +623,8 @@ mod tests {
         assert_eq!(loaded.window, Some(geo));
     }
 
-    /// A hand-edited file this build cannot interpret: a comment, a key from
-    /// some other build, and a typo that sends [`load_settings`] to defaults —
+    /// A hand-edited file this build cannot wholly interpret: a comment, a key
+    /// from some other build, and a typo [`load_settings`] cannot use —
     /// alongside a setting the user does want kept.
     const HAND_EDITED: &str = "# my settings\n\
                                theme = \"drak\"\n\
@@ -472,8 +636,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.toml");
         std::fs::write(&path, HAND_EDITED).unwrap();
-        // The typo costs the whole load, which is the lenient policy…
-        assert_eq!(load_settings(&path), Settings::default());
+        // The typo costs the theme, which is the lenient policy…
+        assert_eq!(
+            load_settings(&path),
+            Settings {
+                show_internal_objects: true,
+                ..Settings::default()
+            }
+        );
 
         // …but not the file: a window move adds its section, set off by a
         // blank line, and changes nothing that was already there.
@@ -513,6 +683,115 @@ mod tests {
             after_theme.replace("show_internal_objects = true\n", "")
         );
         assert!(!load_settings(&path).show_internal_objects);
+    }
+
+    #[test]
+    fn one_bad_value_costs_only_its_own_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+        let (loaded, problem) = load_settings_checked(&path);
+        // The good value beside the typo applies; the typo's own setting is
+        // the default, and it is named — the unknown key is not a problem.
+        assert_eq!(loaded.theme, Theme::System);
+        assert!(loaded.show_internal_objects);
+        assert_eq!(
+            problem,
+            Some(SettingsProblem::BadValues(vec!["theme".to_string()]))
+        );
+        assert_eq!(load_settings(&path), loaded);
+    }
+
+    #[test]
+    fn a_bad_window_field_costs_only_that_field() {
+        let (loaded, problem) = interpret_settings(
+            "theme = \"dark\"\n\
+             [window]\nwidth = \"wide\"\nheight = 600.0\nx = 10\nmaximized = true\nmonitor = 2\n",
+        );
+        assert_eq!(loaded.theme, Theme::Dark);
+        assert_eq!(
+            loaded.window,
+            Some(WindowGeometry {
+                width: DEFAULT_WINDOW_WIDTH,
+                height: 600.0,
+                x: Some(10.0),
+                y: None,
+                maximized: true,
+            })
+        );
+        assert_eq!(
+            problem,
+            Some(SettingsProblem::BadValues(vec!["window.width".to_string()]))
+        );
+
+        // A `window` that is not a table at all opens at the default size.
+        let (loaded, problem) =
+            interpret_settings("window = 3\nshow_internal_objects = true\ntheme = 1\n");
+        assert_eq!(loaded.window, None);
+        assert!(loaded.show_internal_objects);
+        assert_eq!(
+            problem,
+            Some(SettingsProblem::BadValues(vec![
+                "theme".to_string(),
+                "window".to_string()
+            ]))
+        );
+    }
+
+    #[test]
+    fn a_bad_value_notice_names_the_file_and_every_key() {
+        let path = Path::new("/cfg/settings.toml");
+        let one = SettingsProblem::BadValues(vec!["theme".into()]).notice(path);
+        assert!(one.contains("/cfg/settings.toml"), "{one}");
+        assert!(one.contains("the value of theme is"), "{one}");
+        let two =
+            SettingsProblem::BadValues(vec!["theme".into(), "window.width".into()]).notice(path);
+        assert!(two.contains("theme, window.width are"), "{two}");
+    }
+
+    #[test]
+    fn a_file_this_build_fully_understands_is_no_problem() {
+        // Unknown keys, inside `[window]` too, are a newer build's, not errors.
+        let text = "theme = \"light\"\nshow_internal_objects = true\nlater = 1\n\
+                    [window]\nwidth = 900.0\nheight = 600.0\nmonitor = 2\n";
+        let (loaded, problem) = interpret_settings(text);
+        assert_eq!(problem, None);
+        assert_eq!(loaded.theme, Theme::Light);
+        assert_eq!(interpret_settings(""), (Settings::default(), None));
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("settings.toml");
+        assert_eq!(load_settings_checked(&missing), (Settings::default(), None));
+    }
+
+    #[test]
+    fn a_file_that_is_not_toml_is_reported_with_its_line() {
+        let (loaded, problem) =
+            interpret_settings("theme = \"dark\"\nshow_internal_objects = true\n[window\n");
+        assert_eq!(loaded, Settings::default());
+        let Some(SettingsProblem::NotToml { line, message }) = &problem else {
+            panic!("not reported as unparseable: {problem:?}");
+        };
+        assert_eq!(*line, Some(3));
+        assert!(!message.is_empty() && !message.contains('\n'), "{message}");
+
+        let notice = problem.unwrap().notice(Path::new("/cfg/settings.toml"));
+        assert!(notice.contains("/cfg/settings.toml"), "{notice}");
+        assert!(notice.contains("line 3"), "{notice}");
+        assert!(notice.contains("not be saved"), "{notice}");
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, [b't', b'h', 0xff, 0xfe, b'\n']).unwrap();
+        let (loaded, problem) = load_settings_checked(&path);
+        assert_eq!(loaded, Settings::default());
+        assert!(
+            matches!(problem, Some(SettingsProblem::Unreadable(_))),
+            "{problem:?}"
+        );
     }
 
     #[test]
@@ -623,6 +902,12 @@ mod tests {
         assert!(save_theme(&path, Theme::Light).is_err());
         assert!(save_show_internal_objects(&path, false).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), broken.as_bytes());
+        // The refusal is one line naming the file and the error's line,
+        // since it is what the user is shown.
+        let ConfigError(refusal) = save_theme(&path, Theme::Dark).unwrap_err();
+        assert!(!refusal.contains('\n'), "{refusal}");
+        assert!(refusal.contains(&path.display().to_string()), "{refusal}");
+        assert!(refusal.contains("line 3"), "{refusal}");
 
         // Nor is one that cannot even be read as text: a read failure is not
         // a missing file, and must not be written over as if it were.

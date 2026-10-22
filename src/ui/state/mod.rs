@@ -44,10 +44,10 @@ use dioxus::prelude::*;
 use crate::azure::{self, EntraAuth};
 use crate::cli::OpenTarget;
 use crate::config::{
-    default_config_path, default_session_path, default_settings_path, load_session, load_settings,
-    plan_session_restore, save_session, save_show_internal_objects, save_theme, BackendKind,
-    ConnectionColor, GroupError, RestoreCandidate, SavedConnection, SavedList, ServerAuth, Session,
-    SessionPane, SessionTab, Settings, Theme,
+    default_config_path, default_session_path, default_settings_path, load_session,
+    load_settings_checked, plan_session_restore, save_session, save_show_internal_objects,
+    save_theme, BackendKind, ConfigError, ConnectionColor, GroupError, RestoreCandidate,
+    SavedConnection, SavedList, ServerAuth, Session, SessionPane, SessionTab, Settings, Theme,
 };
 use crate::db::{
     apply_staged, build_fk_filter, explain_statement, fk_target_columns, mssql_url_target,
@@ -946,6 +946,32 @@ impl ConnectRequest {
     }
 }
 
+/// The app-wide notice about settings.toml. Raised at most once a session:
+/// a refused write repeats on every window move, so re-raising would bring
+/// back a notice the user had dismissed every second.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SettingsNotice {
+    /// Nothing raised this session.
+    #[default]
+    Quiet,
+    /// On screen, saying this.
+    Showing(String),
+    /// Raised and dismissed; stays dismissed.
+    Dismissed,
+}
+
+impl SettingsNotice {
+    /// The notice once `message` is raised: it shows only if nothing was
+    /// raised before. A notice already showing keeps its message — the first
+    /// one is the cause, a later refused write its consequence.
+    pub fn raised(&self, message: String) -> SettingsNotice {
+        match self {
+            SettingsNotice::Quiet => SettingsNotice::Showing(message),
+            raised => raised.clone(),
+        }
+    }
+}
+
 /// App-wide state provided via context. `Copy` because it only holds signals.
 #[derive(Clone, Copy)]
 pub struct AppState {
@@ -1122,6 +1148,9 @@ pub struct AppState {
     /// per-connection, since it expresses what the user wants to look at
     /// rather than anything about one database.
     pub show_internal_objects: Signal<bool>,
+    /// The app-wide notice about settings.toml: why a preference is not what
+    /// the file says, or why one is not being saved. Shown above every view.
+    pub settings_notice: Signal<SettingsNotice>,
     /// Connection groups the user has collapsed in the connections list,
     /// by name. Seeded from session.toml at restore and written
     /// back with the rest of the session: a fold is view state, not
@@ -1266,12 +1295,21 @@ impl AppState {
                 Some("no config directory found".to_string()),
             ),
         };
-        // UI preferences: best-effort load, defaults on any problem (settings
-        // are non-critical and never block the app).
-        let settings = default_settings_path()
-            .map(|path| load_settings(&path))
-            .unwrap_or_default();
+        // UI preferences: best-effort load, a default for whatever the file
+        // gets wrong (settings are non-critical and never block the app) —
+        // but said, since a preference that silently does not stick reads
+        // as a bug.
+        let (settings, notice) = match default_settings_path() {
+            Some(path) => {
+                let (settings, problem) = load_settings_checked(&path);
+                (settings, problem.map(|problem| problem.notice(&path)))
+            }
+            None => (Settings::default(), None),
+        };
         let state = Self::unstarted(saved, load_error, settings);
+        if let Some(notice) = notice {
+            state.raise_settings_notice(notice);
+        }
         state.start_background_tasks();
         state
     }
@@ -1356,6 +1394,7 @@ impl AppState {
                 settings.show_internal_objects,
                 ScopeId::ROOT,
             ),
+            settings_notice: Signal::new_in_scope(SettingsNotice::Quiet, ScopeId::ROOT),
             // Seeded by `restore_session` rather than here: session.toml is
             // read once, at restore, and reading it twice would be two
             // chances to disagree about what the last session was.
@@ -1619,9 +1658,7 @@ impl AppState {
             return;
         };
         spawn_forever(async move {
-            if let Err(err) = save_theme(&path, theme) {
-                eprintln!("hubro: theme not saved: {err}");
-            }
+            self.report_settings_write("theme", save_theme(&path, theme));
         });
     }
 
@@ -1634,10 +1671,36 @@ impl AppState {
             return;
         };
         spawn_forever(async move {
-            if let Err(err) = save_show_internal_objects(&path, show) {
-                eprintln!("hubro: internal-object visibility not saved: {err}");
-            }
+            self.report_settings_write(
+                "internal-object visibility",
+                save_show_internal_objects(&path, show),
+            );
         });
+    }
+
+    /// Reports the outcome of a preference write: a failure goes to stderr
+    /// and, the first time this session, to the settings notice — the
+    /// change still applies in-session, so without it the user learns only
+    /// at the next launch that it did not stick.
+    pub fn report_settings_write(self, what: &str, result: Result<(), ConfigError>) {
+        if let Err(ConfigError(err)) = result {
+            eprintln!("hubro: {what} not saved: {err}");
+            self.raise_settings_notice(format!("Preferences are not being saved: {err}."));
+        }
+    }
+
+    /// Shows `message` as the settings notice, unless one was already
+    /// raised this session (see [`SettingsNotice::raised`]).
+    fn raise_settings_notice(mut self, message: String) {
+        let next = self.settings_notice.peek().raised(message);
+        if next != *self.settings_notice.peek() {
+            self.settings_notice.set(next);
+        }
+    }
+
+    /// Hides the settings notice for the rest of the session.
+    pub fn dismiss_settings_notice(mut self) {
+        self.settings_notice.set(SettingsNotice::Dismissed);
     }
 
     /// Marks a table as selected in one tab's sidebar. Guarded: switching
@@ -2017,6 +2080,43 @@ pub fn tab_title(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_settings_notice_is_raised_once_a_session() {
+        let first = SettingsNotice::Quiet.raised("the cause".into());
+        assert_eq!(first, SettingsNotice::Showing("the cause".into()));
+        // A later failure does not replace the cause on screen…
+        assert_eq!(first.raised("a consequence".into()), first);
+        // …and a dismissed notice stays dismissed, however often writes fail.
+        assert_eq!(
+            SettingsNotice::Dismissed.raised("again".into()),
+            SettingsNotice::Dismissed
+        );
+    }
+
+    #[test]
+    fn a_refused_preference_write_reaches_the_notice() {
+        fn empty() -> Element {
+            rsx! {}
+        }
+        let dom = VirtualDom::new(empty);
+        let state = crate::ui::test_dom::provide_state(&dom);
+        dom.in_runtime(|| {
+            state.report_settings_write("theme", Ok(()));
+            assert_eq!(*state.settings_notice.peek(), SettingsNotice::Quiet);
+
+            let refusal = "/cfg/settings.toml is not valid TOML at line 3";
+            state.report_settings_write("theme", Err(ConfigError(refusal.into())));
+            let SettingsNotice::Showing(message) = state.settings_notice.peek().clone() else {
+                panic!("a refused write raised no notice");
+            };
+            assert!(message.contains(refusal), "{message}");
+
+            state.dismiss_settings_notice();
+            state.report_settings_write("window geometry", Err(ConfigError("again".into())));
+            assert_eq!(*state.settings_notice.peek(), SettingsNotice::Dismissed);
+        });
+    }
 
     #[test]
     fn a_jump_is_typed_by_the_table_it_lands_in() {
