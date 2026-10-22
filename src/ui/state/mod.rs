@@ -1731,10 +1731,24 @@ impl AppState {
         self.tab_ui.write().entry(id).or_default().row_detail_width = Some(width);
     }
 
-    /// Flips the shortcut cheatsheet overlay (the `?` shortcut).
+    /// Flips the shortcut cheatsheet overlay (the `?` shortcut) — except
+    /// that it never opens while the quit confirmation is up. That dialog is
+    /// drawn over the cheatsheet, but a cheatsheet opened under it would
+    /// still take focus, and Escape would then close the hidden cheatsheet
+    /// instead of cancelling the quit.
     pub fn toggle_cheatsheet(mut self) {
         let showing = *self.show_cheatsheet.read();
+        if !showing && self.quit_confirm_showing() {
+            return;
+        }
         self.show_cheatsheet.set(!showing);
+    }
+
+    /// Whether the discard-and-quit confirmation is on screen. Also gated on
+    /// `any_dirty`: if an in-flight save empties the stage while the prompt
+    /// is up, it self-dismisses instead of offering to discard nothing.
+    pub fn quit_confirm_showing(&self) -> bool {
+        *self.confirm_quit.read() && self.any_dirty()
     }
 
     /// Closes the shortcut cheatsheet if it is open (Escape, the ✕, or a
@@ -2296,6 +2310,44 @@ mod tests {
         dom.in_runtime(|| {
             assert_eq!(*state.theme.peek(), Theme::Dark);
             assert_eq!(*state.settings_notice.peek(), SettingsNotice::Quiet);
+        });
+    }
+
+    #[tokio::test]
+    async fn the_cheatsheet_does_not_open_under_the_quit_confirmation() {
+        use crate::db::{ConnectionRegistry, DbPool, WriteProtection};
+
+        let dom = runtime_dom();
+        let state = crate::ui::test_dom::provide_state(&dom);
+        let pool =
+            DbPool::Sqlite(sqlx::sqlite::SqlitePool::connect_lazy("sqlite::memory:").unwrap());
+        let id = ConnectionRegistry::default().insert("t.db", pool, WriteProtection::Open);
+        let table = TableRef {
+            schema: None,
+            name: "t".into(),
+        };
+        dom.in_runtime(|| {
+            let mut confirm_quit = state.confirm_quit;
+            state.stage_insert_row(id, &table);
+            confirm_quit.set(true);
+            assert!(state.quit_confirm_showing());
+            state.toggle_cheatsheet();
+            assert!(
+                !*state.show_cheatsheet.peek(),
+                "opened under the quit confirmation"
+            );
+
+            // Without the confirmation it opens, and once open, `?` may
+            // still close it whatever else is up.
+            confirm_quit.set(false);
+            state.toggle_cheatsheet();
+            assert!(
+                *state.show_cheatsheet.peek(),
+                "`?` no longer opens it at all"
+            );
+            confirm_quit.set(true);
+            state.toggle_cheatsheet();
+            assert!(!*state.show_cheatsheet.peek(), "`?` could not close it");
         });
     }
 
