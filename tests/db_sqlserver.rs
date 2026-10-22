@@ -1994,11 +1994,13 @@ async fn sqlserver_offers_no_plan_view_rather_than_a_dangerous_one() {
     // T-SQL has no `EXPLAIN` statement. Its estimated plan comes
     // from `SET SHOWPLAN_XML ON`, a session setting that must stand alone in
     // its batch and makes the *next* batch return a plan instead of running
-    // it — and hubro's script path hands each statement to the pool
-    // separately, so the setting and the statement it is meant to cover can
-    // land on different connections. Getting that wrong executes a statement
-    // the user asked only to have explained, so the connection declares no
-    // plan support at all and the editor disables the action with a reason.
+    // it. Hubro's script path runs each statement but transaction control as
+    // its own `sp_executesql`, where a `SET` does not outlive the statement,
+    // and closes the run's connection when the run ends — so nothing it runs
+    // can rely on the setting covering the statement after it. Getting that
+    // wrong executes a statement the user asked only to have explained, so
+    // the connection declares no plan support at all and the editor disables
+    // the action with a reason.
     //
     // Asserted against a live server rather than only against the dialect
     // because this is what the UI reads: a backend that started answering

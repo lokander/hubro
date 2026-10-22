@@ -495,8 +495,8 @@ pub async fn execute_conn(
 /// A probe that fails outright is refused by the session's state, or the
 /// connection is broken; a `ROLLBACK` follows either way, ends whatever block
 /// the session is in, and fails only on a broken connection — then an error is
-/// returned, the connection's state is unknown, and the caller must not return
-/// it to the pool. Whether the `ROLLBACK` undid anything is decided by
+/// returned: the connection's state is unknown, and hubro cannot say what
+/// closing it discarded. Whether the `ROLLBACK` undid anything is decided by
 /// [`refused_probe_rolled_back`]: yes, except for the one refusal known to
 /// follow a commit — CockroachDB's `SHOW COMMIT TIMESTAMP` leaves the session
 /// in a block whose transaction is already *committed* (status `CommitWait`,
