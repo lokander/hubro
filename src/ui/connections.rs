@@ -1313,6 +1313,25 @@ fn remember_hint(
     }
 }
 
+/// The connection form's counterpart of [`remember_hint`]: what an unticked
+/// box does to a password already in the keyring when the form's password
+/// connects (`submit_server_form` hands it to the same
+/// `stored_password_after_connect` decision the prompt does).
+///
+/// Editing a saved connection gets the hedged line. The form cannot know
+/// whether that connection has a stored copy without reading the keyring as
+/// it opens, which could raise an unlock dialog for a form the user may only
+/// be renaming. A new connection gets none: nothing has stored a password for
+/// it yet.
+fn form_remember_hint(editing: bool) -> Option<&'static str> {
+    use super::state::{PromptKind, StoredCopy};
+    if editing {
+        remember_hint(PromptKind::DbPassword, StoredCopy::Unknown)
+    } else {
+        None
+    }
+}
+
 /// Trust-on-first-use prompt for an unrecognized SSH host key. Shows the
 /// server's fingerprint so the user can compare it out-of-band; trusting
 /// records the key in hubro's known_hosts store and retries the connect.
@@ -1861,6 +1880,9 @@ fn PostgresForm(
                         }
                         "Remember in the system keyring (falls back to this session only)"
                     }
+                    if let Some(hint) = form_remember_hint(editing) {
+                        p { class: "text-xs text-amber-700 dark:text-amber-400", "{hint}" }
+                    }
                 }
                 div { class: "flex justify-end gap-2",
                     button {
@@ -2107,6 +2129,9 @@ fn SqlServerForm(
                         }
                         "Remember in the system keyring (falls back to this session only)"
                     }
+                    if let Some(hint) = form_remember_hint(editing) {
+                        p { class: "text-xs text-amber-700 dark:text-amber-400", "{hint}" }
+                    }
                 }
                 div { class: "flex justify-end gap-2",
                     button {
@@ -2206,6 +2231,22 @@ mod tests {
         for stored in [StoredCopy::Present, StoredCopy::Absent, StoredCopy::Unknown] {
             assert_eq!(remember_hint(PromptKind::SshPassphrase, stored), None);
         }
+    }
+
+    #[test]
+    fn the_form_hedges_about_a_stored_password_only_when_editing_a_saved_one() {
+        use super::super::state::{PromptKind, StoredCopy};
+        assert_eq!(
+            form_remember_hint(true),
+            remember_hint(PromptKind::DbPassword, StoredCopy::Unknown),
+            "an edited connection may have a stored password the form cannot see"
+        );
+        assert!(form_remember_hint(true).is_some());
+        assert_eq!(
+            form_remember_hint(false),
+            None,
+            "a new connection has nothing stored to warn about"
+        );
     }
 
     #[test]
