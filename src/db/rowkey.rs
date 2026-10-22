@@ -8,7 +8,7 @@
 //! [`DbPool::execute_checked`](super::DbPool::execute_checked), which rolls
 //! back unless the affected-row count matches expectations.
 
-use super::schema::{ColumnMeta, TableKind, TableMeta};
+use super::schema::{ColumnMeta, TableKind, TableMeta, TypeDetail};
 use super::sql::Dialect;
 
 /// How rows of one table are uniquely addressed by UPDATE/DELETE, in
@@ -118,13 +118,20 @@ pub fn detect_row_identity(table: &TableMeta, dialect: Dialect) -> Option<RowIde
 /// per bound value; refusing the key leaves the table browsable and
 /// read-only with the key-less table's reason, which the UI already handles.
 ///
+/// The values decide, not the name: an alias type declared `FROM
+/// sql_variant` is reported by its alias name, so its system type
+/// ([`TypeDetail::Alias`]) is read too — measured on SQL Server 2022, a key
+/// of such an alias type missed its rows exactly as a plain `sql_variant`
+/// key did. No other engine reports a type named `sql_variant`.
+///
 /// Every other type re-addresses: Postgres's types without a decoder arm
 /// and SQL Server's `hierarchyid` are read through the server's text for
 /// that reason ([`fetched_as_server_text`](super::page::fetched_as_server_text)).
-/// No other engine reports a type named `sql_variant`, so the name alone
-/// decides.
 pub fn key_column_addressable(column: &ColumnMeta) -> bool {
-    !column.type_name.trim().eq_ignore_ascii_case("sql_variant")
+    let is_variant = |name: &str| name.trim().eq_ignore_ascii_case("sql_variant");
+    let alias_of_variant =
+        matches!(&column.type_detail, TypeDetail::Alias { base } if is_variant(base));
+    !is_variant(&column.type_name) && !alias_of_variant
 }
 
 /// First rowid accessor name not shadowed by a user column. SQLite resolves
@@ -443,6 +450,15 @@ mod tests {
         assert_eq!(detect_row_identity(&composite, Dialect::SqlServer), None);
         // Any other type name keys as before.
         assert!(key_column_addressable(&col("k", false, Some(1))));
+        // An alias type is judged by the system type behind it, whatever it
+        // is called.
+        let aliased = |base: &str| ColumnMeta {
+            type_name: "account_code".into(),
+            type_detail: TypeDetail::Alias { base: base.into() },
+            ..col("k", false, Some(1))
+        };
+        assert!(!key_column_addressable(&aliased("sql_variant")));
+        assert!(key_column_addressable(&aliased("nvarchar")));
     }
 
     #[test]

@@ -695,7 +695,8 @@ pub(super) fn display_type(column: &ColumnMeta) -> String {
             None => type_ref.name.clone(),
         },
         TypeDetail::Plain if column.type_name.is_empty() => "any".to_string(),
-        TypeDetail::Plain => column.type_name.to_lowercase(),
+        // An alias type is shown by its own name, as it is declared.
+        TypeDetail::Plain | TypeDetail::Alias { .. } => column.type_name.to_lowercase(),
     }
 }
 
