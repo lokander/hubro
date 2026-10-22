@@ -269,12 +269,30 @@ pub(super) enum ReadOnlyRun {
         conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
         /// [`postgres::read_only_begin`] for this server.
         begin: &'static str,
+        /// The connection's pool, which a statement the row cap cut short is
+        /// cancelled through ([`postgres::cancel_target`]): the flavor says
+        /// how, and another of its connections sends it.
+        pg: postgres::PgConn,
     },
 }
 
 impl ReadOnlyRun {
     /// Runs a row-returning statement, bounded like [`DbPool::query_capped`]
     /// with the per-cell cap chosen by the caller.
+    ///
+    /// On Postgres-wire engines a read the row cap cut short is **cancelled**
+    /// before its transaction is rolled back. The rollback cannot be sent
+    /// until the rest of the result has arrived and been thrown away, so
+    /// without it a script such as `SELECT * FROM big; SELECT 1` waited for all
+    /// of `big` — measured, 4.2 s for 20M rows on localhost, against 0.1 s
+    /// cancelled; over a network, minutes or hours. Cancelling is sound here
+    /// and nowhere else in a run, because nothing the statement does can
+    /// outlive it: the engine refuses its writes, and its transaction is
+    /// rolled back whatever happens. A writable connection's read cannot be
+    /// cancelled, since a `SELECT` can write through a function it calls.
+    ///
+    /// Where the engine cannot cancel the statement, or the cancel cannot be
+    /// sent, the rollback reads the rest as before.
     pub(super) async fn query_capped_to(
         &mut self,
         sql: &str,
@@ -285,12 +303,70 @@ impl ReadOnlyRun {
             ReadOnlyRun::Sqlite(conn) => {
                 sqlite::query_capped_conn(conn, sql, max_rows, cell_cap).await
             }
-            ReadOnlyRun::Postgres { conn, begin } => {
+            ReadOnlyRun::Postgres { conn, begin, pg } => {
                 let mut tx = postgres::begin_read_only(conn, begin).await?;
+                // Asked inside the statement's own transaction: through a
+                // transaction-pooling PgBouncer, the next transaction may run
+                // on another server backend, but this one stays on its backend
+                // until the rollback.
+                let target = match postgres::cancel_target(&mut tx, pg.flavor()).await {
+                    Ok(target) => target,
+                    // The question aborted the transaction: start the
+                    // statement's afresh, and let a cut-short read be read to
+                    // its end.
+                    Err(_) => {
+                        postgres::end_read_only(tx).await?;
+                        tx = postgres::begin_read_only(conn, begin).await?;
+                        None
+                    }
+                };
                 let result = postgres::query_capped_conn(&mut tx, sql, max_rows, cell_cap).await;
-                read_only_outcome(result, postgres::end_read_only(tx).await)
+                let stopped = match (&result, &target) {
+                    (Ok((_, true)), Some(target)) => {
+                        postgres::cancel_cut_short_read(&mut tx, pg.pool(), target).await
+                    }
+                    _ => Ok(()),
+                };
+                let ended = postgres::end_read_only(tx).await;
+                read_only_outcome(result, stopped.and(ended))
             }
         }
+    }
+
+    /// Runs the script's last statement when it returns rows, and lets go of
+    /// the connection as [`Self::close`] does.
+    ///
+    /// Separate because of a read the row cap cut short: on a Postgres-wire
+    /// engine it is not rolled back but closed, since rolling back waits for
+    /// the rest of its result, and closing ends the transaction server-side —
+    /// which is all the rollback was for. The closed connection's backend
+    /// stops sending once it finds nobody reading. This covers the engines
+    /// that cannot cancel a statement, Materialize and RisingWave, as well.
+    pub(super) async fn finish_with_read(
+        mut self,
+        sql: &str,
+        max_rows: u64,
+        cell_cap: usize,
+    ) -> Result<(QueryResult, bool), DbError> {
+        let read = match &mut self {
+            ReadOnlyRun::Postgres { conn, begin, .. } => {
+                match postgres::begin_read_only(conn, begin).await {
+                    Ok(mut tx) => {
+                        let read =
+                            postgres::query_capped_conn(&mut tx, sql, max_rows, cell_cap).await;
+                        if matches!(read, Ok((_, true))) {
+                            read
+                        } else {
+                            read_only_outcome(read, postgres::end_read_only(tx).await)
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            ReadOnlyRun::Sqlite(_) => self.query_capped_to(sql, max_rows, cell_cap).await,
+        };
+        self.close().await;
+        read
     }
 
     /// Runs a non-row statement, returning affected rows. On a connection
@@ -299,7 +375,7 @@ impl ReadOnlyRun {
     pub(super) async fn execute(&mut self, sql: &str) -> Result<RowsAffected, DbError> {
         let rows = match self {
             ReadOnlyRun::Sqlite(conn) => sqlite::execute_conn(conn, sql).await,
-            ReadOnlyRun::Postgres { conn, begin } => {
+            ReadOnlyRun::Postgres { conn, begin, .. } => {
                 let mut tx = postgres::begin_read_only(conn, begin).await?;
                 let result = postgres::execute_conn(&mut tx, sql).await;
                 read_only_outcome(result, postgres::end_read_only(tx).await)
@@ -906,6 +982,7 @@ impl DbPool {
                     sqlx_common::acquire_for_run(pg.pool()).await?
                 },
                 begin: pg.read_only_begin(),
+                pg: pg.clone(),
             })),
             // Turned away above; kept as an arm so a new variant must decide.
             DbPool::SqlServer(_) => Ok(None),

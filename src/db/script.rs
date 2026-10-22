@@ -1983,19 +1983,31 @@ fn sequential_outcome(
 /// statement already runs in a transaction of its own — so a failure reports
 /// [`Rollback::None`], as the sequential path does.
 async fn run_script_read_only(
-    mut run: ReadOnlyRun,
+    run: ReadOnlyRun,
     dialect: Dialect,
     statements: &[String],
     mut on_result: impl FnMut(StatementResult),
 ) -> Result<(), ScriptError> {
     let mut outcome = Ok(());
+    let last = statements.len().saturating_sub(1);
+    let mut run = Some(run);
     for (statement_index, statement) in statements.iter().enumerate() {
-        let result = if classify_statement(statement, dialect).returns_rows() {
-            run.query_capped_to(statement, MAX_QUERY_ROWS, cell_cap(statement, dialect))
+        let Some(held) = run.as_mut() else { break };
+        let reads = classify_statement(statement, dialect).returns_rows();
+        let result = if reads && statement_index == last {
+            // Ends the run too, so that a cut-short read is closed rather
+            // than read to its end (see `ReadOnlyRun::finish_with_read`).
+            run.take()
+                .expect("held until the last statement")
+                .finish_with_read(statement, MAX_QUERY_ROWS, cell_cap(statement, dialect))
+                .await
+                .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated))
+        } else if reads {
+            held.query_capped_to(statement, MAX_QUERY_ROWS, cell_cap(statement, dialect))
                 .await
                 .map(|(result, truncated)| (read_outcome(dialect, result), truncated))
         } else {
-            run.execute(statement)
+            held.execute(statement)
                 .await
                 .map(|affected| (StatementOutcome::Affected(affected), false))
         };
@@ -2016,7 +2028,9 @@ async fn run_script_read_only(
             }
         }
     }
-    run.close().await;
+    if let Some(run) = run {
+        run.close().await;
+    }
     outcome
 }
 
