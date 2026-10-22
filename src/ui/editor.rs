@@ -5,9 +5,9 @@ use serde_json::json;
 
 use crate::db::{
     needs_confirmation, plan_reached_cell_cap, ConnectionId, Dialect, ExportFormat,
-    OpenTransaction, PlanDisplay, PlanNode, PlanTree, Rollback, StatementOutcome, TableMeta, Value,
-    EXPENSIVE_SHARE, MARKED_READ_ONLY, MAX_QUERY_ROWS, NO_DDL, NO_EXPLAIN, NO_MUTATE, NO_QUERY,
-    PLAN_CELL_CAP,
+    OpenTransaction, PlanDisplay, PlanNode, PlanTree, Rollback, RowsAffected, StatementOutcome,
+    TableMeta, Value, EXPENSIVE_SHARE, MARKED_READ_ONLY, MAX_QUERY_ROWS, NO_DDL, NO_EXPLAIN,
+    NO_MUTATE, NO_QUERY, PLAN_CELL_CAP,
 };
 
 use super::history_panel::HistoryPanel;
@@ -914,6 +914,33 @@ fn schema_kept_note(open: OpenTransaction) -> &'static str {
     }
 }
 
+/// The count a statement section's header states after the preview.
+fn outcome_summary(outcome: &StatementOutcome) -> String {
+    match outcome {
+        StatementOutcome::Affected(rows) => rows_affected_line(*rows),
+        StatementOutcome::Rows(r) if r.rows.len() == 1 => "1 row".to_string(),
+        StatementOutcome::Rows(r) => format!("{} rows", r.rows.len()),
+    }
+}
+
+/// What a write reported, in words that claim no more than it did. A
+/// [`RowsAffected::Summed`] count added up several, which on SQL Server can
+/// be a trigger's as well as the statement's — and whether any were cannot
+/// be told, so the line says "any" rather than naming triggers that may not
+/// exist. [`RowsAffected::Unreported`] states no number: a 0 there would
+/// claim nothing changed when a `SELECT … INTO #t` may have copied rows.
+fn rows_affected_line(rows: RowsAffected) -> String {
+    let rows_word = |n: u64| if n == 1 { "row" } else { "rows" };
+    match rows {
+        RowsAffected::Exact(n) => format!("{n} {} affected", rows_word(n)),
+        RowsAffected::Summed(n) => format!(
+            "{n} {} affected in total, any triggers' rows included",
+            rows_word(n)
+        ),
+        RowsAffected::Unreported => "no row count reported".to_string(),
+    }
+}
+
 /// The error block both failing run outcomes render: which statement, its
 /// preview, the message, and a footer saying what it means for the database.
 ///
@@ -959,12 +986,7 @@ fn StatementSection(
     result: SharedStatement,
 ) -> Element {
     let state = use_context::<AppState>();
-    let summary = match &result.outcome {
-        StatementOutcome::Affected(1) => "1 row affected".to_string(),
-        StatementOutcome::Affected(n) => format!("{n} rows affected"),
-        StatementOutcome::Rows(r) if r.rows.len() == 1 => "1 row".to_string(),
-        StatementOutcome::Rows(r) => format!("{} rows", r.rows.len()),
-    };
+    let summary = outcome_summary(&result.outcome);
     // Whether there is a held result to export (reads only). The buttons
     // capture the shared statement, and the export borrows its rows through
     // the `Arc` — nothing is copied, per render or per click.
@@ -1162,7 +1184,7 @@ fn PlanSection(index: usize, structured: bool, result: SharedStatement) -> Eleme
         StatementOutcome::Rows(rows) => PlanDisplay::from_result(structured, rows),
         // An EXPLAIN returns rows on every backend hubro speaks; this is the
         // shape the type allows rather than one seen in practice.
-        StatementOutcome::Affected(n) => PlanDisplay::Raw(format!("{n} rows affected")),
+        StatementOutcome::Affected(rows) => PlanDisplay::Raw(rows_affected_line(*rows)),
     };
     let cut_off =
         matches!(&result.outcome, StatementOutcome::Rows(rows) if plan_reached_cell_cap(rows));
@@ -1353,6 +1375,29 @@ mod tests {
             7,
             3,
         )
+    }
+
+    #[test]
+    fn a_write_count_claims_no_more_than_the_driver_reported() {
+        // The statement's own count: a plain number, no caveat.
+        let exact = outcome_summary(&StatementOutcome::Affected(RowsAffected::Exact(1)));
+        assert!(exact.starts_with("1 row affected"), "{exact}");
+        assert!(!exact.contains("trigger"), "{exact}");
+        assert!(!exact.contains("total"), "{exact}");
+
+        // Several counts added up: says so, and that triggers may be in it.
+        let summed = outcome_summary(&StatementOutcome::Affected(RowsAffected::Summed(4)));
+        assert!(summed.starts_with("4 rows affected"), "{summed}");
+        assert!(summed.contains("in total"), "{summed}");
+        assert!(summed.contains("any triggers"), "{summed}");
+
+        // No count: no number, so not "0 rows affected".
+        let unreported = outcome_summary(&StatementOutcome::Affected(RowsAffected::Unreported));
+        assert!(
+            !unreported.chars().any(|c| c.is_ascii_digit()),
+            "{unreported}"
+        );
+        assert!(unreported.contains("no row count"), "{unreported}");
     }
 
     #[test]

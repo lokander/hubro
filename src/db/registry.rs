@@ -12,6 +12,7 @@ use super::plan;
 use super::postgres;
 use super::rowkey::{detect_row_identity, KeyRules, KeyTextPinned, RowIdentity};
 use super::schema::{ColumnMeta, TableMeta};
+use super::script::RowsAffected;
 use super::sql::{cell_fetch_sql, value_len, Dialect};
 use super::sqlite;
 use super::sqlserver::{self, MssqlPool, MssqlTx};
@@ -111,12 +112,15 @@ pub enum ScriptTx<'p> {
 }
 
 impl ScriptTx<'_> {
-    /// Runs a non-row statement in the transaction, returning affected rows.
-    pub async fn execute(&mut self, sql: &str) -> Result<u64, DbError> {
+    /// Runs a non-row statement in the transaction, returning what it
+    /// reported about the rows it affected.
+    pub async fn execute(&mut self, sql: &str) -> Result<RowsAffected, DbError> {
         // `tx` deref-coerces to the `&mut Connection` these helpers take.
         match self {
-            ScriptTx::Sqlite(tx) => sqlite::execute_conn(tx, sql).await,
-            ScriptTx::Postgres(tx) => postgres::execute_conn(tx, sql).await,
+            ScriptTx::Sqlite(tx) => sqlite::execute_conn(tx, sql).await.map(RowsAffected::Exact),
+            ScriptTx::Postgres(tx) => postgres::execute_conn(tx, sql)
+                .await
+                .map(RowsAffected::Exact),
             ScriptTx::SqlServer(tx) => sqlserver::execute_conn(tx, sql).await,
         }
     }
@@ -292,15 +296,16 @@ impl ReadOnlyRun {
     /// Runs a non-row statement, returning affected rows. On a connection
     /// that may not write, only a statement the gate passed reaches this —
     /// transaction control, say — and the engine refuses one that writes.
-    pub(super) async fn execute(&mut self, sql: &str) -> Result<u64, DbError> {
-        match self {
+    pub(super) async fn execute(&mut self, sql: &str) -> Result<RowsAffected, DbError> {
+        let rows = match self {
             ReadOnlyRun::Sqlite(conn) => sqlite::execute_conn(conn, sql).await,
             ReadOnlyRun::Postgres { conn, begin } => {
                 let mut tx = postgres::begin_read_only(conn, begin).await?;
                 let result = postgres::execute_conn(&mut tx, sql).await;
                 read_only_outcome(result, postgres::end_read_only(tx).await)
             }
-        }
+        };
+        rows.map(RowsAffected::Exact)
     }
 
     /// Lets go of the connection by closing it — SQLite's own, and the
@@ -401,11 +406,16 @@ impl ScriptConn {
         }
     }
 
-    /// Runs a non-row statement, returning affected rows.
-    pub(super) async fn execute(&mut self, sql: &str) -> Result<u64, DbError> {
+    /// Runs a non-row statement, returning what it reported about the rows it
+    /// affected.
+    pub(super) async fn execute(&mut self, sql: &str) -> Result<RowsAffected, DbError> {
         match &mut self.held {
-            HeldConn::Sqlite(conn) => sqlite::execute_conn(conn, sql).await,
-            HeldConn::Postgres { conn, .. } => postgres::execute_conn(conn, sql).await,
+            HeldConn::Sqlite(conn) => sqlite::execute_conn(conn, sql)
+                .await
+                .map(RowsAffected::Exact),
+            HeldConn::Postgres { conn, .. } => postgres::execute_conn(conn, sql)
+                .await
+                .map(RowsAffected::Exact),
             HeldConn::SqlServer(conn) => sqlserver::execute_script_conn(conn, sql).await,
         }
     }
@@ -802,7 +812,9 @@ impl DbPool {
         match self {
             DbPool::Sqlite(pool) => sqlite::execute(pool, sql).await,
             DbPool::Postgres(pg) => postgres::execute(pg.pool(), sql).await,
-            DbPool::SqlServer(pool) => sqlserver::execute(pool, sql).await,
+            // The sum of every count the response carried, triggers' too
+            // ([`RowsAffected::Summed`]); 0 when none was reported.
+            DbPool::SqlServer(pool) => sqlserver::execute(pool, sql).await.map(RowsAffected::rows),
         }
     }
 

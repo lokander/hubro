@@ -25,8 +25,8 @@ use hubro::db::{
     apply_staged, detect_row_identity, mssql_url_with_password, run_script, split_statements,
     Capabilities, CheckedStatement, DbError, DbPool, Dialect, ExportFormat, Filter, Generated,
     OpenTransaction, PageRequest, Restriction, Rollback, RowCount, RowIdentity, RowLocator,
-    ScriptDone, SortDir, StagedChange, StatementOutcome, TableKind, TableMeta, TypeDetail, Value,
-    INSTEAD_OF_TRIGGER, MISSING_ROW, PREVIEW_BYTES, QUERY_CELL_CAP,
+    RowsAffected, ScriptDone, SortDir, StagedChange, StatementOutcome, TableKind, TableMeta,
+    TypeDetail, Value, INSTEAD_OF_TRIGGER, MISSING_ROW, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 async fn test_url() -> Option<String> {
@@ -1261,7 +1261,10 @@ async fn sqlserver_script_go_batches_split_and_execute() {
     .expect("the script should run to completion");
     assert_eq!(results.len(), 3);
     assert!(matches!(results[0].outcome, StatementOutcome::Affected(_)));
-    assert_eq!(results[1].outcome, StatementOutcome::Affected(1));
+    assert_eq!(
+        results[1].outcome,
+        StatementOutcome::Affected(RowsAffected::Exact(1))
+    );
     match &results[2].outcome {
         StatementOutcome::Rows(rows) => {
             assert_eq!(
@@ -1369,7 +1372,11 @@ async fn sqlserver_script_creates_modules_that_must_lead_a_batch() {
     })
     .await
     .expect("the script should run to completion");
-    assert_eq!(results[1].outcome, StatementOutcome::Affected(0));
+    // A plain batch, which carries no count.
+    assert_eq!(
+        results[1].outcome,
+        StatementOutcome::Affected(RowsAffected::Unreported)
+    );
     match &results[3].outcome {
         StatementOutcome::Rows(rows) => assert_eq!(rows.rows, vec![vec![Value::Integer(1)]]),
         other => panic!("expected rows from the SELECT, got {other:?}"),
@@ -3134,7 +3141,9 @@ async fn mssql_script_outcomes(pool: &DbPool, sql: &str) -> Vec<String> {
     let mut outcomes = Vec::new();
     let done = run_script(pool, pool.backend_capabilities(), &statements, |r| {
         outcomes.push(match r.outcome {
-            StatementOutcome::Affected(n) => format!("affected {n}"),
+            StatementOutcome::Affected(RowsAffected::Exact(n)) => format!("affected {n}"),
+            StatementOutcome::Affected(RowsAffected::Summed(n)) => format!("affected {n} in total"),
+            StatementOutcome::Affected(RowsAffected::Unreported) => "no count".to_string(),
             StatementOutcome::Rows(rows) => format!("rows {:?}", rows.rows),
         })
     })
@@ -3161,6 +3170,78 @@ async fn mssql_script_outcomes(pool: &DbPool, sql: &str) -> Vec<String> {
 }
 
 #[tokio::test]
+async fn sqlserver_a_script_count_says_when_it_may_hold_trigger_rows_or_is_missing() {
+    // What each statement's result line is built from. A trigger's count
+    // arrives as the same token as its statement's, so a sum of several is
+    // reported as one; a statement that sent no count reports none, not 0.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.count_probe",
+            "DROP TABLE IF EXISTS dbo.count_probe_quiet",
+            "DROP TABLE IF EXISTS dbo.count_probe_log",
+            "CREATE TABLE dbo.count_probe (a int)",
+            "CREATE TABLE dbo.count_probe_quiet (a int)",
+            "CREATE TABLE dbo.count_probe_log (a int)",
+        ],
+    )
+    .await;
+    // A trigger must lead its batch, which the script path knows how to send.
+    mssql_script(
+        &pool,
+        "CREATE TRIGGER dbo.count_probe_ins ON dbo.count_probe AFTER INSERT AS \
+         INSERT INTO dbo.count_probe_log SELECT a FROM inserted \
+         CROSS JOIN (VALUES (1), (2), (3)) v (x)\nGO\n\
+         CREATE TRIGGER dbo.count_probe_quiet_ins ON dbo.count_probe_quiet AFTER INSERT AS \
+         BEGIN SET NOCOUNT ON INSERT INTO dbo.count_probe_log SELECT a FROM inserted \
+         CROSS JOIN (VALUES (1), (2)) v (x) END",
+    )
+    .await
+    .unwrap();
+    let cases = [
+        // One row of its own, three of its trigger's: the sum, said to be one.
+        (
+            "INSERT INTO dbo.count_probe VALUES (1)",
+            "affected 4 in total",
+        ),
+        // A trigger under NOCOUNT ON sends nothing: the one count is the
+        // statement's.
+        ("INSERT INTO dbo.count_probe_quiet VALUES (1)", "affected 1"),
+        // Two statements in one, no trigger: still several counts.
+        (
+            "INSERT INTO dbo.count_probe_quiet VALUES (1) \
+             INSERT INTO dbo.count_probe_quiet VALUES (2), (3)",
+            "affected 3 in total",
+        ),
+        // No count sent at all.
+        (
+            "SET NOCOUNT ON INSERT INTO dbo.count_probe_quiet VALUES (1)",
+            "no count",
+        ),
+        // A plain batch: the temp-table creator route, and transaction
+        // control.
+        ("CREATE TABLE #count_probe_tmp (a int)", "no count"),
+        ("BEGIN TRAN", "no count"),
+    ];
+    for (sql, want) in cases {
+        let outcomes = mssql_script_outcomes(&pool, sql).await;
+        assert_eq!(outcomes, vec![want.to_string()], "{sql:?}");
+    }
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE dbo.count_probe",
+            "DROP TABLE dbo.count_probe_quiet",
+            "DROP TABLE dbo.count_probe_log",
+        ],
+    )
+    .await;
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn sqlserver_script_temp_tables_last_the_run() {
     // Each statement used to be its own `sp_executesql` call, and a local
     // temp table belongs to the scope that created it: it was dropped when
@@ -3171,11 +3252,14 @@ async fn sqlserver_script_temp_tables_last_the_run() {
     let pool = DbPool::open_mssql(&url).await.unwrap();
     let rows = |n: i64| format!("rows {:?}", vec![vec![Value::Integer(n)]]);
     let affected = |n: u64| format!("affected {n}");
+    // A plain batch — every creator here, and transaction control — carries
+    // no count.
+    let none = || "no count".to_string();
     let cases = [
         // Atomic: several statements, none managing a transaction.
         (
             "CREATE TABLE #t (a int); INSERT INTO #t VALUES (1), (2); SELECT count(*) FROM #t",
-            vec![affected(0), affected(2), rows(2)],
+            vec![none(), affected(2), rows(2)],
         ),
         // `SELECT … INTO` is a read here, and goes the same way.
         (
@@ -3186,19 +3270,19 @@ async fn sqlserver_script_temp_tables_last_the_run() {
         (
             "IF OBJECT_ID('tempdb..#b') IS NULL CREATE TABLE [#b] (a int)\nGO\n\
              INSERT INTO #b VALUES (3)\nGO\nSELECT a FROM [#b]",
-            vec![affected(0), affected(1), rows(3)],
+            vec![none(), affected(1), rows(3)],
         ),
         // Sequential, through the read path: `SELECT … INTO` on the script's
         // own connection rather than in hubro's transaction.
         (
             "BEGIN TRAN; COMMIT; SELECT 5 AS a INTO #r; SELECT a FROM #r",
-            vec![affected(0), affected(0), "rows []".to_string(), rows(5)],
+            vec![none(), none(), "rows []".to_string(), rows(5)],
         ),
         // Sequential: the script manages its own transaction.
         (
             "BEGIN TRAN; CREATE TABLE #q (a int); INSERT INTO #q VALUES (4); COMMIT; \
              SELECT a FROM #q",
-            vec![affected(0), affected(0), affected(1), affected(0), rows(4)],
+            vec![none(), none(), affected(1), none(), rows(4)],
         ),
         // An error in a plain batch names its line within the statement, as
         // through `sp_executesql`.
@@ -3207,11 +3291,12 @@ async fn sqlserver_script_temp_tables_last_the_run() {
             vec!["statement 0 failed [Full] code 208 line 2".to_string()],
         ),
         // What keeps a statement on `sp_executesql`, its temp table with it.
-        // A write: a plain batch carries no counts, and this one's is 2.
+        // A write: a plain batch carries no counts, and this one's is 2 —
+        // summed with the CREATE's count-less 0, so said to be a sum.
         (
             "CREATE TABLE #w (a int) INSERT INTO #w VALUES (1), (2)\nGO\nSELECT a FROM #w",
             vec![
-                affected(2),
+                "affected 2 in total".to_string(),
                 "statement 1 failed [Full] code 208 line 1".to_string(),
             ],
         ),

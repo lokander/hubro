@@ -544,7 +544,7 @@ async fn scripts_and_exports_span_distributed_and_reference_tables() {
         ))
         .await
         .unwrap();
-    assert_eq!(updated, 1);
+    assert_eq!(updated, hubro::db::RowsAffected::Exact(1));
     tx.commit().await.unwrap();
 
     // A second transaction rolls back, and takes both tables' changes with it
