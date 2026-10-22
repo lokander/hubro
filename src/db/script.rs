@@ -1536,6 +1536,24 @@ impl RowsAffected {
     }
 }
 
+/// What a statement run as a read produced. On SQL Server, a read that
+/// came back with no result set at all was not a read: `SELECT … INTO`
+/// (classified by its `SELECT`) fills a table and returns nothing, and the
+/// count it sends is lost on the read path — tiberius's row stream drops
+/// counts, and a temp-table creator runs as a plain batch, which carries
+/// none. Measured, `SELECT a INTO #t FROM t` over three rows was shown as
+/// "0 rows" and "The statement returned no rows." It is reported as a write
+/// that stated no count instead. A T-SQL `SELECT` always has a column, so
+/// no real result set looks like this. Other engines keep their rows as
+/// fetched: Postgres can return a result set of no columns (`SELECT FROM t`).
+fn read_outcome(dialect: Dialect, result: QueryResult) -> StatementOutcome {
+    if dialect == Dialect::SqlServer && result.columns.is_empty() && result.rows.is_empty() {
+        StatementOutcome::Affected(RowsAffected::Unreported)
+    } else {
+        StatementOutcome::Rows(result)
+    }
+}
+
 /// One executed statement: its preview (for the result header) plus its
 /// outcome.
 #[derive(Debug, Clone, PartialEq)]
@@ -1865,7 +1883,7 @@ async fn run_script_sequential(
                 )
                 .await;
             ended = Some(end);
-            read.map(|(result, truncated)| (StatementOutcome::Rows(result), truncated))
+            read.map(|(result, truncated)| (read_outcome(pool.dialect(), result), truncated))
         } else if reads {
             held.query_capped_to(
                 statement,
@@ -1873,7 +1891,7 @@ async fn run_script_sequential(
                 cell_cap(statement, pool.dialect()),
             )
             .await
-            .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated))
+            .map(|(result, truncated)| (read_outcome(pool.dialect(), result), truncated))
         } else {
             held.execute(statement)
                 .await
@@ -1975,7 +1993,7 @@ async fn run_script_read_only(
         let result = if classify_statement(statement, dialect).returns_rows() {
             run.query_capped_to(statement, MAX_QUERY_ROWS, cell_cap(statement, dialect))
                 .await
-                .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated))
+                .map(|(result, truncated)| (read_outcome(dialect, result), truncated))
         } else {
             run.execute(statement)
                 .await
@@ -2037,7 +2055,7 @@ async fn run_script_atomic(
                 cell_cap(statement, pool.dialect()),
             )
             .await
-            .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated))
+            .map(|(result, truncated)| (read_outcome(pool.dialect(), result), truncated))
         } else {
             tx.execute(statement)
                 .await
@@ -2577,6 +2595,31 @@ fn leading_words(stripped: &str, n: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sql_server_read_with_no_result_set_states_no_count() {
+        let unreported = StatementOutcome::Affected(RowsAffected::Unreported);
+        // `SELECT … INTO`: nothing came back, not even columns.
+        let nothing = QueryResult::default();
+        assert_eq!(
+            read_outcome(Dialect::SqlServer, nothing.clone()),
+            unreported
+        );
+        // A real result set that matched nothing is still zero rows.
+        let empty = QueryResult {
+            columns: vec![crate::db::ColumnInfo { name: "a".into() }],
+            rows: vec![],
+        };
+        assert_eq!(
+            read_outcome(Dialect::SqlServer, empty.clone()),
+            StatementOutcome::Rows(empty)
+        );
+        // Postgres can return a result set without columns (`SELECT FROM t`).
+        assert_eq!(
+            read_outcome(Dialect::Postgres, nothing.clone()),
+            StatementOutcome::Rows(nothing)
+        );
+    }
 
     /// [`wrap_atomically`] on a fully capable connection — the only shape
     /// the three current backends have. The capability itself is covered by
