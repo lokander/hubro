@@ -83,6 +83,35 @@ where
         .map_err(map_err)
 }
 
+/// A connection for one script run, checked out of `pool` and marked to be
+/// closed rather than returned to it when it is let go — on every path,
+/// a cancelled run's drop included. Whatever the script left on its session
+/// goes with it: see [`ScriptConn`](super::registry::ScriptConn).
+pub(super) async fn acquire_for_run<DB: Database>(
+    pool: &sqlx::Pool<DB>,
+) -> Result<sqlx::pool::PoolConnection<DB>, DbError> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+    conn.close_on_drop();
+    Ok(conn)
+}
+
+/// A script transaction on a connection from [`acquire_for_run`], so the
+/// connection closes once the transaction is resolved. The transaction owns
+/// the connection (as `Pool::begin`'s does), which is why this goes through
+/// `Transaction::begin` rather than `Pool::begin`: the latter returns a
+/// connection to the pool, and nothing reaches the one inside its handle.
+pub(super) async fn begin_for_run<DB: Database>(
+    pool: &sqlx::Pool<DB>,
+) -> Result<sqlx::Transaction<'static, DB>, DbError> {
+    let conn = acquire_for_run(pool).await?;
+    sqlx::Transaction::begin(conn, None)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))
+}
+
 /// Commits a script transaction — its statements all take effect.
 pub(super) async fn commit_tx<DB: Database>(tx: sqlx::Transaction<'_, DB>) -> Result<(), DbError> {
     tx.commit().await.map_err(|e| DbError::Query(e.to_string()))

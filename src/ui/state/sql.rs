@@ -300,23 +300,23 @@ impl AppState {
     ///
     /// Cancelling only drops the run's future — on every backend the
     /// in-flight statement itself is NOT interrupted and may still complete
-    /// server-side. What happens to its connection depends on the path:
-    /// - In hubro's own transaction (the atomic path), dropping it queues a
-    ///   rollback, so once the statement finishes nothing of the run is kept
-    ///   — unless a SQL Server batch had committed that transaction itself,
-    ///   whose committed part stands; the connection then goes back to the
-    ///   pool.
+    /// server-side. Its connection is closed on every path, as it is when a
+    /// run ends — a run's connection never goes back to the pool. What that
+    /// means for the statement depends on the path:
+    /// - In hubro's own transaction (the atomic path), closing ends the
+    ///   transaction, so once the statement finishes nothing of the run is
+    ///   kept — unless a SQL Server batch had committed that transaction
+    ///   itself, whose committed part stands.
     /// - Outside it (the sequential path, which every one-statement script
-    ///   takes), the held connection is closed rather than returned, since
-    ///   the script may have a transaction of its own open on it. A statement
+    ///   takes), the script may have a transaction of its own open. A statement
     ///   that commits on its own (a cancelled autocommit UPDATE) may still
     ///   take effect; whatever the script left uncommitted is discarded by the
     ///   server. SQLite's worker thread runs the statement to completion
     ///   before the close; Postgres and SQL Server notice the disconnect when
     ///   they next send to the client.
     /// - On a connection marked read-only, Postgres's per-statement
-    ///   transaction goes back to the pool after sqlx drains the in-flight
-    ///   query; SQLite's read-only connection is closed.
+    ///   transaction ends with the connection, as its rollback would have
+    ///   ended it; SQLite's read-only connection is closed.
     ///
     /// Either way each cancelled long-running statement keeps its server
     /// session busy until it finishes.

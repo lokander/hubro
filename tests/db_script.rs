@@ -941,7 +941,8 @@ async fn postgres_cancelled_script_does_not_return_its_transaction_to_the_pool()
             .is_err(),
         "the run should still be sleeping when it is cancelled"
     );
-    // Past the sleep, so a connection that was going back to the pool has.
+    // Past the sleep, so a connection that was going back to the pool would
+    // have.
     tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
 
     assert_eq!(pg_open_transactions(&pool).await, Vec::<String>::new());
@@ -1008,8 +1009,8 @@ async fn sqlite_cancelled_script_does_not_return_its_transaction_to_the_pool() {
 const PG_ENDLESS_READ: &str = "SELECT generate_series(1, 2000000000)";
 
 // Multi-threaded, as the app's runtime is: a capped read with nothing
-// open goes back to the pool for sqlx to read the rest in a background
-// task, which on a single-threaded runtime holds the thread until it is done.
+// open has the rest read in a background task before its connection closes,
+// which on a single-threaded runtime holds the thread until it is done.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_script_ending_in_a_capped_read_does_not_wait_for_the_rest() {
     // Ending a run asks the connection whether the script left a transaction
@@ -1033,9 +1034,9 @@ async fn postgres_script_ending_in_a_capped_read_does_not_wait_for_the_rest() {
         .expect("a capped read must not wait for the rest of its result");
     assert_eq!(outcome, Ok(ScriptDone::default()));
     assert!(results[0].truncated);
-    // With nothing open, the connection went back to the pool for sqlx to
-    // read the rest in the background — two billion rows here, so end that
-    // session rather than let it run on behind the test.
+    // With nothing open, the rest is read in the background before the
+    // connection closes — two billion rows here, so end that session rather
+    // than let it run on behind the test.
     let terminated = count(
         &pool,
         &format!(
@@ -1114,14 +1115,14 @@ async fn postgres_capped_row_returning_write_keeps_its_write() {
 }
 
 // Multi-threaded, as the app's runtime is: a capped read with nothing
-// open goes back to the pool for sqlx to read the rest in a background
-// task, which on a single-threaded runtime holds the thread until it is done.
+// open has the rest read in a background task before its connection closes,
+// which on a single-threaded runtime holds the thread until it is done.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_capped_read_with_a_write_the_gate_cannot_see_keeps_it() {
     // `SELECT f()` for a function that writes looks like a plain read, so it
     // may be cut off at the cap — but never by closing the connection, which
-    // aborted the statement. Handed back to the pool, sqlx reads the rest in
-    // the background and the statement commits, as capped reads always did.
+    // aborted the statement. The rest is read in the background before the
+    // connection closes, and the statement commits, as capped reads always did.
     let Some(url) = pg_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pool.execute("DROP FUNCTION IF EXISTS capped_bump(integer)")
