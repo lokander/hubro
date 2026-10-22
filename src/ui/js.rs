@@ -59,20 +59,63 @@ pub fn focus_by_id_next_frame(id: &str) {
     )));
 }
 
-/// [`focus_by_id_next_frame`], but only when focus is not somewhere else on
-/// purpose: when nothing holds it (the element that did was just removed,
-/// which leaves it on the body) or it is already inside `#id`.
-pub fn reclaim_focus_by_id_next_frame(id: &str) {
-    document::eval(&reclaim_focus_js(id));
+/// The attribute every modal overlay's backdrop carries
+/// (`"data-dv-modal": "true"`), so a reclaim can tell that one is open. RSX
+/// needs the attribute name as a literal, so this is what the overlays'
+/// registry test (`every_modal_overlay_is_marked`) checks them against.
+pub const MODAL_ATTR: &str = "data-dv-modal";
+
+/// Where keyboard focus is, as [`reclaim_focus_by_id_next_frame`] reads it
+/// from the page one frame on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+pub struct FocusFacts {
+    /// The target element exists.
+    pub present: bool,
+    /// Nothing holds focus: it is on the body (or nowhere), which is where it
+    /// lands when the element that held it is removed.
+    pub on_body: bool,
+    /// Focus is already inside the target.
+    pub in_target: bool,
+    /// A modal overlay ([`MODAL_ATTR`]) is open.
+    pub modal_open: bool,
 }
 
-/// The eval behind [`reclaim_focus_by_id_next_frame`]. The guard is the whole
-/// point: without it this is [`focus_by_id_next_frame`], which takes focus
-/// from the filter box a click had just put it in.
-fn reclaim_focus_js(id: &str) -> String {
+/// Whether a reclaim may focus its target: only when focus is not somewhere
+/// else on purpose — it is on the body or already inside the target — and no
+/// modal overlay is open. An overlay owns focus while it is up: the Import
+/// dialog stays open after its import finishes, and that finish refreshes the
+/// grid, so without the overlay check the grid behind it would take focus the
+/// moment the dialog's pressed button was removed, and the dialog would stop
+/// hearing Escape.
+pub fn may_reclaim(facts: FocusFacts) -> bool {
+    facts.present && !facts.modal_open && (facts.on_body || facts.in_target)
+}
+
+/// Focuses `#id` on the next animation frame when [`may_reclaim`] says the
+/// focus there is free to take. The page reports its [`FocusFacts`] and the
+/// decision is made here, in Rust, where a test can execute it.
+pub fn reclaim_focus_by_id_next_frame(id: &str) {
+    let id = id.to_string();
+    spawn(async move {
+        let mut facts = document::eval(&focus_facts_js(&id));
+        if let Ok(facts) = facts.recv::<FocusFacts>().await {
+            if may_reclaim(facts) {
+                document::eval(&format!(
+                    "const el = document.getElementById({}); if (el) el.focus();",
+                    js_string(&id)
+                ));
+            }
+        }
+    });
+}
+
+/// The eval that reports [`FocusFacts`] for `#id`, a frame from now.
+fn focus_facts_js(id: &str) -> String {
     next_frame(&format!(
         "const el = document.getElementById({}); const a = document.activeElement; \
-         if (el && (!a || a === document.body || el.contains(a))) el.focus();",
+         dioxus.send({{ present: !!el, on_body: !a || a === document.body, \
+         in_target: !!(el && a && el.contains(a)), \
+         modal_open: !!document.querySelector('[{MODAL_ATTR}]') }});",
         js_string(id)
     ))
 }
@@ -124,11 +167,120 @@ mod tests {
 
     #[test]
     fn reclaiming_focus_takes_it_only_from_the_body_or_from_inside() {
+        let facts = |on_body, in_target| FocusFacts {
+            present: true,
+            on_body,
+            in_target,
+            modal_open: false,
+        };
+        assert!(may_reclaim(facts(true, false)), "from the body");
+        assert!(may_reclaim(facts(false, true)), "from inside the target");
+        assert!(
+            !may_reclaim(facts(false, false)),
+            "not from the filter box, or anything else the user focused"
+        );
+        let gone = FocusFacts {
+            present: false,
+            ..facts(true, false)
+        };
+        assert!(!may_reclaim(gone), "no target to focus");
+    }
+
+    #[test]
+    fn no_reclaim_while_a_modal_overlay_is_open() {
+        for (on_body, in_target) in [(true, false), (false, true), (false, false)] {
+            let facts = FocusFacts {
+                present: true,
+                on_body,
+                in_target,
+                modal_open: true,
+            };
+            assert!(!may_reclaim(facts), "reclaimed under an overlay: {facts:?}");
+        }
+    }
+
+    #[test]
+    fn the_page_reports_the_facts_the_decision_reads() {
         assert_eq!(
-            reclaim_focus_js("dv-grid"),
+            focus_facts_js("dv-grid"),
             "requestAnimationFrame(() => { const el = document.getElementById(\"dv-grid\"); \
              const a = document.activeElement; \
-             if (el && (!a || a === document.body || el.contains(a))) el.focus(); });"
+             dioxus.send({ present: !!el, on_body: !a || a === document.body, \
+             in_target: !!(el && a && el.contains(a)), \
+             modal_open: !!document.querySelector('[data-dv-modal]') }); });"
         );
+    }
+
+    /// Every modal overlay, by the component that
+    /// renders it. Each backdrop must carry [`MODAL_ATTR`] — that is how
+    /// [`may_reclaim`] knows it is open. And every full-screen layer in
+    /// these files is either one of them or named below as not a modal, so
+    /// a new overlay added beside them cannot go unmarked unnoticed.
+    #[test]
+    fn every_modal_overlay_is_marked() {
+        let marker = format!(r#""{MODAL_ATTR}": "true", class: "fixed inset-0"#);
+        let files: [(&str, &str); 6] = [
+            ("shell.rs", include_str!("shell.rs")),
+            ("connections.rs", include_str!("connections.rs")),
+            ("schema_edit.rs", include_str!("schema_edit.rs")),
+            ("import.rs", include_str!("import.rs")),
+            ("schema.rs", include_str!("schema.rs")),
+            ("grid/mod.rs", include_str!("grid/mod.rs")),
+        ];
+        let code = |source: &str| -> String {
+            source
+                .lines()
+                .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|line| !line.is_empty() && !line.starts_with("//"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let overlays = [
+            ("shell.rs", "fn QuitConfirmDialog("),
+            ("shell.rs", "fn Cheatsheet("),
+            ("connections.rs", "fn ConnectFormModal("),
+            ("schema_edit.rs", "fn SchemaEditDialog("),
+            ("import.rs", "pub fn ImportDialog("),
+            ("schema.rs", "fn DdlOverlay("),
+            // The cell-value popup, inside the grid's own component.
+            (
+                "grid/mod.rs",
+                "if let Some(view) = expanded.read().clone() {",
+            ),
+        ];
+        for (file, start) in overlays {
+            let source = code(files.iter().find(|(name, _)| *name == file).unwrap().1);
+            let from = source
+                .find(start)
+                .unwrap_or_else(|| panic!("{file}: `{start}` is gone"));
+            let backdrop = source[from..]
+                .find(r#"class: "fixed inset-0"#)
+                .map(|i| &source[from..from + i + r#"class: "fixed inset-0"#.len()])
+                .unwrap_or_else(|| panic!("{file}: no backdrop after `{start}`"));
+            assert!(
+                backdrop.ends_with(&marker),
+                "{file}: the overlay at `{start}` does not carry {MODAL_ATTR}"
+            );
+        }
+        // Not a modal: the copy menu's click-catcher closes a dropdown and
+        // never holds focus.
+        let not_modal = [(
+            "grid/mod.rs",
+            r#"class: "fixed inset-0 z-30", onclick: move |_| copy_menu.set(false),"#,
+        )];
+        for (file, source) in files {
+            let source = code(source);
+            let layers = source.matches(r#"class: "fixed inset-0"#).count();
+            let marked = source.matches(marker.as_str()).count();
+            let excused = not_modal
+                .iter()
+                .filter(|(name, layer)| *name == file && source.contains(layer))
+                .count();
+            assert_eq!(
+                layers,
+                marked + excused,
+                "{file}: a full-screen layer is neither marked as a modal nor named as not one"
+            );
+        }
     }
 }

@@ -515,6 +515,8 @@ fn DdlOverlay(
     let loaded = ddl.read();
     rsx! {
         div {
+            // A modal over the app: see `js::MODAL_ATTR`.
+            "data-dv-modal": "true",
             class: "fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-4 outline-none",
             tabindex: "-1",
             onmounted: focus_on_mount,
