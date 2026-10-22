@@ -2223,6 +2223,15 @@ mod tests {
                 panic!("a bad value raised {notice:?}");
             };
             assert!(message.contains("theme"), "{message}");
+
+            // Dismissing it keeps its severity, so a refusal still shows.
+            state.dismiss_settings_notice();
+            state.report_settings_write("theme", Err(ConfigError("refused".into())));
+            let notice = state.settings_notice.peek().clone();
+            assert!(
+                matches!(notice, SettingsNotice::Showing(NoticeSeverity::Unsaved, _)),
+                "a refusal after a dismissed bad value raised {notice:?}"
+            );
         });
 
         // A file it fully understands raises nothing.
