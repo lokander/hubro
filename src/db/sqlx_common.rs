@@ -21,7 +21,7 @@ use sqlx::{Column as _, ColumnIndex, Database, Decode, Executor, IntoArguments, 
 
 use super::error::DbError;
 use super::export::{export_io_err, ExportFormat, ExportSink};
-use super::value::{cap_value, ColumnInfo, QueryResult, Value};
+use super::value::{cap_value, Capped, ColumnInfo, QueryResult, Value};
 
 /// The affected-row count of a driver's execute result. sqlx has no trait for
 /// this — `rows_affected` is an inherent method on each backend's
@@ -180,9 +180,10 @@ where
 
 /// Drains a row stream into a bounded [`QueryResult`], keeping at most
 /// `max_rows` rows and capping each cell to `cell_cap` bytes; the bool is
-/// whether rows existed past the cap.
+/// whether rows existed past the cap. The rest of a cut-short result is left
+/// unread ([`Rest::Leave`]) — see [`collect_capped_then`] for the others.
 pub(super) async fn collect_capped<S, R>(
-    mut stream: S,
+    stream: S,
     max_rows: u64,
     cell_cap: usize,
     decode_value: impl Fn(&R, usize) -> Result<Value, DbError>,
@@ -191,6 +192,78 @@ pub(super) async fn collect_capped<S, R>(
 where
     S: Stream<Item = Result<R, sqlx::Error>> + Unpin,
     R: Row,
+{
+    let capped = collect_capped_then(stream, max_rows, cell_cap, decode_value, map_err, || {
+        std::future::ready(Rest::Leave)
+    })
+    .await?;
+    Ok((capped.result, capped.truncated))
+}
+
+/// What a read the row cap cut short does with the rest of its result,
+/// decided at the moment the cap is reached ([`collect_capped_then`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Rest {
+    /// Left unread. The connection cannot be asked anything until the rest
+    /// has arrived, so the caller closes it, or has it read elsewhere.
+    Leave,
+    /// Read to its end here and thrown away, giving the executor a turn
+    /// every [`DRAIN_YIELD_ROWS`] rows.
+    Read,
+    /// A cancel has been sent for the statement: read, the same way, until
+    /// the server reports it cancelled (or the statement ends first).
+    Cancelled,
+}
+
+/// How many discarded rows the rest of a cut-short result is read in between
+/// turns for the executor.
+///
+/// The turns are the point. Over localhost a row is always waiting, so the
+/// driver's read never returns `Pending`: measured before, the rest of 200M
+/// rows was read in one 44 s poll, during which a timer around the run did not
+/// fire, `abort()` on its task did not take effect, and — the SQL tab's run
+/// being polled on the UI thread — nothing else on that thread ran either.
+pub(super) const DRAIN_YIELD_ROWS: u64 = 1024;
+
+/// Wakes the task and returns `Pending` once — a turn for whatever else the
+/// executor has, on any executor. (`tokio::task::yield_now` may defer its
+/// wake-up to tokio's scheduler, and the SQL tab's run is polled by Dioxus's
+/// event loop, not by a tokio worker.)
+pub(super) async fn yield_now() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await
+}
+
+/// SQLSTATE `query_canceled`: what a cancelled Postgres-wire statement fails
+/// with (measured the same on PostgreSQL, YugabyteDB and CockroachDB).
+pub(super) const QUERY_CANCELED: &str = "57014";
+
+/// [`collect_capped`], with what happens to the rest of a cut-short result
+/// decided by `at_cap` when the cap is reached — while the statement is
+/// still running, which is when a cancel can still stop it. Not called for a
+/// result that fits.
+pub(super) async fn collect_capped_then<S, R, F, Fut>(
+    mut stream: S,
+    max_rows: u64,
+    cell_cap: usize,
+    decode_value: impl Fn(&R, usize) -> Result<Value, DbError>,
+    map_err: impl Fn(sqlx::Error) -> DbError,
+    at_cap: F,
+) -> Result<Capped, DbError>
+where
+    S: Stream<Item = Result<R, sqlx::Error>> + Unpin,
+    R: Row,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Rest>,
 {
     let mut columns: Vec<ColumnInfo> = Vec::new();
     let mut out_rows: Vec<Vec<Value>> = Vec::new();
@@ -207,13 +280,56 @@ where
         }
         out_rows.push(decode_row(&row, cell_cap, &decode_value)?);
     }
-    Ok((
-        QueryResult {
+    let rest_cancelled = if truncated {
+        let rest = at_cap().await;
+        read_rest(&mut stream, rest, &map_err).await?
+    } else {
+        false
+    };
+    Ok(Capped {
+        result: QueryResult {
             columns,
             rows: out_rows,
         },
         truncated,
-    ))
+        rest_cancelled,
+    })
+}
+
+/// Reads the rest of a cut-short result as `rest` says, and reports whether
+/// the statement ended cancelled. An error is the statement's own — a write
+/// past the cap that failed, say — and fails the read, which is where it
+/// belongs: left for the connection's next question, it was reported as that
+/// question's failure.
+async fn read_rest<S, R>(
+    stream: &mut S,
+    rest: Rest,
+    map_err: &impl Fn(sqlx::Error) -> DbError,
+) -> Result<bool, DbError>
+where
+    S: Stream<Item = Result<R, sqlx::Error>> + Unpin,
+{
+    if rest == Rest::Leave {
+        return Ok(false);
+    }
+    let mut discarded = 0u64;
+    loop {
+        match stream.try_next().await {
+            Ok(Some(_)) => {
+                discarded += 1;
+                if discarded.is_multiple_of(DRAIN_YIELD_ROWS) {
+                    yield_now().await;
+                }
+            }
+            Ok(None) => return Ok(false),
+            Err(sqlx::Error::Database(e))
+                if rest == Rest::Cancelled && e.code().as_deref() == Some(QUERY_CANCELED) =>
+            {
+                return Ok(true)
+            }
+            Err(e) => return Err(map_err(e)),
+        }
+    }
 }
 
 /// Streams a query to `out` in the given format, pulling rows one at a time

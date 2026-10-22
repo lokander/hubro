@@ -87,6 +87,21 @@ const _: () = assert!(
 /// it: a `dialect_name: &str` next to a `dialect: Dialect` is two arguments
 /// that must agree with nothing enforcing it, and a mismatch would hand the
 /// editor one engine's completions under another's grammar.
+/// The notice over a read the row cap cut short. When the server stopped the
+/// statement there, says so: whatever the rows past the cap would have
+/// computed — or written — was not.
+fn truncation_notice(rest_cancelled: bool) -> String {
+    let notice = format!(
+        "Result truncated — showing the first {MAX_QUERY_ROWS} rows to keep memory bounded. \
+         Add a LIMIT or a WHERE clause to narrow it."
+    );
+    if rest_cancelled {
+        format!("{notice} The rest of the query was cancelled at the row cap.")
+    } else {
+        notice
+    }
+}
+
 fn dialect_name(dialect: Dialect) -> &'static str {
     match dialect {
         Dialect::Postgres => "postgres",
@@ -1037,10 +1052,7 @@ fn StatementSection(
                 div { class: "px-4 pt-2",
                     Banner {
                         kind: BannerKind::Warning,
-                        message: format!(
-                            "Result truncated — showing the first {MAX_QUERY_ROWS} rows to keep memory bounded. \
-                             Add a LIMIT or a WHERE clause to narrow it.",
-                        ),
+                        message: truncation_notice(result.rest_cancelled),
                     }
                 }
             }
@@ -1333,6 +1345,14 @@ fn format_ms(ms: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_read_stopped_at_the_row_cap_says_its_rest_was_cancelled() {
+        assert!(!truncation_notice(false).contains("cancelled"));
+        assert!(truncation_notice(true)
+            .ends_with("The rest of the query was cancelled at the row cap."));
+        assert!(truncation_notice(true).starts_with(&truncation_notice(false)));
+    }
     use crate::db::Internal;
     use crate::db::{ColumnMeta, TableKind};
     use serde_json::json;
@@ -2048,6 +2068,7 @@ mod tests {
                 rows: vec![vec![Value::Integer(1)]],
             }),
             truncated: false,
+            rest_cancelled: false,
         })
     }
 

@@ -871,3 +871,65 @@ async fn yugabyte_reports_a_transaction_only_when_a_script_leaves_one_open() {
     assert_eq!(run("SELECT 1").await, nothing, "the next run starts clean");
     pool.close().await;
 }
+
+/// A read the row cap cut short that has written — through a function the
+/// `SELECT` calls — keeps every write, though YugabyteDB never says it has
+/// written: measured, its `pg_stat_activity.backend_xid` stayed empty while
+/// the function inserted rows. Read as "has written nothing", that answer
+/// cancelled the rest of the read and lost the writes, so hubro does not ask
+/// this engine and reads the rest to its end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_capped_read_that_writes_keeps_its_writes_though_yugabyte_cannot_say_it_wrote() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    {
+        let _ddl = ddl_lock().lock().await;
+        for statement in [
+            "DROP FUNCTION IF EXISTS yb_capped_bump(integer)",
+            "DROP TABLE IF EXISTS yb_capped_side",
+            "CREATE TABLE yb_capped_side (a integer)",
+            // Rows of 2 KB, so the result outgrows the socket buffers and the
+            // statement cannot finish before most of it has been read.
+            "CREATE FUNCTION yb_capped_bump(i integer) RETURNS text LANGUAGE sql \
+             AS 'INSERT INTO yb_capped_side VALUES (i) RETURNING repeat(''x'', 2000)'",
+        ] {
+            pool.execute(statement).await.unwrap();
+        }
+    }
+    let read = "SELECT yb_capped_bump(g) FROM generate_series(1, 20000) g";
+    let mut expected = 0;
+    for script in [read.to_string(), format!("{read}; SELECT 1")] {
+        let statements = split_statements(&script, pool.dialect());
+        let mut results = Vec::new();
+        run_script(&pool, pool.backend_capabilities(), &statements, |r| {
+            results.push(r)
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{script}: {e:?}"));
+        assert!(results[0].truncated, "{script}");
+        assert!(!results[0].rest_cancelled, "{script}");
+        expected += 20_000;
+        // The last read is read in the background before its transaction
+        // commits.
+        let mut kept = Value::Null;
+        for _ in 0..300 {
+            kept = pool
+                .query("SELECT count(*) FROM yb_capped_side")
+                .await
+                .unwrap()
+                .rows[0][0]
+                .clone();
+            if kept == Value::Integer(expected) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(kept, Value::Integer(expected), "{script}: writes lost");
+    }
+    let _ddl = ddl_lock().lock().await;
+    pool.execute("DROP FUNCTION yb_capped_bump(integer)")
+        .await
+        .unwrap();
+    pool.execute("DROP TABLE yb_capped_side").await.unwrap();
+    pool.close().await;
+}

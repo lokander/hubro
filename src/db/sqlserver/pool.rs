@@ -1578,14 +1578,17 @@ pub async fn finish_script_conn_with_read(
     max_rows: u64,
     cell_cap: usize,
 ) -> crate::db::registry::FinishedRead {
-    use crate::db::registry::FinishedRead;
+    use crate::db::registry::{AfterRead, FinishedRead};
+    use crate::db::value::Capped;
     if !final_read_may_close(sql, crate::db::sql::Dialect::SqlServer) {
-        let read = query_capped_held(&mut conn.conn, true, sql, max_rows, cell_cap).await;
+        let read = query_capped_held(&mut conn.conn, true, sql, max_rows, cell_cap)
+            .await
+            .map(Capped::from);
         let ended = end_script_conn(conn).await;
         return FinishedRead {
             read,
             ended,
-            drain: false,
+            after: AfterRead::Close,
         };
     }
     let held = &mut conn.conn;
@@ -1593,7 +1596,7 @@ pub async fn finish_script_conn_with_read(
         return FinishedRead {
             read: Err(lost_connection()),
             ended: Err(lost_connection()),
-            drain: false,
+            after: AfterRead::Close,
         };
     }
     let before = held
@@ -1618,7 +1621,7 @@ pub async fn finish_script_conn_with_read(
             return FinishedRead {
                 read: Err(error.clone()),
                 ended: Err(error),
-                drain: false,
+                after: AfterRead::Close,
             };
         }
     };
@@ -1636,18 +1639,18 @@ pub async fn finish_script_conn_with_read(
         Ok((result, truncated, abandoned)) if truncated || abandoned => {
             held.discard();
             FinishedRead {
-                read: Ok((result, truncated)),
+                read: Ok(Capped::from((result, truncated))),
                 ended: Ok(open),
-                drain: false,
+                after: AfterRead::Close,
             }
         }
         read => {
-            let read = read.map(|(result, truncated, _)| (result, truncated));
+            let read = read.map(|(result, truncated, _)| Capped::from((result, truncated)));
             let ended = end_script_conn(conn).await;
             FinishedRead {
                 read,
                 ended,
-                drain: false,
+                after: AfterRead::Close,
             }
         }
     }
