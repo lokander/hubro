@@ -87,6 +87,18 @@ where
 /// closed rather than returned to it when it is let go — on every path,
 /// a cancelled run's drop included. Whatever the script left on its session
 /// goes with it: see [`ScriptConn`](super::registry::ScriptConn).
+///
+/// The bound on a close on drop: sqlx gives it five seconds
+/// (`CLOSE_ON_DROP_TIMEOUT`), then frees the pool slot whether or not the
+/// close finished. On SQLite a cancelled statement runs on in the worker
+/// thread past that, holding the write lock, and the connection only closes
+/// — rolling back what the run left uncommitted, measured after a 7 s
+/// statement cancelled at 0.3 s — once it ends. The freed slot is not what an
+/// edit waits on meanwhile: any connection's edit waits SQLite's own five
+/// second busy timeout for the lock and then fails with "database is locked",
+/// measured the same on both paths before runs closed their connections. The
+/// slot matters only when every one of the pool's connections (ten for
+/// SQLite) is busy at once.
 pub(super) async fn acquire_for_run<DB: Database>(
     pool: &sqlx::Pool<DB>,
 ) -> Result<sqlx::pool::PoolConnection<DB>, DbError> {
