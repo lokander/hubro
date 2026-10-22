@@ -600,4 +600,159 @@ mod tests {
         };
         assert!(!format!("{:?}", token.secret).contains("eyJ0eXAi"));
     }
+
+    /// Where a [`Secret`]'s value may be read: each site, how many reads it
+    /// makes, and what it hands the value to. A login handing it to the
+    /// driver (sqlx's password, tiberius's AAD token), the token endpoint's
+    /// refresh grant, and the connect's one consented store of the refresh
+    /// token. Nothing else — no log, no error message, no stray write — can
+    /// reach the value without adding a line here.
+    const EXPOSE_SITES: &[(&str, &str, usize, &str)] = &[
+        (
+            "db/postgres.rs",
+            "renew_login",
+            1,
+            "sqlx: the pool's password",
+        ),
+        (
+            "db/sqlserver/pool.rs",
+            "login_config",
+            1,
+            "tiberius: a new client's AAD token",
+        ),
+        (
+            "db/sqlserver/pool.rs",
+            "into_config",
+            1,
+            "tiberius: a login with one fixed token",
+        ),
+        (
+            "ui/state/connect.rs",
+            "login",
+            1,
+            "sqlx: the Postgres connect URL's password",
+        ),
+        (
+            "azure.rs",
+            "renew_silently",
+            1,
+            "the token endpoint's refresh grant",
+        ),
+        (
+            "ui/state/connect.rs",
+            "finish_entra_connect",
+            1,
+            "the refresh token, kept where the user's answer says",
+        ),
+    ];
+
+    /// Every `.rs` file under `src/`, by path relative to it.
+    fn sources() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.push((rel, std::fs::read_to_string(&path).unwrap()));
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        walk(&root, &root, &mut out);
+        out
+    }
+
+    /// A file's shipped code: up to its test module, with comments removed —
+    /// whole comment lines, and a trailing `//` outside a string.
+    fn shipped(source: &str) -> String {
+        let lines: Vec<&str> = source.lines().collect();
+        let end = lines
+            .windows(2)
+            .position(|w| w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod "))
+            .unwrap_or(lines.len());
+        lines[..end]
+            .iter()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .map(|line| {
+                let mut in_str = false;
+                let mut prev = ' ';
+                for (at, ch) in line.char_indices() {
+                    if ch == '"' && prev != '\\' {
+                        in_str = !in_str;
+                    }
+                    if !in_str && ch == '/' && prev == '/' {
+                        return &line[..at - 1];
+                    }
+                    prev = ch;
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Each read of a secret in `code` — `expose` as a whole identifier, but
+    /// not its definition — by the function it sits in.
+    fn expose_reads(code: &str) -> Vec<String> {
+        let ident = |c: char| c.is_alphanumeric() || c == '_';
+        code.match_indices("expose")
+            .filter(|(at, _)| {
+                !code[..*at].chars().next_back().is_some_and(ident)
+                    && !code[at + "expose".len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(ident)
+                    && !code[..*at].ends_with("fn ")
+            })
+            .map(|(at, _)| {
+                let before = &code[..at];
+                let fn_at = before
+                    .match_indices("fn ")
+                    .filter(|(i, _)| !before[..*i].chars().next_back().is_some_and(ident))
+                    .last()
+                    .map(|(i, _)| i + 3)
+                    .expect("a read outside any function");
+                before[fn_at..].chars().take_while(|c| ident(*c)).collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_secret_is_read_only_where_a_login_or_the_identity_provider_takes_it() {
+        use std::collections::BTreeMap;
+        let mut found: BTreeMap<(String, String), usize> = BTreeMap::new();
+        for (file, source) in sources() {
+            for function in expose_reads(&shipped(&source)) {
+                *found.entry((file.clone(), function)).or_default() += 1;
+            }
+        }
+        let expected: BTreeMap<(String, String), usize> = EXPOSE_SITES
+            .iter()
+            .map(|(file, function, reads, _)| ((file.to_string(), function.to_string()), *reads))
+            .collect();
+        assert_eq!(
+            found, expected,
+            "a token's value is read somewhere new, or no longer where it was: \
+             every read hands it to a driver, the token endpoint or the \
+             consented store, and is registered in EXPOSE_SITES with why"
+        );
+    }
+
+    #[test]
+    fn the_read_scan_attributes_and_counts() {
+        let code = shipped(
+            "fn a() { x.expose(); }\n\
+             // fn b() { y.expose(); }\n\
+             fn c() { let s = Secret::expose; z.expose(); } // .expose()\n\
+             pub fn expose(&self) {}",
+        );
+        assert_eq!(expose_reads(&code), vec!["a", "c", "c"]);
+    }
 }
