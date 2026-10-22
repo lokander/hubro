@@ -2,7 +2,7 @@ use dioxus::desktop::tao::dpi::{LogicalPosition, LogicalSize};
 use dioxus::desktop::tao::event::Event;
 use dioxus::desktop::{Config, WindowBuilder};
 use hubro::cli::{self, CliError, Invocation, Startup};
-use hubro::config::{default_settings_path, load_settings};
+use hubro::config::{load_settings, AppPaths};
 use hubro::ui::App;
 
 fn main() {
@@ -36,7 +36,8 @@ fn main() {
     // Restore the last window geometry, falling back to the historical
     // 1200x800 default when nothing is saved. `sanitized` clamps a corrupt
     // size/position so a bad settings file can't produce an unusable window.
-    let geometry = default_settings_path()
+    let geometry = AppPaths::platform()
+        .settings
         .map(|path| load_settings(&path).window.unwrap_or_default())
         .unwrap_or_default()
         .sanitized();

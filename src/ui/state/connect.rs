@@ -1076,7 +1076,7 @@ impl AppState {
     }
 
     fn persist_saved(mut self) {
-        let Some(config) = default_config_path() else {
+        let Some(config) = self.paths.peek().connections.clone() else {
             self.connect_error
                 .set(Some("no config directory found".to_string()));
             return;
@@ -1753,7 +1753,7 @@ impl AppState {
     /// the host trusted). A failure to persist surfaces as a connect error.
     pub async fn trust_host_and_connect(mut self, prompt: HostKeyPrompt) {
         self.host_key_prompt.set(None);
-        let Some(write_path) = crate::tunnel::app_known_hosts_path() else {
+        let Some(write_path) = self.paths.peek().known_hosts.clone() else {
             self.connect_error.set(Some(
                 "SSH tunnel: no config directory for known_hosts".to_string(),
             ));
@@ -1858,7 +1858,7 @@ impl AppState {
                 return None;
             }
         };
-        let known_hosts = crate::tunnel::default_known_hosts_read();
+        let known_hosts = self.paths.peek().known_hosts_read();
         match Tunnel::open(config.clone(), passphrase, target.0, target.1, &known_hosts).await {
             Ok(live) => {
                 // The tunnel opened, so the passphrase it was handed is good
@@ -4967,6 +4967,29 @@ mod tests {
         }
     }
 
+    /// A change to the saved list lands in the file the state was built on —
+    /// the test's temp dir — so a test that saves never writes the user's
+    /// connections.toml.
+    #[test]
+    fn a_test_state_saves_the_list_into_its_own_file() {
+        fn empty() -> Element {
+            rsx! {}
+        }
+        let dom = dioxus::core::VirtualDom::new(empty);
+        let state = crate::ui::test_dom::provide_state(&dom);
+        let file = dom.in_runtime(|| {
+            state.create_saved_group("Kept here").unwrap();
+            state.paths.peek().connections.clone().unwrap()
+        });
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("Kept here"), "{text}");
+        assert!(
+            file.starts_with(std::env::temp_dir()),
+            "{} is not a temp file",
+            file.display()
+        );
+    }
+
     // The keyring guard is held across the awaits on purpose: it keeps the
     // secrets tests from toggling the disable flag mid-flow, and this runtime
     // is single-threaded.
@@ -5070,6 +5093,11 @@ mod tests {
         drive(&mut dom, connect(Some(("stored", false)))).await;
         let id = open_id(&dom).expect("the renewed role must connect");
         assert_eq!(keyring().as_deref(), Some("stored"));
+        // The connect saved the connection, into the state's own file: this
+        // test once added "expired" to the developer's real list every run.
+        let saved = dom.in_runtime(|| state.paths.peek().connections.clone());
+        let saved = std::fs::read_to_string(saved.unwrap()).unwrap();
+        assert!(saved.contains("hubro_expired_login"), "{saved}");
         dom.in_runtime(|| state.close_connection(id));
 
         // A different password, unticked: the stale stored one is deleted.

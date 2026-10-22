@@ -7,7 +7,6 @@
 //! `docs/interactive-testing.md`.
 
 use std::any::Any;
-use std::path::Path;
 use std::rc::Rc;
 
 use dioxus::core::{generation, ElementId, Event, Mutation, ScopeId, VirtualDom};
@@ -16,7 +15,7 @@ use dioxus::html::{
 };
 
 use super::state::AppState;
-use crate::config::{SavedList, Settings};
+use crate::config::{AppPaths, SavedList, Settings};
 
 /// How many scope ids [`total_renders`] looks at. Scope ids index a slab, so
 /// a tree of a few hundred components stays far below this.
@@ -25,13 +24,27 @@ const SCOPE_SCAN: usize = 1 << 14;
 /// Gives `dom` an [`AppState`] in its root context and returns it.
 ///
 /// The state is [`AppState::unstarted`]: no background task, no history
-/// store, no read of the user's config. The saved list is empty — loaded from
-/// a path that does not exist.
+/// store, and an empty saved list. Its files are [`AppPaths::under`] a temp
+/// dir of its own, which lives as long as `dom` (it sits in the root
+/// context), so whatever the test saves or connects lands there — never in
+/// the user's real config, which a connect test once wrote to on every run.
 pub(crate) fn provide_state(dom: &VirtualDom) -> AppState {
+    let dir = Rc::new(tempfile::tempdir().expect("a temp dir for the test's files"));
+    let paths = AppPaths::under(dir.path());
+    let connections = paths
+        .connections
+        .clone()
+        .expect("under() resolves every path");
     let state = dom.in_runtime(|| {
-        let (saved, _) = SavedList::load(Path::new("/nonexistent/hubro-test/connections.toml"));
-        AppState::unstarted(saved, None, Settings::default(), Default::default())
+        AppState::unstarted(
+            SavedList::load(&connections).0,
+            None,
+            Settings::default(),
+            Default::default(),
+            paths,
+        )
     });
+    dom.provide_root_context(dir);
     dom.provide_root_context(state);
     state
 }

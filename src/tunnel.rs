@@ -182,29 +182,6 @@ enum HostKeyStatus {
     Revoked,
 }
 
-/// hubro's own known_hosts store (writable): `~/.config/hubro/known_hosts`.
-/// New trust decisions are recorded here; the user's `~/.ssh/known_hosts` is
-/// read but never modified.
-pub fn app_known_hosts_path() -> Option<PathBuf> {
-    crate::config::app_config_file("known_hosts")
-}
-
-/// The app's default set of files consulted to decide whether a server host
-/// key is trusted. Reads honor the user's OpenSSH `~/.ssh/known_hosts` (so
-/// hosts already trusted via `ssh` connect without a prompt) in addition to
-/// hubro's own store. Passed into [`Tunnel::open`] by the UI; tests inject
-/// their own paths instead.
-pub fn default_known_hosts_read() -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if let Some(app) = app_known_hosts_path() {
-        files.push(app);
-    }
-    if let Some(home) = dirs::home_dir() {
-        files.push(home.join(".ssh").join("known_hosts"));
-    }
-    files
-}
-
 /// Classifies `key` for `host:port` against what `files` record for that host
 /// ([`known_hosts::recorded_for`]), by [`host_key_verdict`].
 fn verify_host_key(host: &str, port: u16, key: &PublicKey, files: &[PathBuf]) -> HostKeyStatus {
@@ -319,7 +296,8 @@ fn host_key_info(host: &str, port: u16, key: &PublicKey) -> HostKeyInfo {
 /// Records a server key into the known_hosts file at `write_path` so a later
 /// connect to `host:port` treats it as trusted. `key_openssh` is the serialized
 /// key carried by [`TunnelError::HostKeyUnknown`] — this is the "yes, trust it"
-/// half of the trust-on-first-use prompt. The UI passes [`app_known_hosts_path`].
+/// half of the trust-on-first-use prompt. The UI passes
+/// [`crate::config::AppPaths::known_hosts`].
 pub fn trust_host_key(
     host: &str,
     port: u16,
@@ -413,7 +391,7 @@ impl Tunnel {
     /// before any network traffic, so callers can prompt cheaply.
     ///
     /// The server's host key is verified against `known_hosts_read` (the UI
-    /// passes [`default_known_hosts_read`]): an unrecognized key yields
+    /// passes [`crate::config::AppPaths::known_hosts_read`]): an unrecognized key yields
     /// [`TunnelError::HostKeyUnknown`], a changed one
     /// [`TunnelError::HostKeyChanged`] and a revoked one
     /// [`TunnelError::HostKeyRevoked`], all before authentication.
@@ -1114,7 +1092,7 @@ mod tests {
     #[test]
     fn every_readable_file_counts_and_a_bad_line_erases_only_itself() {
         let dir = tempfile::tempdir().unwrap();
-        // hubro's own store comes first in `default_known_hosts_read`, so its
+        // hubro's own store comes first in `AppPaths::known_hosts_read`, so its
         // record must count. In the second file an undecodable line for the
         // host must cost only itself (russh's reader failed the whole file on
         // it, dropping every other key recorded there), and an unreadable path

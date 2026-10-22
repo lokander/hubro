@@ -7,10 +7,7 @@ use dioxus::prelude::*;
 use dioxus_icons::lucide::{Moon, Sun, SunMoon, X};
 
 use crate::cli::Startup;
-use crate::config::{
-    default_settings_path, load_settings, save_window_geometry, ConnectionColor, Theme,
-    WindowGeometry,
-};
+use crate::config::{load_settings, save_window_geometry, ConnectionColor, Theme, WindowGeometry};
 use crate::db::{ConnectionId, Dialect, WriteProtection};
 
 use super::connections::ConnectionsScreen;
@@ -323,7 +320,11 @@ fn WindowPersistence() -> Element {
             if window.is_maximized() {
                 return;
             }
-            let requested = default_settings_path()
+            let requested = state
+                .paths
+                .peek()
+                .settings
+                .clone()
                 .map(|path| load_settings(&path).window.unwrap_or_default())
                 .unwrap_or_default()
                 .sanitized();
@@ -351,7 +352,7 @@ fn WindowPersistence() -> Element {
                 ..
             } => {
                 update_geometry(&mut latest, &window);
-                if let Some(path) = default_settings_path() {
+                if let Some(path) = state.paths.peek().settings.clone() {
                     state.report_settings_write(
                         "window geometry",
                         save_window_geometry(&path, latest.peek().sanitized()),
@@ -394,7 +395,7 @@ fn WindowPersistence() -> Element {
             let current = *latest.peek();
             if current != persisted {
                 persisted = current;
-                if let Some(path) = default_settings_path() {
+                if let Some(path) = state.paths.peek().settings.clone() {
                     state.report_settings_write(
                         "window geometry",
                         save_window_geometry(&path, current.sanitized()),
