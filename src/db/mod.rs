@@ -26,6 +26,7 @@ mod caps;
 mod clipboard;
 mod coerce;
 mod ddl;
+pub mod entra;
 mod error;
 mod export;
 mod fk;

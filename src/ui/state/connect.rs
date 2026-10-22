@@ -10,6 +10,10 @@
 
 use super::*;
 
+use std::sync::Arc;
+
+use crate::db::entra::{EntraTokens, RenewError, Renewed, Token};
+
 /// Moves one keyring secret from `old` to `new`. Best-effort: a
 /// missing secret, or a keyring that refuses, just means nothing to carry.
 /// An existing secret under `new` is left alone — it came from the connect
@@ -654,18 +658,24 @@ impl ServerBackend {
     /// Server takes an auth mode and a TLS host beside the URL), and an async
     /// function pointer would have to be boxed per call while still needing
     /// this argument juggling somewhere.
+    ///
+    /// `renewal` is an Entra sign-in's token provider: the pool asks it for the
+    /// token each new connection logs in with, since it opens connections long
+    /// after this first token expires ([`entra_renewal`]).
     async fn open(
         &self,
         connect_url: &str,
         credential: ServerCredential<'_>,
         tls_host: Option<&str>,
+        renewal: Option<Arc<EntraTokens>>,
     ) -> Result<DbPool, DbError> {
         let ServerLogin { url, aad_token } = self.login(connect_url, credential)?;
         match self.kind {
             BackendKind::SqlServer => {
-                let auth = match aad_token {
-                    Some(token) => MssqlAuth::AadToken(token),
-                    None => MssqlAuth::Password,
+                let auth = match (aad_token, renewal) {
+                    (Some(_), Some(tokens)) => MssqlAuth::Entra(tokens),
+                    (Some(token), None) => MssqlAuth::AadToken(token),
+                    (None, _) => MssqlAuth::Password,
                 };
                 DbPool::open_mssql_with(&url, &auth, tls_host).await
             }
@@ -674,7 +684,10 @@ impl ServerBackend {
             // validates TLS against the URL's own host.
             _ => {
                 debug_assert!(aad_token.is_none(), "a Postgres token belongs in the URL");
-                DbPool::open_postgres(&url).await
+                match renewal {
+                    Some(tokens) => DbPool::open_postgres_entra(&url, tokens).await,
+                    None => DbPool::open_postgres(&url).await,
+                }
             }
         }
     }
@@ -753,6 +766,61 @@ pub(super) fn saved_server_settings(
 /// The opener a *silent* acquisition passes: it refuses to open a browser, so
 /// an interactive sign-in with no usable refresh token errors here and the
 /// flow can park the sign-in card instead of popping a window unasked.
+/// The token provider an Entra connection's pool logs its later connections
+/// in with ([`EntraTokens`]), seeded with the connect's own token.
+///
+/// It renews through [`azure::renew_silently`] alone, which has no browser to
+/// open: a managed identity asks its endpoint, and an interactive sign-in
+/// redeems `token.refresh_token` — the refresh token this very sign-in
+/// returned, which the connect also keeps where the user's "remember" answer
+/// says. The provider holds its copy (and any rotated one) in memory for as
+/// long as the pool is open, the same class of keeping as session memory, and
+/// writes nothing: no keyring store, no keyring delete. A refresh token
+/// refused for good is dropped from the provider only; the keyring copy, if
+/// any, is the next connect's to judge, as it is today.
+fn entra_renewal(
+    entra: &EntraAuth,
+    resource: &'static str,
+    token: &azure::AccessToken,
+) -> Arc<EntraTokens> {
+    let auth = entra.clone();
+    let renew = Arc::new(move |refresh: Option<String>| {
+        let auth = auth.clone();
+        Box::pin(async move {
+            azure::renew_silently(
+                &auth,
+                resource,
+                refresh.as_deref(),
+                &azure::Endpoints::default(),
+            )
+            .await
+            .map(|renewed| Renewed {
+                token: Token {
+                    secret: renewed.secret,
+                    expires_at: renewed.expires_at,
+                },
+                refresh: renewed.refresh_token,
+            })
+            .map_err(|err| {
+                if azure::rejects_refresh(&err) {
+                    RenewError::RefreshRejected(err.to_string())
+                } else {
+                    RenewError::Failed(err.to_string())
+                }
+            })
+        }) as crate::db::entra::RenewFuture
+    });
+    Arc::new(EntraTokens::on_system_clock(
+        Token {
+            secret: token.secret.clone(),
+            expires_at: token.expires_at,
+        },
+        token.refresh_token.clone(),
+        matches!(entra, EntraAuth::ManagedIdentity { .. }),
+        renew,
+    ))
+}
+
 fn refuse_browser(_url: &str) -> Result<(), azure::AzureError> {
     Err(azure::AzureError::Browser(
         "interactive sign-in required".to_string(),
@@ -1270,7 +1338,7 @@ impl AppState {
         // login as a stale password, and delete it.
         let (credential, had_password) = remembered_credential(session_password.as_deref());
         let result = backend
-            .open(&connect_url, credential, tls_host.as_deref())
+            .open(&connect_url, credential, tls_host.as_deref(), None)
             .await;
         // Whether to prompt, and whether to drop the remembered password from
         // session memory first, is `password_retry`'s decision, on the
@@ -1486,13 +1554,17 @@ impl AppState {
             remember,
             ..
         } = pending;
-        // The access token moves into the login (and no further): only the
-        // refresh token below is ever written anywhere.
+        // The access token moves into the login and the pool's renewal, which
+        // holds it and the refresh token in memory for the pool's lifetime and
+        // writes neither anywhere: only the refresh token below is ever
+        // written, and only where `remember` says.
+        let renewal = entra_renewal(&entra, backend.entra_resource, &token);
         let result = backend
             .open(
                 connect_url,
                 ServerCredential::EntraToken(token.secret),
                 tls_host.as_deref(),
+                Some(renewal),
             )
             .await;
         let connected = result.is_ok();
@@ -1605,6 +1677,7 @@ impl AppState {
                 &connect_url,
                 ServerCredential::Password(&password),
                 tls_host.as_deref(),
+                None,
             )
             .await;
         if result.is_ok() {
@@ -2791,6 +2864,73 @@ mod tests {
              justifies not migrating the parked answer by this gate holding — \
              inverted, edits apply exactly when the connect failed, and the \
              argument is stood on its head"
+        );
+    }
+
+    /// A pool's token renewal writes no secret anywhere and cannot sign in
+    /// interactively: the whole of it — the provider (`db/entra.rs`), the
+    /// renewal the connect builds for it, and `azure::renew_silently` — names
+    /// no keyring or session-memory access and no browser path. The refresh
+    /// token's homes stay exactly the ones `keep_entra_refresh` chose by the
+    /// user's answer, and a rotated token never moves into the keyring.
+    #[test]
+    fn a_pools_token_renewal_stores_nothing_and_never_opens_a_browser() {
+        let provider = include_str!("../../db/entra.rs");
+        let provider = provider
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the shipped half");
+        let glue = method_body(include_str!("connect.rs"), "fn entra_renewal(");
+        let renew = method_body(
+            include_str!("../../azure.rs"),
+            "pub async fn renew_silently(",
+        );
+        for (what, body) in [
+            ("db/entra.rs", provider.to_string()),
+            ("entra_renewal", glue),
+            ("azure::renew_silently", renew),
+        ] {
+            let code = code_of(&body);
+            for forbidden in [
+                "secrets::",
+                "session_passwords",
+                "keep_entra_refresh",
+                "place_entra_refresh",
+                "forget_entra_refresh",
+                "acquire_interactive",
+                "acquire_token",
+                "open_browser",
+                "webbrowser",
+            ] {
+                assert!(
+                    !code.contains(forbidden),
+                    "{what} reaches `{forbidden}`: a pool's renewal must store, delete \
+                     and prompt for nothing"
+                );
+            }
+        }
+    }
+
+    /// The renewal the connect builds for an interactive sign-in that kept no
+    /// refresh token never renews: an expired token is refused at once, with
+    /// no renewal attempted (which would carry its error in the message).
+    #[tokio::test]
+    async fn an_interactive_sign_in_without_a_refresh_token_is_never_renewed() {
+        let token = azure::AccessToken {
+            secret: "expired".into(),
+            expires_at: std::time::SystemTime::now() - std::time::Duration::from_secs(1),
+            refresh_token: None,
+        };
+        let tokens = entra_renewal(
+            &EntraAuth::interactive_default(),
+            azure::SQLDB_RESOURCE,
+            &token,
+        );
+        let refused = tokens.current().await.unwrap_err().to_string();
+        assert!(refused.contains("reconnect to sign in again"), "{refused}");
+        assert!(
+            !refused.contains("Entra sign-in:"),
+            "a renewal was attempted: {refused}"
         );
     }
 
@@ -4379,13 +4519,18 @@ mod tests {
         assert_eq!(
             method_body(&source, "async fn open("),
             "async fn open( &self, connect_url: &str, credential: ServerCredential<'_>, \
-             tls_host: Option<&str>, ) -> Result<DbPool, DbError> { \
+             tls_host: Option<&str>, renewal: Option<Arc<EntraTokens>>, ) \
+             -> Result<DbPool, DbError> { \
              let ServerLogin { url, aad_token } = self.login(connect_url, credential)?; \
-             match self.kind { BackendKind::SqlServer => { let auth = match aad_token { \
-             Some(token) => MssqlAuth::AadToken(token), None => MssqlAuth::Password, }; \
+             match self.kind { BackendKind::SqlServer => { \
+             let auth = match (aad_token, renewal) { \
+             (Some(_), Some(tokens)) => MssqlAuth::Entra(tokens), \
+             (Some(token), None) => MssqlAuth::AadToken(token), \
+             (None, _) => MssqlAuth::Password, }; \
              DbPool::open_mssql_with(&url, &auth, tls_host).await } _ => { \
              debug_assert!(aad_token.is_none(), \"a Postgres token belongs in the URL\"); \
-             DbPool::open_postgres(&url).await } } }",
+             match renewal { Some(tokens) => DbPool::open_postgres_entra(&url, tokens).await, \
+             None => DbPool::open_postgres(&url).await, } } } }",
             "ServerBackend::open changed — it may be remapping the error. If the \
              change is deliberate and still returns the driver's DbError untouched, \
              update the pin in \
@@ -4408,7 +4553,7 @@ mod tests {
             "if session_password.is_none() {",
             "session_password = crate::secrets::get_password_async(url.clone())",
             "let (credential, had_password) = remembered_credential(session_password.as_deref());",
-            ".open(&connect_url, credential, tls_host.as_deref())",
+            ".open(&connect_url, credential, tls_host.as_deref(), None)",
             "if let Err(err) = &result {",
             "if let Some(retry) = password_retry(err, had_password) {",
             "if retry == PasswordRetry::ForgetSessionAndPrompt {",
@@ -4600,7 +4745,7 @@ mod tests {
     ) -> Option<PasswordRetry> {
         let (credential, had_password) = remembered_credential(remembered);
         let err = backend
-            .open(url, credential, None)
+            .open(url, credential, None, None)
             .await
             .err()
             .unwrap_or_else(|| panic!("{url} connected"));

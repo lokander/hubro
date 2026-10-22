@@ -232,6 +232,37 @@ pub async fn acquire_token(
     }
 }
 
+/// Renews an access token with nobody at the keyboard — for the logins a
+/// connection's pool makes after the connect (`db::entra::EntraTokens`).
+///
+/// **Never interactive**, by construction rather than by a flag: there is no
+/// browser opener to pass and no path here to [`acquire_interactive`]. A
+/// managed identity asks its endpoint, as at the connect; an interactive
+/// sign-in can only redeem `refresh`, the refresh token the connect kept, and
+/// without one there is nothing to renew with. Nothing here stores a token:
+/// what comes back is the caller's to hold.
+pub async fn renew_silently(
+    auth: &EntraAuth,
+    resource: &str,
+    refresh: Option<&str>,
+    endpoints: &Endpoints,
+) -> Result<AccessToken, AzureError> {
+    match auth {
+        EntraAuth::ManagedIdentity { client_id } => {
+            acquire_managed_identity(client_id.as_deref(), resource, endpoints).await
+        }
+        EntraAuth::Interactive { tenant, client_id } => match refresh {
+            Some(refresh) => {
+                let client_id = client_id.as_deref().unwrap_or(AZURE_CLI_CLIENT_ID);
+                redeem_refresh_token(endpoints, tenant, client_id, resource, refresh).await
+            }
+            None => Err(AzureError::Config(
+                "there is no kept sign-in to renew it with".to_string(),
+            )),
+        },
+    }
+}
+
 /// The `/.default` scope for a resource, plus `offline_access` so the token
 /// endpoint returns a refresh token.
 fn scope(resource: &str) -> String {

@@ -7,6 +7,8 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::Arc;
+use std::time::Duration;
 
 use sqlx::postgres::types::PgInterval;
 use sqlx::postgres::{
@@ -20,6 +22,7 @@ use super::caps::{Restriction, INSTEAD_RULE};
 use super::ddl::{
     create_table_sql, create_view_sql, terminate, ColumnExtra, Ddl, DdlObject, TableExtras,
 };
+use super::entra::EntraTokens;
 use super::error::DbError;
 use super::export::ExportFormat;
 use super::pg_wire;
@@ -163,6 +166,74 @@ pub struct PgConn {
     /// What opens each statement's transaction on a connection that may not
     /// write — see [`read_only_begin`].
     read_only_begin: &'static str,
+    /// An Entra connection's login: where its token comes from, and the task
+    /// that keeps the pool's password current — see [`open_postgres_entra`].
+    entra: Option<EntraLogin>,
+}
+
+/// An Entra connection's token provider, and the task renewing the pool's
+/// password from it, aborted when the last clone of the connection goes.
+#[derive(Clone)]
+struct EntraLogin {
+    tokens: Arc<EntraTokens>,
+    _renewer: Arc<AbortOnDrop>,
+}
+
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// How often an Entra connection's renewal task asks for the token. Well
+/// inside [`RENEW_MARGIN`](super::entra::RENEW_MARGIN), so a token is
+/// renewed before it expires even when a check is missed; and a check costs
+/// nothing while the token is good. Read against the wall clock each time,
+/// so a laptop waking from sleep past the expiry renews within one interval.
+const RENEW_EVERY: Duration = Duration::from_secs(60);
+
+/// Sets `pool`'s password to the token [`EntraTokens::current`] hands out,
+/// renewing it first when it nears expiry. The token *is* the password on
+/// Azure Postgres, and sqlx logs every connection it opens in with the
+/// pool's options — a script run's, and the replacements for connections it
+/// retires (idle for 10 minutes, or 30 minutes old) — so this is what keeps
+/// those logins working past the first token's hour.
+pub(super) async fn renew_login(pool: &PgPool, tokens: &EntraTokens) -> Result<(), DbError> {
+    let token = tokens.current().await?;
+    let options = (*pool.connect_options()).clone().password(&token);
+    pool.set_connect_options(options);
+    Ok(())
+}
+
+/// [`open_postgres`] for a connection that logs in with a Microsoft Entra
+/// token: `url` carries the current token as its password, and a task renews
+/// it into the pool's options every [`RENEW_EVERY`] ([`renew_login`]). A
+/// script run asks too, before it takes its connection
+/// ([`PgConn::renew_login`]), so it never waits a whole interval for a token
+/// that has just expired, and an expired sign-in that cannot be renewed fails
+/// it with a reason rather than the server's password error.
+pub async fn open_postgres_entra(url: &str, tokens: Arc<EntraTokens>) -> Result<PgConn, DbError> {
+    let mut conn = open_postgres(url).await?;
+    let pool = conn.pool.clone();
+    let task_tokens = Arc::clone(&tokens);
+    let renewer = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(RENEW_EVERY).await;
+            if pool.is_closed() {
+                break;
+            }
+            // A refusal is the next login's to report; the task keeps asking,
+            // and `EntraTokens` decides whether that reaches the network.
+            let _ = renew_login(&pool, &task_tokens).await;
+        }
+    });
+    conn.entra = Some(EntraLogin {
+        tokens,
+        _renewer: Arc::new(AbortOnDrop(renewer.abort_handle())),
+    });
+    Ok(conn)
 }
 
 impl PgConn {
@@ -180,6 +251,17 @@ impl PgConn {
     /// [`read_only_begin`].
     pub fn read_only_begin(&self) -> &'static str {
         self.read_only_begin
+    }
+
+    /// For an Entra connection, makes the pool's password the current token
+    /// ([`renew_login`]) — or fails with why it cannot be; nothing for any
+    /// other. Asked before a script run takes its connection, which is always
+    /// a new one.
+    pub(super) async fn renew_login(&self) -> Result<(), DbError> {
+        match &self.entra {
+            Some(entra) => renew_login(&self.pool, &entra.tokens).await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -280,6 +362,7 @@ pub async fn open_postgres_sized(url: &str, max_connections: u32) -> Result<PgCo
         pool,
         flavor,
         read_only_begin,
+        entra: None,
     })
 }
 

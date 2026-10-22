@@ -37,6 +37,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt as _};
 
 use super::{column_infos, decode_row};
+use crate::db::entra::EntraTokens;
 use crate::db::error::DbError;
 use crate::db::export::{export_io_err, ExportFormat, ExportSink};
 use crate::db::registry::RolledBack;
@@ -117,15 +118,19 @@ const SESSION_SETUP: &str = "SET QUOTED_IDENTIFIER ON; \
 type TdsClient = Client<Compat<TcpStream>>;
 
 /// How a SQL Server connect authenticates. [`open_mssql`] always uses
-/// `Password`; the Entra flow passes `AadToken` to [`open_mssql_with`].
+/// `Password`; the Entra flow passes `Entra` to [`open_mssql_with`].
 #[derive(Clone)]
 pub enum MssqlAuth {
     /// SQL Server authentication with the URL's user and (possibly spliced-in)
     /// password.
     Password,
     /// Microsoft Entra ID: log in with this AAD access token; the URL's
-    /// user/password are ignored.
+    /// user/password are ignored. Every connection the pool opens uses this
+    /// one token, so once it expires no new connection can log in.
     AadToken(String),
+    /// Microsoft Entra ID, renewed: each connection the pool opens logs in
+    /// with the token [`EntraTokens::current`] hands out at that moment.
+    Entra(Arc<EntraTokens>),
 }
 
 impl std::fmt::Debug for MssqlAuth {
@@ -133,6 +138,7 @@ impl std::fmt::Debug for MssqlAuth {
         match self {
             MssqlAuth::Password => write!(f, "Password"),
             MssqlAuth::AadToken(_) => write!(f, "AadToken(<HIDDEN>)"),
+            MssqlAuth::Entra(_) => write!(f, "Entra(<HIDDEN>)"),
         }
     }
 }
@@ -248,6 +254,9 @@ impl MssqlUrlParts {
             MssqlAuth::AadToken(token) => {
                 config.authentication(AuthMethod::aad_token(token));
             }
+            // Set per connection, from the token current then
+            // (`PoolInner::login_config`).
+            MssqlAuth::Entra(_) => {}
         }
         if let Some(database) = &self.database {
             config.database(database);
@@ -283,6 +292,9 @@ struct PoolInner {
     /// keeps the logical host for TLS validation (see
     /// [`MssqlUrlParts::into_config`]).
     addr: (String, u16),
+    /// Where an Entra connection's login token comes from, asked for each new
+    /// connection — `None` for every other login, which `config` carries.
+    tokens: Option<Arc<EntraTokens>>,
     /// Bounds live connections at [`MAX_CONNECTIONS`]; a checkout holds one
     /// permit for its whole lifetime.
     permits: Arc<Semaphore>,
@@ -436,12 +448,29 @@ fn lost_connection() -> DbError {
     DbError::Query("the connection was lost — the transaction was rolled back by the server".into())
 }
 
+impl PoolInner {
+    /// The config a new connection logs in with: the pool's own, with an
+    /// Entra connection's token as it stands now ([`EntraTokens::current`],
+    /// which renews one about to expire, or refuses with a reason to
+    /// reconnect). Asked per connection rather than fixed at the connect,
+    /// because the pool opens connections for as long as it is open — every
+    /// script run's among them — and a token lasts about an hour.
+    async fn login_config(&self) -> Result<Config, DbError> {
+        let mut config = self.config.clone();
+        if let Some(tokens) = &self.tokens {
+            config.authentication(AuthMethod::aad_token(&tokens.current().await?));
+        }
+        Ok(config)
+    }
+}
+
 impl MssqlPool {
-    fn new(config: Config, addr: (String, u16)) -> Self {
+    fn new(config: Config, addr: (String, u16), tokens: Option<Arc<EntraTokens>>) -> Self {
         MssqlPool {
             inner: Arc::new(PoolInner {
                 config,
                 addr,
+                tokens,
                 permits: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
                 idle: Mutex::new(Vec::new()),
                 closed: AtomicBool::new(false),
@@ -462,8 +491,8 @@ impl MssqlPool {
             // A statement of its own, so the guard is gone before any await.
             let idle = self.inner.idle.lock().expect("pool lock poisoned").pop();
             let Some(IdleClient { mut client, since }) = idle else {
-                break connect_client(&self.inner.config, &self.inner.addr, CONNECT_TIMEOUT)
-                    .await?;
+                let config = self.inner.login_config().await?;
+                break connect_client(&config, &self.inner.addr, CONNECT_TIMEOUT).await?;
             };
             match idle_reuse(since.elapsed()) {
                 IdleReuse::Reuse => break client,
@@ -523,7 +552,11 @@ pub async fn open_mssql_with(
     let parts = parse_mssql_url(url)?;
     let addr = (parts.host.clone(), parts.port);
     let config = parts.into_config(auth, tls_host);
-    let pool = MssqlPool::new(config, addr);
+    let tokens = match auth {
+        MssqlAuth::Entra(tokens) => Some(Arc::clone(tokens)),
+        MssqlAuth::Password | MssqlAuth::AadToken(_) => None,
+    };
+    let pool = MssqlPool::new(config, addr, tokens);
     {
         let mut conn = pool.acquire().await?;
         conn.request(async |c| run_query(c, "SELECT 1", &[]).await)
@@ -1737,6 +1770,7 @@ mod tests {
         let inner = Arc::new(PoolInner {
             config: Config::new(),
             addr: ("localhost".to_string(), 1433),
+            tokens: None,
             permits: Arc::new(Semaphore::new(1)),
             idle: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
@@ -1934,7 +1968,7 @@ mod tests {
         let target = (parts.host.clone(), parts.port);
         let config = parts.into_config(&MssqlAuth::Password, None);
         let (port, epoch) = freezable_proxy(target).await;
-        let pool = MssqlPool::new(config, ("127.0.0.1".to_string(), port));
+        let pool = MssqlPool::new(config, ("127.0.0.1".to_string(), port), None);
         // Three connections, used and returned, and idle long enough to be
         // checked before reuse.
         {
@@ -1981,7 +2015,85 @@ mod tests {
         Some(MssqlPool::new(
             parts.into_config(&MssqlAuth::Password, None),
             addr,
+            None,
         ))
+    }
+
+    /// An Entra pool's new connection asks the token provider before it
+    /// dials, every time: a renewal is made for it once the token nears
+    /// expiry, and a refusal is what the connection fails with. Dialing a port
+    /// nothing listens on, so the only thing a test can see is that hop — and
+    /// that it happens per connection, not once at the connect.
+    #[tokio::test]
+    async fn a_new_entra_connection_takes_its_token_from_the_provider() {
+        use crate::db::entra::{Clock, EntraTokens, Renew, RenewError, Renewed, Token};
+        use std::sync::atomic::{AtomicU64, AtomicUsize};
+        use std::time::SystemTime;
+
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let clock = Arc::new(AtomicU64::new(0));
+        let now: Clock = {
+            let clock = Arc::clone(&clock);
+            Arc::new(move || base + Duration::from_secs(clock.load(Ordering::SeqCst)))
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let renew: Renew = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |refresh: Option<String>| {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    assert_eq!(refresh.as_deref(), Some("kept"));
+                    if n == 0 {
+                        Ok(Renewed {
+                            token: Token {
+                                secret: "second".into(),
+                                expires_at: base + Duration::from_secs(7200),
+                            },
+                            refresh: None,
+                        })
+                    } else {
+                        Err(RenewError::RefreshRejected("invalid_grant".into()))
+                    }
+                })
+            })
+        };
+        let tokens = Arc::new(EntraTokens::new(
+            Token {
+                secret: "first".into(),
+                expires_at: base + Duration::from_secs(3600),
+            },
+            Some("kept".into()),
+            false,
+            renew,
+            now,
+        ));
+        let parts = parse_mssql_url(&format!("mssql://u@127.0.0.1:{port}/db")).unwrap();
+        let pool = MssqlPool::new(
+            parts.into_config(&MssqlAuth::Entra(Arc::clone(&tokens)), None),
+            ("127.0.0.1".to_string(), port),
+            Some(tokens),
+        );
+
+        // Fresh token: no renewal, and the dial is what fails.
+        assert!(pool.acquire().await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // Near expiry: the next connection renews before it dials.
+        clock.store(3500, Ordering::SeqCst);
+        assert!(pool.acquire().await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Past the renewed token's expiry, with the refresh token refused: the
+        // connection fails with the provider's reason, not a login error.
+        clock.store(7200, Ordering::SeqCst);
+        let refused = match pool.acquire().await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("an expired sign-in must not connect"),
+        };
+        assert!(refused.contains("reconnect to sign in again"), "{refused}");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
