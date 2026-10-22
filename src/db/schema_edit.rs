@@ -206,11 +206,13 @@ pub fn schema_edit_refusal(
     if table.kind != TableKind::Table {
         return Some(NOT_A_TABLE);
     }
-    if let Some(reason) = constraint_index_refusal(table, op) {
-        return Some(reason);
-    }
     let statements = [schema_op_sql(dialect, table, op)];
-    script_refusal(caps, &statements, dialect).map(|(_, reason)| reason)
+    // The connection's refusal first: on a read-only connection every Drop
+    // says why nothing can be dropped here, before any one index says why it
+    // in particular can't be.
+    script_refusal(caps, &statements, dialect)
+        .map(|(_, reason)| reason)
+        .or_else(|| constraint_index_refusal(table, op))
 }
 
 /// Why a Drop of an index the engine built for a constraint is not offered.
@@ -961,6 +963,32 @@ mod tests {
             for op in every_op() {
                 assert_eq!(refusal(&op), None, "{dialect:?} {op:?}");
             }
+        }
+    }
+
+    #[test]
+    fn a_read_only_connection_gives_its_own_reason_before_an_index_gives_its() {
+        let mut meta = table(None, "t");
+        meta.indexes.push(IndexMeta {
+            name: "t_pk".into(),
+            unique: true,
+            partial: false,
+            columns: vec!["id".into()],
+            constraint: Some(IndexConstraint::PrimaryKey),
+        });
+        let read_only = WriteProtection::ReadOnly.apply(Capabilities::FULL);
+        let drop = |name: &str| SchemaOp::DropIndex { name: name.into() };
+        for dialect in DIALECTS {
+            // The reason any index gets on this connection…
+            let connection = schema_edit_refusal(read_only, dialect, &meta, &drop("idx_t_id"));
+            assert!(connection.is_some(), "{dialect:?}");
+            assert_ne!(connection, Some(PRIMARY_KEY_INDEX), "{dialect:?}");
+            // …is the one the constraint's index gets too.
+            assert_eq!(
+                schema_edit_refusal(read_only, dialect, &meta, &drop("t_pk")),
+                connection,
+                "{dialect:?}"
+            );
         }
     }
 }
