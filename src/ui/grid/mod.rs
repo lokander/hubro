@@ -79,12 +79,35 @@ fn settled_count<E>(pending: bool, count: Option<&Result<u64, E>>) -> Option<u64
 }
 
 /// Whether `page`, holding `loaded` rows, is the last one there is — the one
-/// rule both Next and PageDown obey. An unknown count (see
-/// [`settled_count`]) is treated as the end: a page past the last would sit
-/// empty until the count arrived and the clamp pulled it back.
+/// rule both Next and PageDown obey.
+///
+/// A known count decides it. An unknown one (see [`settled_count`]) does not
+/// block paging: a short page is the end whatever the count says, and a full
+/// one may have more behind it. Treating unknown as the end left a slow
+/// `COUNT(*)` holding the grid on its page for the whole count — 38 s on a
+/// large view — and a failed count holding it there for good. The price is a
+/// table of exactly a multiple of [`PAGE_SIZE`] rows, whose last full page
+/// offers a next one that comes back empty; that page is short, so it is the
+/// end, and the clamp pulls it back once the count is known.
 fn at_end(count: Option<u64>, page: u64, loaded: u64) -> bool {
-    let last = page * PAGE_SIZE as u64 + loaded;
-    count.is_none_or(|count| last >= count)
+    match count {
+        Some(count) => page * PAGE_SIZE as u64 + loaded >= count,
+        None => loaded < PAGE_SIZE as u64,
+    }
+}
+
+/// The page to pull the grid back to when `page` is past the last one, or
+/// `None` to leave it where it is.
+///
+/// A delete or an external write (via Refresh) can leave the table with fewer
+/// pages than the one being viewed, and [`at_end`] lets the user page ahead of
+/// a count still running — onto an empty page, when the rows are an exact
+/// multiple of [`PAGE_SIZE`]. Either way the footer would read "rows 301–300
+/// of 250" over an empty page. Only a known count moves the page: while it is
+/// unknown, paging ahead of it is what the user asked for.
+fn clamped_page(count: Option<u64>, page: u64) -> Option<u64> {
+    let last_page = count?.saturating_sub(1) / PAGE_SIZE as u64;
+    (page > last_page).then_some(last_page)
 }
 
 /// Fixed data-row height in CSS pixels. Rows render one truncated
@@ -681,21 +704,15 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         }
     });
 
-    // Clamp the page if the row count shrank below the current offset — e.g. a
-    // delete or an external write (via Refresh) leaves the table with fewer
-    // pages than the one being viewed. Without this the footer reads
-    // "rows 301–300 of 250" and the page sits empty. Only acts on a
-    // resolved count; setting the page re-runs this once with a now-valid page,
-    // so it settles without looping. (Reactive; verified live, not by unit test.)
+    // Clamp the page if it is past the last — see [`clamped_page`]. Setting
+    // the page re-runs this once with a now-valid page, so it settles without
+    // looping. (Reactive; verified live, not by unit test.)
     use_effect(move || {
-        let Some(total) = settled_count(
+        let count = settled_count(
             *count_resource.state().read() == UseResourceState::Pending,
             count_resource.read().as_ref(),
-        ) else {
-            return;
-        };
-        let last_page = total.saturating_sub(1) / PAGE_SIZE as u64;
-        if page() > last_page {
+        );
+        if let Some(last_page) = clamped_page(count, page()) {
             page.set(last_page);
         }
     });
@@ -2054,8 +2071,8 @@ fn GridFooter(
                     let loaded = result.rows.len() as u64;
                     let first = if loaded == 0 { 0 } else { page() * PAGE_SIZE as u64 + 1 };
                     let last = page() * PAGE_SIZE as u64 + loaded;
-                    // While the total is unknown, Next is not offered, as
-                    // PageDown is not taken.
+                    // While the total is unknown, Next is offered on a
+                    // full page only — the same answer PageDown gets.
                     let no_next = at_end(total, page(), loaded);
                     rsx! {
                         // Everything left of the stepper lives in one bounded
@@ -2587,6 +2604,7 @@ mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
+    use crate::db::PREVIEW_BYTES;
 
     #[test]
     fn a_running_count_is_unknown_even_while_it_holds_an_old_value() {
@@ -2595,25 +2613,15 @@ mod tests {
         assert_eq!(settled_count(false, Some(&stale)), Some(1_000));
         assert_eq!(settled_count(false, Some(&Err::<u64, ()>(()))), None);
         assert_eq!(settled_count::<()>(false, None), None);
-        // Paging obeys that: a full first page of a table whose old count
-        // promised ten pages offers no next page until the count settles.
-        assert!(at_end(
-            settled_count(true, Some(&stale)),
-            0,
-            PAGE_SIZE as u64
-        ));
-        assert!(!at_end(
-            settled_count(false, Some(&stale)),
-            0,
-            PAGE_SIZE as u64
-        ));
+        // A stale count is not believed: the old one said 1 000 rows, yet a
+        // short third page is the end while the new one runs.
+        assert!(!at_end(settled_count(false, Some(&stale)), 2, 40));
+        assert!(at_end(settled_count(true, Some(&stale)), 2, 40));
     }
 
     #[test]
     fn the_last_page_is_where_the_rows_reach_the_count() {
         let full = PAGE_SIZE as u64;
-        // An unknown count is the end, however full the page.
-        assert!(at_end(None, 0, full));
         // Exactly two pages: the first has a next, the second does not.
         assert!(!at_end(Some(2 * full), 0, full));
         assert!(at_end(Some(2 * full), 1, full));
@@ -2624,7 +2632,40 @@ mod tests {
         assert!(at_end(Some(40), 0, 40));
         assert!(at_end(Some(0), 0, 0));
     }
-    use crate::db::PREVIEW_BYTES;
+
+    /// A slow count must not hold paging for its whole run, nor a failed
+    /// one for good: with the count unknown, a full page may have more
+    /// behind it and a short page is the end.
+    #[test]
+    fn an_unknown_count_lets_a_full_page_go_on_and_stops_a_short_one() {
+        let full = PAGE_SIZE as u64;
+        assert!(!at_end(None, 0, full));
+        assert!(!at_end(None, 7, full));
+        assert!(at_end(None, 0, full - 1));
+        assert!(at_end(None, 3, 1));
+        // Rows an exact multiple of the page: the last full page offers a
+        // next, which comes back empty — and that empty page is the end, so
+        // PageDown stops there rather than walking on through empty pages.
+        assert!(!at_end(None, 1, full));
+        assert!(at_end(None, 2, 0));
+        // Once the count lands, the empty page is past the last and is
+        // pulled back to it…
+        assert_eq!(clamped_page(Some(2 * full), 2), Some(1));
+        // …but while it is unknown, paging ahead of it is left alone.
+        assert_eq!(clamped_page(None, 2), None);
+        assert_eq!(clamped_page(None, 40), None);
+    }
+
+    #[test]
+    fn the_page_is_clamped_only_when_past_a_known_last_page() {
+        let full = PAGE_SIZE as u64;
+        assert_eq!(clamped_page(Some(250), 2), None);
+        assert_eq!(clamped_page(Some(250), 3), Some(2));
+        assert_eq!(clamped_page(Some(2 * full), 1), None);
+        // An empty table's only page is the first.
+        assert_eq!(clamped_page(Some(0), 0), None);
+        assert_eq!(clamped_page(Some(0), 4), Some(0));
+    }
 
     #[test]
     fn an_open_editor_is_matched_on_row_as_well_as_column() {
