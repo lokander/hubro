@@ -28,7 +28,8 @@ use super::state::{ActiveView, AppState, SettingsNotice};
 /// editor, CodeMirror) so typing never triggers a shortcut, handles the
 /// focus-only shortcuts entirely in JS (focus the grid filter, focus the
 /// schema filter, focus + arrow through the sidebar table list), and forwards
-/// the state-changing ones to Rust via `dioxus.send`. The `__dvKeys` guard
+/// the state-changing ones to Rust via `dioxus.send`. While a modal overlay
+/// is open it stands aside for everything but `?`. The `__dvKeys` guard
 /// makes a re-install (e.g. dev hot-reload) a no-op.
 const GLOBAL_KEYS_JS: &str = r#"
 (() => {
@@ -44,7 +45,13 @@ const GLOBAL_KEYS_JS: &str = r#"
   // Ctrl or Cmd: the rule every Ctrl shortcut follows (see `accel_held`).
   const accel = (e) => e.ctrlKey || e.metaKey;
   const tableButtons = () => Array.from(document.querySelectorAll('.dv-table-btn'));
+  // While a modal overlay is open, only `?` (the cheatsheet, which opens
+  // over it) is a window shortcut. The rest act on what is behind the
+  // overlay, and `/` or Ctrl+F would move focus there, out of the overlay's
+  // reach of Escape.
+  const underModal = (e) => e.key !== '?' && !!document.querySelector('[data-dv-modal]');
   window.addEventListener('keydown', (e) => {
+    if (underModal(e)) return;
     const el = document.activeElement;
     // Sidebar table-list navigation: a focused table button (not a text
     // field) arrows between siblings; Enter/Space open it natively.
@@ -457,9 +464,10 @@ fn ShortcutGroup(title: &'static str, children: Element) -> Element {
     }
 }
 
-/// The `?` shortcut cheatsheet: a modal overlay grouping every
-/// keybinding, dismissed by Escape, a click on the backdrop, or `?` again. Kept in sync by hand with the actual
-/// bindings in [`GLOBAL_KEYS_JS`] and the grid's key handler.
+/// The `?` shortcut cheatsheet: a modal overlay grouping every keybinding,
+/// dismissed by Escape, a click on the backdrop, or `?` again. Kept in sync
+/// by hand with the actual bindings in [`GLOBAL_KEYS_JS`] and the grid's key
+/// handler.
 #[component]
 fn Cheatsheet() -> Element {
     let state = use_context::<AppState>();
@@ -756,6 +764,34 @@ mod tests {
         assert!(!accel_held(Modifiers::SHIFT));
         assert!(!accel_held(Modifiers::ALT));
         assert!(!accel_held(Modifiers::empty()));
+    }
+
+    /// The window listener stands aside while a modal overlay is open, for
+    /// every key but `?`: its first statement is the gate, and the gate
+    /// reads the attribute every overlay's backdrop carries. Before, `/` and
+    /// Ctrl+F moved focus behind an open overlay, after which Escape no
+    /// longer reached it, and Ctrl+E/D/B changed the view under it.
+    #[test]
+    fn the_window_listener_stands_aside_under_a_modal() {
+        let code: Vec<String> = crate::ui::test_dom::code_lines(GLOBAL_KEYS_JS);
+        let gate = format!(
+            "const underModal = (e) => e.key !== '?' && !!document.querySelector('[{}]');",
+            crate::ui::js::MODAL_ATTR
+        );
+        assert_eq!(
+            code.iter().filter(|line| **line == gate).count(),
+            1,
+            "the gate, as written: {code:#?}"
+        );
+        let listener = code
+            .iter()
+            .position(|line| line == "window.addEventListener('keydown', (e) => {")
+            .expect("the keydown listener is gone");
+        assert_eq!(
+            code[listener + 1],
+            "if (underModal(e)) return;",
+            "the gate is not the listener's first statement"
+        );
     }
 
     /// The window listener has no Escape action: every Escape belongs to the
