@@ -179,6 +179,13 @@ fn is_scalar_base(base: &str) -> bool {
 ///   array. `money` is a scalar, but its binary value is a count of the
 ///   minor units of `lc_monetary`'s currency, which the client cannot see,
 ///   so only the server can print it.
+///
+///   The text is printed by the session that served the page and read back by
+///   the one that serves the save, so it holds only while every pooled session
+///   prints alike: the settings it depends on are pinned at login
+///   ([`super::postgres::key_text_pins`]), and the `reg*` types, which follow
+///   `search_path`, are refused as keys
+///   ([`super::rowkey::key_column_addressable`]).
 /// - **SQL Server: `hierarchyid` only.** Its `CAST` to `nvarchar` is
 ///   `ToString()` (`/1/2/`), which the server parses back on comparison.
 ///   SQL Server cannot have the Postgres rule: `CAST` to `nvarchar` is

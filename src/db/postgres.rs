@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use sqlx::postgres::types::{Oid, PgInterval};
 use sqlx::postgres::{
-    PgDatabaseError, PgErrorPosition, PgHasArrayType, PgPool, PgPoolOptions, PgRow, PgTypeKind,
-    PgValueFormat, PgValueRef,
+    PgConnectOptions, PgDatabaseError, PgErrorPosition, PgHasArrayType, PgPool, PgPoolOptions,
+    PgRow, PgTypeKind, PgValueFormat, PgValueRef,
 };
 use sqlx::types::{JsonValue, Uuid};
 use sqlx::{Row as _, TypeInfo as _, ValueRef as _};
@@ -354,11 +354,22 @@ pub async fn open_postgres(url: &str) -> Result<PgConn, DbError> {
 /// back to the pool in a spawned task, so the very next acquire finds the idle
 /// queue empty and opens another.
 pub async fn open_postgres_sized(url: &str, max_connections: u32) -> Result<PgConn, DbError> {
+    let options = url
+        .parse::<PgConnectOptions>()
+        .map_err(|e| connect_error(&e))?;
     let pool = PgPoolOptions::new()
         .max_connections(max_connections)
-        .connect(url)
+        .connect_with(options.clone().options(key_text_pins(None)))
         .await
         .map_err(|e| connect_error(&e))?;
+    // The first connection's `lc_monetary` is the role's and database's
+    // default as of now; every later connection is pinned to it. An engine
+    // without the setting refuses the `SHOW` and has no `money` type either.
+    let monetary: Option<String> = sqlx::query_scalar("SHOW lc_monetary")
+        .fetch_one(&pool)
+        .await
+        .ok();
+    pool.set_connect_options(options.options(key_text_pins(monetary.as_deref())));
     // `SELECT version()` in place of the `SELECT 1` this used to run: it is
     // the same liveness check — one round trip on a connection the pool has
     // already opened — and it answers who the server is at the same time, so
@@ -375,6 +386,53 @@ pub async fn open_postgres_sized(url: &str, max_connections: u32) -> Result<PgCo
         read_only_begin,
         entra: None,
     })
+}
+
+/// The session settings every pooled connection is given at login (as
+/// `-c name=value` in the startup packet's `options`), so that the text one
+/// session prints for a key is the text another reads back as the same value.
+///
+/// A key without a decoder is read through `::text`
+/// ([`super::page::fetched_as_server_text`]) by whichever session served the
+/// page, and parsed back by whichever serves the save. Session settings
+/// differ between pooled connections not only by a script's `SET` (a script's
+/// connection is closed after its run) but by `ALTER ROLE/DATABASE … SET`,
+/// which reaches only the sessions opened after it — and the pool opens new
+/// ones all the time. Measured on PostgreSQL 17, TimescaleDB, Citus and
+/// YugabyteDB: after `ALTER ROLE … SET IntervalStyle = 'sql_standard'`, a new
+/// session got it, and one given this option at login did not. A setting given
+/// at login overrides the role's and the database's.
+///
+/// - **`DateStyle`, `TimeZone`, `extra_float_digits`** are not here because
+///   sqlx already sends them as startup parameters on every connection
+///   (`ISO, MDY`, `UTC`, `2`), which override role defaults the same way and
+///   take precedence over `options` (measured: an `ALTER ROLE … SET DateStyle =
+///   'SQL, DMY'` left new hubro sessions on `ISO, MDY`).
+/// - **`IntervalStyle`** is pinned to `postgres`, the server default and the
+///   style hubro spells interval keys in itself. All seven Postgres-wire
+///   engines accepted it at login (CockroachDB, Materialize and RisingWave
+///   included; the last two support no other value).
+/// - **`lc_monetary`** is pinned to `monetary`, the value the pool's first
+///   connection reported, rather than to a fixed locale: it decides how many
+///   minor units a `money` value has, so pinning `C` would change what every
+///   stored amount means to someone whose database says otherwise. `None` —
+///   Materialize and RisingWave, which lack the setting and the `money` type —
+///   pins nothing.
+///
+/// `search_path` is deliberately absent: it decides name resolution for
+/// everything the user runs, so it is not hubro's to pin, and the key types
+/// whose text depends on it are refused instead
+/// ([`super::rowkey::key_column_addressable`]).
+///
+/// Values are escaped for the `options` string, which splits on whitespace
+/// and takes a backslash as an escape.
+pub(crate) fn key_text_pins(monetary: Option<&str>) -> Vec<(&'static str, String)> {
+    let escape = |value: &str| value.replace('\\', "\\\\").replace(' ', "\\ ");
+    let mut pins = vec![("IntervalStyle", "postgres".to_string())];
+    if let Some(monetary) = monetary {
+        pins.push(("lc_monetary", escape(monetary)));
+    }
+    pins
 }
 
 /// SQLSTATE `invalid_password`. PostgreSQL's `auth_failed` (auth.c) raises it
@@ -2873,6 +2931,31 @@ mod tests {
         assert_eq!(
             connect_error_from(Some(INVALID_PASSWORD), "the words".into()),
             DbError::CredentialsRejected("the words".into())
+        );
+    }
+
+    #[test]
+    fn every_session_is_pinned_to_the_settings_key_text_depends_on() {
+        // IntervalStyle always; lc_monetary to the value the first session
+        // reported, escaped for the whitespace-split `options` string; and
+        // nothing for it where the engine has no such setting.
+        assert_eq!(
+            key_text_pins(Some("en_US.utf8")),
+            [
+                ("IntervalStyle", "postgres".to_string()),
+                ("lc_monetary", "en_US.utf8".to_string()),
+            ]
+        );
+        assert_eq!(
+            key_text_pins(None),
+            [("IntervalStyle", "postgres".to_string())]
+        );
+        assert_eq!(
+            key_text_pins(Some("Norwegian Bokmal\\x")),
+            [
+                ("IntervalStyle", "postgres".to_string()),
+                ("lc_monetary", "Norwegian\\ Bokmal\\\\x".to_string()),
+            ]
         );
     }
 

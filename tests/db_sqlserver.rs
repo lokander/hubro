@@ -2057,7 +2057,11 @@ const MSSQL_KEY_TYPES: &[(&str, &str, &[&str])] = &[
     ("bit", "bit", &["0", "1"]),
     ("money", "money", &["12.3456"]),
     // Read as the `<udt>` marker before it was fetched through its text.
-    ("hierarchyid", "hierarchyid", &["'/'", "'/1/2/'", "'/1.5/'"]),
+    (
+        "hierarchyid",
+        "hierarchyid",
+        &["'/'", "'/1/'", "'/1/1/'", "'/1/2/'", "'/1.5/'"],
+    ),
 ];
 
 /// Creates one table per [`MSSQL_KEY_TYPES`] entry — `<prefix>_<slug>`,
@@ -2243,7 +2247,7 @@ async fn sqlserver_variant_keys_are_refused_rather_than_missed() {
     let keys = introspect_table(&pool, "variant_keys").await;
     assert_eq!(detect_row_identity(&keys, Dialect::SqlServer), None);
     assert!(
-        hubro::db::fk_target_columns(&refs.foreign_keys[0], &keys).is_none(),
+        hubro::db::fk_target_columns(&refs.foreign_keys[0], &keys, Dialect::SqlServer).is_none(),
         "a jump into a variant key is not offered"
     );
 
@@ -2314,7 +2318,7 @@ async fn sqlserver_an_alias_of_sql_variant_is_refused_as_a_key_too() {
 
     assert_eq!(detect_row_identity(&keys, Dialect::SqlServer), None);
     assert!(
-        hubro::db::fk_target_columns(&refs.foreign_keys[0], &keys).is_none(),
+        hubro::db::fk_target_columns(&refs.foreign_keys[0], &keys, Dialect::SqlServer).is_none(),
         "a jump into an aliased variant key is not offered"
     );
     // An alias of anything else is still a key, like its system type.
