@@ -528,12 +528,14 @@ impl PageRequest {
                 previewed,
             });
         }
-        // Columns read through the server's text, by name. A previewed one
-        // is already read through it, so naming it here changes nothing.
+        // Columns fetched whole but through the server's text, by name. A
+        // previewed column is read through the text already; it is left out
+        // because the sort below must not name it (see there).
         let as_text: Vec<&str> = columns
             .iter()
             .filter(|column| fetched_as_server_text(dialect, column))
             .map(|column| column.name.as_str())
+            .filter(|name| specs.iter().any(|s| s.name == *name && !s.previewed))
             .collect();
         // Nothing large to bound and nothing to read as text → identical to
         // the plain page select.
@@ -576,16 +578,18 @@ impl PageRequest {
             select_list.push_str(&length_exprs.join(", "));
         }
         let (where_clause, params) = self.where_clause(dialect);
-        // A sort on a column the select list wraps names the table's column,
-        // not the wrapper: both engines resolve a bare `ORDER BY "c"` to the
-        // output column `… AS "c"` first, which sorted a previewed column by
-        // its text (`[10,20)` before `[9,10)`, `/10/` before `/2/`) — and
-        // would sort a key read through its text the same way.
-        let wrapped = |column: &str| {
-            as_text.contains(&column) || specs.iter().any(|s| s.previewed && s.name == column)
-        };
+        // A sort on a column read whole through its text names the table's
+        // column, not the cast: both engines resolve a bare `ORDER BY "c"` to
+        // the output column `… AS "c"` first, which would sort an `int4range`
+        // key `[10,20)` before `[9,10)` and a `hierarchyid` `/10/` before
+        // `/2/`. Only those columns: they are keys and foreign keys (plus
+        // Postgres `money`), whose types always have an ordering. A previewed
+        // column keeps sorting by its preview's text, as it always has —
+        // naming the column there was measured to turn a sort on a `json`
+        // column (PostgreSQL) or a `tsvector` one (CockroachDB) into an error,
+        // since neither type can be ordered.
         let order = match &self.sort {
-            Some((column, dir)) if wrapped(column) => format!(
+            Some((column, dir)) if as_text.contains(&column.as_str()) => format!(
                 " ORDER BY {}.{} {}",
                 self.qualified_table(),
                 quote_ident(column),
@@ -1351,11 +1355,12 @@ mod tests {
     }
 
     #[test]
-    fn a_sort_on_a_wrapped_column_names_the_tables_column() {
+    fn a_sort_on_a_key_read_as_text_names_the_tables_column() {
         // Both engines resolve a bare `ORDER BY "c"` to the output column
         // `… AS "c"`, which sorts a range or `hierarchyid` by its text. A
-        // column the select list wraps — read as text, or previewed — is
-        // sorted by the table's own column; a plain one stays unqualified.
+        // key read as text is sorted by the table's own column; a previewed
+        // column and a plain one stay unqualified (a previewed `json` column
+        // has no ordering of its own to name).
         let columns = [
             col("span", "int4range", Some(1)),
             col("body", "text", None),
@@ -1371,7 +1376,7 @@ mod tests {
         };
         for (column, order) in [
             ("span", " ORDER BY \"app\".\"tracks\".\"span\" DESC "),
-            ("body", " ORDER BY \"app\".\"tracks\".\"body\" DESC "),
+            ("body", " ORDER BY \"body\" DESC "),
             ("n", " ORDER BY \"n\" DESC "),
         ] {
             let sql = sorted(column, Dialect::Postgres);

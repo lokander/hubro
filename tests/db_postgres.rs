@@ -2177,18 +2177,19 @@ async fn postgres_every_key_type_reads_and_writes_the_same_row() {
 }
 
 #[tokio::test]
-async fn postgres_a_column_read_as_text_still_sorts_by_its_type() {
-    // A key read through its text, and a previewed column, are both
-    // `… AS "c"` in the select list, which a bare `ORDER BY "c"` resolves to
-    // first — sorting `[10,20)` before `[9,10)`. The sort names the table's
-    // column, so both order as ranges.
+async fn postgres_a_key_read_as_text_still_sorts_by_its_type() {
+    // A key read through its text is `"k"::text AS "k"` in the select list,
+    // which a bare `ORDER BY "k"` resolves to first — sorting `[10,20)`
+    // before `[9,10)`. The sort names the table's column, so it orders as a
+    // range. A previewed column must not be named that way: a `json` one has
+    // no ordering, and sorting it failed outright when it was.
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     for sql in [
         "DROP TABLE IF EXISTS range_sort",
-        "CREATE TABLE range_sort (k int4range PRIMARY KEY, r int4range)",
-        "INSERT INTO range_sort VALUES ('[10,20)', '[10,20)'), ('[9,10)', '[9,10)'), \
-         ('[100,200)', '[100,200)')",
+        "CREATE TABLE range_sort (k int4range PRIMARY KEY, j json)",
+        "INSERT INTO range_sort VALUES ('[10,20)', '{\"b\": 1}'), ('[9,10)', '{\"c\": 1}'), \
+         ('[100,200)', '{\"a\": 1}')",
     ] {
         pool.query(sql).await.unwrap();
     }
@@ -2199,32 +2200,33 @@ async fn postgres_a_column_read_as_text_still_sorts_by_its_type() {
         .into_iter()
         .find(|t| t.name == "range_sort")
         .unwrap();
-    for column in ["k", "r"] {
-        let request = PageRequest {
-            schema: table.schema.clone(),
-            table: table.name.clone(),
-            limit: 10,
-            offset: 0,
-            sort: Some((column.into(), SortDir::Asc)),
-            filter: None,
-            extra_key_column: None,
-        };
-        let page = pool
-            .fetch_page_bounded(&request, &table.columns, &["k"])
-            .await
-            .unwrap();
-        let at = if column == "k" { 0 } else { 1 };
-        let order: Vec<&Value> = page.result.rows.iter().map(|row| &row[at]).collect();
-        assert_eq!(
-            order,
-            [
-                &Value::Text("[9,10)".into()),
-                &Value::Text("[10,20)".into()),
-                &Value::Text("[100,200)".into()),
-            ],
-            "sorted by {column}"
-        );
-    }
+    let sorted = |column: &str| PageRequest {
+        schema: table.schema.clone(),
+        table: table.name.clone(),
+        limit: 10,
+        offset: 0,
+        sort: Some((column.into(), SortDir::Asc)),
+        filter: None,
+        extra_key_column: None,
+    };
+    let page = pool
+        .fetch_page_bounded(&sorted("k"), &table.columns, &["k"])
+        .await
+        .unwrap();
+    let keys: Vec<&Value> = page.result.rows.iter().map(|row| &row[0]).collect();
+    assert_eq!(
+        keys,
+        [
+            &Value::Text("[9,10)".into()),
+            &Value::Text("[10,20)".into()),
+            &Value::Text("[100,200)".into()),
+        ]
+    );
+    let page = pool
+        .fetch_page_bounded(&sorted("j"), &table.columns, &["k"])
+        .await
+        .expect("a json column sorts by its preview's text");
+    assert_eq!(page.result.rows[0][0], Value::Text("[100,200)".into()));
     pool.query("DROP TABLE range_sort").await.unwrap();
     pool.close().await;
 }
