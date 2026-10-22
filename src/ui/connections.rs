@@ -1328,14 +1328,29 @@ fn remember_hint(
 /// a different password connecting unticked deletes its entry. Any other new
 /// connection gets no line: nothing saved can have stored a password under its
 /// locator. (`url` is `None` while the fields do not build one.)
+///
+/// Only when the submit would hand a password to the connect
+/// (`enters_password`: typed, or pasted inside the URL — the value
+/// `submit_server_form` takes). Without one it connects through
+/// `connect_server`, which never deletes a stored password, so a rename-only
+/// edit is not warned about a deletion it cannot make. (An edit that moves the
+/// locator with the field empty carries the old stored password across
+/// instead — `migrate_secret` — so that does not delete one either.)
+///
+/// When editing moves the locator, the copy an unticked box costs is the
+/// one under the *old* locator: `migrate_secret` drops it once a different
+/// password has connected, ticked or not. Ticked, that is a move — the new
+/// password is stored under the new locator — and unticked it is what this
+/// line says.
 fn form_remember_hint(
     editing: bool,
+    enters_password: bool,
     url: Option<&str>,
     saved: &[SavedConnection],
 ) -> Option<&'static str> {
     use super::state::{PromptKind, StoredCopy};
     let saved_locator = url.is_some_and(|url| saved.iter().any(|entry| entry.locator() == url));
-    if editing || saved_locator {
+    if enters_password && (editing || saved_locator) {
         remember_hint(PromptKind::DbPassword, StoredCopy::Unknown)
     } else {
         None
@@ -1500,7 +1515,29 @@ fn EntraSignInCard(prompt: super::state::EntraPrompt) -> Element {
                 }
                 "Stay signed in: remember in the system keyring (falls back to this session only)"
             }
+            if let Some(hint) = entra_remember_hint(prompt.stored) {
+                p { class: "mt-1 text-xs text-amber-700 dark:text-amber-400", "{hint}" }
+            }
         }
+    }
+}
+
+/// The line under the sign-in card's "stay signed in" box, saying what an
+/// unticked box does to a sign-in already remembered in the keyring: once the
+/// sign-in connects, `place_entra_refresh` answers `Delete` and the remembered
+/// refresh token goes. `None` where no remembered sign-in is known to remain.
+fn entra_remember_hint(stored: super::state::StoredCopy) -> Option<&'static str> {
+    use super::state::StoredCopy;
+    match stored {
+        StoredCopy::Present => Some(
+            "A sign-in for this connection is remembered in the system keyring. \
+             Leaving this unticked removes it once this sign-in connects.",
+        ),
+        StoredCopy::Unknown => Some(
+            "If a sign-in for this connection is remembered in the system keyring, \
+             leaving this unticked removes it once this sign-in connects.",
+        ),
+        StoredCopy::Absent => None,
     }
 }
 
@@ -1839,9 +1876,13 @@ fn PostgresForm(
         );
     };
 
-    // Read at render, so the line follows the fields as they are typed.
+    // Read at render, so the line follows the fields as they are typed. The
+    // password the submit would hand on: typed, or pasted inside the URL.
+    let enters_password =
+        !password().is_empty() || embedded_url_password(use_url(), &pasted_url()).is_some();
     let remember_note = form_remember_hint(
         editing,
+        enters_password,
         postgres_form_url(
             use_url(),
             &pasted_url(),
@@ -2079,9 +2120,13 @@ fn SqlServerForm(
         );
     };
 
-    // Read at render, so the line follows the fields as they are typed.
+    // Read at render, so the line follows the fields as they are typed. The
+    // password the submit would hand on: typed, or pasted inside the URL.
+    let enters_password =
+        !password().is_empty() || embedded_url_password(use_url(), &pasted_url()).is_some();
     let remember_note = form_remember_hint(
         editing,
+        enters_password,
         sqlserver_form_url(
             use_url(),
             &pasted_url(),
@@ -2368,7 +2413,115 @@ mod tests {
             ),
             (false, None, None, "fields that build no URL match nothing"),
         ] {
-            assert_eq!(form_remember_hint(editing, url, &saved), expected, "{why}");
+            assert_eq!(
+                form_remember_hint(editing, true, url, &saved),
+                expected,
+                "{why}"
+            );
+            assert_eq!(
+                form_remember_hint(editing, false, url, &saved),
+                None,
+                "no password entered, so the submit cannot delete one: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sign_in_card_warns_about_a_remembered_sign_in_only_when_one_remains() {
+        use super::super::state::StoredCopy;
+        let present = entra_remember_hint(StoredCopy::Present)
+            .expect("a remembered sign-in an unticked box deletes must be mentioned");
+        assert!(
+            present.contains("is remembered") && present.contains("unticked removes it"),
+            "{present}"
+        );
+        let unknown = entra_remember_hint(StoredCopy::Unknown)
+            .expect("a possibly remembered sign-in must be mentioned");
+        assert!(unknown.starts_with("If "), "{unknown}");
+        assert_eq!(entra_remember_hint(StoredCopy::Absent), None);
+    }
+
+    #[test]
+    fn every_remember_box_is_handed_the_value_its_hint_is_about() {
+        // The hint functions are executed above; this pins what reaches them,
+        // where an inversion compiles and no executed test sees it: the card
+        // handed `StoredCopy::Absent` instead of what the prompt carries, a
+        // form handed `false` instead of `editing`, or a form's hint built
+        // from fields its submit does not use. Comment-stripped and
+        // whitespace-collapsed, so prose cannot satisfy it and rustfmt cannot
+        // trip it.
+        let source = include_str!("connections.rs");
+        let body_of = |signature: &str| {
+            let lines: Vec<&str> = source
+                .lines()
+                .skip_while(|line| line.trim() != signature)
+                .take_while(|line| line.trim_end() != "}")
+                .collect();
+            assert!(!lines.is_empty(), "no `{signature}`");
+            code_without_prose(&lines.join("\n"))
+        };
+        for (signature, pins) in [
+            (
+                "fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {",
+                &["if let Some(hint) = remember_hint(prompt.kind, prompt.stored) {"][..],
+            ),
+            (
+                "fn EntraSignInCard(prompt: super::state::EntraPrompt) -> Element {",
+                &["if let Some(hint) = entra_remember_hint(prompt.stored) {"][..],
+            ),
+        ] {
+            let body = body_of(signature);
+            for pin in pins {
+                assert!(body.contains(pin), "{signature}: `{pin}` is gone: {body}");
+            }
+        }
+        let shared = [
+            "let enters_password = !password().is_empty() \
+             || embedded_url_password(use_url(), &pasted_url()).is_some();",
+            "let remember_note = form_remember_hint( editing, enters_password,",
+            "state.saved.read().entries(), );",
+        ];
+        for (form, builder_at_render, builder_at_submit) in [
+            (
+                "fn PostgresForm(",
+                "postgres_form_url( use_url(), &pasted_url(), &host(), &port(), \
+                 &database(), &user(), &sslmode(), ) .ok() .as_deref(),",
+                "let built = postgres_form_url( *use_url.peek(), &pasted_url.peek(), \
+                 &host.peek(), &port.peek(), &database.peek(), &user.peek(), \
+                 &sslmode.peek(), );",
+            ),
+            (
+                "fn SqlServerForm(",
+                "sqlserver_form_url( use_url(), &pasted_url(), &host(), &port(), \
+                 &database(), &user(), &encrypt(), trust_cert(), ) .ok() .as_deref(),",
+                "let built = sqlserver_form_url( *use_url.peek(), &pasted_url.peek(), \
+                 &host.peek(), &port.peek(), &database.peek(), &user.peek(), \
+                 &encrypt.peek(), *trust_cert.peek(), );",
+            ),
+        ] {
+            let body = body_of(form);
+            for pin in shared
+                .iter()
+                .copied()
+                .chain([builder_at_render, builder_at_submit])
+            {
+                assert!(body.contains(pin), "{form}: `{pin}` is gone: {body}");
+            }
+            // The line renders inside the box's gate, after the box: shown
+            // exactly when the box is, so it never speaks for a hidden one.
+            let gate = "if asks_remember(&auth_mode()) { label {";
+            let at = body.find(gate).expect("the box's gate");
+            let block = &body[at..];
+            let block = &block[..block.find("div { class:").unwrap_or(block.len())];
+            assert!(
+                block.contains("if let Some(hint) = remember_note {"),
+                "{form}: the hint is not inside the box's gate: {block}"
+            );
+            assert_eq!(
+                body.matches("remember_note").count(),
+                2,
+                "{form}: the hint is bound once and rendered once: {body}"
+            );
         }
     }
 

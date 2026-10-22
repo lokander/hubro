@@ -830,8 +830,9 @@ pub struct PasswordPrompt {
     pub stored: StoredCopy,
 }
 
-/// Whether the OS keyring holds a password for a prompt's connection, as far
-/// as the connect that raised the prompt found out.
+/// Whether the OS keyring holds a secret for a prompt's connection — the
+/// database password, or the Entra sign-in's refresh token — as far as the
+/// connect that raised the prompt found out.
 ///
 /// Three states, because the connect reads session memory first and only
 /// falls through to the keyring when that is empty: a password remembered for
@@ -849,7 +850,8 @@ pub enum StoredCopy {
     /// hedging there would put the warning on every keyring-less machine.
     Absent,
     /// The keyring was not asked: session memory supplied the password, or
-    /// the prompt is not for a database password at all.
+    /// nothing has looked yet (an SSH-passphrase prompt never does, since its
+    /// answer deletes nothing).
     Unknown,
 }
 
@@ -886,6 +888,11 @@ pub struct EntraPrompt {
     /// keyring rather than for this session only. What the card offers, and
     /// once it is submitted, what the user answered.
     pub remember: bool,
+    /// Whether a remembered sign-in — a refresh token in the OS keyring — is
+    /// still there when the card is raised, which an unticked box deletes
+    /// once the sign-in connects. Known from where the silent attempt found
+    /// its token, never from a keyring read of its own.
+    pub stored: StoredCopy,
 }
 
 /// Which phase of a connect is running, so the connections list can say more
