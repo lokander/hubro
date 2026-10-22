@@ -52,10 +52,11 @@ pub struct TypeRef {
     pub name: String,
 }
 
-/// Type structure that the declared type name alone doesn't convey, used to
-/// pick a richer editor. Postgres reports both of these as opaque
-/// `information_schema` strings (`USER-DEFINED`, `ARRAY`), so the detail is
-/// resolved during introspection; backends without these types report
+/// Type structure that the declared type name alone doesn't convey. Postgres
+/// reports enums and arrays as opaque `information_schema` strings
+/// (`USER-DEFINED`, `ARRAY`), so the detail is resolved during introspection
+/// to pick a richer editor; SQL Server reports an alias type by its alias
+/// name, so the system type behind it is carried too. Anything else reports
 /// [`TypeDetail::Plain`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum TypeDetail {
@@ -72,6 +73,13 @@ pub enum TypeDetail {
     /// An array type, with the real type name to cast to (e.g.
     /// `pg_catalog._text`); `data_type` only says `ARRAY`.
     Array { type_ref: TypeRef },
+    /// A SQL Server alias type (`CREATE TYPE dbo.code FROM nvarchar(10)`),
+    /// which `type_name` reports by its alias name: `base` is the system
+    /// type it was declared from, lowercased (`nvarchar`, `sql_variant`).
+    /// Read where a decision depends on what the values *are* rather than
+    /// what the column is called — a `sql_variant` key is refused under any
+    /// alias ([`key_column_addressable`](super::rowkey::key_column_addressable)).
+    Alias { base: String },
 }
 
 impl TypeDetail {
@@ -79,7 +87,7 @@ impl TypeDetail {
     /// `type_name` isn't itself a usable cast target.
     pub fn cast_type(&self) -> Option<&TypeRef> {
         match self {
-            TypeDetail::Plain => None,
+            TypeDetail::Plain | TypeDetail::Alias { .. } => None,
             TypeDetail::Enum { type_ref, .. } | TypeDetail::Array { type_ref } => Some(type_ref),
         }
     }

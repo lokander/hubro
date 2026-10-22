@@ -25,7 +25,7 @@ use hubro::db::{
     apply_staged, detect_row_identity, mssql_url_with_password, run_script, split_statements,
     Capabilities, CheckedStatement, DbError, DbPool, Dialect, ExportFormat, Filter, Generated,
     OpenTransaction, PageRequest, Restriction, Rollback, RowCount, RowIdentity, RowLocator,
-    ScriptDone, SortDir, StagedChange, StatementOutcome, TableKind, TableMeta, Value,
+    ScriptDone, SortDir, StagedChange, StatementOutcome, TableKind, TableMeta, TypeDetail, Value,
     INSTEAD_OF_TRIGGER, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
@@ -2250,6 +2250,99 @@ async fn sqlserver_variant_keys_are_refused_rather_than_missed() {
     run_all(
         &pool,
         &["DROP TABLE dbo.variant_refs", "DROP TABLE dbo.variant_keys"],
+    )
+    .await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_an_alias_of_sql_variant_is_refused_as_a_key_too() {
+    // SQL Server reports an alias type by its alias name, so refusing
+    // `sql_variant` by name alone let `CREATE TYPE … FROM sql_variant` back
+    // in: such a key missed its rows exactly as a plain variant did. The
+    // system type behind the alias is introspected, and decides.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.alias_variant_refs",
+            "DROP TABLE IF EXISTS dbo.alias_variant_keys",
+            "DROP TYPE IF EXISTS dbo.hubro_variant_alias",
+            "CREATE TYPE dbo.hubro_variant_alias FROM sql_variant",
+            "CREATE TABLE dbo.alias_variant_keys (k dbo.hubro_variant_alias NOT NULL PRIMARY KEY, \
+             body nvarchar(max))",
+            "INSERT INTO dbo.alias_variant_keys VALUES \
+             (CAST(CAST(5 AS int) AS sql_variant), CONCAT(N'0:', REPLICATE(CAST(N'x' AS nvarchar(max)), 5000)))",
+            "CREATE TABLE dbo.alias_variant_refs \
+             (ref dbo.hubro_variant_alias REFERENCES dbo.alias_variant_keys (k))",
+        ],
+    )
+    .await;
+    let keys = introspect_table(&pool, "alias_variant_keys").await;
+    let refs = introspect_table(&pool, "alias_variant_refs").await;
+    let k = &keys.columns[0];
+    assert_eq!(k.type_name, "hubro_variant_alias");
+    assert_eq!(
+        k.type_detail,
+        TypeDetail::Alias {
+            base: "sql_variant".into()
+        }
+    );
+    // What a key on it would do if it were offered: the row it was read
+    // from is not found again.
+    let forced = RowIdentity::PrimaryKey {
+        columns: vec!["k".into()],
+    };
+    let request = page_request("alias_variant_keys");
+    let page = pool
+        .fetch_page_bounded(&request, &keys.columns, &["k"])
+        .await
+        .unwrap();
+    let locator = RowLocator {
+        identity_values: vec![page.result.rows[0][0].clone()],
+    };
+    let cell = pool
+        .fetch_cell(&keys, &forced, &locator, "body")
+        .await
+        .unwrap();
+    assert_eq!(
+        cell.value,
+        Value::Null,
+        "the int variant's key finds no row"
+    );
+
+    assert_eq!(detect_row_identity(&keys, Dialect::SqlServer), None);
+    assert!(
+        hubro::db::fk_target_columns(&refs.foreign_keys[0], &keys).is_none(),
+        "a jump into an aliased variant key is not offered"
+    );
+    // An alias of anything else is still a key, like its system type.
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.alias_int_keys",
+            "DROP TYPE IF EXISTS dbo.hubro_int_alias",
+            "CREATE TYPE dbo.hubro_int_alias FROM int",
+            "CREATE TABLE dbo.alias_int_keys (k dbo.hubro_int_alias NOT NULL PRIMARY KEY)",
+        ],
+    )
+    .await;
+    let ints = introspect_table(&pool, "alias_int_keys").await;
+    assert_eq!(
+        ints.columns[0].type_detail,
+        TypeDetail::Alias { base: "int".into() }
+    );
+    assert!(detect_row_identity(&ints, Dialect::SqlServer).is_some());
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE dbo.alias_variant_refs",
+            "DROP TABLE dbo.alias_variant_keys",
+            "DROP TABLE dbo.alias_int_keys",
+            "DROP TYPE dbo.hubro_variant_alias",
+            "DROP TYPE dbo.hubro_int_alias",
+        ],
     )
     .await;
     pool.close().await;

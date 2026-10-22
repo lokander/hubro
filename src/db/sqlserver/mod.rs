@@ -112,7 +112,10 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
     // Columns with PK positions resolved in SQL (LEFT JOIN on the primary-key
     // index's key columns), one row per column. sys.types is joined on
     // user_type_id so alias types report their alias name and system CLR
-    // types (hierarchyid, geography, …) their own names. The raw
+    // types (hierarchyid, geography, …) their own names; an alias type's
+    // system type comes out beside it (`TYPE_NAME(system_type_id)`), because
+    // what its values are is not in its name. A CLR type is left out of that:
+    // geography, geometry and hierarchyid share one `system_type_id`. The raw
     // (max_length, precision, scale) triple is carried out and rendered into
     // the conventional readable form (`nvarchar(50)`, `decimal(10,2)`) by
     // [`format_mssql_type`]; default definitions are unwrapped from SQL
@@ -122,7 +125,9 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
         "SELECT s.name, o.name, c.name, t.name, \
                 c.max_length, c.precision, c.scale, \
                 c.is_nullable, c.is_identity, c.is_computed, \
-                d.definition, pk.key_ordinal \
+                d.definition, pk.key_ordinal, \
+                CASE WHEN t.is_user_defined = 1 AND t.is_assembly_type = 0 \
+                     THEN TYPE_NAME(t.system_type_id) END \
          FROM sys.columns c \
          JOIN sys.objects o ON o.object_id = c.object_id \
          JOIN sys.schemas s ON s.schema_id = o.schema_id \
@@ -258,8 +263,15 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
             primary_key_position: pk_position,
             default,
             generated,
-            // SQL Server has neither enum nor array types.
-            type_detail: TypeDetail::Plain,
+            // SQL Server has neither enum nor array types; an alias type
+            // carries the system type it was declared from, since
+            // `type_name` names only the alias.
+            type_detail: match row_opt_text(row, 12) {
+                Some(base) => TypeDetail::Alias {
+                    base: base.to_lowercase(),
+                },
+                None => TypeDetail::Plain,
+            },
         });
     }
 
