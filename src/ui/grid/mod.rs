@@ -52,10 +52,13 @@ use crate::util::human_bytes;
 
 use super::editing::{editor_kind, CellEditor, EditNav, EditorKind};
 use super::import::ImportDialog;
-use super::js::{focus_by_id_next_frame, js_string};
+use super::js::{
+    focus_by_id_next_frame, focus_on_mount, js_string, reclaim_focus_by_id_next_frame,
+};
 use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState};
 use super::schema::display_type;
 use super::selection::Selection;
+use super::shell::accel_held;
 use super::stage::{required_insert_columns, PendingInsert, TableStage};
 use super::state::{
     find_table_meta, fk_jump_target, grid_export_line, AppState, ImportStatus, TableRef,
@@ -240,6 +243,53 @@ fn expand_view(cell: &GridNavCell, locator: Option<RowLocator>) -> ExpandView {
     }
 }
 
+/// What Enter does on the focused cell.
+#[derive(Debug, Clone, PartialEq)]
+enum EnterAction {
+    /// Open the in-place editor on this cell.
+    Edit(ActiveEdit),
+    /// Show the cell's full value in the popup.
+    Expand(ExpandView),
+    /// Nothing: an empty page, or a pending insert's locked cell (a blob or
+    /// generated column, which stays "default" until saved).
+    Nothing,
+}
+
+/// Resolves Enter at focus `pos`, which may be on a fetched row or a pending
+/// insert: an editable cell opens its editor — a pending insert's under its
+/// own row key, the one [`InsertCellSlot`] opens for — and a fetched cell that
+/// can't be edited expands instead. A phantom row has nothing to expand.
+fn enter_action(nav: &GridNav, pos: (usize, usize)) -> EnterAction {
+    let (rows, cols) = nav.focus_dims();
+    if rows == 0 || cols == 0 {
+        return EnterAction::Nothing;
+    }
+    let (r, c) = (pos.0.min(rows - 1), pos.1.min(cols - 1));
+    let edit = |row_key: String| {
+        EnterAction::Edit(ActiveEdit {
+            row_key,
+            column: nav.headers[c].clone(),
+            draft: None,
+        })
+    };
+    if let Some(insert) = nav.insert_at(r) {
+        return match insert.editable.get(c) {
+            Some(true) => edit(insert.key.clone()),
+            _ => EnterAction::Nothing,
+        };
+    }
+    let Some(row) = nav.rows.get(r) else {
+        return EnterAction::Nothing;
+    };
+    let Some(cell) = row.cells.get(c) else {
+        return EnterAction::Nothing;
+    };
+    match (cell.editable, row.key.clone()) {
+        (true, Some(key)) => edit(key),
+        _ => EnterAction::Expand(expand_view(cell, row.locator.clone())),
+    }
+}
+
 /// Paged grid for one table: sortable headers, per-column contains/equals
 /// filter, page navigation, row-count indicator, refresh — plus staged-edit
 /// rendering: dirty cells and deletes are tinted, pending inserts
@@ -408,7 +458,12 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         let _ = sort.read();
         let _ = applied_filter.read();
         let _ = refresh_nonce();
-        editing.set(None);
+        // Peeked first: a set is unconditional, and every write wakes the
+        // focus effect below — which is how applying a filter used to pull
+        // focus out of the filter box.
+        if editing.peek().is_some() {
+            editing.set(None);
+        }
         selected.set(HashMap::new());
         // Re-seed the focus ring at the first cell and drop any expand popup;
         // the clamp effect below trims it to None for an empty page.
@@ -707,10 +762,21 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // container's key handler for focus movement and Enter. Built from the
     // same `page_view` the render consumes — one row derivation, two readers —
     // but owning its data so the `'static` key closure can read it off-render.
+    let nav_table = table.clone();
     let grid_nav = use_memo(move || {
         let view = page_view.read();
         let meta = render_meta();
+        // The phantom rows render only under a loaded page, so they join
+        // the focus ring only then too.
+        let inserts = match (
+            rows_resource.read().as_ref(),
+            state.table_stage(id, &nav_table),
+        ) {
+            (Some(Ok(_)), Some(stage)) => stage.inserts().to_vec(),
+            _ => Vec::new(),
+        };
         GridNav::build((*view.headers).clone(), &view.rows, &meta.column_kinds)
+            .with_inserts(&inserts, &meta.column_kinds)
     });
 
     // Keep the focus ring inside the current page and seed it once data
@@ -720,7 +786,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // rectangle reaching past a page that just shrank would address rows the
     // grid no longer has.
     use_effect(move || {
-        let (rows, cols) = grid_nav.read().dims();
+        let (rows, cols) = grid_nav.read().focus_dims();
         let focus = *focused_cell.peek();
         let anchor = *selection_anchor.peek();
         let current = match focus {
@@ -757,10 +823,15 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // anchor, when one is pinned. `None` only for a page with nothing to
     // select. Derived rather than stored so the two corners can never drift
     // apart from the focus the rest of the grid navigates by.
+    //
+    // `None` too while the focus ring is on a pending insert, which no
+    // selection covers (see `GridNav`).
     let selection = use_memo(move || {
-        let focus = (*focused_cell.read())?;
-        let anchor = selection_anchor.read().unwrap_or(focus);
-        Some(Selection { anchor, focus })
+        selection_of(
+            *focused_cell.read(),
+            *selection_anchor.read(),
+            grid_nav.read().rows.len(),
+        )
     });
 
     // Scroll the focused cell into view as it moves. With windowed rows an
@@ -823,18 +894,30 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         compute_visible_range(scroll_top(), viewport_h(), ROW_HEIGHT, total, ROW_OVERSCAN)
     });
 
-    // Return keyboard focus to the grid container whenever no cell editor is
-    // open — on mount, and after an editor closes (the editor input, not the
-    // container, held focus) — so arrow navigation keeps working without a
-    // mouse click. Only fires on an editing → None transition, so it never
-    // steals focus from the filter box or sidebar while the grid is idle.
+    // Give keyboard focus to the grid container on mount, and hand it back
+    // after an editor closes (the editor input, not the container, held
+    // focus), so arrow navigation keeps working without a mouse click.
     //
     // Both editors count: watching only the grid's left the arrow
     // keys dead after a commit in the panel, because focus stayed on the
     // closed panel editor's input and nothing handed it back.
+    //
+    // `grid_refocus` decides from the *edge*, not the level: this effect
+    // re-runs on every write to either signal, and a write of `None` over
+    // `None` (any page, sort, filter or refresh reset) used to pull focus
+    // out of the filter box the user had just pressed Enter in. And handing
+    // focus back only reclaims it — it leaves alone a focus the user moved
+    // elsewhere, as clicking the filter box while an editor was open does
+    // (the click's blur is what commits and closes the editor).
+    let mut editor_was_open = use_hook(|| CopyValue::new(None::<bool>));
     use_effect(move || {
-        if editing.read().is_none() && detail_editing.read().is_none() {
-            focus_by_id_next_frame("dv-grid");
+        let open = editing.read().is_some() || detail_editing.read().is_some();
+        let was_open = *editor_was_open.peek();
+        editor_was_open.set(Some(open));
+        match grid_refocus(was_open, open) {
+            GridRefocus::Take => focus_by_id_next_frame("dv-grid"),
+            GridRefocus::Reclaim => reclaim_focus_by_id_next_frame("dv-grid"),
+            GridRefocus::Leave => {}
         }
     });
 
@@ -962,13 +1045,9 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             anchor: selection_anchor.peek().unwrap_or(focus),
             focus,
         };
-        let next = if shift {
-            current.extended_to((row, col))
-        } else {
-            Selection::single((row, col))
-        };
-        selection_anchor.set(shift.then_some(next.anchor));
-        focused_cell.set(Some(next.focus));
+        let (anchor, focus) = select_to(current, (row, col), shift, grid_nav.peek().rows.len());
+        selection_anchor.set(anchor);
+        focused_cell.set(Some(focus));
         copy_status.set(None);
     };
 
@@ -980,6 +1059,12 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // instead of collapsing, Ctrl+A / Shift+Space / Ctrl+Space select the
     // page / row / column, and Ctrl+C copies.
     let key_copy_ctx = copy_ctx.clone();
+    // Closes the value-expand popup and hands focus back to the grid: the
+    // popup held it, and it is about to be removed.
+    let mut close_expanded = move || {
+        expanded.set(None);
+        focus_by_id_next_frame("dv-grid");
+    };
     let on_grid_key = move |evt: KeyboardEvent| {
         if editing.peek().is_some() {
             return;
@@ -998,11 +1083,14 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             return;
         }
         let modifiers = evt.modifiers();
-        // Cmd on macOS is the same intent as Ctrl elsewhere for these.
-        let ctrl = modifiers.ctrl() || modifiers.meta();
+        let ctrl = accel_held(modifiers);
         let shift = modifiers.shift();
-        let (rows, cols) = grid_nav.peek().dims();
-        if rows == 0 || cols == 0 {
+        // Two extents: the focus ring moves over the pending inserts too,
+        // while a selection — and so copying, and selecting a whole row or
+        // page — covers the fetched rows only.
+        let (focus_rows, cols) = grid_nav.peek().focus_dims();
+        let rows = grid_nav.peek().rows.len();
+        if focus_rows == 0 || cols == 0 {
             return;
         }
         let pos = focused_cell.peek().unwrap_or((0, 0));
@@ -1010,12 +1098,16 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             anchor: selection_anchor.peek().unwrap_or(pos),
             focus: pos,
         };
+        let on_insert = pos.0 >= rows;
         // Copy: the plain shortcut, so `None` — a single cell
-        // copies its raw value, a block copies TSV.
+        // copies its raw value, a block copies TSV. A pending insert has no
+        // value to copy.
         if ctrl && code == Code::KeyC {
             evt.prevent_default();
-            copy_menu.set(false);
-            start_copy(&key_copy_ctx, &grid_nav.peek(), current, None);
+            if !on_insert {
+                copy_menu.set(false);
+                start_copy(&key_copy_ctx, &grid_nav.peek(), current, None);
+            }
             return;
         }
         // Select all / whole row / whole column. Ctrl+A must also suppress
@@ -1023,7 +1115,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         let axis = match code {
             Code::KeyA if ctrl => Selection::all(rows, cols),
             Code::Space if ctrl => Selection::column(pos.1, rows),
-            Code::Space if shift => Selection::row(pos.0, cols),
+            Code::Space if shift && !on_insert => Selection::row(pos.0, cols),
             _ => None,
         };
         if let Some(axis) = axis {
@@ -1035,20 +1127,14 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         }
         if code == Code::Enter || code == Code::NumpadEnter {
             evt.prevent_default();
-            let nav = grid_nav.peek();
-            let (r, c) = (pos.0.min(rows - 1), pos.1.min(cols - 1));
-            if let Some(cell) = nav.rows.get(r).and_then(|row| row.cells.get(c)) {
-                // Editable cell → open the in-place editor; otherwise expand
-                // the value. A truncated cell fetches its full value on demand;
-                // a complete one shows the in-hand text.
-                match (cell.editable, nav.rows[r].key.clone()) {
-                    (true, Some(key)) => editing.set(Some(ActiveEdit {
-                        row_key: key,
-                        column: cell.column.clone(),
-                        draft: None,
-                    })),
-                    _ => expanded.set(Some(expand_view(cell, nav.rows[r].locator.clone()))),
-                }
+            // Editable cell → open the in-place editor; otherwise expand
+            // the value. A truncated cell fetches its full value on demand;
+            // a complete one shows the in-hand text.
+            let action = enter_action(&grid_nav.peek(), pos);
+            match action {
+                EnterAction::Edit(edit) => editing.set(Some(edit)),
+                EnterAction::Expand(view) => expanded.set(Some(view)),
+                EnterAction::Nothing => {}
             }
             return;
         }
@@ -1056,13 +1142,13 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             return;
         };
         evt.prevent_default();
-        match apply_grid_move(pos, mv, rows, cols) {
+        match apply_grid_move(pos, mv, focus_rows, cols) {
             FocusOutcome::Cell(next) => {
                 // Shift extends the rectangle (the anchor stays where the
                 // selection started); an unmodified move collapses it.
-                let moved = current.extended_to(next);
-                selection_anchor.set(shift.then_some(moved.anchor));
-                focused_cell.set(Some(moved.focus));
+                let (anchor, focus) = select_to(current, next, shift, rows);
+                selection_anchor.set(anchor);
+                focused_cell.set(Some(focus));
             }
             FocusOutcome::PrevPage => {
                 let p = *page.peek();
@@ -1296,6 +1382,10 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                                 }
                                                 for (col_index , header) in headers.iter().cloned().enumerate() {
                                                     GridHeader {
+                                                        // The name carries the identity; the
+                                                        // index only separates a result that
+                                                        // repeats one.
+                                                        key: "{col_index}:{header}",
                                                         name: header,
                                                         sort: sort_value.clone(),
                                                         on_sort: move |name: String| {
@@ -1370,9 +1460,15 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                             }
                                             // Pending inserts: phantom rows with
                                             // editable "database default" cells.
-                                            for insert in pending_inserts {
+                                            for (offset , insert) in pending_inserts.into_iter().enumerate() {
                                                 InsertRow {
                                                     key: "{insert.row_key()}",
+                                                    row_index: total_rows + offset,
+                                                    focused_col: match focused_cell() {
+                                                        Some((r, c)) if r == total_rows + offset => Some(c),
+                                                        _ => None,
+                                                    },
+                                                    on_select_cell,
                                                     id,
                                                     table: insert_parent_table.clone(),
                                                     insert,
@@ -1406,6 +1502,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                         id,
                         table: detail_table,
                         detail: detail(),
+                        on_pending_insert: focused_cell().is_some_and(|(row, _)| row >= grid_nav.read().rows.len()),
                         width: detail_width,
                         dialect: dialect.unwrap_or(Dialect::Sqlite),
                         read_only_notice: read_only_notice.map(str::to_string),
@@ -1428,11 +1525,27 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             // Value-expand popup: Enter on a read-only / non-editable
             // focused cell shows its full value — fetched on demand for a
             // truncated cell. Dismissed by a backdrop click, the ✕,
-            // or Escape (handled by the grid container).
+            // or Escape.
+            //
+            // The popup owns its Escape, like the DDL overlay: it renders
+            // beside `#dv-grid`, not inside it, so once a click on its text or
+            // its Copy raw button has taken focus the grid's handler never
+            // sees the key. The backdrop takes focus when it opens and holds
+            // it for any click inside that lands on nothing focusable; closing
+            // hands focus back to the grid, since the element that had it is
+            // gone.
             if let Some(view) = expanded.read().clone() {
                 div {
-                    class: "fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-4",
-                    onclick: move |_| expanded.set(None),
+                    class: "fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-4 outline-none",
+                    tabindex: "-1",
+                    onmounted: focus_on_mount,
+                    onkeydown: move |evt: KeyboardEvent| {
+                        if evt.code() == Code::Escape {
+                            evt.prevent_default();
+                            close_expanded();
+                        }
+                    },
+                    onclick: move |_| close_expanded(),
                     div {
                         class: "max-h-[70vh] w-full max-w-2xl overflow-auto rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 p-4 shadow-xl",
                         onclick: move |evt| evt.stop_propagation(),
@@ -1443,7 +1556,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                             button {
                                 class: "rounded px-2 py-0.5 text-sm text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
                                 aria_label: "Close",
-                                onclick: move |_| expanded.set(None),
+                                onclick: move |_| close_expanded(),
                                 X { size: 16 }
                             }
                         }
@@ -2801,5 +2914,58 @@ mod tests {
                 "{function} spawns a scoped task: {body}"
             );
         }
+    }
+
+    #[test]
+    fn enter_opens_a_pending_inserts_own_editor_and_never_expands_it() {
+        let kinds: HashMap<String, (EditorKind, bool)> = [
+            ("id".to_string(), (EditorKind::Text, false)),
+            ("title".to_string(), (EditorKind::Text, true)),
+        ]
+        .into_iter()
+        .collect();
+        let result = two_column_result();
+        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), None, true);
+        let mut stage = TableStage::default();
+        let insert = stage.add_insert();
+        let nav = GridNav::build(vec!["id".into(), "title".into()], &rows, &kinds)
+            .with_inserts(stage.inserts(), &kinds);
+
+        // Two fetched rows, then the insert at focus row 2.
+        // The insert's cell: its editor, under the key `InsertCellSlot`
+        // matches on.
+        assert_eq!(
+            enter_action(&nav, (2, 1)),
+            EnterAction::Edit(ActiveEdit {
+                row_key: format!("insert:{insert}"),
+                column: "title".into(),
+                draft: None,
+            })
+        );
+        // A fetched cell is unchanged: its own row key.
+        let EnterAction::Edit(edit) = enter_action(&nav, (0, 1)) else {
+            panic!("a fetched editable cell opens its editor");
+        };
+        assert_eq!(edit.row_key, nav.rows[0].key.clone().unwrap());
+        // A stale focus past the inserts clamps onto the last one.
+        assert!(
+            matches!(enter_action(&nav, (9, 1)), EnterAction::Edit(e) if e.row_key.starts_with("insert:"))
+        );
+        // An empty page: nothing.
+        assert_eq!(
+            enter_action(&GridNav::default(), (0, 0)),
+            EnterAction::Nothing
+        );
+    }
+
+    #[test]
+    fn enter_on_a_pending_inserts_locked_cell_does_nothing() {
+        let mut nav = GridNav::build(vec!["id".into(), "cover".into()], &[], &HashMap::new());
+        nav.inserts = vec![GridNavInsert {
+            key: "insert:7".into(),
+            editable: vec![true, false],
+        }];
+        assert_eq!(enter_action(&nav, (0, 1)), EnterAction::Nothing);
+        assert!(matches!(enter_action(&nav, (0, 0)), EnterAction::Edit(_)));
     }
 }

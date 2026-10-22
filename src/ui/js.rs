@@ -59,6 +59,17 @@ pub fn focus_by_id_next_frame(id: &str) {
     )));
 }
 
+/// [`focus_by_id_next_frame`], but only when focus is not somewhere else on
+/// purpose: when nothing holds it (the element that did was just removed,
+/// which leaves it on the body) or it is already inside `#id`.
+pub fn reclaim_focus_by_id_next_frame(id: &str) {
+    document::eval(&next_frame(&format!(
+        "const el = document.getElementById({}); const a = document.activeElement; \
+         if (el && (!a || a === document.body || el.contains(a))) el.focus();",
+        js_string(id)
+    )));
+}
+
 /// [`focus_by_id_next_frame`] for a text input, leaving the caret at the end
 /// of the current value.
 pub fn focus_input_end_next_frame(id: &str) {
