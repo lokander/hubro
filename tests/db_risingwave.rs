@@ -653,6 +653,13 @@ async fn risingwave_long_cells_load_through_every_key_type() {
         ("text", "varchar", &["'plain'", "'trailing  '"]),
         ("tstz", "timestamptz", &["'2024-02-29 13:45:01.123456+02'"]),
         ("bytea", "bytea", &["'\\x00ff10'"]),
+        // Reported as `character varying[]` with `udt_name` `list`, which no
+        // `pg_type` row is named: the cast comes from the name itself.
+        (
+            "textarr",
+            "varchar[]",
+            &["ARRAY['a,b', 'c']", "ARRAY['a', 'b,c']"],
+        ),
     ];
     for (slug, type_name, literals) in key_types {
         let rows: Vec<String> = literals

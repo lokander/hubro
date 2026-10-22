@@ -602,7 +602,8 @@ pub(super) fn column_cast(column: &ColumnMeta, dialect: Dialect) -> Option<Strin
 /// - when the column's type name is empty;
 /// - for `data_type` strings that are not usable/plain type names:
 ///   `ARRAY` and `USER-DEFINED` whose real name didn't resolve, or anything
-///   outside `[a-z0-9 _.]` after lowercasing — `.` is allowed because the
+///   outside `[a-z0-9 _.]` after lowercasing and setting aside a trailing
+///   `[]` (an array spelled by its element type) — `.` is allowed because the
 ///   materialized-view half of the introspection UNION fills `type_name`
 ///   from `format_type()`, which can legitimately emit `myschema.mytype`
 ///   (the charset gate also guarantees the interpolated cast text is inert).
@@ -643,20 +644,34 @@ fn cast_target(column: &ColumnMeta) -> Option<String> {
         ));
     }
     let lowered = column.type_name.trim().to_ascii_lowercase();
+    // An array spelled as its element type with `[]` — what RisingWave's
+    // `data_type` says (`character varying[]`, with a `udt_name` of `list`
+    // that names no `pg_type` row, so no [`TypeDetail`] resolves) and what
+    // `format_type()` prints for a materialized view's array column. The
+    // suffix is kept and the element type goes through the same gate and
+    // rewrites as a scalar. Uncast, RisingWave refused the key predicate
+    // outright (`"k" = $1` binds text against `varchar[]`), so a long cell
+    // keyed by an array never loaded.
+    let mut element = lowered.as_str();
+    let mut dims = 0;
+    while let Some(inner) = element.strip_suffix("[]") {
+        element = inner.trim_end();
+        dims += 1;
+    }
     // Bare `bit` and `character` are `bit(n)` and `character(n)`, whose
     // modifier `data_type` dropped. Cast to the unbounded member of the
     // family and let the column's own modifier apply on assignment.
-    match lowered.as_str() {
-        "bit" => return Some("bit varying".to_string()),
-        "character" => return Some("bpchar".to_string()),
-        _ => {}
-    }
-    let plain = !lowered.is_empty()
-        && lowered != "array"
-        && lowered.chars().all(|c| {
+    let element = match element {
+        "bit" => "bit varying",
+        "character" => "bpchar",
+        other => other,
+    };
+    let plain = !element.is_empty()
+        && element != "array"
+        && element.chars().all(|c| {
             c.is_ascii_lowercase() || c.is_ascii_digit() || c == ' ' || c == '_' || c == '.'
         });
-    plain.then_some(lowered)
+    plain.then(|| format!("{element}{}", "[]".repeat(dims)))
 }
 
 /// `UPDATE t SET a = ?, b = NULL WHERE k1 = ? AND k2 = ?`, guarded to one
@@ -1670,6 +1685,36 @@ mod tests {
              \"tags\" = $2::\"pg_catalog\".\"_text\" \
              WHERE \"id\" = $3::integer"
         );
+    }
+
+    #[test]
+    fn an_array_spelled_by_its_element_type_casts_to_that_array() {
+        // RisingWave's `data_type` for a `varchar[]` column, and
+        // `format_type()` for a materialized view's array column, name the
+        // element type with `[]`. The element goes through the scalar gate
+        // and rewrites; the suffix stays. Uncast, RisingWave refused the key
+        // predicate outright.
+        let cast = |type_name: &str| {
+            column_cast(
+                &ColumnMeta {
+                    type_name: type_name.into(),
+                    ..col("k", Some(1))
+                },
+                Dialect::Postgres,
+            )
+        };
+        assert_eq!(
+            cast("character varying[]").as_deref(),
+            Some("character varying[]")
+        );
+        assert_eq!(cast("integer[][]").as_deref(), Some("integer[][]"));
+        assert_eq!(cast("character[]").as_deref(), Some("bpchar[]"));
+        assert_eq!(cast("bit []").as_deref(), Some("bit varying[]"));
+        // The gate still holds for what the suffix wraps.
+        assert_eq!(cast("[]"), None);
+        assert_eq!(cast("array[]"), None);
+        assert_eq!(cast("character varying(5)[]"), None);
+        assert_eq!(cast("x\"; drop[]"), None);
     }
 
     #[test]
