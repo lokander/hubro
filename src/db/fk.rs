@@ -6,9 +6,8 @@
 use std::collections::HashMap;
 
 use super::page::{Filter, KeyEquality};
-use super::rowkey::key_column_addressable;
+use super::rowkey::{key_column_addressable, KeyRules};
 use super::schema::{ColumnMeta, ForeignKeyMeta, TableMeta};
-use super::sql::Dialect;
 use super::value::Value;
 
 /// The name of the target column the FK's `index`-th key column references.
@@ -48,9 +47,9 @@ pub fn build_fk_filter(
     fk: &ForeignKeyMeta,
     source_row: &HashMap<String, Value>,
     target: &TableMeta,
-    dialect: Dialect,
+    rules: impl Into<KeyRules>,
 ) -> Option<Filter> {
-    let referenced = fk_target_columns(fk, target, dialect)?;
+    let referenced = fk_target_columns(fk, target, rules)?;
     let mut terms = Vec::with_capacity(referenced.len());
     for (column, meta) in fk.columns.iter().zip(referenced) {
         let value = source_row.get(column)?;
@@ -72,14 +71,15 @@ pub fn build_fk_filter(
 /// column at its position, a referenced column is missing from `target`
 /// (a stale schema, or a reference SQLite accepted to a column that does
 /// not exist), or a referenced column's values cannot be bound back to find
-/// their row on `dialect` ([`key_column_addressable`]: a jump on a SQL Server
+/// their row under `rules` ([`key_column_addressable`]: a jump on a SQL Server
 /// `sql_variant` key landed on an empty page). Whether a row's link is offered
 /// at all is decided by this, so a link is never a dead click.
 pub fn fk_target_columns<'a>(
     fk: &ForeignKeyMeta,
     target: &'a TableMeta,
-    dialect: Dialect,
+    rules: impl Into<KeyRules>,
 ) -> Option<Vec<&'a ColumnMeta>> {
+    let rules = rules.into();
     if fk.columns.is_empty() {
         return None;
     }
@@ -95,7 +95,7 @@ pub fn fk_target_columns<'a>(
                 .columns
                 .iter()
                 .find(|c| c.name == name)
-                .filter(|c| key_column_addressable(c, dialect))
+                .filter(|c| key_column_addressable(c, rules))
         })
         .collect()
 }
@@ -104,6 +104,7 @@ pub fn fk_target_columns<'a>(
 mod tests {
     use super::*;
     use crate::db::schema::{ColumnMeta, Generated, TableKind};
+    use crate::db::sql::Dialect;
     use crate::db::TypeDetail;
 
     fn make_fk(columns: &[&str], referenced: Vec<Option<&str>>) -> ForeignKeyMeta {

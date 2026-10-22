@@ -94,8 +94,8 @@
 //! narrows, rather than the connection being clamped shut.
 
 use hubro::db::{
-    detect_row_identity, Capabilities, DbPool, Filter, Generated, Internal, PageRequest, PgFlavor,
-    Restriction, SortDir, TableKind, TableMeta, TypeDetail, Value,
+    detect_row_identity, Capabilities, DbPool, Filter, Generated, Internal, KeyTextPinned,
+    PageRequest, PgFlavor, Restriction, SortDir, TableKind, TableMeta, TypeDetail, Value,
 };
 
 fn test_url() -> Option<String> {
@@ -616,5 +616,17 @@ async fn materialize_write_only_transaction_left_open_is_rolled_back_and_said_to
     assert_eq!(rows().await, Value::Integer(1));
 
     pool.execute("DROP TABLE write_only").await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn materialize_reports_neither_pin_as_held() {
+    // Materialize supports only the `postgres` IntervalStyle, so a probe
+    // asking for another is refused, and it has no `lc_monetary`. Neither
+    // pin is claimed; with only one style there is nothing for sessions to
+    // disagree on, and no table here has a key to refuse.
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    assert_eq!(pool.key_rules().pinned, KeyTextPinned::NONE);
     pool.close().await;
 }

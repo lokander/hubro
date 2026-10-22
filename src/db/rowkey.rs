@@ -69,14 +69,19 @@ impl RowIdentity {
 ///   yields `None` rather than risking a write against the wrong column.
 /// - Postgres and SQL Server tables with neither yield `None` (neither has
 ///   a rowid analogue reachable through plain SQL).
-pub fn detect_row_identity(table: &TableMeta, dialect: Dialect) -> Option<RowIdentity> {
+///
+/// `rules` is the dialect, plus — on Postgres — which session settings the
+/// connection pins ([`KeyRules`]); a bare [`Dialect`] means every pin holds.
+pub fn detect_row_identity(table: &TableMeta, rules: impl Into<KeyRules>) -> Option<RowIdentity> {
+    let rules = rules.into();
+    let dialect = rules.dialect;
     // Views and materialized views are read-only; even if a matview carries a
     // unique index, we must not offer editing that UPDATE/DELETE can't perform.
     if matches!(table.kind, TableKind::View | TableKind::MaterializedView) {
         return None;
     }
     let pk = table.primary_key();
-    if !pk.is_empty() && pk.iter().all(|c| key_column_addressable(c, dialect)) {
+    if !pk.is_empty() && pk.iter().all(|c| key_column_addressable(c, rules)) {
         let columns = pk.iter().map(|c| c.name.clone()).collect();
         return Some(RowIdentity::PrimaryKey { columns });
     }
@@ -86,7 +91,7 @@ pub fn detect_row_identity(table: &TableMeta, dialect: Dialect) -> Option<RowIde
                 table
                     .columns
                     .iter()
-                    .any(|c| c.name == *name && !c.nullable && key_column_addressable(c, dialect))
+                    .any(|c| c.name == *name && !c.nullable && key_column_addressable(c, rules))
             });
         if usable {
             return Some(RowIdentity::UniqueIndex {
@@ -139,7 +144,15 @@ pub fn detect_row_identity(table: &TableMeta, dialect: Dialect) -> Option<RowIde
 /// **SQLite: always true.** It echoes a declared type verbatim, so a
 /// `sql_variant` or `regclass` there is just a name, and its values bind as
 /// they read.
-pub fn key_column_addressable(column: &ColumnMeta, dialect: Dialect) -> bool {
+///
+/// **Postgres, on a connection that could not pin a setting**: false for the
+/// types whose text depends on it ([`text_depends_on`]). A pooler can refuse
+/// the startup option that pins it — measured, PgBouncer 1.18 refuses
+/// `options` outright, and 1.21 and 1.26 take `IntervalStyle` but refuse
+/// `lc_monetary` — and then sessions opened before and after an `ALTER
+/// ROLE … SET` print those types differently.
+pub fn key_column_addressable(column: &ColumnMeta, rules: impl Into<KeyRules>) -> bool {
+    let KeyRules { dialect, pinned } = rules.into();
     match dialect {
         Dialect::SqlServer => {
             let is_variant = |name: &str| name.trim().eq_ignore_ascii_case("sql_variant");
@@ -155,9 +168,85 @@ pub fn key_column_addressable(column: &ColumnMeta, dialect: Dialect) -> bool {
                 TypeDetail::Array { type_ref } => type_ref.name.trim_start_matches('_').to_string(),
                 _ => lowered.trim_end_matches("[]").to_string(),
             };
-            !SEARCH_PATH_DEPENDENT.contains(&element.as_str())
+            let held = match text_depends_on(column) {
+                Some(KeyTextSetting::IntervalStyle) => pinned.interval_style,
+                Some(KeyTextSetting::LcMonetary) => pinned.lc_monetary,
+                None => true,
+            };
+            held && !SEARCH_PATH_DEPENDENT.contains(&element.as_str())
         }
         Dialect::Sqlite => true,
+    }
+}
+
+/// What a key is judged against: the dialect, and which of the settings key
+/// text depends on the connection's sessions are pinned to
+/// ([`super::postgres::key_text_pins`]). From a bare [`Dialect`] every pin
+/// holds — always so on SQLite and SQL Server, which read no key as server
+/// text that depends on one, and on a Postgres connection that pinned both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyRules {
+    pub dialect: Dialect,
+    pub pinned: KeyTextPinned,
+}
+
+impl From<Dialect> for KeyRules {
+    fn from(dialect: Dialect) -> KeyRules {
+        KeyRules {
+            dialect,
+            pinned: KeyTextPinned::ALL,
+        }
+    }
+}
+
+/// Which session settings every pooled session of a Postgres connection is
+/// given at login. Both are `true` unless a pooler in front of the server
+/// refused the startup option ([`super::postgres::open_postgres_sized`]);
+/// `lc_monetary` is also `false` on an engine without the setting, which has
+/// no `money` type either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyTextPinned {
+    pub interval_style: bool,
+    pub lc_monetary: bool,
+}
+
+impl KeyTextPinned {
+    pub const ALL: KeyTextPinned = KeyTextPinned {
+        interval_style: true,
+        lc_monetary: true,
+    };
+    pub const NONE: KeyTextPinned = KeyTextPinned {
+        interval_style: false,
+        lc_monetary: false,
+    };
+}
+
+/// A session setting that a key's `::text` depends on and hubro pins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyTextSetting {
+    IntervalStyle,
+    LcMonetary,
+}
+
+/// The pinned setting a Postgres key column's text form depends on, if any:
+/// `money` (and arrays of it) prints by `lc_monetary`, arrays of `interval`
+/// by `IntervalStyle`. A scalar `interval` is not here — hubro decodes it
+/// from the binary value and spells it itself — and `DateStyle`, `TimeZone`
+/// and `extra_float_digits` are sent by sqlx as their own startup parameters,
+/// which every pooler passes on.
+pub fn text_depends_on(column: &ColumnMeta) -> Option<KeyTextSetting> {
+    let lowered = column.type_name.trim().to_ascii_lowercase();
+    let (element, array) = match &column.type_detail {
+        TypeDetail::Array { type_ref } => (type_ref.name.trim_start_matches('_').to_string(), true),
+        _ => match lowered.strip_suffix("[]") {
+            Some(element) => (element.trim_end().to_string(), true),
+            None => (lowered.clone(), false),
+        },
+    };
+    match element.as_str() {
+        "money" => Some(KeyTextSetting::LcMonetary),
+        "interval" if array => Some(KeyTextSetting::IntervalStyle),
+        _ => None,
     }
 }
 
@@ -524,6 +613,68 @@ mod tests {
                 columns: vec!["k".into()]
             })
         );
+    }
+
+    #[test]
+    fn a_key_whose_text_follows_an_unpinned_setting_is_refused() {
+        // When a pooler refused the startup option that pins a setting,
+        // sessions may print the types depending on it differently.
+        let typed = |type_name: &str, detail: TypeDetail| ColumnMeta {
+            type_name: type_name.into(),
+            type_detail: detail,
+            ..col("k", false, Some(1))
+        };
+        let array_of = |name: &str| TypeDetail::Array {
+            type_ref: crate::db::TypeRef {
+                schema: "pg_catalog".into(),
+                name: name.into(),
+            },
+        };
+        let money = typed("money", TypeDetail::Plain);
+        let monies = typed("ARRAY", array_of("_money"));
+        let intervals = typed("ARRAY", array_of("_interval"));
+        let interval = typed("interval", TypeDetail::Plain);
+        let text = typed("text", TypeDetail::Plain);
+        assert_eq!(text_depends_on(&money), Some(KeyTextSetting::LcMonetary));
+        assert_eq!(text_depends_on(&monies), Some(KeyTextSetting::LcMonetary));
+        assert_eq!(
+            text_depends_on(&intervals),
+            Some(KeyTextSetting::IntervalStyle)
+        );
+        assert_eq!(
+            text_depends_on(&typed("interval[]", TypeDetail::Plain)),
+            Some(KeyTextSetting::IntervalStyle)
+        );
+        // hubro spells a scalar interval itself.
+        assert_eq!(text_depends_on(&interval), None);
+        assert_eq!(text_depends_on(&text), None);
+
+        let rules = |interval_style, lc_monetary| KeyRules {
+            dialect: Dialect::Postgres,
+            pinned: KeyTextPinned {
+                interval_style,
+                lc_monetary,
+            },
+        };
+        for column in [&money, &monies, &intervals, &interval, &text] {
+            assert!(
+                key_column_addressable(column, rules(true, true)),
+                "{column:?}"
+            );
+            assert!(key_column_addressable(column, Dialect::Postgres));
+        }
+        // PgBouncer 1.21/1.26: IntervalStyle taken, lc_monetary refused.
+        assert!(!key_column_addressable(&money, rules(true, false)));
+        assert!(!key_column_addressable(&monies, rules(true, false)));
+        assert!(key_column_addressable(&intervals, rules(true, false)));
+        // PgBouncer 1.18: no options at all.
+        assert!(!key_column_addressable(&intervals, rules(false, false)));
+        assert!(key_column_addressable(&interval, rules(false, false)));
+        assert!(key_column_addressable(&text, rules(false, false)));
+        // The identity follows: a money-keyed table reads as key-less.
+        let t = table(TableKind::Table, vec![money.clone()], vec![]);
+        assert_eq!(detect_row_identity(&t, rules(true, false)), None);
+        assert!(detect_row_identity(&t, rules(true, true)).is_some());
     }
 
     #[test]

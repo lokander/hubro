@@ -16,7 +16,7 @@ use sqlx::postgres::{
     PgRow, PgTypeKind, PgValueFormat, PgValueRef,
 };
 use sqlx::types::{JsonValue, Uuid};
-use sqlx::{Row as _, TypeInfo as _, ValueRef as _};
+use sqlx::{ConnectOptions as _, Connection as _, Row as _, TypeInfo as _, ValueRef as _};
 
 use super::caps::{Restriction, INSTEAD_RULE};
 use super::ddl::{
@@ -26,6 +26,7 @@ use super::entra::EntraTokens;
 use super::error::DbError;
 use super::export::ExportFormat;
 use super::pg_wire;
+use super::rowkey::KeyTextPinned;
 use super::schema::{
     ColumnMeta, ForeignKeyMeta, Generated, IndexConstraint, IndexMeta, Internal, TableKind,
     TableMeta, TypeDetail, TypeRef,
@@ -169,6 +170,10 @@ pub struct PgConn {
     /// An Entra connection's login: where its token comes from, and the task
     /// that keeps the pool's password current — see [`open_postgres_entra`].
     entra: Option<EntraLogin>,
+    /// Which settings key text depends on every session is given at login —
+    /// all of them, unless a pooler refused the startup option
+    /// ([`open_postgres_sized`]).
+    pinned: KeyTextPinned,
 }
 
 /// An Entra connection's token provider, and the task renewing the pool's
@@ -256,6 +261,12 @@ impl PgConn {
 
     pub fn flavor(&self) -> PgFlavor {
         self.flavor
+    }
+
+    /// Which settings key text depends on this connection's sessions share —
+    /// see [`KeyTextPinned`].
+    pub fn pinned(&self) -> KeyTextPinned {
+        self.pinned
     }
 
     /// The statement [`run_read_only`] opens each transaction with — see
@@ -357,11 +368,25 @@ pub async fn open_postgres_sized(url: &str, max_connections: u32) -> Result<PgCo
     let options = url
         .parse::<PgConnectOptions>()
         .map_err(|e| connect_error(&e))?;
-    let pool = PgPoolOptions::new()
-        .max_connections(max_connections)
+    let pool_options = || PgPoolOptions::new().max_connections(max_connections);
+    // The pins go in the startup packet's `options`, which a pooler may
+    // refuse: then the pool connects without them, and the key types whose
+    // text depends on them are refused instead ([`KeyTextPinned`]). Any other
+    // failure is the connect's own and is reported as it is.
+    let (pool, options_reach) = match pool_options()
         .connect_with(options.clone().options(key_text_pins(None)))
         .await
-        .map_err(|e| connect_error(&e))?;
+    {
+        Ok(pool) => (pool, true),
+        Err(e) if rejects_startup_options(&e) => (
+            pool_options()
+                .connect_with(options.clone())
+                .await
+                .map_err(|e| connect_error(&e))?,
+            false,
+        ),
+        Err(e) => return Err(connect_error(&e)),
+    };
     // The first connection's `lc_monetary` is the role's and database's
     // default as of now; every later connection is pinned to it. An engine
     // without the setting refuses the `SHOW` and has no `money` type either.
@@ -369,7 +394,20 @@ pub async fn open_postgres_sized(url: &str, max_connections: u32) -> Result<PgCo
         .fetch_one(&pool)
         .await
         .ok();
-    pool.set_connect_options(options.options(key_text_pins(monetary.as_deref())));
+    // Whether each pin actually reaches the server is asked of it, not
+    // assumed from a connect succeeding: a pooler can take one option and
+    // refuse another (PgBouncer 1.21 and 1.26 take `IntervalStyle` and refuse
+    // `lc_monetary`), or drop the ones it does not track without a word
+    // (`ignore_startup_parameters = options` kept `IntervalStyle` and dropped
+    // `lc_monetary`, measured on 1.26).
+    let pinned = if options_reach {
+        probe_pins(&options, monetary.as_deref()).await
+    } else {
+        KeyTextPinned::NONE
+    };
+    if pinned.lc_monetary {
+        pool.set_connect_options(options.options(key_text_pins(monetary.as_deref())));
+    }
     // `SELECT version()` in place of the `SELECT 1` this used to run: it is
     // the same liveness check — one round trip on a connection the pool has
     // already opened — and it answers who the server is at the same time, so
@@ -385,6 +423,7 @@ pub async fn open_postgres_sized(url: &str, max_connections: u32) -> Result<PgCo
         flavor,
         read_only_begin,
         entra: None,
+        pinned,
     })
 }
 
@@ -410,14 +449,23 @@ pub async fn open_postgres_sized(url: &str, max_connections: u32) -> Result<PgCo
 ///   'SQL, DMY'` left new hubro sessions on `ISO, MDY`).
 /// - **`IntervalStyle`** is pinned to `postgres`, the server default and the
 ///   style hubro spells interval keys in itself. All seven Postgres-wire
-///   engines accepted it at login (CockroachDB, Materialize and RisingWave
-///   included; the last two support no other value).
+///   engines accepted it at login; Materialize supports no other value.
 /// - **`lc_monetary`** is pinned to `monetary`, the value the pool's first
 ///   connection reported, rather than to a fixed locale: it decides how many
 ///   minor units a `money` value has, so pinning `C` would change what every
 ///   stored amount means to someone whose database says otherwise. `None` —
 ///   Materialize and RisingWave, which lack the setting and the `money` type —
-///   pins nothing.
+///   pins nothing, and so does CockroachDB in effect: it has only `C.UTF-8`,
+///   no `money` type, and fails the probe below.
+///
+/// Because a setting given at login beats a role's default, a role-level
+/// `IntervalStyle` (say `iso_8601`) does not apply in hubro's own sessions:
+/// there, intervals print in the `postgres` style.
+///
+/// A pooler may refuse these options, or drop them: whether each reaches the
+/// server is asked of the server ([`probe_pins`]), and a key type whose
+/// setting did not is refused rather than trusted
+/// ([`super::rowkey::KeyTextPinned`]).
 ///
 /// `search_path` is deliberately absent: it decides name resolution for
 /// everything the user runs, so it is not hubro's to pin, and the key types
@@ -433,6 +481,103 @@ pub(crate) fn key_text_pins(monetary: Option<&str>) -> Vec<(&'static str, String
         pins.push(("lc_monetary", escape(monetary)));
     }
     pins
+}
+
+/// Which pins reach the server: one probe session is given *other* values
+/// than the pool's ([`pin_probe`]), so a pin a pooler dropped silently shows
+/// as the server's own default rather than passing for one that held. When
+/// the probe cannot connect with both, each is tried alone; a probe that
+/// fails for any reason counts its pin as absent, which only refuses keys.
+async fn probe_pins(options: &PgConnectOptions, monetary: Option<&str>) -> KeyTextPinned {
+    async fn reported(
+        options: PgConnectOptions,
+        settings: &[(&str, String)],
+    ) -> Option<Vec<String>> {
+        let mut conn = options
+            .options(settings.iter().map(|(name, value)| (*name, value.as_str())))
+            .connect()
+            .await
+            .ok()?;
+        let mut values = Vec::new();
+        for (name, _) in settings {
+            values.push(
+                sqlx::query_scalar::<_, String>(&format!("SHOW {name}"))
+                    .fetch_one(&mut conn)
+                    .await
+                    .ok()?,
+            );
+        }
+        let _ = conn.close().await;
+        Some(values)
+    }
+    let probe = pin_probe(monetary);
+    let held = |settings: &[(&str, String)], values: &[String]| {
+        settings
+            .iter()
+            .zip(values)
+            .all(|((_, wanted), got)| wanted.eq_ignore_ascii_case(got))
+    };
+    let mut pinned = KeyTextPinned::NONE;
+    if let Some(values) = reported(options.clone(), &probe).await {
+        pinned.interval_style = held(&probe[..1], &values[..1]);
+        pinned.lc_monetary = probe.len() > 1 && held(&probe[1..], &values[1..]);
+        return pinned;
+    }
+    for (at, setting) in probe.iter().enumerate() {
+        let one = std::slice::from_ref(setting);
+        let ok = reported(options.clone(), one)
+            .await
+            .is_some_and(|values| held(one, &values));
+        match at {
+            0 => pinned.interval_style = ok,
+            _ => pinned.lc_monetary = ok,
+        }
+    }
+    pinned
+}
+
+/// The probe session's settings for [`probe_pins`]: each differs from the
+/// value the pool pins and from the server's usual default, so the server
+/// reporting it back proves the option reached it. `IntervalStyle` first;
+/// `lc_monetary` only when the server has the setting (`monetary` is the
+/// first session's value), as `C` — or `POSIX` where that value already is
+/// `C`, both of which every PostgreSQL accepts.
+fn pin_probe(monetary: Option<&str>) -> Vec<(&'static str, String)> {
+    let mut probe = vec![("IntervalStyle", "iso_8601".to_string())];
+    if let Some(monetary) = monetary {
+        let other = if monetary.eq_ignore_ascii_case("C") {
+            "POSIX"
+        } else {
+            "C"
+        };
+        probe.push(("lc_monetary", other.to_string()));
+    }
+    probe
+}
+
+/// Whether a failed connect is a pooler refusing the startup packet's
+/// `options` — the one refusal [`open_postgres_sized`] answers by connecting
+/// again without the pins.
+fn rejects_startup_options(err: &sqlx::Error) -> bool {
+    err.as_database_error()
+        .is_some_and(|db| startup_options_refusal(db.code().as_deref(), db.message()))
+}
+
+/// [`rejects_startup_options`] over plain data, so a test can execute it.
+///
+/// Matched on the code *and* the wording, because the code alone says
+/// nothing: `08P01` is a protocol violation, which PgBouncer also sends for a
+/// failed SASL login (measured). The two wordings are PgBouncer's, measured
+/// in front of PostgreSQL 17: 1.18 refuses `options` itself (`unsupported
+/// startup parameter: options`); 1.21 and 1.26 parse it and refuse a
+/// setting they do not track (`unsupported startup parameter in options:
+/// lc_monetary`). Anything else — a wrong password, an unreachable host, a
+/// pooler refusing some other parameter — is not retried: connecting again
+/// without the pins could not change it.
+fn startup_options_refusal(code: Option<&str>, message: &str) -> bool {
+    code == Some("08P01")
+        && (message == "unsupported startup parameter: options"
+            || message.starts_with("unsupported startup parameter in options: "))
 }
 
 /// SQLSTATE `invalid_password`. PostgreSQL's `auth_failed` (auth.c) raises it
@@ -2932,6 +3077,52 @@ mod tests {
             connect_error_from(Some(INVALID_PASSWORD), "the words".into()),
             DbError::CredentialsRejected("the words".into())
         );
+    }
+
+    #[test]
+    fn the_pin_probe_asks_for_values_the_server_would_not_report_by_itself() {
+        // Neither the pinned `postgres` nor the server default, so a pooler
+        // dropping the option shows; `lc_monetary` only where the server has
+        // it, and never the value it already has.
+        assert_eq!(pin_probe(None), [("IntervalStyle", "iso_8601".to_string())]);
+        assert_eq!(
+            pin_probe(Some("en_US.utf8")),
+            [
+                ("IntervalStyle", "iso_8601".to_string()),
+                ("lc_monetary", "C".to_string()),
+            ]
+        );
+        assert_eq!(pin_probe(Some("C"))[1].1, "POSIX");
+    }
+
+    #[test]
+    fn only_a_pooler_refusing_the_startup_options_is_retried_without_them() {
+        // PgBouncer 1.18, then 1.21/1.26, measured.
+        assert!(startup_options_refusal(
+            Some("08P01"),
+            "unsupported startup parameter: options"
+        ));
+        assert!(startup_options_refusal(
+            Some("08P01"),
+            "unsupported startup parameter in options: lc_monetary"
+        ));
+        // The same code for a failed SASL login (measured through PgBouncer),
+        // a wrong password, another parameter, or no server answer at all:
+        // none of them is the pins' fault.
+        for (code, message) in [
+            (Some("08P01"), "SASL authentication failed"),
+            (Some("28P01"), "unsupported startup parameter: options"),
+            (
+                Some("08P01"),
+                "unsupported startup parameter: application_name",
+            ),
+            (None, "unsupported startup parameter: options"),
+        ] {
+            assert!(
+                !startup_options_refusal(code, message),
+                "{code:?} {message}"
+            );
+        }
     }
 
     #[test]

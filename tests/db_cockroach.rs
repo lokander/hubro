@@ -96,8 +96,9 @@ mod common;
 
 use hubro::db::{
     apply_staged, detect_row_identity, run_script, split_statements, Capabilities, DbPool, Filter,
-    Internal, OpenTransaction, PageRequest, PgFlavor, Restriction, Rollback, RowIdentity,
-    RowLocator, ScriptDone, SortDir, StagedChange, StatementOutcome, TableKind, TableMeta, Value,
+    Internal, KeyTextPinned, OpenTransaction, PageRequest, PgFlavor, Restriction, Rollback,
+    RowIdentity, RowLocator, ScriptDone, SortDir, StagedChange, StatementOutcome, TableKind,
+    TableMeta, Value,
 };
 
 fn test_url() -> Option<String> {
@@ -1144,5 +1145,23 @@ async fn cockroach_nan_and_infinity_go_through_the_editor_and_back() {
     let pool = DbPool::open_postgres(&url).await.unwrap();
     let failures = common::non_finite_edit_failures(&pool, "non_finite_edits").await;
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn cockroach_pins_interval_style_and_has_no_monetary_setting_to_pin() {
+    // Whether a pin reaches the server is asked of it: CockroachDB takes
+    // `IntervalStyle` at login, and has only `C.UTF-8` for `lc_monetary` (and
+    // no `money` type), so that probe fails and nothing is pinned for it —
+    // which refuses only `money` keys, which cannot exist here.
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    assert_eq!(
+        pool.key_rules().pinned,
+        KeyTextPinned {
+            interval_style: true,
+            lc_monetary: false,
+        }
+    );
     pool.close().await;
 }

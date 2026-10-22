@@ -10,7 +10,7 @@ use super::export::ExportFormat;
 use super::page::{classify_column, ColumnClass, Page, PageRequest, PREVIEW_BYTES};
 use super::plan;
 use super::postgres;
-use super::rowkey::{detect_row_identity, RowIdentity};
+use super::rowkey::{detect_row_identity, KeyRules, KeyTextPinned, RowIdentity};
 use super::schema::{ColumnMeta, TableMeta};
 use super::sql::{cell_fetch_sql, value_len, Dialect};
 use super::sqlite;
@@ -744,7 +744,22 @@ impl DbPool {
     /// would then be tempted to read `can_mutate` off — which is how a gate
     /// ends up silently ignoring the user's marking.
     pub fn backend_row_identity(&self, table: &TableMeta) -> Option<RowIdentity> {
-        detect_row_identity(table, self.dialect())
+        detect_row_identity(table, self.key_rules())
+    }
+
+    /// What this connection's keys are judged against: its dialect, and on
+    /// Postgres which settings key text depends on its sessions are pinned
+    /// to ([`KeyRules`]). Every key decision taken for this connection — its
+    /// row identity, its access, whether a jump into a table is offered —
+    /// takes this, not the bare dialect.
+    pub fn key_rules(&self) -> KeyRules {
+        KeyRules {
+            dialect: self.dialect(),
+            pinned: match self {
+                DbPool::Postgres(pg) => pg.pinned(),
+                DbPool::Sqlite(_) | DbPool::SqlServer(_) => KeyTextPinned::ALL,
+            },
+        }
     }
 
     /// Resolves the *engine's* capabilities for one object, ignoring the
@@ -758,7 +773,7 @@ impl DbPool {
     /// certainly a gate ignoring the user's read-only marking — the bug this
     /// prefix exists to make visible.
     pub fn backend_access(&self, table: &TableMeta) -> TableAccess {
-        TableAccess::resolve(self.backend_capabilities(), table, self.dialect())
+        TableAccess::resolve(self.backend_capabilities(), table, self.key_rules())
     }
 
     /// Runs a free-form read query, buffered. A zero-row result still carries
@@ -1252,7 +1267,7 @@ impl Connection {
             self.pool.backend_capabilities(),
             self.protection,
             table,
-            self.pool.dialect(),
+            self.pool.key_rules(),
         )
     }
 
