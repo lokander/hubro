@@ -841,8 +841,12 @@ pub enum StoredCopy {
     /// The keyring supplied the password that was just refused, so it still
     /// holds it (a refusal alone deletes nothing).
     Present,
-    /// The keyring was read and held nothing, or could not be read — which
-    /// the unticked answer's own read also treats as nothing to delete.
+    /// The keyring was read and held nothing, or could not be read. The
+    /// second case can be wrong: a wallet whose unlock was dismissed during
+    /// the connect and unlocked at submit lets the unticked answer's own read
+    /// find a copy and delete it, with no warning shown. Accepted, because a
+    /// read error cannot be told apart from having no keyring at all, and
+    /// hedging there would put the warning on every keyring-less machine.
     Absent,
     /// The keyring was not asked: session memory supplied the password, or
     /// the prompt is not for a database password at all.
