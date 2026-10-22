@@ -286,18 +286,65 @@ pub fn Overlay(
     }
 }
 
-/// How long a [`ConfirmInline`]'s confirm button ignores clicks after the
-/// confirmation appears. Longer than a double-click: the confirmation
-/// replaces the button that armed it, and a confirm button that happened to
-/// land under the pointer would otherwise take a double-click's second click
-/// (the saved-queries panel's "Delete for good" sat exactly where "Delete"
-/// had been).
+/// How long a confirmation ignores the press that would complete it, after
+/// the press that armed it. Longer than a double-click: every two-step
+/// confirmation here puts its confirming button where the pointer already
+/// is (the saved-queries panel's "Delete for good" sat exactly where
+/// "Delete" had been; Import, Run and the grid's Save relabel themselves in
+/// place), so without this a double-click is a confirmed action.
 pub(crate) const CONFIRM_ARM_DELAY: Duration = Duration::from_millis(500);
 
-/// Whether a confirm click arriving `since` the confirmation appeared is
-/// taken. Anything sooner is the click that armed it, repeated.
-fn confirm_accepted(since: Duration) -> bool {
+/// Whether a confirming press arriving `since` the confirmation was armed is
+/// taken. Anything sooner is the press that armed it, repeated.
+pub(crate) fn confirm_accepted(since: Duration) -> bool {
     since >= CONFIRM_ARM_DELAY
+}
+
+/// What a first press armed, and when. Every two-step confirmation holds its
+/// armed state in one of these, so the press that completes it can ask
+/// [`Armed::settled`] whether it is a second, deliberate press or the first
+/// one repeated — one rule, [`confirm_accepted`], for all of them.
+///
+/// Comparing two of these compares the instant too, so callers match on
+/// [`Armed::subject`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Armed<T> {
+    subject: T,
+    at: Instant,
+}
+
+impl<T> Armed<T> {
+    /// Arms `subject` now.
+    pub(crate) fn new(subject: T) -> Self {
+        Self {
+            subject,
+            at: Instant::now(),
+        }
+    }
+
+    /// What was armed: the exact request, statement or change list the
+    /// confirmation is about.
+    pub(crate) fn subject(&self) -> &T {
+        &self.subject
+    }
+
+    /// Whether a confirming press now is taken (see [`CONFIRM_ARM_DELAY`]).
+    pub(crate) fn settled(&self) -> bool {
+        confirm_accepted(self.at.elapsed())
+    }
+}
+
+/// A `keydown` handler for any button whose press can complete a
+/// confirmation: a key held down never presses it again. A held Enter on a
+/// focused button repeats its click every few tens of milliseconds once the
+/// key starts repeating, which outlasts [`CONFIRM_ARM_DELAY`] — measured
+/// against schema editing's Run and the import dialog's Import, which a 1.5 s
+/// held Enter took straight through their confirm-writes prompts. Blocking
+/// the repeat's default action stops the button from being activated.
+pub(crate) fn a_held_key_is_not_a_press(evt: KeyboardEvent) {
+    if evt.is_auto_repeating() {
+        evt.prevent_default();
+    }
 }
 
 /// The second step of a two-step destructive action: an optional question,
@@ -306,8 +353,9 @@ fn confirm_accepted(since: Duration) -> bool {
 /// one row armed at a time.
 ///
 /// One click never confirms. The confirm button ignores clicks for
-/// [`CONFIRM_ARM_DELAY`] after this mounts, and focus goes to **Keep**, so a
-/// repeating Enter from the arming button lands on the safe choice. Escape
+/// [`CONFIRM_ARM_DELAY`] after this mounts and is never pressed by a held
+/// key, and focus goes to **Keep**, so a repeating Enter from the arming
+/// button lands on the safe choice. Escape
 /// cancels, heard on the wrapper while focus is anywhere inside it. Nothing
 /// disarms it on its own (no blur, no timeout): it stays until answered,
 /// like every confirmation before this component.
@@ -320,7 +368,7 @@ pub fn ConfirmInline(
     on_confirm: EventHandler<()>,
     on_cancel: EventHandler<()>,
 ) -> Element {
-    let shown_at = use_hook(Instant::now);
+    let shown = use_hook(|| Armed::new(()));
     rsx! {
         div {
             class: "flex flex-wrap items-center gap-2",
@@ -336,8 +384,9 @@ pub fn ConfirmInline(
             }
             button {
                 class: "cursor-pointer rounded bg-amber-600 px-2 py-0.5 text-xs font-semibold text-slate-950 hover:bg-amber-500",
+                onkeydown: a_held_key_is_not_a_press,
                 onclick: move |_| {
-                    if confirm_accepted(shown_at.elapsed()) {
+                    if shown.settled() {
                         on_confirm.call(());
                     }
                 },
@@ -572,9 +621,12 @@ mod tests {
             let [confirm, keep] = listeners(&edits, "click")[..] else {
                 panic!("expected confirm and Keep: {edits:#?}");
             };
-            let [wrapper] = listeners(&edits, "keydown")[..] else {
-                panic!("expected one Escape listener: {edits:#?}");
+            // Mount order: the wrapper's Escape, then the confirm button's
+            // held-key guard.
+            let [wrapper, held] = listeners(&edits, "keydown")[..] else {
+                panic!("expected two keydown listeners: {edits:#?}");
             };
+            assert_eq!(held, confirm, "the confirm button ignores a held key");
             assert_eq!(
                 listeners(&edits, "mounted"),
                 [keep],
@@ -597,6 +649,42 @@ mod tests {
         std::thread::sleep(CONFIRM_ARM_DELAY + Duration::from_millis(50));
         fire(&dom, "click", click(), confirm);
         assert_eq!(confirms.get(), 1, "a deliberate click did not confirm");
+    }
+
+    /// The held-key guard every confirming button carries: a repeat of a
+    /// held key loses its default action (the button's activation), a fresh
+    /// press keeps it.
+    #[test]
+    fn a_held_key_never_presses_a_confirming_button() {
+        for repeating in [false, true] {
+            let data = KeyboardData::new(SerializedKeyboardData::new(
+                Key::Enter,
+                Code::Enter,
+                Location::Standard,
+                repeating,
+                Modifiers::empty(),
+                false,
+            ));
+            let evt = Event::new(Rc::new(data), true);
+            a_held_key_is_not_a_press(evt.clone());
+            assert_eq!(
+                evt.default_action_enabled(),
+                !repeating,
+                "repeating: {repeating}"
+            );
+        }
+    }
+
+    /// [`Armed`] is unsettled when armed and settles after the delay — the
+    /// gate the relabelled-in-place buttons (Import, Run, the grid's Save)
+    /// put in front of their confirming press.
+    #[test]
+    fn an_armed_confirmation_settles_only_after_the_delay() {
+        let armed = Armed::new("x");
+        assert!(!armed.settled(), "settled the instant it was armed");
+        assert_eq!(armed.subject(), &"x");
+        std::thread::sleep(CONFIRM_ARM_DELAY + Duration::from_millis(50));
+        assert!(armed.settled(), "never settled");
     }
 
     /// Every modal in the app is an [`Overlay`], and each one's backdrop

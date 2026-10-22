@@ -205,7 +205,7 @@ impl AppState {
 
     /// Runs the two-step guard for one navigation attempt. Returns `true`
     /// when the attempt may proceed: the same intent was parked at least
-    /// [`NAV_CONFIRM_MIN_DELAY`] ago. Otherwise parks the intent (first
+    /// [`CONFIRM_ARM_DELAY`](crate::ui::notice::CONFIRM_ARM_DELAY) ago. Otherwise parks the intent (first
     /// attempt or a different action) or ignores it (identical repeat
     /// inside the double-click floor — the original park time is kept so a
     /// deliberate later repeat still confirms).
@@ -258,10 +258,23 @@ impl AppState {
             _ => return,
         };
         let protection = self.protection_of(id);
-        match save_action(protection, parked.as_deref(), &current) {
+        let action = save_action(
+            protection,
+            parked.as_ref().map(|armed| armed.subject().as_slice()),
+            parked.as_ref().is_some_and(Armed::settled),
+            &current,
+        );
+        match action {
             SaveAction::Apply => self.apply_staged_now(id, table),
             SaveAction::Park => {
-                self.pending_saves.write().insert(key, current);
+                self.pending_saves.write().insert(key, Armed::new(current));
+            }
+            // Put back as it was, park time and all, so a deliberate later
+            // press still confirms it.
+            SaveAction::Wait => {
+                if let Some(parked) = parked {
+                    self.pending_saves.write().insert(key, parked);
+                }
             }
         }
     }
@@ -421,11 +434,19 @@ enum SaveAction {
     Apply,
     /// Hold them and show the connection-naming confirmation first.
     Park,
+    /// Nothing: the press that parked them, repeated (Save's double-click),
+    /// rather than a second press. The confirmation stays up.
+    Wait,
 }
 
 /// Resolves a Save click: `protection` is the connection's marking, `parked`
-/// the change list a previous click already confirmed (if any), and `current`
-/// what the stage holds now.
+/// the change list a previous click already confirmed (if any), `settled`
+/// whether it has been parked long enough for a press to count
+/// ([`Armed::settled`]), and `current` what the stage holds now.
+///
+/// `settled` only holds a press back. Save stays where it is when the
+/// prompt appears, so without it a double-click on Save was the
+/// confirmation; nothing about when the prompt is shown changes.
 ///
 /// The comparison between `parked` and `current` is the substance here.
 /// Confirming authorizes a *specific* set of changes, so editing, discarding
@@ -441,13 +462,15 @@ enum SaveAction {
 fn save_action(
     protection: WriteProtection,
     parked: Option<&[StagedChange]>,
+    settled: bool,
     current: &[StagedChange],
 ) -> SaveAction {
     if !protection.confirms() {
         return SaveAction::Apply;
     }
     match parked {
-        Some(confirmed) if confirmed == current => SaveAction::Apply,
+        Some(confirmed) if confirmed == current && settled => SaveAction::Apply,
+        Some(confirmed) if confirmed == current => SaveAction::Wait,
         _ => SaveAction::Park,
     }
 }
@@ -503,7 +526,7 @@ mod tests {
             "an immediate identical repeat (double-click) must not confirm"
         );
         let aged = PendingNav {
-            parked_at: Instant::now() - NAV_CONFIRM_MIN_DELAY,
+            parked_at: Instant::now() - crate::ui::notice::CONFIRM_ARM_DELAY,
             ..fresh
         };
         assert!(aged.confirmable(), "a deliberate later repeat confirms");
@@ -518,13 +541,35 @@ mod tests {
         let changes = vec![delete(1)];
         // First click: nothing parked yet, so the prompt goes up.
         assert_eq!(
-            save_action(WriteProtection::Confirm, None, &changes),
+            save_action(WriteProtection::Confirm, None, false, &changes),
             SaveAction::Park
         );
         // Second click, stage unchanged: the confirmation stands.
         assert_eq!(
-            save_action(WriteProtection::Confirm, Some(&changes), &changes),
+            save_action(WriteProtection::Confirm, Some(&changes), true, &changes),
             SaveAction::Apply
+        );
+    }
+
+    #[test]
+    fn a_double_click_on_save_does_not_confirm_the_write() {
+        // Save stays put when the prompt goes up, so a double-click's second
+        // click is a press on the confirmation. It waits; it neither applies
+        // nor re-parks with a fresh time.
+        let changes = vec![delete(1)];
+        assert_eq!(
+            save_action(WriteProtection::Confirm, Some(&changes), false, &changes),
+            SaveAction::Wait
+        );
+        // A stale confirmation is replaced as before, settled or not.
+        assert_eq!(
+            save_action(
+                WriteProtection::Confirm,
+                Some(&[delete(2)]),
+                false,
+                &changes
+            ),
+            SaveAction::Park
         );
     }
 
@@ -540,7 +585,7 @@ mod tests {
             vec![],                     // discarded
         ] {
             assert_eq!(
-                save_action(WriteProtection::Confirm, Some(&confirmed), &moved_on),
+                save_action(WriteProtection::Confirm, Some(&confirmed), true, &moved_on),
                 SaveAction::Park,
                 "{moved_on:?} must send the user back through the prompt"
             );
@@ -551,7 +596,7 @@ mod tests {
     fn an_unmarked_connection_never_parks_a_save() {
         let changes = vec![delete(1)];
         assert_eq!(
-            save_action(WriteProtection::Open, None, &changes),
+            save_action(WriteProtection::Open, None, false, &changes),
             SaveAction::Apply,
             "Open must behave exactly as it did before write protection existed"
         );
@@ -563,7 +608,7 @@ mod tests {
         // prompt here would have only one possible outcome — failure.
         let changes = vec![delete(1)];
         assert_eq!(
-            save_action(WriteProtection::ReadOnly, None, &changes),
+            save_action(WriteProtection::ReadOnly, None, false, &changes),
             SaveAction::Apply
         );
     }
