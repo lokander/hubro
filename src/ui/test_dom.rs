@@ -30,7 +30,7 @@ const SCOPE_SCAN: usize = 1 << 14;
 pub(crate) fn provide_state(dom: &VirtualDom) -> AppState {
     let state = dom.in_runtime(|| {
         let (saved, _) = SavedList::load(Path::new("/nonexistent/hubro-test/connections.toml"));
-        AppState::unstarted(saved, None, Settings::default())
+        AppState::unstarted(saved, None, Settings::default(), Default::default())
     });
     dom.provide_root_context(state);
     state

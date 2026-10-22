@@ -4,8 +4,10 @@
 //!
 //! The three domains deliberately carry different error policies —
 //! connections are strict (a malformed file is an error, never silent data
-//! loss), settings and session are lenient (a bad file yields defaults) —
-//! each policy's rationale lives with its loader. Everything is re-exported
+//! loss), settings and session are lenient (a bad file yields defaults;
+//! for settings, a bad *value* costs only its own setting, and what was not
+//! used is reported — see `settings::interpret_settings`) — each policy's
+//! rationale lives with its loader. Everything is re-exported
 //! here, so callers keep addressing `config::…` regardless of which file a
 //! type lives in.
 

@@ -95,8 +95,8 @@ pub fn Shell() -> Element {
     let dark = state.dark;
     let show_cheatsheet = state.show_cheatsheet;
     let settings_notice = match &*state.settings_notice.read() {
-        SettingsNotice::Showing(message) => Some(message.clone()),
-        SettingsNotice::Quiet | SettingsNotice::Dismissed => None,
+        SettingsNotice::Showing(_, message) => Some(message.clone()),
+        SettingsNotice::Quiet | SettingsNotice::Dismissed(_) => None,
     };
 
     // Install the window-level shortcut listener once and pump the keys it
@@ -297,7 +297,9 @@ fn update_geometry(latest: &mut Signal<WindowGeometry>, window: &DesktopService)
 /// `Resized`/`Moved` (cheap, no file I/O) and writes the final value on
 /// `CloseRequested`; a 1 s poll writes it when it settles, so dragging the
 /// window produces one write, not one per pixel. Writes are best-effort — a
-/// failure only means the geometry won't survive this restart, never a crash.
+/// failure only means the geometry won't survive this restart, never a crash
+/// — but not silent: the first one raises the settings notice
+/// ([`AppState::report_settings_write`]).
 #[component]
 fn WindowPersistence() -> Element {
     let state = use_context::<AppState>();
