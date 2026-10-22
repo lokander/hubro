@@ -117,6 +117,55 @@ fn clamped_page(count: Option<u64>, page: u64) -> Option<u64> {
     (page > last_page).then_some(last_page)
 }
 
+/// What the rows resource holds: the page, the hidden key column it fetched
+/// beside the visible ones, and the offset it was fetched at.
+type FetchedPage = (Page, Option<String>, u64);
+
+/// The offset a page fetch was made at and the rows it returned, out of the
+/// rows resource; `None` while it has nothing (or failed).
+fn fetched_rows<E>(fetched: Option<&Result<FetchedPage, E>>) -> Option<(u64, u64)> {
+    match fetched? {
+        Ok((page, _, offset)) => Some((*offset, page.result.rows.len() as u64)),
+        Err(_) => None,
+    }
+}
+
+/// Whether Next and PageDown may move on from `page` — the whole rule, for
+/// both, from the resources' plain data.
+///
+/// `fetched` is the offset the rows on screen were fetched at and how many
+/// there are. While the page asked for is still being fetched those are the
+/// previous page's rows, and a full previous page says nothing about the one
+/// after: answering from them let PageDown run ahead of a slow deep-page
+/// fetch, queueing a fetch per press. So rows count only when they were
+/// fetched for `page` itself — compared by offset, which does not depend on
+/// the resource having flipped to Pending by the time the next key arrives.
+fn next_page_offered<E>(
+    count_pending: bool,
+    count: Option<&Result<u64, E>>,
+    page: u64,
+    fetched: Option<(u64, u64)>,
+) -> bool {
+    let loaded =
+        fetched.and_then(|(offset, rows)| (offset == page * PAGE_SIZE as u64).then_some(rows));
+    !at_end(settled_count(count_pending, count), page, loaded)
+}
+
+/// The footer's account of the rows on screen: fetched at `offset`, `rows` of
+/// them, out of `count` when it is known. Driven by the fetched offset rather
+/// than the page asked for, so it never labels one page's rows with another's
+/// range while a fetch is in flight. A page with nothing on it says so: past
+/// the first it is the empty page beyond a table of an exact multiple of
+/// [`PAGE_SIZE`] rows, which a failed count leaves in place for good.
+fn row_range(offset: u64, rows: u64, count: Option<u64>) -> String {
+    let of = count.map_or_else(|| "…".to_string(), |count| count.to_string());
+    match (rows, offset) {
+        (0, 0) => "no rows".to_string(),
+        (0, _) => "no more rows".to_string(),
+        _ => format!("rows {}–{} of {of}", offset + 1, offset + rows),
+    }
+}
+
 /// Fixed data-row height in CSS pixels. Rows render one truncated
 /// line at `text-xs` + `py-1`, so their height is uniform; pinning it lets the
 /// windowed renderer compute exact scroll offsets and spacer heights. Measured
@@ -671,7 +720,10 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             let page = pool
                 .fetch_page_bounded(&request, &columns, &no_preview_refs)
                 .await?;
-            Ok::<(Page, Option<String>), crate::db::DbError>((page, request.extra_key_column))
+            // The offset travels with the rows, so whatever describes them —
+            // the footer's range, the paging rule — describes the rows on
+            // screen rather than the page asked for since.
+            Ok::<FetchedPage, crate::db::DbError>((page, request.extra_key_column, request.offset))
         }
     });
 
@@ -772,7 +824,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let page_view = use_memo(move || {
         let meta = render_meta();
         let current = rows_resource.read();
-        let Some(Ok((page, extra_key))) = current.as_ref() else {
+        let Some(Ok((page, extra_key, _))) = current.as_ref() else {
             return PageView::default();
         };
         let result = &page.result;
@@ -1213,13 +1265,14 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             }
             FocusOutcome::NextPage => {
                 // The Next button's rule, so the two cannot disagree.
-                let count = settled_count(
+                let p = *page.peek();
+                let offered = next_page_offered(
                     *count_resource.state().peek() == UseResourceState::Pending,
                     count_resource.peek().as_ref(),
+                    p,
+                    fetched_rows(rows_resource.peek().as_ref()),
                 );
-                let p = *page.peek();
-                let loading = *rows_resource.state().peek() == UseResourceState::Pending;
-                if !at_end(count, p, (!loading).then_some(rows as u64)) {
+                if offered {
                     page.set(p + 1);
                 }
             }
@@ -2047,7 +2100,7 @@ fn GridToolbar(
 /// a row of equal values) repaints nothing.
 #[component]
 fn GridFooter(
-    rows_resource: Resource<Result<(Page, Option<String>), crate::db::DbError>>,
+    rows_resource: Resource<Result<FetchedPage, crate::db::DbError>>,
     count_resource: Resource<Result<u64, crate::db::DbError>>,
     page: Signal<u64>,
     selection: ReadSignal<Option<Selection>>,
@@ -2066,23 +2119,20 @@ fn GridFooter(
     rsx! {
         div { class: "flex items-center gap-3 border-t border-slate-200 dark:border-slate-800 px-3 py-1.5 text-xs text-slate-500 dark:text-slate-400",
             match current.as_ref() {
-                Some(Ok((page_data, _))) => {
-                    let result = &page_data.result;
+                Some(Ok((page_data, _, offset))) => {
                     // The count comes from its own resource; it
                     // stays resolved across page flips, so flipping reuses
                     // it. While it re-runs it reads as unknown, and the
                     // readout says "of …" rather than a stale total.
-                    let total = settled_count(
-                        *count_resource.state().read() == UseResourceState::Pending,
+                    let count_pending = *count_resource.state().read() == UseResourceState::Pending;
+                    let total = settled_count(count_pending, count_resource.read().as_ref());
+                    let range = row_range(*offset, page_data.result.rows.len() as u64, total);
+                    let no_next = !next_page_offered(
+                        count_pending,
                         count_resource.read().as_ref(),
+                        page(),
+                        fetched_rows(current.as_ref()),
                     );
-                    let loaded = result.rows.len() as u64;
-                    let first = if loaded == 0 { 0 } else { page() * PAGE_SIZE as u64 + 1 };
-                    let last = page() * PAGE_SIZE as u64 + loaded;
-                    // While the total is unknown, Next is offered on a
-                    // full page only — the same answer PageDown gets.
-                    let loading = *rows_resource.state().read() == UseResourceState::Pending;
-                    let no_next = at_end(total, page(), (!loading).then_some(loaded));
                     rsx! {
                         // Everything left of the stepper lives in one bounded
                         // group: `flex-1 min-w-0 overflow-hidden` fixes its
@@ -2091,10 +2141,7 @@ fn GridFooter(
                         // over the buttons. It also replaces the old spacer —
                         // growing to fill is what pushes the stepper right.
                         div { class: "flex min-w-0 flex-1 items-center gap-3 overflow-hidden",
-                            match total {
-                                Some(total) => rsx! { span { class: "shrink-0 whitespace-nowrap", "rows {first}–{last} of {total}" } },
-                                None => rsx! { span { class: "shrink-0 whitespace-nowrap", "rows {first}–{last} of …" } },
-                            }
+                            span { class: "shrink-0 whitespace-nowrap", "{range}" }
                             // Aggregate readout for the selected cells.
                             // It sits beside the row range deliberately: the range
                             // says what the *page* holds, this says what the
@@ -2671,6 +2718,54 @@ mod tests {
     fn a_page_still_loading_is_the_end_for_now() {
         assert!(at_end(None, 3, None));
         assert!(at_end(Some(1_000_000), 3, None));
+    }
+
+    /// The rule both Next and PageDown call, from the resources' raw data:
+    /// rows count only when they were fetched for the page now asked for.
+    #[test]
+    fn a_next_page_is_offered_only_from_rows_fetched_for_this_page() {
+        let full = PAGE_SIZE as u64;
+        let unknown: Option<&Result<u64, ()>> = None;
+        // Page 3 asked for; page 2's full rows still on screen: no next yet,
+        // whatever the count — this is what stops PageDown queueing fetches.
+        assert!(!next_page_offered(true, unknown, 3, Some((2 * full, full))));
+        assert!(!next_page_offered(
+            false,
+            Some(&Ok::<u64, ()>(1_000_000)),
+            3,
+            Some((2 * full, full))
+        ));
+        // Page 3's own rows arrived: a full page goes on while counting…
+        assert!(next_page_offered(true, unknown, 3, Some((3 * full, full))));
+        // …and a failed count does not stop it either.
+        assert!(next_page_offered(
+            false,
+            Some(&Err(())),
+            3,
+            Some((3 * full, full))
+        ));
+        // A known count still has the last word.
+        assert!(!next_page_offered(
+            false,
+            Some(&Ok::<u64, ()>(4 * full)),
+            3,
+            Some((3 * full, full))
+        ));
+        // Nothing fetched yet, or the fetch failed: no next page.
+        assert!(!next_page_offered(true, unknown, 0, None));
+        let failed: Result<FetchedPage, ()> = Err(());
+        assert_eq!(fetched_rows(Some(&failed)), None);
+    }
+
+    #[test]
+    fn the_row_range_describes_the_rows_on_screen() {
+        let full = PAGE_SIZE as u64;
+        assert_eq!(row_range(0, full, Some(250)), "rows 1–100 of 250");
+        assert_eq!(row_range(2 * full, 50, None), "rows 201–250 of …");
+        // The empty page past an exact multiple — with the count failed it
+        // stays, so it must not claim a range.
+        assert_eq!(row_range(2 * full, 0, None), "no more rows");
+        assert_eq!(row_range(0, 0, Some(0)), "no rows");
     }
 
     #[test]
