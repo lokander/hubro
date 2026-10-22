@@ -963,6 +963,127 @@ pub async fn end_read_only(tx: sqlx::Transaction<'_, sqlx::Postgres>) -> Result<
         .map_err(|e| DbError::Query(e.to_string()))
 }
 
+/// How a read-only statement the row cap cut short is cancelled from another
+/// session ([`cancel_cut_short_read`]), named by the session it runs on.
+pub(super) enum CancelTarget {
+    /// `pg_cancel_backend` on this server backend.
+    Backend(i32),
+    /// CockroachDB's `CANCEL QUERIES` on whatever this session is running.
+    /// It has no `pg_cancel_backend` (measured: "unknown function").
+    CockroachSession(String),
+}
+
+/// How each engine is asked to cancel a statement from another session —
+/// `None` where it cannot be. Measured with a read-only transaction streaming
+/// `generate_series(1, 200000000)`, cancelled after its first thousand rows:
+///
+/// - PostgreSQL and YugabyteDB: `pg_cancel_backend` ends it, with `57014`.
+/// - CockroachDB: `CANCEL QUERIES` does, with `57014` again.
+/// - Materialize: `pg_cancel_backend` answers true and changes nothing — the
+///   result is computed in full before its first row is sent, and the rest
+///   went on arriving for minutes.
+/// - RisingWave: `pg_backend_pid()` is `0`, and cancelling it answers false.
+///
+/// Decided by the flavor, as no catalog says whether a cancel takes effect.
+pub(super) fn cancel_kind(flavor: PgFlavor) -> Option<CancelKind> {
+    match flavor {
+        PgFlavor::Postgres | PgFlavor::Yugabyte => Some(CancelKind::Backend),
+        PgFlavor::CockroachDB => Some(CancelKind::CockroachSession),
+        PgFlavor::Materialize | PgFlavor::RisingWave => None,
+    }
+}
+
+/// Which [`CancelTarget`] an engine is cancelled through ([`cancel_kind`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CancelKind {
+    Backend,
+    CockroachSession,
+}
+
+/// Names the session `conn` runs on, so a statement on it can be cancelled
+/// from another ([`cancel_cut_short_read`]); `None` on an engine that cannot
+/// cancel one ([`cancel_kind`]). Asked inside the transaction the statement
+/// will run in, which keeps it on one server backend even through a pooler.
+pub(super) async fn cancel_target(
+    conn: &mut sqlx::postgres::PgConnection,
+    flavor: PgFlavor,
+) -> Result<Option<CancelTarget>, DbError> {
+    let target = match cancel_kind(flavor) {
+        None => return Ok(None),
+        Some(CancelKind::Backend) => sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+            .fetch_one(conn)
+            .await
+            .map(CancelTarget::Backend),
+        Some(CancelKind::CockroachSession) => sqlx::query_scalar::<_, String>("SHOW session_id")
+            .fetch_one(conn)
+            .await
+            .map(CancelTarget::CockroachSession),
+    };
+    target.map(Some).map_err(|e| DbError::Query(e.to_string()))
+}
+
+/// How long sending a cancel may take before the rest of the result is read
+/// instead: it needs another of the pool's connections, and every one may be
+/// busy.
+const CANCEL_WAIT: Duration = Duration::from_secs(5);
+
+/// Cancels the statement on `conn` whose result the row cap cut short, from
+/// another of `pool`'s connections, and reads the cancellation off `conn` so
+/// that the transaction can be rolled back at once. Only for a statement
+/// inside a read-only transaction that is rolled back afterwards — see
+/// [`ReadOnlyRun::query_capped_to`](super::registry::ReadOnlyRun::query_capped_to).
+///
+/// A cancel that cannot be sent, or that finds the statement already done,
+/// leaves the rest to be read by the rollback, as it was before. An error
+/// means `conn`'s state is unknown.
+pub(super) async fn cancel_cut_short_read(
+    conn: &mut sqlx::postgres::PgConnection,
+    pool: &PgPool,
+    target: &CancelTarget,
+) -> Result<(), DbError> {
+    let sent = tokio::time::timeout(CANCEL_WAIT, send_cancel(pool, target)).await;
+    if !matches!(sent, Ok(Ok(true))) {
+        return Ok(());
+    }
+    // sqlx answers a ping only once every pending response has been read: the
+    // rest of the rows the server had sent already, then the cancellation —
+    // which it returns as the ping's error, before the ping's own reply.
+    match sqlx::Connection::ping(&mut *conn).await {
+        Ok(()) => Ok(()),
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some(QUERY_CANCELED) => {
+            sqlx::Connection::ping(&mut *conn)
+                .await
+                .map_err(|e| DbError::Query(e.to_string()))
+        }
+        Err(e) => Err(DbError::Query(e.to_string())),
+    }
+}
+
+/// SQLSTATE `query_canceled`.
+const QUERY_CANCELED: &str = "57014";
+
+/// Asks the server to cancel what `target` is running; true if it took the
+/// request. A statement already finished is not cancelled — the session is
+/// idle, and the request is ignored or finds nothing to cancel.
+async fn send_cancel(pool: &PgPool, target: &CancelTarget) -> Result<bool, sqlx::Error> {
+    match target {
+        CancelTarget::Backend(pid) => {
+            sqlx::query_scalar::<_, bool>("SELECT pg_cancel_backend($1)")
+                .bind(*pid)
+                .fetch_one(pool)
+                .await
+        }
+        CancelTarget::CockroachSession(session) => sqlx::query(
+            "CANCEL QUERIES IF EXISTS \
+             (SELECT query_id FROM [SHOW CLUSTER STATEMENTS] WHERE session_id = $1)",
+        )
+        .bind(session)
+        .execute(pool)
+        .await
+        .map(|done| done.rows_affected() > 0),
+    }
+}
+
 /// [`execute_conn`] with bound parameters — the write path for a batch of
 /// imported rows, which must run inside the caller's transaction
 /// and must not interpolate its values into the SQL.
@@ -2751,6 +2872,20 @@ fn format_interval(iv: &PgInterval) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cut_short_read_is_cancelled_only_where_a_cancel_was_measured_to_stop_it() {
+        assert_eq!(cancel_kind(PgFlavor::Postgres), Some(CancelKind::Backend));
+        assert_eq!(cancel_kind(PgFlavor::Yugabyte), Some(CancelKind::Backend));
+        // No `pg_cancel_backend` at all.
+        assert_eq!(
+            cancel_kind(PgFlavor::CockroachDB),
+            Some(CancelKind::CockroachSession)
+        );
+        // Answers true and goes on sending; and a backend id of 0.
+        assert_eq!(cancel_kind(PgFlavor::Materialize), None);
+        assert_eq!(cancel_kind(PgFlavor::RisingWave), None);
+    }
 
     /// A refused probe counts as a rollback — the `ROLLBACK` after it discards
     /// whatever was open — except CockroachDB's commit-wait block, which

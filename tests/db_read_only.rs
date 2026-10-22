@@ -27,8 +27,8 @@
 mod common;
 
 use hubro::db::{
-    run_script, script_refusal, ConnectionRegistry, DbError, DbPool, Dialect, StatementOutcome,
-    Value, WriteProtection,
+    run_script, script_refusal, ConnectionRegistry, DbError, DbPool, Dialect, PgFlavor,
+    StatementOutcome, Value, WriteProtection,
 };
 
 fn url(var: &str) -> Option<String> {
@@ -470,5 +470,103 @@ async fn citus_writes_through_run_command_on_coordinator_despite_the_marking() {
     );
 
     pool.execute(&format!("DROP TABLE {t}")).await.unwrap();
+    pool.close().await;
+}
+
+/// Far more rows than the row cap, generated as they are sent (in the select
+/// list a set-returning function streams; in `FROM` it would be materialized
+/// first). Read to its end it takes about 45 s on localhost, so a run that
+/// waits for it is told apart from one that does not by the clock alone.
+const LONG_READ: &str = "SELECT generate_series(1, 200000000)";
+
+/// How many sessions are still running [`LONG_READ`]. The pattern is split
+/// so that this question does not match itself.
+async fn sessions_running_the_long_read(pool: &DbPool) -> Value {
+    let running = "query LIKE '%generate' || '_series(1, 200000000)%'";
+    let sql = match pool.pg_flavor() {
+        Some(PgFlavor::CockroachDB) => {
+            format!("SELECT count(*) FROM [SHOW CLUSTER STATEMENTS] WHERE {running}")
+        }
+        _ => format!(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE pid <> pg_backend_pid() AND state = 'active' AND {running}"
+        ),
+    };
+    pool.query(&sql).await.unwrap().rows[0][0].clone()
+}
+
+/// A marked connection's read that the row cap cut short is not read to its
+/// end — neither as the script's last statement, whose transaction is ended
+/// by closing the connection, nor before another, where it is cancelled —
+/// and the server stops running it. Its transaction was rolled back either
+/// way, and the engine refused any write in it, so the rest of the result
+/// could change nothing. Measured before: 4.2 s per 20M rows on localhost,
+/// waited for in both places.
+async fn assert_a_capped_read_is_not_read_to_its_end(pool: &DbPool) {
+    let marked = WriteProtection::ReadOnly.apply(pool.backend_capabilities());
+    for script in [vec![LONG_READ], vec![LONG_READ, "SELECT 1"]] {
+        let started = std::time::Instant::now();
+        let mut results = Vec::new();
+        run_script(pool, marked, &stmts(&script), |r| results.push(r))
+            .await
+            .unwrap_or_else(|e| panic!("{script:?}: {e:?}"));
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(15),
+            "{script:?} waited {took:?} for the rest of its read"
+        );
+        assert!(results[0].truncated, "{script:?}");
+        if let Some(after) = results.get(1) {
+            match &after.outcome {
+                StatementOutcome::Rows(rows) => {
+                    assert_eq!(rows.rows, vec![vec![Value::Integer(1)]], "{script:?}")
+                }
+                other => panic!("{script:?}: {other:?}"),
+            }
+        }
+        let mut running = sessions_running_the_long_read(pool).await;
+        for _ in 0..50 {
+            if running == Value::Integer(0) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            running = sessions_running_the_long_read(pool).await;
+        }
+        assert_eq!(
+            running,
+            Value::Integer(0),
+            "{script:?}: the server is still sending the rest"
+        );
+    }
+}
+
+// Multi-threaded, as the app's runtime is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_marked_postgres_connection_does_not_read_a_capped_read_to_its_end() {
+    let Some(url) = common::pg_test_url().await else {
+        return;
+    };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    assert_a_capped_read_is_not_read_to_its_end(&pool).await;
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_marked_cockroach_connection_does_not_read_a_capped_read_to_its_end() {
+    let Some(url) = url("HUBRO_CRDB_TEST_URL") else {
+        return;
+    };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    assert_a_capped_read_is_not_read_to_its_end(&pool).await;
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_marked_yugabyte_connection_does_not_read_a_capped_read_to_its_end() {
+    let Some(url) = url("HUBRO_YUGABYTE_TEST_URL") else {
+        return;
+    };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    assert_a_capped_read_is_not_read_to_its_end(&pool).await;
     pool.close().await;
 }
