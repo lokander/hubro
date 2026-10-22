@@ -2763,7 +2763,9 @@ async fn sqlserver_script_ending_in_a_capped_read_does_not_wait_for_the_rest() {
             let statements = split_statements(&sql, pool.dialect());
             let mut truncated = Vec::new();
             let outcome = run_script(pool, pool.backend_capabilities(), &statements, |r| {
-                truncated.push(r.truncated)
+                // Whether the read was cut short, and whether the editor is
+                // told its rest was stopped: discarded with its connection.
+                truncated.push((r.truncated, r.rest_cancelled))
             })
             .await;
             (truncated, outcome)
@@ -2779,7 +2781,7 @@ async fn sqlserver_script_ending_in_a_capped_read_does_not_wait_for_the_rest() {
         "{}",
         common::script_outcome(&outcome)
     );
-    assert_eq!(truncated, [true]);
+    assert_eq!(truncated, [(true, true)]);
 
     let (truncated, outcome) = tokio::time::timeout(
         bound,
@@ -2789,7 +2791,7 @@ async fn sqlserver_script_ending_in_a_capped_read_does_not_wait_for_the_rest() {
     )
     .await
     .expect("a capped read must not wait for the rest of its result");
-    assert_eq!(truncated, [false, false, true]);
+    assert_eq!(truncated, [(false, false), (false, false), (true, true)]);
     assert_eq!(
         outcome,
         Ok(ScriptDone {

@@ -107,8 +107,10 @@ pub enum ScriptTx<'p> {
         tx: sqlx::Transaction<'p, sqlx::Postgres>,
         /// The pool the transaction's connection came from: a read the row
         /// cap cuts short is cancelled through another of its connections
-        /// ([`postgres::writable_capped_read`]).
+        /// ([`postgres::transaction_capped_read`]).
         pg: postgres::PgConn,
+        /// What the transaction's reads have learned and left open.
+        reads: postgres::TransactionReads,
     },
     // Not an sqlx transaction: an owned pooled connection driving
     // BEGIN/COMMIT as manual SQL (predating tiberius 0.13's transaction API,
@@ -124,9 +126,12 @@ impl ScriptTx<'_> {
         // `tx` deref-coerces to the `&mut Connection` these helpers take.
         match self {
             ScriptTx::Sqlite(tx) => sqlite::execute_conn(tx, sql).await.map(RowsAffected::Exact),
-            ScriptTx::Postgres { tx, .. } => postgres::execute_conn(tx, sql)
-                .await
-                .map(RowsAffected::Exact),
+            ScriptTx::Postgres { tx, reads, .. } => {
+                postgres::release_read_savepoint(tx, reads).await?;
+                postgres::execute_conn(tx, sql)
+                    .await
+                    .map(RowsAffected::Exact)
+            }
             ScriptTx::SqlServer(tx) => sqlserver::execute_conn(tx, sql).await,
         }
     }
@@ -143,7 +148,10 @@ impl ScriptTx<'_> {
         // `tx` deref-coerces to the `&mut Connection` these helpers take.
         match self {
             ScriptTx::Sqlite(tx) => sqlite::execute_with_conn(tx, sql, params).await,
-            ScriptTx::Postgres { tx, .. } => postgres::execute_with_conn(tx, sql, params).await,
+            ScriptTx::Postgres { tx, reads, .. } => {
+                postgres::release_read_savepoint(tx, reads).await?;
+                postgres::execute_with_conn(tx, sql, params).await
+            }
             ScriptTx::SqlServer(tx) => sqlserver::execute_with_conn(tx, sql, params).await,
         }
     }
@@ -159,7 +167,8 @@ impl ScriptTx<'_> {
             // Not the script path's savepoint and cancel: a caller of this
             // holds the transaction itself, and the savepoint changes what a
             // failed read leaves behind (see `postgres::ReadScope`).
-            ScriptTx::Postgres { tx, .. } => {
+            ScriptTx::Postgres { tx, reads, .. } => {
+                postgres::release_read_savepoint(tx, reads).await?;
                 postgres::capped_read(
                     tx,
                     sql,
@@ -191,16 +200,8 @@ impl ScriptTx<'_> {
             ScriptTx::Sqlite(tx) => sqlite::query_capped_conn(tx, sql, max_rows, cell_cap)
                 .await
                 .map(Capped::from),
-            ScriptTx::Postgres { tx, pg } => {
-                postgres::writable_capped_read(
-                    tx,
-                    pg,
-                    postgres::ReadScope::InTransaction,
-                    sql,
-                    max_rows,
-                    cell_cap,
-                )
-                .await
+            ScriptTx::Postgres { tx, pg, reads } => {
+                postgres::transaction_capped_read(tx, pg, reads, sql, max_rows, cell_cap).await
             }
             ScriptTx::SqlServer(tx) => sqlserver::query_capped_conn(tx, sql, max_rows, cell_cap)
                 .await
@@ -307,9 +308,11 @@ pub(super) enum ReadOnlyRun {
         /// [`postgres::read_only_begin`] for this server.
         begin: &'static str,
         /// The connection's pool, which a statement the row cap cut short is
-        /// cancelled through ([`postgres::cancel_target`]): the flavor says
+        /// cancelled through ([`postgres::read_only_target`]): the flavor says
         /// how, and another of its connections sends it.
         pg: postgres::PgConn,
+        /// The run's session ([`postgres::read_only_session`]), asked once.
+        session: Option<postgres::Session>,
     },
 }
 
@@ -340,13 +343,15 @@ impl ReadOnlyRun {
             ReadOnlyRun::Sqlite(conn) => sqlite::query_capped_conn(conn, sql, max_rows, cell_cap)
                 .await
                 .map(Capped::from),
-            ReadOnlyRun::Postgres { conn, begin, pg } => {
+            ReadOnlyRun::Postgres {
+                conn,
+                begin,
+                pg,
+                session,
+            } => {
                 let mut tx = postgres::begin_read_only(conn, begin).await?;
-                // Asked inside the statement's own transaction: through a
-                // transaction-pooling PgBouncer, the next transaction may run
-                // on another server backend, but this one stays on its backend
-                // until the rollback.
-                let target = match postgres::cancel_target(&mut tx, pg.flavor()).await {
+                let target = match postgres::read_only_target(&mut tx, pg.flavor(), *session).await
+                {
                     Ok(target) => target,
                     // The question aborted the transaction: start the
                     // statement's afresh, and let a cut-short read be read to
@@ -357,9 +362,10 @@ impl ReadOnlyRun {
                         None
                     }
                 };
-                let stopper = target.map(|target| postgres::Stopper {
+                let stopper = target.as_ref().map(|target| postgres::Stopper {
                     pool: pg.pool(),
                     target,
+                    sql,
                     unwritten_only: false,
                 });
                 let result = postgres::capped_read(
@@ -511,6 +517,8 @@ enum HeldConn {
         /// row cap cuts short is cancelled through another of its connections
         /// ([`postgres::writable_capped_read`]).
         pg: postgres::PgConn,
+        /// The session the reads have seen ([`postgres::probe_session`]).
+        session: Option<postgres::Session>,
     },
     SqlServer(Box<sqlserver::MssqlScriptConn>),
 }
@@ -531,16 +539,8 @@ impl ScriptConn {
                 .map(Capped::from),
             // Whether a transaction is open here is the script's business, so
             // it is asked of the server.
-            HeldConn::Postgres { conn, pg } => {
-                postgres::writable_capped_read(
-                    conn,
-                    pg,
-                    postgres::ReadScope::Unknown,
-                    sql,
-                    max_rows,
-                    cell_cap,
-                )
-                .await
+            HeldConn::Postgres { conn, pg, session } => {
+                postgres::writable_capped_read(conn, pg, session, sql, max_rows, cell_cap).await
             }
             HeldConn::SqlServer(conn) => {
                 sqlserver::query_capped_script_conn(conn, sql, max_rows, cell_cap)
@@ -571,7 +571,9 @@ impl ScriptConn {
     pub(super) async fn end(mut self) -> Result<bool, DbError> {
         let ended = match &mut self.held {
             HeldConn::Sqlite(conn) => sqlite::end_script_conn(conn).await,
-            HeldConn::Postgres { conn, pg } => postgres::end_script_conn(conn, pg.flavor()).await,
+            HeldConn::Postgres { conn, pg, .. } => {
+                postgres::end_script_conn(conn, pg.flavor()).await
+            }
             HeldConn::SqlServer(conn) => sqlserver::end_script_conn(conn).await,
         };
         self.close().await;
@@ -638,8 +640,9 @@ impl ScriptConn {
             return (read, self.end().await);
         }
         let finished = match &mut self.held {
-            HeldConn::Postgres { conn, pg } => {
-                postgres::finish_script_conn_with_read(conn, pg, sql, max_rows, cell_cap).await
+            HeldConn::Postgres { conn, pg, session } => {
+                postgres::finish_script_conn_with_read(conn, pg, session, sql, max_rows, cell_cap)
+                    .await
             }
             HeldConn::SqlServer(conn) => {
                 sqlserver::finish_script_conn_with_read(conn, sql, max_rows, cell_cap).await
@@ -648,10 +651,7 @@ impl ScriptConn {
         };
         match (self.held, finished.after) {
             (HeldConn::Postgres { conn, .. }, AfterRead::DrainClose) => {
-                postgres::drain_then_close(conn, false);
-            }
-            (HeldConn::Postgres { conn, .. }, AfterRead::DrainCommitClose) => {
-                postgres::drain_then_close(conn, true);
+                postgres::drain_then_close(conn);
             }
             (held, _) => ScriptConn { held }.close().await,
         }
@@ -676,9 +676,6 @@ pub(super) enum AfterRead {
     Close,
     /// Read the rest of a cut-short read in the background, then close it.
     DrainClose,
-    /// The same, committing the transaction hubro ran the read in between —
-    /// a read that had written when the row cap was reached.
-    DrainCommitClose,
 }
 
 /// A read-only statement's outcome, given how its rollback went: the
@@ -997,7 +994,11 @@ impl DbPool {
                 pg.renew_login().await?;
                 sqlx_common::begin_for_run(pg.pool())
                     .await
-                    .map(|tx| ScriptTx::Postgres { tx, pg: pg.clone() })
+                    .map(|tx| ScriptTx::Postgres {
+                        tx,
+                        pg: pg.clone(),
+                        reads: Default::default(),
+                    })
             }
             DbPool::SqlServer(pool) => sqlserver::begin_script_tx(pool)
                 .await
@@ -1025,7 +1026,11 @@ impl DbPool {
                 .pool()
                 .begin()
                 .await
-                .map(|tx| ScriptTx::Postgres { tx, pg: pg.clone() })
+                .map(|tx| ScriptTx::Postgres {
+                    tx,
+                    pg: pg.clone(),
+                    reads: Default::default(),
+                })
                 .map_err(|e| DbError::Query(e.to_string())),
             DbPool::SqlServer(pool) => sqlserver::begin_tx(pool)
                 .await
@@ -1043,6 +1048,7 @@ impl DbPool {
                 HeldConn::Postgres {
                     conn: sqlx_common::acquire_for_run(pg.pool()).await?,
                     pg: pg.clone(),
+                    session: None,
                 }
             }
             DbPool::SqlServer(pool) => {
@@ -1062,14 +1068,19 @@ impl DbPool {
             DbPool::Sqlite(pool) => Ok(Some(ReadOnlyRun::Sqlite(
                 sqlite::open_read_only(pool).await?,
             ))),
-            DbPool::Postgres(pg) => Ok(Some(ReadOnlyRun::Postgres {
-                conn: {
-                    pg.renew_login().await?;
-                    sqlx_common::acquire_for_run(pg.pool()).await?
-                },
-                begin: pg.read_only_begin(),
-                pg: pg.clone(),
-            })),
+            DbPool::Postgres(pg) => {
+                pg.renew_login().await?;
+                let mut conn = sqlx_common::acquire_for_run(pg.pool()).await?;
+                // Asked once for the run: a read-only statement may then be
+                // cancelled without a question of its own.
+                let session = postgres::read_only_session(&mut conn, pg.flavor()).await;
+                Ok(Some(ReadOnlyRun::Postgres {
+                    conn,
+                    begin: pg.read_only_begin(),
+                    pg: pg.clone(),
+                    session,
+                }))
+            }
             // Turned away above; kept as an arm so a new variant must decide.
             DbPool::SqlServer(_) => Ok(None),
         }

@@ -830,27 +830,26 @@ fn refused_probe_rolled_back(flavor: PgFlavor, sqlstate: Option<&str>) -> bool {
 ///
 /// Unless [`final_read_may_close`] says the statement can neither touch the
 /// transaction nor write, the read is an ordinary one
-/// ([`writable_capped_read`]) followed by the ordinary end. Otherwise the
-/// probe of [`end_script_conn`] is sent *before* the read:
+/// ([`writable_capped_read`]) followed by the ordinary end. Otherwise
+/// whether a transaction is open is asked *before* the read:
 ///
-/// - A transaction is open: the read runs inside the handle the probe
-///   returned, so the script still sees its own uncommitted rows, and the
-///   handle's rollback ends it afterwards. A read the row cap cut short is
-///   followed by nothing — the caller closes the connection, which ends the
-///   transaction server-side and is reported as the rollback it is.
+/// - A transaction is open: a read the row cap cut short is followed by
+///   nothing — the caller closes the connection, which ends the transaction
+///   server-side and is reported as the rollback it is.
 /// - Nothing is open, on an engine that says whether a statement has written
-///   ([`knows_whether_written`]): the read runs in a transaction of hubro's
-///   ([`ReadScope::Idle`]). Cut short with nothing written, the rest is
-///   cancelled and the transaction rolled back. Cut short after writing, the
-///   rest is read in the background and the transaction committed before
-///   the connection closes ([`AfterRead::DrainCommitClose`]).
+///   ([`knows_whether_written`]): the rest is cancelled if the statement has
+///   written nothing, and otherwise read to its end here, so that an error
+///   past the cap — a unique violation, say — is the read's, reported as
+///   any other statement's is.
 /// - Nothing is open on any other engine: a cut-short read is left
 ///   unfinished, and its rest read in the background before the connection
 ///   closes ([`AfterRead::DrainClose`]) — closing at once would abort a write
-///   the gate cannot see (`SELECT f()` for a function that writes).
+///   the gate cannot see (`SELECT f()` for a function that writes), and
+///   waiting for it would cost every capped read the rest of its result.
 pub async fn finish_script_conn_with_read(
     conn: &mut sqlx::postgres::PgConnection,
     pg: &PgConn,
+    known: &mut Option<Session>,
     sql: &str,
     max_rows: u64,
     cell_cap: usize,
@@ -858,14 +857,46 @@ pub async fn finish_script_conn_with_read(
     use super::registry::{AfterRead, FinishedRead};
     let flavor = pg.flavor();
     if !final_read_may_close(sql, Dialect::Postgres) {
-        let read =
-            writable_capped_read(conn, pg, ReadScope::Unknown, sql, max_rows, cell_cap).await;
+        let read = writable_capped_read(conn, pg, known, sql, max_rows, cell_cap).await;
         let ended = end_script_conn(conn, flavor).await;
         return FinishedRead {
             read,
             ended,
             after: AfterRead::Close,
         };
+    }
+    if knows_whether_written(flavor) {
+        if let Some(Probed {
+            session, in_block, ..
+        }) = probe_session(conn, known).await
+        {
+            let target = CancelTarget::Backend(session);
+            let stopper = (!in_block).then_some(Stopper {
+                pool: pg.pool(),
+                target: &target,
+                sql,
+                unwritten_only: true,
+            });
+            let otherwise = if in_block { Rest::Leave } else { Rest::Read };
+            let read = capped_read(conn, sql, max_rows, cell_cap, stopper, otherwise).await;
+            if in_block && matches!(&read, Ok(capped) if capped.truncated) {
+                // Stopped by the close that follows.
+                return FinishedRead {
+                    read: read.map(|capped| Capped {
+                        rest_cancelled: true,
+                        ..capped
+                    }),
+                    ended: Ok(true),
+                    after: AfterRead::Close,
+                };
+            }
+            let ended = end_script_conn(conn, flavor).await;
+            return FinishedRead {
+                read,
+                ended,
+                after: AfterRead::Close,
+            };
+        }
     }
     let refused = match sqlx::Connection::begin_with(&mut *conn, "SELECT 1").await {
         Ok(mut open) => {
@@ -909,10 +940,6 @@ pub async fn finish_script_conn_with_read(
             after: AfterRead::Close,
         };
     }
-    // Nothing is open.
-    if knows_whether_written(flavor) {
-        return finish_idle_read(conn, pg, sql, max_rows, cell_cap).await;
-    }
     let read = capped_read(conn, sql, max_rows, cell_cap, None, Rest::Leave).await;
     if matches!(&read, Ok(capped) if capped.truncated) {
         return FinishedRead {
@@ -929,56 +956,10 @@ pub async fn finish_script_conn_with_read(
     }
 }
 
-/// [`finish_script_conn_with_read`] with nothing open, on an engine that says
-/// whether a statement has written: the read in a transaction of hubro's
-/// ([`ReadScope::Idle`]), its rest cancelled at the cap if it has written
-/// nothing and otherwise read in the background before that transaction is
-/// committed. Nothing the script opened is open, so `ended` is `false`
-/// whatever happens to hubro's own transaction.
-async fn finish_idle_read(
-    conn: &mut sqlx::postgres::PgConnection,
-    pg: &PgConn,
-    sql: &str,
-    max_rows: u64,
-    cell_cap: usize,
-) -> super::registry::FinishedRead {
-    use super::registry::{AfterRead, FinishedRead};
-    let Ok(pid) = open_read_scope(conn, READ_BEGIN).await else {
-        let _ = run_raw(conn, "ROLLBACK").await;
-        let read = capped_read(conn, sql, max_rows, cell_cap, None, Rest::Read).await;
-        let ended = end_script_conn(conn, pg.flavor()).await;
-        return FinishedRead {
-            read,
-            ended,
-            after: AfterRead::Close,
-        };
-    };
-    let stopper = Stopper {
-        pool: pg.pool(),
-        target: CancelTarget::Backend(pid),
-        unwritten_only: true,
-    };
-    let read = capped_read(conn, sql, max_rows, cell_cap, Some(stopper), Rest::Leave).await;
-    if matches!(&read, Ok(capped) if capped.truncated && !capped.rest_cancelled) {
-        return FinishedRead {
-            read,
-            ended: Ok(false),
-            after: AfterRead::DrainCommitClose,
-        };
-    }
-    let read = close_read_transaction(conn, read).await;
-    FinishedRead {
-        read,
-        ended: Ok(false),
-        after: AfterRead::Close,
-    }
-}
-
 /// Reads the rest of a cut-short read in a background task, then closes the
 /// connection — the end of a script run whose last read the row cap cut short
-/// with no transaction of the script's open (see
-/// [`finish_script_conn_with_read`]), and with `commit`, commits the
-/// transaction hubro ran it in first.
+/// with nothing open, on an engine that cannot say whether the statement has
+/// written (see [`finish_script_conn_with_read`]).
 ///
 /// Read rather than abandoned, because closing a connection mid-result
 /// aborts the statement, and a read can write (`SELECT f()`); in the
@@ -987,29 +968,19 @@ async fn finish_idle_read(
 /// connection is ([`ScriptConn`](super::registry::ScriptConn)). The ping is
 /// what the pool sent on a connection's return: sqlx answers it only once
 /// every pending response has been read. The connection keeps its pool slot
-/// until it is closed, as it did while the pool read it.
+/// until it is closed, as it did while the pool read it. A failure in the
+/// rest is not reported — the statement's own transaction ends with it, as it
+/// always did here.
 ///
 /// Unlike every other rest, this one is read by sqlx in one poll — the stream
 /// is gone — so it holds one of the runtime's worker threads until it is
 /// done. Not the thread the run is polled on: a `tokio::spawn`ed task runs on
 /// the worker pool, and the SQL tab's run on the UI thread.
-pub(super) fn drain_then_close(mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>, commit: bool) {
+pub(super) fn drain_then_close(mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>) {
     tokio::spawn(async move {
-        let drained = sqlx::Connection::ping(&mut *conn).await;
-        if commit && drained.is_ok() {
-            let _ = commit_boxed(&mut conn).await;
-        }
+        let _ = sqlx::Connection::ping(&mut *conn).await;
         let _ = conn.close().await;
     });
-}
-
-/// `COMMIT` on `conn`, as a boxed future: awaited bare inside a
-/// `tokio::spawn`ed task, sqlx's executor trips a higher-ranked bound the
-/// spawn's `Send` check cannot prove.
-fn commit_boxed(
-    conn: &mut sqlx::postgres::PgConnection,
-) -> futures_util::future::BoxFuture<'_, Result<sqlx::postgres::PgQueryResult, sqlx::Error>> {
-    sqlx::Executor::execute(conn, "COMMIT")
 }
 
 /// Opens the read-only transaction one statement of a read-only script runs
@@ -1038,11 +1009,22 @@ pub async fn end_read_only(tx: sqlx::Transaction<'_, sqlx::Postgres>) -> Result<
         .map_err(|e| DbError::Query(e.to_string()))
 }
 
-/// How a statement the row cap cut short is cancelled from another session,
-/// named by the session it runs on ([`Stopper`]).
+/// One server session, named so that a statement on it can be cancelled
+/// from another connection: its backend's pid, and when that backend
+/// started. A pid alone is not a name — through anything that can route the
+/// cancelling connection to another server (a load balancer in front of
+/// several), the same pid can be an unrelated session there — and a pid
+/// with its start time, to the microsecond, is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Session {
+    pid: i32,
+    started_us: i64,
+}
+
+/// How a statement the row cap cut short is cancelled from another session.
 pub(super) enum CancelTarget {
-    /// `pg_cancel_backend` on this server backend.
-    Backend(i32),
+    /// `pg_cancel_backend` on this session's backend.
+    Backend(Session),
     /// CockroachDB's `CANCEL QUERIES` on whatever this session is running.
     /// It has no `pg_cancel_backend` (measured: "unknown function").
     CockroachSession(String),
@@ -1090,6 +1072,16 @@ pub(super) enum CancelKind {
 /// - Materialize and RisingWave cannot cancel a statement anyway
 ///   ([`cancel_kind`]).
 ///
+/// No transaction id is **not** the same as no effect, and the cancel
+/// undoes the whole statement, rows before the cap included — measured on
+/// PostgreSQL 17, through both the atomic and the sequential path: a
+/// `set_config(…, false)` the statement made was gone afterwards, and a
+/// listener received none of the `pg_notify`s it sent. Neither takes a
+/// transaction id; nor do `dblink_exec`, `COPY … TO PROGRAM` or `lo_export`
+/// run through a function, whose effects are outside the transaction. The
+/// user's decision is to cancel anyway, and the editor says what that means
+/// (`truncation_notice`).
+///
 /// Where it is `false`, a writable connection's cut-short read is read to
 /// its end, as every one was before.
 pub(super) fn knows_whether_written(flavor: PgFlavor) -> bool {
@@ -1102,26 +1094,84 @@ pub(super) fn knows_whether_written(flavor: PgFlavor) -> bool {
     }
 }
 
-/// Names the session `conn` runs on, so a statement on it can be cancelled
-/// from another ([`Stopper`]); `None` on an engine that cannot cancel one
-/// ([`cancel_kind`]). Asked inside the transaction the statement will run in,
-/// which keeps it on one server backend even through a pooler.
-pub(super) async fn cancel_target(
+/// The session `conn` runs on and whether it is inside a transaction
+/// block, in one round trip.
+///
+/// Sent as a simple query, where a statement outside a block is a
+/// transaction of its own and so starts when it does: measured, its
+/// `transaction_timestamp()` equalled its `statement_timestamp()` 200 times
+/// out of 200 outside a block, and never inside one. (Over the extended
+/// protocol the two differ outside a block too, so this needs `raw_sql`.)
+const SESSION_PROBE: &str = "SELECT pg_backend_pid(), \
+    (SELECT (extract(epoch FROM backend_start) * 1000000)::int8 \
+     FROM pg_stat_activity WHERE pid = pg_backend_pid()), \
+    transaction_timestamp() = statement_timestamp(), \
+    txid_current_if_assigned() IS NOT NULL";
+
+/// [`SESSION_PROBE`] without the start time, which only `pg_stat_activity`
+/// has: reading that view made the probe cost 0.5 ms a read on localhost,
+/// against a tenth of that without it. The start time of a backend the run
+/// has seen before is known already ([`probe_session`]).
+const BLOCK_PROBE: &str = "SELECT pg_backend_pid(), \
+    transaction_timestamp() = statement_timestamp(), \
+    txid_current_if_assigned() IS NOT NULL";
+
+/// What a writable read needs to know before it runs: the session `conn`
+/// runs on, whether it is inside a transaction block, and whether that
+/// transaction has written already — in which case the read will not be
+/// cancelled, and needs no savepoint. [`BLOCK_PROBE`] when the backend is `known`'s, [`SESSION_PROBE`] (and
+/// `known` updated) when it is not — the first read of a run, or a pooler
+/// that moved the session to another backend. `None` when it cannot be had —
+/// the read is then read to its end.
+pub(super) async fn probe_session(
     conn: &mut sqlx::postgres::PgConnection,
-    flavor: PgFlavor,
-) -> Result<Option<CancelTarget>, DbError> {
-    let target = match cancel_kind(flavor) {
-        None => return Ok(None),
-        Some(CancelKind::Backend) => sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
-            .fetch_one(conn)
+    known: &mut Option<Session>,
+) -> Option<Probed> {
+    if let Some(session) = *known {
+        let row = sqlx::raw_sql(BLOCK_PROBE)
+            .fetch_one(&mut *conn)
             .await
-            .map(CancelTarget::Backend),
-        Some(CancelKind::CockroachSession) => sqlx::query_scalar::<_, String>("SHOW session_id")
-            .fetch_one(conn)
-            .await
-            .map(CancelTarget::CockroachSession),
-    };
-    target.map(Some).map_err(|e| DbError::Query(e.to_string()))
+            .ok()?;
+        let pid: i32 = row.try_get(0).ok()?;
+        if pid == session.pid {
+            return Some(Probed {
+                session,
+                in_block: !row.try_get::<bool, _>(1).ok()?,
+                written: row.try_get(2).ok()?,
+            });
+        }
+    }
+    let row = sqlx::raw_sql(SESSION_PROBE)
+        .fetch_one(&mut *conn)
+        .await
+        .ok()?;
+    let session = session_from(&row, 0)?;
+    *known = Some(session);
+    Some(Probed {
+        session,
+        in_block: !row.try_get::<bool, _>(2).ok()?,
+        written: row.try_get(3).ok()?,
+    })
+}
+
+/// [`probe_session`]'s answer.
+pub(super) struct Probed {
+    session: Session,
+    in_block: bool,
+    /// The transaction has written to a table already. Only ever true inside
+    /// a block: a statement outside one is a transaction of its own, which
+    /// has not started yet.
+    written: bool,
+}
+
+/// The [`Session`] in a row's columns `at` and `at + 1`.
+fn session_from(row: &sqlx::postgres::PgRow, at: usize) -> Option<Session> {
+    let pid: i32 = row.try_get(at).ok()?;
+    let started_us: Option<i64> = row.try_get(at + 1).ok()?;
+    Some(Session {
+        pid,
+        started_us: started_us?,
+    })
 }
 
 /// How long sending a cancel may take before the rest of the result is read
@@ -1133,13 +1183,18 @@ const CANCEL_WAIT: Duration = Duration::from_secs(5);
 /// from another of `pool`'s connections.
 pub(super) struct Stopper<'a> {
     pub(super) pool: &'a PgPool,
-    pub(super) target: CancelTarget,
+    pub(super) target: &'a CancelTarget,
+    /// The statement being read. The cancel also requires the session to be
+    /// running it, so a session that has moved on — or, through a
+    /// transaction-pooling PgBouncer, a server backend now serving another
+    /// client — is left alone.
+    pub(super) sql: &'a str,
     /// Cancel only a statement whose transaction has written nothing — what
-    /// a writable connection's read needs, where a `SELECT` can write through
-    /// a function it calls. Asked of the server in the same statement that
-    /// sends the cancel ([`send_cancel`]). A read-only connection's needs no
-    /// such question: the engine refuses its writes, and its transaction is
-    /// rolled back regardless.
+    /// a writable connection's read needs ([`knows_whether_written`]). Asked
+    /// of the server in the same statement that sends the cancel
+    /// ([`send_cancel`]). A read-only connection's needs no such question:
+    /// the engine refuses its writes, and its transaction is rolled back
+    /// regardless.
     pub(super) unwritten_only: bool,
 }
 
@@ -1150,7 +1205,7 @@ impl Stopper<'_> {
     async fn at_cap(self, otherwise: Rest) -> Rest {
         let sent = tokio::time::timeout(
             CANCEL_WAIT,
-            send_cancel(self.pool, &self.target, self.unwritten_only),
+            send_cancel(self.pool, self.target, self.sql, self.unwritten_only),
         )
         .await;
         if matches!(sent, Ok(Ok(true))) {
@@ -1161,36 +1216,48 @@ impl Stopper<'_> {
     }
 }
 
+/// Cancels `pid` if it is still the session that started at `$2` and still
+/// running `$3` — `pg_stat_activity.query` is the statement's text, cut at
+/// `track_activity_query_size`, so a prefix of it.
+const CANCEL_SESSION: &str = "SELECT pg_cancel_backend(pid) FROM pg_stat_activity \
+     WHERE pid = $1 AND (extract(epoch FROM backend_start) * 1000000)::int8 = $2 \
+     AND state = 'active' AND query <> '' AND starts_with($3, query)";
+
+/// [`CANCEL_SESSION`], and only while the session's transaction has no id —
+/// has written nothing to a table.
+const CANCEL_SESSION_UNWRITTEN: &str = "SELECT pg_cancel_backend(pid) FROM pg_stat_activity \
+     WHERE pid = $1 AND (extract(epoch FROM backend_start) * 1000000)::int8 = $2 \
+     AND state = 'active' AND query <> '' AND starts_with($3, query) \
+     AND backend_xid IS NULL";
+
 /// Asks the server to cancel what `target` is running; true if it took the
 /// request. A statement already finished is not cancelled — the session is
-/// idle, and the request is ignored or finds nothing to cancel.
+/// idle, or running something else.
 ///
 /// With `unwritten_only`, the transaction's having written nothing is read
 /// in the very statement that sends the cancel, so the answer is not one
 /// round trip stale. A write that lands between that read and the cancel can
 /// only be made by a row past the cap — the rows before it have all been
-/// produced — and a write past the cap is exactly what cancelling at the cap
-/// gives up.
+/// produced — and a write past the cap is what cancelling at the cap gives
+/// up.
 async fn send_cancel(
     pool: &PgPool,
     target: &CancelTarget,
+    sql: &str,
     unwritten_only: bool,
 ) -> Result<bool, sqlx::Error> {
     match target {
-        CancelTarget::Backend(pid) if unwritten_only => sqlx::query_scalar::<_, bool>(
-            "SELECT pg_cancel_backend(pid) FROM pg_stat_activity \
-             WHERE pid = $1 AND state = 'active' AND backend_xid IS NULL",
-        )
-        .bind(*pid)
+        CancelTarget::Backend(session) => sqlx::query_scalar::<_, bool>(if unwritten_only {
+            CANCEL_SESSION_UNWRITTEN
+        } else {
+            CANCEL_SESSION
+        })
+        .bind(session.pid)
+        .bind(session.started_us)
+        .bind(sql)
         .fetch_optional(pool)
         .await
         .map(|cancelled| cancelled == Some(true)),
-        CancelTarget::Backend(pid) => {
-            sqlx::query_scalar::<_, bool>("SELECT pg_cancel_backend($1)")
-                .bind(*pid)
-                .fetch_one(pool)
-                .await
-        }
         // No way to ask CockroachDB whether the session has written
         // (`knows_whether_written`), so never on that condition.
         CancelTarget::CockroachSession(_) if unwritten_only => Ok(false),
@@ -1205,12 +1272,48 @@ async fn send_cancel(
     }
 }
 
-/// Runs `sql` on `conn`, bounded like [`query_capped_conn`], with the rest of
-/// a result the row cap cuts short cancelled by `stopper` where it can be,
-/// and otherwise handled as `otherwise` says. The rest is read here, giving
-/// the executor turns ([`sqlx_common::collect_capped_then`]) — never by the
-/// connection's next question, which reads it in one poll that nothing can
-/// interrupt.
+/// The session a marked connection's run holds, asked once when the run
+/// takes its connection, on the engines cancelled by backend
+/// ([`cancel_kind`]). Each statement runs in a read-only transaction of its
+/// own; the cancel's match on the statement's text keeps a pooler's switch
+/// of backends between them from cancelling anyone else's.
+pub(super) async fn read_only_session(
+    conn: &mut sqlx::postgres::PgConnection,
+    flavor: PgFlavor,
+) -> Option<Session> {
+    if cancel_kind(flavor) != Some(CancelKind::Backend) {
+        return None;
+    }
+    probe_session(conn, &mut None)
+        .await
+        .map(|probed| probed.session)
+}
+
+/// Who a marked connection's read is cancelled through: the run's
+/// [`Session`], or on CockroachDB the session id, asked inside the
+/// statement's transaction (`CANCEL QUERIES` has no text to match).
+pub(super) async fn read_only_target(
+    conn: &mut sqlx::postgres::PgConnection,
+    flavor: PgFlavor,
+    session: Option<Session>,
+) -> Result<Option<CancelTarget>, DbError> {
+    match cancel_kind(flavor) {
+        None => Ok(None),
+        Some(CancelKind::Backend) => Ok(session.map(CancelTarget::Backend)),
+        Some(CancelKind::CockroachSession) => sqlx::query_scalar::<_, String>("SHOW session_id")
+            .fetch_one(conn)
+            .await
+            .map(|id| Some(CancelTarget::CockroachSession(id)))
+            .map_err(|e| DbError::Query(e.to_string())),
+    }
+}
+
+/// Runs `sql` on `conn`, bounded by the row cap and `cell_cap`, with the
+/// rest of a result the row cap cuts short cancelled by `stopper` where it
+/// can be, and otherwise handled as `otherwise` says. The rest is read here,
+/// giving the thread turns ([`sqlx_common::collect_capped_then`]) — never by
+/// the connection's next question, which reads it in one poll that nothing
+/// can interrupt.
 pub(super) async fn capped_read(
     conn: &mut sqlx::postgres::PgConnection,
     sql: &str,
@@ -1238,87 +1341,6 @@ pub(super) async fn capped_read(
     Ok(capped)
 }
 
-/// Where a writable connection's read runs, which decides how a cancel at
-/// the row cap is contained ([`writable_capped_read`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ReadScope {
-    /// Inside a transaction — hubro's, or one the script opened. The read runs
-    /// in a savepoint, and a cancelled read rolls back to it: a cancelled
-    /// statement aborts the transaction it runs in, and measured, every
-    /// statement after it then failed with "current transaction is aborted".
-    ///
-    /// The savepoint changes one thing about a read that *fails*: the error
-    /// aborts the savepoint, and the transaction is left aborted holding the
-    /// locks it took before it, until it is rolled back — where without one,
-    /// the error released them at once (measured: a deadlock victim's earlier
-    /// row lock kept the other transaction waiting until the victim rolled
-    /// back). Every run rolls back straight after a failed statement, so the
-    /// difference lasts as long as that rollback takes.
-    InTransaction,
-    /// Outside one. The read runs in a transaction hubro opens for it, so that
-    /// the backend it is cancelled on is the one it runs on even through a
-    /// transaction-pooling PgBouncer; committed after a read that ran to its
-    /// end, rolled back after a cancel — which has nothing to undo, since the
-    /// transaction had written nothing.
-    Idle,
-    /// Not known: asked of the server ([`scope_from_state`]).
-    Unknown,
-}
-
-/// The scope a session between statements is in, from its
-/// `pg_stat_activity.state` — set by the backend before it reports itself
-/// ready. `None` for anything else (`idle in transaction (aborted)`, a
-/// session the view does not show, `track_activities` off): the read is then
-/// read to its end.
-pub(super) fn scope_from_state(state: Option<&str>) -> Option<ReadScope> {
-    match state {
-        Some("idle") => Some(ReadScope::Idle),
-        Some("idle in transaction") => Some(ReadScope::InTransaction),
-        _ => None,
-    }
-}
-
-/// [`ReadScope::Unknown`] resolved: the session's state as the server sees it.
-async fn session_scope(
-    conn: &mut sqlx::postgres::PgConnection,
-    pool: &PgPool,
-) -> Option<ReadScope> {
-    let pid = sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
-        .fetch_one(&mut *conn)
-        .await
-        .ok()?;
-    let state = tokio::time::timeout(
-        CANCEL_WAIT,
-        sqlx::query_scalar::<_, Option<String>>(
-            "SELECT state FROM pg_stat_activity WHERE pid = $1",
-        )
-        .bind(pid)
-        .fetch_optional(pool),
-    )
-    .await
-    .ok()?
-    .ok()?
-    .flatten();
-    scope_from_state(state.as_deref())
-}
-
-/// The savepoint a writable read runs in inside a transaction.
-const READ_SAVEPOINT: &str = "SAVEPOINT hubro_capped_read; SELECT pg_backend_pid()";
-/// The transaction a writable read runs in outside one.
-const READ_BEGIN: &str = "BEGIN; SELECT pg_backend_pid()";
-
-/// Opens a read's savepoint or transaction (`opener`) and names the backend,
-/// in one round trip.
-async fn open_read_scope(
-    conn: &mut sqlx::postgres::PgConnection,
-    opener: &'static str,
-) -> Result<i32, sqlx::Error> {
-    sqlx::raw_sql(opener)
-        .fetch_one(&mut *conn)
-        .await
-        .and_then(|row| row.try_get::<i32, _>(0))
-}
-
 async fn run_raw(
     conn: &mut sqlx::postgres::PgConnection,
     sql: &'static str,
@@ -1330,21 +1352,39 @@ async fn run_raw(
         .map_err(|e| DbError::Query(e.to_string()))
 }
 
-/// A writable connection's read, bounded like [`query_capped_conn`]. When the
-/// row cap cuts it short and its transaction has **written nothing**, the rest
-/// is cancelled ([`Stopper::unwritten_only`]); when it has written — or the
-/// engine cannot say ([`knows_whether_written`]) — the rest is read to its end
-/// here, as before. Writes that rows past the cap would have made are not
-/// made: that is the trade, decided for the user.
+/// The savepoint a writable read runs in inside a transaction. A cancelled
+/// statement aborts the transaction it runs in, and measured, every statement
+/// after it then failed with "current transaction is aborted"; rolling back
+/// to this instead leaves the transaction as it was before the read.
 ///
-/// The cancel is contained by `scope` ([`ReadScope`]). Anything that keeps
-/// hubro from containing it — the savepoint or transaction cannot be
-/// opened, the session's state is not one it knows — leaves the read to be
-/// read to its end.
+/// One thing changes for a read that *fails* inside it: the error aborts the
+/// savepoint, and the transaction is left aborted still holding the locks it
+/// took before it, until it is rolled back — where without one, the error
+/// released them at once (measured: a deadlock victim's earlier row lock kept
+/// the other transaction waiting until the victim rolled back). Every run
+/// rolls back straight after a failed statement, so the difference lasts as
+/// long as that rollback takes.
+const READ_SAVEPOINT: &str = "SAVEPOINT hubro_capped_read";
+
+/// A sequential script's read on a writable connection: when the row cap cuts
+/// it short and its transaction has **written nothing to a table**
+/// ([`knows_whether_written`]), the rest is cancelled; otherwise it is read to
+/// its end here. Writes that rows past the cap would have made are not made,
+/// and the cancel undoes what the statement did before the cap, too: that is
+/// the trade, decided for the user.
+///
+/// One round trip before the read ([`probe_session`]) names the session and
+/// says whether the script has a transaction open, and whether it has
+/// written — `known` is the run's session, kept from read to read. Outside one the
+/// statement is its own transaction, and the cancel ends it alone. Inside
+/// one, the read runs in [`READ_SAVEPOINT`], released right after it — the
+/// script may roll back to a savepoint of its own, which would take an
+/// unreleased one of hubro's with it — for two more, unless the transaction
+/// has written already and the read cannot be cancelled anyway.
 pub(super) async fn writable_capped_read(
     conn: &mut sqlx::postgres::PgConnection,
     pg: &PgConn,
-    scope: ReadScope,
+    known: &mut Option<Session>,
     sql: &str,
     max_rows: u64,
     cell_cap: usize,
@@ -1352,86 +1392,134 @@ pub(super) async fn writable_capped_read(
     if !knows_whether_written(pg.flavor()) {
         return capped_read(conn, sql, max_rows, cell_cap, None, Rest::Read).await;
     }
-    let scope = match scope {
-        ReadScope::Unknown => match session_scope(conn, pg.pool()).await {
-            Some(scope) => scope,
-            None => return capped_read(conn, sql, max_rows, cell_cap, None, Rest::Read).await,
-        },
-        known => known,
+    let Some(Probed {
+        session,
+        in_block,
+        written,
+    }) = probe_session(conn, known).await
+    else {
+        return capped_read(conn, sql, max_rows, cell_cap, None, Rest::Read).await;
     };
-    let stopper = |pid| Stopper {
+    if written {
+        // Never cancelled, so no savepoint either.
+        return capped_read(conn, sql, max_rows, cell_cap, None, Rest::Read).await;
+    }
+    let target = CancelTarget::Backend(session);
+    let stopper = Stopper {
         pool: pg.pool(),
-        target: CancelTarget::Backend(pid),
+        target: &target,
+        sql,
         unwritten_only: true,
     };
-    match scope {
-        ReadScope::InTransaction => {
-            let Ok(pid) = open_read_scope(conn, READ_SAVEPOINT).await else {
-                // Refused: an aborted transaction, which refuses the read
-                // too, with the server's own message — or no transaction
-                // after all, where nothing was opened.
-                return capped_read(conn, sql, max_rows, cell_cap, None, Rest::Read).await;
-            };
-            let read = capped_read(
-                conn,
-                sql,
-                max_rows,
-                cell_cap,
-                Some(stopper(pid)),
-                Rest::Read,
-            )
-            .await;
-            // A read that failed leaves the transaction aborted, as it always
-            // did; the savepoint goes with it.
-            if let Ok(capped) = &read {
-                if capped.rest_cancelled {
-                    run_raw(conn, "ROLLBACK TO SAVEPOINT hubro_capped_read").await?;
-                }
-                run_raw(conn, "RELEASE SAVEPOINT hubro_capped_read").await?;
-            }
-            read
-        }
-        ReadScope::Idle | ReadScope::Unknown => {
-            let Ok(pid) = open_read_scope(conn, READ_BEGIN).await else {
-                let _ = run_raw(conn, "ROLLBACK").await;
-                return capped_read(conn, sql, max_rows, cell_cap, None, Rest::Read).await;
-            };
-            let read = capped_read(
-                conn,
-                sql,
-                max_rows,
-                cell_cap,
-                Some(stopper(pid)),
-                Rest::Read,
-            )
-            .await;
-            close_read_transaction(conn, read).await
-        }
+    if !in_block {
+        return capped_read(conn, sql, max_rows, cell_cap, Some(stopper), Rest::Read).await;
     }
+    if run_raw(conn, READ_SAVEPOINT).await.is_err() {
+        // An aborted transaction refuses the read too, with the server's own
+        // message.
+        return capped_read(conn, sql, max_rows, cell_cap, None, Rest::Read).await;
+    }
+    let read = capped_read(conn, sql, max_rows, cell_cap, Some(stopper), Rest::Read).await;
+    if let Ok(capped) = &read {
+        if capped.rest_cancelled {
+            run_raw(conn, "ROLLBACK TO SAVEPOINT hubro_capped_read").await?;
+        }
+        run_raw(conn, "RELEASE SAVEPOINT hubro_capped_read").await?;
+    }
+    read
 }
 
-/// Ends the transaction [`writable_capped_read`] opened for a read outside
-/// one: committed after a read that ran to its end — a commit that fails is
-/// the read's failure, as it was the statement's own in autocommit — and
-/// rolled back after a cancelled or failed one.
-async fn close_read_transaction(
+/// What hubro's own script transaction has learned for its reads
+/// ([`transaction_capped_read`]): the session, asked with the first read and
+/// kept, since the transaction holds one backend for the whole run; and
+/// whether [`READ_SAVEPOINT`] is still open.
+#[derive(Debug, Default)]
+pub struct TransactionReads {
+    session: Option<Option<Session>>,
+    savepoint_open: bool,
+}
+
+/// [`READ_SAVEPOINT`] with the session asked in the same round trip — the
+/// first read of a script transaction.
+const FIRST_READ_SAVEPOINT: &str = "SAVEPOINT hubro_capped_read; \
+    SELECT pg_backend_pid(), \
+    (SELECT (extract(epoch FROM backend_start) * 1000000)::int8 \
+     FROM pg_stat_activity WHERE pid = pg_backend_pid())";
+
+/// [`READ_SAVEPOINT`] after the previous read's.
+const NEXT_READ_SAVEPOINT: &str =
+    "RELEASE SAVEPOINT hubro_capped_read; SAVEPOINT hubro_capped_read";
+
+/// [`writable_capped_read`] in hubro's own script transaction (the atomic
+/// path), for one round trip per read: the savepoint is opened together with
+/// the release of the previous read's, and released before a write
+/// ([`release_read_savepoint`]) rather than straight after the read — so
+/// writes never run inside one, where each would take a subtransaction id,
+/// and a script of many reads and writes would overflow the 64 the server
+/// tracks per session. The script's statements cannot touch savepoints
+/// themselves: a script that does is not run in hubro's transaction.
+pub(super) async fn transaction_capped_read(
     conn: &mut sqlx::postgres::PgConnection,
-    read: Result<Capped, DbError>,
+    pg: &PgConn,
+    reads: &mut TransactionReads,
+    sql: &str,
+    max_rows: u64,
+    cell_cap: usize,
 ) -> Result<Capped, DbError> {
-    match read {
-        Ok(capped) if !capped.rest_cancelled => {
-            run_raw(conn, "COMMIT").await?;
-            Ok(capped)
-        }
-        Ok(capped) => {
-            run_raw(conn, "ROLLBACK").await?;
-            Ok(capped)
-        }
-        Err(error) => {
-            let _ = run_raw(conn, "ROLLBACK").await;
-            Err(error)
-        }
+    if !knows_whether_written(pg.flavor()) {
+        return capped_read(conn, sql, max_rows, cell_cap, None, Rest::Read).await;
     }
+    let session = match reads.session {
+        None => {
+            let asked = sqlx::raw_sql(FIRST_READ_SAVEPOINT)
+                .fetch_one(&mut *conn)
+                .await
+                .ok()
+                .and_then(|row| session_from(&row, 0));
+            reads.session = Some(asked);
+            reads.savepoint_open = asked.is_some();
+            asked
+        }
+        Some(None) => None,
+        Some(Some(session)) => {
+            let opener = if reads.savepoint_open {
+                NEXT_READ_SAVEPOINT
+            } else {
+                READ_SAVEPOINT
+            };
+            reads.savepoint_open = run_raw(conn, opener).await.is_ok();
+            reads.savepoint_open.then_some(session)
+        }
+    };
+    let Some(session) = session else {
+        return capped_read(conn, sql, max_rows, cell_cap, None, Rest::Read).await;
+    };
+    let target = CancelTarget::Backend(session);
+    let stopper = Stopper {
+        pool: pg.pool(),
+        target: &target,
+        sql,
+        unwritten_only: true,
+    };
+    let read = capped_read(conn, sql, max_rows, cell_cap, Some(stopper), Rest::Read).await;
+    if matches!(&read, Ok(capped) if capped.rest_cancelled) {
+        run_raw(conn, "ROLLBACK TO SAVEPOINT hubro_capped_read").await?;
+    }
+    read
+}
+
+/// Releases the savepoint the last read of hubro's script transaction left
+/// open ([`transaction_capped_read`]) — before a write, so the write runs in
+/// the transaction itself.
+pub(super) async fn release_read_savepoint(
+    conn: &mut sqlx::postgres::PgConnection,
+    reads: &mut TransactionReads,
+) -> Result<(), DbError> {
+    if !reads.savepoint_open {
+        return Ok(());
+    }
+    reads.savepoint_open = false;
+    run_raw(conn, "RELEASE SAVEPOINT hubro_capped_read").await
 }
 
 /// [`execute_conn`] with bound parameters — the write path for a batch of
@@ -3232,22 +3320,6 @@ mod tests {
         assert!(!knows_whether_written(PgFlavor::CockroachDB));
         assert!(!knows_whether_written(PgFlavor::Materialize));
         assert!(!knows_whether_written(PgFlavor::RisingWave));
-    }
-
-    #[test]
-    fn a_session_state_names_a_read_scope_only_when_it_is_one_hubro_can_contain() {
-        assert_eq!(scope_from_state(Some("idle")), Some(ReadScope::Idle));
-        assert_eq!(
-            scope_from_state(Some("idle in transaction")),
-            Some(ReadScope::InTransaction)
-        );
-        // Refuses the read anyway, with the server's own message.
-        assert_eq!(
-            scope_from_state(Some("idle in transaction (aborted)")),
-            None
-        );
-        assert_eq!(scope_from_state(Some("active")), None);
-        assert_eq!(scope_from_state(None), None);
     }
 
     #[test]

@@ -80,6 +80,27 @@ const _: () = assert!(
     "the load budget must allow many polls"
 );
 
+/// The notice over a read the row cap cut short. When the server stopped the
+/// statement there, says what that cost: cancelling a statement undoes all of
+/// it, rows before the cap included, and the check that allowed it looks only
+/// for table writes — a session setting or a notification the statement made
+/// is undone without one (measured, `postgres::knows_whether_written`).
+fn truncation_notice(rest_cancelled: bool) -> String {
+    let notice = format!(
+        "Result truncated — showing the first {MAX_QUERY_ROWS} rows to keep memory bounded. \
+         Add a LIMIT or a WHERE clause to narrow it."
+    );
+    if rest_cancelled {
+        format!(
+            "{notice} The rest was cancelled at the row cap, which undid everything the \
+             statement did. Only a statement that had written no table rows is cancelled; \
+             settings or notifications it made are undone too."
+        )
+    } else {
+        notice
+    }
+}
+
 /// The bundle's name for a dialect (its `create`/`updateSchema` argument;
 /// anything unrecognized falls back to SQLite there).
 ///
@@ -87,21 +108,6 @@ const _: () = assert!(
 /// it: a `dialect_name: &str` next to a `dialect: Dialect` is two arguments
 /// that must agree with nothing enforcing it, and a mismatch would hand the
 /// editor one engine's completions under another's grammar.
-/// The notice over a read the row cap cut short. When the server stopped the
-/// statement there, says so: whatever the rows past the cap would have
-/// computed — or written — was not.
-fn truncation_notice(rest_cancelled: bool) -> String {
-    let notice = format!(
-        "Result truncated — showing the first {MAX_QUERY_ROWS} rows to keep memory bounded. \
-         Add a LIMIT or a WHERE clause to narrow it."
-    );
-    if rest_cancelled {
-        format!("{notice} The rest of the query was cancelled at the row cap.")
-    } else {
-        notice
-    }
-}
-
 fn dialect_name(dialect: Dialect) -> &'static str {
     match dialect {
         Dialect::Postgres => "postgres",
@@ -1349,8 +1355,12 @@ mod tests {
     #[test]
     fn a_read_stopped_at_the_row_cap_says_its_rest_was_cancelled() {
         assert!(!truncation_notice(false).contains("cancelled"));
-        assert!(truncation_notice(true)
-            .ends_with("The rest of the query was cancelled at the row cap."));
+        let cancelled = truncation_notice(true);
+        assert!(cancelled.contains("The rest was cancelled at the row cap"));
+        // What a cancel costs, as the user decided it should be said: the
+        // whole statement undone, and a check that looks at table writes only.
+        assert!(cancelled.contains("undid everything the statement did"));
+        assert!(cancelled.contains("settings or notifications it made are undone too"));
         assert!(truncation_notice(true).starts_with(&truncation_notice(false)));
     }
     use crate::db::Internal;

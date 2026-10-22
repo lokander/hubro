@@ -436,3 +436,89 @@ where
         .map(|name| ColumnInfo { name })
         .collect();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A server error with a SQLSTATE, as the driver hands one over.
+    #[derive(Debug)]
+    struct ServerError(&'static str);
+
+    impl std::fmt::Display for ServerError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "server error {}", self.0)
+        }
+    }
+
+    impl std::error::Error for ServerError {}
+
+    impl sqlx::error::DatabaseError for ServerError {
+        fn message(&self) -> &str {
+            "server error"
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.0.into())
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    /// The rest of a result: `rows` rows, then `end` — `None` for the
+    /// statement finishing, or the SQLSTATE it fails with.
+    fn rest(
+        rows: usize,
+        end: Option<&'static str>,
+    ) -> impl Stream<Item = Result<(), sqlx::Error>> + Unpin {
+        let rows = std::iter::repeat_with(|| Ok(())).take(rows);
+        let end = end.map(|code| Err(sqlx::Error::Database(Box::new(ServerError(code)))));
+        futures_util::stream::iter(rows.chain(end))
+    }
+
+    fn read(rows: usize, end: Option<&'static str>, how: Rest) -> Result<bool, DbError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(read_rest(&mut rest(rows, end), how, &|e| {
+            DbError::Query(e.to_string())
+        }))
+    }
+
+    #[test]
+    fn a_cancel_is_reported_only_when_the_server_says_the_statement_was_cancelled() {
+        // The cancel landed: the statement ended cancelled.
+        assert_eq!(
+            read(3, Some(QUERY_CANCELED), Rest::Cancelled).ok(),
+            Some(true)
+        );
+        // The cancel was taken but the statement finished first: nothing was
+        // cancelled, and the read is reported as run to its end.
+        assert_eq!(read(3, None, Rest::Cancelled).ok(), Some(false));
+        // Any other failure is the statement's own.
+        assert!(read(3, Some("23505"), Rest::Cancelled).is_err());
+    }
+
+    #[test]
+    fn a_rest_read_to_its_end_reports_the_statements_failure() {
+        assert_eq!(read(3, None, Rest::Read).ok(), Some(false));
+        // A unique violation past the cap fails the read, rather than the
+        // connection's next question or nothing at all.
+        assert!(read(3, Some("23505"), Rest::Read).is_err());
+        // Without a cancel of hubro's, a cancellation is someone else's — a
+        // `statement_timeout`, say — and is an error like any other.
+        assert!(read(3, Some(QUERY_CANCELED), Rest::Read).is_err());
+        // Left unread: nothing is read, so nothing is reported.
+        assert_eq!(read(3, Some("23505"), Rest::Leave).ok(), Some(false));
+    }
+}
