@@ -79,6 +79,39 @@ pub(super) fn apply_grid_move(
     }
 }
 
+/// What the grid does with keyboard focus when its editors' open state is
+/// (re)read — see [`grid_refocus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GridRefocus {
+    /// Focus the grid container unconditionally.
+    Take,
+    /// Focus the grid container only if focus is nowhere else on purpose:
+    /// on the page body (the editor's input that held it is gone) or already
+    /// inside the grid.
+    Reclaim,
+    /// Leave focus where it is.
+    Leave,
+}
+
+/// Whether the grid takes keyboard focus, given whether an editor (the grid's
+/// or the detail panel's) was open on the previous read — `None` on the first
+/// read, at mount — and whether one is open now.
+///
+/// Decided on the edge rather than the level: the signals are re-read on
+/// every write, and a reset writes `None` over `None` after every page, sort,
+/// filter and refresh, none of which may move focus. On mount the grid takes
+/// focus outright, so a table opened from the sidebar answers the arrow keys
+/// at once; when an editor closes it only reclaims focus, because a click
+/// elsewhere (the filter box) is itself what closed the editor.
+pub(super) fn grid_refocus(was_open: Option<bool>, open: bool) -> GridRefocus {
+    match (was_open, open) {
+        (_, true) => GridRefocus::Leave,
+        (None, false) => GridRefocus::Take,
+        (Some(true), false) => GridRefocus::Reclaim,
+        (Some(false), false) => GridRefocus::Leave,
+    }
+}
+
 /// The half-open range of row indices to render for a scroll position:
 /// windowed rendering keeps only these rows in the DOM. `first` is
 /// the row at the top of the viewport (`scroll_top / row_height`); the window
@@ -116,10 +149,31 @@ pub(super) fn compute_visible_range(
 /// container's key handler to move the focus ring and open the editor without
 /// threading render-time borrows into the `'static` closure. Built by a memo
 /// from the same fetched page + stage the grid renders.
+///
+/// The pending inserts — the phantom rows under the fetched ones — are here
+/// too, but only for the focus ring: arrows and clicks reach them and Enter
+/// opens their editor. They are deliberately *not* rows of the selection:
+/// copy, the selection statistics and the row detail panel all read `rows`
+/// alone, because a phantom row has no values to read — a cell left to the
+/// database shows "default", which is not a value — and the panel edits a
+/// fetched row by its locator, which a phantom row does not have.
+/// [`selection_of`] and [`select_to`] are where that line is drawn.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(super) struct GridNav {
     pub(super) headers: Vec<String>,
     pub(super) rows: Vec<GridNavRow>,
+    /// The pending inserts, in render order, below `rows`: focus row
+    /// `rows.len() + i` is `inserts[i]`.
+    pub(super) inserts: Vec<GridNavInsert>,
+}
+
+/// A pending insert as the focus ring sees it: the row key its editor opens
+/// under ([`PendingInsert::row_key`]) and, per column, whether that cell
+/// opens one (blob and generated cells stay "default", as the row renders).
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct GridNavInsert {
+    pub(super) key: String,
+    pub(super) editable: Vec<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -184,12 +238,84 @@ impl GridNav {
                     .collect(),
             })
             .collect();
-        GridNav { headers, rows }
+        GridNav {
+            headers,
+            rows,
+            inserts: Vec::new(),
+        }
     }
 
-    /// (rows on the page, columns); a zero in either means nothing to focus.
+    /// This snapshot with `inserts` as its phantom rows, each column's
+    /// editability resolved the way [`InsertRow`] renders it.
+    pub(super) fn with_inserts(
+        mut self,
+        inserts: &[PendingInsert],
+        column_kinds: &HashMap<String, (EditorKind, bool)>,
+    ) -> Self {
+        self.inserts = inserts
+            .iter()
+            .map(|insert| GridNavInsert {
+                key: insert.row_key(),
+                editable: self
+                    .headers
+                    .iter()
+                    .map(|column| !column_kind(column, column_kinds).0.is_read_only())
+                    .collect(),
+            })
+            .collect();
+        self
+    }
+
+    /// (fetched rows on the page, columns): the extent of the selection, copy
+    /// and the row detail panel. A zero in either means nothing to select.
     pub(super) fn dims(&self) -> (usize, usize) {
         (self.rows.len(), self.headers.len())
+    }
+
+    /// (fetched rows plus pending inserts, columns): the extent the focus
+    /// ring moves over.
+    pub(super) fn focus_dims(&self) -> (usize, usize) {
+        (self.rows.len() + self.inserts.len(), self.headers.len())
+    }
+
+    /// The pending insert at focus row `row`, if that row is one.
+    pub(super) fn insert_at(&self, row: usize) -> Option<&GridNavInsert> {
+        row.checked_sub(self.rows.len())
+            .and_then(|i| self.inserts.get(i))
+    }
+}
+
+/// The cell selection for a focus ring at `focus` with `anchor` pinned, on a
+/// page of `fetched_rows` fetched rows: `None` while the focus is on a pending
+/// insert, which the selection never covers (see [`GridNav`]).
+pub(super) fn selection_of(
+    focus: Option<(usize, usize)>,
+    anchor: Option<(usize, usize)>,
+    fetched_rows: usize,
+) -> Option<Selection> {
+    let focus = focus.filter(|&(row, _)| row < fetched_rows)?;
+    Some(Selection {
+        anchor: anchor.unwrap_or(focus),
+        focus,
+    })
+}
+
+/// Where a move or click to `next` leaves the selection: `(anchor, focus)`.
+/// Shift extends `current` only while both ends stay on fetched rows; a move
+/// onto, or from, a pending insert collapses to the one cell instead, so a
+/// rectangle never reaches a phantom row.
+pub(super) fn select_to(
+    current: Selection,
+    next: (usize, usize),
+    shift: bool,
+    fetched_rows: usize,
+) -> (Option<(usize, usize)>, (usize, usize)) {
+    let on_fetched = |cell: (usize, usize)| cell.0 < fetched_rows;
+    if shift && on_fetched(current.anchor) && on_fetched(current.focus) && on_fetched(next) {
+        let moved = current.extended_to(next);
+        (Some(moved.anchor), moved.focus)
+    } else {
+        (None, next)
     }
 }
 
@@ -348,5 +474,111 @@ mod tests {
         let (start, end) = compute_visible_range(99_999.0, 600.0, 33.0, 40, 8);
         assert_eq!(end, 40);
         assert!(start <= end);
+    }
+
+    /// The two-row fetched page of `grid_nav_reports_dims_and_cell_editability`
+    /// with two pending inserts under it; `title` is a blob column, so an
+    /// insert can edit `id` but not `title`.
+    fn nav_with_inserts() -> GridNav {
+        let kinds: HashMap<String, (EditorKind, bool)> = [
+            ("id".to_string(), (EditorKind::Text, false)),
+            ("title".to_string(), (EditorKind::Blob, true)),
+        ]
+        .into_iter()
+        .collect();
+        let result = two_column_result();
+        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), None, true);
+        let mut stage = TableStage::default();
+        stage.add_insert();
+        stage.add_insert();
+        GridNav::build(vec!["id".into(), "title".into()], &rows, &kinds)
+            .with_inserts(stage.inserts(), &kinds)
+    }
+
+    #[test]
+    fn pending_inserts_extend_the_focus_ring_but_not_the_selection() {
+        let nav = nav_with_inserts();
+        assert_eq!(nav.dims(), (2, 2), "the selection's extent: fetched rows");
+        assert_eq!(
+            nav.focus_dims(),
+            (4, 2),
+            "the focus ring's: and the inserts"
+        );
+        assert_eq!(nav.insert_at(1), None, "row 1 is fetched");
+        let first = nav.insert_at(2).expect("row 2 is the first insert");
+        assert!(first.key.starts_with("insert:"));
+        assert_eq!(first.editable, vec![true, false], "a blob stays default");
+        assert_ne!(nav.insert_at(3).map(|i| &i.key), Some(&first.key));
+        assert_eq!(nav.insert_at(4), None);
+        // Down from the last fetched row reaches the first insert, and stops
+        // at the last one.
+        let (rows, cols) = nav.focus_dims();
+        assert_eq!(
+            apply_grid_move((1, 0), GridMove::Down, rows, cols),
+            FocusOutcome::Cell((2, 0))
+        );
+        assert_eq!(
+            apply_grid_move((3, 0), GridMove::Down, rows, cols),
+            FocusOutcome::Cell((3, 0))
+        );
+    }
+
+    #[test]
+    fn no_selection_covers_a_pending_insert() {
+        assert_eq!(
+            selection_of(Some((1, 1)), Some((0, 0)), 2),
+            Some(Selection {
+                anchor: (0, 0),
+                focus: (1, 1)
+            })
+        );
+        assert_eq!(
+            selection_of(Some((1, 1)), None, 2),
+            Some(Selection::single((1, 1)))
+        );
+        assert_eq!(selection_of(Some((2, 0)), None, 2), None, "on an insert");
+        assert_eq!(selection_of(None, None, 2), None);
+    }
+
+    #[test]
+    fn shift_extends_only_between_fetched_rows() {
+        let at = |cell| Selection::single(cell);
+        // Fetched to fetched: extends, anchored where it started.
+        assert_eq!(
+            select_to(at((0, 0)), (1, 1), true, 2),
+            (Some((0, 0)), (1, 1))
+        );
+        // Without Shift: collapses.
+        assert_eq!(select_to(at((0, 0)), (1, 1), false, 2), (None, (1, 1)));
+        // Onto an insert, from an insert, or from a rectangle anchored on
+        // one: collapses to the cell instead.
+        assert_eq!(select_to(at((1, 0)), (2, 0), true, 2), (None, (2, 0)));
+        assert_eq!(select_to(at((2, 0)), (1, 0), true, 2), (None, (1, 0)));
+        let reaching = Selection {
+            anchor: (2, 0),
+            focus: (1, 0),
+        };
+        assert_eq!(select_to(reaching, (0, 0), true, 2), (None, (0, 0)));
+    }
+
+    #[test]
+    fn the_grid_takes_focus_on_mount_and_reclaims_it_when_an_editor_closes() {
+        assert_eq!(grid_refocus(None, false), GridRefocus::Take, "mount");
+        assert_eq!(grid_refocus(None, true), GridRefocus::Leave);
+        assert_eq!(
+            grid_refocus(Some(true), false),
+            GridRefocus::Reclaim,
+            "editor closed"
+        );
+        assert_eq!(
+            grid_refocus(Some(false), true),
+            GridRefocus::Leave,
+            "editor opened"
+        );
+        assert_eq!(grid_refocus(Some(true), true), GridRefocus::Leave);
+        // The reset after a page, sort, filter or refresh writes `None` over
+        // `None`: that must not move focus, or Enter in the filter box hands
+        // the next keystroke to the grid.
+        assert_eq!(grid_refocus(Some(false), false), GridRefocus::Leave);
     }
 }

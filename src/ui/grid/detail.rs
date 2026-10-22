@@ -232,6 +232,10 @@ pub(super) fn RowDetailPanel(
     /// this prop stays pointer-comparable while the grid re-renders around it
     /// — the panel only rebuilds when the focused row changes.
     detail: Option<Shared<RowDetail>>,
+    /// Whether the grid's focus is on a pending insert, which the panel does
+    /// not show (see [`GridNav`]) — so `detail` is `None` for that reason
+    /// rather than an empty page.
+    on_pending_insert: bool,
     width: f64,
     dialect: Dialect,
     /// Why editing is unavailable — the grid's sentence, from the grid's
@@ -332,7 +336,11 @@ pub(super) fn RowDetailPanel(
                     },
                     None => rsx! {
                         p { class: "p-3 text-xs text-slate-500 dark:text-slate-400",
-                            "No row to show — this page is empty."
+                            if on_pending_insert {
+                                "A new row has no saved values to show yet — fill it in in the grid."
+                            } else {
+                                "No row to show — this page is empty."
+                            }
                         }
                     },
                 }

@@ -816,6 +816,14 @@ pub(super) fn InsertRow(
     /// whenever inserts are possible; this keeps the phantom row aligned).
     lead_cell: bool,
     editing: Signal<Option<ActiveEdit>>,
+    /// This row's focus-ring row: the fetched rows' count plus its position
+    /// among the inserts (see [`GridNav`]).
+    row_index: usize,
+    /// The keyboard-focused column in this row, or `None` when the focus
+    /// ring is elsewhere.
+    focused_col: Option<usize>,
+    /// A click on a cell: `(row, column, shift held)`.
+    on_select_cell: EventHandler<(usize, usize, bool)>,
 ) -> Element {
     let state = use_context::<AppState>();
     let insert_id = insert.id();
@@ -853,9 +861,13 @@ pub(super) fn InsertRow(
                     }
                 }
             }
-            for (column , kind , nullable) in columns {
+            for (col_index , (column , kind , nullable)) in columns.into_iter().enumerate() {
                 InsertCellSlot {
                     key: "{column}",
+                    focused: focused_col == Some(col_index),
+                    row_index,
+                    col_index,
+                    on_select_cell,
                     id,
                     table: table.clone(),
                     insert_id,
@@ -900,6 +912,12 @@ pub(super) fn InsertCellSlot(
     dialect: Dialect,
     editable_columns: Shared<Vec<String>>,
     mut editing: Signal<Option<ActiveEdit>>,
+    /// Whether this cell holds the grid's keyboard focus ring.
+    focused: bool,
+    /// This cell's focus-ring coordinates, for the click handler.
+    row_index: usize,
+    col_index: usize,
+    on_select_cell: EventHandler<(usize, usize, bool)>,
 ) -> Element {
     let state = use_context::<AppState>();
     let editable = !kind.is_read_only();
@@ -948,7 +966,6 @@ pub(super) fn InsertCellSlot(
                 draft: None,
             }));
         };
-        let mut open_on_enter = activate.clone();
         let (display, text_class) = match &override_value {
             // Not overridden: the database decides (default / serial /
             // identity / NULL).
@@ -982,19 +999,27 @@ pub(super) fn InsertCellSlot(
         } else {
             ""
         };
-        let class = format!("px-3 py-1 {text_class}{dirty_tint}{missing_ring}");
+        // The grid's focus ring, as on a fetched cell — it outranks the
+        // missing-value ring while it is here.
+        let ring = if focused {
+            " ring-2 ring-inset ring-sky-500 dark:ring-sky-400"
+        } else {
+            missing_ring
+        };
+        let class = format!("px-3 py-1 {text_class}{dirty_tint}{ring}");
         rsx! {
             td {
                 class,
-                tabindex: if editable { "0" },
+                id: if focused { "dv-focused-cell" },
+                // No tab stop and no Enter handler of its own: the cell is
+                // reached by the grid's focus ring, and Enter on it is the
+                // grid's (`enter_action`), as for every other cell.
+                onclick: move |evt: MouseEvent| {
+                    on_select_cell.call((row_index, col_index, evt.modifiers().shift()));
+                },
                 ondoubleclick: move |_| {
                     if editable {
                         activate();
-                    }
-                },
-                onkeydown: move |evt| {
-                    if editable && evt.key() == Key::Enter {
-                        open_on_enter();
                     }
                 },
                 div { class: "max-w-md truncate", title: "{tooltip}", "{display}" }

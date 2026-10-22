@@ -44,6 +44,8 @@ const GLOBAL_KEYS_JS: &str = r#"
     if (el.isContentEditable) return true;
     return !!(el.closest && el.closest('.cm-editor'));
   };
+  // Ctrl or Cmd: the rule every Ctrl shortcut follows (see `accel_held`).
+  const accel = (e) => e.ctrlKey || e.metaKey;
   const tableButtons = () => Array.from(document.querySelectorAll('.dv-table-btn'));
   window.addEventListener('keydown', (e) => {
     const el = document.activeElement;
@@ -68,15 +70,15 @@ const GLOBAL_KEYS_JS: &str = r#"
     // Ctrl+F focuses the schema sidebar's filter and selects what
     // is already there, so a second search replaces the first by typing.
     // preventDefault also suppresses the webview's own find-in-page.
-    if (e.ctrlKey && (e.key === 'f' || e.key === 'F')) {
+    if (accel(e) && (e.key === 'f' || e.key === 'F')) {
       const f = document.getElementById('dv-schema-filter');
       if (f) { e.preventDefault(); f.focus(); f.select(); }
       return;
     }
-    if (e.ctrlKey && (e.key === 'e' || e.key === 'E')) { e.preventDefault(); dioxus.send('pane'); return; }
+    if (accel(e) && (e.key === 'e' || e.key === 'E')) { e.preventDefault(); dioxus.send('pane'); return; }
     // Ctrl+D docks/undocks the row detail panel beside the grid.
-    if (e.ctrlKey && (e.key === 'd' || e.key === 'D')) { e.preventDefault(); dioxus.send('rowdetail'); return; }
-    if (e.ctrlKey && (e.key === 'b' || e.key === 'B')) {
+    if (accel(e) && (e.key === 'd' || e.key === 'D')) { e.preventDefault(); dioxus.send('rowdetail'); return; }
+    if (accel(e) && (e.key === 'b' || e.key === 'B')) {
       e.preventDefault();
       const btns = tableButtons();
       const cur = btns.find((b) => b.getAttribute('data-selected') === 'true') || btns[0];
@@ -86,6 +88,24 @@ const GLOBAL_KEYS_JS: &str = r#"
   });
 })();
 "#;
+
+/// Whether a key event's modifiers count as "Ctrl" for the app's shortcuts:
+/// Ctrl or Cmd (⌘), on every platform.
+///
+/// One rule rather than one per OS: a macOS user reaches for Cmd and everyone
+/// else for Ctrl, and neither combination means anything else to the app.
+/// Elsewhere Cmd is the Super/Windows key, which the desktop usually keeps for
+/// itself, so accepting it there costs nothing. [`GLOBAL_KEYS_JS`]'s `accel`
+/// is the same rule for the window-level shortcuts, and the cheatsheet states
+/// it. The SQL editor is the one exception: CodeMirror binds Run to Ctrl+Enter,
+/// or Cmd+Enter on macOS.
+pub(crate) fn accel_held(modifiers: Modifiers) -> bool {
+    modifiers.ctrl() || modifiers.meta()
+}
+
+/// The cheatsheet's statement of [`accel_held`]'s rule.
+const ACCEL_NOTE: &str =
+    "Ctrl also means ⌘ Cmd: every Ctrl shortcut takes either, except the SQL editor's.";
 
 /// Top-level layout: tab bar over the active view.
 #[component]
@@ -495,8 +515,11 @@ fn Cheatsheet() -> Element {
                         ShortcutRow { keys: "Double-click", desc: "Edit a cell with the mouse" }
                     }
                     ShortcutGroup { title: "SQL editor",
-                        ShortcutRow { keys: "Ctrl+Enter", desc: "Run the buffer or selection" }
+                        ShortcutRow { keys: "Ctrl+Enter", desc: "Run the buffer or selection (⌘+Enter on macOS)" }
                     }
+                }
+                p { class: "mt-4 text-xs text-slate-500 dark:text-slate-400",
+                    "{ACCEL_NOTE}"
                 }
             }
         }
@@ -716,6 +739,56 @@ fn PaneButton(
             },
             onclick: move |_| state.set_pane(id, target),
             "{label}"
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_shortcut_takes_ctrl_or_cmd() {
+        assert!(accel_held(Modifiers::CONTROL));
+        assert!(accel_held(Modifiers::META));
+        assert!(accel_held(Modifiers::CONTROL | Modifiers::SHIFT));
+        assert!(!accel_held(Modifiers::SHIFT));
+        assert!(!accel_held(Modifiers::ALT));
+        assert!(!accel_held(Modifiers::empty()));
+    }
+
+    /// The window-level shortcuts follow the same rule as [`accel_held`]:
+    /// every one reads its modifier through `accel`, and `accel` takes Ctrl
+    /// or Cmd. Before, they read `e.ctrlKey` alone, so on macOS Cmd+C copied
+    /// in the grid while Cmd+D did nothing.
+    #[test]
+    fn every_window_shortcut_takes_ctrl_or_cmd() {
+        // Code only — a comment naming `e.ctrlKey` must not satisfy, or
+        // trip, anything here — with whitespace collapsed so a reflow is not
+        // a failure.
+        let code: Vec<String> = GLOBAL_KEYS_JS
+            .lines()
+            .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|line| !line.starts_with("//"))
+            .collect();
+        let rule = "const accel = (e) => e.ctrlKey || e.metaKey;";
+        assert_eq!(
+            code.iter().filter(|line| *line == rule).count(),
+            1,
+            "the rule, as written"
+        );
+        for line in code.iter().filter(|line| *line != rule) {
+            assert!(
+                !line.contains("ctrlKey") && !line.contains("metaKey"),
+                "a shortcut reads a modifier directly instead of through `accel`: {line}"
+            );
+        }
+        for key in ['f', 'e', 'd', 'b'] {
+            let gate = format!("if (accel(e) && (e.key === '{key}' ||");
+            assert!(
+                code.iter().any(|line| line.contains(&gate)),
+                "Ctrl+{key} is not gated on `accel`"
+            );
         }
     }
 }
