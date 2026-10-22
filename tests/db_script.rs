@@ -52,6 +52,8 @@ async fn sqlite_execute_reports_rows_affected() {
         2
     );
     assert_eq!(pool.execute("DELETE FROM t WHERE a = 1").await.unwrap(), 1);
+    // Not the DELETE's count again: a statement that changes no row reports 0.
+    assert_eq!(pool.execute("CREATE TABLE u (a)").await.unwrap(), 0);
     // Errors surface as query errors, not panics.
     assert!(matches!(
         pool.execute("UPDATE nope SET a = 1").await,
@@ -1171,5 +1173,79 @@ async fn postgres_capped_read_with_a_write_the_gate_cannot_see_keeps_it() {
         .await
         .unwrap();
     pool.execute("DROP TABLE capped_side").await.unwrap();
+    pool.close().await;
+}
+
+/// SQLite's driver count is `sqlite3_changes()`, which only an `INSERT`,
+/// `UPDATE` or `DELETE` sets, so every other statement used to repeat the last
+/// write's count: here `BEGIN` reported the 2 of the `INSERT` before it,
+/// `ROLLBACK` the 1 of the one inside, and the DDL and `SAVEPOINT` the same.
+/// Each now reports 0, and the writes keep their own counts — the trigger's
+/// two extra rows left out of the `INSERT`'s, a write that matched nothing
+/// reporting 0 rather than the count before it.
+#[tokio::test]
+async fn sqlite_script_reports_no_rows_for_statements_that_change_none() {
+    let fixture = FixtureDb::with_sql(
+        "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT); \
+         CREATE TABLE log (x); \
+         CREATE TRIGGER tr AFTER INSERT ON t \
+         BEGIN INSERT INTO log VALUES (1); INSERT INTO log VALUES (2); END;",
+    )
+    .await;
+    let pool = fixture.open().await;
+
+    // Both paths a script runs on: one the script's own transaction steers,
+    // and one hubro wraps.
+    for (script, expected) in [
+        (
+            "INSERT INTO t (b) VALUES ('a'), ('b'); \
+             BEGIN; \
+             INSERT INTO t (b) VALUES ('c'); \
+             SAVEPOINT s; \
+             RELEASE s; \
+             ROLLBACK",
+            vec![
+                ("INSERT", 2),
+                ("BEGIN", 0),
+                ("INSERT", 1),
+                ("SAVEPOINT", 0),
+                ("RELEASE", 0),
+                ("ROLLBACK", 0),
+            ],
+        ),
+        (
+            "DELETE FROM log; \
+             CREATE TABLE u (a); \
+             CREATE INDEX i ON t (b); \
+             UPDATE t SET b = 'z' WHERE a = -1; \
+             DROP TABLE u",
+            vec![
+                ("DELETE", 4),
+                ("CREATE TABLE", 0),
+                ("CREATE INDEX", 0),
+                ("UPDATE", 0),
+                ("DROP", 0),
+            ],
+        ),
+    ] {
+        let (results, outcome) = collect_script(&pool, script).await;
+        outcome.unwrap();
+        let got: Vec<_> = results
+            .iter()
+            .map(|r| match r.outcome {
+                StatementOutcome::Affected(n) => n,
+                ref other => panic!("{}: expected a count, got {other:?}", r.preview),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            expected.iter().map(|(_, n)| *n).collect::<Vec<u64>>(),
+            "{script}"
+        );
+        for (result, (lead, _)) in results.iter().zip(&expected) {
+            assert!(result.preview.starts_with(lead), "{}", result.preview);
+        }
+    }
+
     pool.close().await;
 }
