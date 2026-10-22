@@ -102,9 +102,7 @@ const GLOBAL_KEYS_JS: &str = r#"
 /// unsaved-changes guard), and a held key's repeat must never be that press —
 /// a 1.5 s held Ctrl+E used to discard the edits.
 fn pane_shortcut(msg: &str) -> Gesture {
-    Gesture {
-        repeat: msg == "pane-repeat",
-    }
+    Gesture::key(msg == "pane-repeat")
 }
 
 /// Whether a key event's modifiers count as "Ctrl" for the app's shortcuts:
@@ -795,8 +793,8 @@ mod tests {
                 .any(|line| line.contains("dioxus.send(e.repeat ? 'pane-repeat' : 'pane')")),
             "the listener no longer says a Ctrl+E is held"
         );
-        assert!(pane_shortcut("pane-repeat").repeat);
-        assert!(!pane_shortcut("pane").repeat);
+        assert!(pane_shortcut("pane-repeat").is_repeat());
+        assert!(!pane_shortcut("pane").is_repeat());
     }
 
     /// The window listener stands aside while a modal overlay is open, for

@@ -3014,7 +3014,7 @@ mod tests {
             SavePress::Wait
         );
         assert_eq!(
-            save_press(1, Some(&settled), Gesture { repeat: true }, &current),
+            save_press(1, Some(&settled), Gesture::key(true), &current),
             SavePress::Wait
         );
         assert_eq!(
