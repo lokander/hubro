@@ -10,6 +10,7 @@ use super::filter::{
 use super::js::focus_input_end_next_frame;
 use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState, KindBadge};
 use super::state::{AppState, SchemaLoad, TableRef};
+use super::text_field::TextInput;
 
 /// Puts the caret back in the filter box after one of the buttons inside it
 /// was clicked. Without this the button keeps focus and the next keystroke
@@ -172,7 +173,7 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
                         span { class: "shrink-0 text-slate-400 dark:text-slate-600",
                             Search { size: 12 }
                         }
-                        input {
+                        TextInput {
                             // `dv-schema-filter` is the target of the Ctrl+F
                             // focus shortcut; the grid's own filter
                             // keeps `/` and `dv-filter`.
@@ -180,8 +181,8 @@ pub fn SchemaSidebar(id: ConnectionId) -> Element {
                             class: "min-w-0 flex-1 bg-transparent font-mono text-xs text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600 focus:outline-none",
                             placeholder: if columns_mode { "column…" } else { "table…" },
                             title: "Filter the list (Ctrl+F). Esc clears; “:col name” searches column names.",
-                            value: "{raw}",
-                            oninput: move |evt| filter.set(evt.value()),
+                            text: "{raw}",
+                            oninput: move |evt: FormEvent| filter.set(evt.value()),
                             // Handled here rather than in the window listener,
                             // which deliberately ignores keys typed into an
                             // input (see GLOBAL_KEYS_JS in shell.rs).

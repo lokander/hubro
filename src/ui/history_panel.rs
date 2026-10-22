@@ -19,6 +19,7 @@ use crate::history::{HistoryEntry, HISTORY_CAP};
 use super::js::copy_to_clipboard;
 use super::notice::{Banner, BannerKind, LoadingLine};
 use super::state::AppState;
+use super::text_field::TextInput;
 
 /// Cap on entries the history panel fetches per query. Matches the store's
 /// retention cap so every persisted entry is reachable by scrolling, not only
@@ -65,11 +66,11 @@ pub(super) fn HistoryPanel(id: ConnectionId, buffer: u64) -> Element {
     rsx! {
         aside { class: "flex w-80 shrink-0 flex-col border-l border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/50",
             div { class: "border-b border-slate-200 dark:border-slate-800 p-2",
-                input {
+                TextInput {
                     class: "w-full rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 text-xs text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600",
                     placeholder: "Search history (Enter)",
-                    value: "{search_input}",
-                    oninput: move |evt| {
+                    text: "{search_input}",
+                    oninput: move |evt: FormEvent| {
                         let value = evt.value();
                         // Clearing the box resets the filter immediately.
                         if value.trim().is_empty() {

@@ -138,6 +138,7 @@ fn next_frame(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::test_dom::ui_sources;
 
     #[test]
     fn js_string_escapes_what_would_break_out_of_a_literal() {
@@ -209,41 +210,6 @@ mod tests {
              in_target: !!(el && a && el.contains(a)), \
              modal_open: !!document.querySelector('[data-dv-modal]') }); });"
         );
-    }
-
-    /// Every Rust file under `src/ui`, walked at test time, as
-    /// (path components below `src/ui`, source).
-    fn ui_sources() -> Vec<(Vec<String>, String)> {
-        fn walk(dir: &std::path::Path, below: &[String], out: &mut Vec<(Vec<String>, String)>) {
-            let mut entries: Vec<_> = std::fs::read_dir(dir)
-                .unwrap_or_else(|err| panic!("{}: {err}", dir.display()))
-                .map(|entry| entry.expect("a readable directory entry").path())
-                .collect();
-            entries.sort();
-            for path in entries {
-                let name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .expect("a UTF-8 file name")
-                    .to_string();
-                let mut here = below.to_vec();
-                here.push(name);
-                if path.is_dir() {
-                    walk(&path, &here, out);
-                } else if path.extension().is_some_and(|ext| ext == "rs") {
-                    let source = std::fs::read_to_string(&path)
-                        .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
-                    out.push((here, source));
-                }
-            }
-        }
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("ui");
-        let mut out = Vec::new();
-        walk(&root, &[], &mut out);
-        assert!(out.len() > 10, "src/ui was not found: {}", root.display());
-        out
     }
 
     /// `source` with comment lines dropped and each line's whitespace

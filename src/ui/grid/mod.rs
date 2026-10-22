@@ -63,6 +63,7 @@ use super::stage::{required_insert_columns, PendingInsert, TableStage};
 use super::state::{
     find_table_meta, fk_jump_target, grid_export_line, AppState, ImportStatus, TableRef,
 };
+use super::text_field::TextInput;
 
 const PAGE_SIZE: u32 = 100;
 
@@ -1849,14 +1850,14 @@ fn GridToolbar(
                 option { value: "contains", "contains" }
                 option { value: "equals", "equals" }
             }
-            input {
+            TextInput {
                 // `dv-filter` is the target of the `/` focus shortcut.
                 id: "dv-filter",
                 class: "w-48 rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 font-mono text-xs text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600",
                 placeholder: "filter value",
-                value: "{filter_text}",
-                oninput: move |evt| filter_text.set(evt.value()),
-                onkeydown: move |evt| {
+                text: "{filter_text}",
+                oninput: move |evt: FormEvent| filter_text.set(evt.value()),
+                onkeydown: move |evt: KeyboardEvent| {
                     if evt.key() == Key::Enter {
                         apply_filter(filter_column, filter_op, filter_text, applied_filter, page);
                     }

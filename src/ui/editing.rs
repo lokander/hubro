@@ -67,6 +67,7 @@ use crate::db::{
 pub use crate::db::{bool_checked, bool_value};
 
 use super::js::{focus_by_id_next_frame, focus_on_mount};
+use super::text_field::{TextArea, TextInput};
 
 /// Which editor a column gets, derived by [`editor_kind`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -510,35 +511,35 @@ pub fn CellEditor(
                     onblur: move |_| commit(EditNav::Stay),
                 }
             } else if multiline {
-                textarea {
+                TextArea {
                     id: "dv-cell-editor",
                     class: "{input_class} min-w-48",
                     rows: "3",
-                    value: "{text}",
+                    text: "{text}",
                     onmounted: focus_on_mount,
-                    oninput: move |evt| {
+                    oninput: move |evt: FormEvent| {
                         text.set(evt.value());
                         modified.set(true);
                         error.set(None);
                     },
                     onkeydown: on_key,
-                    onblur: move |_| commit(EditNav::Stay),
+                    onblur: move |_: FocusEvent| commit(EditNav::Stay),
                 }
             } else {
-                input {
+                TextInput {
                     r#type: "text",
                     id: "dv-cell-editor",
                     class: input_class,
-                    value: "{text}",
+                    text: "{text}",
                     placeholder: if initial.is_null() { "NULL" },
                     onmounted: focus_on_mount,
-                    oninput: move |evt| {
+                    oninput: move |evt: FormEvent| {
                         text.set(evt.value());
                         modified.set(true);
                         error.set(None);
                     },
                     onkeydown: on_key,
-                    onblur: move |_| commit(EditNav::Stay),
+                    onblur: move |_: FocusEvent| commit(EditNav::Stay),
                 }
             }
             if nullable {
