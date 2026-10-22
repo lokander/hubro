@@ -5,9 +5,9 @@ use serde_json::json;
 
 use crate::db::{
     needs_confirmation, plan_reached_cell_cap, ConnectionId, Dialect, ExportFormat,
-    OpenTransaction, PlanDisplay, PlanNode, PlanTree, Rollback, RowsAffected, StatementOutcome,
-    TableMeta, Value, EXPENSIVE_SHARE, MARKED_READ_ONLY, MAX_QUERY_ROWS, NO_DDL, NO_EXPLAIN,
-    NO_MUTATE, NO_QUERY, PLAN_CELL_CAP,
+    OpenTransaction, PlanDisplay, PlanNode, PlanTree, RestOfRead, Rollback, RowsAffected,
+    StatementOutcome, TableMeta, Value, EXPENSIVE_SHARE, MARKED_READ_ONLY, MAX_QUERY_ROWS, NO_DDL,
+    NO_EXPLAIN, NO_MUTATE, NO_QUERY, PLAN_CELL_CAP,
 };
 
 use super::history_panel::HistoryPanel;
@@ -80,24 +80,26 @@ const _: () = assert!(
     "the load budget must allow many polls"
 );
 
-/// The notice over a read the row cap cut short. When the server stopped the
-/// statement there, says what that cost: cancelling a statement undoes all of
-/// it, rows before the cap included, and the check that allowed it looks only
-/// for table writes — a session setting or a notification the statement made
-/// is undone without one (measured, `postgres::knows_whether_written`).
-fn truncation_notice(rest_cancelled: bool) -> String {
+/// The notice over a read the row cap cut short, and what became of its
+/// rest. A cancel on a writable connection says what it cost: it undoes all
+/// of the statement, rows before the cap included, and the rule that allowed
+/// it looks only for table writes — a session setting or a notification the
+/// statement made is undone without one (measured,
+/// `postgres::knows_whether_written`). A statement stopped where nothing it
+/// did could have lasted anyway (`RestOfRead::Stopped`) gets the plain line.
+fn truncation_notice(rest: RestOfRead) -> String {
     let notice = format!(
         "Result truncated — showing the first {MAX_QUERY_ROWS} rows to keep memory bounded. \
          Add a LIMIT or a WHERE clause to narrow it."
     );
-    if rest_cancelled {
-        format!(
+    match rest {
+        RestOfRead::Ran => notice,
+        RestOfRead::Stopped => format!("{notice} The rest was not run."),
+        RestOfRead::CancelledUnwritten => format!(
             "{notice} The rest was cancelled at the row cap, which undid everything the \
              statement did. Only a statement that had written no table rows is cancelled; \
              settings or notifications it made are undone too."
-        )
-    } else {
-        notice
+        ),
     }
 }
 
@@ -1058,7 +1060,7 @@ fn StatementSection(
                 div { class: "px-4 pt-2",
                     Banner {
                         kind: BannerKind::Warning,
-                        message: truncation_notice(result.rest_cancelled),
+                        message: truncation_notice(result.rest),
                     }
                 }
             }
@@ -1353,15 +1355,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_read_stopped_at_the_row_cap_says_its_rest_was_cancelled() {
-        assert!(!truncation_notice(false).contains("cancelled"));
-        let cancelled = truncation_notice(true);
+    fn a_read_stopped_at_the_row_cap_says_what_became_of_its_rest() {
+        let ran = truncation_notice(RestOfRead::Ran);
+        assert!(!ran.contains("rest"));
+        let stopped = truncation_notice(RestOfRead::Stopped);
+        assert!(stopped.starts_with(&ran));
+        assert!(stopped.ends_with("The rest was not run."));
+        // The xid rule's line, and only there: a marked connection's read and
+        // SQL Server's discarded one were not cancelled on its grounds.
+        assert!(!stopped.contains("table rows"));
+        let cancelled = truncation_notice(RestOfRead::CancelledUnwritten);
+        assert!(cancelled.starts_with(&ran));
         assert!(cancelled.contains("The rest was cancelled at the row cap"));
         // What a cancel costs, as the user decided it should be said: the
         // whole statement undone, and a check that looks at table writes only.
         assert!(cancelled.contains("undid everything the statement did"));
+        assert!(cancelled.contains("Only a statement that had written no table rows"));
         assert!(cancelled.contains("settings or notifications it made are undone too"));
-        assert!(truncation_notice(true).starts_with(&truncation_notice(false)));
     }
     use crate::db::Internal;
     use crate::db::{ColumnMeta, TableKind};
@@ -2078,7 +2088,7 @@ mod tests {
                 rows: vec![vec![Value::Integer(1)]],
             }),
             truncated: false,
-            rest_cancelled: false,
+            rest: crate::db::RestOfRead::Ran,
         })
     }
 

@@ -2559,7 +2559,7 @@ mod tests {
                 rows: vec![vec![Value::Integer(1)]],
             }),
             truncated: false,
-            rest_cancelled: false,
+            rest: crate::db::RestOfRead::Ran,
         })
     }
 

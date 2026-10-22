@@ -9,8 +9,8 @@ mod common;
 
 use common::FixtureDb;
 use hubro::db::{
-    run_script, split_statements, DbError, DbPool, OpenTransaction, Rollback, RowsAffected,
-    ScriptDone, StatementOutcome, StatementResult, Value,
+    run_script, split_statements, DbError, DbPool, OpenTransaction, RestOfRead, Rollback,
+    RowsAffected, ScriptDone, StatementOutcome, StatementResult, Value,
 };
 
 async fn pg_url() -> Option<String> {
@@ -1099,7 +1099,7 @@ async fn postgres_script_ending_in_a_capped_read_does_not_wait_for_the_rest() {
     assert!(results[0].truncated);
     // It had written nothing, so the rest was cancelled rather than read in
     // the background — and the server stopped running it.
-    assert!(results[0].rest_cancelled);
+    assert_eq!(results[0].rest, RestOfRead::CancelledUnwritten);
     assert_eq!(pg_sessions_still_reading(&pool).await, Value::Integer(0));
 
     // The same read at the end of a script inside its own transaction: the
@@ -1110,7 +1110,11 @@ async fn postgres_script_ending_in_a_capped_read_does_not_wait_for_the_rest() {
     )
     .await;
     assert!(results[2].truncated);
-    assert!(results[2].rest_cancelled, "ended with its connection");
+    assert_eq!(
+        results[2].rest,
+        RestOfRead::Stopped,
+        "ended with its connection"
+    );
     assert_eq!(
         outcome,
         Ok(ScriptDone {
@@ -1163,7 +1167,11 @@ async fn postgres_capped_read_that_has_written_nothing_is_cancelled_wherever_it_
         let (results, outcome) = collect_promptly(&pool, &script).await;
         assert_eq!(outcome, Ok(ScriptDone::default()), "{script}");
         assert!(results[read].truncated, "{script}");
-        assert!(results[read].rest_cancelled, "{script}");
+        assert_eq!(
+            results[read].rest,
+            RestOfRead::CancelledUnwritten,
+            "{script}"
+        );
         if let Some(after) = then_one {
             match &results[after].outcome {
                 StatementOutcome::Rows(rows) => {
@@ -1212,7 +1220,7 @@ async fn postgres_capped_read_after_a_write_is_read_to_its_end() {
             .iter()
             .find(|r| r.truncated)
             .unwrap_or_else(|| panic!("{script}: no read was cut short"));
-        assert!(!read.rest_cancelled, "{script}");
+        assert_eq!(read.rest, RestOfRead::Ran, "{script}");
     }
     assert_eq!(
         count(&pool, "SELECT count(*) FROM capped_before").await,
@@ -1257,7 +1265,7 @@ async fn postgres_capped_read_cancel_undoes_effects_that_take_no_xid() {
         let (results, outcome) = collect_promptly(&pool, script).await;
         assert_eq!(outcome, Ok(ScriptDone::default()), "{script}");
         assert!(
-            results[0].truncated && results[0].rest_cancelled,
+            results[0].truncated && results[0].rest == RestOfRead::CancelledUnwritten,
             "{script}"
         );
         match &results.last().unwrap().outcome {
@@ -1284,7 +1292,7 @@ async fn postgres_capped_read_cancel_undoes_effects_that_take_no_xid() {
     ] {
         let (results, outcome) = collect_promptly(&pool, script).await;
         assert_eq!(outcome, Ok(ScriptDone::default()), "{script}");
-        assert!(results[0].rest_cancelled, "{script}");
+        assert_eq!(results[0].rest, RestOfRead::CancelledUnwritten, "{script}");
         assert_eq!(notifications_delivered(&mut listener).await, 0, "{script}");
     }
     pool.close().await;
@@ -1484,7 +1492,7 @@ async fn postgres_capped_read_with_a_write_the_gate_cannot_see_keeps_it() {
     assert_eq!(outcome, Ok(ScriptDone::default()));
     assert!(results[0].truncated);
     // It had written when the cap was reached, so it was not cancelled.
-    assert!(!results[0].rest_cancelled);
+    assert_eq!(results[0].rest, RestOfRead::Ran);
     let mut kept = Value::Null;
     for _ in 0..300 {
         kept = count(&pool, "SELECT count(*) FROM capped_side").await;
@@ -1507,7 +1515,7 @@ async fn postgres_capped_read_with_a_write_the_gate_cannot_see_keeps_it() {
     )
     .await;
     assert_eq!(outcome, Ok(ScriptDone::default()));
-    assert!(results[0].truncated && !results[0].rest_cancelled);
+    assert!(results[0].truncated && results[0].rest == RestOfRead::Ran);
     assert_eq!(
         count(&pool, "SELECT count(*) FROM capped_side").await,
         Value::Integer(40_000),

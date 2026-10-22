@@ -24,9 +24,9 @@ mod common;
 use hubro::db::{
     apply_staged, detect_row_identity, mssql_url_with_password, run_script, split_statements,
     Capabilities, CheckedStatement, DbError, DbPool, Dialect, ExportFormat, Filter, Generated,
-    OpenTransaction, PageRequest, Restriction, Rollback, RowCount, RowIdentity, RowLocator,
-    RowsAffected, ScriptDone, SortDir, StagedChange, StatementOutcome, TableKind, TableMeta,
-    TypeDetail, Value, INSTEAD_OF_TRIGGER, MISSING_ROW, PREVIEW_BYTES, QUERY_CELL_CAP,
+    OpenTransaction, PageRequest, RestOfRead, Restriction, Rollback, RowCount, RowIdentity,
+    RowLocator, RowsAffected, ScriptDone, SortDir, StagedChange, StatementOutcome, TableKind,
+    TableMeta, TypeDetail, Value, INSTEAD_OF_TRIGGER, MISSING_ROW, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 async fn test_url() -> Option<String> {
@@ -2765,7 +2765,7 @@ async fn sqlserver_script_ending_in_a_capped_read_does_not_wait_for_the_rest() {
             let outcome = run_script(pool, pool.backend_capabilities(), &statements, |r| {
                 // Whether the read was cut short, and whether the editor is
                 // told its rest was stopped: discarded with its connection.
-                truncated.push((r.truncated, r.rest_cancelled))
+                truncated.push((r.truncated, r.rest))
             })
             .await;
             (truncated, outcome)
@@ -2781,7 +2781,7 @@ async fn sqlserver_script_ending_in_a_capped_read_does_not_wait_for_the_rest() {
         "{}",
         common::script_outcome(&outcome)
     );
-    assert_eq!(truncated, [(true, true)]);
+    assert_eq!(truncated, [(true, RestOfRead::Stopped)]);
 
     let (truncated, outcome) = tokio::time::timeout(
         bound,
@@ -2791,7 +2791,14 @@ async fn sqlserver_script_ending_in_a_capped_read_does_not_wait_for_the_rest() {
     )
     .await
     .expect("a capped read must not wait for the rest of its result");
-    assert_eq!(truncated, [(false, false), (false, false), (true, true)]);
+    assert_eq!(
+        truncated,
+        [
+            (false, RestOfRead::Ran),
+            (false, RestOfRead::Ran),
+            (true, RestOfRead::Stopped)
+        ]
+    );
     assert_eq!(
         outcome,
         Ok(ScriptDone {

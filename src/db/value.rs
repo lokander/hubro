@@ -136,14 +136,39 @@ pub struct QueryResult {
     pub rows: Vec<Vec<Value>>,
 }
 
+/// What became of the rest of a read the row cap cut short — what the editor
+/// says beside its "first N rows" notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RestOfRead {
+    /// Run to its end (or the read fitted under the cap).
+    #[default]
+    Ran,
+    /// Stopped where nothing it did could have lasted anyway: a marked
+    /// connection's read (the engine refuses its writes, and its transaction
+    /// is rolled back regardless), or a read ended with its connection inside
+    /// a transaction the run rolls back, or one discarded with its connection.
+    Stopped,
+    /// Cancelled on a writable connection because its transaction had
+    /// written nothing to a table — which undoes everything else the
+    /// statement did, rows before the cap included.
+    CancelledUnwritten,
+}
+
+impl RestOfRead {
+    /// Whether the server stopped the statement at the cap rather than
+    /// running it to its end.
+    pub fn stopped(self) -> bool {
+        self != RestOfRead::Ran
+    }
+}
+
 /// A bounded read: the rows kept, whether rows existed past the cap, and
-/// whether the server stopped the statement there rather than running it to
-/// its end — which the editor says beside the "first N rows" notice.
+/// what became of the rest.
 #[derive(Debug)]
 pub(crate) struct Capped {
     pub(crate) result: QueryResult,
     pub(crate) truncated: bool,
-    pub(crate) rest_cancelled: bool,
+    pub(crate) rest: RestOfRead,
 }
 
 impl From<(QueryResult, bool)> for Capped {
@@ -151,7 +176,7 @@ impl From<(QueryResult, bool)> for Capped {
         Capped {
             result,
             truncated,
-            rest_cancelled: false,
+            rest: RestOfRead::Ran,
         }
     }
 }
