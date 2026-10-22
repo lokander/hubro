@@ -137,9 +137,11 @@ pub struct Settings {
     /// Whether the schema sidebar lists the objects a backend declared
     /// internal — extension schemas and tables, child partitions.
     /// Off by default: on a Timescale database they outnumber the user's
-    /// tables roughly twenty to one. `default` + `skip_serializing_if` keep
-    /// settings files from before this flag existed deserializing and
-    /// unchanged on rewrite.
+    /// tables roughly twenty to one. A file from before this flag loads it
+    /// as off because [`interpret_settings`] defaults an absent key — the
+    /// loader reads fields itself rather than through this struct's
+    /// `Deserialize`, so the `serde(default)` here matters only to tests.
+    /// `skip_serializing_if` is what keeps such a file free of the key.
     #[serde(default, skip_serializing_if = "is_false")]
     pub show_internal_objects: bool,
 }
@@ -183,6 +185,17 @@ pub enum SettingsProblem {
 }
 
 impl SettingsProblem {
+    /// Whether, with this problem, preference changes are not saved: the
+    /// file is not one [`set_settings_key`] can edit. A bad value in a file
+    /// that parses is not such a problem — changing the preference replaces
+    /// it.
+    pub fn saves_refused(&self) -> bool {
+        match self {
+            SettingsProblem::Unreadable(_) | SettingsProblem::NotToml { .. } => true,
+            SettingsProblem::BadValues(_) => false,
+        }
+    }
+
     /// The one-line notice for the user, naming the file at `path`.
     pub fn notice(&self, path: &Path) -> String {
         let file = path.display();
@@ -552,6 +565,9 @@ mod tests {
     fn window_geometry_round_trips_in_settings() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.toml");
+        // Every field non-default — a new one too — so a key the loader
+        // misspells loads as its default and fails here
+        // (`every_setting_reads_back_under_its_own_key` checks each alone).
         let settings = Settings {
             theme: Theme::Dark,
             window: Some(WindowGeometry {
@@ -567,6 +583,62 @@ mod tests {
         };
         save_settings(&path, &settings).unwrap();
         assert_eq!(load_settings(&path), settings);
+    }
+
+    #[test]
+    fn every_setting_reads_back_under_its_own_key() {
+        let full = Settings {
+            theme: Theme::Light,
+            window: Some(WindowGeometry {
+                width: 900.0,
+                ..WindowGeometry::default()
+            }),
+            show_internal_objects: true,
+        };
+        // An exhaustive pattern, no `..`: a new field does not compile here
+        // until it is named, given a non-default value above, and counted.
+        let Settings {
+            theme,
+            window,
+            show_internal_objects,
+        } = &full;
+        const FIELDS: usize = 3;
+        assert_ne!(*theme, Theme::default());
+        assert_ne!(*window, None);
+        assert!(*show_internal_objects);
+
+        // Each key as the struct serializes it — a `serde(rename)` included —
+        // alone in a file, must be read by the loader: a key it spells
+        // differently would load as the default.
+        let toml::Value::Table(table) = toml::Value::try_from(&full).unwrap() else {
+            panic!("settings serialize as a table");
+        };
+        assert_eq!(table.len(), FIELDS, "{table:?}");
+        for (key, value) in table {
+            let text = toml::to_string(&toml::Table::from_iter([(key.clone(), value)])).unwrap();
+            let (loaded, problem) = interpret_settings(&text);
+            assert_eq!(problem, None, "{key}");
+            assert_ne!(
+                loaded,
+                Settings::default(),
+                "the loader does not read {key}"
+            );
+        }
+        assert_eq!(
+            interpret_settings(&toml::to_string(&full).unwrap()),
+            (full, None)
+        );
+    }
+
+    #[test]
+    fn only_a_file_that_cannot_be_edited_refuses_saves() {
+        assert!(SettingsProblem::Unreadable("denied".into()).saves_refused());
+        assert!(SettingsProblem::NotToml {
+            line: Some(1),
+            message: "bad".into()
+        }
+        .saves_refused());
+        assert!(!SettingsProblem::BadValues(vec!["theme".into()]).saves_refused());
     }
 
     #[test]

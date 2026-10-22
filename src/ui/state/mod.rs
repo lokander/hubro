@@ -47,7 +47,8 @@ use crate::config::{
     default_config_path, default_session_path, default_settings_path, load_session,
     load_settings_checked, plan_session_restore, save_session, save_show_internal_objects,
     save_theme, BackendKind, ConfigError, ConnectionColor, GroupError, RestoreCandidate,
-    SavedConnection, SavedList, ServerAuth, Session, SessionPane, SessionTab, Settings, Theme,
+    SavedConnection, SavedList, ServerAuth, Session, SessionPane, SessionTab, Settings,
+    SettingsProblem, Theme,
 };
 use crate::db::{
     apply_staged, build_fk_filter, explain_statement, fk_target_columns, mssql_url_target,
@@ -946,28 +947,74 @@ impl ConnectRequest {
     }
 }
 
-/// The app-wide notice about settings.toml. Raised at most once a session:
-/// a refused write repeats on every window move, so re-raising would bring
-/// back a notice the user had dismissed every second.
+/// How much a [`SettingsNotice`] matters, in increasing order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NoticeSeverity {
+    /// Some values in the file were not used, but preference changes are
+    /// saved as usual — and changing one replaces its bad value.
+    Unused,
+    /// Preference changes are not being saved: the file does not parse, or
+    /// cannot be read, or a write was refused.
+    Unsaved,
+}
+
+/// The app-wide notice about settings.toml.
+///
+/// Each severity is raised at most once a session: a refused write repeats
+/// on every window move, so re-raising it would bring back a notice the user
+/// had dismissed every second. A more severe notice does replace a lesser
+/// one, though, shown or dismissed — dismissing "theme was not understood"
+/// (writes still work) must not silence "preferences are not being saved".
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SettingsNotice {
     /// Nothing raised this session.
     #[default]
     Quiet,
     /// On screen, saying this.
-    Showing(String),
-    /// Raised and dismissed; stays dismissed.
-    Dismissed,
+    Showing(NoticeSeverity, String),
+    /// Raised and dismissed; stays dismissed unless something more severe
+    /// is raised.
+    Dismissed(NoticeSeverity),
 }
 
 impl SettingsNotice {
-    /// The notice once `message` is raised: it shows only if nothing was
-    /// raised before. A notice already showing keeps its message — the first
-    /// one is the cause, a later refused write its consequence.
-    pub fn raised(&self, message: String) -> SettingsNotice {
+    /// The notice at launch, for what loading the settings file at `path`
+    /// ran into.
+    pub fn at_startup(path: &Path, problem: Option<&SettingsProblem>) -> SettingsNotice {
+        let Some(problem) = problem else {
+            return SettingsNotice::Quiet;
+        };
+        let severity = if problem.saves_refused() {
+            NoticeSeverity::Unsaved
+        } else {
+            NoticeSeverity::Unused
+        };
+        SettingsNotice::Quiet.raised(severity, problem.notice(path))
+    }
+
+    /// The notice once `message` is raised at `severity`: it shows only if
+    /// nothing at least as severe was raised before this session. A notice
+    /// already showing at that severity keeps its message — the first one is
+    /// the cause, a later refused write its consequence.
+    pub fn raised(&self, severity: NoticeSeverity, message: String) -> SettingsNotice {
+        let current = match self {
+            SettingsNotice::Quiet => None,
+            SettingsNotice::Showing(current, _) | SettingsNotice::Dismissed(current) => {
+                Some(*current)
+            }
+        };
+        if Some(severity) > current {
+            SettingsNotice::Showing(severity, message)
+        } else {
+            self.clone()
+        }
+    }
+
+    /// The notice once the user dismisses it.
+    pub fn dismissed(&self) -> SettingsNotice {
         match self {
-            SettingsNotice::Quiet => SettingsNotice::Showing(message),
-            raised => raised.clone(),
+            SettingsNotice::Showing(severity, _) => SettingsNotice::Dismissed(*severity),
+            other => other.clone(),
         }
     }
 }
@@ -1282,10 +1329,19 @@ pub fn find_table_meta<'a>(
 impl AppState {
     /// Must be called from a component (signals need the runtime).
     pub fn new() -> Self {
+        let state = Self::loaded(default_config_path(), default_settings_path());
+        state.start_background_tasks();
+        state
+    }
+
+    /// The state built from the config files at these paths, with nothing
+    /// started: [`Self::new`] minus the startup tasks, so a test can give it
+    /// files of its own.
+    pub(crate) fn loaded(config_path: Option<PathBuf>, settings_path: Option<PathBuf>) -> Self {
         // A failed config load surfaces on the launch screen and the app
         // starts with an empty list; SavedList remembers the failure and
         // refuses to persist over the unreadable file.
-        let (saved, load_error) = match default_config_path() {
+        let (saved, load_error) = match config_path {
             Some(path) => {
                 let (list, error) = SavedList::load(&path);
                 (list, error.map(|e| e.to_string()))
@@ -1299,19 +1355,17 @@ impl AppState {
         // gets wrong (settings are non-critical and never block the app) —
         // but said, since a preference that silently does not stick reads
         // as a bug.
-        let (settings, notice) = match default_settings_path() {
+        let (settings, notice) = match settings_path {
             Some(path) => {
                 let (settings, problem) = load_settings_checked(&path);
-                (settings, problem.map(|problem| problem.notice(&path)))
+                (
+                    settings,
+                    SettingsNotice::at_startup(&path, problem.as_ref()),
+                )
             }
-            None => (Settings::default(), None),
+            None => (Settings::default(), SettingsNotice::Quiet),
         };
-        let state = Self::unstarted(saved, load_error, settings);
-        if let Some(notice) = notice {
-            state.raise_settings_notice(notice);
-        }
-        state.start_background_tasks();
-        state
+        Self::unstarted(saved, load_error, settings, notice)
     }
 
     /// The state built from already-loaded config, with nothing started:
@@ -1323,6 +1377,7 @@ impl AppState {
         saved: SavedList,
         load_error: Option<String>,
         settings: Settings,
+        settings_notice: SettingsNotice,
     ) -> Self {
         let theme = settings.theme;
         // Every signal is root-scoped, without exception.
@@ -1394,7 +1449,7 @@ impl AppState {
                 settings.show_internal_objects,
                 ScopeId::ROOT,
             ),
-            settings_notice: Signal::new_in_scope(SettingsNotice::Quiet, ScopeId::ROOT),
+            settings_notice: Signal::new_in_scope(settings_notice, ScopeId::ROOT),
             // Seeded by `restore_session` rather than here: session.toml is
             // read once, at restore, and reading it twice would be two
             // chances to disagree about what the last session was.
@@ -1634,7 +1689,9 @@ impl AppState {
 
     /// Sets the theme: updates the resolved `dark` signal immediately and
     /// persists the choice to settings.toml (best-effort — a write failure
-    /// only means the choice won't survive a restart, never an error). For
+    /// only means the choice won't survive a restart, never an error, though
+    /// the first one raises the settings notice; see
+    /// [`Self::report_settings_write`]). For
     /// `System` the resolution re-reads the OS preference in the background.
     pub fn set_theme(mut self, theme: Theme) {
         self.theme.set(theme);
@@ -1685,22 +1742,24 @@ impl AppState {
     pub fn report_settings_write(self, what: &str, result: Result<(), ConfigError>) {
         if let Err(ConfigError(err)) = result {
             eprintln!("hubro: {what} not saved: {err}");
-            self.raise_settings_notice(format!("Preferences are not being saved: {err}."));
+            let message = format!("Preferences are not being saved: {err}.");
+            self.raise_settings_notice(NoticeSeverity::Unsaved, message);
         }
     }
 
-    /// Shows `message` as the settings notice, unless one was already
-    /// raised this session (see [`SettingsNotice::raised`]).
-    fn raise_settings_notice(mut self, message: String) {
-        let next = self.settings_notice.peek().raised(message);
+    /// Shows `message` as the settings notice, unless something at least as
+    /// severe was already raised this session (see [`SettingsNotice::raised`]).
+    fn raise_settings_notice(mut self, severity: NoticeSeverity, message: String) {
+        let next = self.settings_notice.peek().raised(severity, message);
         if next != *self.settings_notice.peek() {
             self.settings_notice.set(next);
         }
     }
 
-    /// Hides the settings notice for the rest of the session.
+    /// Hides the settings notice, until something more severe is raised.
     pub fn dismiss_settings_notice(mut self) {
-        self.settings_notice.set(SettingsNotice::Dismissed);
+        let next = self.settings_notice.peek().dismissed();
+        self.settings_notice.set(next);
     }
 
     /// Marks a table as selected in one tab's sidebar. Guarded: switching
@@ -2083,23 +2142,102 @@ mod tests {
 
     #[test]
     fn the_settings_notice_is_raised_once_a_session() {
-        let first = SettingsNotice::Quiet.raised("the cause".into());
-        assert_eq!(first, SettingsNotice::Showing("the cause".into()));
+        use NoticeSeverity::{Unsaved, Unused};
+        let first = SettingsNotice::Quiet.raised(Unsaved, "the cause".into());
+        assert_eq!(first, SettingsNotice::Showing(Unsaved, "the cause".into()));
         // A later failure does not replace the cause on screen…
-        assert_eq!(first.raised("a consequence".into()), first);
+        assert_eq!(first.raised(Unsaved, "a consequence".into()), first);
+        // …nor does something less severe…
+        assert_eq!(first.raised(Unused, "a bad value".into()), first);
         // …and a dismissed notice stays dismissed, however often writes fail.
+        assert_eq!(first.dismissed(), SettingsNotice::Dismissed(Unsaved));
         assert_eq!(
-            SettingsNotice::Dismissed.raised("again".into()),
-            SettingsNotice::Dismissed
+            SettingsNotice::Dismissed(Unsaved).raised(Unsaved, "again".into()),
+            SettingsNotice::Dismissed(Unsaved)
         );
     }
 
     #[test]
-    fn a_refused_preference_write_reaches_the_notice() {
+    fn a_refusal_notice_is_not_silenced_by_a_dismissed_bad_value() {
+        use NoticeSeverity::{Unsaved, Unused};
+        // Writes worked when the bad value was reported; the file broke later.
+        let informational = SettingsNotice::Quiet.raised(Unused, "theme".into());
+        let refusal = SettingsNotice::Showing(Unsaved, "not saved".into());
+        assert_eq!(
+            informational
+                .dismissed()
+                .raised(Unsaved, "not saved".into()),
+            refusal
+        );
+        // Shown or dismissed, the lesser notice gives way.
+        assert_eq!(informational.raised(Unsaved, "not saved".into()), refusal);
+        // The refusal itself is still raised once.
+        assert_eq!(
+            refusal.dismissed().raised(Unsaved, "again".into()),
+            SettingsNotice::Dismissed(Unsaved)
+        );
+    }
+
+    /// Mounts an empty app, for tests that only need a runtime.
+    fn runtime_dom() -> VirtualDom {
         fn empty() -> Element {
             rsx! {}
         }
-        let dom = VirtualDom::new(empty);
+        VirtualDom::new(empty)
+    }
+
+    #[test]
+    fn a_settings_file_the_launch_could_not_use_is_on_screen_from_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("connections.toml");
+        let settings = dir.path().join("settings.toml");
+        let dom = runtime_dom();
+
+        // Not TOML: nothing applied, and changes will not be saved.
+        std::fs::write(&settings, "theme = \"dark\"\n[window\n").unwrap();
+        let state =
+            dom.in_runtime(|| AppState::loaded(Some(config.clone()), Some(settings.clone())));
+        let notice = dom.in_runtime(|| state.settings_notice.peek().clone());
+        let SettingsNotice::Showing(NoticeSeverity::Unsaved, message) = notice else {
+            panic!("an unparseable settings file raised {notice:?}");
+        };
+        assert!(
+            message.contains(&settings.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("line 2"), "{message}");
+
+        // A bad value beside a good one: the good one applies, and the bad
+        // one is named — as the lesser severity, so a refusal can still show.
+        std::fs::write(
+            &settings,
+            "theme = \"drak\"\nshow_internal_objects = true\n",
+        )
+        .unwrap();
+        let state =
+            dom.in_runtime(|| AppState::loaded(Some(config.clone()), Some(settings.clone())));
+        dom.in_runtime(|| {
+            assert!(*state.show_internal_objects.peek());
+            let notice = state.settings_notice.peek().clone();
+            let SettingsNotice::Showing(NoticeSeverity::Unused, message) = notice else {
+                panic!("a bad value raised {notice:?}");
+            };
+            assert!(message.contains("theme"), "{message}");
+        });
+
+        // A file it fully understands raises nothing.
+        std::fs::write(&settings, "theme = \"dark\"\n").unwrap();
+        let state =
+            dom.in_runtime(|| AppState::loaded(Some(config.clone()), Some(settings.clone())));
+        dom.in_runtime(|| {
+            assert_eq!(*state.theme.peek(), Theme::Dark);
+            assert_eq!(*state.settings_notice.peek(), SettingsNotice::Quiet);
+        });
+    }
+
+    #[test]
+    fn a_refused_preference_write_reaches_the_notice() {
+        let dom = runtime_dom();
         let state = crate::ui::test_dom::provide_state(&dom);
         dom.in_runtime(|| {
             state.report_settings_write("theme", Ok(()));
@@ -2107,14 +2245,19 @@ mod tests {
 
             let refusal = "/cfg/settings.toml is not valid TOML at line 3";
             state.report_settings_write("theme", Err(ConfigError(refusal.into())));
-            let SettingsNotice::Showing(message) = state.settings_notice.peek().clone() else {
+            let SettingsNotice::Showing(NoticeSeverity::Unsaved, message) =
+                state.settings_notice.peek().clone()
+            else {
                 panic!("a refused write raised no notice");
             };
             assert!(message.contains(refusal), "{message}");
 
             state.dismiss_settings_notice();
             state.report_settings_write("window geometry", Err(ConfigError("again".into())));
-            assert_eq!(*state.settings_notice.peek(), SettingsNotice::Dismissed);
+            assert_eq!(
+                *state.settings_notice.peek(),
+                SettingsNotice::Dismissed(NoticeSeverity::Unsaved)
+            );
         });
     }
 
