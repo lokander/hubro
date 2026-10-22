@@ -59,6 +59,15 @@ Docs-only changes (CLAUDE.md, README, etc.) may be committed directly to `main`;
    Treat "the issue is wrong about itself" as the default rather than the exception. That same issue's first bullet asked for a migration that turned out to *be* the bug, and reversing it took both reviewers tracing the same call graph separately. Correct the issue description before moving it to Done, marking what was wrong rather than deleting it — the wrong diagnosis is the part worth keeping — and say it in the PR description too, which outlives the issue.
 4. **Wait for CI to pass** (`gh pr checks <n> --watch`) before merging — local clippy/test runs don't cover everything CI checks (e.g. rustfmt). With several PRs in flight, rebase each onto `main` locally and build before merging: GitHub's `MERGEABLE` is textual, and a conflict-free merge still failed to compile when a sibling added a field to `SavedConnection`. Then **remove the worktree first**, and rebase-merge (`gh pr merge --rebase --delete-branch`) from the main checkout — merging from inside the worktree fails trying to check out `main`. Run the merge as its own step (chaining a `gh pr comment` + merge in one command trips the self-merge classifier). Move the issue to Done with the PR linked.
 
+**Running several issues at once.** At most three worker agents at a time: a batch of five hit the session limit twice, and almost all of the tokens went on subagents' building, measuring, mutating and reviewing, not on orchestration. Spend less without lowering quality:
+- Batch each agent's mutation checks into one script. Commit first: the script restores with `git checkout`, which wipes uncommitted edits.
+- Run targeted tests while iterating, and the full suite once before pushing.
+- Reviewers reuse the author's measurements and re-review through `git range-diff`.
+- Keep the cold second reviewer (step 3) for consent, security and data-integrity changes (transactions, writes) and nowhere else. On a transaction fix it caught regressions the first reviewer had missed.
+- Don't move re-reviews to a cheaper model: a fix can bring in a new bug that a weaker check misses.
+
+A same-area finding (the same bug class one hop away, a stale comment, a small adjacent fix) gets fixed in the PR it was found in, not filed as a follow-up.
+
 ### Milestones
 
 Milestones are **scoped deliverables that complete**, not categories. Three rules:
