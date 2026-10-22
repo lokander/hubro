@@ -63,11 +63,18 @@ pub fn focus_by_id_next_frame(id: &str) {
 /// purpose: when nothing holds it (the element that did was just removed,
 /// which leaves it on the body) or it is already inside `#id`.
 pub fn reclaim_focus_by_id_next_frame(id: &str) {
-    document::eval(&next_frame(&format!(
+    document::eval(&reclaim_focus_js(id));
+}
+
+/// The eval behind [`reclaim_focus_by_id_next_frame`]. The guard is the whole
+/// point: without it this is [`focus_by_id_next_frame`], which takes focus
+/// from the filter box a click had just put it in.
+fn reclaim_focus_js(id: &str) -> String {
+    next_frame(&format!(
         "const el = document.getElementById({}); const a = document.activeElement; \
          if (el && (!a || a === document.body || el.contains(a))) el.focus();",
         js_string(id)
-    )));
+    ))
 }
 
 /// [`focus_by_id_next_frame`] for a text input, leaving the caret at the end
@@ -112,6 +119,16 @@ mod tests {
         assert_eq!(
             next_frame("el.focus();"),
             "requestAnimationFrame(() => { el.focus(); });"
+        );
+    }
+
+    #[test]
+    fn reclaiming_focus_takes_it_only_from_the_body_or_from_inside() {
+        assert_eq!(
+            reclaim_focus_js("dv-grid"),
+            "requestAnimationFrame(() => { const el = document.getElementById(\"dv-grid\"); \
+             const a = document.activeElement; \
+             if (el && (!a || a === document.body || el.contains(a))) el.focus(); });"
         );
     }
 }
