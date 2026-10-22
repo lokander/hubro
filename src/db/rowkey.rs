@@ -137,6 +137,7 @@ mod tests {
             unique,
             partial: false,
             columns: columns.iter().map(|c| c.to_string()).collect(),
+            constraint: None,
         }
     }
 

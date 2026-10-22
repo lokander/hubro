@@ -870,6 +870,7 @@ mod tests {
             unique: true,
             partial: false,
             columns: vec!["email".into()],
+            constraint: None,
         });
         assert!(TableAccess::resolve(Capabilities::FULL, &t, Dialect::Postgres).can_mutate());
         assert!(

@@ -815,6 +815,7 @@ mod tests {
             unique: true,
             partial: true,
             columns: vec!["created_at".into()],
+            constraint: None,
         };
         let extras = IndexExtras {
             key_columns: vec!["\"created_at\" DESC".into()],
@@ -840,6 +841,7 @@ mod tests {
             unique: false,
             partial: false,
             columns: vec!["id".into()],
+            constraint: None,
         };
         let extras = IndexExtras {
             key_columns: vec!["\"id\" ASC".into()],
@@ -863,6 +865,7 @@ mod tests {
             unique: true,
             partial: true,
             columns: vec!["a".into()],
+            constraint: None,
         };
         let ddl = create_index_sql(Dialect::Sqlite, &meta, &index, &IndexExtras::default());
         assert_eq!(ddl.sql, "CREATE UNIQUE INDEX \"idx\" ON \"t\" (\"a\");");
