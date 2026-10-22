@@ -242,13 +242,17 @@ mod tests {
     #[test]
     fn the_clipboard_write_falls_back_when_the_modern_api_is_missing_or_refuses() {
         let js = clipboard_js("a \"quoted\"\nline");
-        let lines: Vec<&str> = js.lines().map(str::trim).collect();
+        let collapsed: Vec<String> = js
+            .lines()
+            .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect();
+        let lines: Vec<&str> = collapsed.iter().map(String::as_str).collect();
         // The text arrives escaped, through `js_string`.
         assert!(
             lines.contains(&r#"const text = "a \"quoted\"\nline";"#),
             "{js}"
         );
-        // A rejected write (no permission, no user activation) falls back...
+        // A rejected write falls back...
         assert!(
             lines.contains(&"navigator.clipboard.writeText(text).catch(fallback);"),
             "{js}"
@@ -270,6 +274,25 @@ mod tests {
             ),
             "{js}"
         );
+        // It cleans up after itself, and gives focus back: the textarea took
+        // it to be selected, and the grid's keyboard navigation needs it.
+        let fallback = lines
+            .iter()
+            .position(|line| *line == "const fallback = () => {")
+            .unwrap_or_else(|| panic!("no fallback: {js}"));
+        let body = &lines[fallback..];
+        let end = body
+            .iter()
+            .position(|line| *line == "};")
+            .unwrap_or_else(|| panic!("the fallback has no end: {js}"));
+        let body = &body[..end];
+        for line in [
+            "const prev = document.activeElement;",
+            "document.body.removeChild(ta);",
+            "if (prev && prev.focus) prev.focus();",
+        ] {
+            assert!(body.contains(&line), "the fallback lost `{line}`: {js}");
+        }
     }
 
     /// The clipboard APIs a copy could reach for directly, instead of going
@@ -281,6 +304,12 @@ mod tests {
     /// [`clipboard_js`] does. There used to be two, and the Copy buttons in
     /// the history, saved-query and DDL panels used the one without the
     /// `execCommand` fallback.
+    ///
+    /// What the scan cannot see: an API name split across string literals or
+    /// lines (`"navigator." + "clipboard"`, or built with `format!`), a Rust
+    /// clipboard crate (`arboard` and the like) writing natively, a write in
+    /// a non-`.rs` asset such as a JavaScript file under `assets/`, and code
+    /// outside `src/ui`.
     #[test]
     fn only_js_rs_writes_the_clipboard() {
         for (path, source) in ui_sources() {
