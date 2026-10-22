@@ -1373,6 +1373,11 @@ pub fn find_table_meta<'a>(
 
 impl AppState {
     /// Must be called from a component (signals need the runtime).
+    ///
+    /// No `Default` impl on purpose: this resolves the user's real files, so
+    /// it is named wherever it is called rather than reached through
+    /// `Default::default()`.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         let state = Self::loaded(AppPaths::platform());
         state.start_background_tasks();
@@ -2140,12 +2145,6 @@ impl AppState {
         if *self.active.read() == ActiveView::Connection(id) {
             self.active.set(ActiveView::Connections);
         }
-    }
-}
-
-impl Default for AppState {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
