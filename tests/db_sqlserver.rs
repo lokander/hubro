@@ -3182,6 +3182,7 @@ async fn sqlserver_a_script_count_says_when_it_may_hold_trigger_rows_or_is_missi
             "DROP TABLE IF EXISTS dbo.count_probe",
             "DROP TABLE IF EXISTS dbo.count_probe_quiet",
             "DROP TABLE IF EXISTS dbo.count_probe_log",
+            "DROP TABLE IF EXISTS dbo.count_probe_copy",
             "CREATE TABLE dbo.count_probe (a int)",
             "CREATE TABLE dbo.count_probe_quiet (a int)",
             "CREATE TABLE dbo.count_probe_log (a int)",
@@ -3224,6 +3225,19 @@ async fn sqlserver_a_script_count_says_when_it_may_hold_trigger_rows_or_is_missi
         // control.
         ("CREATE TABLE #count_probe_tmp (a int)", "no count"),
         ("BEGIN TRAN", "no count"),
+        // `SELECT … INTO` goes down the read path, which carries no count
+        // either: a temp table (a plain batch) and a permanent one (through
+        // `sp_executesql`). Not "0 rows": each copied a row.
+        (
+            "SELECT a INTO #count_probe_copy FROM dbo.count_probe",
+            "no count",
+        ),
+        (
+            "SELECT a INTO dbo.count_probe_copy FROM dbo.count_probe",
+            "no count",
+        ),
+        // A read that matched nothing still says so.
+        ("SELECT a FROM dbo.count_probe WHERE 1 = 0", "rows []"),
     ];
     for (sql, want) in cases {
         let outcomes = mssql_script_outcomes(&pool, sql).await;
@@ -3235,6 +3249,7 @@ async fn sqlserver_a_script_count_says_when_it_may_hold_trigger_rows_or_is_missi
             "DROP TABLE dbo.count_probe",
             "DROP TABLE dbo.count_probe_quiet",
             "DROP TABLE dbo.count_probe_log",
+            "DROP TABLE dbo.count_probe_copy",
         ],
     )
     .await;
@@ -3264,7 +3279,7 @@ async fn sqlserver_script_temp_tables_last_the_run() {
         // `SELECT … INTO` is a read here, and goes the same way.
         (
             "SELECT 7 AS a INTO #s; UPDATE #s SET a = 8; SELECT a FROM #s",
-            vec!["rows []".to_string(), affected(1), rows(8)],
+            vec![none(), affected(1), rows(8)],
         ),
         // A bracketed name, and the usual guard around a create.
         (
@@ -3276,7 +3291,7 @@ async fn sqlserver_script_temp_tables_last_the_run() {
         // own connection rather than in hubro's transaction.
         (
             "BEGIN TRAN; COMMIT; SELECT 5 AS a INTO #r; SELECT a FROM #r",
-            vec![none(), none(), "rows []".to_string(), rows(5)],
+            vec![none(), none(), none(), rows(5)],
         ),
         // Sequential: the script manages its own transaction.
         (
