@@ -382,6 +382,13 @@ mod tests {
                 panic!("expected two click listeners: {edits:#?}");
             };
             assert_eq!(keydown[0], backdrop, "Escape is heard on the backdrop");
+            // Focus-on-mount is what lets Escape work before anything inside
+            // is clicked.
+            assert_eq!(
+                listeners(&edits, "mounted"),
+                [backdrop],
+                "the backdrop takes focus when it mounts"
+            );
 
             fire(
                 &dom,
@@ -415,11 +422,15 @@ mod tests {
     /// new file is covered without being listed): nothing outside this file
     /// carries [`MODAL_ATTR`] or a full-screen `fixed inset-0` layer, bar the
     /// one named below — so no modal hand-rolls its backdrop and with it its
-    /// own Escape and click rules; every `Overlay {` call is one of the
-    /// modals listed; and each listed modal passes the `dismiss_on_backdrop`
-    /// listed for it. What the scan cannot see is a full-screen layer spelled
-    /// another way (`fixed top-0 left-0 h-full w-full`, an inline style, the
-    /// two classes split across lines or strings).
+    /// own Escape and click rules; every `Overlay` call is one of the modals
+    /// listed; and each listed modal passes the `dismiss_on_backdrop` listed
+    /// for it. A call is found however it is laid out — on its own line, all
+    /// on one line, split before its brace, or through a path
+    /// (`notice::Overlay {`). What the scan cannot see: a full-screen layer
+    /// spelled another way (`fixed top-0 left-0 h-full w-full`, an inline
+    /// style, the two classes split across lines or strings), an `Overlay`
+    /// imported under another name (`use … Overlay as Modal`), and a modal
+    /// built from a string or a macro of its own.
     #[test]
     fn every_modal_is_an_overlay() {
         let marker_line = format!(r#""{MODAL_ATTR}": "true","#);
@@ -452,52 +463,90 @@ mod tests {
                 .unwrap_or_else(|| panic!("{file:?} is gone"));
             code_lines(source)
         };
+        // Every place `text` calls `Overlay`: the name as a whole word (a
+        // path before it is fine, `DdlOverlay` is not) followed by its brace.
+        let calls_in = |text: &str| -> Vec<usize> {
+            text.match_indices("Overlay")
+                .filter(|&(at, word)| {
+                    let before = text[..at].chars().next_back();
+                    let whole = !before.is_some_and(|c| c.is_alphanumeric() || c == '_');
+                    whole && text[at + word.len()..].trim_start().starts_with('{')
+                })
+                .map(|(at, _)| at)
+                .collect()
+        };
+        let mut claimed = Vec::new();
         for (file, start, dismiss) in modals {
-            let lines = lines_of(file);
-            let from = lines
-                .iter()
-                .position(|line| line.contains(start))
+            let text = lines_of(file).join("\n");
+            let from = text
+                .find(start)
                 .unwrap_or_else(|| panic!("{file:?}: `{start}` is gone"));
-            let overlay = lines[from..]
-                .iter()
-                .position(|line| line == "Overlay {")
-                .map(|i| from + i)
+            let call = calls_in(&text)
+                .into_iter()
+                .find(|&at| at > from)
                 .unwrap_or_else(|| panic!("{file:?}: `{start}` renders no Overlay"));
-            // The props come first, before the panel's own lines.
-            let props = &lines[overlay + 1..(overlay + 4).min(lines.len())];
-            let policy = format!("dismiss_on_backdrop: {dismiss},");
+            claimed.push((file, call));
+            // The first policy after the call is its own: props come before
+            // the panel, so a nested overlay's would come later.
+            let prop = "dismiss_on_backdrop:";
+            let after = &text[call..];
+            let value = after
+                .find(prop)
+                .map(|at| after[at + prop.len()..].trim_start())
+                .unwrap_or_else(|| panic!("{file:?}: the overlay at `{start}` passes no policy"));
+            let expected = dismiss.to_string();
             assert!(
-                props.contains(&policy),
-                "{file:?}: the overlay at `{start}` should pass `{policy}`, has {props:?}"
+                value.starts_with(&expected)
+                    && !value[expected.len()..]
+                        .starts_with(|c: char| c.is_alphanumeric() || c == '_'),
+                "{file:?}: the overlay at `{start}` should pass `{prop} {dismiss}`, has `{}`",
+                value.lines().next().unwrap_or_default()
             );
         }
+        claimed.sort();
+        claimed.dedup();
+        assert_eq!(
+            claimed.len(),
+            modals.len(),
+            "two modals claimed one Overlay"
+        );
 
         // Not a modal: the copy menu's click-catcher closes a dropdown and
-        // never holds focus.
+        // never holds focus. It excuses exactly one line, so a second layer
+        // spelled the same way is still caught.
         let not_modal: (&[&str], &str) = (&["grid", "mod.rs"], r#"class: "fixed inset-0 z-30","#);
         let mut calls = 0;
+        let mut excused = 0;
         for (path, source) in &sources {
             if path.len() == 1 && path[0] == "notice.rs" {
                 continue;
             }
             let lines = code_lines(source);
-            calls += lines.iter().filter(|line| *line == "Overlay {").count();
+            calls += calls_in(&lines.join("\n")).len();
             for line in &lines {
                 assert!(
                     *line != marker_line,
                     "{path:?} marks a modal of its own instead of using Overlay"
                 );
-                let excused = path
+                if !line.contains(layer) {
+                    continue;
+                }
+                let is_exempt = path
                     .iter()
                     .map(String::as_str)
                     .eq(not_modal.0.iter().copied())
                     && line == not_modal.1;
                 assert!(
-                    !line.contains(layer) || excused,
+                    is_exempt,
                     "{path:?} hand-rolls a full-screen layer instead of using Overlay: {line}"
                 );
+                excused += 1;
             }
         }
+        assert_eq!(
+            excused, 1,
+            "the copy menu's click-catcher should be the one exempt layer"
+        );
         assert_eq!(
             calls,
             modals.len(),

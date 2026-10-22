@@ -152,10 +152,13 @@ fn focus_facts_js(id: &str) -> String {
 /// whatever held it before once the overlay is gone.
 ///
 /// One eval, so the element that had focus is read before the overlay takes
-/// it. The hand-back is the same rule as [`may_reclaim`]: only when focus fell
-/// to the body with the overlay, never away from something that took it on
-/// purpose (the grid's popup refocuses the grid itself; a prompt card that
-/// replaces the connect form autofocuses its field). Without it, closing the
+/// it. The hand-back happens only when focus fell to the body with the
+/// overlay and the element is still in the page, so it never takes focus
+/// away from something that took it on purpose (the grid's popup refocuses
+/// the grid itself; a prompt card that replaces the connect form autofocuses
+/// its field). Unlike [`may_reclaim`] it does not stand aside for an open
+/// modal: closing the cheatsheet over a dialog must hand focus back to that
+/// dialog, or its Escape stops working. Without the hand-back, closing the
 /// cheatsheet would leave the grid behind it deaf to the arrow keys.
 pub fn take_overlay_focus(id: &str) {
     document::eval(&overlay_focus_js(id));
@@ -254,6 +257,27 @@ mod tests {
                 modal_open: true,
             };
             assert!(!may_reclaim(facts), "reclaimed under an overlay: {facts:?}");
+        }
+    }
+
+    /// The hand-back's conditions, as written: the observer stops once the
+    /// overlay is gone, and focus goes back only to an element still in the
+    /// page, and only from the body.
+    #[test]
+    fn an_overlay_hands_focus_back_only_from_the_body() {
+        let js = overlay_focus_js("dv-overlay-0")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for part in [
+            "const el = document.getElementById(\"dv-overlay-0\"); if (!el) return;",
+            "const back = document.activeElement; el.focus();",
+            "if (el.isConnected) return; watch.disconnect();",
+            "requestAnimationFrame(() => { const now = document.activeElement; \
+             if (back && back.isConnected && (!now || now === document.body)) back.focus(); });",
+            "watch.observe(document.body, { childList: true, subtree: true });",
+        ] {
+            assert!(js.contains(part), "missing `{part}` in {js}");
         }
     }
 
