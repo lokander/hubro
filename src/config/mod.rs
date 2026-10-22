@@ -277,11 +277,29 @@ pub(crate) mod tests {
         found
     }
 
+    /// Every way code computes a user's real directory: the `dirs` crate
+    /// (named however it is imported), std's `home_dir`, and the environment
+    /// variables the platforms keep those directories in. A word ending in
+    /// `*` matches as a prefix.
+    pub(crate) const PLATFORM_DIR_WORDS: &[&str] = &[
+        "dirs",
+        "home_dir",
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "XDG_*",
+    ];
+
     /// Every line of a `.rs` file under `dir` that names one of `words` as a
-    /// whole identifier, outside comments and string literals, as
-    /// `path:line: text`. Panics if `dir` holds suspiciously few files, so a
-    /// wrong path cannot pass by scanning nothing.
-    pub(crate) fn words_named_in(dir: &Path, words: &[&str]) -> Vec<String> {
+    /// whole identifier, as `path:line: text`, except lines whose trimmed
+    /// text is exactly one of `allowed`. Comment lines are blanked; string
+    /// literals are **not** skipped — telling them apart takes a lexer, and a
+    /// hand-rolled one is fooled by `'"'` — so a literal that must name a
+    /// word is allowed by its exact line instead. Panics if `dir` holds
+    /// suspiciously few files, so a wrong path cannot pass by scanning
+    /// nothing.
+    pub(crate) fn words_named_in(dir: &Path, words: &[&str], allowed: &[&str]) -> Vec<String> {
         let sources = sources(dir);
         assert!(
             sources.len() > 20,
@@ -289,15 +307,22 @@ pub(crate) mod tests {
             dir.display(),
             sources.len()
         );
+        let matches = |word: &str| {
+            words.iter().any(|pattern| match pattern.strip_suffix('*') {
+                Some(prefix) => word.starts_with(prefix),
+                None => word == *pattern,
+            })
+        };
         let mut found = Vec::new();
         for (path, code) in &sources {
             for (number, line) in code.lines().enumerate() {
-                // Every other piece split on `"` is inside a string literal.
-                let named = line.split('"').step_by(2).any(|code| {
-                    code.split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                        .any(|word| words.contains(&word))
-                });
-                if named {
+                if allowed.contains(&line.trim()) {
+                    continue;
+                }
+                if line
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .any(matches)
+                {
                     found.push(format!(
                         "{}:{}: {}",
                         path.display(),
@@ -310,66 +335,64 @@ pub(crate) mod tests {
         found
     }
 
-    /// The guard holds only while [`AppPaths::platform`] is the one place the
-    /// platform's directories are asked for: a `dirs::config_dir()` anywhere
-    /// else would be a route to the real files the guard never sees.
+    /// The guard holds only while [`AppPaths::from_platform_dirs`] is the
+    /// one place in `src/` that computes a user's real directory: a
+    /// `dirs::config_dir()`, a `home_dir()` or a read of `$HOME` anywhere
+    /// else — test modules included, which the guard's panic does not cover —
+    /// would be a route to the real files nobody sees.
     ///
-    /// One exception, which resolves none of hubro's files: the SSH form
-    /// expands a `~/` the user typed in a key-file path.
+    /// Allowed, each by its exact line: the resolver itself; the test pinning
+    /// the paths existing installs use, which resolves and touches nothing;
+    /// this test's own literals, one per line; and the SSH form expanding
+    /// a `~/` the user typed in a key-file path, which resolves none of
+    /// hubro's files.
     #[test]
     fn only_app_paths_asks_the_platform_for_a_directory() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let allowed = [
-            root.join("src").join("config").join("mod.rs"),
-            root.join("src").join("ui").join("connections.rs"),
+        let mut allowed = vec![
+            "Self::resolve(dirs::config_dir(), dirs::data_dir(), dirs::home_dir())",
+            "let config = dirs::config_dir().expect(\"a config dir\").join(\"hubro\");",
+            "let data = dirs::data_dir().expect(\"a data dir\").join(\"hubro\");",
+            "let home = dirs::home_dir().expect(\"a home dir\");",
+            "Some(rest) => match dirs::home_dir() {",
         ];
-        let sources = sources(&root.join("src"));
-        assert!(
-            sources.len() > 50,
-            "src/ was not scanned: {}",
-            sources.len()
-        );
-        let strays: Vec<_> = sources
+        // This test's own literals name the words too: the word list's
+        // lines, and the allowed lines above as they are written here.
+        let quoted: Vec<String> = PLATFORM_DIR_WORDS
             .iter()
-            .filter(|(path, code)| code.contains("dirs::") && !allowed.contains(path))
-            .map(|(path, _)| path.display().to_string())
+            .chain(&allowed)
+            .map(|text| format!("{text:?},"))
             .collect();
+        allowed.extend(quoted.iter().map(String::as_str));
+        let found = words_named_in(&root.join("src"), PLATFORM_DIR_WORDS, &allowed);
         assert!(
-            strays.is_empty(),
-            "resolve hubro's files through AppPaths, not dirs:: — {strays:?}"
-        );
-        let (_, form) = sources
-            .iter()
-            .find(|(path, _)| *path == allowed[1])
-            .expect("the SSH form's source");
-        let uses: Vec<_> = form
-            .lines()
-            .filter(|line| line.contains("dirs::"))
-            .collect();
-        assert_eq!(
-            uses.iter().map(|line| line.trim()).collect::<Vec<_>>(),
-            ["Some(rest) => match dirs::home_dir() {"],
-            "the SSH form may ask for the home dir only to expand a typed ~/"
+            found.is_empty(),
+            "resolve hubro's files through AppPaths, not the platform's \
+             directories directly:\n{}",
+            found.join("\n")
         );
     }
 
     /// `tests/` links the library without `cfg(test)`, so the panic in
-    /// [`AppPaths::platform`] does not reach it. An integration test cannot
-    /// build an `AppState` on paths of its own either — `loaded` and
-    /// `unstarted` are crate-private — so the only states it could build
-    /// stand on the real files. Hence: no integration test names the paths,
-    /// the state, or the `App` component that builds one.
+    /// [`AppPaths::platform`] does not reach it — and the library hands it
+    /// every means to write a file: the savers (`save_theme`,
+    /// `save_window_geometry`, `save_session`, the saved list's persist,
+    /// `HistoryStore::open_at`) are public and take any path. So an
+    /// integration test must not be able to *name* a real file: it may not
+    /// compute a user's directory at all ([`PLATFORM_DIR_WORDS`]), nor name
+    /// the paths, the state, or the `App` component, whose only constructor
+    /// reachable from there resolves the real files. Every path it writes
+    /// then comes from somewhere it made itself, such as a temp dir.
     #[test]
     fn no_integration_test_names_the_real_paths() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let found = words_named_in(
-            &root.join("tests"),
-            &["App", "AppState", "AppPaths", "from_platform_dirs"],
-        );
+        let mut words = vec!["App", "AppState", "AppPaths", "from_platform_dirs"];
+        words.extend(PLATFORM_DIR_WORDS);
+        let found = words_named_in(&root.join("tests"), &words, &[]);
         assert!(
             found.is_empty(),
-            "these reach the user's real config and data; test through a unit \
-             test's test_dom::provide_state, whose files are a temp dir's:\n{}",
+            "these can reach the user's real config and data; test through a \
+             unit test's test_dom::provide_state, or write under a temp dir:\n{}",
             found.join("\n")
         );
     }
