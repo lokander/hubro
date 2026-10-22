@@ -278,12 +278,16 @@ pub(crate) mod tests {
     }
 
     /// Every way code computes a user's real directory: the `dirs` crate
-    /// (named however it is imported), std's `home_dir`, and the environment
-    /// variables the platforms keep those directories in. A word ending in
-    /// `*` matches as a prefix.
+    /// (named however it is imported), std's `home_dir`, the environment
+    /// variables the platforms keep those directories in, and russh's two
+    /// known_hosts helpers that call `home_dir` themselves — the real
+    /// `~/.ssh/known_hosts` — where the tunnel uses their `_path` variants,
+    /// a one-word slip away. A word ending in `*` matches as a prefix.
     pub(crate) const PLATFORM_DIR_WORDS: &[&str] = &[
         "dirs",
         "home_dir",
+        "learn_known_hosts",
+        "check_known_hosts",
         "HOME",
         "USERPROFILE",
         "APPDATA",
@@ -292,14 +296,26 @@ pub(crate) mod tests {
     ];
 
     /// Every line of a `.rs` file under `dir` that names one of `words` as a
-    /// whole identifier, as `path:line: text`, except lines whose trimmed
-    /// text is exactly one of `allowed`. Comment lines are blanked; string
-    /// literals are **not** skipped — telling them apart takes a lexer, and a
-    /// hand-rolled one is fooled by `'"'` — so a literal that must name a
-    /// word is allowed by its exact line instead. Panics if `dir` holds
-    /// suspiciously few files, so a wrong path cannot pass by scanning
-    /// nothing.
-    pub(crate) fn words_named_in(dir: &Path, words: &[&str], allowed: &[&str]) -> Vec<String> {
+    /// whole identifier, as `path:line: text`, except the lines `allowed`
+    /// names: a file (relative to `dir`, `/`-separated) and its exact trimmed
+    /// line, each pair excusing **one** occurrence in that file only — so a
+    /// copy of an allowed line, in another file or a second time in its own,
+    /// is reported. Comment lines are blanked; string literals are **not**
+    /// skipped — telling them apart takes a lexer, and a hand-rolled one is
+    /// fooled by `'"'` — so a literal that must name a word is allowed by its
+    /// exact line instead. Panics if `dir` holds suspiciously few files, so a
+    /// wrong path cannot pass by scanning nothing.
+    ///
+    /// These scans catch accidents, not deliberate evasion: `concat!` can
+    /// build a name and iterating `env::vars()` names no variable. For unit
+    /// tests the real guard is the `cfg(test)` panic in
+    /// [`AppPaths::platform`]; the scans keep the routes around it from
+    /// opening by mistake.
+    pub(crate) fn words_named_in(
+        dir: &Path,
+        words: &[&str],
+        allowed: &[(&str, &str)],
+    ) -> Vec<String> {
         let sources = sources(dir);
         assert!(
             sources.len() > 20,
@@ -313,10 +329,23 @@ pub(crate) mod tests {
                 None => word == *pattern,
             })
         };
+        let mut used = vec![false; allowed.len()];
         let mut found = Vec::new();
         for (path, code) in &sources {
+            let file = path
+                .strip_prefix(dir)
+                .expect("a file under the scanned dir")
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
             for (number, line) in code.lines().enumerate() {
-                if allowed.contains(&line.trim()) {
+                let excused = allowed
+                    .iter()
+                    .enumerate()
+                    .position(|(at, pair)| !used[at] && *pair == (file.as_str(), line.trim()));
+                if let Some(at) = excused {
+                    used[at] = true;
                     continue;
                 }
                 if line
@@ -341,29 +370,37 @@ pub(crate) mod tests {
     /// else — test modules included, which the guard's panic does not cover —
     /// would be a route to the real files nobody sees.
     ///
-    /// Allowed, each by its exact line: the resolver itself; the test pinning
-    /// the paths existing installs use, which resolves and touches nothing;
-    /// this test's own literals, one per line; and the SSH form expanding
-    /// a `~/` the user typed in a key-file path, which resolves none of
-    /// hubro's files.
+    /// Allowed, each by its file and exact line, once: the resolver itself;
+    /// the test pinning the paths existing installs use, which resolves and
+    /// touches nothing; this test's own literals, one per line; and the SSH
+    /// form expanding a `~/` the user typed in a key-file path, which
+    /// resolves none of hubro's files.
     #[test]
     fn only_app_paths_asks_the_platform_for_a_directory() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut allowed = vec![
+        let in_config = [
             "Self::resolve(dirs::config_dir(), dirs::data_dir(), dirs::home_dir())",
             "let config = dirs::config_dir().expect(\"a config dir\").join(\"hubro\");",
             "let data = dirs::data_dir().expect(\"a data dir\").join(\"hubro\");",
             "let home = dirs::home_dir().expect(\"a home dir\");",
-            "Some(rest) => match dirs::home_dir() {",
         ];
-        // This test's own literals name the words too: the word list's
-        // lines, and the allowed lines above as they are written here.
+        let in_form = [
+            "Some(rest) => match dirs::home_dir() {",
+            // Kept on a line of its own (this comment stops rustfmt joining
+            // the array), so its quoted form below matches it as written.
+        ];
+        // This test's own literals name the words too — the word list's
+        // lines and the two arrays above — each as written here, once.
         let quoted: Vec<String> = PLATFORM_DIR_WORDS
             .iter()
-            .chain(&allowed)
+            .chain(&in_config)
+            .chain(&in_form)
             .map(|text| format!("{text:?},"))
             .collect();
-        allowed.extend(quoted.iter().map(String::as_str));
+        let mut allowed: Vec<(&str, &str)> = Vec::new();
+        allowed.extend(in_config.iter().map(|line| ("config/mod.rs", *line)));
+        allowed.extend(in_form.iter().map(|line| ("ui/connections.rs", *line)));
+        allowed.extend(quoted.iter().map(|line| ("config/mod.rs", line.as_str())));
         let found = words_named_in(&root.join("src"), PLATFORM_DIR_WORDS, &allowed);
         assert!(
             found.is_empty(),
