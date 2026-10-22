@@ -41,9 +41,7 @@ use crate::db::entra::{EntraTokens, Secret};
 use crate::db::error::DbError;
 use crate::db::export::{export_io_err, ExportFormat, ExportSink};
 use crate::db::registry::RolledBack;
-use crate::db::script::{
-    final_read_may_close, statement_needs, tsql_is_transaction_control, tsql_leads_own_batch,
-};
+use crate::db::script::{final_read_may_close, statement_needs, tsql_runs_as_batch};
 use crate::db::staged::CheckedStatement;
 use crate::db::value::{cap_value, ColumnInfo, QueryResult, Value};
 
@@ -97,16 +95,18 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 /// No statement can undo this pin for the ones after it. A trigger's `SET`
 /// lapses when the trigger returns, and so does a script's: scripts run
 /// through `sp_executesql`, and a `SET` inside it ends with the call. The one
-/// exception is a statement that must lead its batch ([`tsql_leads_own_batch`]:
+/// exception is a statement that must lead its batch ([`tsql_leads_own_batch`](crate::db::script::tsql_leads_own_batch):
 /// `CREATE`/`ALTER` of a procedure, function, trigger or view, `CREATE
 /// SCHEMA`/`DEFAULT`/`RULE`), which runs as a plain batch, where a `SET` would
 /// stick. It is safe because a `SET` trailing one of those never runs as the
 /// session's own: measured, a procedure or trigger takes it into its body, and
 /// the rest refuse it as a syntax error (156). The other plain batch is bare
-/// transaction control ([`tsql_is_transaction_control`]): the keywords and at
+/// transaction control ([`tsql_is_transaction_control`](crate::db::script::tsql_is_transaction_control)): the keywords and at
 /// most a transaction's name, with a reserved word, a parenthesis or a string
 /// in the name's place turned away — so a `SET`, or an `EXEC` that could carry
-/// one, never rides along.
+/// one, never rides along. The last is a statement that creates a temp table,
+/// on a run's own connection only, and only when no `SET` word appears in it
+/// anywhere ([`tsql_creates_temp_table`](crate::db::script::tsql_creates_temp_table)).
 const SESSION_SETUP: &str = "SET QUOTED_IDENTIFIER ON; \
      SET NOCOUNT OFF; \
      SET ANSI_NULLS ON; \
@@ -797,7 +797,7 @@ async fn run_query(
     // is the capped read with its two limiters switched off rather than a
     // second copy of the same loop.
     let (result, _, abandoned) =
-        run_query_capped(client, sql, params, u64::MAX, usize::MAX).await?;
+        run_query_capped(client, sql, params, false, u64::MAX, usize::MAX).await?;
     Ok((result, abandoned))
 }
 
@@ -811,7 +811,9 @@ trait RowSink {
 /// Runs a parameterized query and feeds its first result set to the sink
 /// `start` builds from that set's columns (`None`: the batch returned no
 /// result set). The one copy of the TDS result loop: the buffered, capped and
-/// export paths differ only in their sinks.
+/// export paths differ only in their sinks. `batch` sends `sql` as a plain
+/// batch, with no parameters, rather than through `sp_executesql`
+/// ([`tsql_runs_as_batch`]); the rows come back the same either way.
 ///
 /// Returns the sink and whether the stream was abandoned with data still
 /// unread — the sink stopped early, or a second result set arrived. Only the
@@ -821,11 +823,17 @@ async fn read_first_result_set<S: RowSink>(
     client: &mut TdsClient,
     sql: &str,
     params: &[Value],
+    batch: bool,
     start: impl FnOnce(Option<&[Column]>) -> Result<S, TdsError>,
 ) -> Result<(S, bool), TdsError> {
-    let mut query = Query::new(sql.to_string());
-    bind_params(&mut query, params);
-    let mut stream = query.query(client).await?;
+    let mut stream = if batch {
+        debug_assert!(params.is_empty(), "a plain batch binds no parameters");
+        client.simple_query(sql).await?
+    } else {
+        let mut query = Query::new(sql.to_string());
+        bind_params(&mut query, params);
+        query.query(client).await?
+    };
     let mut sink = start(stream.columns().await?)?;
     let mut result_sets = 0usize;
     while let Some(item) = stream.try_next().await? {
@@ -894,24 +902,31 @@ fn statement_rows(counts: &[u64]) -> u64 {
 
 /// Runs one script statement that returns no rows, reporting its affected
 /// rows. A statement SQL Server only accepts at the head of a batch
-/// ([`tsql_leads_own_batch`]) cannot go through `sp_executesql`, so it runs as
+/// ([`tsql_leads_own_batch`](crate::db::script::tsql_leads_own_batch)) cannot go through `sp_executesql`, so it runs as
 /// a plain batch instead; nothing it does counts as an affected row, so it
 /// reports 0.
 ///
 /// Bare transaction control (`BEGIN TRAN`, `COMMIT`, `ROLLBACK`:
-/// [`tsql_is_transaction_control`]) runs as a plain batch too. Inside
+/// [`tsql_is_transaction_control`](crate::db::script::tsql_is_transaction_control)) runs as a plain batch too. Inside
 /// `sp_executesql` it fails with error 266 — the RPC refuses to return with
 /// `@@TRANCOUNT` different from what it started with — and measured, the
 /// `BEGIN TRAN` that error is about has still opened its transaction, so a
 /// script could not open one and was left with one open anyway.
+///
+/// On a run's own connection, a statement that creates a temp table runs as
+/// a plain batch as well, so the table lasts the run
+/// ([`tsql_creates_temp_table`](crate::db::script::tsql_creates_temp_table)).
+/// `batch` is [`tsql_runs_as_batch`]'s answer for all three. A plain batch
+/// reports 0: tiberius's `simple_query` carries no affected-row counts at
+/// all, which is why a statement that writes rows is never sent as one.
 ///
 /// The report is the *sum* of every count, trigger rows included — unlike
 /// [`statement_rows`], and deliberately: a script statement is a whole `GO`
 /// batch, and its several statements' counts arrive as the same token as
 /// their triggers', so no rule over the counts can tell the batch's own rows
 /// from theirs. The sum is what SQL Server reported; nothing is held to it.
-async fn run_statement(client: &mut TdsClient, sql: &str) -> Result<u64, TdsError> {
-    if tsql_leads_own_batch(sql) || tsql_is_transaction_control(sql) {
+async fn run_statement(client: &mut TdsClient, sql: &str, batch: bool) -> Result<u64, TdsError> {
+    if batch {
         run_batch(client, sql).await.map(|()| 0)
     } else {
         run_execute(client, sql, &[])
@@ -951,7 +966,10 @@ pub async fn query_with(
 /// affected-row count.
 pub async fn execute(pool: &MssqlPool, sql: &str) -> Result<u64, DbError> {
     let mut conn = pool.acquire().await?;
-    let result = conn.request(async |c| run_statement(c, sql).await).await;
+    let batch = tsql_runs_as_batch(sql, false);
+    let result = conn
+        .request(async |c| run_statement(c, sql, batch).await)
+        .await;
     settle(&mut conn, result, sql)
 }
 
@@ -976,7 +994,7 @@ pub async fn query_capped(
 ) -> Result<(QueryResult, bool), DbError> {
     let mut conn = pool.acquire().await?;
     let result = conn
-        .request(async |c| run_query_capped(c, sql, params, max_rows, cell_cap).await)
+        .request(async |c| run_query_capped(c, sql, params, false, max_rows, cell_cap).await)
         .await;
     let (result, truncated, abandoned) = settle(&mut conn, result, sql)?;
     if truncated || abandoned {
@@ -1006,14 +1024,16 @@ pub async fn query_capped_conn(
     max_rows: u64,
     cell_cap: usize,
 ) -> Result<(QueryResult, bool), DbError> {
-    query_capped_held(&mut tx.conn, sql, max_rows, cell_cap).await
+    query_capped_held(&mut tx.conn, tx.discard_after, sql, max_rows, cell_cap).await
 }
 
 /// [`query_capped_conn`] on any connection held across statements. A
 /// truncated read keeps the connection for the same reason in both: the
-/// script may have a transaction of its own open on it.
+/// script may have a transaction of its own open on it. `held_for_run`: the
+/// connection is discarded when the run ends ([`tsql_runs_as_batch`]).
 async fn query_capped_held(
     conn: &mut PooledConn,
+    held_for_run: bool,
     sql: &str,
     max_rows: u64,
     cell_cap: usize,
@@ -1021,8 +1041,9 @@ async fn query_capped_held(
     if conn.is_discarded() {
         return Err(lost_connection());
     }
+    let batch = tsql_runs_as_batch(sql, held_for_run);
     let result = conn
-        .request(async |c| run_query_capped(c, sql, &[], max_rows, cell_cap).await)
+        .request(async |c| run_query_capped(c, sql, &[], batch, max_rows, cell_cap).await)
         .await;
     let (result, truncated, _abandoned) = settle(conn, result, sql)?;
     Ok((result, truncated))
@@ -1037,10 +1058,11 @@ async fn run_query_capped(
     client: &mut TdsClient,
     sql: &str,
     params: &[Value],
+    batch: bool,
     max_rows: u64,
     cell_cap: usize,
 ) -> Result<(QueryResult, bool, bool), TdsError> {
-    let (rows, abandoned) = read_first_result_set(client, sql, params, |columns| {
+    let (rows, abandoned) = read_first_result_set(client, sql, params, batch, |columns| {
         Ok(CappedRows {
             columns: columns.map(column_infos).unwrap_or_default(),
             rows: Vec::new(),
@@ -1179,16 +1201,24 @@ pub async fn begin_tx(pool: &MssqlPool) -> Result<MssqlTx, DbError> {
 /// rows. Errors (instead of panicking) when an earlier fatal failure already
 /// discarded the transaction's connection.
 pub async fn execute_conn(tx: &mut MssqlTx, sql: &str) -> Result<u64, DbError> {
-    execute_held(&mut tx.conn, sql).await
+    execute_held(&mut tx.conn, tx.discard_after, sql).await
 }
 
 /// One script statement on a connection held across statements — a script
-/// transaction's or a [`MssqlScriptConn`]'s.
-async fn execute_held(conn: &mut PooledConn, sql: &str) -> Result<u64, DbError> {
+/// transaction's or a [`MssqlScriptConn`]'s. `held_for_run`: the connection
+/// is discarded when the run ends ([`tsql_runs_as_batch`]).
+async fn execute_held(
+    conn: &mut PooledConn,
+    held_for_run: bool,
+    sql: &str,
+) -> Result<u64, DbError> {
     if conn.is_discarded() {
         return Err(lost_connection());
     }
-    let result = conn.request(async |c| run_statement(c, sql).await).await;
+    let batch = tsql_runs_as_batch(sql, held_for_run);
+    let result = conn
+        .request(async |c| run_statement(c, sql, batch).await)
+        .await;
     settle(conn, result, sql)
 }
 
@@ -1311,7 +1341,7 @@ pub async fn acquire_script_conn(pool: &MssqlPool) -> Result<MssqlScriptConn, Db
 
 /// [`execute_conn`] on a script's held connection.
 pub async fn execute_script_conn(conn: &mut MssqlScriptConn, sql: &str) -> Result<u64, DbError> {
-    execute_held(&mut conn.conn, sql).await
+    execute_held(&mut conn.conn, true, sql).await
 }
 
 /// [`query_capped_conn`] on a script's held connection.
@@ -1321,7 +1351,7 @@ pub async fn query_capped_script_conn(
     max_rows: u64,
     cell_cap: usize,
 ) -> Result<(QueryResult, bool), DbError> {
-    query_capped_held(&mut conn.conn, sql, max_rows, cell_cap).await
+    query_capped_held(&mut conn.conn, true, sql, max_rows, cell_cap).await
 }
 
 /// Rolls back a transaction the script left open and answers one
@@ -1383,7 +1413,7 @@ pub async fn finish_script_conn_with_read(
 ) -> crate::db::registry::FinishedRead {
     use crate::db::registry::FinishedRead;
     if !final_read_may_close(sql, crate::db::sql::Dialect::SqlServer) {
-        let read = query_capped_held(&mut conn.conn, sql, max_rows, cell_cap).await;
+        let read = query_capped_held(&mut conn.conn, true, sql, max_rows, cell_cap).await;
         let ended = end_script_conn(conn).await;
         return FinishedRead {
             read,
@@ -1425,8 +1455,9 @@ pub async fn finish_script_conn_with_read(
             };
         }
     };
+    let batch = tsql_runs_as_batch(sql, true);
     let read = held
-        .request(async |c| run_query_capped(c, sql, &[], max_rows, cell_cap).await)
+        .request(async |c| run_query_capped(c, sql, &[], batch, max_rows, cell_cap).await)
         .await;
     match settle(held, read, sql) {
         Ok((result, truncated, abandoned)) if truncated || abandoned => {
@@ -1466,7 +1497,7 @@ pub async fn export(
     // settled after the stream is dropped.
     let outcome = conn
         .request(async |c| {
-            let (mut rows, abandoned) = read_first_result_set(c, sql, params, |columns| {
+            let (mut rows, abandoned) = read_first_result_set(c, sql, params, false, |columns| {
                 let columns = columns
                     .map(|columns| columns.iter().map(|c| c.name().to_string()).collect())
                     .unwrap_or_default();

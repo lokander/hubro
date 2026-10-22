@@ -322,6 +322,57 @@ async fn sqlserver_script_session_state_stays_in_its_run() {
             ));
         }
     }
+    // A statement that creates a temp table runs as a plain batch, so the
+    // table is the session's (each statement's `sp_executesql` dropped it
+    // before): it must last the run and no longer.
+    for (name, script) in [
+        ("#leak_lone", "CREATE TABLE #leak_lone (a int)"),
+        (
+            "#leak_atomic",
+            "CREATE TABLE #leak_atomic (a int); INSERT INTO #leak_atomic VALUES (1); \
+             SELECT a FROM #leak_atomic",
+        ),
+        ("#leak_into", "SELECT 1 AS a INTO #leak_into"),
+        (
+            "#leak_sequential",
+            "BEGIN TRAN; COMMIT; SELECT 1 AS a INTO #leak_sequential; \
+             SELECT TOP 20000 CAST(1 AS int) AS a \
+             FROM sys.all_objects a CROSS JOIN sys.all_objects b",
+        ),
+    ] {
+        run_ok(var, &pool, caps, script).await;
+        let probe = format!(
+            "SELECT CAST(CASE WHEN OBJECT_ID('tempdb..{name}') IS NULL THEN 0 ELSE 1 END AS int)"
+        );
+        if one(&pool, &probe).await == Value::Integer(1) {
+            leaks.push(format!(
+                "{script:?} left its temp table on the pooled connection"
+            ));
+        }
+    }
+    // Only a run's own connection, which the run discards, gets the plain
+    // batch: through the pool the table would reach the next borrower.
+    pool.execute("CREATE TABLE #leak_pool (a int)")
+        .await
+        .unwrap();
+    if one(
+        &pool,
+        "SELECT CAST(CASE WHEN OBJECT_ID('tempdb..#leak_pool') IS NULL THEN 0 ELSE 1 END AS int)",
+    )
+    .await
+        == Value::Integer(1)
+    {
+        leaks.push("a pooled statement left its temp table on the pooled connection".into());
+    }
+    // A connection marked read-only has no mode on SQL Server to run in, so
+    // the gate is what refuses a temp table there, before anything runs.
+    let marked = WriteProtection::ReadOnly.apply(caps);
+    for script in ["CREATE TABLE #ro (a int)", "SELECT 1 AS a INTO #ro"] {
+        assert!(
+            !run(&pool, marked, script).await.is_empty(),
+            "{script:?} ran on a connection marked read-only"
+        );
+    }
     run_ok(var, &pool, caps, "USE master").await;
     if one(&pool, "SELECT DB_NAME()").await == Value::Text("master".into()) {
         leaks.push("\"USE master\" left the pooled connection in another database".into());
