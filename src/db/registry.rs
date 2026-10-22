@@ -53,6 +53,12 @@ pub const PLAN_CELL_CAP: usize = FETCH_CELL_MAX_BYTES;
 /// expand overlay notes the value is too large to show in full.
 pub const FETCH_CELL_MAX_BYTES: usize = 8 * 1024 * 1024;
 
+/// What [`DbPool::fetch_cell`] reports when the row's locator matches no row
+/// — deleted since the page loaded, or a key the server cannot be asked for
+/// again. Shown by the expand popup, the truncated-cell editor, the row
+/// detail panel and the clipboard in place of the value.
+pub const MISSING_ROW: &str = "this row no longer exists — reload the table";
+
 /// One cell's value loaded on demand ([`DbPool::fetch_cell`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CellFetch {
@@ -1018,6 +1024,10 @@ impl DbPool {
     /// A locator whose arity no longer matches `identity` is a
     /// [`DbError::Query`], not a lookup over the columns that happen to pair
     /// up — see [`staged::locator_mismatch`].
+    ///
+    /// A locator that matches no row is a [`DbError::Query`] carrying
+    /// [`MISSING_ROW`], not a NULL value: every consumer shows, edits or
+    /// copies what this returns, so an empty value would read as data.
     pub async fn fetch_cell(
         &self,
         table: &TableMeta,
@@ -1047,13 +1057,11 @@ impl DbPool {
         );
         let result = self.query_with(&sql, &params).await?;
         let Some(row) = result.rows.into_iter().next() else {
-            // The row is gone (concurrent delete): report an empty value
-            // rather than an error.
-            return Ok(CellFetch {
-                value: Value::Null,
-                full_len: 0,
-                capped: false,
-            });
+            // No row matched: deleted underneath the grid, or a key the
+            // server cannot be asked for again. Either way it is a failure,
+            // never an empty value — a NULL here was shown as the cell's
+            // value, opened in the editor as one and copied as an empty cell.
+            return Err(DbError::Query(MISSING_ROW.into()));
         };
         let value = row.first().cloned().unwrap_or(Value::Null);
         let full_len = match row.get(1) {

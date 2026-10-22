@@ -98,7 +98,7 @@ use hubro::db::{
     apply_staged, detect_row_identity, run_script, split_statements, Capabilities, DbPool, Filter,
     Internal, KeyTextPinned, OpenTransaction, PageRequest, PgFlavor, Restriction, Rollback,
     RowIdentity, RowLocator, ScriptDone, SortDir, StagedChange, StatementOutcome, TableKind,
-    TableMeta, Value,
+    TableMeta, Value, MISSING_ROW,
 };
 
 fn test_url() -> Option<String> {
@@ -840,7 +840,7 @@ async fn cockroach_real_keys_are_re_addressed_by_their_shortest_spelling() {
     let precise = common::row_addressing_failures(&pool, find(&tables, "real_precise")).await;
     assert_eq!(precise.len(), 2, "{}", precise.join("\n"));
     assert!(
-        precise[0].contains("fetch_cell returned Null")
+        precise[0].ends_with(&format!("fetch_cell failed: query failed: {MISSING_ROW}"))
             && precise[1].contains("the write did not address its row"),
         "{}",
         precise.join("\n")

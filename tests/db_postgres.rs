@@ -20,8 +20,8 @@ use hubro::db::{
     plan_reached_cell_cap, run_script, script_refusal, url_with_password, Capabilities, DbError,
     DbPool, Dialect, Filter, Internal, KeyTextPinned, PageRequest, PgFlavor, PlanDisplay,
     Restriction, Rollback, RowCount, RowLocator, SortDir, StagedChange, StatementOutcome,
-    TableKind, TableMeta, TypeDetail, TypeRef, Value, WriteProtection, INSTEAD_RULE, PREVIEW_BYTES,
-    QUERY_CELL_CAP,
+    TableKind, TableMeta, TypeDetail, TypeRef, Value, WriteProtection, INSTEAD_RULE, MISSING_ROW,
+    PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 async fn test_url() -> Option<String> {
@@ -972,6 +972,17 @@ async fn postgres_bounded_page_previews_large_text_and_bytea() {
         assert_eq!(t.chars().count(), 50_000);
     } else {
         panic!("expected full text");
+    }
+    // Deleted underneath the grid: an error, never a NULL value.
+    pool.query("DELETE FROM bounded_docs WHERE id = 1")
+        .await
+        .unwrap();
+    match pool
+        .fetch_cell(&docs, &identity, &locator, "big_text")
+        .await
+    {
+        Err(DbError::Query(message)) => assert_eq!(message, MISSING_ROW),
+        other => panic!("a deleted row's cell must not load: {other:?}"),
     }
 
     pool.query("DROP TABLE IF EXISTS bounded_docs")

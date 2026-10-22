@@ -8,7 +8,7 @@ mod common;
 use common::FixtureDb;
 use hubro::db::{
     detect_row_identity, DbError, Generated, PageRequest, RowLocator, TableMeta, Value,
-    PREVIEW_BYTES, QUERY_CELL_CAP,
+    MISSING_ROW, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 fn request(table: &str) -> PageRequest {
@@ -205,22 +205,34 @@ async fn fetch_cell_loads_the_full_value() {
 }
 
 #[tokio::test]
-async fn fetch_cell_reports_a_missing_row_as_null() {
+async fn fetch_cell_reports_a_missing_row_as_an_error_not_null() {
+    // A row deleted underneath the grid used to load as an empty value, so
+    // the expand popup showed NULL, the truncated-cell editor opened on NULL
+    // (and could stage a write from it) and the clipboard got an empty cell —
+    // a failure that read as data. It is an error now, and a stored NULL is
+    // still a value.
     let fixture = docs_fixture().await;
     let pool = fixture.open().await;
     let tables = pool.introspect().await.unwrap();
     let docs = tables.iter().find(|t| t.name == "docs").unwrap();
     let identity = detect_row_identity(docs, pool.dialect()).unwrap();
-
-    let locator = RowLocator {
-        identity_values: vec![Value::Integer(999)], // no such row
+    let at = |id| RowLocator {
+        identity_values: vec![Value::Integer(id)],
     };
-    let fetched = pool
-        .fetch_cell(docs, &identity, &locator, "big_text")
+
+    let stored_null = pool
+        .fetch_cell(docs, &identity, &at(3), "big_text")
         .await
         .unwrap();
-    assert_eq!(fetched.value, Value::Null);
-    assert!(!fetched.capped);
+    assert_eq!(stored_null.value, Value::Null);
+
+    pool.query("DELETE FROM docs WHERE id = 1").await.unwrap();
+    for id in [1, 999] {
+        match pool.fetch_cell(docs, &identity, &at(id), "big_text").await {
+            Err(DbError::Query(message)) => assert_eq!(message, MISSING_ROW),
+            other => panic!("row {id} is gone, so its cell must not load: {other:?}"),
+        }
+    }
 
     pool.close().await;
 }
