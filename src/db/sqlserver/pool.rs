@@ -458,7 +458,7 @@ impl PoolInner {
     async fn login_config(&self) -> Result<Config, DbError> {
         let mut config = self.config.clone();
         if let Some(tokens) = &self.tokens {
-            config.authentication(AuthMethod::aad_token(&tokens.current().await?));
+            config.authentication(AuthMethod::aad_token(tokens.current().await?.expose()));
         }
         Ok(config)
     }
@@ -2026,7 +2026,7 @@ mod tests {
     /// that it happens per connection, not once at the connect.
     #[tokio::test]
     async fn a_new_entra_connection_takes_its_token_from_the_provider() {
-        use crate::db::entra::{Clock, EntraTokens, Renew, RenewError, Renewed, Token};
+        use crate::db::entra::{Clock, EntraTokens, Renew, RenewError, Renewed, Secret, Token};
         use std::sync::atomic::{AtomicU64, AtomicUsize};
         use std::time::SystemTime;
 
@@ -2043,14 +2043,14 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let renew: Renew = {
             let calls = Arc::clone(&calls);
-            Arc::new(move |refresh: Option<String>| {
+            Arc::new(move |refresh: Option<Secret>| {
                 let n = calls.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async move {
-                    assert_eq!(refresh.as_deref(), Some("kept"));
+                    assert_eq!(refresh.as_ref().map(Secret::expose), Some("kept"));
                     if n == 0 {
                         Ok(Renewed {
                             token: Token {
-                                secret: "second".into(),
+                                secret: Secret::new("second"),
                                 expires_at: base + Duration::from_secs(7200),
                             },
                             refresh: None,
@@ -2063,10 +2063,10 @@ mod tests {
         };
         let tokens = Arc::new(EntraTokens::new(
             Token {
-                secret: "first".into(),
+                secret: Secret::new("first"),
                 expires_at: base + Duration::from_secs(3600),
             },
-            Some("kept".into()),
+            Some(Secret::new("kept")),
             false,
             renew,
             now,
