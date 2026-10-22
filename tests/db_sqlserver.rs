@@ -3183,6 +3183,8 @@ async fn sqlserver_a_script_count_says_when_it_may_hold_trigger_rows_or_is_missi
             "DROP TABLE IF EXISTS dbo.count_probe_quiet",
             "DROP TABLE IF EXISTS dbo.count_probe_log",
             "DROP TABLE IF EXISTS dbo.count_probe_copy",
+            "DROP TABLE IF EXISTS dbo.count_probe_guard",
+            "CREATE TABLE dbo.count_probe_guard (a int)",
             "CREATE TABLE dbo.count_probe (a int)",
             "CREATE TABLE dbo.count_probe_quiet (a int)",
             "CREATE TABLE dbo.count_probe_log (a int)",
@@ -3197,7 +3199,13 @@ async fn sqlserver_a_script_count_says_when_it_may_hold_trigger_rows_or_is_missi
          CROSS JOIN (VALUES (1), (2), (3)) v (x)\nGO\n\
          CREATE TRIGGER dbo.count_probe_quiet_ins ON dbo.count_probe_quiet AFTER INSERT AS \
          BEGIN SET NOCOUNT ON INSERT INTO dbo.count_probe_log SELECT a FROM inserted \
-         CROSS JOIN (VALUES (1), (2)) v (x) END",
+         CROSS JOIN (VALUES (1), (2)) v (x) END\nGO\n\
+         CREATE TRIGGER dbo.count_probe_guard_ins ON dbo.count_probe_guard AFTER INSERT AS \
+         IF @@ROWCOUNT = 0 RETURN\nSET NOCOUNT ON\n\
+         INSERT INTO dbo.count_probe_log SELECT a FROM inserted \
+         CROSS JOIN (VALUES (1), (2)) v (x)\nGO\n\
+         CREATE TRIGGER dbo.count_probe_upd ON dbo.count_probe AFTER UPDATE AS \
+         INSERT INTO dbo.count_probe_log VALUES (1), (2), (3)",
     )
     .await
     .unwrap();
@@ -3210,6 +3218,15 @@ async fn sqlserver_a_script_count_says_when_it_may_hold_trigger_rows_or_is_missi
         // A trigger under NOCOUNT ON sends nothing: the one count is the
         // statement's.
         ("INSERT INTO dbo.count_probe_quiet VALUES (1)", "affected 1"),
+        // The usual trigger guard sends a 0 of its own: the one count that
+        // isn't 0 is the statement's.
+        ("INSERT INTO dbo.count_probe_guard VALUES (1)", "affected 1"),
+        // A statement matching nothing, whose trigger wrote three rows: the
+        // last count is the statement's 0, and the sum still says so.
+        (
+            "UPDATE dbo.count_probe SET a = a WHERE 1 = 0",
+            "affected 3 in total",
+        ),
         // Two statements in one, no trigger: still several counts.
         (
             "INSERT INTO dbo.count_probe_quiet VALUES (1) \
@@ -3250,6 +3267,7 @@ async fn sqlserver_a_script_count_says_when_it_may_hold_trigger_rows_or_is_missi
             "DROP TABLE dbo.count_probe_quiet",
             "DROP TABLE dbo.count_probe_log",
             "DROP TABLE dbo.count_probe_copy",
+            "DROP TABLE dbo.count_probe_guard",
         ],
     )
     .await;
@@ -3307,11 +3325,11 @@ async fn sqlserver_script_temp_tables_last_the_run() {
         ),
         // What keeps a statement on `sp_executesql`, its temp table with it.
         // A write: a plain batch carries no counts, and this one's is 2 —
-        // summed with the CREATE's count-less 0, so said to be a sum.
+        // after the CREATE's count-less 0, which adds nothing.
         (
             "CREATE TABLE #w (a int) INSERT INTO #w VALUES (1), (2)\nGO\nSELECT a FROM #w",
             vec![
-                "affected 2 in total".to_string(),
+                affected(2),
                 "statement 1 failed [Full] code 208 line 1".to_string(),
             ],
         ),

@@ -2348,8 +2348,9 @@ pub(crate) fn tsql_route(sql: &str, held_for_run: bool) -> TsqlRoute {
 /// - **Writes and opaque statements** (`INSERT`, `UPDATE`, `DELETE`,
 ///   `MERGE`, `TRUNCATE`, [`TSQL_OPAQUE_WORDS`]), and **an `INTO` anywhere
 ///   but a read's own temp table**: tiberius reports no affected-row counts
-///   for a plain batch, so a write in one would report 0 rows affected. A
-///   read (`SELECT … INTO #t`) never reported a count; anything else that
+///   for a plain batch, so a write in one would report no count
+///   ([`RowsAffected::Unreported`]) where it has one. A read (`SELECT … INTO
+///   #t`) never reported a count; anything else that
 ///   fills a table through `INTO` — a permanent one, or a temp table in a
 ///   statement led by `IF` or `DECLARE` — did.
 ///
