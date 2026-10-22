@@ -26,7 +26,7 @@ use hubro::db::{
     Capabilities, CheckedStatement, DbError, DbPool, Dialect, ExportFormat, Filter, Generated,
     OpenTransaction, PageRequest, Restriction, Rollback, RowCount, RowIdentity, RowLocator,
     ScriptDone, SortDir, StagedChange, StatementOutcome, TableKind, TableMeta, TypeDetail, Value,
-    INSTEAD_OF_TRIGGER, PREVIEW_BYTES, QUERY_CELL_CAP,
+    INSTEAD_OF_TRIGGER, MISSING_ROW, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
 async fn test_url() -> Option<String> {
@@ -1735,6 +1735,15 @@ async fn sqlserver_bounded_page_previews_large_text_and_binary() {
     } else {
         panic!("expected full blob");
     }
+    // Deleted underneath the grid: an error, never a NULL value.
+    run_all(&pool, &["DELETE FROM dbo.bounded_docs WHERE id = 1"]).await;
+    match pool
+        .fetch_cell(&docs, &identity, &locator, "big_text")
+        .await
+    {
+        Err(DbError::Query(message)) => assert_eq!(message, MISSING_ROW),
+        other => panic!("a deleted row's cell must not load: {other:?}"),
+    }
 
     run_all(&pool, &["DROP TABLE dbo.bounded_docs"]).await;
     pool.close().await;
@@ -2306,15 +2315,10 @@ async fn sqlserver_an_alias_of_sql_variant_is_refused_as_a_key_too() {
     let locator = RowLocator {
         identity_values: vec![page.result.rows[0][0].clone()],
     };
-    let cell = pool
-        .fetch_cell(&keys, &forced, &locator, "body")
-        .await
-        .unwrap();
-    assert_eq!(
-        cell.value,
-        Value::Null,
-        "the int variant's key finds no row"
-    );
+    match pool.fetch_cell(&keys, &forced, &locator, "body").await {
+        Err(DbError::Query(message)) => assert_eq!(message, MISSING_ROW),
+        other => panic!("the int variant's key finds no row, so nothing loads: {other:?}"),
+    }
 
     assert_eq!(detect_row_identity(&keys, Dialect::SqlServer), None);
     assert!(
