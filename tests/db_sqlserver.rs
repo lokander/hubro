@@ -3188,6 +3188,12 @@ async fn sqlserver_script_temp_tables_last_the_run() {
              INSERT INTO #b VALUES (3)\nGO\nSELECT a FROM [#b]",
             vec![affected(0), affected(1), rows(3)],
         ),
+        // Sequential, through the read path: `SELECT … INTO` on the script's
+        // own connection rather than in hubro's transaction.
+        (
+            "BEGIN TRAN; COMMIT; SELECT 5 AS a INTO #r; SELECT a FROM #r",
+            vec![affected(0), affected(0), "rows []".to_string(), rows(5)],
+        ),
         // Sequential: the script manages its own transaction.
         (
             "BEGIN TRAN; CREATE TABLE #q (a int); INSERT INTO #q VALUES (4); COMMIT; \
@@ -3229,5 +3235,85 @@ async fn sqlserver_script_temp_tables_last_the_run() {
         assert_eq!(mssql_script_outcomes(&pool, sql).await, want, "{sql:?}");
     }
     assert_eq!(mssql_open_transactions(&pool).await, Vec::<Value>::new());
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_a_temp_table_batch_that_loses_the_transaction_stops_the_script() {
+    // A temp-table creator runs as a plain batch, which has no error 266 of
+    // its own. Measured in review before the post-check: a TRY…CATCH swallowed
+    // a DDL trigger's rollback (3609), the batch returned normally with the
+    // transaction gone, the INSERT after it ran in autocommit and kept its
+    // row, and the run failed only at its COMMIT (3902). Through
+    // `sp_executesql`, 266 had stopped it at once with nothing kept.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP TRIGGER IF EXISTS lost_tx_ddl ON DATABASE",
+            "DROP TABLE IF EXISTS dbo.lost_tx",
+            "CREATE TABLE dbo.lost_tx (a int)",
+        ],
+    )
+    .await;
+    mssql_script(
+        &pool,
+        "CREATE TRIGGER lost_tx_ddl ON DATABASE FOR CREATE_TABLE AS \
+         IF EVENTDATA().value('(/EVENT_INSTANCE/ObjectName)[1]', 'nvarchar(256)') \
+         LIKE 'lost_tx_refused%' ROLLBACK",
+    )
+    .await
+    .unwrap();
+    let creator = "DECLARE @q int BEGIN TRY CREATE TABLE #t (a int) \
+                   CREATE TABLE dbo.lost_tx_refused (a int) END TRY BEGIN CATCH PRINT 'x' END CATCH";
+    let cases = [
+        // Atomic: hubro's transaction is gone, as after a 266.
+        (
+            format!(
+                "INSERT INTO dbo.lost_tx VALUES (0)\nGO\n{creator}\nGO\n\
+                 INSERT INTO dbo.lost_tx VALUES (1)"
+            ),
+            "affected 1",
+            "statement 1 failed [AlreadyEnded]",
+        ),
+        // Sequential: the script's own transaction, the same way.
+        (
+            format!(
+                "BEGIN TRAN\nGO\nINSERT INTO dbo.lost_tx VALUES (0)\nGO\n{creator}\nGO\n\
+                 INSERT INTO dbo.lost_tx VALUES (1)\nGO\nCOMMIT"
+            ),
+            "affected 1",
+            "statement 2 failed [None]",
+        ),
+    ];
+    for (sql, ran, failed) in cases {
+        run_all(&pool, &["DELETE FROM dbo.lost_tx"]).await;
+        let outcomes = mssql_script_outcomes(&pool, &sql).await;
+        assert_eq!(
+            outcomes.iter().filter(|o| *o == ran).count(),
+            1,
+            "{sql:?}: {outcomes:?}"
+        );
+        let last = outcomes.last().unwrap();
+        assert!(
+            last.starts_with(failed) && last.contains("@@TRANCOUNT 1 before it, 0 after"),
+            "{sql:?}: {outcomes:?}"
+        );
+        let rows = pool
+            .query("SELECT count(*) FROM dbo.lost_tx")
+            .await
+            .unwrap();
+        assert_eq!(rows.rows[0][0], Value::Integer(0), "{sql:?}: a row escaped");
+        assert_eq!(mssql_open_transactions(&pool).await, Vec::<Value>::new());
+    }
+    run_all(
+        &pool,
+        &[
+            "DROP TRIGGER lost_tx_ddl ON DATABASE",
+            "DROP TABLE dbo.lost_tx",
+        ],
+    )
+    .await;
     pool.close().await;
 }

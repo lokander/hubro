@@ -41,7 +41,7 @@ use crate::db::entra::{EntraTokens, Secret};
 use crate::db::error::DbError;
 use crate::db::export::{export_io_err, ExportFormat, ExportSink};
 use crate::db::registry::RolledBack;
-use crate::db::script::{final_read_may_close, statement_needs, tsql_runs_as_batch};
+use crate::db::script::{final_read_may_close, statement_needs, tsql_route, TsqlRoute};
 use crate::db::staged::CheckedStatement;
 use crate::db::value::{cap_value, ColumnInfo, QueryResult, Value};
 
@@ -813,7 +813,7 @@ trait RowSink {
 /// result set). The one copy of the TDS result loop: the buffered, capped and
 /// export paths differ only in their sinks. `batch` sends `sql` as a plain
 /// batch, with no parameters, rather than through `sp_executesql`
-/// ([`tsql_runs_as_batch`]); the rows come back the same either way.
+/// ([`tsql_route`]); the rows come back the same either way.
 ///
 /// Returns the sink and whether the stream was abandoned with data still
 /// unread — the sink stopped early, or a second result set arrived. Only the
@@ -915,8 +915,9 @@ fn statement_rows(counts: &[u64]) -> u64 {
 ///
 /// On a run's own connection, a statement that creates a temp table runs as
 /// a plain batch as well, so the table lasts the run
-/// ([`tsql_creates_temp_table`](crate::db::script::tsql_creates_temp_table)).
-/// `batch` is [`tsql_runs_as_batch`]'s answer for all three. A plain batch
+/// ([`tsql_creates_temp_table`](crate::db::script::tsql_creates_temp_table)),
+/// and the caller checks it with [`checked_batch`]. `batch` is whether
+/// [`tsql_route`] sends it as a plain batch, for all three. A plain batch
 /// reports 0: tiberius's `simple_query` carries no affected-row counts at
 /// all, which is why a statement that writes rows is never sent as one.
 ///
@@ -944,6 +945,105 @@ async fn run_batch(client: &mut TdsClient, sql: &str) -> Result<(), TdsError> {
     Ok(())
 }
 
+/// A connection's transaction state: `@@TRANCOUNT`, and the open
+/// transaction's `CURRENT_TRANSACTION_ID()` when there is one (outside a
+/// transaction every statement gets an id of its own, so it says nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransactionState {
+    count: i32,
+    id: Option<i64>,
+}
+
+const TRANSACTION_STATE: &str =
+    "SELECT @@TRANCOUNT, CASE WHEN @@TRANCOUNT > 0 THEN CURRENT_TRANSACTION_ID() END";
+
+/// Reads [`TransactionState`], as a plain batch of its own. `None` when the
+/// answer did not come back as asked, which no comparison accepts.
+async fn transaction_state(client: &mut TdsClient) -> Result<Option<TransactionState>, TdsError> {
+    let row = client
+        .simple_query(TRANSACTION_STATE)
+        .await?
+        .into_row()
+        .await?;
+    Ok(row.and_then(|row| {
+        Some(TransactionState {
+            count: row.get::<i32, _>(0)?,
+            id: row.get::<i64, _>(1),
+        })
+    }))
+}
+
+/// A statement sent as a [`TsqlRoute::CheckedBatch`] left the connection's
+/// transaction state other than it found it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransactionChanged {
+    before: Option<TransactionState>,
+    after: Option<TransactionState>,
+}
+
+impl TransactionChanged {
+    /// The statement's error. Not a success, whatever the batch reported:
+    /// through `sp_executesql` the server fails such a statement with error
+    /// 266, and the run then reports what its rollback found, as it does
+    /// after a 266 — on the atomic path, hubro's transaction already ended.
+    fn error(self) -> DbError {
+        let count = |state: Option<TransactionState>| {
+            state.map_or_else(|| "unknown".to_string(), |s| s.count.to_string())
+        };
+        DbError::Query(format!(
+            "the statement changed the open transaction (@@TRANCOUNT {} before it, {} after, \
+             or another transaction in its place) without an error reaching hubro — a trigger \
+             or a deadlock can roll it back inside TRY…CATCH. It ran as a plain batch so its \
+             temp table could outlast it, and is stopped here as error 266 would stop it \
+             through sp_executesql",
+            count(self.before),
+            count(self.after),
+        ))
+    }
+}
+
+/// Whether a checked batch left the transaction state as it found it: the
+/// same `@@TRANCOUNT` and, inside a transaction, the same transaction. An
+/// unknown state on either side is a change.
+fn transaction_unchanged(
+    before: Option<TransactionState>,
+    after: Option<TransactionState>,
+) -> bool {
+    before.is_some() && before == after
+}
+
+/// Runs `body`, and for a [`TsqlRoute::CheckedBatch`] reads the
+/// connection's transaction state before and after it.
+///
+/// The guard a plain batch needs in place of error 266, which only
+/// `sp_executesql` raises: there the server refuses to return with
+/// `@@TRANCOUNT` changed, *whatever* changed it. A word list cannot stand in
+/// for that — measured in review, a temp-table creator inside `BEGIN TRY …
+/// END TRY BEGIN CATCH … END CATCH` whose DDL a database trigger rolled back
+/// (3609; a deadlock victim, 1205, the same) returned normally with hubro's
+/// transaction gone, and the `INSERT` after it ran in autocommit and
+/// persisted under a run reported as failed. The state is read in requests of
+/// its own rather than appended to the statement's text: a batch can end
+/// early (`RETURN`) and carries result sets of its own. Two round trips, for
+/// temp-table creators only.
+async fn checked_batch<T>(
+    client: &mut TdsClient,
+    route: TsqlRoute,
+    body: impl AsyncFnOnce(&mut TdsClient) -> Result<T, TdsError>,
+) -> Result<Result<T, TransactionChanged>, TdsError> {
+    if route != TsqlRoute::CheckedBatch {
+        return body(client).await.map(Ok);
+    }
+    let before = transaction_state(client).await?;
+    let out = body(client).await?;
+    let after = transaction_state(client).await?;
+    Ok(if transaction_unchanged(before, after) {
+        Ok(out)
+    } else {
+        Err(TransactionChanged { before, after })
+    })
+}
+
 pub async fn query_with(
     pool: &MssqlPool,
     sql: &str,
@@ -966,7 +1066,8 @@ pub async fn query_with(
 /// affected-row count.
 pub async fn execute(pool: &MssqlPool, sql: &str) -> Result<u64, DbError> {
     let mut conn = pool.acquire().await?;
-    let batch = tsql_runs_as_batch(sql, false);
+    // Never a checked batch: that route is a run's own connection's.
+    let batch = tsql_route(sql, false) != TsqlRoute::Rpc;
     let result = conn
         .request(async |c| run_statement(c, sql, batch).await)
         .await;
@@ -1030,7 +1131,7 @@ pub async fn query_capped_conn(
 /// [`query_capped_conn`] on any connection held across statements. A
 /// truncated read keeps the connection for the same reason in both: the
 /// script may have a transaction of its own open on it. `held_for_run`: the
-/// connection is discarded when the run ends ([`tsql_runs_as_batch`]).
+/// connection is discarded when the run ends ([`tsql_route`]).
 async fn query_capped_held(
     conn: &mut PooledConn,
     held_for_run: bool,
@@ -1041,11 +1142,17 @@ async fn query_capped_held(
     if conn.is_discarded() {
         return Err(lost_connection());
     }
-    let batch = tsql_runs_as_batch(sql, held_for_run);
+    let route = tsql_route(sql, held_for_run);
+    let batch = route != TsqlRoute::Rpc;
     let result = conn
-        .request(async |c| run_query_capped(c, sql, &[], batch, max_rows, cell_cap).await)
+        .request(async |c| {
+            checked_batch(c, route, async |c| {
+                run_query_capped(c, sql, &[], batch, max_rows, cell_cap).await
+            })
+            .await
+        })
         .await;
-    let (result, truncated, _abandoned) = settle(conn, result, sql)?;
+    let (result, truncated, _abandoned) = settle(conn, result, sql)?.map_err(|c| c.error())?;
     Ok((result, truncated))
 }
 
@@ -1206,7 +1313,7 @@ pub async fn execute_conn(tx: &mut MssqlTx, sql: &str) -> Result<u64, DbError> {
 
 /// One script statement on a connection held across statements — a script
 /// transaction's or a [`MssqlScriptConn`]'s. `held_for_run`: the connection
-/// is discarded when the run ends ([`tsql_runs_as_batch`]).
+/// is discarded when the run ends ([`tsql_route`]).
 async fn execute_held(
     conn: &mut PooledConn,
     held_for_run: bool,
@@ -1215,11 +1322,14 @@ async fn execute_held(
     if conn.is_discarded() {
         return Err(lost_connection());
     }
-    let batch = tsql_runs_as_batch(sql, held_for_run);
+    let route = tsql_route(sql, held_for_run);
+    let batch = route != TsqlRoute::Rpc;
     let result = conn
-        .request(async |c| run_statement(c, sql, batch).await)
+        .request(async |c| {
+            checked_batch(c, route, async |c| run_statement(c, sql, batch).await).await
+        })
         .await;
-    settle(conn, result, sql)
+    settle(conn, result, sql)?.map_err(|c| c.error())
 }
 
 /// [`execute_conn`] with bound parameters — the write path for a batch of
@@ -1455,11 +1565,17 @@ pub async fn finish_script_conn_with_read(
             };
         }
     };
-    let batch = tsql_runs_as_batch(sql, true);
+    let route = tsql_route(sql, true);
+    let batch = route != TsqlRoute::Rpc;
     let read = held
-        .request(async |c| run_query_capped(c, sql, &[], batch, max_rows, cell_cap).await)
+        .request(async |c| {
+            checked_batch(c, route, async |c| {
+                run_query_capped(c, sql, &[], batch, max_rows, cell_cap).await
+            })
+            .await
+        })
         .await;
-    match settle(held, read, sql) {
+    match settle(held, read, sql).and_then(|read| read.map_err(|c| c.error())) {
         Ok((result, truncated, abandoned)) if truncated || abandoned => {
             held.discard();
             FinishedRead {
@@ -1554,6 +1670,30 @@ fn io_to_tds(err: std::io::Error) -> TdsError {
 mod tests {
     use super::*;
     use crate::db::sqlserver::mssql_url_via_local_port;
+
+    #[test]
+    fn a_checked_batch_must_leave_the_same_transaction_open() {
+        let state = |count, id| Some(TransactionState { count, id });
+        assert!(transaction_unchanged(state(1, Some(7)), state(1, Some(7))));
+        assert!(transaction_unchanged(state(0, None), state(0, None)));
+        for (before, after) in [
+            // Rolled back (a trigger, a deadlock), or committed.
+            (state(1, Some(7)), state(0, None)),
+            // Ended and another opened in its place.
+            (state(1, Some(7)), state(1, Some(8))),
+            // One opened, or nested.
+            (state(0, None), state(1, Some(8))),
+            (state(1, Some(7)), state(2, Some(7))),
+            // Not answered: nothing to vouch for.
+            (None, None),
+            (state(1, Some(7)), None),
+        ] {
+            assert!(
+                !transaction_unchanged(before, after),
+                "{before:?} -> {after:?}"
+            );
+        }
+    }
 
     #[test]
     fn tunneled_config_keeps_the_logical_host_for_tls() {
