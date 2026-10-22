@@ -63,7 +63,6 @@ Docs-only changes (CLAUDE.md, README, etc.) may be committed directly to `main`;
 - Batch each agent's mutation checks into one script. Commit first: the script restores with `git checkout`, which wipes uncommitted edits.
 - Run targeted tests while iterating, and the full suite once before pushing.
 - Reviewers reuse the author's measurements and re-review through `git range-diff`.
-- Keep the cold second reviewer (step 3) for consent, security and data-integrity changes (transactions, writes) and nowhere else. On a transaction fix it caught regressions the first reviewer had missed.
 - Don't move re-reviews to a cheaper model: a fix can bring in a new bug that a weaker check misses.
 
 A same-area finding (the same bug class one hop away, a stale comment, a small adjacent fix) gets fixed in the PR it was found in, not filed as a follow-up.
