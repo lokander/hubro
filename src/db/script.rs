@@ -22,6 +22,7 @@ use super::registry::{
     QUERY_CELL_CAP,
 };
 use super::sql::Dialect;
+use super::value::Capped;
 use super::value::QueryResult;
 
 /// One lexed region of a SQL script. [`lex_regions`] is the single place
@@ -1564,6 +1565,21 @@ pub struct StatementResult {
     /// holds only the first N rows — the editor shows a "showing
     /// first N" indicator. Always false for writes.
     pub truncated: bool,
+    /// True when the server stopped a truncated read at the cap rather than
+    /// running it to its end — cancelled, or ended with its connection — so
+    /// whatever the rows past the cap would have done was not done. The
+    /// editor says so beside the truncation notice.
+    pub rest_cancelled: bool,
+}
+
+/// A read's outcome as a run reports it: its rows, whether the row cap cut
+/// it short, and whether its rest was then stopped.
+fn rows_outcome(dialect: Dialect, capped: Capped) -> (StatementOutcome, bool, bool) {
+    (
+        read_outcome(dialect, capped.result),
+        capped.truncated,
+        capped.rest_cancelled,
+    )
 }
 
 /// What a failed script's rollback actually undid — the state the editor
@@ -1883,7 +1899,7 @@ async fn run_script_sequential(
                 )
                 .await;
             ended = Some(end);
-            read.map(|(result, truncated)| (read_outcome(pool.dialect(), result), truncated))
+            read.map(|capped| rows_outcome(pool.dialect(), capped))
         } else if reads {
             held.query_capped_to(
                 statement,
@@ -1891,17 +1907,18 @@ async fn run_script_sequential(
                 cell_cap(statement, pool.dialect()),
             )
             .await
-            .map(|(result, truncated)| (read_outcome(pool.dialect(), result), truncated))
+            .map(|capped| rows_outcome(pool.dialect(), capped))
         } else {
             held.execute(statement)
                 .await
-                .map(|affected| (StatementOutcome::Affected(affected), false))
+                .map(|affected| (StatementOutcome::Affected(affected), false, false))
         };
         match outcome {
-            Ok((outcome, truncated)) => on_result(StatementResult {
+            Ok((outcome, truncated, rest_cancelled)) => on_result(StatementResult {
                 preview: statement_preview(statement),
                 outcome,
                 truncated,
+                rest_cancelled,
             }),
             Err(error) => {
                 failure = Some((statement_index, error));
@@ -2001,21 +2018,22 @@ async fn run_script_read_only(
                 .expect("held until the last statement")
                 .finish_with_read(statement, MAX_QUERY_ROWS, cell_cap(statement, dialect))
                 .await
-                .map(|(result, truncated)| (StatementOutcome::Rows(result), truncated))
+                .map(|capped| rows_outcome(dialect, capped))
         } else if reads {
             held.query_capped_to(statement, MAX_QUERY_ROWS, cell_cap(statement, dialect))
                 .await
-                .map(|(result, truncated)| (read_outcome(dialect, result), truncated))
+                .map(|capped| rows_outcome(dialect, capped))
         } else {
             held.execute(statement)
                 .await
-                .map(|affected| (StatementOutcome::Affected(affected), false))
+                .map(|affected| (StatementOutcome::Affected(affected), false, false))
         };
         match result {
-            Ok((result, truncated)) => on_result(StatementResult {
+            Ok((result, truncated, rest_cancelled)) => on_result(StatementResult {
                 preview: statement_preview(statement),
                 outcome: result,
                 truncated,
+                rest_cancelled,
             }),
             Err(error) => {
                 outcome = Err(ScriptError {
@@ -2069,17 +2087,18 @@ async fn run_script_atomic(
                 cell_cap(statement, pool.dialect()),
             )
             .await
-            .map(|(result, truncated)| (read_outcome(pool.dialect(), result), truncated))
+            .map(|capped| rows_outcome(pool.dialect(), capped))
         } else {
             tx.execute(statement)
                 .await
-                .map(|affected| (StatementOutcome::Affected(affected), false))
+                .map(|affected| (StatementOutcome::Affected(affected), false, false))
         };
         match outcome {
-            Ok((outcome, truncated)) => on_result(StatementResult {
+            Ok((outcome, truncated, rest_cancelled)) => on_result(StatementResult {
                 preview: statement_preview(statement),
                 outcome,
                 truncated,
+                rest_cancelled,
             }),
             Err(error) => {
                 let found = tx.rollback().await;
@@ -2530,11 +2549,11 @@ fn names_temp_table(tokens: &[NameToken]) -> bool {
 ///   read. On SQL Server, where a cut-short read's connection is discarded,
 ///   that is what keeps the write: discarded, it was aborted with the
 ///   session. On Postgres it changes no data outcome — a cut-short read with
-///   nothing open is read to the end in the background before its
-///   connection closes, and one inside an open transaction is rolled back either
-///   way — and decides only whether a write that fails after the cap is
-///   reported, read to the end before the run ends, or lost in the
-///   background read.
+///   nothing open is cancelled only if it has written nothing and otherwise
+///   read to the end (`postgres::writable_capped_read`), and one inside an
+///   open transaction is rolled back either way — and decides only whether a
+///   write that fails after the cap is reported, read to the end before the
+///   run ends, or lost in the background read.
 /// - **SQLite** never asks: its read is followed by the ordinary end.
 ///
 /// A false "no" costs only the wait for the rest of the result, as every

@@ -943,6 +943,7 @@ mod tests {
                 rows: vec![vec![Value::Integer(1)]],
             }),
             truncated: false,
+            rest_cancelled: false,
         });
         dom.in_runtime(|| {
             let (mut sources, mut statuses) = (state.sql_export_sources, state.export_status);

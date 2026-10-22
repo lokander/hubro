@@ -1027,15 +1027,56 @@ async fn sqlite_cancelled_script_does_not_return_its_transaction_to_the_pool() {
     pool.close().await;
 }
 
-/// A read with far more rows than the cap — two billion, generated as they
-/// are sent (a set-returning function in the select list streams; in `FROM`
-/// it would be materialized first). Reading the rest of it after the cap
-/// would take minutes.
-const PG_ENDLESS_READ: &str = "SELECT generate_series(1, 2000000000)";
+/// A read with far more rows than the cap — two hundred million, generated as
+/// they are sent (a set-returning function in the select list streams; in
+/// `FROM` it would be materialized first). Reading the rest of it after the
+/// cap takes about 45 s on localhost, so a run that waits for it is told
+/// apart from one that does not by the clock.
+const PG_ENDLESS_READ: &str = "SELECT generate_series(1, 200000000)";
 
-// Multi-threaded, as the app's runtime is: a capped read with nothing
-// open has the rest read in a background task before its connection closes,
-// which on a single-threaded runtime holds the thread until it is done.
+/// The longest a run may take that does not read the rest of
+/// [`PG_ENDLESS_READ`]. Asserted on the clock, not with `tokio::time::timeout`:
+/// a timeout cannot fire while the run is reading the rest in one poll, which
+/// is what a run that waits for it does on localhost.
+const NOT_READ_TO_ITS_END: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How many sessions are still running [`PG_ENDLESS_READ`], waiting up to five
+/// seconds for the count to reach zero. The pattern is split so that this
+/// question does not match itself.
+async fn pg_sessions_still_reading(pool: &DbPool) -> Value {
+    let sql = "SELECT count(*) FROM pg_stat_activity \
+               WHERE pid <> pg_backend_pid() AND state = 'active' \
+               AND query LIKE '%generate' || '_series(1, 200000000)%'";
+    let mut running = count(pool, sql).await;
+    for _ in 0..50 {
+        if running == Value::Integer(0) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        running = count(pool, sql).await;
+    }
+    running
+}
+
+/// Runs `sql` as a script, asserting it did not wait for the rest of a read.
+async fn collect_promptly(
+    pool: &DbPool,
+    sql: &str,
+) -> (
+    Vec<StatementResult>,
+    Result<hubro::db::ScriptDone, hubro::db::ScriptError>,
+) {
+    let started = std::time::Instant::now();
+    let collected = collect_script(pool, sql).await;
+    let took = started.elapsed();
+    assert!(
+        took < NOT_READ_TO_ITS_END,
+        "{sql}: waited {took:?} for the rest of a read"
+    );
+    collected
+}
+
+// Multi-threaded, as the app's runtime is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_script_ending_in_a_capped_read_does_not_wait_for_the_rest() {
     // Ending a run asks the connection whether the script left a transaction
@@ -1052,43 +1093,24 @@ async fn postgres_script_ending_in_a_capped_read_does_not_wait_for_the_rest() {
         .await
         .unwrap();
     common::open_several_connections(&pool, "SELECT pg_sleep(0.2)").await;
-    let bound = std::time::Duration::from_secs(30);
 
-    let (results, outcome) = tokio::time::timeout(bound, collect_script(&pool, PG_ENDLESS_READ))
-        .await
-        .expect("a capped read must not wait for the rest of its result");
+    let (results, outcome) = collect_promptly(&pool, PG_ENDLESS_READ).await;
     assert_eq!(outcome, Ok(ScriptDone::default()));
     assert!(results[0].truncated);
-    // With nothing open, the rest is read in the background before the
-    // connection closes — two billion rows here, so end that session rather
-    // than let it run on behind the test.
-    let terminated = count(
-        &pool,
-        &format!(
-            "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity \
-             WHERE datname = current_database() AND pid <> pg_backend_pid() \
-             AND query = '{PG_ENDLESS_READ}'"
-        ),
-    )
-    .await;
-    assert_eq!(
-        terminated,
-        Value::Integer(1),
-        "the read is still being drained"
-    );
+    // It had written nothing, so the rest was cancelled rather than read in
+    // the background — and the server stopped running it.
+    assert!(results[0].rest_cancelled);
+    assert_eq!(pg_sessions_still_reading(&pool).await, Value::Integer(0));
 
     // The same read at the end of a script inside its own transaction: the
     // transaction is still rolled back, and said to be.
-    let (results, outcome) = tokio::time::timeout(
-        bound,
-        collect_script(
-            &pool,
-            &format!("BEGIN; INSERT INTO capped_tx VALUES (1); {PG_ENDLESS_READ}"),
-        ),
+    let (results, outcome) = collect_promptly(
+        &pool,
+        &format!("BEGIN; INSERT INTO capped_tx VALUES (1); {PG_ENDLESS_READ}"),
     )
-    .await
-    .expect("a capped read must not wait for the rest of its result");
+    .await;
     assert!(results[2].truncated);
+    assert!(results[2].rest_cancelled, "ended with its connection");
     assert_eq!(
         outcome,
         Ok(ScriptDone {
@@ -1103,8 +1125,169 @@ async fn postgres_script_ending_in_a_capped_read_does_not_wait_for_the_rest() {
         count(&pool, "SELECT count(*) FROM capped_tx").await,
         Value::Integer(0)
     );
+    assert_eq!(pg_sessions_still_reading(&pool).await, Value::Integer(0));
     pool.execute("DROP TABLE capped_tx").await.unwrap();
     pool.close().await;
+}
+
+// Multi-threaded, as the app's runtime is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_capped_read_that_has_written_nothing_is_cancelled_wherever_it_runs() {
+    // A writable connection's read cut short at the row cap is cancelled when
+    // its transaction has written nothing — before another statement as well
+    // as last, on the atomic path and the sequential one, in a transaction or
+    // not — and every statement after it still runs.
+    let Some(url) = pg_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.execute("DROP TABLE IF EXISTS capped_after")
+        .await
+        .unwrap();
+    pool.execute("CREATE TABLE capped_after (a integer)")
+        .await
+        .unwrap();
+    let scripts = [
+        // Atomic: hubro's transaction, read in a savepoint.
+        (format!("{PG_ENDLESS_READ}; SELECT 1"), 0, Some(1)),
+        // Sequential (the script's `COMMIT`), outside a transaction.
+        (format!("{PG_ENDLESS_READ}; COMMIT"), 0, None),
+        // Sequential, inside the script's own transaction: the cancel must
+        // not abort it, or the `INSERT` fails with "current transaction is
+        // aborted" and the `COMMIT` rolls back.
+        (
+            format!("BEGIN; {PG_ENDLESS_READ}; INSERT INTO capped_after VALUES (1); COMMIT"),
+            1,
+            None,
+        ),
+    ];
+    for (script, read, then_one) in scripts {
+        let (results, outcome) = collect_promptly(&pool, &script).await;
+        assert_eq!(outcome, Ok(ScriptDone::default()), "{script}");
+        assert!(results[read].truncated, "{script}");
+        assert!(results[read].rest_cancelled, "{script}");
+        if let Some(after) = then_one {
+            match &results[after].outcome {
+                StatementOutcome::Rows(rows) => {
+                    assert_eq!(rows.rows, vec![vec![Value::Integer(1)]], "{script}")
+                }
+                other => panic!("{script}: {other:?}"),
+            }
+        }
+        assert_eq!(
+            pg_sessions_still_reading(&pool).await,
+            Value::Integer(0),
+            "{script}: the server is still sending the rest"
+        );
+    }
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM capped_after").await,
+        Value::Integer(1),
+        "the statement after the cancelled read was committed"
+    );
+    pool.execute("DROP TABLE capped_after").await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_capped_read_after_a_write_is_read_to_its_end() {
+    // The transaction has an id once anything in it has written — here an
+    // `INSERT` before the read — so the read is not cancelled, and the write
+    // commits with the script.
+    let Some(url) = pg_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    pool.execute("DROP TABLE IF EXISTS capped_before")
+        .await
+        .unwrap();
+    pool.execute("CREATE TABLE capped_before (a integer)")
+        .await
+        .unwrap();
+    for script in [
+        // Atomic.
+        "INSERT INTO capped_before VALUES (1); SELECT generate_series(1, 1000000); SELECT 1",
+        // Sequential, in the script's transaction.
+        "BEGIN; INSERT INTO capped_before VALUES (1); SELECT generate_series(1, 1000000); COMMIT",
+    ] {
+        let (results, outcome) = collect_script(&pool, script).await;
+        assert_eq!(outcome, Ok(ScriptDone::default()), "{script}");
+        let read = results
+            .iter()
+            .find(|r| r.truncated)
+            .unwrap_or_else(|| panic!("{script}: no read was cut short"));
+        assert!(!read.rest_cancelled, "{script}");
+    }
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM capped_before").await,
+        Value::Integer(2)
+    );
+    pool.execute("DROP TABLE capped_before").await.unwrap();
+    pool.close().await;
+}
+
+#[test]
+fn postgres_reading_the_rest_of_a_capped_read_leaves_the_thread_to_others() {
+    // The SQL tab's run is polled on the UI thread, beside everything else on
+    // it. Over localhost a row is always waiting, so reading the rest of a
+    // result never waits: measured before, the rest of 200M rows was read in
+    // one 44 s poll, a 1 s timer beside the run fired after 44 s, and
+    // `abort()` took effect only once the rest was read. Here the rest is
+    // read — a write before the read means it is not cancelled — on a
+    // single thread, like the UI's, and the run must be abortable in a moment.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let Some(url) = pg_url().await else { return };
+        let pool = DbPool::open_postgres(&url).await.unwrap();
+        pool.execute("DROP TABLE IF EXISTS capped_yield")
+            .await
+            .unwrap();
+        pool.execute("CREATE TABLE capped_yield (a integer)")
+            .await
+            .unwrap();
+        let statements = split_statements(
+            &format!("INSERT INTO capped_yield VALUES (1); {PG_ENDLESS_READ}; SELECT 1"),
+            pool.dialect(),
+        );
+        let run_pool = pool.clone();
+        let started = std::time::Instant::now();
+        let run = tokio::task::spawn_local(async move {
+            run_script(
+                &run_pool,
+                run_pool.backend_capabilities(),
+                &statements,
+                |_| {},
+            )
+            .await
+            .is_ok()
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let woke = started.elapsed();
+        run.abort();
+        let aborted = run.await;
+        let resolved = started.elapsed();
+        assert!(
+            woke < std::time::Duration::from_secs(3),
+            "a 1 s timer beside the run fired after {woke:?}"
+        );
+        assert!(
+            matches!(&aborted, Err(e) if e.is_cancelled()),
+            "the run finished instead of being aborted: {aborted:?}"
+        );
+        assert!(
+            resolved < std::time::Duration::from_secs(5),
+            "abort took effect after {resolved:?}"
+        );
+        // The aborted run's connection closes, and the server stops.
+        assert_eq!(pg_sessions_still_reading(&pool).await, Value::Integer(0));
+        assert_eq!(
+            count(&pool, "SELECT count(*) FROM capped_yield").await,
+            Value::Integer(0),
+            "the aborted run's transaction is rolled back"
+        );
+        pool.execute("DROP TABLE capped_yield").await.unwrap();
+        pool.close().await;
+    });
 }
 
 #[tokio::test]
@@ -1179,6 +1362,8 @@ async fn postgres_capped_read_with_a_write_the_gate_cannot_see_keeps_it() {
     .await;
     assert_eq!(outcome, Ok(ScriptDone::default()));
     assert!(results[0].truncated);
+    // It had written when the cap was reached, so it was not cancelled.
+    assert!(!results[0].rest_cancelled);
     let mut kept = Value::Null;
     for _ in 0..300 {
         kept = count(&pool, "SELECT count(*) FROM capped_side").await;
@@ -1191,6 +1376,21 @@ async fn postgres_capped_read_with_a_write_the_gate_cannot_see_keeps_it() {
         kept,
         Value::Integer(20_000),
         "the function's writes must be kept"
+    );
+
+    // The same read before another statement, on the atomic path: read to its
+    // end in the run, and committed with the script.
+    let (results, outcome) = collect_script(
+        &pool,
+        "SELECT capped_bump(g) FROM generate_series(1, 20000) g; SELECT 1",
+    )
+    .await;
+    assert_eq!(outcome, Ok(ScriptDone::default()));
+    assert!(results[0].truncated && !results[0].rest_cancelled);
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM capped_side").await,
+        Value::Integer(40_000),
+        "the function's writes before another statement must be kept"
     );
     pool.execute("DROP FUNCTION capped_bump(integer)")
         .await

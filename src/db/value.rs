@@ -136,6 +136,26 @@ pub struct QueryResult {
     pub rows: Vec<Vec<Value>>,
 }
 
+/// A bounded read: the rows kept, whether rows existed past the cap, and
+/// whether the server stopped the statement there rather than running it to
+/// its end — which the editor says beside the "first N rows" notice.
+#[derive(Debug)]
+pub(crate) struct Capped {
+    pub(crate) result: QueryResult,
+    pub(crate) truncated: bool,
+    pub(crate) rest_cancelled: bool,
+}
+
+impl From<(QueryResult, bool)> for Capped {
+    fn from((result, truncated): (QueryResult, bool)) -> Self {
+        Capped {
+            result,
+            truncated,
+            rest_cancelled: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
