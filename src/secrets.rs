@@ -52,8 +52,8 @@ fn disabled() -> bool {
 }
 
 /// Entries are cached per URL. Real backends don't need this, but the
-/// `mock` backend used in tests stores state inside the Entry instance, so
-/// repeated lookups must reuse the same one.
+/// `mock` backend used in tests ([`new_entry`]) stores state inside the Entry
+/// instance, so repeated lookups must reuse the same one.
 fn entry(url: &str) -> Result<Arc<Entry>, String> {
     if disabled() {
         return Err("keyring disabled by HUBRO_DISABLE_KEYRING".to_string());
@@ -67,9 +67,30 @@ fn entry(url: &str) -> Result<Arc<Entry>, String> {
     if let Some(cached) = cache.get(url) {
         return Ok(cached.clone());
     }
-    let created = Arc::new(Entry::new(SERVICE, url).map_err(|e| e.to_string())?);
+    let created = Arc::new(new_entry(url)?);
     cache.insert(url.to_string(), created.clone());
     Ok(created)
+}
+
+/// The keyring entry for `url`: in the OS's credential store in the app, and
+/// **always in keyring's in-memory mock in this crate's unit tests**.
+///
+/// The mock is chosen here, per entry, rather than by installing it as the
+/// process-wide default builder: that install happened only in the tests that
+/// asked for it, so any other test that reached the keyring — a connect
+/// through a test's `AppState`, say — wrote the developer's real wallet or
+/// not depending on which test ran first. Chosen here, no unit test has a
+/// route to the real store whatever the order. `tests/` links the library
+/// without `cfg(test)`, so `no_integration_test_reaches_the_keyring` keeps
+/// it from naming this module at all.
+fn new_entry(url: &str) -> Result<Entry, String> {
+    if cfg!(test) {
+        let credential = keyring::mock::default_credential_builder()
+            .build(None, SERVICE, url)
+            .map_err(|e| e.to_string())?;
+        return Ok(Entry::new_with_credential(credential));
+    }
+    Entry::new(SERVICE, url).map_err(|e| e.to_string())
 }
 
 /// Stores (or replaces) the password for a connection URL.
@@ -105,35 +126,61 @@ pub fn delete_password(url: &str) -> Result<(), String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::sync::{Mutex as TestMutex, MutexGuard, Once};
+    use std::path::Path;
+    use std::sync::{Mutex as TestMutex, MutexGuard};
 
     // The disable-flag test mutates process-wide env; serialize the module's
     // tests so it can't poison the round-trip test running in parallel.
     static TEST_LOCK: TestMutex<()> = TestMutex::new(());
 
-    /// Routes keyring calls to the mock store, with the disable flag cleared,
-    /// for as long as the guard lives — for tests elsewhere that drive a flow
-    /// through the keyring.
+    /// Holds the module's lock with the disable flag cleared, for as long as
+    /// the guard lives — for tests elsewhere that drive a flow through the
+    /// keyring and need it to answer. Every unit test's keyring is the mock
+    /// whether or not it holds this ([`new_entry`]); what it buys is that no
+    /// other test sets the disable flag mid-flow.
     pub(crate) fn mock_keyring() -> MutexGuard<'static, ()> {
         let guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        use_mock();
         std::env::remove_var("HUBRO_DISABLE_KEYRING");
         guard
     }
 
-    // Route all keyring calls to the crate's in-memory mock store so tests
-    // never touch (or prompt for) the user's real wallet.
-    fn use_mock() {
-        static ONCE: Once = Once::new();
-        ONCE.call_once(|| {
-            keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
-        });
+    /// The guard: in a unit test, an entry is the mock's — asked for first,
+    /// by a test that installed nothing, so no test order can make it real.
+    #[test]
+    fn a_unit_test_reaches_only_the_mock_store() {
+        let _guard = mock_keyring();
+        let entry = entry("postgres://u@h:5432/which-store").unwrap();
+        assert!(
+            entry
+                .get_credential()
+                .downcast_ref::<keyring::mock::MockCredential>()
+                .is_some(),
+            "a unit test reached a real credential store"
+        );
+    }
+
+    /// `tests/` links the library without `cfg(test)`, where [`new_entry`]
+    /// is the OS's store, so no integration test may name this module or the
+    /// keyring crate. The other route there — a connect through an
+    /// `AppState` — is closed by `no_integration_test_names_the_real_paths`.
+    /// Words inside string literals don't count: the help text's test asserts
+    /// that the help *mentions* the keyring.
+    #[test]
+    fn no_integration_test_reaches_the_keyring() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let found =
+            crate::config::tests::words_named_in(&root.join("tests"), &["secrets", "keyring"]);
+        assert!(
+            found.is_empty(),
+            "these reach the user's real keyring; drive the keyring from a \
+             unit test, where it is the mock:\n{}",
+            found.join("\n")
+        );
     }
 
     #[test]
     fn store_get_delete_round_trip() {
         let _guard = TEST_LOCK.lock().unwrap();
-        use_mock();
         // Hermetic even when the developer's shell exports the disable flag
         // (the headless test recipe suggests it).
         std::env::remove_var("HUBRO_DISABLE_KEYRING");
@@ -150,31 +197,34 @@ pub(crate) mod tests {
     }
 
     /// Round-trip against the real OS credential store (Keychain on macOS,
-    /// Credential Manager on Windows, Secret Service on Linux). Must run
-    /// alone — `cargo test real_store_round_trip -- --ignored` — so no other
-    /// test installs the process-wide mock builder first; under
-    /// `--include-ignored`, test ordering decides whether this silently
-    /// exercises the mock or the real store.
+    /// Credential Manager on Windows, Secret Service on Linux), run by hand:
+    /// `cargo test real_store_round_trip -- --ignored`. The one deliberate
+    /// route to the real store in this crate's tests, so it builds its entry
+    /// with `Entry::new` itself — [`entry`] is the mock here — and uses a
+    /// service name of its own, never touching an entry hubro stored.
     #[test]
     #[ignore = "touches the real OS credential store; run alone, manually"]
     fn real_store_round_trip() {
-        let _guard = TEST_LOCK.lock().unwrap();
-        std::env::remove_var("HUBRO_DISABLE_KEYRING");
-        let url = "postgres://hubro-test@localhost:5432/hubro-real-store-test";
-        delete_password(url).unwrap();
-        assert_eq!(get_password(url).unwrap(), None);
-        store_password(url, "s3cret-real").unwrap();
-        assert_eq!(get_password(url).unwrap(), Some("s3cret-real".to_string()));
-        store_password(url, "changed-real").unwrap();
-        assert_eq!(get_password(url).unwrap(), Some("changed-real".to_string()));
-        delete_password(url).unwrap();
-        assert_eq!(get_password(url).unwrap(), None);
+        let entry = Entry::new("hubro-real-store-test", "postgres://hubro-test@localhost/x")
+            .expect("the platform's credential store");
+        let get = || match entry.get_password() {
+            Ok(password) => Some(password),
+            Err(keyring::Error::NoEntry) => None,
+            Err(err) => panic!("{err}"),
+        };
+        let _ = entry.delete_credential();
+        assert_eq!(get(), None);
+        entry.set_password("s3cret-real").unwrap();
+        assert_eq!(get().as_deref(), Some("s3cret-real"));
+        entry.set_password("changed-real").unwrap();
+        assert_eq!(get().as_deref(), Some("changed-real"));
+        entry.delete_credential().unwrap();
+        assert_eq!(get(), None);
     }
 
     #[test]
     fn disable_flag_forces_fallback_errors() {
         let _guard = TEST_LOCK.lock().unwrap();
-        use_mock();
         std::env::set_var("HUBRO_DISABLE_KEYRING", "1");
         let result = get_password("postgres://u@h/db");
         std::env::remove_var("HUBRO_DISABLE_KEYRING");
