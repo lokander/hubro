@@ -1084,10 +1084,15 @@ pub async fn execute_all_checked(
 /// the whole script, its statements tied together by a manual `BEGIN TRAN`.
 /// Must be resolved via [`commit_tx`] or [`rollback_tx`]; a transaction
 /// dropped unresolved discards its connection (never returning one with an
-/// open transaction to the pool).
+/// open transaction to the pool), and a script's ([`begin_script_tx`])
+/// discards it however it ends.
 pub struct MssqlTx {
     conn: PooledConn,
     resolved: bool,
+    /// Set for a script's transaction: what the script left on the session
+    /// (`USE`, `SET CONTEXT_INFO`, a session app lock) must not reach the
+    /// pool — see [`MssqlScriptConn`].
+    discard_after: bool,
     /// `CURRENT_TRANSACTION_ID()` once `BEGIN TRAN` ran: [`rollback_tx`]
     /// compares it to tell this transaction from one a script opened after
     /// committing it.
@@ -1096,10 +1101,18 @@ pub struct MssqlTx {
 
 impl Drop for MssqlTx {
     fn drop(&mut self) {
-        if !self.resolved {
+        if !self.resolved || self.discard_after {
             self.conn.discard();
         }
     }
+}
+
+/// [`begin_tx`] for a script, whose connection is discarded once the
+/// transaction ends rather than returned to the pool.
+pub async fn begin_script_tx(pool: &MssqlPool) -> Result<MssqlTx, DbError> {
+    let mut tx = begin_tx(pool).await?;
+    tx.discard_after = true;
+    Ok(tx)
 }
 
 /// Opens a script transaction on a dedicated pooled connection.
@@ -1116,6 +1129,7 @@ pub async fn begin_tx(pool: &MssqlPool) -> Result<MssqlTx, DbError> {
         Some(id) => Ok(MssqlTx {
             conn,
             resolved: false,
+            discard_after: false,
             id,
         }),
         // Without its id no later answer about this transaction can be
@@ -1237,18 +1251,20 @@ pub async fn rollback_tx(mut tx: MssqlTx) -> RolledBack {
 /// what keeps the script's own transaction on the connection that opened it.
 ///
 /// Ended by [`end_script_conn`], which rolls back whatever transaction the
-/// script left open. The registry's
-/// [`ScriptConn`](crate::db::registry::ScriptConn) discards a connection that
-/// was not ended — a cancelled run — so none goes back to the pool with a
-/// transaction still open on it.
+/// script left open, and then **discarded when dropped, however the run
+/// went** — never returned to the pool, like every script run's connection
+/// ([`ScriptConn`](crate::db::registry::ScriptConn)). Measured before: `USE`,
+/// `SET CONTEXT_INFO`, `EXECUTE AS USER` and `sp_getapplock @LockOwner =
+/// 'Session'` outlived the run on its pooled connection (most `SET` options
+/// did not: each statement is its own `sp_executesql`). `sp_reset_connection`
+/// is not something a TDS client can call, so there is no reset to send.
+/// The server rolls back any transaction left open when the session goes.
 pub struct MssqlScriptConn {
     conn: PooledConn,
 }
 
-impl MssqlScriptConn {
-    /// Drops the connection instead of returning it to the pool. The server
-    /// rolls back any transaction left open on it when the session goes.
-    pub fn discard(&mut self) {
+impl Drop for MssqlScriptConn {
+    fn drop(&mut self) {
         self.conn.discard();
     }
 }
@@ -1336,11 +1352,10 @@ pub async fn finish_script_conn_with_read(
     if !final_read_may_close(sql, crate::db::sql::Dialect::SqlServer) {
         let read = query_capped_held(&mut conn.conn, sql, max_rows, cell_cap).await;
         let ended = end_script_conn(conn).await;
-        let reusable = ended.is_ok();
         return FinishedRead {
             read,
             ended,
-            reusable,
+            drain: false,
         };
     }
     let held = &mut conn.conn;
@@ -1348,7 +1363,7 @@ pub async fn finish_script_conn_with_read(
         return FinishedRead {
             read: Err(lost_connection()),
             ended: Err(lost_connection()),
-            reusable: false,
+            drain: false,
         };
     }
     let before = held
@@ -1373,7 +1388,7 @@ pub async fn finish_script_conn_with_read(
             return FinishedRead {
                 read: Err(error.clone()),
                 ended: Err(error),
-                reusable: false,
+                drain: false,
             };
         }
     };
@@ -1386,17 +1401,16 @@ pub async fn finish_script_conn_with_read(
             FinishedRead {
                 read: Ok((result, truncated)),
                 ended: Ok(open),
-                reusable: false,
+                drain: false,
             }
         }
         read => {
             let read = read.map(|(result, truncated, _)| (result, truncated));
             let ended = end_script_conn(conn).await;
-            let reusable = ended.is_ok();
             FinishedRead {
                 read,
                 ended,
-                reusable,
+                drain: false,
             }
         }
     }
@@ -1733,6 +1747,7 @@ mod tests {
         MssqlTx {
             conn: PooledConn::new(None, inner, permit),
             resolved: false,
+            discard_after: false,
             id: 0,
         }
     }

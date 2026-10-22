@@ -459,8 +459,8 @@ pub async fn end_script_conn(conn: &mut sqlx::sqlite::SqliteConnection) -> Resul
 ///   transaction is closed again — `false`.
 /// - `ROLLBACK` refused, whatever the `BEGIN` did: the connection may still be
 ///   inside a transaction — the probe's, or one nothing could end — so the
-///   error is returned and the caller closes the connection rather than
-///   return it to the pool.
+///   error is returned: hubro cannot say what was open when the connection
+///   closed.
 pub(super) fn script_end(begun: bool, rollback: Result<u64, DbError>) -> Result<bool, DbError> {
     rollback.map(|_| !begun)
 }
@@ -1580,9 +1580,11 @@ mod tests {
     ];
 
     /// What may follow `sqlx_common::` outside the door: the helpers that
-    /// take rows or a transaction, not text.
+    /// take rows, a pool or a transaction, not text.
     const COMMON_ALLOWED: &[&str] = &[
         "get",
+        "acquire_for_run",
+        "begin_for_run",
         "collect_all",
         "collect_capped",
         "export_stream",

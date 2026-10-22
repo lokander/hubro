@@ -559,11 +559,11 @@ fn refused_probe_rolled_back(flavor: PgFlavor, sqlstate: Option<&str>) -> bool {
 ///   handle's rollback ends it afterwards. A read the row cap cut short is
 ///   followed by nothing — the caller closes the connection, which ends the
 ///   transaction server-side and is reported as the rollback it is.
-/// - Nothing is open: a cut-short read goes back to the pool unfinished, and
-///   sqlx reads the rest in the background before reusing it, as every capped
-///   read did before scripts held a connection. Closing instead would abort
-///   a write the gate cannot see (`SELECT f()` for a function that writes),
-///   and costs a reconnect.
+/// - Nothing is open: a cut-short read is left unfinished, and its rest is
+///   read in the background before the connection closes
+///   ([`drain_then_close`]) — what the pool did before reuse while a run's
+///   connection still went back to it. Closing at once would abort a write
+///   the gate cannot see (`SELECT f()` for a function that writes).
 pub async fn finish_script_conn_with_read(
     conn: &mut sqlx::postgres::PgConnection,
     flavor: PgFlavor,
@@ -584,7 +584,7 @@ pub async fn finish_script_conn_with_read(
                     return FinishedRead {
                         read,
                         ended: Ok(true),
-                        reusable: false,
+                        drain: false,
                     };
                 }
                 let ended = open
@@ -592,11 +592,10 @@ pub async fn finish_script_conn_with_read(
                     .await
                     .map(|()| true)
                     .map_err(|e| DbError::Query(e.to_string()));
-                let reusable = ended.is_ok();
                 return FinishedRead {
                     read,
                     ended,
-                    reusable,
+                    drain: false,
                 };
             }
             Err(sqlx::Error::BeginFailed) => true,
@@ -611,16 +610,34 @@ pub async fn finish_script_conn_with_read(
         return FinishedRead {
             read,
             ended: Ok(false),
-            reusable: true,
+            drain: true,
         };
     }
     let ended = end_script_conn(conn, flavor).await;
-    let reusable = ended.is_ok();
     FinishedRead {
         read,
         ended,
-        reusable,
+        drain: false,
     }
+}
+
+/// Reads the rest of a cut-short read in a background task, then closes the
+/// connection — the end of a script run whose last read the row cap cut short
+/// with no transaction open (see [`finish_script_conn_with_read`]).
+///
+/// Read rather than abandoned, because closing a connection mid-result
+/// aborts the statement, and a read can write (`SELECT f()`); in the
+/// background, because the run must not wait for it (measured, 1.3 s for 3M
+/// rows on localhost). Closed rather than returned, as every script run's
+/// connection is ([`ScriptConn`](super::registry::ScriptConn)). The ping is
+/// what the pool sent on a connection's return: sqlx answers it only once
+/// every pending response has been read. The connection keeps its pool slot
+/// until it is closed, as it did while the pool read it.
+pub(super) fn drain_then_close(mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>) {
+    tokio::spawn(async move {
+        let _ = sqlx::Connection::ping(&mut *conn).await;
+        let _ = conn.close().await;
+    });
 }
 
 /// Opens the read-only transaction one statement of a read-only script runs

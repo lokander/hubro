@@ -88,6 +88,11 @@ pub enum DbPool {
 /// helpers — nothing here assumes sqlx, so a variant with a completely
 /// different shape (e.g. an owned pooled connection driving `BEGIN`/`COMMIT`
 /// as manual SQL) can be added without touching the existing arms.
+///
+/// Its connection is **closed once the transaction is resolved**, never
+/// returned to the pool, like every hold a script runs on (see
+/// [`ScriptConn`]): a `SET`, temp table or session lock made inside the
+/// transaction outlives its `COMMIT`.
 pub enum ScriptTx<'p> {
     Sqlite(sqlx::Transaction<'p, sqlx::Sqlite>),
     Postgres(sqlx::Transaction<'p, sqlx::Postgres>),
@@ -248,6 +253,8 @@ pub enum RolledBack {
 pub(super) enum ReadOnlyRun {
     Sqlite(sqlx::SqliteConnection),
     Postgres {
+        /// From [`sqlx_common::acquire_for_run`], so a cancelled run's drop
+        /// closes it too.
         conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
         /// [`postgres::read_only_begin`] for this server.
         begin: &'static str,
@@ -289,13 +296,18 @@ impl ReadOnlyRun {
         }
     }
 
-    /// Lets go of the connection: closes SQLite's own, returns the pooled one.
+    /// Lets go of the connection by closing it — SQLite's own, and the
+    /// pooled Postgres one too: each statement's transaction is rolled back,
+    /// but a session-level advisory lock is not transactional, and was
+    /// measured still held through the pool after a read-only run took it.
     pub(super) async fn close(self) {
         match self {
             ReadOnlyRun::Sqlite(conn) => {
                 let _ = sqlx::Connection::close(conn).await;
             }
-            ReadOnlyRun::Postgres { .. } => {}
+            ReadOnlyRun::Postgres { conn, .. } => {
+                let _ = conn.close().await;
+            }
         }
     }
 }
@@ -313,9 +325,9 @@ impl ReadOnlyRun {
 /// session while its `ROLLBACK` ended an empty transaction on another, and the
 /// script's transaction went back to the pool still open.
 ///
-/// [`Self::end`] rolls back whatever transaction the script left open, so no
-/// connection returns to the pool inside one. What that prevents was measured
-/// on all four engines: later, unrelated statements ran inside the abandoned
+/// [`Self::end`] rolls back whatever transaction the script left open and
+/// reports it. A connection going back to the pool inside one was measured
+/// on all four engines, before the connection was closed after every run: later, unrelated statements ran inside the abandoned
 /// transaction — on SQL Server an edit that reported success was lost when the
 /// connection closed, on CockroachDB a read from another connection waited on
 /// the abandoned transaction's locks indefinitely, on SQLite an edit failed
@@ -324,15 +336,31 @@ impl ReadOnlyRun {
 /// CockroachDB a transaction an error had aborted failed every query that
 /// landed on that connection afterwards.
 ///
-/// A hold dropped without [`Self::end`] — the run was cancelled mid-statement
-/// — closes its connection instead of returning it, which ends any
-/// transaction on it server-side.
+/// **The connection is closed when the run lets go of it, never returned to
+/// the pool** — after [`Self::end`], after [`Self::finish_with_read`], and
+/// when a cancelled run drops the hold mid-statement. Whatever the script
+/// left on its session goes with it, on every engine, with no list of things
+/// to reset. Measured before, through the pool after a run: on Postgres-wire
+/// engines `SET` (search_path, ROLE, statement_timeout,
+/// `default_transaction_read_only`), temp tables and session advisory locks;
+/// on SQL Server `USE`, `SET CONTEXT_INFO`, `EXECUTE AS` and a session app
+/// lock; on SQLite PRAGMAs, temp tables, `ATTACH` and an exclusive locking
+/// mode that locked every other connection out of the file. A script's
+/// `DISCARD ALL` also deallocated sqlx's cached prepared statements, so the
+/// next query on that connection failed. Resetting instead would need a
+/// per-engine list, and `RESET ALL` was measured not to restore a role.
+/// The cost is a reconnect per run, and that nothing — a temp table, a
+/// setting — carries from one run to the next.
+/// The rollback in [`Self::end`] is kept beside the close because it is what
+/// answers whether anything was open — closing alone would discard it
+/// unannounced.
 pub(super) struct ScriptConn {
     held: HeldConn,
-    /// Set once [`Self::end`] has left the connection outside any transaction.
-    ended: bool,
 }
 
+/// Each variant closes its connection when dropped: the sqlx ones were
+/// marked by [`sqlx_common::acquire_for_run`], and [`sqlserver::MssqlScriptConn`]
+/// discards its own.
 enum HeldConn {
     Sqlite(sqlx::pool::PoolConnection<sqlx::Sqlite>),
     Postgres {
@@ -341,19 +369,6 @@ enum HeldConn {
         flavor: postgres::PgFlavor,
     },
     SqlServer(Box<sqlserver::MssqlScriptConn>),
-}
-
-impl Drop for ScriptConn {
-    fn drop(&mut self) {
-        if self.ended {
-            return;
-        }
-        match &mut self.held {
-            HeldConn::Sqlite(conn) => conn.close_on_drop(),
-            HeldConn::Postgres { conn, .. } => conn.close_on_drop(),
-            HeldConn::SqlServer(conn) => conn.discard(),
-        }
-    }
 }
 
 impl ScriptConn {
@@ -389,17 +404,32 @@ impl ScriptConn {
     }
 
     /// Lets go of the connection: rolls back any transaction the script left
-    /// open, and says whether there was one. On an error the connection's
-    /// transaction state is unknown, so it is closed rather than returned to
-    /// the pool — which, server-side, ends whatever was open on it.
+    /// open, says whether there was one, and closes the connection. An error
+    /// means the connection's transaction state is unknown; closing it ends,
+    /// server-side, whatever was open on it.
     pub(super) async fn end(mut self) -> Result<bool, DbError> {
         let ended = match &mut self.held {
             HeldConn::Sqlite(conn) => sqlite::end_script_conn(conn).await,
             HeldConn::Postgres { conn, flavor } => postgres::end_script_conn(conn, *flavor).await,
             HeldConn::SqlServer(conn) => sqlserver::end_script_conn(conn).await,
         };
-        self.ended = ended.is_ok();
+        self.close().await;
         ended
+    }
+
+    /// Closes the connection now rather than in a task the drop spawns, so a
+    /// run reports done only once the server has been told the session is
+    /// over — its locks go a moment later, as the server ends it.
+    async fn close(self) {
+        match self.held {
+            HeldConn::Sqlite(conn) => {
+                let _ = conn.close().await;
+            }
+            HeldConn::Postgres { conn, .. } => {
+                let _ = conn.close().await;
+            }
+            HeldConn::SqlServer(conn) => drop(conn),
+        }
     }
 
     /// Runs the script's last statement when it returns rows, and ends the
@@ -424,10 +454,10 @@ impl ScriptConn {
     ///
     /// For one that qualifies, a cut-short read inside an open transaction
     /// closes the connection, which ends the transaction server-side — the
-    /// rollback that is reported. With nothing open, Postgres hands the
-    /// connection back for sqlx to read the rest in the background, as capped
-    /// reads always did, and SQL Server discards it, as its capped reads
-    /// always did (the cost is a reconnect next time the pool needs one).
+    /// rollback that is reported. With nothing open, Postgres reads the rest
+    /// in a background task and only then closes the connection, as the pool
+    /// read it before reuse when a run's connection still went back there;
+    /// SQL Server discards it, as its capped reads always did.
     ///
     /// SQLite has no stream to wait for (its worker stops stepping when the
     /// read is dropped), so there the read is simply followed by
@@ -451,22 +481,25 @@ impl ScriptConn {
             }
             HeldConn::Sqlite(_) => unreachable!("handled above"),
         };
-        // Left false when the connection must not go back to the pool — a
-        // cut-short read inside a transaction, or a failed end — so the drop
-        // closes it.
-        self.ended = finished.reusable;
+        match self.held {
+            HeldConn::Postgres { conn, .. } if finished.drain => {
+                postgres::drain_then_close(conn);
+            }
+            _ => self.close().await,
+        }
         (finished.read, finished.ended)
     }
 }
 
 /// How [`ScriptConn::finish_with_read`] went on one backend: the read, what
 /// ending the hold found (whether a transaction the script left open was
-/// rolled back or discarded), and whether the connection may go back to the
-/// pool.
+/// rolled back or discarded), and whether the rest of a cut-short read must be
+/// read before the connection is closed (Postgres, with nothing open: see
+/// [`postgres::finish_script_conn_with_read`]).
 pub(super) struct FinishedRead {
     pub(super) read: Result<(QueryResult, bool), DbError>,
     pub(super) ended: Result<bool, DbError>,
-    pub(super) reusable: bool,
+    pub(super) drain: bool,
 }
 
 /// A read-only statement's outcome, given how its rollback went: the
@@ -718,21 +751,15 @@ impl DbPool {
 
     /// Opens a transaction for atomically running a multi-statement script.
     /// The returned [`ScriptTx`] runs statements on one connection so
-    /// they share a transaction, then commits or rolls back as a unit.
+    /// they share a transaction, then commits or rolls back as a unit, and
+    /// closes the connection.
     pub async fn begin_script_tx(&self) -> Result<ScriptTx<'_>, DbError> {
         match self {
-            DbPool::Sqlite(pool) => pool
-                .begin()
+            DbPool::Sqlite(pool) => sqlx_common::begin_for_run(pool).await.map(ScriptTx::Sqlite),
+            DbPool::Postgres(pg) => sqlx_common::begin_for_run(pg.pool())
                 .await
-                .map(ScriptTx::Sqlite)
-                .map_err(|e| DbError::Query(e.to_string())),
-            DbPool::Postgres(pg) => pg
-                .pool()
-                .begin()
-                .await
-                .map(ScriptTx::Postgres)
-                .map_err(|e| DbError::Query(e.to_string())),
-            DbPool::SqlServer(pool) => sqlserver::begin_tx(pool)
+                .map(ScriptTx::Postgres),
+            DbPool::SqlServer(pool) => sqlserver::begin_script_tx(pool)
                 .await
                 .map(|tx| ScriptTx::SqlServer(Box::new(tx))),
         }
@@ -742,24 +769,16 @@ impl DbPool {
     /// transaction — see [`ScriptConn`].
     pub(super) async fn acquire_script_conn(&self) -> Result<ScriptConn, DbError> {
         let held = match self {
-            DbPool::Sqlite(pool) => HeldConn::Sqlite(
-                pool.acquire()
-                    .await
-                    .map_err(|e| DbError::Query(e.to_string()))?,
-            ),
+            DbPool::Sqlite(pool) => HeldConn::Sqlite(sqlx_common::acquire_for_run(pool).await?),
             DbPool::Postgres(pg) => HeldConn::Postgres {
-                conn: pg
-                    .pool()
-                    .acquire()
-                    .await
-                    .map_err(|e| DbError::Query(e.to_string()))?,
+                conn: sqlx_common::acquire_for_run(pg.pool()).await?,
                 flavor: pg.flavor(),
             },
             DbPool::SqlServer(pool) => {
                 HeldConn::SqlServer(Box::new(sqlserver::acquire_script_conn(pool).await?))
             }
         };
-        Ok(ScriptConn { held, ended: false })
+        Ok(ScriptConn { held })
     }
 
     /// Takes a connection for one read-only script — see [`ReadOnlyRun`].
@@ -773,11 +792,7 @@ impl DbPool {
                 sqlite::open_read_only(pool).await?,
             ))),
             DbPool::Postgres(pg) => Ok(Some(ReadOnlyRun::Postgres {
-                conn: pg
-                    .pool()
-                    .acquire()
-                    .await
-                    .map_err(|e| DbError::Query(e.to_string()))?,
+                conn: sqlx_common::acquire_for_run(pg.pool()).await?,
                 begin: pg.read_only_begin(),
             })),
             // Turned away above; kept as an arm so a new variant must decide.

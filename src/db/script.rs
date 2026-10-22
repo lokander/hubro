@@ -1558,16 +1558,15 @@ pub enum Rollback {
     OpenTransaction(OpenTransaction),
     /// Hubro could not check what the script left open — the sequential
     /// path's check failed, or the atomic path's connection was lost
-    /// ([`RolledBack::Unknown`]) — so the connection was closed instead of
-    /// returned to the pool. The server
-    /// discards anything uncommitted on a closed connection; whether there was
-    /// anything, hubro cannot say.
+    /// ([`RolledBack::Unknown`]) — before the connection closed, as every
+    /// run's does. The server discards anything uncommitted on a closed
+    /// connection; whether there was anything, hubro cannot say.
     ConnectionClosed,
 }
 
 /// A transaction a script opened itself and had not ended when the run did,
-/// which hubro rolled back rather than return the connection to the pool
-/// inside it — see [`ScriptConn`](super::registry::ScriptConn).
+/// which hubro rolled back before closing the connection, so the run can say
+/// so — see [`ScriptConn`](super::registry::ScriptConn).
 ///
 /// Rolled back, not committed and not kept open for a later run: a script
 /// that ends without its `COMMIT` has not said its changes are done, and
@@ -1590,9 +1589,8 @@ pub struct ScriptDone {
     /// (a `BEGIN` with no `COMMIT`) and hubro rolled it back, so the run is
     /// not mistaken for one whose changes took effect.
     pub rolled_back: Option<OpenTransaction>,
-    /// Hubro could not check whether the script left a transaction open, and
-    /// closed the connection rather than return it to the pool — see
-    /// [`Rollback::ConnectionClosed`].
+    /// Hubro could not check whether the script left a transaction open
+    /// before the connection closed — see [`Rollback::ConnectionClosed`].
     pub connection_closed: bool,
 }
 
@@ -2257,8 +2255,8 @@ pub(crate) fn tsql_is_transaction_control(sql: &str) -> bool {
 ///   read. On SQL Server, where a cut-short read's connection is discarded,
 ///   that is what keeps the write: discarded, it was aborted with the
 ///   session. On Postgres it changes no data outcome — a cut-short read with
-///   nothing open goes back to the pool to be read to the end in the
-///   background, and one inside an open transaction is rolled back either
+///   nothing open is read to the end in the background before its
+///   connection closes, and one inside an open transaction is rolled back either
 ///   way — and decides only whether a write that fails after the cap is
 ///   reported, read to the end before the run ends, or lost in the
 ///   background read.
