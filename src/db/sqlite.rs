@@ -8,6 +8,12 @@
 //! round-trips for ordinary tables. Views and virtual tables are the exception:
 //! their columns are read one query each, so one SQLite cannot resolve costs
 //! only itself (see `table_columns`).
+//!
+//! Every pragma is given the schema, `'main'`, which is what `sqlite_master`
+//! lists. Unqualified, a pragma resolves its name temp-first, so a TEMP table
+//! sharing a main table's name lent it its columns and indexes — and with them
+//! the rowid-alias decision
+//! (`a_temp_table_of_the_same_name_does_not_lend_its_shape_to_the_main_one`).
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -764,7 +770,7 @@ const ORDINARY_TABLE: &str = "m.type = 'table' AND m.rootpage <> 0";
 async fn table_columns(pool: &SqlitePool, entries: &[MasterEntry]) -> Result<ColumnsRead, DbError> {
     let sql = format!(
         "SELECT m.name AS table_name, {XINFO_COLUMNS} \
-         FROM sqlite_master m JOIN pragma_table_xinfo(m.name) x \
+         FROM sqlite_master m JOIN pragma_table_xinfo(m.name, 'main') x \
          WHERE {MASTER_FILTER} AND {ORDINARY_TABLE} \
          ORDER BY m.name, x.cid"
     );
@@ -785,7 +791,8 @@ async fn table_columns(pool: &SqlitePool, entries: &[MasterEntry]) -> Result<Col
         .iter()
         .filter(|entry| !columns.contains_key(&entry.name))
         .collect();
-    let sql = format!("SELECT {XINFO_COLUMNS} FROM pragma_table_xinfo(?1) x ORDER BY x.cid");
+    let sql =
+        format!("SELECT {XINFO_COLUMNS} FROM pragma_table_xinfo(?1, 'main') x ORDER BY x.cid");
     let sql = SqlText::new(&sql)?;
     let (resolved, unreadable) = read_each(&pending, |name| async move {
         let rows = sql
@@ -890,8 +897,13 @@ fn column_meta(row: &SqliteRow) -> Result<Option<ColumnMeta>, DbError> {
 ///   `TEXT` keys, any key of a `WITHOUT ROWID` table (where the old guess
 ///   from the declared type went wrong), and every composite key.
 ///
-/// Only an ordinary table can have one: a view or a virtual table has no
-/// index list, so the absent index would prove nothing.
+/// `ordinary_table` is defence in depth, not what decides today: a view or a
+/// virtual table has no index list, so the absent pk index would prove
+/// nothing about it, but `pragma_table_xinfo` also reports no key column for
+/// either (measured for views and FTS5, and pinned by
+/// `views_virtual_and_generated_shapes_never_claim_the_alias` in
+/// `tests/db_sqlite.rs`), so the key-column count already rules both out. The
+/// guard keeps that true for a virtual-table module that does declare a key.
 pub(super) fn rowid_alias(
     ordinary_table: bool,
     columns: &[ColumnMeta],
@@ -934,8 +946,8 @@ async fn table_indexes(
     let sql = format!(
         "SELECT il.name AS index_name, ii.seqno AS seqno, ii.name AS column_name \
          FROM sqlite_master m \
-         JOIN pragma_index_list(m.name) il \
-         JOIN pragma_index_info(il.name) ii \
+         JOIN pragma_index_list(m.name, 'main') il \
+         JOIN pragma_index_info(il.name, 'main') ii \
          WHERE {MASTER_FILTER}"
     );
     let column_rows = SqlText::new(&sql)?
@@ -958,7 +970,7 @@ async fn table_indexes(
         "SELECT m.name AS table_name, il.name AS index_name, \
                 il.\"unique\" AS \"unique\", il.partial AS partial, \
                 il.origin AS origin \
-         FROM sqlite_master m JOIN pragma_index_list(m.name) il \
+         FROM sqlite_master m JOIN pragma_index_list(m.name, 'main') il \
          WHERE {MASTER_FILTER} \
          ORDER BY m.name, il.seq"
     );
@@ -1006,7 +1018,7 @@ async fn table_foreign_keys(
     let sql = format!(
         "SELECT m.name AS table_name, fk.id AS id, fk.seq AS seq, \
                 fk.\"table\" AS ref_table, fk.\"from\" AS from_col, fk.\"to\" AS to_col \
-         FROM sqlite_master m JOIN pragma_foreign_key_list(m.name) fk \
+         FROM sqlite_master m JOIN pragma_foreign_key_list(m.name, 'main') fk \
          WHERE {MASTER_FILTER}"
     );
     let rows = SqlText::new(&sql)?
@@ -1955,5 +1967,66 @@ mod tests {
         assert_eq!(index_constraint("pk"), Some(IndexConstraint::PrimaryKey));
         assert_eq!(index_constraint("u"), Some(IndexConstraint::Unique));
         assert_eq!(index_constraint("c"), None);
+    }
+
+    /// A one-connection pool, so a TEMP table or an ATTACH made on it is seen
+    /// by the introspection that follows — both are per-connection.
+    async fn one_connection() -> SqlitePool {
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap()
+    }
+
+    async fn run(pool: &SqlitePool, sql: &str) {
+        SqlText::new(sql).unwrap().execute(pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_temp_table_of_the_same_name_does_not_lend_its_shape_to_the_main_one() {
+        // Unqualified, the pragmas resolve a name temp-first. Measured: with
+        // `main.s` WITHOUT ROWID and `temp.s` a rowid table, `pragma_index_list('s')`
+        // describes the temp one — no pk index — so `s` was declared the rowid
+        // alias, and an import's blank id was left out and refused NOT NULL.
+        let pool = one_connection().await;
+        run(
+            &pool,
+            "CREATE TABLE s (id INTEGER PRIMARY KEY NOT NULL, x TEXT) WITHOUT ROWID",
+        )
+        .await;
+        run(
+            &pool,
+            "CREATE TEMP TABLE s (id INTEGER PRIMARY KEY, only_in_temp TEXT)",
+        )
+        .await;
+        let tables = introspect(&pool).await.unwrap();
+        let s: Vec<&TableMeta> = tables.iter().filter(|t| t.name == "s").collect();
+        assert_eq!(s.len(), 1, "{tables:?}");
+        let columns: Vec<&str> = s[0].columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(columns, ["id", "x"], "main's columns, not temp's");
+        assert_eq!(s[0].columns[0].generated, Generated::Never);
+        assert_eq!(
+            s[0].indexes
+                .iter()
+                .map(|i| i.constraint)
+                .collect::<Vec<_>>(),
+            [Some(IndexConstraint::PrimaryKey)]
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_main_schema_is_introspected() {
+        // TEMP and ATTACHed tables are not listed at all, so their keys never
+        // reach the rowid decision.
+        let pool = one_connection().await;
+        run(&pool, "CREATE TABLE kept (id INTEGER PRIMARY KEY)").await;
+        run(&pool, "CREATE TEMP TABLE scratch (id INTEGER PRIMARY KEY)").await;
+        run(&pool, "ATTACH DATABASE ':memory:' AS aux").await;
+        run(&pool, "CREATE TABLE aux.elsewhere (id INTEGER PRIMARY KEY)").await;
+        let tables = introspect(&pool).await.unwrap();
+        let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["kept"]);
+        assert_eq!(tables[0].columns[0].generated, Generated::RowidAlias);
     }
 }
