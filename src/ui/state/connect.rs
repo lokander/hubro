@@ -5082,7 +5082,7 @@ mod tests {
         const API: &str = "the keyring API itself; its callers are the sites listed here";
         let registry: &[(&str, &str, usize, &str)] = &[
             ("secrets.rs", "delete_password_async", 1, API),
-            ("secrets.rs", "delete_password", 1, API),
+            ("secrets.rs", "delete_in", 1, API),
             (
                 "ui/state/connect.rs",
                 "connect_server_with_password",

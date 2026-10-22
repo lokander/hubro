@@ -99,15 +99,21 @@ fn new_entry(url: &str) -> Result<Entry, String> {
 /// with a different port/user/sslmode creates a distinct entry; the old one
 /// lingers until its saved connection is removed.
 pub fn store_password(url: &str, password: &str) -> Result<(), String> {
-    entry(url)?
-        .set_password(password)
-        .map_err(|e| e.to_string())
+    store_in(&*entry(url)?, password)
+}
+
+fn store_in(entry: &Entry, password: &str) -> Result<(), String> {
+    entry.set_password(password).map_err(|e| e.to_string())
 }
 
 /// Fetches the stored password. `Ok(None)` when no entry exists; `Err` when
 /// the keyring itself is unavailable.
 pub fn get_password(url: &str) -> Result<Option<String>, String> {
-    match entry(url)?.get_password() {
+    get_in(&*entry(url)?)
+}
+
+fn get_in(entry: &Entry) -> Result<Option<String>, String> {
+    match entry.get_password() {
         Ok(password) => Ok(Some(password)),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(err) => Err(err.to_string()),
@@ -116,7 +122,11 @@ pub fn get_password(url: &str) -> Result<Option<String>, String> {
 
 /// Removes the stored password. Idempotent: a missing entry is success.
 pub fn delete_password(url: &str) -> Result<(), String> {
-    match entry(url)?.delete_credential() {
+    delete_in(&*entry(url)?)
+}
+
+fn delete_in(entry: &Entry) -> Result<(), String> {
+    match entry.delete_credential() {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()),
         Err(err) => Err(err.to_string()),
@@ -201,28 +211,30 @@ pub(crate) mod tests {
 
     /// Round-trip against the real OS credential store (Keychain on macOS,
     /// Credential Manager on Windows, Secret Service on Linux), run by hand:
-    /// `cargo test real_store_round_trip -- --ignored`. The one deliberate
-    /// route to the real store in this crate's tests, so it builds its entry
-    /// with `Entry::new` itself — [`entry`] is the mock here — and uses a
-    /// service name of its own, never touching an entry hubro stored.
+    /// `cargo test real_store_round_trip -- --ignored`.
+    ///
+    /// The one deliberate route to the real store in this crate's tests.
+    /// [`entry`] is the mock here, so this builds its own entry with
+    /// `Entry::new`, under a service name of its own — never touching an
+    /// entry hubro stored — and drives the wrappers' bodies (`store_in`,
+    /// `get_in`, `delete_in`, with their `NoEntry` mapping) against it. What
+    /// it does *not* cover against a real store is the part in front of
+    /// them: `entry`'s cache, the disable flag and the `hubro` service name.
     #[test]
     #[ignore = "touches the real OS credential store; run alone, manually"]
     fn real_store_round_trip() {
         let entry = Entry::new("hubro-real-store-test", "postgres://hubro-test@localhost/x")
             .expect("the platform's credential store");
-        let get = || match entry.get_password() {
-            Ok(password) => Some(password),
-            Err(keyring::Error::NoEntry) => None,
-            Err(err) => panic!("{err}"),
-        };
-        let _ = entry.delete_credential();
-        assert_eq!(get(), None);
-        entry.set_password("s3cret-real").unwrap();
-        assert_eq!(get().as_deref(), Some("s3cret-real"));
-        entry.set_password("changed-real").unwrap();
-        assert_eq!(get().as_deref(), Some("changed-real"));
-        entry.delete_credential().unwrap();
-        assert_eq!(get(), None);
+        delete_in(&entry).unwrap();
+        assert_eq!(get_in(&entry).unwrap(), None);
+        store_in(&entry, "s3cret-real").unwrap();
+        assert_eq!(get_in(&entry).unwrap().as_deref(), Some("s3cret-real"));
+        store_in(&entry, "changed-real").unwrap();
+        assert_eq!(get_in(&entry).unwrap().as_deref(), Some("changed-real"));
+        delete_in(&entry).unwrap();
+        assert_eq!(get_in(&entry).unwrap(), None);
+        // Deleting again is fine.
+        delete_in(&entry).unwrap();
     }
 
     #[test]
