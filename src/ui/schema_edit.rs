@@ -287,6 +287,8 @@ pub fn SchemaEditDialog(
 
     rsx! {
         div {
+            // A modal over the app: see `js::MODAL_ATTR`.
+            "data-dv-modal": "true",
             class: "fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4 outline-none",
             tabindex: "-1",
             onmounted: super::js::focus_on_mount,

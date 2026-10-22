@@ -165,6 +165,8 @@ pub fn ImportDialog(
 
     rsx! {
         div {
+            // A modal over the app: see `js::MODAL_ATTR`.
+            "data-dv-modal": "true",
             class: "fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4 outline-none",
             // Focused on mount so Escape works before anything is clicked,
             // matching the connect form (the window key listener ignores

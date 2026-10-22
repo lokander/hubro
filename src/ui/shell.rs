@@ -243,6 +243,8 @@ fn QuitConfirmDialog() -> Element {
     let window = use_window();
     rsx! {
         div {
+            // A modal over the app: see `js::MODAL_ATTR`.
+            "data-dv-modal": "true",
             class: "fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4",
             div { class: "w-full max-w-md rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 p-5 shadow-xl",
                 h2 { class: "text-base font-semibold text-slate-900 dark:text-slate-100",
@@ -463,6 +465,8 @@ fn Cheatsheet() -> Element {
     rsx! {
         // Backdrop: a click anywhere outside the panel closes.
         div {
+            // A modal over the app: see `js::MODAL_ATTR`.
+            "data-dv-modal": "true",
             class: "fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4",
             onclick: move |_| state.close_cheatsheet(),
             div {
