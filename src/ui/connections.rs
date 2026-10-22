@@ -1279,7 +1279,37 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
                 }
                 "Remember in the system keyring (falls back to this session only)"
             }
+            if let Some(hint) = remember_hint(prompt.kind, prompt.stored) {
+                p { class: "mt-1 text-xs text-amber-700 dark:text-amber-400", "{hint}" }
+            }
         }
+    }
+}
+
+/// The line under the password prompt's "remember" box, saying what an
+/// unticked box does to a password already in the keyring — `None` where it
+/// does nothing, and the label alone is the whole story.
+///
+/// Only a database-password prompt's answer can delete a stored copy, and only
+/// once a *different* password has connected
+/// (`stored_password_after_connect`); an unticked SSH-passphrase prompt never
+/// deletes one. When the connect could not tell whether a copy is stored, the
+/// line says so rather than staying silent about a deletion that may happen.
+fn remember_hint(
+    kind: super::state::PromptKind,
+    stored: super::state::StoredCopy,
+) -> Option<&'static str> {
+    use super::state::{PromptKind, StoredCopy};
+    match (kind, stored) {
+        (PromptKind::DbPassword, StoredCopy::Present) => Some(
+            "A password for this connection is stored in the system keyring. \
+             Leaving this unticked removes it once a different password connects.",
+        ),
+        (PromptKind::DbPassword, StoredCopy::Unknown) => Some(
+            "If a password for this connection is stored in the system keyring, \
+             leaving this unticked removes it once a different password connects.",
+        ),
+        (PromptKind::DbPassword, StoredCopy::Absent) | (PromptKind::SshPassphrase, _) => None,
     }
 }
 
@@ -2150,6 +2180,32 @@ mod tests {
         let postgres = protection_hint(WriteProtection::ReadOnly, BackendKind::Postgres);
         assert!(postgres.contains("except"), "{postgres}");
         assert!(postgres.contains("run_command_on_"), "{postgres}");
+    }
+
+    #[test]
+    fn the_prompt_warns_that_unticking_removes_a_stored_password_only_when_it_can() {
+        use super::super::state::{PromptKind, StoredCopy};
+        let stored = remember_hint(PromptKind::DbPassword, StoredCopy::Present)
+            .expect("a stored database password must be mentioned under the box");
+        assert!(
+            stored.contains("is stored") && stored.contains("unticked removes it"),
+            "{stored}"
+        );
+        let unknown = remember_hint(PromptKind::DbPassword, StoredCopy::Unknown)
+            .expect("a possibly stored database password must be mentioned under the box");
+        assert!(
+            unknown.starts_with("If ") && unknown.contains("unticked removes it"),
+            "an unconfirmed copy must be hedged, not asserted: {unknown}"
+        );
+        // Nothing stored: the label alone, as before.
+        assert_eq!(
+            remember_hint(PromptKind::DbPassword, StoredCopy::Absent),
+            None
+        );
+        // An unticked passphrase prompt deletes nothing, whatever is stored.
+        for stored in [StoredCopy::Present, StoredCopy::Absent, StoredCopy::Unknown] {
+            assert_eq!(remember_hint(PromptKind::SshPassphrase, stored), None);
+        }
     }
 
     #[test]

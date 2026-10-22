@@ -417,6 +417,23 @@ fn remembered_credential(remembered: Option<&str>) -> (ServerCredential<'_>, boo
     (credential, offered)
 }
 
+/// What [`AppState::connect_server`]'s reads found out about a stored
+/// password, for the prompt a refusal raises: `in_session` says session memory
+/// supplied the password (so the keyring was never read), `found` that the
+/// reads came back with one at all.
+///
+/// Only the keyring's own answer is knowledge. A session password says
+/// nothing either way — one remembered from a ticked prompt is also stored, one
+/// from the command line may sit beside a different stored one — and the
+/// connect does not read the keyring a second time just to find out.
+pub(super) fn stored_copy(in_session: bool, found: bool) -> StoredCopy {
+    match (in_session, found) {
+        (true, _) => StoredCopy::Unknown,
+        (false, true) => StoredCopy::Present,
+        (false, false) => StoredCopy::Absent,
+    }
+}
+
 /// What a password connect that just succeeded does to the keyring entry for
 /// its locator. See [`stored_password_after_connect`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1211,12 +1228,16 @@ impl AppState {
         // it has worked (see [`Self::open_target`]).
         self.set_step(&url, ConnectStep::Credentials);
         let mut session_password = self.session_passwords.read().get(&url).cloned();
+        let in_session = session_password.is_some();
         if session_password.is_none() {
             session_password = crate::secrets::get_password_async(url.clone())
                 .await
                 .ok()
                 .flatten();
         }
+        // What a prompt raised below can tell the user about a stored copy —
+        // from the reads just made, without asking the keyring again.
+        let stored = stored_copy(in_session, session_password.is_some());
         self.set_step(&url, ConnectStep::Opening);
         // One value for what is offered and whether it was a remembered
         // password, so the decision below cannot be told about a password the
@@ -1250,6 +1271,7 @@ impl AppState {
                     // on the moment the connect succeeds — so there is no
                     // earlier answer to carry and this prompt asks fresh.
                     remember: true,
+                    stored,
                 }));
                 return;
             }
@@ -1864,6 +1886,9 @@ impl AppState {
                     tunnel: Some(config.clone()),
                     auth: auth.clone(),
                     remember,
+                    // Not looked up: this prompt's answer decides only the
+                    // passphrase, and never deletes a stored one.
+                    stored: StoredCopy::Unknown,
                 }));
                 None
             }
@@ -4378,7 +4403,7 @@ mod tests {
         for (ident, uses) in [
             ("had_password", 2),
             ("credential", 2),
-            ("session_password", 4),
+            ("session_password", 6),
             ("result", 3),
             ("err", 3),
         ] {
@@ -4595,6 +4620,37 @@ mod tests {
                 Some(PasswordRetry::Prompt),
                 "{var}: a server that wants a password must still be asked for one"
             );
+        }
+    }
+
+    #[test]
+    fn the_prompt_says_a_password_is_stored_only_when_the_keyring_said_so() {
+        // The password prompt warns that an unticked box removes a stored
+        // password on `Present`, and hedges on `Unknown`. Claiming `Present`
+        // for a session password would warn about a copy that may not exist;
+        // claiming `Absent` for one would hide a deletion the unticked box can
+        // still make.
+        for (in_session, found, expected, why) in [
+            (
+                false,
+                true,
+                StoredCopy::Present,
+                "the keyring supplied the refused password and still holds it",
+            ),
+            (
+                false,
+                false,
+                StoredCopy::Absent,
+                "the keyring was read and held nothing (or could not be read)",
+            ),
+            (
+                true,
+                true,
+                StoredCopy::Unknown,
+                "session memory supplied it, so the keyring was never asked",
+            ),
+        ] {
+            assert_eq!(stored_copy(in_session, found), expected, "{why}");
         }
     }
 

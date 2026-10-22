@@ -823,6 +823,30 @@ pub struct PasswordPrompt {
     /// the answer the user already gave, so a mistyped passphrase cannot
     /// silently restore a decision to store one they had cleared.
     pub remember: bool,
+    /// What the connect knew about a stored database password when it raised
+    /// the prompt — what the card tells the user unticking "remember" puts at
+    /// risk. Gathered from the reads the connect already made, never from a
+    /// keyring lookup of its own.
+    pub stored: StoredCopy,
+}
+
+/// Whether the OS keyring holds a password for a prompt's connection, as far
+/// as the connect that raised the prompt found out.
+///
+/// Three states, because the connect reads session memory first and only
+/// falls through to the keyring when that is empty: a password remembered for
+/// the session was refused without the keyring ever being asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredCopy {
+    /// The keyring supplied the password that was just refused, so it still
+    /// holds it (a refusal alone deletes nothing).
+    Present,
+    /// The keyring was read and held nothing, or could not be read — which
+    /// the unticked answer's own read also treats as nothing to delete.
+    Absent,
+    /// The keyring was not asked: session memory supplied the password, or
+    /// the prompt is not for a database password at all.
+    Unknown,
 }
 
 /// A pending host-key trust decision for a tunneled Postgres or SQL Server
