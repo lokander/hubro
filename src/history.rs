@@ -16,7 +16,7 @@
 //! private pool — it is never opened as a user connection tab — so queries
 //! the app runs against history are naturally never recorded into it.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
@@ -93,11 +93,6 @@ fn locator_of(scope: String) -> Option<String> {
     (scope != GLOBAL_SCOPE).then_some(scope)
 }
 
-/// Default location: `$XDG_DATA_HOME/hubro/history.db`.
-pub fn default_history_path() -> Option<PathBuf> {
-    crate::config::app_data_file("history.db")
-}
-
 /// Handle to the history database. Cheap to clone (wraps a pool).
 #[derive(Debug, Clone)]
 pub struct HistoryStore {
@@ -105,14 +100,8 @@ pub struct HistoryStore {
 }
 
 impl HistoryStore {
-    /// Opens (creating if missing) the history database at its default
-    /// location.
-    pub async fn open() -> Result<Self, String> {
-        let path = default_history_path().ok_or_else(|| "no data directory found".to_string())?;
-        Self::open_at(&path).await
-    }
-
-    /// Opens the history database at an explicit path (used by tests).
+    /// Opens the history database at `path` — the app passes
+    /// [`crate::config::AppPaths::history`], tests a temp file.
     /// Unlike user databases, the file is created when missing — this store
     /// is app-owned, not user data.
     pub async fn open_at(path: &Path) -> Result<Self, String> {

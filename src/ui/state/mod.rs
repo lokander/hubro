@@ -44,11 +44,10 @@ use dioxus::prelude::*;
 use crate::azure::{self, EntraAuth};
 use crate::cli::OpenTarget;
 use crate::config::{
-    default_config_path, default_session_path, default_settings_path, load_session,
-    load_settings_checked, plan_session_restore, save_session, save_show_internal_objects,
-    save_theme, BackendKind, ConfigError, ConnectionColor, GroupError, RestoreCandidate,
-    SavedConnection, SavedList, ServerAuth, Session, SessionPane, SessionTab, Settings,
-    SettingsProblem, Theme,
+    load_session, load_settings_checked, plan_session_restore, save_session,
+    save_show_internal_objects, save_theme, AppPaths, BackendKind, ConfigError, ConnectionColor,
+    GroupError, RestoreCandidate, SavedConnection, SavedList, ServerAuth, Session, SessionPane,
+    SessionTab, Settings, SettingsProblem, Theme,
 };
 use crate::db::{
     apply_staged, build_fk_filter, explain_statement, fk_target_columns, mssql_url_target,
@@ -1300,6 +1299,12 @@ pub struct AppState {
     /// App-global (one overlay for the whole window), toggled by `?` and
     /// dismissed by Escape / a backdrop click / `?` again.
     pub show_cheatsheet: Signal<bool>,
+    /// Every file this state reads and writes: the saved list, settings,
+    /// session, history and known_hosts. The real ones in the app
+    /// ([`AppPaths::platform`]), a temp dir's in a test — nothing in the
+    /// state resolves a path any other way, so a test's state cannot touch
+    /// the user's files. Set once at construction; read with `peek`.
+    pub paths: Signal<AppPaths>,
 }
 
 /// Where a foreign-key jump from `source_row` along `fk` lands: the
@@ -1369,21 +1374,21 @@ pub fn find_table_meta<'a>(
 impl AppState {
     /// Must be called from a component (signals need the runtime).
     pub fn new() -> Self {
-        let state = Self::loaded(default_config_path(), default_settings_path());
+        let state = Self::loaded(AppPaths::platform());
         state.start_background_tasks();
         state
     }
 
-    /// The state built from the config files at these paths, with nothing
+    /// The state built from the config files in `paths`, with nothing
     /// started: [`Self::new`] minus the startup tasks, so a test can give it
     /// files of its own.
-    pub(crate) fn loaded(config_path: Option<PathBuf>, settings_path: Option<PathBuf>) -> Self {
+    pub(crate) fn loaded(paths: AppPaths) -> Self {
         // A failed config load surfaces on the launch screen and the app
         // starts with an empty list; SavedList remembers the failure and
         // refuses to persist over the unreadable file.
-        let (saved, load_error) = match config_path {
+        let (saved, load_error) = match &paths.connections {
             Some(path) => {
-                let (list, error) = SavedList::load(&path);
+                let (list, error) = SavedList::load(path);
                 (list, error.map(|e| e.to_string()))
             }
             None => (
@@ -1395,29 +1400,27 @@ impl AppState {
         // gets wrong (settings are non-critical and never block the app) —
         // but said, since a preference that silently does not stick reads
         // as a bug.
-        let (settings, notice) = match settings_path {
+        let (settings, notice) = match &paths.settings {
             Some(path) => {
-                let (settings, problem) = load_settings_checked(&path);
-                (
-                    settings,
-                    SettingsNotice::at_startup(&path, problem.as_ref()),
-                )
+                let (settings, problem) = load_settings_checked(path);
+                (settings, SettingsNotice::at_startup(path, problem.as_ref()))
             }
             None => (Settings::default(), SettingsNotice::Quiet),
         };
-        Self::unstarted(saved, load_error, settings, notice)
+        Self::unstarted(saved, load_error, settings, notice, paths)
     }
 
     /// The state built from already-loaded config, with nothing started:
     /// no background task and no file touched. [`Self::new`] is this plus
     /// the disk reads before it and the startup tasks after it; tests that
-    /// mount components in a `VirtualDom` use it directly, so they read
-    /// none of the user's config and open no history store.
+    /// mount components in a `VirtualDom` use it directly, so they open no
+    /// history store. Whatever the state later saves goes to `paths`.
     pub(crate) fn unstarted(
         saved: SavedList,
         load_error: Option<String>,
         settings: Settings,
         settings_notice: SettingsNotice,
+        paths: AppPaths,
     ) -> Self {
         let theme = settings.theme;
         // Every signal is root-scoped, without exception.
@@ -1508,6 +1511,7 @@ impl AppState {
             pending_focus: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             nav_history: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             show_cheatsheet: Signal::new_in_scope(false, ScopeId::ROOT),
+            paths: Signal::new_in_scope(paths, ScopeId::ROOT),
         }
     }
 
@@ -1532,8 +1536,13 @@ impl AppState {
         // the history panel, never the app. spawn_forever: the opening must
         // not be tied to whichever component happened to create the state.
         let mut state_for_open = self;
+        let history_path = self.paths.peek().history.clone();
         spawn_forever(async move {
-            match HistoryStore::open().await {
+            let opened = match history_path {
+                Some(path) => HistoryStore::open_at(&path).await,
+                None => Err("no data directory found".to_string()),
+            };
+            match opened {
                 Ok(store) => {
                     let enabled = store.recording_enabled().await.unwrap_or(true);
                     state_for_open.history_recording.set(enabled);
@@ -1751,7 +1760,7 @@ impl AppState {
         // Persist off the UI path; no signal borrow is held across the write.
         // `save_theme` merges into the existing file so the window geometry
         // (persisted in the same settings.toml) isn't clobbered.
-        let Some(path) = default_settings_path() else {
+        let Some(path) = self.paths.peek().settings.clone() else {
             return;
         };
         spawn_forever(async move {
@@ -1764,7 +1773,7 @@ impl AppState {
     /// [`Self::set_theme`].
     pub fn set_show_internal_objects(mut self, show: bool) {
         self.show_internal_objects.set(show);
-        let Some(path) = default_settings_path() else {
+        let Some(path) = self.paths.peek().settings.clone() else {
             return;
         };
         spawn_forever(async move {
@@ -2229,14 +2238,14 @@ mod tests {
     #[test]
     fn a_settings_file_the_launch_could_not_use_is_on_screen_from_the_start() {
         let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join("connections.toml");
-        let settings = dir.path().join("settings.toml");
+        let paths = AppPaths::under(dir.path());
+        let settings = paths.settings.clone().unwrap();
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
         let dom = runtime_dom();
 
         // Not TOML: nothing applied, and changes will not be saved.
         std::fs::write(&settings, "theme = \"dark\"\n[window\n").unwrap();
-        let state =
-            dom.in_runtime(|| AppState::loaded(Some(config.clone()), Some(settings.clone())));
+        let state = dom.in_runtime(|| AppState::loaded(paths.clone()));
         let notice = dom.in_runtime(|| state.settings_notice.peek().clone());
         let SettingsNotice::Showing(NoticeSeverity::Unsaved, message) = notice else {
             panic!("an unparseable settings file raised {notice:?}");
@@ -2254,8 +2263,7 @@ mod tests {
             "theme = \"drak\"\nshow_internal_objects = true\n",
         )
         .unwrap();
-        let state =
-            dom.in_runtime(|| AppState::loaded(Some(config.clone()), Some(settings.clone())));
+        let state = dom.in_runtime(|| AppState::loaded(paths.clone()));
         dom.in_runtime(|| {
             assert!(*state.show_internal_objects.peek());
             let notice = state.settings_notice.peek().clone();
@@ -2276,8 +2284,7 @@ mod tests {
 
         // A file it fully understands raises nothing.
         std::fs::write(&settings, "theme = \"dark\"\n").unwrap();
-        let state =
-            dom.in_runtime(|| AppState::loaded(Some(config.clone()), Some(settings.clone())));
+        let state = dom.in_runtime(|| AppState::loaded(paths.clone()));
         dom.in_runtime(|| {
             assert_eq!(*state.theme.peek(), Theme::Dark);
             assert_eq!(*state.settings_notice.peek(), SettingsNotice::Quiet);

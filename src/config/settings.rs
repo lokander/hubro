@@ -11,7 +11,7 @@
 //! use is reported as a [`SettingsProblem`], so the app can say why a
 //! preference is not what the file says.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -149,11 +149,6 @@ pub struct Settings {
 /// `skip_serializing_if` predicate for `bool` fields defaulting to `false`.
 fn is_false(value: &bool) -> bool {
     !*value
-}
-
-/// Default location: `$XDG_CONFIG_HOME/hubro/settings.toml`.
-pub fn default_settings_path() -> Option<PathBuf> {
-    super::app_config_file("settings.toml")
 }
 
 /// Loads settings. A missing *or* malformed file yields defaults — these are

@@ -527,11 +527,6 @@ pub struct ConnectionsFile {
     pub connections: Vec<SavedConnection>,
 }
 
-/// Default location: `$XDG_CONFIG_HOME/hubro/connections.toml`.
-pub fn default_config_path() -> Option<PathBuf> {
-    super::app_config_file("connections.toml")
-}
-
 /// Loads the whole file — groups and entries. A missing file is an empty
 /// file, not an error; a malformed one is an error (don't silently drop user
 /// data).

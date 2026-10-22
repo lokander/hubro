@@ -6,7 +6,7 @@
 //! transient, churns often, and is fine to lose — whereas a corrupt settings
 //! file must not take user preferences with it.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -94,14 +94,6 @@ pub struct Session {
     /// group instead of a twisty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collapsed_groups: Vec<String>,
-}
-
-/// Default location: `$XDG_CONFIG_HOME/hubro/session.toml`. Kept separate
-/// from `settings.toml` because it is transient, churns often, and is fine to
-/// lose — whereas a corrupt settings file must not take user preferences with
-/// it.
-pub fn default_session_path() -> Option<PathBuf> {
-    super::app_config_file("session.toml")
 }
 
 /// Loads the last session. A missing *or* malformed file yields an empty

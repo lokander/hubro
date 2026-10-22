@@ -55,7 +55,7 @@ impl AppState {
     /// Persists the current session (best-effort, off the UI path). Called by
     /// the persistence effect only when the snapshot actually changed.
     pub fn persist_session(&self) {
-        let Some(path) = default_session_path() else {
+        let Some(path) = self.paths.peek().session.clone() else {
             return;
         };
         let session = self.current_session();
@@ -77,7 +77,7 @@ impl AppState {
     /// Returns once the connects have *started* (see [`Self::start_restore`]),
     /// not once they have finished.
     pub async fn restore_session(mut self) {
-        let Some(path) = default_session_path() else {
+        let Some(path) = self.paths.peek().session.clone() else {
             return;
         };
         let session = load_session(&path);
