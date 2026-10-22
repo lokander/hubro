@@ -207,40 +207,37 @@ pub(super) enum Rest {
     /// Left unread. The connection cannot be asked anything until the rest
     /// has arrived, so the caller closes it, or has it read elsewhere.
     Leave,
-    /// Read to its end here and thrown away, giving the executor a turn
-    /// every [`DRAIN_YIELD_ROWS`] rows.
+    /// Read to its end here and thrown away, giving the thread a [`turn`]
+    /// now and then.
     Read,
     /// A cancel has been sent for the statement: read, the same way, until
     /// the server reports it cancelled (or the statement ends first).
     Cancelled,
 }
 
-/// How many discarded rows the rest of a cut-short result is read in between
-/// turns for the executor.
+/// How often, in discarded rows, reading the rest of a cut-short result
+/// checks whether it is time for a [`turn`].
+pub(super) const DRAIN_CHECK_ROWS: u64 = 1024;
+
+/// How long reading the rest of a cut-short result goes between [`turn`]s.
+const DRAIN_TURN_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Gives everything else on the thread a turn while the rest of a cut-short
+/// result is read.
 ///
 /// The turns are the point. Over localhost a row is always waiting, so the
 /// driver's read never returns `Pending`: measured before, the rest of 200M
-/// rows was read in one 44 s poll, during which a timer around the run did not
-/// fire, `abort()` on its task did not take effect, and — the SQL tab's run
-/// being polled on the UI thread — nothing else on that thread ran either.
-pub(super) const DRAIN_YIELD_ROWS: u64 = 1024;
-
-/// Wakes the task and returns `Pending` once — a turn for whatever else the
-/// executor has, on any executor. (`tokio::task::yield_now` may defer its
-/// wake-up to tokio's scheduler, and the SQL tab's run is polled by Dioxus's
-/// event loop, not by a tokio worker.)
-pub(super) async fn yield_now() {
-    let mut yielded = false;
-    std::future::poll_fn(|cx| {
-        if yielded {
-            std::task::Poll::Ready(())
-        } else {
-            yielded = true;
-            cx.waker().wake_by_ref();
-            std::task::Poll::Pending
-        }
-    })
-    .await
+/// rows was read in one 44 s poll, during which a timer beside the run did not
+/// fire and `abort()` on its task did not take effect.
+///
+/// A timer rather than a wake-up: the SQL tab's run is a Dioxus task, and
+/// Dioxus polls a task that woke itself again before returning to the window's
+/// event loop. Measured in the app with an immediate wake every 1024 rows, the
+/// run went on, and a click on Cancel was not seen until the rest had been
+/// read. A 1 ms timer every 20 ms leaves the loop free in between, for about
+/// 5% of the reading time.
+async fn turn() {
+    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
 }
 
 /// SQLSTATE `query_canceled`: what a cancelled Postgres-wire statement fails
@@ -313,12 +310,16 @@ where
         return Ok(false);
     }
     let mut discarded = 0u64;
+    let mut since_turn = std::time::Instant::now();
     loop {
         match stream.try_next().await {
             Ok(Some(_)) => {
                 discarded += 1;
-                if discarded.is_multiple_of(DRAIN_YIELD_ROWS) {
-                    yield_now().await;
+                if discarded.is_multiple_of(DRAIN_CHECK_ROWS)
+                    && since_turn.elapsed() >= DRAIN_TURN_EVERY
+                {
+                    turn().await;
+                    since_turn = std::time::Instant::now();
                 }
             }
             Ok(None) => return Ok(false),
