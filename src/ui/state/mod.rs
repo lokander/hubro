@@ -848,6 +848,11 @@ pub enum StoredCopy {
     /// find a copy and delete it, with no warning shown. Accepted, because a
     /// read error cannot be told apart from having no keyring at all, and
     /// hedging there would put the warning on every keyring-less machine.
+    ///
+    /// For an Entra sign-in, a failed earlier keyring delete can also leave a
+    /// remembered token behind a session-kept one, which reads as `Absent`
+    /// too; the user was told when that delete failed (see
+    /// `entra_stored_copy`).
     Absent,
     /// The keyring was not asked: session memory supplied the password, or
     /// nothing has looked yet (an SSH-passphrase prompt never does, since its

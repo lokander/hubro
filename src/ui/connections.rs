@@ -1329,13 +1329,15 @@ fn remember_hint(
 /// connection gets no line: nothing saved can have stored a password under its
 /// locator. (`url` is `None` while the fields do not build one.)
 ///
-/// Only when the submit would hand a password to the connect
-/// (`enters_password`: typed, or pasted inside the URL — the value
-/// `submit_server_form` takes). Without one it connects through
-/// `connect_server`, which never deletes a stored password, so a rename-only
-/// edit is not warned about a deletion it cannot make. (An edit that moves the
-/// locator with the field empty carries the old stored password across
-/// instead — `migrate_secret` — so that does not delete one either.)
+/// Only when the submit hands a password to the connect — `handed`, the same
+/// [`form_password`] verdict `submit_server_form` acts on: typed, pasted inside
+/// the URL, or carried across from the old locator by an edit that moves it.
+/// The carried case can delete too: moved onto another saved connection's
+/// locator, the carried password connecting unticked deletes that
+/// connection's differing stored one. With nothing handed on, the submit
+/// connects through `connect_server`, which never deletes a stored password,
+/// so a rename-only edit that keeps its locator is not warned about a deletion
+/// it cannot make.
 ///
 /// When editing moves the locator, the copy an unticked box costs is the
 /// one under the *old* locator: `migrate_secret` drops it once a different
@@ -1344,13 +1346,13 @@ fn remember_hint(
 /// line says.
 fn form_remember_hint(
     editing: bool,
-    enters_password: bool,
+    handed: &FormPassword,
     url: Option<&str>,
     saved: &[SavedConnection],
 ) -> Option<&'static str> {
     use super::state::{PromptKind, StoredCopy};
     let saved_locator = url.is_some_and(|url| saved.iter().any(|entry| entry.locator() == url));
-    if enters_password && (editing || saved_locator) {
+    if *handed != FormPassword::Nothing && (editing || saved_locator) {
         remember_hint(PromptKind::DbPassword, StoredCopy::Unknown)
     } else {
         None
@@ -1650,12 +1652,14 @@ fn submit_server_form(
         ));
         return;
     }
-    let mut entered_password = form.password.peek().clone();
-    if entered_password.is_empty() {
-        if let Some(embedded) = embedded_password {
-            entered_password = embedded;
-        }
-    }
+    // The password this submit hands on, decided where the "remember" hint
+    // decides too ([`form_password`]), so the two cannot disagree.
+    let handed = form_password(
+        &form.password.peek(),
+        embedded_password,
+        old_locator.as_deref(),
+        &url,
+    );
     // `None` when the box was not on screen: nobody was asked.
     let remember_choice = asks_remember(&form.auth_mode.peek()).then(|| *form.remember.peek());
     form_error.set(None);
@@ -1674,13 +1678,15 @@ fn submit_server_form(
         // working when the edit moves the locator: the stored secret is still
         // filed under the OLD one, and the connect below looks up the new.
         // Carry it over first.
-        if entered_password.is_empty() {
-            if let Some(old) = old_locator.as_ref().filter(|old| **old != url) {
-                if let Ok(Some(stored)) = crate::secrets::get_password_async(old.clone()).await {
-                    entered_password = stored;
-                }
-            }
-        }
+        let entered_password = match handed {
+            FormPassword::Entered(password) => password,
+            FormPassword::CarriedFrom(old) => crate::secrets::get_password_async(old)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            FormPassword::Nothing => String::new(),
+        };
         // An entered passphrase seeds session memory so the tunnel open finds
         // it, and parks its "remember" answer for that open to redeem once it
         // accepts the passphrase, exactly as if both came from the prompt.
@@ -1753,6 +1759,50 @@ fn submit_server_form(
     });
 }
 
+/// Where the password a connection form's submit hands on comes from. See
+/// [`form_password`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FormPassword {
+    /// Typed into the field, or pasted inside the URL.
+    Entered(String),
+    /// None entered, and the edit moves the locator: the password stored
+    /// under the old locator (this one) is read and handed on, so "leave it
+    /// empty to keep the existing one" survives the move.
+    CarriedFrom(String),
+    /// None at all: the submit connects through `connect_server`, which never
+    /// deletes a stored password.
+    Nothing,
+}
+
+/// Decides what password a connection form's submit hands to
+/// `connect_server_with_password` — where an unticked box can delete a stored
+/// one — from the typed field, a password embedded in a pasted URL, the
+/// locator being edited (`None` when adding) and the locator the fields build.
+///
+/// One function, called by both [`submit_server_form`] and the form's
+/// "remember" hint, because a hint that re-derived this disagreed with the
+/// submit: an edit moving onto another saved connection's locator with the
+/// field empty carries the old password across and can delete that
+/// connection's differing stored one, while the hint read the empty field and
+/// said nothing.
+fn form_password(
+    typed: &str,
+    embedded: Option<String>,
+    old_locator: Option<&str>,
+    url: &str,
+) -> FormPassword {
+    if !typed.is_empty() {
+        return FormPassword::Entered(typed.to_string());
+    }
+    if let Some(embedded) = embedded {
+        return FormPassword::Entered(embedded);
+    }
+    match old_locator {
+        Some(old) if old != url => FormPassword::CarriedFrom(old.to_string()),
+        _ => FormPassword::Nothing,
+    }
+}
+
 /// Whether the connection form shows its "remember" box for `auth_mode`.
 /// The box is rendered on this and its answer read on this, so a hidden box —
 /// which keeps its default tick — is never taken for an answer.
@@ -1804,6 +1854,7 @@ fn PostgresForm(
     let prefill = edit.clone().map(EditPrefill::from_saved);
     let seed = prefill.clone().unwrap_or_default();
     let old_locator = edit.as_ref().map(|e| e.locator().to_string());
+    let hint_old_locator = old_locator.clone();
     let editing = edit.is_some();
     let mut host = use_signal(|| seed.host.clone());
     let mut port = use_signal(|| seed.port.clone());
@@ -1876,24 +1927,27 @@ fn PostgresForm(
         );
     };
 
-    // Read at render, so the line follows the fields as they are typed. The
-    // password the submit would hand on: typed, or pasted inside the URL.
-    let enters_password =
-        !password().is_empty() || embedded_url_password(use_url(), &pasted_url()).is_some();
+    // Read at render, so the line follows the fields as they are typed — on
+    // the same URL builder and the same password decision as the submit.
+    let hint_url = postgres_form_url(
+        use_url(),
+        &pasted_url(),
+        &host(),
+        &port(),
+        &database(),
+        &user(),
+        &sslmode(),
+    )
+    .ok();
     let remember_note = form_remember_hint(
         editing,
-        enters_password,
-        postgres_form_url(
-            use_url(),
-            &pasted_url(),
-            &host(),
-            &port(),
-            &database(),
-            &user(),
-            &sslmode(),
-        )
-        .ok()
-        .as_deref(),
+        &form_password(
+            &password(),
+            embedded_url_password(use_url(), &pasted_url()),
+            hint_old_locator.as_deref(),
+            hint_url.as_deref().unwrap_or_default(),
+        ),
+        hint_url.as_deref(),
         state.saved.read().entries(),
     );
     let field_class = FORM_FIELD_CLASS;
@@ -2043,6 +2097,7 @@ fn SqlServerForm(
         .map(EditPrefill::from_saved)
         .unwrap_or_default();
     let old_locator = edit.as_ref().map(|e| e.locator().to_string());
+    let hint_old_locator = old_locator.clone();
     let editing = edit.is_some();
     let mut host = use_signal(|| seed.host.clone());
     let mut port = use_signal(|| seed.port.clone());
@@ -2120,25 +2175,28 @@ fn SqlServerForm(
         );
     };
 
-    // Read at render, so the line follows the fields as they are typed. The
-    // password the submit would hand on: typed, or pasted inside the URL.
-    let enters_password =
-        !password().is_empty() || embedded_url_password(use_url(), &pasted_url()).is_some();
+    // Read at render, so the line follows the fields as they are typed — on
+    // the same URL builder and the same password decision as the submit.
+    let hint_url = sqlserver_form_url(
+        use_url(),
+        &pasted_url(),
+        &host(),
+        &port(),
+        &database(),
+        &user(),
+        &encrypt(),
+        trust_cert(),
+    )
+    .ok();
     let remember_note = form_remember_hint(
         editing,
-        enters_password,
-        sqlserver_form_url(
-            use_url(),
-            &pasted_url(),
-            &host(),
-            &port(),
-            &database(),
-            &user(),
-            &encrypt(),
-            trust_cert(),
-        )
-        .ok()
-        .as_deref(),
+        &form_password(
+            &password(),
+            embedded_url_password(use_url(), &pasted_url()),
+            hint_old_locator.as_deref(),
+            hint_url.as_deref().unwrap_or_default(),
+        ),
+        hint_url.as_deref(),
         state.saved.read().entries(),
     );
     let field_class = FORM_FIELD_CLASS;
@@ -2384,44 +2442,145 @@ mod tests {
             color: None,
             group: None,
         }];
-        for (editing, url, expected, why) in [
+        // Each case goes through `form_password`, the decision the submit
+        // acts on, so the hint is asked about what the submit would hand on.
+        // (typed field, embedded password, edited locator, built URL)
+        let (typed, pasted, other) = (typed.as_str(), pasted.as_str(), other.as_str());
+        let cases = [
             (
-                true,
+                "x",
                 None,
+                Some(typed),
+                Some(typed),
                 hedged,
-                "an edited connection may have a stored password",
+                "an edit handing a typed password",
             ),
             (
-                false,
-                Some(typed.as_str()),
-                hedged,
-                "adding a saved connection's URL again is that connection to the \
-                 keyring, and an unticked different password deletes its entry",
-            ),
-            (
-                false,
-                Some(pasted.as_str()),
-                hedged,
-                "the same connection pasted with a password in it is still that \
-                 locator",
-            ),
-            (
-                false,
-                Some(other.as_str()),
+                "",
                 None,
-                "a new locator has nothing saved under it",
+                Some(typed),
+                Some(typed),
+                None,
+                "a rename-only edit hands nothing",
             ),
-            (false, None, None, "fields that build no URL match nothing"),
-        ] {
+            (
+                "",
+                None,
+                Some(other),
+                Some(typed),
+                hedged,
+                "an edit moved onto a saved locator carries its old password across, \
+                 which can delete that connection's differing stored one",
+            ),
+            (
+                "",
+                None,
+                Some(typed),
+                Some(other),
+                hedged,
+                "an edit moving off its locator carries the password across",
+            ),
+            (
+                "x",
+                None,
+                None,
+                Some(typed),
+                hedged,
+                "adding a saved URL again, typed",
+            ),
+            (
+                "",
+                Some("hunter2"),
+                None,
+                Some(pasted),
+                hedged,
+                "adding a saved URL again, pasted with its password",
+            ),
+            (
+                "x",
+                None,
+                None,
+                Some(other),
+                None,
+                "a new locator has nothing saved",
+            ),
+            (
+                "",
+                None,
+                None,
+                Some(typed),
+                None,
+                "adding with no password hands nothing",
+            ),
+            (
+                "x",
+                None,
+                None,
+                None,
+                None,
+                "fields that build no URL match nothing",
+            ),
+        ];
+        for (field, embedded, old, url, expected, why) in cases {
+            let handed = form_password(
+                field,
+                embedded.map(str::to_string),
+                old,
+                url.unwrap_or_default(),
+            );
             assert_eq!(
-                form_remember_hint(editing, true, url, &saved),
+                form_remember_hint(old.is_some(), &handed, url, &saved),
                 expected,
                 "{why}"
             );
-            assert_eq!(
-                form_remember_hint(editing, false, url, &saved),
+        }
+    }
+
+    #[test]
+    fn the_form_hands_on_one_password_decided_in_one_place() {
+        use FormPassword::{CarriedFrom, Entered, Nothing};
+        const OLD: &str = "postgres://app@db:5432/old?sslmode=prefer";
+        const NEW: &str = "postgres://app@db:5432/new?sslmode=prefer";
+        for (typed, embedded, old, url, expected, why) in [
+            ("typed", None, None, NEW, Entered("typed".into()), "typed"),
+            (
+                "typed",
+                Some("pasted"),
+                Some(OLD),
+                NEW,
+                Entered("typed".into()),
+                "the field outranks the URL and the carry",
+            ),
+            (
+                "",
+                Some("pasted"),
                 None,
-                "no password entered, so the submit cannot delete one: {why}"
+                NEW,
+                Entered("pasted".into()),
+                "embedded in a pasted URL",
+            ),
+            (
+                "",
+                None,
+                Some(OLD),
+                NEW,
+                CarriedFrom(OLD.into()),
+                "an edit moving the locator carries the old password across",
+            ),
+            (
+                "",
+                None,
+                Some(OLD),
+                OLD,
+                Nothing,
+                "an edit keeping its locator with the field empty hands nothing",
+            ),
+            ("", None, None, NEW, Nothing, "adding with nothing entered"),
+        ] {
+            assert_eq!(
+                form_password(typed, embedded.map(str::to_string), old, url),
+                expected,
+                "{why}"
             );
         }
     }
@@ -2476,24 +2635,25 @@ mod tests {
             }
         }
         let shared = [
-            "let enters_password = !password().is_empty() \
-             || embedded_url_password(use_url(), &pasted_url()).is_some();",
-            "let remember_note = form_remember_hint( editing, enters_password,",
-            "state.saved.read().entries(), );",
+            "let hint_old_locator = old_locator.clone();",
+            "let remember_note = form_remember_hint( editing, &form_password( &password(), \
+             embedded_url_password(use_url(), &pasted_url()), hint_old_locator.as_deref(), \
+             hint_url.as_deref().unwrap_or_default(), ), hint_url.as_deref(), \
+             state.saved.read().entries(), );",
         ];
         for (form, builder_at_render, builder_at_submit) in [
             (
                 "fn PostgresForm(",
-                "postgres_form_url( use_url(), &pasted_url(), &host(), &port(), \
-                 &database(), &user(), &sslmode(), ) .ok() .as_deref(),",
+                "let hint_url = postgres_form_url( use_url(), &pasted_url(), &host(), &port(), \
+                 &database(), &user(), &sslmode(), ) .ok();",
                 "let built = postgres_form_url( *use_url.peek(), &pasted_url.peek(), \
                  &host.peek(), &port.peek(), &database.peek(), &user.peek(), \
                  &sslmode.peek(), );",
             ),
             (
                 "fn SqlServerForm(",
-                "sqlserver_form_url( use_url(), &pasted_url(), &host(), &port(), \
-                 &database(), &user(), &encrypt(), trust_cert(), ) .ok() .as_deref(),",
+                "let hint_url = sqlserver_form_url( use_url(), &pasted_url(), &host(), &port(), \
+                 &database(), &user(), &encrypt(), trust_cert(), ) .ok();",
                 "let built = sqlserver_form_url( *use_url.peek(), &pasted_url.peek(), \
                  &host.peek(), &port.peek(), &database.peek(), &user.peek(), \
                  &encrypt.peek(), *trust_cert.peek(), );",
@@ -2523,6 +2683,33 @@ mod tests {
                 "{form}: the hint is bound once and rendered once: {body}"
             );
         }
+        // The submit acts on the same decision, and on nothing else: the
+        // password it hands on is `form_password`'s verdict, read once.
+        let submit = {
+            let lines: Vec<&str> = source
+                .lines()
+                .skip_while(|line| !line.starts_with("fn submit_server_form("))
+                .take_while(|line| line.trim_end() != "}")
+                .collect();
+            code_without_prose(&lines.join("\n"))
+        };
+        for pin in [
+            "let handed = form_password( &form.password.peek(), embedded_password, \
+             old_locator.as_deref(), &url, );",
+            "let entered_password = match handed { FormPassword::Entered(password) => password, \
+             FormPassword::CarriedFrom(old) => crate::secrets::get_password_async(old) .await \
+             .ok() .flatten() .unwrap_or_default(), FormPassword::Nothing => String::new(), };",
+        ] {
+            assert!(
+                submit.contains(pin),
+                "submit_server_form: `{pin}` is gone: {submit}"
+            );
+        }
+        assert_eq!(
+            submit.matches("entered_password =").count(),
+            1,
+            "submit_server_form decides its password somewhere besides `form_password`: {submit}"
+        );
     }
 
     #[test]
