@@ -1992,12 +1992,14 @@ mod tests {
         let pool = one_connection().await;
         run(
             &pool,
-            "CREATE TABLE s (id INTEGER PRIMARY KEY NOT NULL, x TEXT) WITHOUT ROWID",
+            "CREATE TABLE s (id INTEGER PRIMARY KEY NOT NULL, x TEXT REFERENCES p_main (id)) \
+             WITHOUT ROWID",
         )
         .await;
         run(
             &pool,
-            "CREATE TEMP TABLE s (id INTEGER PRIMARY KEY, only_in_temp TEXT)",
+            "CREATE TEMP TABLE s (id INTEGER PRIMARY KEY, \
+             only_in_temp TEXT REFERENCES p_temp (id))",
         )
         .await;
         let tables = introspect(&pool).await.unwrap();
@@ -2012,6 +2014,16 @@ mod tests {
                 .map(|i| i.constraint)
                 .collect::<Vec<_>>(),
             [Some(IndexConstraint::PrimaryKey)]
+        );
+        let foreign_keys: Vec<(&str, &[String])> = s[0]
+            .foreign_keys
+            .iter()
+            .map(|fk| (fk.referenced_table.as_str(), fk.columns.as_slice()))
+            .collect();
+        assert_eq!(
+            foreign_keys,
+            [("p_main", &["x".to_string()][..])],
+            "main's foreign keys, not temp's"
         );
     }
 
