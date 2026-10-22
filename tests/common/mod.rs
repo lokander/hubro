@@ -977,7 +977,7 @@ fn a_rewritten_url_keeps_everything_but_the_database() {
 /// then used twice: `fetch_cell` must return that row's full `body`, and an
 /// `apply_staged` update of `tag` must land on that row. The two are the
 /// same question asked by the expand popup and by Save, so a key type that
-/// one answers and the other does not is a cell that expands to NULL but
+/// one answers and the other does not is a cell that cannot be expanded but
 /// saves — or the reverse.
 ///
 /// "Lands on that row" is checked by reading the tags back, not by the write

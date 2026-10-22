@@ -55,8 +55,9 @@ pub const FETCH_CELL_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// What [`DbPool::fetch_cell`] reports when the row's locator matches no row
 /// — deleted since the page loaded, or a key the server cannot be asked for
-/// again. Shown by the expand popup, the truncated-cell editor, the row
-/// detail panel and the clipboard in place of the value.
+/// again. Shown in place of the value by the expand popup, the truncated-cell
+/// editor and the row detail panel, and in the Copy status (the clipboard is
+/// left untouched).
 pub const MISSING_ROW: &str = "this row no longer exists — reload the table";
 
 /// One cell's value loaded on demand ([`DbPool::fetch_cell`]).
