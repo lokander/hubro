@@ -298,39 +298,6 @@ pub(super) fn copy_summary(raw: bool, format: CopyFormat, rows: usize, cols: usi
     }
 }
 
-/// Puts `text` on the system clipboard through the webview.
-///
-/// `navigator.clipboard` is the modern path; the hidden-textarea
-/// `execCommand` fallback covers a webview that withholds it (no secure
-/// context, or a rejected permission), because a copy that silently does
-/// nothing is indistinguishable from a broken app. The fallback restores the
-/// previously focused element so the grid keeps its keyboard focus.
-pub(super) fn write_clipboard(text: &str) {
-    let json = js_string(text);
-    document::eval(&format!(
-        r#"(() => {{
-  const text = {json};
-  const fallback = () => {{
-    const prev = document.activeElement;
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    ta.style.position = 'fixed';
-    ta.style.top = '-1000px';
-    document.body.appendChild(ta);
-    ta.select();
-    try {{ document.execCommand('copy'); }} catch (e) {{ /* nothing else to try */ }}
-    document.body.removeChild(ta);
-    if (prev && prev.focus) prev.focus();
-  }};
-  if (navigator.clipboard && navigator.clipboard.writeText) {{
-    navigator.clipboard.writeText(text).catch(fallback);
-  }} else {{
-    fallback();
-  }}
-}})();"#
-    ));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

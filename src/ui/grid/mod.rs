@@ -53,7 +53,7 @@ use crate::util::human_bytes;
 use super::editing::{editor_kind, CellEditor, EditNav, EditorKind};
 use super::import::ImportDialog;
 use super::js::{
-    focus_by_id_next_frame, focus_on_mount, js_string, reclaim_focus_by_id_next_frame,
+    focus_by_id_next_frame, focus_on_mount, reclaim_focus_by_id_next_frame, write_clipboard,
 };
 use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState};
 use super::schema::display_type;

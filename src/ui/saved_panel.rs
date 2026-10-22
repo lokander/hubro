@@ -17,7 +17,7 @@ use dioxus::prelude::*;
 use crate::db::ConnectionId;
 use crate::history::SavedQuery;
 
-use super::js::copy_to_clipboard;
+use super::js::write_clipboard;
 use super::notice::{Banner, BannerKind, LoadingLine};
 use super::state::AppState;
 use super::text_field::TextInput;
@@ -282,7 +282,7 @@ fn SavedRow(id: ConnectionId, entry: SavedQuery) -> Element {
                 }
                 button {
                     class: "rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
-                    onclick: move |_| copy_to_clipboard(&sql_for_copy),
+                    onclick: move |_| write_clipboard(&sql_for_copy),
                     "Copy"
                 }
                 if confirm_delete() {
