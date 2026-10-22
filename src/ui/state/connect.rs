@@ -231,6 +231,12 @@ pub(super) fn card_offers_remember(source: Option<RefreshSource>) -> bool {
 /// one of the two places ([`place_entra_refresh`] deletes the keyring copy when
 /// it keeps one for the session). No token at all means the keyring read came
 /// back empty or failed — the same accepted gap as [`StoredCopy::Absent`].
+///
+/// One case breaks the one-place rule: a `RefreshKeyring::Delete` that fails
+/// leaves the token in session memory *and* the keyring. The next card then
+/// reads `Absent` while an unticked box would still delete the keyring copy.
+/// Accepted: [`AppState::keep_entra_refresh`] tells the user so when it
+/// happens ("it will still sign you in").
 pub(super) fn entra_stored_copy(source: Option<RefreshSource>, rejected: bool) -> StoredCopy {
     if source == Some(RefreshSource::Keyring) && !rejected {
         StoredCopy::Present
@@ -4715,6 +4721,12 @@ mod tests {
         // a keyring entry, each classified. A new one fails here until it is
         // classified, and a user-answered one has to name the hint that
         // warns of it.
+        //
+        // Limits: it reads only `src/`, stops each file at its test module,
+        // and finds deletes by the names of the three `secrets`/`keyring`
+        // functions. A delete reached some other way — another crate's
+        // keyring call, a macro that builds the name — is invisible. It
+        // catches accidents, not evasion.
         const API: &str = "the keyring API itself; its callers are the sites listed here";
         let registry: &[(&str, &str, usize, &str)] = &[
             ("secrets.rs", "delete_password_async", 1, API),
@@ -4781,28 +4793,37 @@ mod tests {
         };
         for (rel, text) in all_sources() {
             let code = code_only(&shipped(&without_tests(&text)));
-            for call in [
-                "delete_password(",
-                "delete_password_async(",
-                "delete_credential(",
+            // Every reference to a delete, not only calls: a fn pointer
+            // (`let del = …delete_password_async;`), `.map(delete_password)`
+            // and a `use … as` rename all still name the original, so each
+            // is counted where it appears — a `use` outside any function as
+            // `<module>`, which no entry classifies.
+            for ident in [
+                "delete_password",
+                "delete_password_async",
+                "delete_credential",
             ] {
-                for (at, _) in code.match_indices(call) {
+                for (at, _) in code.match_indices(ident) {
                     let before = &code[..at];
-                    // A definition is not a deletion; a longer name ending in
-                    // the call (`x_delete_password(`) is not this call.
-                    if before.ends_with("fn ")
-                        || before
-                            .chars()
-                            .next_back()
-                            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                    let after = &code[at + ident.len()..];
+                    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+                    // Part of a longer name (`delete_password` inside
+                    // `delete_password_async`, or `x_delete_password`) is that
+                    // name's occurrence, not this one; a definition is not a
+                    // deletion.
+                    if before.chars().next_back().is_some_and(is_ident)
+                        || after.chars().next().is_some_and(is_ident)
+                        || before.ends_with("fn ")
                     {
                         continue;
                     }
-                    let fn_at = before.rfind("fn ").expect("a call inside a function");
-                    let name: String = before[fn_at + 3..]
-                        .chars()
-                        .take_while(|c| c.is_alphanumeric() || *c == '_')
-                        .collect();
+                    let name: String = match before.rfind("fn ") {
+                        Some(fn_at) => before[fn_at + 3..]
+                            .chars()
+                            .take_while(|c| is_ident(*c))
+                            .collect(),
+                        None => "<module>".to_string(),
+                    };
                     found.push((rel.clone(), name));
                 }
             }
