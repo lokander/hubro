@@ -270,16 +270,23 @@ mod tests {
     #[test]
     fn a_failed_renewal_is_not_retried_at_once() {
         let expires = at(3600);
+        // Failed inside the margin: the token is still used while it lasts.
         let failed = Some(at(3590));
         assert_eq!(token_step(at(3595), expires, true, failed), TokenStep::Use);
+        // Failed as it expired: refused, without another try, until
+        // `RETRY_AFTER` has passed. Stated against the constant, so the test
+        // pins the rule rather than one value of it.
+        let failed = Some(expires);
+        let just_before = expires + RETRY_AFTER - Duration::from_secs(1);
         assert_eq!(
-            token_step(at(3610), expires, true, failed),
+            token_step(just_before, expires, true, failed),
             TokenStep::Refuse
         );
-        let later = at(3590) + RETRY_AFTER;
+        let later = expires + RETRY_AFTER;
         assert_eq!(token_step(later, expires, true, failed), TokenStep::Renew);
         // A clock that went back before the failure does not retry: it uses
         // the token while it lasts and refuses it after.
+        let failed = Some(at(3590));
         assert_eq!(token_step(at(3000), at(3100), true, failed), TokenStep::Use);
         assert_eq!(
             token_step(at(3200), at(3100), true, failed),
