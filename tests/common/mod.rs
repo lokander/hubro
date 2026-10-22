@@ -1091,7 +1091,7 @@ pub async fn row_addressing_failures(pool: &DbPool, table: &hubro::db::TableMeta
             .collect();
         if found != [&Value::Text(tag.clone())] {
             failures.push(format!(
-                "{} row {name}: its save reported success, but its tag is now {found:?} \
+                "{} row `{name}`: its save reported success, but its tag is now {found:?} \
                  (another row's write landed on it, or its own landed elsewhere)",
                 table.name
             ));
