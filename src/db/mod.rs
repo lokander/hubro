@@ -90,8 +90,8 @@ pub use schema::{
     TableMeta, TypeDetail, TypeRef,
 };
 pub use schema_edit::{
-    op_problem, schema_edit_refusal, schema_op_sql, SchemaOp, NOTHING_TO_RUN, NOT_A_TABLE,
-    PRIMARY_KEY_INDEX, UNIQUE_CONSTRAINT_INDEX,
+    op_problem, schema_edit_refusal, schema_op_sql, SchemaOp, EXCLUSION_CONSTRAINT_INDEX,
+    NOTHING_TO_RUN, NOT_A_TABLE, PRIMARY_KEY_INDEX, UNIQUE_CONSTRAINT_INDEX,
 };
 pub use script::{
     classify_statement, needs_confirmation, run_script, script_refusal, split_statements,

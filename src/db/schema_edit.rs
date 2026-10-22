@@ -219,12 +219,17 @@ pub const PRIMARY_KEY_INDEX: &str =
 /// As [`PRIMARY_KEY_INDEX`], for a UNIQUE constraint's index.
 pub const UNIQUE_CONSTRAINT_INDEX: &str =
     "This index enforces a UNIQUE constraint and can't be dropped on its own.";
+/// As [`PRIMARY_KEY_INDEX`], for an EXCLUDE constraint's index.
+pub const EXCLUSION_CONSTRAINT_INDEX: &str =
+    "This index enforces an EXCLUDE constraint and can't be dropped on its own.";
 
 /// Refuses dropping an index that exists to enforce a constraint
-/// ([`IndexMeta::constraint`](super::schema::IndexMeta::constraint)): the engine refuses `DROP INDEX` on one
-/// (measured on SQLite), so offering it would only offer a failure. Unlike the
-/// capability half, this is a fact about the one object, which no statement
-/// text reveals — the generated `DROP INDEX` reads the same either way.
+/// ([`IndexMeta::constraint`](super::schema::IndexMeta::constraint)): the
+/// engine refuses `DROP INDEX` on one (measured on SQLite, SQL Server and every
+/// Postgres-wire engine that has such constraints), so offering it would only
+/// offer a failure. Unlike the capability half, this is a fact about the one
+/// object, which no statement text reveals — the generated `DROP INDEX` reads
+/// the same either way.
 fn constraint_index_refusal(table: &TableMeta, op: &SchemaOp) -> Option<&'static str> {
     let SchemaOp::DropIndex { name } = op else {
         return None;
@@ -233,6 +238,7 @@ fn constraint_index_refusal(table: &TableMeta, op: &SchemaOp) -> Option<&'static
     match index.constraint? {
         IndexConstraint::PrimaryKey => Some(PRIMARY_KEY_INDEX),
         IndexConstraint::Unique => Some(UNIQUE_CONSTRAINT_INDEX),
+        IndexConstraint::Exclusion => Some(EXCLUSION_CONSTRAINT_INDEX),
     }
 }
 
@@ -929,6 +935,7 @@ mod tests {
         };
         constrained("t_pk", IndexConstraint::PrimaryKey);
         constrained("t_uq", IndexConstraint::Unique);
+        constrained("t_excl", IndexConstraint::Exclusion);
         let drop = |name: &str| SchemaOp::DropIndex { name: name.into() };
         for dialect in DIALECTS {
             let refusal =
@@ -941,6 +948,11 @@ mod tests {
             assert_eq!(
                 refusal(&drop("t_uq")),
                 Some(UNIQUE_CONSTRAINT_INDEX),
+                "{dialect:?}"
+            );
+            assert_eq!(
+                refusal(&drop("t_excl")),
+                Some(EXCLUSION_CONSTRAINT_INDEX),
                 "{dialect:?}"
             );
             // An index the user made is offered — `table`'s own, unique or

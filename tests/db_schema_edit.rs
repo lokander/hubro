@@ -59,7 +59,8 @@ mod common;
 use common::FixtureDb;
 use hubro::db::{
     run_script, schema_edit_refusal, schema_op_sql, split_statements, Capabilities, DbPool,
-    Dialect, SchemaOp, TableMeta, Value, PRIMARY_KEY_INDEX, UNIQUE_CONSTRAINT_INDEX,
+    Dialect, SchemaOp, TableMeta, Value, EXCLUSION_CONSTRAINT_INDEX, PRIMARY_KEY_INDEX,
+    UNIQUE_CONSTRAINT_INDEX,
 };
 
 /// What happened to one operation on one engine.
@@ -462,61 +463,114 @@ async fn sqlite_truncate_is_a_delete_and_says_so() {
     pool.close().await;
 }
 
-#[tokio::test]
-async fn sqlite_an_index_built_for_a_constraint_is_not_offered_for_drop() {
-    // SQLite refuses `DROP INDEX` on the index behind a PRIMARY KEY or UNIQUE
-    // constraint. The gate must refuse exactly those, and still offer an index
-    // the user created — unique or not, which is why `unique` cannot decide it.
-    let fixture = FixtureDb::with_sql(
-        "CREATE TABLE tagged (code TEXT PRIMARY KEY, slug TEXT UNIQUE, a INT, b INT,
-                              UNIQUE (a, b));
-         CREATE UNIQUE INDEX tagged_made_unique ON tagged (a);
-         CREATE INDEX tagged_made ON tagged (b);",
-    )
-    .await;
-    let pool = fixture.open().await;
-    let tables = pool.introspect().await.unwrap();
-    let meta = table(&tables, "tagged");
-    let caps = pool.backend_capabilities();
+/// What one engine did with every index of a table that has both kinds: the
+/// indexes its constraints own, and indexes made with `CREATE [UNIQUE] INDEX`.
+#[derive(Debug)]
+struct ConstraintSweep {
+    /// The gate's reason for each index it withheld, sorted. Each was also
+    /// sent to the engine, which had to refuse it.
+    refused: Vec<&'static str>,
+    /// Indexes the gate offered that the engine then dropped.
+    dropped: usize,
+    /// Indexes the gate offered that the engine refused anyway, with its
+    /// message — empty wherever the catalog can tell the two kinds apart.
+    offered_but_refused: Vec<String>,
+}
 
-    let mut refused = Vec::new();
+/// Drives the Drop button's decision over every index of `name`: refused by
+/// the gate must mean refused by the engine (with a message containing
+/// `engine_refusal`), and offered must mean dropped — except what lands in
+/// [`ConstraintSweep::offered_but_refused`], which each caller pins.
+async fn constraint_sweep(
+    pool: &DbPool,
+    name: &str,
+    setup: &[String],
+    engine_refusal: &str,
+) -> ConstraintSweep {
+    for statement in setup {
+        pool.execute(statement)
+            .await
+            .unwrap_or_else(|e| panic!("setup failed: {e}\n{statement}"));
+    }
+    let tables = pool.introspect().await.unwrap();
+    let meta = table(&tables, name);
+    let caps = pool.backend_capabilities();
+    let mut sweep = ConstraintSweep {
+        refused: Vec::new(),
+        dropped: 0,
+        offered_but_refused: Vec::new(),
+    };
     for index in &meta.indexes {
         let op = SchemaOp::DropIndex {
             name: index.name.clone(),
         };
-        match schema_edit_refusal(caps, Dialect::Sqlite, meta, &op) {
+        match schema_edit_refusal(caps, pool.dialect(), meta, &op) {
             Some(reason) => {
-                refused.push(reason);
-                // The engine agrees: what the gate withholds really fails.
-                let sql = schema_op_sql(Dialect::Sqlite, meta, &op);
+                sweep.refused.push(reason);
+                let sql = schema_op_sql(pool.dialect(), meta, &op);
                 let err = pool.execute(&sql).await.expect_err(&sql);
-                assert!(
-                    err.to_string()
-                        .contains("associated with UNIQUE or PRIMARY KEY constraint"),
-                    "{err}"
-                );
+                assert!(err.to_string().contains(engine_refusal), "{err}");
             }
-            None => apply(&pool, meta, &op).await.unwrap(),
+            None => match apply(pool, meta, &op).await {
+                Ok(()) => sweep.dropped += 1,
+                Err(err) => sweep.offered_but_refused.push(err),
+            },
         }
     }
-    refused.sort();
-    let mut expected = vec![
-        PRIMARY_KEY_INDEX,
-        UNIQUE_CONSTRAINT_INDEX,
-        UNIQUE_CONSTRAINT_INDEX,
-    ];
-    expected.sort();
-    assert_eq!(refused, expected);
-    // Both indexes the user made were dropped; the constraints' remain.
+    sweep.refused.sort();
     let left = pool.introspect().await.unwrap();
-    let left: Vec<_> = table(&left, "tagged")
-        .indexes
-        .iter()
-        .map(|i| i.constraint)
-        .collect();
-    assert_eq!(left.len(), 3, "{left:?}");
-    assert!(left.iter().all(Option::is_some), "{left:?}");
+    assert_eq!(
+        table(&left, name).indexes.len(),
+        sweep.refused.len() + sweep.offered_but_refused.len(),
+        "exactly the indexes the engine refused remain: {sweep:?}"
+    );
+    sweep
+}
 
+/// The fixture every engine with constraints shares: a primary key, a UNIQUE
+/// column, a two-column UNIQUE constraint, and two indexes the user made, one
+/// of them unique — so `unique` alone cannot be what decides. `extra` adds
+/// engine-specific columns or constraints.
+fn constraint_fixture(name: &str, text_type: &str, extra: &str) -> Vec<String> {
+    vec![
+        format!("DROP TABLE IF EXISTS {name}"),
+        format!(
+            "CREATE TABLE {name} (code {text_type} PRIMARY KEY, slug {text_type} UNIQUE, \
+             a INT, b INT, UNIQUE (a, b){extra})"
+        ),
+        format!("CREATE UNIQUE INDEX {name}_made_unique ON {name} (a)"),
+        format!("CREATE INDEX {name}_made ON {name} (b)"),
+    ]
+}
+
+fn sorted(mut reasons: Vec<&'static str>) -> Vec<&'static str> {
+    reasons.sort();
+    reasons
+}
+
+#[tokio::test]
+async fn sqlite_an_index_built_for_a_constraint_is_not_offered_for_drop() {
+    let fixture = FixtureDb::with_sql("").await;
+    let pool = fixture.open().await;
+    let mut setup = constraint_fixture("ci_lite", "TEXT", "");
+    setup.remove(0);
+    let sweep = constraint_sweep(
+        &pool,
+        "ci_lite",
+        &setup,
+        "associated with UNIQUE or PRIMARY KEY constraint",
+    )
+    .await;
+    assert_eq!(
+        sweep.refused,
+        sorted(vec![
+            PRIMARY_KEY_INDEX,
+            UNIQUE_CONSTRAINT_INDEX,
+            UNIQUE_CONSTRAINT_INDEX
+        ])
+    );
+    assert_eq!(sweep.dropped, 2, "{sweep:?}");
+    assert!(sweep.offered_but_refused.is_empty(), "{sweep:?}");
     pool.close().await;
 }
 
@@ -701,6 +755,131 @@ async fn sqlserver_renames_through_sp_rename() {
     assert!(find(&tables, "se_rename").is_none());
 
     let _ = pool.query("DROP TABLE se_renamed").await;
+    pool.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// Indexes a constraint owns, on the engines that have such constraints.
+// Materialize and RisingWave have none (an empty `pg_constraint`); their drop of
+// a user-made index is covered by their sequences below.
+// ---------------------------------------------------------------------------
+
+/// PostgreSQL, TimescaleDB and Citus also have EXCLUDE constraints, whose
+/// index is as undroppable as the other two.
+async fn assert_postgres_constraint_sweep(url: &str, name: &str, engine: &str) {
+    let pool = DbPool::open_postgres(url).await.unwrap();
+    let setup = constraint_fixture(
+        name,
+        "varchar(40)",
+        ", span int4range, EXCLUDE USING gist (span WITH &&)",
+    );
+    let sweep = constraint_sweep(&pool, name, &setup, "because constraint").await;
+    assert_eq!(
+        sweep.refused,
+        sorted(vec![
+            PRIMARY_KEY_INDEX,
+            UNIQUE_CONSTRAINT_INDEX,
+            UNIQUE_CONSTRAINT_INDEX,
+            EXCLUSION_CONSTRAINT_INDEX,
+        ]),
+        "{engine}"
+    );
+    assert_eq!(sweep.dropped, 2, "{engine}: {sweep:?}");
+    assert!(sweep.offered_but_refused.is_empty(), "{engine}: {sweep:?}");
+    pool.execute(&format!("DROP TABLE {name}")).await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_an_index_built_for_a_constraint_is_not_offered_for_drop() {
+    let Some(url) = common::pg_test_url().await else {
+        return;
+    };
+    assert_postgres_constraint_sweep(&url, "ci_pg", "PostgreSQL").await;
+}
+
+#[tokio::test]
+async fn timescale_an_index_built_for_a_constraint_is_not_offered_for_drop() {
+    let Some(url) = url("HUBRO_TIMESCALE_TEST_URL") else {
+        return;
+    };
+    assert_postgres_constraint_sweep(&url, "ci_ts", "TimescaleDB").await;
+}
+
+#[tokio::test]
+async fn citus_an_index_built_for_a_constraint_is_not_offered_for_drop() {
+    let Some(url) = url("HUBRO_CITUS_TEST_URL") else {
+        return;
+    };
+    assert_postgres_constraint_sweep(&url, "ci_citus", "Citus").await;
+}
+
+#[tokio::test]
+async fn yugabyte_an_index_built_for_a_constraint_is_not_offered_for_drop() {
+    let Some(url) = url("HUBRO_YUGABYTE_TEST_URL") else {
+        return;
+    };
+    // No EXCLUDE: "EXCLUDE constraint not supported yet".
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let setup = constraint_fixture("ci_yb", "varchar(40)", "");
+    let sweep = constraint_sweep(&pool, "ci_yb", &setup, "because constraint").await;
+    assert_eq!(
+        sweep.refused,
+        sorted(vec![
+            PRIMARY_KEY_INDEX,
+            UNIQUE_CONSTRAINT_INDEX,
+            UNIQUE_CONSTRAINT_INDEX
+        ])
+    );
+    assert_eq!(sweep.dropped, 2, "{sweep:?}");
+    assert!(sweep.offered_but_refused.is_empty(), "{sweep:?}");
+    pool.execute("DROP TABLE ci_yb").await.unwrap();
+    pool.close().await;
+}
+
+/// CockroachDB lists a `CREATE UNIQUE INDEX` in `pg_constraint` exactly as it
+/// lists a UNIQUE constraint, so hubro claims only its primary key (see
+/// `pg_index_constraint`). This pins the cost of that: the two UNIQUE
+/// constraints' indexes are offered and the engine refuses them — a refusal the
+/// user reads, never a statement accepted while nothing changes — while the
+/// unique index the user made really does drop.
+#[tokio::test]
+async fn cockroach_offers_a_unique_constraints_index_and_the_engine_refuses_it() {
+    let Some(url) = url("HUBRO_CRDB_TEST_URL") else {
+        return;
+    };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let setup = constraint_fixture("ci_crdb", "varchar(40)", "");
+    let sweep = constraint_sweep(&pool, "ci_crdb", &setup, "cannot drop the primary index").await;
+    assert_eq!(sweep.refused, vec![PRIMARY_KEY_INDEX]);
+    assert_eq!(sweep.dropped, 2, "{sweep:?}");
+    assert_eq!(sweep.offered_but_refused.len(), 2, "{sweep:?}");
+    for err in &sweep.offered_but_refused {
+        assert!(err.contains("is in use as unique constraint"), "{err}");
+    }
+    pool.execute("DROP TABLE ci_crdb").await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_an_index_built_for_a_constraint_is_not_offered_for_drop() {
+    let Some(url) = common::mssql_test_url().await else {
+        return;
+    };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    let setup = constraint_fixture("ci_mssql", "nvarchar(40)", "");
+    let sweep = constraint_sweep(&pool, "ci_mssql", &setup, "constraint enforcement").await;
+    assert_eq!(
+        sweep.refused,
+        sorted(vec![
+            PRIMARY_KEY_INDEX,
+            UNIQUE_CONSTRAINT_INDEX,
+            UNIQUE_CONSTRAINT_INDEX
+        ])
+    );
+    assert_eq!(sweep.dropped, 2, "{sweep:?}");
+    assert!(sweep.offered_but_refused.is_empty(), "{sweep:?}");
+    pool.execute("DROP TABLE ci_mssql").await.unwrap();
     pool.close().await;
 }
 
