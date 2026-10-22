@@ -87,8 +87,11 @@ async fn interactive_flow_exchanges_the_code_for_a_token() {
     .token
     .unwrap();
 
-    assert_eq!(token.secret, "ACCESS_TOKEN");
-    assert_eq!(token.refresh_token.as_deref(), Some("REFRESH_TOKEN"));
+    assert_eq!(token.secret.expose(), "ACCESS_TOKEN");
+    assert_eq!(
+        token.refresh_token.as_ref().map(|r| r.expose()),
+        Some("REFRESH_TOKEN")
+    );
 }
 
 #[tokio::test]
@@ -116,8 +119,11 @@ async fn a_cached_refresh_token_is_redeemed_without_opening_a_browser() {
     assert!(!acquired.refresh_rejected);
     let token = acquired.token.unwrap();
 
-    assert_eq!(token.secret, "RENEWED");
-    assert_eq!(token.refresh_token.as_deref(), Some("ROTATED"));
+    assert_eq!(token.secret.expose(), "RENEWED");
+    assert_eq!(
+        token.refresh_token.as_ref().map(|r| r.expose()),
+        Some("ROTATED")
+    );
 }
 
 #[tokio::test]
@@ -150,7 +156,7 @@ async fn managed_identity_reads_the_token_from_imds() {
     .token
     .unwrap();
 
-    assert_eq!(token.secret, "MI_TOKEN");
+    assert_eq!(token.secret.expose(), "MI_TOKEN");
     assert!(token.refresh_token.is_none());
 }
 
@@ -327,7 +333,9 @@ async fn the_redirect_is_found_among_the_browser_s_other_connections() {
         )
         .await;
         assert_eq!(
-            acquired.token.map(|token| token.secret),
+            acquired
+                .token
+                .map(|token| token.secret.expose().to_string()),
             Ok("ACCESS_TOKEN".to_string()),
             "{noise:?} reached the listener before the redirect, and the \
              sign-in the user completed was reported as failed"

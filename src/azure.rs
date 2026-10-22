@@ -28,6 +28,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::db::entra::Secret;
+
 /// The Azure Database for PostgreSQL OAuth resource; tokens are requested for
 /// its `/.default` scope.
 pub const OSSRDBMS_RESOURCE: &str = "https://ossrdbms-aad.database.windows.net";
@@ -89,15 +91,16 @@ impl EntraAuth {
 }
 
 /// An acquired access token plus (for interactive auth) a refresh token to
-/// persist for silent renewals.
+/// persist for silent renewals. Both are [`Secret`]s from the moment the
+/// token endpoint's answer is parsed, so neither prints in a `Debug`.
 #[derive(Debug, Clone)]
 pub struct AccessToken {
     /// The bearer token — spliced in as the Postgres password.
-    pub secret: String,
+    pub secret: Secret,
     /// When the token expires (best-effort; used only to decide re-acquisition).
     pub expires_at: SystemTime,
     /// A refresh token to store for silent renewal, when the flow returned one.
-    pub refresh_token: Option<String>,
+    pub refresh_token: Option<Secret>,
 }
 
 /// Where to reach Azure. Real values by default; tests point these at a local
@@ -244,7 +247,7 @@ pub async fn acquire_token(
 pub async fn renew_silently(
     auth: &EntraAuth,
     resource: &str,
-    refresh: Option<&str>,
+    refresh: Option<&Secret>,
     endpoints: &Endpoints,
 ) -> Result<AccessToken, AzureError> {
     match auth {
@@ -254,6 +257,9 @@ pub async fn renew_silently(
         EntraAuth::Interactive { tenant, client_id } => match refresh {
             Some(refresh) => {
                 let client_id = client_id.as_deref().unwrap_or(AZURE_CLI_CLIENT_ID);
+                // Handed to the token endpoint: the one place the identity
+                // provider reads it.
+                let refresh = refresh.expose();
                 redeem_refresh_token(endpoints, tenant, client_id, resource, refresh).await
             }
             None => Err(AzureError::Config(
@@ -580,10 +586,10 @@ async fn post_token(
     let parsed: TokenResponse = serde_json::from_str(&body)
         .map_err(|e| AzureError::Http(format!("bad token response: {e}")))?;
     Ok(AccessToken {
-        secret: parsed.access_token,
+        secret: Secret::new(parsed.access_token),
         expires_at: SystemTime::now()
             + Duration::from_secs(parsed.expires_in.unwrap_or(3600).min(24 * 3600)),
-        refresh_token: parsed.refresh_token,
+        refresh_token: parsed.refresh_token.map(Secret::new),
     })
 }
 
@@ -662,7 +668,7 @@ async fn imds_get(
         .map(|epoch| SystemTime::UNIX_EPOCH + Duration::from_secs(epoch))
         .unwrap_or_else(|| SystemTime::now() + Duration::from_secs(3600));
     Ok(AccessToken {
-        secret: parsed.access_token,
+        secret: Secret::new(parsed.access_token),
         expires_at,
         refresh_token: None,
     })

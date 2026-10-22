@@ -37,7 +37,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt as _};
 
 use super::{column_infos, decode_row};
-use crate::db::entra::EntraTokens;
+use crate::db::entra::{EntraTokens, Secret};
 use crate::db::error::DbError;
 use crate::db::export::{export_io_err, ExportFormat, ExportSink};
 use crate::db::registry::RolledBack;
@@ -127,7 +127,7 @@ pub enum MssqlAuth {
     /// Microsoft Entra ID: log in with this AAD access token; the URL's
     /// user/password are ignored. Every connection the pool opens uses this
     /// one token, so once it expires no new connection can log in.
-    AadToken(String),
+    AadToken(Secret),
     /// Microsoft Entra ID, renewed: each connection the pool opens logs in
     /// with the token [`EntraTokens::current`] hands out at that moment.
     Entra(Arc<EntraTokens>),
@@ -252,7 +252,7 @@ impl MssqlUrlParts {
                 config.authentication(AuthMethod::sql_server(&self.user, &self.password));
             }
             MssqlAuth::AadToken(token) => {
-                config.authentication(AuthMethod::aad_token(token));
+                config.authentication(AuthMethod::aad_token(token.expose()));
             }
             // Set per connection, from the token current then
             // (`PoolInner::login_config`).
@@ -1547,7 +1547,7 @@ mod tests {
 
     #[test]
     fn mssql_auth_debug_never_prints_the_token() {
-        let auth = MssqlAuth::AadToken("SECRET_TOKEN".to_string());
+        let auth = MssqlAuth::AadToken(Secret::new("SECRET_TOKEN"));
         let rendered = format!("{auth:?}");
         assert!(!rendered.contains("SECRET_TOKEN"), "{rendered}");
         assert!(rendered.contains("AadToken"));
@@ -1740,7 +1740,7 @@ mod tests {
         // tiberius 0.13 defaults to a 30s bound per round-trip; a query that
         // runs longer than that is the user's business, not a driver error.
         let parts = || parse_mssql_url("mssql://sa@db.example.com:1433/app").unwrap();
-        let token = MssqlAuth::AadToken("t".to_string());
+        let token = MssqlAuth::AadToken(Secret::new("t"));
         for config in [
             parts().into_config(&MssqlAuth::Password, None),
             parts().into_config(&token, Some("db.example.com")),
