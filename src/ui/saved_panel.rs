@@ -20,6 +20,7 @@ use crate::history::SavedQuery;
 use super::js::copy_to_clipboard;
 use super::notice::{Banner, BannerKind, LoadingLine};
 use super::state::AppState;
+use super::text_field::TextInput;
 
 /// Right-side panel listing the queries saved for this connection plus the
 /// global ones: save-current, search, and per-entry Open / Copy / Delete.
@@ -89,11 +90,11 @@ pub(super) fn SavedQueriesPanel(
                         rsx! { span { class: "text-xs {class}", "{text}" } }
                     }
                 }
-                input {
+                TextInput {
                     class: "w-full rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 text-xs text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600",
                     placeholder: "Search saved queries (Enter)",
-                    value: "{search_input}",
-                    oninput: move |evt| {
+                    text: "{search_input}",
+                    oninput: move |evt: FormEvent| {
                         let value = evt.value();
                         // Clearing the box resets the filter immediately.
                         if value.trim().is_empty() {
@@ -180,12 +181,12 @@ fn SaveForm(id: ConnectionId, buffer: u64, on_close: EventHandler<()>) -> Elemen
     };
     rsx! {
         div { class: "flex flex-col gap-1.5",
-            input {
+            TextInput {
                 class: "w-full rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 text-xs text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600",
                 placeholder: "Name",
-                autofocus: true,
-                value: "{name}",
-                oninput: move |evt| name.set(evt.value()),
+                "autofocus": "true",
+                text: "{name}",
+                oninput: move |evt: FormEvent| name.set(evt.value()),
                 onkeydown: move |evt: KeyboardEvent| {
                     if evt.key() == Key::Enter {
                         submit();
@@ -194,11 +195,11 @@ fn SaveForm(id: ConnectionId, buffer: u64, on_close: EventHandler<()>) -> Elemen
                     }
                 },
             }
-            input {
+            TextInput {
                 class: "w-full rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 text-xs text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600",
                 placeholder: "Description (optional)",
-                value: "{description}",
-                oninput: move |evt| description.set(evt.value()),
+                text: "{description}",
+                oninput: move |evt: FormEvent| description.set(evt.value()),
                 onkeydown: move |evt: KeyboardEvent| {
                     if evt.key() == Key::Enter {
                         submit();

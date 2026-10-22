@@ -20,6 +20,7 @@ use super::icons::BackendIcon;
 use super::js::focus_on_mount;
 use super::notice::{Banner, BannerKind, EmptyState, Spinner};
 use super::state::{ActiveView, AppState, ConnectStep, ServerBackend};
+use super::text_field::TextInput;
 
 /// One saved connection's per-row settings, edited inline under its row in
 /// the connections list: which group it is filed under, and its
@@ -312,11 +313,11 @@ fn GroupHeader(
     rsx! {
         div { class: "flex items-center gap-1 border-b border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-900/60 pr-2",
             if renaming {
-                input {
+                TextInput {
                     class: "m-1.5 min-w-0 flex-1 rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 px-2 py-1 text-sm text-slate-900 dark:text-slate-200",
-                    value: "{rename_draft}",
+                    text: "{rename_draft}",
                     onmounted: focus_on_mount,
-                    oninput: move |evt| rename_draft.set(evt.value()),
+                    oninput: move |evt: FormEvent| rename_draft.set(evt.value()),
                     onkeydown: {
                         let mut commit = commit_rename.clone();
                         move |evt: KeyboardEvent| match evt.key() {
@@ -957,12 +958,12 @@ pub(super) fn ConnectionsScreen() -> Element {
                             span { class: "shrink-0 text-slate-400 dark:text-slate-600",
                                 Search { size: 14 }
                             }
-                            input {
+                            TextInput {
                                 id: "dv-connection-search",
                                 class: "min-w-0 flex-1 bg-transparent text-sm text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600 focus:outline-none",
                                 placeholder: "Search connections by name…",
-                                value: "{query}",
-                                oninput: move |evt| search.set(evt.value()),
+                                text: "{query}",
+                                oninput: move |evt: FormEvent| search.set(evt.value()),
                                 // Handled here, not in the window listener,
                                 // which ignores keys typed into an input.
                                 onkeydown: move |evt: KeyboardEvent| {
@@ -997,12 +998,12 @@ pub(super) fn ConnectionsScreen() -> Element {
                     }
                     if naming_group() {
                         div { class: "flex items-center gap-2",
-                            input {
+                            TextInput {
                                 class: "min-w-0 flex-1 rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 text-sm text-slate-900 dark:text-slate-200",
                                 placeholder: "Group name, e.g. Production",
-                                value: "{new_group}",
+                                text: "{new_group}",
                                 onmounted: focus_on_mount,
-                                oninput: move |evt| new_group.set(evt.value()),
+                                oninput: move |evt: FormEvent| new_group.set(evt.value()),
                                 onkeydown: move |evt: KeyboardEvent| {
                                     match evt.key() {
                                         Key::Enter => {
@@ -1247,12 +1248,12 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
                 span { class: "font-mono text-cyan-700 dark:text-cyan-300", "{prompt.name}" }
             }
             div { class: "flex gap-2",
-                input {
+                TextInput {
                     r#type: "password",
                     class: "min-w-0 flex-1 rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-3 py-2 font-mono text-sm text-slate-900 dark:text-slate-200",
-                    autofocus: true,
-                    value: "{password}",
-                    oninput: move |evt| password.set(evt.value()),
+                    "autofocus": "true",
+                    text: "{password}",
+                    oninput: move |evt: FormEvent| password.set(evt.value()),
                     onkeydown: {
                         let submit = submit.clone();
                         move |evt: KeyboardEvent| {
@@ -1971,46 +1972,46 @@ fn PostgresForm(
                 }
             }
             div { class: "flex flex-col gap-2",
-                input {
+                TextInput {
                     class: field_class,
                     placeholder: "display name (optional)",
-                    value: "{name}",
-                    oninput: move |evt| name.set(evt.value()),
+                    text: "{name}",
+                    oninput: move |evt: FormEvent| name.set(evt.value()),
                 }
                 if use_url() {
-                    input {
+                    TextInput {
                         class: field_class,
                         placeholder: "postgres://user@host:5432/database?sslmode=require",
-                        value: "{pasted_url}",
-                        oninput: move |evt| pasted_url.set(evt.value()),
+                        text: "{pasted_url}",
+                        oninput: move |evt: FormEvent| pasted_url.set(evt.value()),
                     }
                 } else {
                     div { class: "flex gap-2",
-                        input {
+                        TextInput {
                             class: "{field_class} flex-[3]",
                             placeholder: "host",
-                            value: "{host}",
-                            oninput: move |evt| host.set(evt.value()),
+                            text: "{host}",
+                            oninput: move |evt: FormEvent| host.set(evt.value()),
                         }
-                        input {
+                        TextInput {
                             class: "{field_class} flex-1",
                             placeholder: "5432",
-                            value: "{port}",
-                            oninput: move |evt| port.set(evt.value()),
+                            text: "{port}",
+                            oninput: move |evt: FormEvent| port.set(evt.value()),
                         }
                     }
                     div { class: "flex gap-2",
-                        input {
+                        TextInput {
                             class: field_class,
                             placeholder: "database",
-                            value: "{database}",
-                            oninput: move |evt| database.set(evt.value()),
+                            text: "{database}",
+                            oninput: move |evt: FormEvent| database.set(evt.value()),
                         }
-                        input {
+                        TextInput {
                             class: field_class,
                             placeholder: "user",
-                            value: "{user}",
-                            oninput: move |evt| user.set(evt.value()),
+                            text: "{user}",
+                            oninput: move |evt: FormEvent| user.set(evt.value()),
                         }
                     }
                     div { class: "flex gap-2",
@@ -2027,12 +2028,12 @@ fn PostgresForm(
                 // principal and a token instead of a password.
                 AuthModeFields { auth_mode, entra_tenant, entra_client_id }
                 if auth_mode() == "password" {
-                    input {
+                    TextInput {
                         r#type: "password",
                         class: field_class,
                         placeholder: if editing { "password (unchanged if left empty)" } else { "password" },
-                        value: "{password}",
-                        oninput: move |evt| password.set(evt.value()),
+                        text: "{password}",
+                        oninput: move |evt: FormEvent| password.set(evt.value()),
                     }
                 }
                 SshTunnelFields {
@@ -2219,46 +2220,46 @@ fn SqlServerForm(
                 }
             }
             div { class: "flex flex-col gap-2",
-                input {
+                TextInput {
                     class: field_class,
                     placeholder: "display name (optional)",
-                    value: "{name}",
-                    oninput: move |evt| name.set(evt.value()),
+                    text: "{name}",
+                    oninput: move |evt: FormEvent| name.set(evt.value()),
                 }
                 if use_url() {
-                    input {
+                    TextInput {
                         class: field_class,
                         placeholder: "mssql://user@host:1433/database?encrypt=on",
-                        value: "{pasted_url}",
-                        oninput: move |evt| pasted_url.set(evt.value()),
+                        text: "{pasted_url}",
+                        oninput: move |evt: FormEvent| pasted_url.set(evt.value()),
                     }
                 } else {
                     div { class: "flex gap-2",
-                        input {
+                        TextInput {
                             class: "{field_class} flex-[3]",
                             placeholder: "host",
-                            value: "{host}",
-                            oninput: move |evt| host.set(evt.value()),
+                            text: "{host}",
+                            oninput: move |evt: FormEvent| host.set(evt.value()),
                         }
-                        input {
+                        TextInput {
                             class: "{field_class} flex-1",
                             placeholder: "1433",
-                            value: "{port}",
-                            oninput: move |evt| port.set(evt.value()),
+                            text: "{port}",
+                            oninput: move |evt: FormEvent| port.set(evt.value()),
                         }
                     }
                     div { class: "flex gap-2",
-                        input {
+                        TextInput {
                             class: field_class,
                             placeholder: "database",
-                            value: "{database}",
-                            oninput: move |evt| database.set(evt.value()),
+                            text: "{database}",
+                            oninput: move |evt: FormEvent| database.set(evt.value()),
                         }
-                        input {
+                        TextInput {
                             class: field_class,
                             placeholder: "user",
-                            value: "{user}",
-                            oninput: move |evt| user.set(evt.value()),
+                            text: "{user}",
+                            oninput: move |evt: FormEvent| user.set(evt.value()),
                         }
                     }
                     div { class: "flex gap-2",
@@ -2283,12 +2284,12 @@ fn SqlServerForm(
                 // the principal and a token instead of a password.
                 AuthModeFields { auth_mode, entra_tenant, entra_client_id }
                 if auth_mode() == "password" {
-                    input {
+                    TextInput {
                         r#type: "password",
                         class: field_class,
                         placeholder: if editing { "password (unchanged if left empty)" } else { "password" },
-                        value: "{password}",
-                        oninput: move |evt| password.set(evt.value()),
+                        text: "{password}",
+                        oninput: move |evt: FormEvent| password.set(evt.value()),
                     }
                 }
                 SshTunnelFields {
@@ -3213,19 +3214,19 @@ fn AuthModeFields(
             }
         }
         if auth_mode() == "entra-interactive" {
-            input {
+            TextInput {
                 class: field_class,
                 placeholder: "Entra tenant — id, domain, or 'organizations'",
-                value: "{entra_tenant}",
-                oninput: move |evt| entra_tenant.set(evt.value()),
+                text: "{entra_tenant}",
+                oninput: move |evt: FormEvent| entra_tenant.set(evt.value()),
             }
         }
         if auth_mode().starts_with("entra") {
-            input {
+            TextInput {
                 class: field_class,
                 placeholder: "application (client) ID — optional",
-                value: "{entra_client_id}",
-                oninput: move |evt| entra_client_id.set(evt.value()),
+                text: "{entra_client_id}",
+                oninput: move |evt: FormEvent| entra_client_id.set(evt.value()),
             }
             p { class: "text-xs text-slate-500 dark:text-slate-400",
                 "The user field is your Entra principal (e.g. you@contoso.com); a token is used instead of a password."
@@ -3261,24 +3262,24 @@ fn SshTunnelFields(
         if use_tunnel() {
             div { class: "flex flex-col gap-2 rounded border border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-900/60 p-3",
                 div { class: "flex gap-2",
-                    input {
+                    TextInput {
                         class: "{field_class} flex-[3]",
                         placeholder: "ssh host",
-                        value: "{ssh_host}",
-                        oninput: move |evt| ssh_host.set(evt.value()),
+                        text: "{ssh_host}",
+                        oninput: move |evt: FormEvent| ssh_host.set(evt.value()),
                     }
-                    input {
+                    TextInput {
                         class: "{field_class} flex-1",
                         placeholder: "22",
-                        value: "{ssh_port}",
-                        oninput: move |evt| ssh_port.set(evt.value()),
+                        text: "{ssh_port}",
+                        oninput: move |evt: FormEvent| ssh_port.set(evt.value()),
                     }
                 }
-                input {
+                TextInput {
                     class: field_class,
                     placeholder: "ssh user",
-                    value: "{ssh_user}",
-                    oninput: move |evt| ssh_user.set(evt.value()),
+                    text: "{ssh_user}",
+                    oninput: move |evt: FormEvent| ssh_user.set(evt.value()),
                 }
                 div { class: "flex gap-4 text-xs text-slate-500 dark:text-slate-400",
                     label { class: "flex items-center gap-2",
@@ -3301,18 +3302,18 @@ fn SshTunnelFields(
                     }
                 }
                 if ssh_use_key() {
-                    input {
+                    TextInput {
                         class: field_class,
                         placeholder: "key file path, e.g. ~/.ssh/id_ed25519",
-                        value: "{ssh_key_path}",
-                        oninput: move |evt| ssh_key_path.set(evt.value()),
+                        text: "{ssh_key_path}",
+                        oninput: move |evt: FormEvent| ssh_key_path.set(evt.value()),
                     }
-                    input {
+                    TextInput {
                         r#type: "password",
                         class: field_class,
                         placeholder: "key passphrase (if the key is encrypted)",
-                        value: "{ssh_passphrase}",
-                        oninput: move |evt| ssh_passphrase.set(evt.value()),
+                        text: "{ssh_passphrase}",
+                        oninput: move |evt: FormEvent| ssh_passphrase.set(evt.value()),
                     }
                 }
             }

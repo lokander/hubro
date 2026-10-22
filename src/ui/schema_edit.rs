@@ -35,6 +35,7 @@ use crate::db::{
 
 use super::notice::{Banner, BannerKind};
 use super::state::{after_edit, AppState, SchemaEditRequest, TableRef};
+use super::text_field::{TextArea, TextInput};
 
 const INPUT_CLASS: &str = "rounded border border-slate-300 dark:border-slate-700 bg-white \
                            dark:bg-slate-800 px-2 py-1 text-xs text-slate-900 dark:text-slate-100 \
@@ -331,11 +332,11 @@ pub fn SchemaEditDialog(
                         }
                     }
                 }
-                textarea {
+                TextArea {
                     class: "mb-2 h-24 w-full resize-y rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 p-2 font-mono text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-1 focus:ring-sky-500",
-                    spellcheck: false,
-                    value: "{sql()}",
-                    oninput: move |evt| edited.set(Some(evt.value())),
+                    "spellcheck": "false",
+                    text: "{sql()}",
+                    oninput: move |evt: FormEvent| edited.set(Some(evt.value())),
                 }
 
                 if let Some(err) = failure {
@@ -350,10 +351,10 @@ pub fn SchemaEditDialog(
                 if op().destroys_data() && refusal().is_none() {
                     label { class: "mb-2 flex flex-wrap items-center gap-2 text-xs text-slate-600 dark:text-slate-300",
                         "Type {table.read().name} to confirm"
-                        input {
+                        TextInput {
                             class: INPUT_CLASS,
-                            value: "{typed_name()}",
-                            oninput: move |evt| typed_name.set(evt.value()),
+                            text: "{typed_name()}",
+                            oninput: move |evt: FormEvent| typed_name.set(evt.value()),
                         }
                     }
                 }
@@ -420,10 +421,10 @@ fn OpForm(table: TableMeta, op: Signal<SchemaOp>) -> Element {
                 SchemaOp::CreateIndex { name, columns, unique } => rsx! {
                     label { class: "flex items-center gap-2",
                         "Name"
-                        input {
+                        TextInput {
                             class: INPUT_CLASS,
-                            value: "{name}",
-                            oninput: move |evt| {
+                            text: "{name}",
+                            oninput: move |evt: FormEvent| {
                                 if let SchemaOp::CreateIndex { name, .. } = &mut *op.write() {
                                     *name = evt.value();
                                 }
@@ -476,10 +477,10 @@ fn OpForm(table: TableMeta, op: Signal<SchemaOp>) -> Element {
                 SchemaOp::AddColumn { name, type_name } => rsx! {
                     label { class: "flex items-center gap-2",
                         "Name"
-                        input {
+                        TextInput {
                             class: INPUT_CLASS,
-                            value: "{name}",
-                            oninput: move |evt| {
+                            text: "{name}",
+                            oninput: move |evt: FormEvent| {
                                 if let SchemaOp::AddColumn { name, .. } = &mut *op.write() {
                                     *name = evt.value();
                                 }
@@ -488,10 +489,10 @@ fn OpForm(table: TableMeta, op: Signal<SchemaOp>) -> Element {
                     }
                     label { class: "flex items-center gap-2",
                         "Type"
-                        input {
+                        TextInput {
                             class: INPUT_CLASS,
-                            value: "{type_name}",
-                            oninput: move |evt| {
+                            text: "{type_name}",
+                            oninput: move |evt: FormEvent| {
                                 if let SchemaOp::AddColumn { type_name, .. } = &mut *op.write() {
                                     *type_name = evt.value();
                                 }
@@ -506,10 +507,10 @@ fn OpForm(table: TableMeta, op: Signal<SchemaOp>) -> Element {
                 SchemaOp::RenameTable { new_name } => rsx! {
                     label { class: "flex items-center gap-2",
                         "New name"
-                        input {
+                        TextInput {
                             class: INPUT_CLASS,
-                            value: "{new_name}",
-                            oninput: move |evt| {
+                            text: "{new_name}",
+                            oninput: move |evt: FormEvent| {
                                 if let SchemaOp::RenameTable { new_name } = &mut *op.write() {
                                     *new_name = evt.value();
                                 }
@@ -521,10 +522,10 @@ fn OpForm(table: TableMeta, op: Signal<SchemaOp>) -> Element {
                     div { "Column " span { class: "font-mono", "{column}" } }
                     label { class: "flex items-center gap-2",
                         "New name"
-                        input {
+                        TextInput {
                             class: INPUT_CLASS,
-                            value: "{new_name}",
-                            oninput: move |evt| {
+                            text: "{new_name}",
+                            oninput: move |evt: FormEvent| {
                                 if let SchemaOp::RenameColumn { new_name, .. } = &mut *op.write() {
                                     *new_name = evt.value();
                                 }

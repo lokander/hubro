@@ -21,6 +21,7 @@ pub mod stage;
 mod state;
 #[cfg(test)]
 mod test_dom;
+mod text_field;
 
 pub use stage::TableStage;
 pub use state::{tab_title, ActiveView, AppState, TableRef};
