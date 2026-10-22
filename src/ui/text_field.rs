@@ -14,15 +14,18 @@
 //! into `poucin`, and a connect form's host field into `prduton`. Typing
 //! slowly hid it, because each echo then landed before the next key.
 //!
-//! So these fields carry no `value` attribute at all. The text is rendered
-//! once as `initial_value` (the element's default value, which the browser
-//! stops showing as soon as the field has been edited), and the field keeps a
-//! note of the text its element holds — what it last reported through an
-//! input event, or what was last pushed into it. A render whose text differs
-//! from that note is a change the user did not type (Escape clearing a
-//! search, a pasted URL filling the host field, a foreign-key jump installing
-//! a filter), and only then is the text written into the element, by
-//! [`push_text_js`]. Typing never writes the field.
+//! So these fields carry no `value` attribute at all, and drop one a caller
+//! passes. The text the field mounts with is rendered as `initial_value` (the
+//! element's default value) and never re-rendered, so later text — a
+//! password's included — never reaches an attribute. The field keeps a note
+//! of the text its element holds: what it last reported through an input
+//! event, or what was last pushed into it. A render whose text differs from
+//! that note is a change the user did not type (Escape clearing a search, a
+//! pasted URL filling the host field, a foreign-key jump installing a
+//! filter), and only then is the text written into the element, by
+//! [`push_text_js`] — and only if the element still holds the noted text, so
+//! a key typed after the change and before the push lands is not wiped out.
+//! Typing never writes the field.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -43,20 +46,39 @@ pub(super) fn needs_push(text: &str, held: &str) -> bool {
 /// marks its element with a number of its own instead.
 const MARKER_ATTR: &str = "data-dv-text";
 
-/// The eval that writes `text` into the field marked `marker`.
-pub(super) fn push_text_js(marker: u64, text: &str) -> String {
+/// The eval that writes `text` into the field marked `marker`, if the field
+/// still holds `held` — the text it was believed to hold when the push was
+/// decided. The push is decided in Rust and lands in the webview later; a
+/// key typed in between makes the element differ from `held`, and the input
+/// event already on its way brings the caller's state up to what the field
+/// shows. Overwriting it instead would leave the field empty under a list
+/// filtered by what was typed.
+pub(super) fn push_text_js(marker: u64, held: &str, text: &str) -> String {
     format!(
         "const el = document.querySelector('[{MARKER_ATTR}=\"{marker}\"]'); \
-         if (el && el.value !== {text}) el.value = {text};",
+         if (el && el.value === {held}) el.value = {text};",
+        held = js_string(held),
         text = js_string(text)
     )
 }
 
-/// The bookkeeping both field kinds share: the element's marker, and the text
-/// the element is known to hold.
+/// The caller's attributes, less the two this module owns. A `value` would
+/// bring back the stale echo the module exists to remove (`extends = input`
+/// offers it, and it is the attribute a hand reaches for), and an
+/// `initial_value` would re-render the text into an attribute.
+fn passed_through(attributes: Vec<Attribute>) -> Vec<Attribute> {
+    attributes
+        .into_iter()
+        .filter(|attribute| !matches!(attribute.name, "value" | "initial_value"))
+        .collect()
+}
+
+/// The bookkeeping both field kinds share: the element's marker, the text
+/// the field mounted with, and the text the element is known to hold.
 #[derive(Clone, Copy)]
 struct HeldText {
     marker: u64,
+    initial: CopyValue<String>,
     held: CopyValue<String>,
 }
 
@@ -74,15 +96,21 @@ impl HeldText {
 fn use_held_text(text: &str) -> HeldText {
     static NEXT_MARKER: AtomicU64 = AtomicU64::new(0);
     let marker = use_hook(|| NEXT_MARKER.fetch_add(1, Ordering::Relaxed));
+    let initial = use_hook(|| CopyValue::new(text.to_string()));
     let mut held = use_hook(|| CopyValue::new(text.to_string()));
     // Decided during the render, not in an effect: the props compare by
     // value, so a changed `text` always re-renders this component, and the
     // comparison makes a render without a change a no-op.
-    if needs_push(text, &held.peek()) {
+    let before = held.peek().clone();
+    if needs_push(text, &before) {
         held.set(text.to_string());
-        document::eval(&push_text_js(marker, text));
+        document::eval(&push_text_js(marker, &before, text));
     }
-    HeldText { marker, held }
+    HeldText {
+        marker,
+        initial,
+        held,
+    }
 }
 
 /// A single-line text field. `text` is the field's content as the caller
@@ -123,10 +151,12 @@ pub fn TextInput(props: TextInputProps) -> Element {
         attributes,
     } = props;
     let held = use_held_text(&text);
+    let attributes = passed_through(attributes);
+    let initial = held.initial.cloned();
     rsx! {
         input {
             "data-dv-text": "{held.marker}",
-            initial_value: "{text}",
+            initial_value: "{initial}",
             oninput: move |evt| {
                 held.typed(&evt);
                 oninput.call(evt);
@@ -181,10 +211,12 @@ pub fn TextArea(props: TextAreaProps) -> Element {
         attributes,
     } = props;
     let held = use_held_text(&text);
+    let attributes = passed_through(attributes);
+    let initial = held.initial.cloned();
     rsx! {
         textarea {
             "data-dv-text": "{held.marker}",
-            initial_value: "{text}",
+            initial_value: "{initial}",
             oninput: move |evt| {
                 held.typed(&evt);
                 oninput.call(evt);
@@ -229,11 +261,11 @@ mod tests {
     }
 
     #[test]
-    fn the_push_finds_its_element_and_escapes_the_text() {
+    fn the_push_writes_only_over_the_text_it_was_decided_against() {
         assert_eq!(
-            push_text_js(7, "a\"b"),
+            push_text_js(7, "pro\"d", "a\"b"),
             "const el = document.querySelector('[data-dv-text=\"7\"]'); \
-             if (el && el.value !== \"a\\\"b\") el.value = \"a\\\"b\";"
+             if (el && el.value === \"pro\\\"d\") el.value = \"a\\\"b\";"
         );
     }
 
@@ -260,15 +292,20 @@ mod tests {
         }
     }
 
-    /// The `value` writes in `edits`.
-    fn value_writes(edits: &[Mutation]) -> Vec<&AttributeValue> {
+    /// The writes of attribute `attribute` in `edits`.
+    fn writes<'a>(edits: &'a [Mutation], attribute: &str) -> Vec<&'a AttributeValue> {
         edits
             .iter()
             .filter_map(|edit| match edit {
-                Mutation::SetAttribute { name, value, .. } if *name == "value" => Some(value),
+                Mutation::SetAttribute { name, value, .. } if *name == attribute => Some(value),
                 _ => None,
             })
             .collect()
+    }
+
+    /// The `value` writes in `edits`.
+    fn value_writes(edits: &[Mutation]) -> Vec<&AttributeValue> {
+        writes(edits, "value")
     }
 
     /// The whole wire, in a real `VirtualDom`: typing reaches the caller's
@@ -299,10 +336,17 @@ mod tests {
         let input = listeners(&mounted, "input");
         assert_eq!(input.len(), 1, "{mounted:#?}");
 
+        // Typing writes neither the value nor the default value: the text
+        // the field mounted with stays the only text in an attribute, so a
+        // password typed into it never lands in one.
         for typed in ["p", "pr", "pro", "prod"] {
             type_into(&dom, input[0], typed);
             let edits = dom.render_immediate_to_vec().edits;
             assert!(value_writes(&edits).is_empty(), "{typed}: {edits:#?}");
+            assert!(
+                writes(&edits, "initial_value").is_empty(),
+                "{typed}: {edits:#?}"
+            );
         }
         assert_eq!(dom.in_runtime(|| text.peek().clone()), "prod");
         assert!(pushed.borrow().is_empty(), "typing pushed: {pushed:?}");
@@ -322,12 +366,66 @@ mod tests {
                 _ => None,
             })
             .expect("the element carries its marker");
-        assert_eq!(*pushed.borrow(), [push_text_js(marker, "")]);
+        // Pushed over the text the field was last known to hold.
+        assert_eq!(*pushed.borrow(), [push_text_js(marker, "prod", "")]);
+
+        // The push is now what the field holds: setting the text back is a
+        // second change, pushed over the cleared field. A note left at the
+        // typed `prod` would call this no change, and the field would stay
+        // empty under a state that says `prod`.
+        dom.in_runtime(|| text.set("prod".into()));
+        dom.render_immediate_to_vec();
+        assert_eq!(
+            *pushed.borrow(),
+            [
+                push_text_js(marker, "prod", ""),
+                push_text_js(marker, "", "prod")
+            ]
+        );
 
         // Typing after the push is the user's again.
-        type_into(&dom, input[0], "s");
-        dom.render_immediate_to_vec();
-        assert_eq!(pushed.borrow().len(), 1, "{pushed:?}");
+        type_into(&dom, input[0], "prods");
+        let edits = dom.render_immediate_to_vec().edits;
+        assert!(writes(&edits, "initial_value").is_empty(), "{edits:#?}");
+        assert_eq!(pushed.borrow().len(), 2, "{pushed:?}");
+    }
+
+    #[component]
+    fn Smuggled() -> Element {
+        let mut text = use_context::<Signal<String>>();
+        rsx! {
+            TextInput {
+                // The attribute a hand reaches for; `extends = input` lets it
+                // compile.
+                value: "{text}",
+                initial_value: "{text}",
+                text: "{text}",
+                oninput: move |evt: FormEvent| text.set(evt.value()),
+            }
+        }
+    }
+
+    /// A `value` or `initial_value` passed to the field never reaches the
+    /// element: the field's own `initial_value` is the one written at mount,
+    /// and typing writes neither.
+    #[test]
+    fn a_value_passed_to_the_field_never_reaches_the_element() {
+        let mut dom = VirtualDom::new(Smuggled);
+        let text = dom.in_runtime(|| Signal::new_in_scope("a".to_string(), ScopeId::ROOT));
+        dom.provide_root_context(text);
+        let mounted = dom.rebuild_to_vec().edits;
+        assert!(value_writes(&mounted).is_empty(), "{mounted:#?}");
+        assert_eq!(writes(&mounted, "initial_value").len(), 1, "{mounted:#?}");
+        let input = listeners(&mounted, "input");
+        for typed in ["ab", "abc"] {
+            type_into(&dom, input[0], typed);
+            let edits = dom.render_immediate_to_vec().edits;
+            assert!(value_writes(&edits).is_empty(), "{typed}: {edits:#?}");
+            assert!(
+                writes(&edits, "initial_value").is_empty(),
+                "{typed}: {edits:#?}"
+            );
+        }
     }
 
     #[component]
@@ -371,33 +469,60 @@ mod tests {
         assert_eq!(dom.in_runtime(|| heard.peek().clone()), [1]);
     }
 
-    /// Every text field under `src/ui` goes through this module: an `input`
-    /// or `textarea` with a `value` attribute is the pattern that lost
-    /// keystrokes. A `value:` line belongs to the nearest less-indented line
-    /// above it that opens a block, which is how rustfmt lays out `rsx!`.
-    /// Checkboxes and selects carry `checked`/`value` on other elements and
-    /// are not text fields, so they are not caught.
+    /// Whether `code` binds `value:` as an attribute of its own — not as the
+    /// tail of `initial_value:` or another name.
+    fn binds_value(code: &str) -> bool {
+        code.match_indices("value:").any(|(at, _)| {
+            !code[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        })
+    }
+
+    /// The text after the opening brace when `line` opens a text field —
+    /// raw or through this module — else `None`.
+    fn opens_text_field(line: &str) -> Option<&str> {
+        ["input {", "textarea {", "TextInput {", "TextArea {"]
+            .iter()
+            .find_map(|owner| line.trim_start().strip_prefix(owner))
+    }
+
+    /// No text field under `src/ui` binds a `value` attribute: on a raw
+    /// `input` or `textarea` it is the pattern that lost keystrokes, and on
+    /// `TextInput`/`TextArea` it is dropped, so writing it there reads as
+    /// handled when it is not. A `value:` line belongs to the nearest
+    /// less-indented line above it, which is how rustfmt lays out `rsx!`; the
+    /// owner may carry attributes on its own line (`input { id: "x",`), and
+    /// a field written on one line is checked whole. Checkboxes and selects
+    /// carry `checked`/`value` on other elements and are not text fields.
     #[test]
     fn no_text_field_binds_a_value_attribute() {
         let mut found = Vec::new();
         for (path, source) in ui_sources() {
+            if path.len() == 1 && path[0] == "text_field.rs" {
+                // The tests above pass one on purpose.
+                continue;
+            }
             let lines: Vec<&str> = source.lines().collect();
             for (at, line) in lines.iter().enumerate() {
-                if !line.trim_start().starts_with("value:") {
-                    continue;
-                }
-                let indent = line.len() - line.trim_start().len();
-                let owner = lines[..at].iter().rev().find(|above| {
-                    let above_indent = above.len() - above.trim_start().len();
-                    above_indent < indent && above.trim_end().ends_with('{')
-                });
-                if let Some(owner) = owner {
-                    if matches!(owner.trim(), "input {" | "textarea {") {
-                        found.push(format!("{}:{}", path.join("/"), at + 1));
-                    }
+                let indent = |l: &str| l.len() - l.trim_start().len();
+                let hit = if let Some(rest) = opens_text_field(line) {
+                    binds_value(rest)
+                } else if binds_value(line) && line.trim_start().starts_with("value:") {
+                    lines[..at]
+                        .iter()
+                        .rev()
+                        .find(|above| indent(above) < indent(line))
+                        .is_some_and(|owner| opens_text_field(owner).is_some())
+                } else {
+                    false
+                };
+                if hit {
+                    found.push(format!("{}:{}", path.join("/"), at + 1));
                 }
             }
         }
-        assert!(found.is_empty(), "use TextInput/TextArea: {found:#?}");
+        assert!(found.is_empty(), "drop the value attribute: {found:#?}");
     }
 }
