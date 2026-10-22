@@ -2276,10 +2276,14 @@ pub(crate) fn tsql_route(sql: &str, held_for_run: bool) -> TsqlRoute {
 /// **What keeps hubro's transaction safe is not this list but the check
 /// after the batch** ([`TsqlRoute::CheckedBatch`]). Measured by the review of
 /// this route: a creator inside `BEGIN TRY … END TRY BEGIN CATCH … END CATCH`
-/// whose DDL a database trigger rolled back (3609) — or a deadlock victim
-/// (1205) — returned normally with the transaction gone, and a later `INSERT`
-/// ran in autocommit and persisted under a run reported as failed. No word
-/// announces that, and through `sp_executesql` error 266 had stopped it.
+/// whose DDL a database trigger rolled back (3609) returned normally with
+/// the transaction gone, and a later `INSERT` ran in autocommit and persisted
+/// under a run reported as failed. No word announces that, and through
+/// `sp_executesql` error 266 had stopped it. (A deadlock victim, 1205, is not
+/// that shape: measured, it dooms the transaction and the server ends the
+/// batch with 3998 on either route. A trigger's rollback leaves nothing
+/// doomed, and one that rolls back and reopens kept the count, which only
+/// the check's transaction id catches — 266 missed it.)
 /// The words here are a first filter, and say what a plain batch would
 /// change besides the transaction:
 ///
