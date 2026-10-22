@@ -22,8 +22,8 @@ on:
       - "**/*.png"
       - "**/*.xcf"
       - "assets/icons/*.ico"
-  # Escape hatch for a PR that touches platform-specific code: run the full
-  # matrix on its branch with `gh workflow run ci.yml --ref <branch>`.
+  # Runs the full matrix on a branch that has no pull request:
+  # `gh workflow run ci.yml --ref <branch>`.
   workflow_dispatch:
 
 # Cancel superseded runs on the same ref (e.g. a force-push to a PR).
@@ -45,54 +45,58 @@ env:
 jobs:
   check:
     name: fmt, clippy, test (${{ matrix.os }})
-    # Pull requests check Linux only; every push to main (and a manual
-    # dispatch) checks all three desktop platforms. Tags are left out because
-    # release.yml already builds each OS. Keeping macOS and Windows off the PR
-    # path is what holds this repo inside the monthly Actions minutes — the
-    # cost is that platform-specific breakage surfaces after the merge, so
-    # dispatch the full matrix on the branch (see the workflow_dispatch note
-    # above) when a PR touches anything platform-shaped:
+    # Every trigger runs all three desktop platforms: pull requests, pushes
+    # to main and a manual dispatch. Tags are left out because release.yml
+    # already builds each OS. The repository is public, so GitHub's standard
+    # hosted runners cost no Actions minutes on any OS — the reason pull
+    # requests used to check Linux only (a monthly minutes budget) does not
+    # apply, and keeping macOS and Windows off them only meant that
+    # platform-specific breakage surfaced after the merge. One batch of three
+    # Windows failures across two merged PRs did exactly that, with no `cfg`
+    # block anywhere in the change: a path, a `file://` URL, and two
+    # byte-exact comparisons of checked-in files.
     #
-    #   - `cfg(windows)`/`cfg(unix)` code;
-    #   - path *syntax* — separators, drive letters, UNC, absolute-ness,
-    #     canonicalisation, or a `file://` URL (`Url::to_file_path` applies
-    #     each platform's rules, so one assertion cannot describe all three).
-    #     Not merely handling a path: nearly every PR here does that, and a
-    #     trigger that fires on all of them is one nobody can follow;
-    #   - a test comparing a checked-in file byte for byte, or matching one
-    #     against a literal containing `\n` (see .gitattributes);
-    #   - process spawning, signals, or the keyring.
-    #
-    # The `cfg` bullet alone used to be the whole rule and was too narrow:
-    # one batch of three Windows failures across two merged PRs had no `cfg`
-    # block at all — a path, a `file://` URL, and two byte-exact
-    # comparisons.
     # fail-fast off: when one leg fails, the others still report, so
     # platform-specific breakage is diagnosed in a single run.
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest", "windows-latest"]') }}
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      # A Postgres for the engine suites, so the Linux leg runs them instead of
-      # skipping them: db_postgres and the shared suites (db_ddl, db_script,
-      # db_staged, …) all read HUBRO_PG_TEST_URL. Started first so it boots
-      # while cargo compiles. The same image and credentials as
-      # tests/db_postgres.rs's header and scripts/test-db.sh set 0. A plain
-      # `docker run` rather than `services:`, which fails a job outright on
-      # macOS and Windows runners and would take this matrix's other legs
-      # with it. HUBRO_REQUIRE_TEST_URLS makes a lost variable a failure
-      # rather than ~70 silent skips (tests/common/mod.rs).
+      # Two Postgres servers for the engine suites, so the Linux leg runs them
+      # instead of skipping them: db_postgres and the shared suites (db_ddl,
+      # db_script, db_staged, …) all read HUBRO_PG_TEST_URL. Started first so
+      # they boot while cargo compiles.
+      #
+      # 17 is the suites' documented server — the same image and credentials
+      # as tests/db_postgres.rs's header and scripts/test-db.sh set 0 — and
+      # the main Test step runs against it. 18 gets a second pass of the same
+      # suites below, because some behaviour only exists there: a bare
+      # GENERATED ALWAYS AS (…) is VIRTUAL from 18 on, and on 17
+      # tests/db_ddl.rs can check only the STORED half, so a regression
+      # rendering VIRTUAL as STORED would pass a 17-only CI.
+      #
+      # Plain `docker run` rather than `services:`, which fails a job outright
+      # on macOS and Windows runners and would take this matrix's other legs
+      # with it. HUBRO_REQUIRE_TEST_URLS makes a lost URL a failure rather
+      # than ~70 silent skips, and HUBRO_PG_TEST_MAJOR makes a URL reaching
+      # the wrong server one (both in tests/common/mod.rs). The 18 pass
+      # overrides the URL and the major on its own command line.
       - name: Start Postgres
         if: runner.os == 'Linux'
         run: |
           docker run -d --name hubro-pg-test -e POSTGRES_PASSWORD=testpass \
             -e POSTGRES_USER=tester -e POSTGRES_DB=demo -p 5433:5432 \
             postgres:17-alpine
+          docker run -d --name hubro-pg18-test -e POSTGRES_PASSWORD=testpass \
+            -e POSTGRES_USER=tester -e POSTGRES_DB=demo -p 5418:5432 \
+            postgres:18-alpine
           echo "HUBRO_PG_TEST_URL=postgres://tester:testpass@localhost:5433/demo" >> "$GITHUB_ENV"
+          echo "HUBRO_PG_TEST_MAJOR=17" >> "$GITHUB_ENV"
+          echo "PG18_URL=postgres://tester:testpass@localhost:5418/demo" >> "$GITHUB_ENV"
           echo "HUBRO_REQUIRE_TEST_URLS=HUBRO_PG_TEST_URL" >> "$GITHUB_ENV"
 
       # System libraries the Dioxus desktop build (wry/WebKitGTK), the tray
@@ -142,12 +146,16 @@ jobs:
       - name: Wait for Postgres
         if: runner.os == 'Linux'
         run: |
-          for _ in $(seq 60); do
-            docker exec hubro-pg-test pg_isready -h 127.0.0.1 -U tester -d demo && exit 0
-            sleep 2
+          for name in hubro-pg-test hubro-pg18-test; do
+            ready=
+            for _ in $(seq 60); do
+              docker exec "$name" pg_isready -h 127.0.0.1 -U tester -d demo && { ready=1; break; }
+              sleep 2
+            done
+            [ -n "$ready" ] || { docker logs "$name"; exit 1; }
+            # In the log, so a run says which servers it actually tested.
+            docker exec "$name" psql -U tester -d demo -tAc 'SELECT version()'
           done
-          docker logs hubro-pg-test
-          exit 1
 
       # Builds every target and runs the fast suite. On Linux the Postgres
       # suites run against the container above; every other engine, the SSH
@@ -156,3 +164,12 @@ jobs:
       # `#[ignore]`d.
       - name: Test
         run: cargo test --all-targets
+
+      # The same suites again, against Postgres 18. Everything is already
+      # built, so this costs the suites' run time and no compile. Every
+      # target rather than a list of the Postgres ones: a list would have to
+      # be kept in step with which suites read HUBRO_PG_TEST_URL, and one left
+      # off it would quietly lose its 18 coverage.
+      - name: Test against Postgres 18
+        if: runner.os == 'Linux'
+        run: HUBRO_PG_TEST_URL="$PG18_URL" HUBRO_PG_TEST_MAJOR=18 cargo test --all-targets

@@ -12,7 +12,7 @@
 //! `.gitattributes` exists, so there it is a diagnosis rather than a gate,
 //! turning "an untouched file must be rewritten unchanged" into "this file
 //! arrived with CRLF". The gate for those is the Windows leg of CI, which runs
-//! only on push to `main` or a dispatch.
+//! on every pull request as well as on push to `main`.
 //!
 //! **For anything under `tests/fixtures/` it is a gate everywhere**, because
 //! `-text` is symmetric: a fixture authored on Windows commits its CRLF bytes
