@@ -193,16 +193,60 @@ async fn postgres_entra_logins_after_the_first_token_expires_use_a_renewed_one()
     rig.drop_role().await;
 }
 
+/// How long a wait for the renewal task may take before it fails: generous,
+/// so a loaded runner that starves the task for a while is not a failure.
+const DEADLINE: Duration = Duration::from_secs(10);
+
+/// Polls `ready` every few milliseconds until it holds or [`DEADLINE`]
+/// passes; whether it held.
+async fn eventually(mut ready: impl FnMut() -> bool) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < DEADLINE {
+        if ready() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    ready()
+}
+
+/// Whether the task is asking: the provider's clock is read again.
+async fn asking(reads: &AtomicUsize) -> bool {
+    let from = reads.load(Ordering::SeqCst);
+    eventually(|| reads.load(Ordering::SeqCst) > from).await
+}
+
+/// Whether the task has stopped asking: a quiet spell of `quiet` with no
+/// read of the clock, found within [`DEADLINE`]. One tick already under way
+/// when its pool closed is allowed to finish first.
+async fn stopped(reads: &AtomicUsize, quiet: Duration) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < DEADLINE {
+        let from = reads.load(Ordering::SeqCst);
+        tokio::time::sleep(quiet).await;
+        if reads.load(Ordering::SeqCst) == from {
+            return true;
+        }
+    }
+    false
+}
+
 /// The grid's logins after an expiry, with **no script run** to renew first:
 /// only the pool's renewal task can have put the new token in its options.
 /// Then the task's end: it stops asking once the pool is closed, and once
-/// the last handle on a pool is dropped without a close.
+/// the last handle on a pool is dropped without a close — each shown alive
+/// first, so "it stopped" is not read off a task that never ran.
+///
+/// Waits poll for the expected state with a generous deadline rather than
+/// sleeping fixed amounts, so a loaded runner slows the test without failing
+/// it. A quiet spell is ten ticks long: a live task asks every tick.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_entra_renewal_task_keeps_the_grid_logging_in_and_ends_with_its_pool() {
     let Some(admin_url) = common::pg_test_url().await else {
         return;
     };
     let tick = Duration::from_millis(50);
+    let quiet = tick * 10;
     let rig = rig(&admin_url, "task").await;
     let pool = DbPool::open_postgres_entra_renewing_every(&rig.url, Arc::clone(&rig.tokens), tick)
         .await
@@ -214,43 +258,28 @@ async fn postgres_entra_renewal_task_keeps_the_grid_logging_in_and_ends_with_its
     );
 
     rig.clock.store(3500, Ordering::SeqCst);
-    for _ in 0..100 {
-        if rig.calls.load(Ordering::SeqCst) > 0 {
-            break;
-        }
-        tokio::time::sleep(tick).await;
-    }
-    assert_eq!(
-        rig.calls.load(Ordering::SeqCst),
-        1,
+    assert!(
+        eventually(|| rig.calls.load(Ordering::SeqCst) > 0).await,
         "the task did not renew the token"
     );
+    assert_eq!(rig.calls.load(Ordering::SeqCst), 1);
     pool.query("SELECT 1")
         .await
         .unwrap_or_else(|e| panic!("the grid's login after the task renewed failed: {e}"));
 
-    // Alive: it keeps asking, once per tick.
-    let asked = |reads: &AtomicUsize| reads.load(Ordering::SeqCst);
-    let before = asked(&rig.reads);
-    tokio::time::sleep(tick * 6).await;
+    // Closed: alive until then, quiet after.
     assert!(
-        asked(&rig.reads) > before,
+        asking(&rig.reads).await,
         "the task stopped while its pool is open"
     );
-
-    // Closed: it stops (one tick may already be under way).
     pool.close().await;
-    tokio::time::sleep(tick * 3).await;
-    let settled = asked(&rig.reads);
-    tokio::time::sleep(tick * 6).await;
-    assert_eq!(
-        asked(&rig.reads),
-        settled,
+    assert!(
+        stopped(&rig.reads, quiet).await,
         "the task kept asking after its pool closed"
     );
 
-    // Dropped without a close: the last handle going takes the task with it.
-    // Opened with the password the role has now.
+    // Dropped without a close: alive while a handle remains, quiet once the
+    // last one goes. Opened with the password the role has now.
     let mut renewed_url = url::Url::parse(&rig.url).unwrap();
     renewed_url.set_password(Some("second")).unwrap();
     let dropped = DbPool::open_postgres_entra_renewing_every(
@@ -262,19 +291,13 @@ async fn postgres_entra_renewal_task_keeps_the_grid_logging_in_and_ends_with_its
     .unwrap();
     let copy = dropped.clone();
     drop(dropped);
-    let before = asked(&rig.reads);
-    tokio::time::sleep(tick * 6).await;
     assert!(
-        asked(&rig.reads) > before,
+        asking(&rig.reads).await,
         "the task ended while a handle on its pool remained"
     );
     drop(copy);
-    tokio::time::sleep(tick * 3).await;
-    let settled = asked(&rig.reads);
-    tokio::time::sleep(tick * 6).await;
-    assert_eq!(
-        asked(&rig.reads),
-        settled,
+    assert!(
+        stopped(&rig.reads, quiet).await,
         "the task outlived the last handle on its pool"
     );
 
