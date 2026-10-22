@@ -986,11 +986,13 @@ async fn sqlserver_a_trigger_row_cannot_vouch_for_an_edit_that_matched_nothing()
 #[tokio::test]
 async fn sqlserver_a_script_cannot_turn_row_counts_off_for_later_writes() {
     // Guarded writes read the statement's own count, which a session under
-    // NOCOUNT ON never sends. A script runs on the same pooled connections,
-    // so whatever it sets must not outlive it. Most statements go through
-    // `sp_executesql`, where a SET lapses when the call returns; one that must
-    // lead its batch goes as a plain batch, where a SET would stick — there a
-    // trailing SET is either a syntax error or part of the module's body.
+    // NOCOUNT ON never sends, so whatever a script sets must not outlive it.
+    // Most statements go through `sp_executesql`, where a SET lapses when the
+    // call returns; one that must lead its batch goes as a plain batch, where
+    // a SET would stick — there a trailing SET is either a syntax error or
+    // part of the module's body. (A run's connection is now discarded when
+    // the run ends, so the pool probe below no longer lands on it; a SET
+    // within the run is pinned by `sqlserver_script_temp_tables_last_the_run`.)
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
@@ -1051,8 +1053,8 @@ async fn sqlserver_a_script_cannot_turn_row_counts_off_for_later_writes() {
                 "{script:?}: {e:?}"
             ),
         }
-        // The pool hands out the connection returned last, so these run on
-        // the one the script just used.
+        // The pool hands out the connection returned last, so these ran on
+        // the one the script had used while runs still returned theirs.
         let options = pool.query("SELECT @@OPTIONS & 512").await.unwrap();
         assert_eq!(
             options.rows,
@@ -2655,7 +2657,8 @@ async fn sqlserver_cancelled_script_does_not_return_its_transaction_to_the_pool(
     .await;
     common::open_several_connections(&pool, MSSQL_SLOW).await;
     let statements = split_statements(
-        "BEGIN TRAN\nGO\nINSERT INTO dbo.cancelled_tx VALUES (1)\nGO\nWAITFOR DELAY '00:00:01.500'",
+        "BEGIN TRAN\nGO\nINSERT INTO dbo.cancelled_tx VALUES (1)\nGO\n\
+         CREATE TABLE #cancelled (a int)\nGO\nWAITFOR DELAY '00:00:01.500'",
         pool.dialect(),
     );
     let run = run_script(&pool, pool.backend_capabilities(), &statements, |_| {});
@@ -2672,6 +2675,22 @@ async fn sqlserver_cancelled_script_does_not_return_its_transaction_to_the_pool(
         Vec::<Value>::new(),
         "a connection went back inside a transaction"
     );
+    // Nor with the temp table the run created at session scope.
+    let probes: Vec<_> = (0..4)
+        .map(|_| {
+            pool.query(
+                "WAITFOR DELAY '00:00:00.200'; \
+                 SELECT CAST(CASE WHEN OBJECT_ID('tempdb..#cancelled') IS NULL THEN 0 ELSE 1 END AS int)",
+            )
+        })
+        .collect();
+    for probe in futures_util::future::join_all(probes).await {
+        assert_eq!(
+            probe.unwrap().rows[0][0],
+            Value::Integer(0),
+            "a connection went back with the run's temp table"
+        );
+    }
     for n in 0..4 {
         pool.execute_checked(
             "INSERT INTO dbo.cancelled_tx_edit VALUES (@P1)",
@@ -3104,5 +3123,111 @@ async fn sqlserver_edits_a_committing_trigger_kept_are_not_reported_unapplied() 
     assert_eq!(index, Some(0), "{error}");
     assert_eq!(mssql_open_transactions(&pool).await, Vec::<Value>::new());
     run_all(&pool, &["DROP TABLE dbo.edit_trigger_commit"]).await;
+    pool.close().await;
+}
+
+/// Every statement's outcome in a script run, in a form one assertion can
+/// compare: `affected N`, or the read's rows. A failure ends the list with the
+/// failing statement, the rollback, and the server's error code and line.
+async fn mssql_script_outcomes(pool: &DbPool, sql: &str) -> Vec<String> {
+    let statements = split_statements(sql, pool.dialect());
+    let mut outcomes = Vec::new();
+    let done = run_script(pool, pool.backend_capabilities(), &statements, |r| {
+        outcomes.push(match r.outcome {
+            StatementOutcome::Affected(n) => format!("affected {n}"),
+            StatementOutcome::Rows(rows) => format!("rows {:?}", rows.rows),
+        })
+    })
+    .await;
+    if let Err(err) = done {
+        let message = err.error.to_string();
+        // tiberius renders `… on line N (code: C, …`.
+        let after = |marker: &str| {
+            message
+                .split(marker)
+                .nth(1)
+                .map(|rest| rest.chars().take_while(char::is_ascii_digit).collect())
+                .unwrap_or_else(|| format!("? in {message:?}"))
+        };
+        outcomes.push(format!(
+            "statement {} failed [{:?}] code {} line {}",
+            err.statement_index,
+            err.rollback,
+            after("(code: "),
+            after(" on line "),
+        ));
+    }
+    outcomes
+}
+
+#[tokio::test]
+async fn sqlserver_script_temp_tables_last_the_run() {
+    // Each statement used to be its own `sp_executesql` call, and a local
+    // temp table belongs to the scope that created it: it was dropped when
+    // the call returned, and the next statement could not see it. Measured
+    // before the fix: every script in the first group failed on its second
+    // statement with "Invalid object name" (208).
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    let rows = |n: i64| format!("rows {:?}", vec![vec![Value::Integer(n)]]);
+    let affected = |n: u64| format!("affected {n}");
+    let cases = [
+        // Atomic: several statements, none managing a transaction.
+        (
+            "CREATE TABLE #t (a int); INSERT INTO #t VALUES (1), (2); SELECT count(*) FROM #t",
+            vec![affected(0), affected(2), rows(2)],
+        ),
+        // `SELECT … INTO` is a read here, and goes the same way.
+        (
+            "SELECT 7 AS a INTO #s; UPDATE #s SET a = 8; SELECT a FROM #s",
+            vec!["rows []".to_string(), affected(1), rows(8)],
+        ),
+        // A bracketed name, and the usual guard around a create.
+        (
+            "IF OBJECT_ID('tempdb..#b') IS NULL CREATE TABLE [#b] (a int)\nGO\n\
+             INSERT INTO #b VALUES (3)\nGO\nSELECT a FROM [#b]",
+            vec![affected(0), affected(1), rows(3)],
+        ),
+        // Sequential: the script manages its own transaction.
+        (
+            "BEGIN TRAN; CREATE TABLE #q (a int); INSERT INTO #q VALUES (4); COMMIT; \
+             SELECT a FROM #q",
+            vec![affected(0), affected(0), affected(1), affected(0), rows(4)],
+        ),
+        // An error in a plain batch names its line within the statement, as
+        // through `sp_executesql`.
+        (
+            "CREATE TABLE #e (a int)\nSELECT a FROM #nowhere\nGO\nSELECT 1 AS a",
+            vec!["statement 0 failed [Full] code 208 line 2".to_string()],
+        ),
+        // What keeps a statement on `sp_executesql`, its temp table with it.
+        // A write: a plain batch carries no counts, and this one's is 2.
+        (
+            "CREATE TABLE #w (a int) INSERT INTO #w VALUES (1), (2)\nGO\nSELECT a FROM #w",
+            vec![
+                affected(2),
+                "statement 1 failed [Full] code 208 line 1".to_string(),
+            ],
+        ),
+        // A SET: in a plain batch it would outlive the statement, and the
+        // write after it would report no rows.
+        (
+            "CREATE TABLE #n (a int) SET NOCOUNT ON\nGO\n\
+             DECLARE @v TABLE (a int) INSERT INTO @v VALUES (1), (2)",
+            vec![affected(0), affected(2)],
+        ),
+        // Transaction control in hubro's transaction: error 266 is what stops
+        // the script before the statements after it run outside it, and
+        // what reports the transaction as already ended where it happened.
+        (
+            "CREATE TABLE #c (a int) COMMIT\nGO\n\
+             DECLARE @v TABLE (a int) INSERT INTO @v VALUES (1)",
+            vec!["statement 0 failed [AlreadyEnded] code 266 line 0".to_string()],
+        ),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(mssql_script_outcomes(&pool, sql).await, want, "{sql:?}");
+    }
+    assert_eq!(mssql_open_transactions(&pool).await, Vec::<Value>::new());
     pool.close().await;
 }

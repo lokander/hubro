@@ -2227,6 +2227,168 @@ pub(crate) fn tsql_is_transaction_control(sql: &str) -> bool {
             .all(|c| c.is_alphanumeric() || c.is_whitespace() || matches!(c, '_' | '@' | '#' | ';'))
 }
 
+/// Whether a SQL Server script statement runs as a plain batch rather than
+/// through `sp_executesql` — on a connection the run holds and then discards
+/// (`held_for_run`), or on a pooled one that goes back to the pool.
+///
+/// Everywhere: a statement that must lead its batch ([`tsql_leads_own_batch`])
+/// and bare transaction control ([`tsql_is_transaction_control`]), which
+/// `sp_executesql` refuses or fails. On a run's own connection, also a
+/// statement that creates a local temp table ([`tsql_creates_temp_table`]):
+/// `sp_executesql` is a scope of its own, and a `#temp` table is dropped
+/// with the scope that created it, so the script's next statement could not
+/// see it. Created by a plain batch, it is the session's, and every later
+/// statement sees it from inside its own `sp_executesql` (measured: `INSERT`,
+/// `ALTER TABLE`, `CREATE INDEX`). Never on a pooled connection: the table
+/// would outlive the statement there and reach whoever borrows it next.
+pub(crate) fn tsql_runs_as_batch(sql: &str, held_for_run: bool) -> bool {
+    tsql_leads_own_batch(sql)
+        || tsql_is_transaction_control(sql)
+        || (held_for_run && tsql_creates_temp_table(sql))
+}
+
+/// Whether a SQL Server statement creates a local temp table — `CREATE
+/// TABLE #t`, `SELECT … INTO #t`, the name bare, bracketed or double-quoted
+/// — and carries nothing a plain batch would change the meaning of, so
+/// [`tsql_runs_as_batch`] may send it as one.
+///
+/// What a plain batch changes, and so what keeps a statement on
+/// `sp_executesql` even though its temp table then lasts only the statement:
+///
+/// - **`SET`**: an option set in a plain batch holds for the rest of the
+///   session, where through `sp_executesql` it lapses with the call — the
+///   property the session's `NOCOUNT OFF` pin rests on (`SESSION_SETUP` in
+///   the SQL Server backend). `SET NOEXEC ON` would go on to skip hubro's own
+///   `COMMIT`.
+/// - **Transaction words** (`BEGIN TRAN`, `COMMIT`, `ROLLBACK`, `SAVE TRAN`,
+///   `SET TRANSACTION`): through `sp_executesql`, a statement that changes
+///   `@@TRANCOUNT` fails with error 266, and that error is what stops a
+///   script whose batch ended hubro's transaction before the statements after
+///   it run outside it (`INSERT … COMMIT`). A plain batch raises nothing.
+/// - **Writes and opaque statements** (`INSERT`, `UPDATE`, `DELETE`,
+///   `MERGE`, `TRUNCATE`, [`TSQL_OPAQUE_WORDS`]): tiberius reports no
+///   affected-row counts for a plain batch, so a write in one would report 0
+///   rows affected.
+///
+/// The words are read off the stripped text with the gate's own scan, so a
+/// word the gate sees, this sees. A false "no" costs only the temp table's
+/// life past its statement — what every statement had before.
+pub(crate) fn tsql_creates_temp_table(sql: &str) -> bool {
+    let stripped = strip_strings_and_comments(sql, Dialect::SqlServer);
+    let carries_more = has_opaque_word(Dialect::SqlServer, &stripped)
+        || has_word(&stripped, |word| {
+            matches!(
+                word.to_ascii_lowercase().as_str(),
+                "set"
+                    | "commit"
+                    | "rollback"
+                    | "tran"
+                    | "transaction"
+                    | "insert"
+                    | "update"
+                    | "delete"
+                    | "merge"
+                    | "truncate"
+            )
+        });
+    if carries_more {
+        return false;
+    }
+    let tokens = tsql_name_tokens(sql);
+    tokens.iter().enumerate().any(|(i, token)| {
+        let creates = match token {
+            NameToken::Word(word) if word == "table" => {
+                i > 0 && tokens[i - 1] == NameToken::Word("create".into())
+            }
+            NameToken::Word(word) => word == "into",
+            _ => false,
+        };
+        creates && names_temp_table(&tokens[i + 1..])
+    })
+}
+
+/// A token of a SQL Server statement as [`tsql_creates_temp_table`] reads
+/// names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NameToken {
+    /// A bare word: a keyword or a name, lowercased.
+    Word(String),
+    /// A bracketed or double-quoted name.
+    Quoted,
+    /// A name, bare or quoted, that starts with `#`: a temp table's.
+    Temp,
+    /// The `.` between the parts of a name.
+    Dot,
+    /// Anything else: punctuation, a string literal.
+    Other,
+}
+
+/// `sql` as [`NameToken`]s, comments skipped.
+fn tsql_name_tokens(sql: &str) -> Vec<NameToken> {
+    let mut tokens = Vec::new();
+    for (range, kind) in lex_regions(sql, Dialect::SqlServer) {
+        let text = &sql[range];
+        let quoted = || {
+            if text[1..].starts_with('#') {
+                NameToken::Temp
+            } else {
+                NameToken::Quoted
+            }
+        };
+        match kind {
+            RegionKind::Comment => {}
+            RegionKind::Bracket => tokens.push(quoted()),
+            RegionKind::String if text.starts_with('"') => tokens.push(quoted()),
+            RegionKind::String | RegionKind::DollarQuote => tokens.push(NameToken::Other),
+            RegionKind::Code => {
+                let bytes = text.as_bytes();
+                let mut i = 0;
+                while i < bytes.len() {
+                    let start = i;
+                    if is_word_byte(bytes[i]) {
+                        while i < bytes.len() && is_word_byte(bytes[i]) {
+                            i += 1;
+                        }
+                        let word = &text[start..i];
+                        tokens.push(if word.starts_with('#') {
+                            NameToken::Temp
+                        } else {
+                            NameToken::Word(word.to_ascii_lowercase())
+                        });
+                        continue;
+                    }
+                    match bytes[i] {
+                        b'.' => tokens.push(NameToken::Dot),
+                        byte if byte.is_ascii_whitespace() => {}
+                        _ => tokens.push(NameToken::Other),
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+    tokens
+}
+
+/// Whether the name `tokens` start with is a temp table's: `#t`, or one
+/// qualified like `tempdb..#t`, which SQL Server accepts with a warning.
+fn names_temp_table(tokens: &[NameToken]) -> bool {
+    let mut tokens = tokens.iter();
+    loop {
+        match tokens.next() {
+            Some(NameToken::Temp) => return true,
+            Some(NameToken::Dot) => {}
+            // A qualifier, which only a dot may follow.
+            Some(NameToken::Word(_) | NameToken::Quoted) => {
+                if tokens.next() != Some(&NameToken::Dot) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
 /// Whether a row-returning statement that ends a script may have its result
 /// cut off at the row cap without being read to the end: it can neither
 /// change the session's transaction state nor write anything this module can
@@ -4638,6 +4800,91 @@ mod tests {
             "INSERT INTO t VALUES (1)",
         ] {
             assert!(!tsql_is_transaction_control(sql), "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn sqlserver_statements_that_create_a_temp_table_are_recognized() {
+        for sql in [
+            "CREATE TABLE #t (a int)",
+            "create table #t (a int)",
+            "CREATE TABLE ##global (a int)",
+            "CREATE TABLE [#t] (a int)",
+            "CREATE TABLE \"#t\" (a int)",
+            "CREATE TABLE tempdb..#t (a int)",
+            "CREATE TABLE tempdb.dbo.#t (a int)",
+            "CREATE /* c */ TABLE -- c\n#t (a int)",
+            "SELECT 1 AS a INTO #t",
+            "SELECT * INTO [#t] FROM dbo.src",
+            "WITH c AS (SELECT 1 AS a) SELECT a INTO #t FROM c",
+            "IF OBJECT_ID('tempdb..#t') IS NULL CREATE TABLE #t (a int)",
+            "IF 1 = 1 BEGIN CREATE TABLE #t (a int) END",
+            "BEGIN TRY CREATE TABLE #t (a int) END TRY BEGIN CATCH END CATCH",
+            "DECLARE @n int = 1 SELECT @n AS n INTO #t",
+            "CREATE TABLE #t (a int) CREATE INDEX ix ON #t (a)",
+        ] {
+            assert!(tsql_creates_temp_table(sql), "{sql:?}");
+        }
+        for sql in [
+            // No temp table created.
+            "CREATE TABLE t (a int)",
+            "CREATE TABLE dbo.t (a int)",
+            "CREATE TABLE [t#] (a int)",
+            "SELECT a INTO t FROM #src",
+            "SELECT * FROM #t",
+            "DROP TABLE #t",
+            "ALTER TABLE #t ADD b int",
+            "CREATE INDEX ix ON #t (a)",
+            "DECLARE @t TABLE (a int)",
+            "FETCH NEXT FROM c INTO @a",
+            "SELECT 'CREATE TABLE #t' AS a",
+            "-- CREATE TABLE #t\nSELECT 1",
+            "CREATE TABLE t (a int) /* INTO #t */",
+            // A write, which would report no rows as a plain batch.
+            "INSERT INTO #t VALUES (1)",
+            "CREATE TABLE #t (a int) INSERT INTO #t VALUES (1)",
+            "SELECT 1 AS a INTO #t UPDATE #t SET a = 2",
+            "SELECT 1 AS a INTO #t DELETE FROM #t",
+            "SELECT 1 AS a INTO #t MERGE #t AS d USING #t AS s ON 1 = 0 \
+             WHEN NOT MATCHED THEN INSERT (a) VALUES (1);",
+            "SELECT 1 AS a INTO #t TRUNCATE TABLE #t",
+            "CREATE TABLE #t (a int) EXEC dbo.p",
+            "CREATE TABLE #t (a int) EXECUTE ('SELECT 1')",
+            // A setting that would outlive the statement.
+            "CREATE TABLE #t (a int) SET NOCOUNT ON",
+            "SET NOEXEC ON CREATE TABLE #t (a int)",
+            "CREATE TABLE #t (a int)\nset xact_abort on",
+            "SELECT 1 AS a INTO #t SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            // Transaction control, which error 266 must still stop.
+            "CREATE TABLE #t (a int) COMMIT",
+            "CREATE TABLE #t (a int) ROLLBACK",
+            "BEGIN TRAN CREATE TABLE #t (a int)",
+            "BEGIN TRANSACTION CREATE TABLE #t (a int)",
+            "BEGIN DISTRIBUTED TRAN CREATE TABLE #t (a int)",
+            "CREATE TABLE #t (a int) SAVE TRAN s",
+            "IF 1 = 1 COMMIT WORK SELECT 1 AS a INTO #t",
+        ] {
+            assert!(!tsql_creates_temp_table(sql), "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn a_temp_table_is_created_by_a_plain_batch_only_on_a_runs_own_connection() {
+        let creates = "CREATE TABLE #t (a int)";
+        assert!(tsql_runs_as_batch(creates, true));
+        assert!(!tsql_runs_as_batch(creates, false));
+        // What must be a plain batch is one wherever it runs.
+        for sql in ["CREATE VIEW v AS SELECT 1 AS a", "BEGIN TRAN", "COMMIT"] {
+            assert!(tsql_runs_as_batch(sql, true), "{sql:?}");
+            assert!(tsql_runs_as_batch(sql, false), "{sql:?}");
+        }
+        for sql in [
+            "INSERT INTO #t VALUES (1)",
+            "SELECT * FROM #t",
+            "SET NOCOUNT ON",
+        ] {
+            assert!(!tsql_runs_as_batch(sql, true), "{sql:?}");
+            assert!(!tsql_runs_as_batch(sql, false), "{sql:?}");
         }
     }
 
