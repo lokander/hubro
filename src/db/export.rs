@@ -56,6 +56,14 @@ impl ExportFormat {
             ExportFormat::Json => "json",
         }
     }
+
+    /// The save dialog's name for the format's file filter.
+    pub fn filter_label(self) -> &'static str {
+        match self {
+            ExportFormat::Csv => "CSV",
+            ExportFormat::Json => "JSON",
+        }
+    }
 }
 
 /// Incremental writer shared by the streaming and materialized paths. Holds

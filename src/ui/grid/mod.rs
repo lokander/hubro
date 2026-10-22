@@ -43,10 +43,10 @@ use dioxus_icons::lucide::{
 };
 
 use crate::db::{
-    import_refusal, raw_cell_text, render_copy, ColumnMeta, ConnectionId, CopyBlock, CopyFormat,
-    Dialect, ExportFormat, Filter, FilterOp, ForeignKeyMeta, Generated, Page, PageRequest,
-    PreviewInfo, QueryResult, RowIdentity, RowLocator, SortDir, StagedChange, TableAccess,
-    TableMeta, Value, FETCH_CELL_MAX_BYTES,
+    import_refusal, raw_cell_text, render_copy, CellFetch, ColumnMeta, ConnectionId, CopyBlock,
+    CopyFormat, Dialect, ExportFormat, Filter, FilterOp, ForeignKeyMeta, Generated, Page,
+    PageRequest, PreviewInfo, QueryResult, RowIdentity, RowLocator, SortDir, StagedChange,
+    TableAccess, TableMeta, Value, FETCH_CELL_MAX_BYTES,
 };
 use crate::util::human_bytes;
 
@@ -54,6 +54,7 @@ use super::editing::{editor_kind, CellEditor, EditNav, EditorKind};
 use super::import::ImportDialog;
 use super::js::{focus_by_id_next_frame, reclaim_focus_by_id_next_frame, write_clipboard};
 use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState, Overlay, OverlayAlign};
+use super::pick_export_path;
 use super::schema::display_type;
 use super::selection::Selection;
 use super::shell::accel_held;
@@ -64,6 +65,27 @@ use super::state::{
 use super::text_field::TextInput;
 
 const PAGE_SIZE: u32 = 100;
+
+/// The table's row count, as far as paging may rely on it: `None` while the
+/// count is running or has failed. A *re-running* count still holds its old
+/// value (`use_resource` keeps it and flips its state to Pending), so it is
+/// unknown rather than stale — new rows are never paired with a count from
+/// before a filter change or a write.
+fn settled_count<E>(pending: bool, count: Option<&Result<u64, E>>) -> Option<u64> {
+    if pending {
+        return None;
+    }
+    count.and_then(|count| count.as_ref().ok().copied())
+}
+
+/// Whether `page`, holding `loaded` rows, is the last one there is — the one
+/// rule both Next and PageDown obey. An unknown count (see
+/// [`settled_count`]) is treated as the end: a page past the last would sit
+/// empty until the count arrived and the clamp pulled it back.
+fn at_end(count: Option<u64>, page: u64, loaded: u64) -> bool {
+    let last = page * PAGE_SIZE as u64 + loaded;
+    count.is_none_or(|count| last >= count)
+}
 
 /// Fixed data-row height in CSS pixels. Rows render one truncated
 /// line at `text-xs` + `py-1`, so their height is uniform; pinning it lets the
@@ -666,12 +688,11 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // resolved count; setting the page re-runs this once with a now-valid page,
     // so it settles without looping. (Reactive; verified live, not by unit test.)
     use_effect(move || {
-        if *count_resource.state().read() == UseResourceState::Pending {
+        let Some(total) = settled_count(
+            *count_resource.state().read() == UseResourceState::Pending,
+            count_resource.read().as_ref(),
+        ) else {
             return;
-        }
-        let total = match count_resource.read().as_ref() {
-            Some(Ok(total)) => *total,
-            _ => return,
         };
         let last_page = total.saturating_sub(1) / PAGE_SIZE as u64;
         if page() > last_page {
@@ -1167,19 +1188,13 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                 }
             }
             FocusOutcome::NextPage => {
-                // Don't page past the end (mirrors the Next button's guard).
-                // A re-running count reads as 0 → blocked, like the footer.
-                let total = if *count_resource.state().peek() == UseResourceState::Pending {
-                    0
-                } else {
-                    match count_resource.peek().as_ref() {
-                        Some(Ok(total)) => *total,
-                        _ => 0,
-                    }
-                };
+                // The Next button's rule, so the two cannot disagree.
+                let count = settled_count(
+                    *count_resource.state().peek() == UseResourceState::Pending,
+                    count_resource.peek().as_ref(),
+                );
                 let p = *page.peek();
-                let last = p * PAGE_SIZE as u64 + rows as u64;
-                if last < total {
+                if !at_end(count, p, rows as u64) {
                     page.set(p + 1);
                 }
             }
@@ -2030,25 +2045,18 @@ fn GridFooter(
                     let result = &page_data.result;
                     // The count comes from its own resource; it
                     // stays resolved across page flips, so flipping reuses
-                    // it. While it is *re-running* (a filter change or a
-                    // write bump — `use_resource` keeps the old value but
-                    // flips its state to Pending), treat the total as
-                    // unknown so we never pair new rows with a stale count.
-                    let total = if *count_resource.state().read() == UseResourceState::Pending {
-                        None
-                    } else {
-                        count_resource
-                            .read()
-                            .as_ref()
-                            .and_then(|r| r.as_ref().ok().copied())
-                    };
+                    // it. While it re-runs it reads as unknown, and the
+                    // readout says "of …" rather than a stale total.
+                    let total = settled_count(
+                        *count_resource.state().read() == UseResourceState::Pending,
+                        count_resource.read().as_ref(),
+                    );
                     let loaded = result.rows.len() as u64;
                     let first = if loaded == 0 { 0 } else { page() * PAGE_SIZE as u64 + 1 };
                     let last = page() * PAGE_SIZE as u64 + loaded;
-                    // While the total is unknown, don't offer Next (avoid
-                    // paging past the end); a full page implies there may be
-                    // more, so the ellipsis reads honestly.
-                    let at_end = total.map(|t| last >= t).unwrap_or(true);
+                    // While the total is unknown, Next is not offered, as
+                    // PageDown is not taken.
+                    let no_next = at_end(total, page(), loaded);
                     rsx! {
                         // Everything left of the stepper lives in one bounded
                         // group: `flex-1 min-w-0 overflow-hidden` fixes its
@@ -2137,7 +2145,7 @@ fn GridFooter(
                         span { class: "shrink-0 whitespace-nowrap", "page {page() + 1}" }
                         button {
                             class: "shrink-0 whitespace-nowrap rounded px-2 py-0.5 hover:bg-slate-200 dark:hover:bg-slate-800 disabled:opacity-40",
-                            disabled: at_end,
+                            disabled: no_next,
                             onclick: move |_| { let p = page(); page.set(p + 1); },
                             "Next →"
                         }
@@ -2414,11 +2422,6 @@ fn spawn_grid_export(
         extra_key_column: None,
     };
     let (sql, params) = request.export_sql(dialect);
-    let suggested = format!("{}.{}", table.name, format.extension());
-    let (filter_name, ext) = match format {
-        ExportFormat::Csv => ("CSV", "csv"),
-        ExportFormat::Json => ("JSON", "json"),
-    };
     // `spawn_forever`: the save dialog does not block the window, and a
     // table switch meanwhile unmounts this grid. A scoped task was cancelled
     // with it, so the dialog accepted a path and nothing was written or
@@ -2426,14 +2429,9 @@ fn spawn_grid_export(
     // query is built, and its line names the table wherever it shows
     // ([`grid_export_line`]).
     dioxus::core::spawn_forever(async move {
-        let picked = rfd::AsyncFileDialog::new()
-            .set_title("Export table")
-            .set_file_name(suggested)
-            .add_filter(filter_name, &[ext])
-            .save_file()
-            .await;
-        if let Some(file) = picked {
-            state.export_query(id, table, sql, params, format, file.path().to_path_buf());
+        let picked = pick_export_path("Export table", &table.name, format).await;
+        if let Some(path) = picked {
+            state.export_query(id, table, sql, params, format, path);
         }
     });
 }
@@ -2589,6 +2587,43 @@ mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
+
+    #[test]
+    fn a_running_count_is_unknown_even_while_it_holds_an_old_value() {
+        let stale: Result<u64, ()> = Ok(1_000);
+        assert_eq!(settled_count(true, Some(&stale)), None);
+        assert_eq!(settled_count(false, Some(&stale)), Some(1_000));
+        assert_eq!(settled_count(false, Some(&Err::<u64, ()>(()))), None);
+        assert_eq!(settled_count::<()>(false, None), None);
+        // Paging obeys that: a full first page of a table whose old count
+        // promised ten pages offers no next page until the count settles.
+        assert!(at_end(
+            settled_count(true, Some(&stale)),
+            0,
+            PAGE_SIZE as u64
+        ));
+        assert!(!at_end(
+            settled_count(false, Some(&stale)),
+            0,
+            PAGE_SIZE as u64
+        ));
+    }
+
+    #[test]
+    fn the_last_page_is_where_the_rows_reach_the_count() {
+        let full = PAGE_SIZE as u64;
+        // An unknown count is the end, however full the page.
+        assert!(at_end(None, 0, full));
+        // Exactly two pages: the first has a next, the second does not.
+        assert!(!at_end(Some(2 * full), 0, full));
+        assert!(at_end(Some(2 * full), 1, full));
+        // One row past a page boundary is a page of its own.
+        assert!(!at_end(Some(full + 1), 0, full));
+        assert!(at_end(Some(full + 1), 1, 1));
+        // A short page is the last, and an empty table has no next page.
+        assert!(at_end(Some(40), 0, 40));
+        assert!(at_end(Some(0), 0, 0));
+    }
     use crate::db::PREVIEW_BYTES;
 
     #[test]
@@ -2899,13 +2934,28 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        for (source, function) in [
-            (include_str!("mod.rs"), "spawn_grid_export"),
-            (include_str!("mod.rs"), "pick_import_file"),
-            (include_str!("../editor.rs"), "spawn_result_export"),
+        // The two exports open theirs through the shared `pick_export_path`,
+        // which only awaits the dialog — so it is the caller's task that has
+        // to outlive the component, and the caller that is checked.
+        for (source, function, dialog) in [
+            (
+                include_str!("mod.rs"),
+                "spawn_grid_export",
+                "pick_export_path(",
+            ),
+            (
+                include_str!("mod.rs"),
+                "pick_import_file",
+                "rfd::AsyncFileDialog",
+            ),
+            (
+                include_str!("../editor.rs"),
+                "spawn_result_export",
+                "pick_export_path(",
+            ),
         ] {
             let body = code(source, function);
-            assert!(body.contains("rfd::AsyncFileDialog"), "{function}: {body}");
+            assert!(body.contains(dialog), "{function}: {body}");
             assert!(
                 body.contains("spawn_forever(async move"),
                 "{function}: {body}"
@@ -2916,6 +2966,12 @@ mod tests {
                 "{function} spawns a scoped task: {body}"
             );
         }
+        let picker = code(include_str!("../mod.rs"), "pick_export_path");
+        assert!(picker.contains("rfd::AsyncFileDialog"), "{picker}");
+        assert!(
+            !picker.contains("spawn"),
+            "the picker spawns a task: {picker}"
+        );
     }
 
     #[test]

@@ -534,57 +534,51 @@ pub(super) fn RowDetailFullValue(
     editing: Signal<Option<ActiveEdit>>,
     grid_editing: Signal<Option<ActiveEdit>>,
 ) -> Element {
-    let state = use_context::<AppState>();
-    let fetch_table = table.clone();
-    let fetch_locator = locator.clone();
-    let fetch_column = field.column.clone();
-    let cell = use_resource(move || {
-        let table = fetch_table.clone();
-        let locator = fetch_locator.clone();
-        let column = fetch_column.clone();
-        async move { state.load_cell(id, table, locator, column).await }
-    });
-    let loaded = cell.read();
-    match loaded.as_ref() {
-        None => rsx! {
-            DelayedLoading { label: "Loading full value…" }
-        },
-        Some(Err(err)) => rsx! {
-            Banner { kind: BannerKind::Error, message: err.clone() }
-        },
-        Some(Ok(fetch)) if fetch.capped => {
-            let note = format!(
-                "Value is very large; only the first {} was loaded, so there is no editor for it.",
-                human_bytes(FETCH_CELL_MAX_BYTES as u64),
-            );
-            rsx! {
-                Banner { kind: BannerKind::Warning, message: note }
-                // What is on screen is the viewer's to say — the banner states
-                // the consequence (no editor), the viewer states what it is
-                // showing and of how much, so neither restates the other.
-                div { class: "mt-1",
-                    CellViewer {
-                        value: fetch.value.clone(),
-                        type_name: field.type_name.clone(),
-                        truncated: Some(fetch.full_len),
+    let loaded_table = table.clone();
+    let loaded_locator = locator.clone();
+    let column = field.column.clone();
+    rsx! {
+        LoadedCell {
+            id,
+            table,
+            locator,
+            column,
+            loaded: move |fetch: CellFetch| {
+                if fetch.capped {
+                    let note = format!(
+                        "Value is very large; only the first {} was loaded, so there is no editor for it.",
+                        human_bytes(FETCH_CELL_MAX_BYTES as u64),
+                    );
+                    return rsx! {
+                        Banner { kind: BannerKind::Warning, message: note }
+                        // What is on screen is the viewer's to say — the banner states
+                        // the consequence (no editor), the viewer states what it is
+                        // showing and of how much, so neither restates the other.
+                        div { class: "mt-1",
+                            CellViewer {
+                                value: fetch.value,
+                                type_name: field.type_name.clone(),
+                                truncated: Some(fetch.full_len),
+                            }
+                        }
+                    };
+                }
+                rsx! {
+                    RowDetailValue {
+                        id,
+                        table: loaded_table.clone(),
+                        dialect,
+                        value: fetch.value,
+                        field: field.clone(),
+                        locator: Some(loaded_locator.clone()),
+                        editable_columns: editable_columns.clone(),
+                        row_key: row_key.clone(),
+                        editing,
+                        grid_editing,
                     }
                 }
-            }
+            },
         }
-        Some(Ok(fetch)) => rsx! {
-            RowDetailValue {
-                id,
-                table,
-                dialect,
-                value: fetch.value.clone(),
-                field,
-                locator: Some(locator),
-                editable_columns,
-                row_key: row_key.clone(),
-                editing,
-                grid_editing,
-            }
-        },
     }
 }
 
