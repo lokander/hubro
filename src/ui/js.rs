@@ -211,75 +211,127 @@ mod tests {
         );
     }
 
-    /// Every modal overlay, by the component that
-    /// renders it. Each backdrop must carry [`MODAL_ATTR`] — that is how
-    /// [`may_reclaim`] knows it is open. And every full-screen layer in
-    /// these files is either one of them or named below as not a modal, so
-    /// a new overlay added beside them cannot go unmarked unnoticed.
+    /// Every Rust file under `src/ui`, walked at test time, as
+    /// (path components below `src/ui`, source).
+    fn ui_sources() -> Vec<(Vec<String>, String)> {
+        fn walk(dir: &std::path::Path, below: &[String], out: &mut Vec<(Vec<String>, String)>) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .unwrap_or_else(|err| panic!("{}: {err}", dir.display()))
+                .map(|entry| entry.expect("a readable directory entry").path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("a UTF-8 file name")
+                    .to_string();
+                let mut here = below.to_vec();
+                here.push(name);
+                if path.is_dir() {
+                    walk(&path, &here, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let source = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+                    out.push((here, source));
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("ui");
+        let mut out = Vec::new();
+        walk(&root, &[], &mut out);
+        assert!(out.len() > 10, "src/ui was not found: {}", root.display());
+        out
+    }
+
+    /// `source` with comment lines dropped and each line's whitespace
+    /// collapsed: one entry per remaining line.
+    fn code_lines(source: &str) -> Vec<String> {
+        source
+            .lines()
+            .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|line| !line.is_empty() && !line.starts_with("//"))
+            .collect()
+    }
+
+    /// Every modal overlay, by the component that renders it. Each backdrop
+    /// must carry [`MODAL_ATTR`] — that is how [`may_reclaim`] knows it is
+    /// open.
+    ///
+    /// And every full-screen layer anywhere under `src/ui` (walked at test
+    /// time, so a new file is covered without being listed) is either marked
+    /// or named below as not a modal. A layer is any code line containing
+    /// `fixed inset-0` — a plain `class:` literal, a branch of a conditional
+    /// `class: if …`, or a `format!` — and each one must be matched by a
+    /// marker line. What the scan cannot see: a full-screen layer spelled
+    /// without `fixed inset-0` on one line (`fixed top-0 left-0 h-full
+    /// w-full`, an inline style, or the two classes split across lines or
+    /// strings), and a layer in this file, whose tests quote the class.
     #[test]
     fn every_modal_overlay_is_marked() {
-        let marker = format!(r#""{MODAL_ATTR}": "true", class: "fixed inset-0"#);
-        let files: [(&str, &str); 6] = [
-            ("shell.rs", include_str!("shell.rs")),
-            ("connections.rs", include_str!("connections.rs")),
-            ("schema_edit.rs", include_str!("schema_edit.rs")),
-            ("import.rs", include_str!("import.rs")),
-            ("schema.rs", include_str!("schema.rs")),
-            ("grid/mod.rs", include_str!("grid/mod.rs")),
-        ];
-        let code = |source: &str| -> String {
-            source
-                .lines()
-                .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
-                .filter(|line| !line.is_empty() && !line.starts_with("//"))
-                .collect::<Vec<_>>()
-                .join(" ")
+        let marker_line = format!(r#""{MODAL_ATTR}": "true","#);
+        let layer = "fixed inset-0";
+        let sources = ui_sources();
+        let source_of = |file: &[&str]| -> Vec<String> {
+            let (_, source) = sources
+                .iter()
+                .find(|(path, _)| path.iter().map(String::as_str).eq(file.iter().copied()))
+                .unwrap_or_else(|| panic!("{file:?} is gone"));
+            code_lines(source)
         };
-        let overlays = [
-            ("shell.rs", "fn QuitConfirmDialog("),
-            ("shell.rs", "fn Cheatsheet("),
-            ("connections.rs", "fn ConnectFormModal("),
-            ("schema_edit.rs", "fn SchemaEditDialog("),
-            ("import.rs", "pub fn ImportDialog("),
-            ("schema.rs", "fn DdlOverlay("),
+        let overlays: [(&[&str], &str); 7] = [
+            (&["shell.rs"], "fn QuitConfirmDialog("),
+            (&["shell.rs"], "fn Cheatsheet("),
+            (&["connections.rs"], "fn ConnectFormModal("),
+            (&["schema_edit.rs"], "fn SchemaEditDialog("),
+            (&["import.rs"], "pub fn ImportDialog("),
+            (&["schema.rs"], "fn DdlOverlay("),
             // The cell-value popup, inside the grid's own component.
             (
-                "grid/mod.rs",
+                &["grid", "mod.rs"],
                 "if let Some(view) = expanded.read().clone() {",
             ),
         ];
         for (file, start) in overlays {
-            let source = code(files.iter().find(|(name, _)| *name == file).unwrap().1);
-            let from = source
-                .find(start)
-                .unwrap_or_else(|| panic!("{file}: `{start}` is gone"));
-            let backdrop = source[from..]
-                .find(r#"class: "fixed inset-0"#)
-                .map(|i| &source[from..from + i + r#"class: "fixed inset-0"#.len()])
-                .unwrap_or_else(|| panic!("{file}: no backdrop after `{start}`"));
+            let lines = source_of(file);
+            let from = lines
+                .iter()
+                .position(|line| line.contains(start))
+                .unwrap_or_else(|| panic!("{file:?}: `{start}` is gone"));
+            let backdrop = lines[from..]
+                .iter()
+                .position(|line| line.contains(layer))
+                .map(|i| from + i)
+                .unwrap_or_else(|| panic!("{file:?}: no backdrop after `{start}`"));
             assert!(
-                backdrop.ends_with(&marker),
-                "{file}: the overlay at `{start}` does not carry {MODAL_ATTR}"
+                backdrop > 0 && lines[backdrop - 1] == marker_line,
+                "{file:?}: the overlay at `{start}` does not carry {MODAL_ATTR}"
             );
         }
         // Not a modal: the copy menu's click-catcher closes a dropdown and
         // never holds focus.
-        let not_modal = [(
-            "grid/mod.rs",
-            r#"class: "fixed inset-0 z-30", onclick: move |_| copy_menu.set(false),"#,
-        )];
-        for (file, source) in files {
-            let source = code(source);
-            let layers = source.matches(r#"class: "fixed inset-0"#).count();
-            let marked = source.matches(marker.as_str()).count();
+        let not_modal: [(&[&str], &str); 1] =
+            [(&["grid", "mod.rs"], r#"class: "fixed inset-0 z-30","#)];
+        for (path, source) in &sources {
+            if path.len() == 1 && path[0] == "js.rs" {
+                continue;
+            }
+            let lines = code_lines(source);
+            let layers = lines.iter().filter(|line| line.contains(layer)).count();
+            let marked = lines.iter().filter(|line| **line == marker_line).count();
             let excused = not_modal
                 .iter()
-                .filter(|(name, layer)| *name == file && source.contains(layer))
+                .filter(|(file, excused)| {
+                    path.iter().map(String::as_str).eq(file.iter().copied())
+                        && lines.iter().any(|line| line == excused)
+                })
                 .count();
             assert_eq!(
                 layers,
                 marked + excused,
-                "{file}: a full-screen layer is neither marked as a modal nor named as not one"
+                "{path:?}: a full-screen layer is neither marked as a modal nor named as not one"
             );
         }
     }
