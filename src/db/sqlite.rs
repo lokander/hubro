@@ -225,6 +225,28 @@ pub const NUL_IN_SQL: &str =
 
 use door::SqlText;
 
+/// The affected-row count to report for a statement, given the connection's
+/// `total_changes()` before and after it and the count the driver reported.
+///
+/// The driver reports `sqlite3_changes()`, which only an `INSERT`, `UPDATE` or
+/// `DELETE` sets: any other statement leaves it at the last such statement's
+/// count. Measured after a two-row `INSERT`: `BEGIN`, `ROLLBACK`, `SAVEPOINT`,
+/// `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`, `ANALYZE` and `VACUUM` each
+/// reported 2. `total_changes()` counts every row an `INSERT`, `UPDATE` or
+/// `DELETE` changed on the connection, so when it did not move, the statement
+/// changed nothing — whatever its kind, without classifying it — and the
+/// count is 0. When it moved, the statement was one that sets the driver's
+/// count, which is then the true one. The difference itself is not reported:
+/// it also counts the rows a trigger changed, which `sqlite3_changes()`, like
+/// Postgres's command tag, leaves out.
+fn affected_rows(total_before: i64, total_after: i64, reported: u64) -> u64 {
+    if total_after == total_before {
+        0
+    } else {
+        reported
+    }
+}
+
 /// The one door SQL text passes through to sqlx-sqlite — see [`SqlText`].
 mod door {
     use super::{query_error, sqlx_common, DbError, QueryResult, SqliteQuery, NUL_IN_SQL};
@@ -272,12 +294,22 @@ mod door {
             sqlx::query(self.0)
         }
 
-        /// Runs this text without decoding rows — see [`sqlx_common::execute`].
-        pub(super) async fn execute<'c, E>(self, executor: E) -> Result<u64, DbError>
+        /// Runs this text without decoding rows — see [`sqlx_common::execute`] —
+        /// and returns its affected-row count, which is the driver's only when
+        /// the text changed a row: see [`affected_rows`](super::affected_rows).
+        ///
+        /// Takes a pool or a connection, and runs the text and both reads of
+        /// `total_changes()` on one connection, since the counter is per
+        /// connection.
+        pub(super) async fn execute<'c, A>(self, acquire: A) -> Result<u64, DbError>
         where
-            E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
+            A: sqlx::Acquire<'c, Database = sqlx::Sqlite>,
         {
-            sqlx_common::execute(executor, self.0, query_error).await
+            let mut conn = acquire.acquire().await.map_err(query_error)?;
+            let before = total_changes(&mut conn).await?;
+            let reported = sqlx_common::execute(&mut *conn, self.0, query_error).await?;
+            let after = total_changes(&mut conn).await?;
+            Ok(super::affected_rows(before, after, reported))
         }
 
         /// See [`sqlx_common::fill_headers`].
@@ -299,10 +331,19 @@ mod door {
             sqlx_common::describe_columns(executor, self.0).await
         }
     }
+
+    /// The connection's `total_changes()`: every row an `INSERT`, `UPDATE` or
+    /// `DELETE` has changed on it since it opened, triggers' included.
+    async fn total_changes(conn: &mut sqlx::SqliteConnection) -> Result<i64, DbError> {
+        sqlx::query_scalar("SELECT total_changes()")
+            .fetch_one(conn)
+            .await
+            .map_err(query_error)
+    }
 }
 
-/// Executes a statement without decoding rows, returning the driver's
-/// affected-row count.
+/// Executes a statement without decoding rows, returning its affected-row
+/// count (0 for a statement that changed no row — see [`affected_rows`]).
 pub async fn execute(pool: &SqlitePool, sql: &str) -> Result<u64, DbError> {
     SqlText::new(sql)?.execute(pool).await
 }
@@ -1279,6 +1320,16 @@ fn decode_value(row: &SqliteRow, idx: usize) -> Result<Value, DbError> {
 mod tests {
     use super::super::sql::quote_ident;
     use super::*;
+
+    #[test]
+    fn a_statement_that_changed_no_row_reports_none_whatever_the_driver_says() {
+        // `BEGIN` after a two-row INSERT: the driver repeats the 2.
+        assert_eq!(affected_rows(7, 7, 2), 0);
+        // A write: the driver's count, not the counter's difference, which
+        // also holds the rows its triggers changed.
+        assert_eq!(affected_rows(7, 10, 1), 1);
+        assert_eq!(affected_rows(7, 9, 2), 2);
+    }
 
     /// The probe's two outcomes, and what [`end_script_conn`] makes of them.
     /// Only a refused `BEGIN` says a transaction was open; a refused
