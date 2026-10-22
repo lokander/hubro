@@ -483,6 +483,12 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                 if (el) el.scrollTop = 0; \
             });",
         );
+        // A reset can take away whatever held focus: Save's button goes with
+        // the pending-changes bar once the stage empties, and a refresh
+        // closes an open value popup. Either leaves focus on the body, so
+        // hand it back — but only from there, never from the filter box a
+        // filter was just applied from, nor from the Refresh button.
+        reclaim_focus_by_id_next_frame("dv-grid");
     });
 
     // Rowid-identity tables (SQLite, keyless) need the rowid in every
@@ -1075,7 +1081,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         if code == Code::Escape {
             if expanded.peek().is_some() {
                 evt.prevent_default();
-                expanded.set(None);
+                close_expanded();
             } else if selection_anchor.peek().is_some() {
                 evt.prevent_default();
                 selection_anchor.set(None);
@@ -2967,5 +2973,93 @@ mod tests {
         }];
         assert_eq!(enter_action(&nav, (0, 1)), EnterAction::Nothing);
         assert!(matches!(enter_action(&nav, (0, 0)), EnterAction::Edit(_)));
+    }
+
+    /// This file's code with comment lines dropped and each line's
+    /// whitespace collapsed, joined by single spaces — so a comment cannot
+    /// satisfy an assertion and a rustfmt reflow cannot fail one.
+    fn grid_code() -> String {
+        include_str!("mod.rs")
+            .lines()
+            .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|line| !line.is_empty() && !line.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The span of `code` from `start` to the next `end` after it.
+    fn span<'a>(code: &'a str, start: &str, end: &str) -> &'a str {
+        let from = code
+            .find(start)
+            .unwrap_or_else(|| panic!("{start} is gone"));
+        let rest = &code[from..];
+        let to = rest[start.len()..]
+            .find(end)
+            .map_or(rest.len(), |i| i + start.len());
+        &rest[..to]
+    }
+
+    /// `grid_refocus` is pinned by its own test; this pins that the focus
+    /// effect acts on its answer as written — each arm its own focus call,
+    /// and the edge remembered — which a driven run cannot repeat.
+    #[test]
+    fn the_focus_effect_does_what_grid_refocus_says() {
+        let code = grid_code();
+        let effect = span(&code, "let mut editor_was_open", "});");
+        for wire in [
+            "let open = editing.read().is_some() || detail_editing.read().is_some();",
+            "let was_open = *editor_was_open.peek();",
+            "editor_was_open.set(Some(open));",
+            "match grid_refocus(was_open, open) {",
+            r#"GridRefocus::Take => focus_by_id_next_frame("dv-grid"),"#,
+            r#"GridRefocus::Reclaim => reclaim_focus_by_id_next_frame("dv-grid"),"#,
+            "GridRefocus::Leave => {}",
+        ] {
+            assert!(
+                effect.contains(wire),
+                "the focus effect lost `{wire}`: {effect}"
+            );
+        }
+    }
+
+    /// The reset after a page, sort, filter or refresh hands focus back when
+    /// it took it away (Save's button leaves with the pending bar), and only
+    /// reclaims it — it must not take focus from the filter box.
+    #[test]
+    fn the_reset_effect_reclaims_focus_and_never_takes_it() {
+        let code = grid_code();
+        let reset = span(&code, "let _ = refresh_nonce();", "use_effect(");
+        assert!(
+            reset.contains(r#"reclaim_focus_by_id_next_frame("dv-grid");"#),
+            "the reset no longer hands focus back: {reset}"
+        );
+        // Every focus call in it is a reclaim: none takes focus outright.
+        assert_eq!(
+            reset.matches("focus_by_id_next_frame").count(),
+            reset.matches("reclaim_focus_by_id_next_frame").count(),
+            "the reset takes focus outright: {reset}"
+        );
+    }
+
+    /// The grid's shortcuts follow the app's one Ctrl rule, `accel_held` —
+    /// the window-level half is `every_window_shortcut_takes_ctrl_or_cmd`.
+    #[test]
+    fn the_grid_reads_ctrl_through_the_shared_rule() {
+        let code = grid_code();
+        let handler = span(
+            &code,
+            "let on_grid_key = move |evt: KeyboardEvent| {",
+            "rsx! {",
+        );
+        assert!(
+            handler.contains("let ctrl = accel_held(modifiers);"),
+            "the grid's Ctrl is not `accel_held`: {handler}"
+        );
+        for direct in [".ctrl()", ".meta()"] {
+            assert!(
+                !handler.contains(direct),
+                "the grid reads `{direct}` directly instead of through `accel_held`"
+            );
+        }
     }
 }
