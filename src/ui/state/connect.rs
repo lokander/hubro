@@ -222,6 +222,23 @@ pub(super) fn card_offers_remember(source: Option<RefreshSource>) -> bool {
     source != Some(RefreshSource::Session)
 }
 
+/// Whether a remembered sign-in is still in the keyring after a sign-in
+/// attempt, from where the attempt found its refresh token (`source`) and
+/// whether Entra refused that token for good (`rejected`, in which case
+/// [`AppState::acquire_entra`] has just deleted it).
+///
+/// A session-kept token means the keyring holds none: a token lives in exactly
+/// one of the two places ([`place_entra_refresh`] deletes the keyring copy when
+/// it keeps one for the session). No token at all means the keyring read came
+/// back empty or failed — the same accepted gap as [`StoredCopy::Absent`].
+pub(super) fn entra_stored_copy(source: Option<RefreshSource>, rejected: bool) -> StoredCopy {
+    if source == Some(RefreshSource::Keyring) && !rejected {
+        StoredCopy::Present
+    } else {
+        StoredCopy::Absent
+    }
+}
+
 /// What to do with the keyring entry for a sign-in's refresh token.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum RefreshKeyring {
@@ -1205,6 +1222,8 @@ impl AppState {
                     backend: backend.kind,
                     // Decided by the silent attempt below, either way it goes.
                     remember: true,
+                    // Likewise: the attempt finds out where its token was.
+                    stored: StoredCopy::Unknown,
                 };
                 self.connect_server_entra(backend, pending, connect_url, tls_host, live_tunnel)
                     .await;
@@ -1301,7 +1320,9 @@ impl AppState {
     /// Acquires one Entra token for `url`'s connection: redeem the kept
     /// refresh token when there is one, otherwise fall through to
     /// `open_browser`. Also returns where the redeemed token was kept, which
-    /// [`redeemed_refresh_remembered`] reads.
+    /// [`redeemed_refresh_remembered`] reads, and whether a remembered one is
+    /// still in the keyring afterwards ([`entra_stored_copy`]), which the
+    /// sign-in card warns about.
     ///
     /// A refresh token Entra refuses for good is forgotten here, wherever it
     /// was kept: it can never work again, and kept it would cost a token round
@@ -1316,6 +1337,7 @@ impl AppState {
     ) -> (
         Result<azure::AccessToken, azure::AzureError>,
         Option<RefreshSource>,
+        StoredCopy,
     ) {
         let cached = self.cached_entra_refresh(url).await;
         let acquired = azure::acquire_token(
@@ -1330,7 +1352,9 @@ impl AppState {
         if acquired.refresh_rejected {
             self.forget_entra_refresh(url).await;
         }
-        (acquired.token, cached.map(|(_, source)| source))
+        let source = cached.map(|(_, source)| source);
+        let stored = entra_stored_copy(source, acquired.refresh_rejected);
+        (acquired.token, source, stored)
     }
 
     /// Drops a connection's kept refresh token from session memory and the
@@ -1393,7 +1417,7 @@ impl AppState {
         live_tunnel: Option<Tunnel>,
     ) {
         self.set_step(&pending.url, ConnectStep::SigningIn);
-        let (token, source) = self
+        let (token, source, stored) = self
             .acquire_entra(
                 &pending.entra,
                 backend.entra_resource,
@@ -1420,6 +1444,7 @@ impl AppState {
                 self.release_connect(&pending.url);
                 drop(live_tunnel);
                 pending.remember = card_offers_remember(source);
+                pending.stored = stored;
                 self.entra_prompt.set(Some(pending));
             }
             Err(err) => {
@@ -1481,7 +1506,7 @@ impl AppState {
     pub async fn connect_server_with_entra_signin(
         mut self,
         backend: ServerBackend,
-        prompt: EntraPrompt,
+        mut prompt: EntraPrompt,
     ) {
         self.connect_error.set(None);
         self.entra_prompt.set(None);
@@ -1501,7 +1526,7 @@ impl AppState {
             return;
         };
         let tls_host = backend.tls_host(&prompt.url, prompt.tunnel.is_some());
-        let (token, _) = self
+        let (token, _, stored) = self
             .acquire_entra(
                 &prompt.entra,
                 backend.entra_resource,
@@ -1528,7 +1553,10 @@ impl AppState {
                 self.fail_connect(&prompt.url, err.to_string());
                 // Re-raise the card so the user can retry the sign-in in
                 // place. It carries the answer they gave, so a failed sign-in
-                // does not re-tick a box they cleared.
+                // does not re-tick a box they cleared — and what this attempt
+                // learned about a remembered sign-in, which it may have just
+                // deleted as refused.
+                prompt.stored = stored;
                 self.entra_prompt.set(Some(prompt));
             }
         }
@@ -4619,6 +4647,183 @@ mod tests {
                 retry_after(backend, bare.as_str(), None).await,
                 Some(PasswordRetry::Prompt),
                 "{var}: a server that wants a password must still be asked for one"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sign_in_card_says_a_sign_in_is_remembered_only_while_the_keyring_holds_it() {
+        use RefreshSource::{Keyring, Session};
+        for (source, rejected, expected, why) in [
+            (
+                Some(Keyring),
+                false,
+                StoredCopy::Present,
+                "a keyring token that failed only transiently is still there",
+            ),
+            (
+                Some(Keyring),
+                true,
+                StoredCopy::Absent,
+                "a refused keyring token was just deleted by acquire_entra",
+            ),
+            (
+                Some(Session),
+                false,
+                StoredCopy::Absent,
+                "a session-kept token means the keyring holds none",
+            ),
+            (None, false, StoredCopy::Absent, "no token anywhere"),
+        ] {
+            assert_eq!(entra_stored_copy(source, rejected), expected, "{why}");
+        }
+
+        // The hops from that verdict to the card, which no executed test can
+        // reach without a tenant: computed from the attempt's own source and
+        // rejection, and handed to the card on both routes that raise it.
+        // Comment-stripped and whitespace-collapsed.
+        let source = include_str!("connect.rs");
+        for (signature, pin) in [
+            (
+                "async fn acquire_entra(",
+                "let stored = entra_stored_copy(source, acquired.refresh_rejected);",
+            ),
+            (
+                "async fn acquire_entra(",
+                "(acquired.token, source, stored)",
+            ),
+            (
+                "async fn connect_server_entra(",
+                "pending.remember = card_offers_remember(source); pending.stored = stored; \
+                 self.entra_prompt.set(Some(pending));",
+            ),
+            (
+                "pub async fn connect_server_with_entra_signin(",
+                "prompt.stored = stored; self.entra_prompt.set(Some(prompt));",
+            ),
+        ] {
+            let body = collapsed(&code_only(&method_body(source, signature)));
+            assert!(body.contains(pin), "{signature}: `{pin}` is gone: {body}");
+        }
+    }
+
+    #[test]
+    fn every_keyring_delete_is_either_warned_about_or_not_the_user_s_answer() {
+        // The hints were first derived from the UI side — each box — and a
+        // deletion nobody started from (the sign-in card's) went unwarned.
+        // This starts from the other end: every place shipped code can delete
+        // a keyring entry, each classified. A new one fails here until it is
+        // classified, and a user-answered one has to name the hint that
+        // warns of it.
+        const API: &str = "the keyring API itself; its callers are the sites listed here";
+        let registry: &[(&str, &str, usize, &str)] = &[
+            ("secrets.rs", "delete_password_async", 1, API),
+            ("secrets.rs", "delete_password", 1, API),
+            (
+                "ui/state/connect.rs",
+                "connect_server_with_password",
+                1,
+                "user-answered: `StoredPassword::Delete`, an unticked box once a different \
+                 password connects. Warned by `remember_hint` on the password prompt and \
+                 `form_remember_hint` on both connection forms",
+            ),
+            (
+                "ui/state/connect.rs",
+                "keep_entra_refresh",
+                1,
+                "user-answered: `RefreshKeyring::Delete`, an unticked \"stay signed in\" box \
+                 once the sign-in connects. Warned by `entra_remember_hint` on the sign-in \
+                 card. The silent path reaches it only for a session-kept token, whose \
+                 keyring holds none",
+            ),
+            (
+                "ui/state/connect.rs",
+                "migrate_secret",
+                3,
+                "explicit: an edit that moved the locator. The old copy is carried to the \
+                 new locator, dropped once it is redundant there, or dropped because a \
+                 different secret connected. No saved connection's secret is lost: the \
+                 old locator belongs to no saved entry after the move, and a different \
+                 secret that connected is the current one (ticked, it is stored under the \
+                 new locator, so this is a move; unticked, `form_remember_hint` warns)",
+            ),
+            (
+                "ui/state/connect.rs",
+                "remove_saved",
+                1,
+                "explicit: the user removed the connection, which owns these secrets",
+            ),
+            (
+                "ui/state/connect.rs",
+                "forget_entra_refresh",
+                1,
+                "automatic: Entra refused the refresh token for good, so it can never \
+                 work again; or explicit: an edit moved the locator it was kept under",
+            ),
+            (
+                "ui/state/connect.rs",
+                "open_tunnel",
+                1,
+                "automatic: a keyring-sourced SSH passphrase the tunnel rejected, which is \
+                 stale (a session-sourced one is never deleted)",
+            ),
+        ];
+        let mut found: Vec<(String, String)> = Vec::new();
+        // `shipped` stops at `mod tests`; secrets.rs exports its test module
+        // (`pub(crate) mod tests`) for the mock keyring, so stop there too.
+        let without_tests = |text: &str| {
+            let lines: Vec<&str> = text.lines().collect();
+            let end = lines
+                .windows(2)
+                .position(|w| w[0].trim() == "#[cfg(test)]" && w[1].contains("mod tests"))
+                .unwrap_or(lines.len());
+            lines[..end].join("\n")
+        };
+        for (rel, text) in all_sources() {
+            let code = code_only(&shipped(&without_tests(&text)));
+            for call in [
+                "delete_password(",
+                "delete_password_async(",
+                "delete_credential(",
+            ] {
+                for (at, _) in code.match_indices(call) {
+                    let before = &code[..at];
+                    // A definition is not a deletion; a longer name ending in
+                    // the call (`x_delete_password(`) is not this call.
+                    if before.ends_with("fn ")
+                        || before
+                            .chars()
+                            .next_back()
+                            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                    {
+                        continue;
+                    }
+                    let fn_at = before.rfind("fn ").expect("a call inside a function");
+                    let name: String = before[fn_at + 3..]
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    found.push((rel.clone(), name));
+                }
+            }
+        }
+        for (rel, function) in &found {
+            assert!(
+                registry.iter().any(|(r, f, ..)| r == rel && f == function),
+                "a keyring delete in `{function}` (src/{rel}) is not classified. Add it \
+                 to this registry as user-answered (naming the hint that warns of it) \
+                 or explicit/automatic (saying why no answer is overridden)"
+            );
+        }
+        for (rel, function, count, why) in registry {
+            assert!(!why.is_empty());
+            assert_eq!(
+                found
+                    .iter()
+                    .filter(|(r, f)| r == rel && f == function)
+                    .count(),
+                *count,
+                "keyring deletes in `{function}` (src/{rel}) changed; reclassify: {why}"
             );
         }
     }
