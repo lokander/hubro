@@ -52,8 +52,13 @@ use crate::util::human_bytes;
 
 use super::editing::{editor_kind, CellEditor, EditNav, EditorKind};
 use super::import::ImportDialog;
-use super::js::{focus_by_id_next_frame, reclaim_focus_by_id_next_frame, write_clipboard};
-use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState, Overlay, OverlayAlign};
+use super::js::{
+    focus_by_id_next_frame, focus_on_mount, reclaim_focus_by_id_next_frame, write_clipboard,
+};
+use super::notice::{
+    a_held_key_is_not_a_press, Armed, Banner, BannerKind, DelayedLoading, EmptyState, Overlay,
+    OverlayAlign,
+};
 use super::pick_export_path;
 use super::schema::display_type;
 use super::selection::Selection;
@@ -475,7 +480,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // The armed save confirmation: the exact change list shown to the user
     // when the Save button turned into "Confirm: delete N…". The second
     // click only proceeds while the stage still generates this exact list.
-    let mut confirm = use_signal(|| Option::<Vec<StagedChange>>::None);
+    let mut confirm = use_signal(|| Option::<Armed<Vec<StagedChange>>>::None);
     // Once armed, the FIRST divergence of the stage from the snapshot
     // permanently disarms — clearing `confirm`, not just hiding it. Without
     // this, staging then un-staging back to an identical change list (e.g.
@@ -485,7 +490,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // "two clicks per confirmation instance" guarantee.
     let confirm_reset_table = table.clone();
     use_effect(move || {
-        let Some(snapshot) = confirm.read().clone() else {
+        let Some(snapshot) = confirm.read().as_ref().map(|armed| armed.subject().clone()) else {
             return;
         };
         let current = state
@@ -1104,9 +1109,13 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // The confirmation stays armed only while its snapshot still matches
     // the stage exactly (see `confirm` above).
     let armed = delete_count > 0
-        && stage
-            .as_ref()
-            .is_some_and(|s| confirm.read().as_deref() == Some(s.changes().as_slice()));
+        && stage.as_ref().is_some_and(|s| {
+            confirm
+                .read()
+                .as_ref()
+                .map(|armed| armed.subject().as_slice())
+                == Some(s.changes().as_slice())
+        });
 
     let current = rows_resource.read();
     let sort_value = sort();
@@ -2255,7 +2264,7 @@ fn GridBars(
     can_mutate: bool,
     /// Rows ticked for deletion but not yet staged.
     selected: Signal<HashMap<String, RowLocator>>,
-    confirm: Signal<Option<Vec<StagedChange>>>,
+    confirm: Signal<Option<Armed<Vec<StagedChange>>>>,
     /// Why this table refuses writes, if it does — named in the Save bar so a
     /// disabled Save button is never unexplained.
     read_only_notice: Option<&'static str>,
@@ -2320,22 +2329,34 @@ fn GridBars(
                         "rounded bg-emerald-700 px-3 py-1 font-semibold text-white hover:bg-emerald-600 disabled:opacity-40"
                     },
                     disabled: save_disabled(saving, missing_required, can_mutate),
+                    onkeydown: a_held_key_is_not_a_press,
                     // Two-step save when deletes are staged: the first
                     // click arms the exact-count confirmation, the second
-                    // (with the stage unchanged) saves. Stages without
-                    // deletes save immediately.
+                    // (with the stage unchanged, and not straight after the
+                    // first) saves. Stages without deletes save immediately.
                     onclick: move |_| {
                         let Some(stage) = state.table_stage(id, &save_table) else { return };
                         if stage.saving {
                             return;
                         }
                         let changes = stage.changes();
-                        if stage.delete_count() > 0 && confirm.peek().as_deref() != Some(changes.as_slice()) {
-                            confirm.set(Some(changes));
-                            return;
+                        let press = {
+                            let armed = confirm.peek();
+                            save_press(
+                                stage.delete_count(),
+                                armed.as_ref().map(|armed| armed.subject().as_slice()),
+                                armed.as_ref().is_some_and(Armed::settled),
+                                &changes,
+                            )
+                        };
+                        match press {
+                            SavePress::Arm => confirm.set(Some(Armed::new(changes))),
+                            SavePress::Wait => {}
+                            SavePress::Save => {
+                                confirm.set(None);
+                                state.save_staged(id, &save_table);
+                            }
                         }
-                        confirm.set(None);
-                        state.save_staged(id, &save_table);
                     },
                     "{save_button_label(saving, armed, delete_count, pending_count - delete_count)}"
                 }
@@ -2366,11 +2387,16 @@ fn GridBars(
                 }
                 button {
                     class: "rounded bg-red-700 px-3 py-1 font-semibold text-white hover:bg-red-600",
+                    onkeydown: a_held_key_is_not_a_press,
                     onclick: move |_| state.confirm_pending_save(id, &confirm_save_table),
                     "Apply to \"{connection_name}\""
                 }
                 button {
                     class: "rounded border border-slate-400 dark:border-slate-600 px-3 py-1 text-slate-900 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
+                    // Focus on the safe answer, as in every inline
+                    // confirmation: Enter pressed at the prompt keeps the
+                    // changes staged rather than writing them.
+                    onmounted: focus_on_mount,
                     onclick: move |_| state.dismiss_pending_save(id, &dismiss_save_table),
                     "Cancel"
                 }
@@ -2441,6 +2467,45 @@ fn save_disabled(saving: bool, missing_required: usize, can_mutate: bool) -> boo
 /// The red inline message shown while required insert cells are unfilled.
 fn required_missing_message(missing: usize) -> Option<String> {
     (missing > 0).then(|| format!("{missing} required column(s) missing in pending insert(s)"))
+}
+
+/// What a Save press does, on the grid's side of the save: the exact-count
+/// delete confirmation. (Write protection is the state's, in
+/// `save_staged`.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SavePress {
+    /// Arm the confirmation for this change list.
+    Arm,
+    /// Nothing: the press that armed it, repeated.
+    Wait,
+    /// Hand the stage to `save_staged`.
+    Save,
+}
+
+/// Resolves a Save press: `deletes` is how many deletes are staged, `armed`
+/// the change list a previous press armed (if any) and `settled` whether it
+/// has been armed long enough for a press to count ([`Armed::settled`]),
+/// `current` what is staged now.
+///
+/// Stages without deletes save at once. With deletes, a press saves only the
+/// exact list it armed, and only once settled: Save relabels itself
+/// "Confirm: delete N" in place, so without that a double-click on Save was
+/// the confirmation. An unsettled press waits and stays armed; when to ask
+/// is unchanged.
+fn save_press(
+    deletes: usize,
+    armed: Option<&[StagedChange]>,
+    settled: bool,
+    current: &[StagedChange],
+) -> SavePress {
+    if deletes == 0 {
+        return SavePress::Save;
+    }
+    match armed {
+        Some(armed) if armed == current && settled => SavePress::Save,
+        Some(armed) if armed == current => SavePress::Wait,
+        _ => SavePress::Arm,
+    }
 }
 
 /// The Save button's label. Once the exact-count confirmation is armed it
@@ -2920,6 +2985,33 @@ mod tests {
                 column: "body".into(),
             }
         );
+    }
+
+    #[test]
+    fn a_double_click_on_save_does_not_confirm_the_deletes() {
+        let delete = |id| StagedChange::Delete {
+            locator: RowLocator {
+                identity_values: vec![Value::Integer(id)],
+            },
+        };
+        let current = vec![delete(1)];
+        // The first press arms; its repeat, before the confirmation has
+        // settled, waits and stays armed; a settled press saves.
+        assert_eq!(save_press(1, None, false, &current), SavePress::Arm);
+        assert_eq!(
+            save_press(1, Some(&current), false, &current),
+            SavePress::Wait
+        );
+        assert_eq!(
+            save_press(1, Some(&current), true, &current),
+            SavePress::Save
+        );
+        // A confirmation armed for another change list asks again, settled
+        // or not — the exact-count rule is unchanged.
+        let other = vec![delete(2)];
+        assert_eq!(save_press(1, Some(&other), true, &current), SavePress::Arm);
+        // No deletes, nothing to confirm on this side.
+        assert_eq!(save_press(0, None, false, &[]), SavePress::Save);
     }
 
     #[test]

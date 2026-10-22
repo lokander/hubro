@@ -37,7 +37,7 @@ use crate::db::{
     SourceField, SourceFormat, SourcePreview, TableMeta,
 };
 
-use super::notice::{Banner, BannerKind, Overlay, OverlayAlign};
+use super::notice::{a_held_key_is_not_a_press, Armed, Banner, BannerKind, Overlay, OverlayAlign};
 use super::state::{AppState, ImportRequest};
 
 /// How many records the preview reads. Enough to show the shape of the file
@@ -128,7 +128,9 @@ pub fn ImportDialog(
     // Holding the whole request rather than a flag is what makes
     // the confirmation about *this* import: change a mapping or the error
     // mode afterwards and it no longer matches, so the prompt returns.
-    let mut confirmed = use_signal(|| Option::<ImportRequest>::None);
+    // Armed, so a press too soon after the one that armed it is told apart
+    // from a deliberate second press (see `import_action`).
+    let mut confirmed = use_signal(|| Option::<Armed<ImportRequest>>::None);
     let confirms = confirm_connection.is_some();
     let start = {
         let table = table.clone();
@@ -148,11 +150,20 @@ pub fn ImportDialog(
             // Resolved before the write below, so the peek's borrow is
             // released — a signal borrow must never span the write that
             // follows it.
-            let action = import_action(confirms, confirmed.peek().as_ref(), &request);
+            let action = {
+                let armed = confirmed.peek();
+                import_action(
+                    confirms,
+                    armed.as_ref().map(Armed::subject),
+                    armed.as_ref().is_some_and(Armed::settled),
+                    &request,
+                )
+            };
             match action {
                 ImportAction::Confirm => {
-                    confirmed.set(Some(request));
+                    confirmed.set(Some(Armed::new(request)));
                 }
+                ImportAction::Wait => {}
                 ImportAction::Start => {
                     state.start_import(id, request);
                     on_close.call(());
@@ -429,6 +440,7 @@ pub fn ImportDialog(
                             "rounded bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-50"
                         },
                         disabled: refusal.is_some() || problem().is_some(),
+                        onkeydown: a_held_key_is_not_a_press,
                         onclick: start,
                         if armed { "Import anyway" } else { "Import" }
                     }
@@ -445,11 +457,16 @@ enum ImportAction {
     Start,
     /// Show the connection-naming confirmation first.
     Confirm,
+    /// Nothing: this is the press that armed the confirmation, repeated (a
+    /// double-click), not a second one. It stays armed.
+    Wait,
 }
 
 /// Resolves an Import press: `confirms` is whether the connection is marked
 /// *confirm writes*, `confirmed` the request a previous press already
-/// confirmed (if any), and `current` what the dialog holds now.
+/// confirmed (if any), `settled` whether that confirmation has been showing
+/// long enough for a press to count ([`Armed::settled`]), and `current` what
+/// the dialog holds now.
 ///
 /// The comparison between `confirmed` and `current` is the substance, and it
 /// is the same rule Save follows
@@ -464,16 +481,21 @@ enum ImportAction {
 /// refused by [`import_refusal`](crate::db::import_refusal) and the button is
 /// disabled with that reason. `Confirm` narrows nothing by design, which is
 /// why it needs this instead — and why it was missed.
+///
+/// `settled` only ever holds a press back: an unsettled confirmation of this
+/// same import waits, and nothing about *when* a prompt is shown changes.
 fn import_action(
     confirms: bool,
     confirmed: Option<&ImportRequest>,
+    settled: bool,
     current: &ImportRequest,
 ) -> ImportAction {
     if !confirms {
         return ImportAction::Start;
     }
     match confirmed {
-        Some(previous) if previous == current => ImportAction::Start,
+        Some(previous) if previous == current && settled => ImportAction::Start,
+        Some(previous) if previous == current => ImportAction::Wait,
         _ => ImportAction::Confirm,
     }
 }
@@ -715,7 +737,7 @@ mod tests {
     #[test]
     fn an_unmarked_connection_imports_without_a_prompt() {
         assert_eq!(
-            import_action(false, None, &request(ErrorMode::Abort)),
+            import_action(false, None, false, &request(ErrorMode::Abort)),
             ImportAction::Start
         );
     }
@@ -728,14 +750,32 @@ mod tests {
         // one.
         let current = request(ErrorMode::Abort);
         assert_eq!(
-            import_action(true, None, &current),
+            import_action(true, None, false, &current),
             ImportAction::Confirm,
             "the first press must only arm"
         );
         assert_eq!(
-            import_action(true, Some(&current), &current),
+            import_action(true, Some(&current), true, &current),
             ImportAction::Start,
             "the second press, unchanged, runs it"
+        );
+    }
+
+    #[test]
+    fn a_double_click_on_import_does_not_confirm_the_write() {
+        // The first press relabels the button "Import anyway" in place, so a
+        // double-click's second click lands on the confirmation. It waits
+        // rather than starting — and it neither disarms nor re-arms.
+        let current = request(ErrorMode::Abort);
+        assert_eq!(
+            import_action(true, Some(&current), false, &current),
+            ImportAction::Wait
+        );
+        // An unsettled confirmation of a *different* import is still the
+        // prompt for this one, as before.
+        assert_eq!(
+            import_action(true, Some(&request(ErrorMode::Skip)), false, &current),
+            ImportAction::Confirm
         );
     }
 
@@ -748,7 +788,7 @@ mod tests {
         let confirmed = request(ErrorMode::Abort);
         let changed = request(ErrorMode::Skip);
         assert_eq!(
-            import_action(true, Some(&confirmed), &changed),
+            import_action(true, Some(&confirmed), true, &changed),
             ImportAction::Confirm
         );
     }

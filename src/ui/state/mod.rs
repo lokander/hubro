@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use dioxus::core::{spawn_forever, Task};
 use dioxus::prelude::*;
@@ -62,7 +62,7 @@ use crate::db::{
 };
 use crate::history::{HistoryStore, SaveOutcome};
 use crate::tunnel::{HostKeyInfo, Tunnel, TunnelAuth, TunnelConfig, TunnelError};
-use crate::ui::notice::SPINNER_DELAY;
+use crate::ui::notice::{confirm_accepted, Armed, SPINNER_DELAY};
 use crate::ui::stage::TableStage;
 
 /// Which screen the main panel shows: the connections screen or one open
@@ -157,12 +157,9 @@ impl Pane {
     }
 }
 
-/// Minimum age of a parked navigation intent before repeating the action
-/// confirms it. Without a floor, a double-click delivers two identical
-/// attempts ~100 ms apart — parking and immediately "confirming" the
-/// discard the user never read. Repeats inside the floor are ignored (the
-/// original park time is kept, so a deliberate later repeat still confirms).
-const NAV_CONFIRM_MIN_DELAY: Duration = Duration::from_millis(500);
+/// A staged save parked on the write-protection confirmation: the exact
+/// change list the prompt named, and when it was parked.
+pub type ParkedSave = Armed<Vec<StagedChange>>;
 
 /// A navigation the unsaved-changes guard intercepted (see
 /// [`AppState::nav_guard`]).
@@ -170,7 +167,13 @@ const NAV_CONFIRM_MIN_DELAY: Duration = Duration::from_millis(500);
 pub struct PendingNav {
     pub id: ConnectionId,
     pub action: NavAction,
-    /// When the intent was parked (drives the double-click floor).
+    /// When the intent was parked. Without a floor, a double-click delivers
+    /// two identical attempts ~100 ms apart — parking and immediately
+    /// "confirming" the discard the user never read. Repeats inside the
+    /// floor ([`CONFIRM_ARM_DELAY`](crate::ui::notice::CONFIRM_ARM_DELAY), every
+    /// confirmation's) are ignored, and
+    /// the original park time is kept, so a deliberate later repeat still
+    /// confirms.
     parked_at: Instant,
 }
 
@@ -190,7 +193,7 @@ impl PendingNav {
 
     /// Whether the intent is old enough for a repeat to confirm it.
     fn confirmable(&self) -> bool {
-        self.parked_at.elapsed() >= NAV_CONFIRM_MIN_DELAY
+        confirm_accepted(self.parked_at.elapsed())
     }
 }
 
@@ -1155,7 +1158,7 @@ pub struct AppState {
     /// (selecting another table, switching panes, closing the tab) does not
     /// happen immediately: the first attempt parks the intent here and the
     /// grid's Save bar shows a blocking notice; repeating the *same* action
-    /// at least [`NAV_CONFIRM_MIN_DELAY`] later (double-click protection)
+    /// at least [`CONFIRM_ARM_DELAY`](crate::ui::notice::CONFIRM_ARM_DELAY) later (double-click protection)
     /// discards the affected stage(s) and proceeds. Any other action —
     /// saving, discarding, staging more edits, or a different navigation —
     /// replaces or clears the parked intent. While a save is in flight the
@@ -1178,8 +1181,9 @@ pub struct AppState {
     /// an unmarked connection saves straight through as before. The staged
     /// changes themselves stay in [`Self::staged`] — this holds only a copy,
     /// so dismissing loses nothing, and the copy is what makes a confirmation
-    /// stale once the stage moves on (see `take_pending_save`).
-    pub pending_saves: Signal<HashMap<(ConnectionId, String), Vec<StagedChange>>>,
+    /// stale once the stage moves on (see `take_pending_save`). Armed, so a
+    /// press straight after the one that parked it does not confirm it.
+    pub pending_saves: Signal<HashMap<(ConnectionId, String), ParkedSave>>,
     /// Per-connection accent colour, seeded from the saved entry at
     /// connect time.
     ///

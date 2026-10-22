@@ -33,7 +33,7 @@ use crate::db::{
     TableMeta, NOTHING_TO_RUN,
 };
 
-use super::notice::{Banner, BannerKind, Overlay, OverlayAlign};
+use super::notice::{a_held_key_is_not_a_press, Armed, Banner, BannerKind, Overlay, OverlayAlign};
 use super::state::{after_edit, AppState, SchemaEditRequest, TableRef};
 use super::text_field::{TextArea, TextInput};
 
@@ -93,6 +93,18 @@ pub(super) fn run_action(press: Press) -> RunAction {
         return RunAction::Confirm;
     }
     RunAction::Run
+}
+
+/// Whether a Run press runs the statement [`run_action`] resolved to: only
+/// when it resolved to [`RunAction::Run`], and, on a *confirm writes*
+/// connection, only once the confirmation has settled ([`Armed::settled`]).
+/// Run relabels itself "Yes, run it" in place, so without the second
+/// condition a double-click on Run was the confirmation.
+///
+/// This only ever holds a press back: an unsettled press does nothing, and
+/// [`run_action`] still alone decides what is asked and when.
+pub(super) fn press_runs(action: &RunAction, confirms: bool, settled: bool) -> bool {
+    *action == RunAction::Run && (!confirms || settled)
 }
 
 /// Everything a Run press is decided from — see [`run_action`], whose
@@ -181,7 +193,7 @@ pub fn SchemaEditDialog(
     // its own small data-loss.
     let mut edited = use_signal(|| Option::<String>::None);
     let mut typed_name = use_signal(String::new);
-    let mut confirmed = use_signal(|| Option::<String>::None);
+    let mut confirmed = use_signal(|| Option::<Armed<String>>::None);
     // Whether *this* dialog started the edit it is watching. Without it, a run
     // left in flight by an earlier dialog (Run → Escape → reopen) closes this
     // one when it finishes, discarding whatever has been typed into it since.
@@ -249,17 +261,25 @@ pub fn SchemaEditDialog(
         table_name: &table.read().name,
         typed: &typed_name(),
         confirms,
-        confirmed: confirmed().as_deref(),
+        confirmed: confirmed
+            .read()
+            .as_ref()
+            .map(|armed| armed.subject().as_str()),
         sql: &sql(),
     });
     let armed = action == RunAction::Run && confirms;
 
     let run = move |_| {
         let sql = sql();
-        if action != RunAction::Run {
-            if action == RunAction::Confirm {
-                confirmed.set(Some(sql));
-            }
+        if action == RunAction::Confirm {
+            confirmed.set(Some(Armed::new(sql)));
+            return;
+        }
+        // Asked now, at the press, not when `action` was rendered: whether
+        // the confirmation has settled is a matter of time, which no render
+        // follows.
+        let settled = confirmed.peek().as_ref().is_some_and(Armed::settled);
+        if !press_runs(&action, confirms, settled) {
             return;
         }
         let meta = table.read().clone();
@@ -388,6 +408,7 @@ pub fn SchemaEditDialog(
                         },
                         disabled: running
                             || matches!(action, RunAction::Refused(_) | RunAction::Incomplete(_) | RunAction::TypeTheName),
+                        onkeydown: a_held_key_is_not_a_press,
                         onclick: run,
                         if running {
                             "Running…"
@@ -715,6 +736,21 @@ mod tests {
             }),
             RunAction::Run
         );
+    }
+
+    #[test]
+    fn a_double_click_on_run_does_not_confirm_the_statement() {
+        // The confirmed press runs only once the confirmation has settled;
+        // the click that armed it, repeated, does nothing.
+        assert!(!press_runs(&RunAction::Run, true, false));
+        assert!(press_runs(&RunAction::Run, true, true));
+        // An unprotected connection has no confirmation to settle: Run runs.
+        assert!(press_runs(&RunAction::Run, false, false));
+        // And nothing else ever runs, settled or not.
+        for action in [RunAction::Confirm, RunAction::TypeTheName] {
+            assert!(!press_runs(&action, true, true), "{action:?}");
+            assert!(!press_runs(&action, false, true), "{action:?}");
+        }
     }
 
     #[test]
