@@ -226,24 +226,37 @@ ready() {
 # One engine's liveness check *and* its initialisation, in the same step: for
 # most of these the setup is a `CREATE DATABASE` that only succeeds once the
 # server is up, so a separate readiness probe would just be the same call twice.
+#
+# The three images built on the official Postgres entrypoint (pg, timescale,
+# citus) are probed over TCP, `-h 127.0.0.1`, never the default Unix socket.
+# On first start that entrypoint runs a temporary server with
+# `listen_addresses=''` — socket only — while it creates the database and runs
+# the init scripts, then shuts it down and starts the real one. A socket probe
+# answers ready from the temporary server, and the shutdown that follows takes
+# a few seconds: measured on pg, 3 of 15 cold `up`s returned while it was
+# going down, and the first query over the published port failed. The
+# temporary server never listens on TCP, so a TCP answer can only come from
+# the real one. CI's "Wait for Postgres" step probes the same way for the same
+# reason. Once TCP has answered, the socket reaches the same server, so the
+# setup `psql` calls below keep using it.
 probe() {
   local engine=$1 name=$2
   case "$engine" in
     pg)
-      docker exec "$name" pg_isready -U tester -d demo >/dev/null 2>&1
+      docker exec "$name" pg_isready -h 127.0.0.1 -U tester -d demo >/dev/null 2>&1
       ;;
     mssql)
       docker exec "$name" /opt/mssql-tools18/bin/sqlcmd -C -S localhost \
         -U sa -P 'Str0ng!Passw0rd' -Q 'SELECT 1' >/dev/null 2>&1
       ;;
     timescale)
-      docker exec "$name" pg_isready -U postgres >/dev/null 2>&1 || return 1
+      docker exec "$name" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1 || return 1
       docker exec "$name" psql -U postgres -tAc \
         "SELECT 1 FROM pg_database WHERE datname = 'demo'" 2>/dev/null | grep -q 1 ||
         docker exec "$name" psql -U postgres -c 'CREATE DATABASE demo' >/dev/null 2>&1
       ;;
     citus)
-      docker exec "$name" pg_isready -U postgres >/dev/null 2>&1 || return 1
+      docker exec "$name" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1 || return 1
       docker exec "$name" psql -U postgres -tAc \
         "SELECT 1 FROM pg_database WHERE datname = 'demo'" 2>/dev/null | grep -q 1 ||
         docker exec "$name" psql -U postgres -c 'CREATE DATABASE demo' >/dev/null 2>&1
