@@ -327,8 +327,8 @@ impl ReadOnlyRun {
 ///
 /// [`Self::end`] rolls back whatever transaction the script left open and
 /// reports it. A connection going back to the pool inside one was measured
-/// on all four engines, before the connection was closed after every run: later, unrelated statements ran inside the abandoned
-/// transaction — on SQL Server an edit that reported success was lost when the
+/// on all four engines, before the connection was closed after every run:
+/// later, unrelated statements ran inside the abandoned transaction — on SQL Server an edit that reported success was lost when the
 /// connection closed, on CockroachDB a read from another connection waited on
 /// the abandoned transaction's locks indefinitely, on SQLite an edit failed
 /// with "cannot start a transaction within a transaction" on that connection
@@ -749,10 +749,16 @@ impl DbPool {
         }
     }
 
-    /// Opens a transaction for atomically running a multi-statement script.
-    /// The returned [`ScriptTx`] runs statements on one connection so
-    /// they share a transaction, then commits or rolls back as a unit, and
-    /// closes the connection.
+    /// Opens a transaction for atomically running a multi-statement script —
+    /// the atomic path of [`run_script`](super::script::run_script), which is
+    /// what the SQL tab and schema edits run through. The returned
+    /// [`ScriptTx`] runs statements on one connection so they share a
+    /// transaction, then commits or rolls back as a unit, and **closes the
+    /// connection**: the statements are the user's, and whatever they leave
+    /// on the session must not reach the pool (see [`ScriptConn`]).
+    ///
+    /// Not for statements hubro writes itself — the import's are
+    /// [`Self::begin_pooled_tx`]'s.
     pub async fn begin_script_tx(&self) -> Result<ScriptTx<'_>, DbError> {
         match self {
             DbPool::Sqlite(pool) => sqlx_common::begin_for_run(pool).await.map(ScriptTx::Sqlite),
@@ -760,6 +766,34 @@ impl DbPool {
                 .await
                 .map(ScriptTx::Postgres),
             DbPool::SqlServer(pool) => sqlserver::begin_script_tx(pool)
+                .await
+                .map(|tx| ScriptTx::SqlServer(Box::new(tx))),
+        }
+    }
+
+    /// [`Self::begin_script_tx`] on a connection that goes back to the pool
+    /// once the transaction is resolved — for the import
+    /// ([`run_import`](super::import::run_import)), and only for statements
+    /// hubro builds itself. The import runs nothing but the `INSERT`s it
+    /// generates, which leave no session state behind, so closing its
+    /// connection would only cost a reconnect — and on a cancelled import,
+    /// sqlx gives a close on drop five seconds, after which a SQLite batch
+    /// still running could keep its write lock while the pool opened a new
+    /// connection beside it.
+    pub(crate) async fn begin_pooled_tx(&self) -> Result<ScriptTx<'_>, DbError> {
+        match self {
+            DbPool::Sqlite(pool) => pool
+                .begin()
+                .await
+                .map(ScriptTx::Sqlite)
+                .map_err(|e| DbError::Query(e.to_string())),
+            DbPool::Postgres(pg) => pg
+                .pool()
+                .begin()
+                .await
+                .map(ScriptTx::Postgres)
+                .map_err(|e| DbError::Query(e.to_string())),
+            DbPool::SqlServer(pool) => sqlserver::begin_tx(pool)
                 .await
                 .map(|tx| ScriptTx::SqlServer(Box::new(tx))),
         }

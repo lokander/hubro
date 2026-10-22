@@ -111,6 +111,68 @@ async fn import(
     run_import(pool, &access, table, options, source).await
 }
 
+/// The import's transaction gives its connection back to the pool, unlike a
+/// script's, which is closed so the user's session state goes with it. The
+/// import runs only `INSERT`s hubro builds, so there is nothing to discard,
+/// and closing would cost a reconnect — and, cancelled, a close that sqlx
+/// abandons after five seconds while a SQLite batch could still hold its
+/// write lock. On a pool of one connection a temp table marks the session: it
+/// is still there after the import only if the import ran on, and returned,
+/// that same connection. Both endings are covered — a commit, and the
+/// rollback of an import that fails.
+#[tokio::test]
+async fn sqlite_import_returns_its_connection_to_the_pool() {
+    let fixture = FixtureDb::with_sql(
+        "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL, weight REAL)",
+    )
+    .await;
+    let options_ = sqlx::sqlite::SqliteConnectOptions::new().filename(fixture.path());
+    let pool = DbPool::Sqlite(
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options_)
+            .await
+            .unwrap(),
+    );
+    pool.execute("CREATE TEMP TABLE session_marker (a)")
+        .await
+        .unwrap();
+    let tables = pool.introspect().await.unwrap();
+    let people = find(&tables, "people");
+    let mapping = || vec![bind(0, "id"), bind(1, "name"), bind(2, "weight")];
+    let marker = "SELECT count(*) FROM sqlite_temp_master WHERE name = 'session_marker'";
+
+    let report = import(
+        &pool,
+        people,
+        &options(mapping(), ErrorMode::Abort),
+        csv("id,name,weight\n1,ada,1.5\n").as_mut(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.inserted_rows, 1);
+    assert_eq!(
+        pool.query(marker).await.unwrap().rows,
+        vec![vec![Value::Integer(1)]],
+        "a committed import closed its connection instead of returning it"
+    );
+
+    import(
+        &pool,
+        people,
+        &options(mapping(), ErrorMode::Abort),
+        csv(&csv_with_a_bad_row(5, 5)).as_mut(),
+    )
+    .await
+    .expect_err("the last row cannot be coerced");
+    assert_eq!(
+        pool.query(marker).await.unwrap().rows,
+        vec![vec![Value::Integer(1)]],
+        "a rolled-back import closed its connection instead of returning it"
+    );
+    pool.close().await;
+}
+
 /// A CSV whose rows are fine up to `bad_at`, where one row carries a value
 /// the target column cannot take. Long enough to span several batches so a
 /// failure has real, already-inserted rows behind it.
