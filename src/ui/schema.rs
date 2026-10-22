@@ -16,7 +16,7 @@ use crate::db::{
 };
 use crate::util::{human_bytes, human_count};
 
-use super::js::{copy_to_clipboard, focus_on_mount};
+use super::js::{focus_on_mount, write_clipboard};
 use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState, KindBadge};
 use super::schema_edit::SchemaEditDialog;
 use super::state::{AppState, SchemaLoad, TableRef};
@@ -590,7 +590,7 @@ fn CopyDdlButton(text: String) -> Element {
     rsx! {
         button {
             class: "shrink-0 rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
-            onclick: move |_| copy_to_clipboard(&text),
+            onclick: move |_| write_clipboard(&text),
             "Copy"
         }
     }

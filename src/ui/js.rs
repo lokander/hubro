@@ -23,17 +23,44 @@ pub fn js_string(text: &str) -> String {
     serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into())
 }
 
-/// Copies `text` to the system clipboard.
+/// Puts `text` on the system clipboard through the webview. Every Copy
+/// button and the grid's Ctrl+C go through here; nothing else in `src/ui`
+/// touches a clipboard API (`only_js_rs_writes_the_clipboard`).
 ///
-/// Used by the small copy buttons (query history, DDL viewer). The grid's
-/// copy path has its own eval with a `document.execCommand` fallback and a
-/// completion signal, which this deliberately doesn't try to cover — it still
-/// escapes its text with [`js_string`].
-pub fn copy_to_clipboard(text: &str) {
-    document::eval(&format!(
-        "navigator.clipboard.writeText({});",
-        js_string(text)
-    ));
+/// `navigator.clipboard` is the modern path; the hidden-textarea
+/// `execCommand` fallback covers a webview that withholds it (no secure
+/// context, or a rejected permission), because a copy that silently does
+/// nothing is indistinguishable from a broken app. The fallback restores the
+/// previously focused element so the grid keeps its keyboard focus.
+pub fn write_clipboard(text: &str) {
+    document::eval(&clipboard_js(text));
+}
+
+/// The eval behind [`write_clipboard`].
+fn clipboard_js(text: &str) -> String {
+    let json = js_string(text);
+    format!(
+        r#"(() => {{
+  const text = {json};
+  const fallback = () => {{
+    const prev = document.activeElement;
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.top = '-1000px';
+    document.body.appendChild(ta);
+    ta.select();
+    try {{ document.execCommand('copy'); }} catch (e) {{ /* nothing else to try */ }}
+    document.body.removeChild(ta);
+    if (prev && prev.focus) prev.focus();
+  }};
+  if (navigator.clipboard && navigator.clipboard.writeText) {{
+    navigator.clipboard.writeText(text).catch(fallback);
+  }} else {{
+    fallback();
+  }}
+}})();"#
+    )
 }
 
 /// Focuses the element an `onmounted` handler fired for.
@@ -210,6 +237,90 @@ mod tests {
              in_target: !!(el && a && el.contains(a)), \
              modal_open: !!document.querySelector('[data-dv-modal]') }); });"
         );
+    }
+
+    #[test]
+    fn the_clipboard_write_falls_back_when_the_modern_api_is_missing_or_refuses() {
+        let js = clipboard_js("a \"quoted\"\nline");
+        let lines: Vec<&str> = js.lines().map(str::trim).collect();
+        // The text arrives escaped, through `js_string`.
+        assert!(
+            lines.contains(&r#"const text = "a \"quoted\"\nline";"#),
+            "{js}"
+        );
+        // A rejected write (no permission, no user activation) falls back...
+        assert!(
+            lines.contains(&"navigator.clipboard.writeText(text).catch(fallback);"),
+            "{js}"
+        );
+        // ...and so does a webview with no `navigator.clipboard` at all.
+        let guard = lines
+            .iter()
+            .position(|line| *line == "if (navigator.clipboard && navigator.clipboard.writeText) {")
+            .unwrap_or_else(|| panic!("no feature check: {js}"));
+        assert_eq!(
+            lines[guard + 2..guard + 4],
+            ["} else {", "fallback();"],
+            "{js}"
+        );
+        // The fallback is the one that copies without the API.
+        assert!(
+            lines.contains(
+                &"try { document.execCommand('copy'); } catch (e) { /* nothing else to try */ }"
+            ),
+            "{js}"
+        );
+    }
+
+    /// The clipboard APIs a copy could reach for directly, instead of going
+    /// through [`write_clipboard`].
+    const CLIPBOARD_APIS: [&str; 3] = ["navigator.clipboard", "writeText", "execCommand"];
+
+    /// One clipboard path: no file under `src/ui` but this one names a
+    /// clipboard API in code (comments are dropped), and in this one only
+    /// [`clipboard_js`] does. There used to be two, and the Copy buttons in
+    /// the history, saved-query and DDL panels used the one without the
+    /// `execCommand` fallback.
+    #[test]
+    fn only_js_rs_writes_the_clipboard() {
+        for (path, source) in ui_sources() {
+            if path.len() == 1 && path[0] == "js.rs" {
+                continue;
+            }
+            for line in code_lines(&source) {
+                for api in CLIPBOARD_APIS {
+                    assert!(
+                        !line.contains(api),
+                        "{path:?} writes the clipboard itself; call js::write_clipboard: {line}"
+                    );
+                }
+            }
+        }
+        let own = include_str!("js.rs");
+        let (code, _tests) = own
+            .split_once("#[cfg(test)]")
+            .expect("js.rs has a test module");
+        let lines = code_lines(code);
+        let start = lines
+            .iter()
+            .position(|line| line.starts_with("fn clipboard_js("))
+            .expect("clipboard_js is gone");
+        let end = start
+            + lines[start..]
+                .iter()
+                .position(|line| line == "}")
+                .expect("clipboard_js has an end");
+        for (i, line) in lines.iter().enumerate() {
+            if (start..=end).contains(&i) {
+                continue;
+            }
+            for api in CLIPBOARD_APIS {
+                assert!(
+                    !line.contains(api),
+                    "js.rs has a second clipboard path outside clipboard_js: {line}"
+                );
+            }
+        }
     }
 
     /// `source` with comment lines dropped and each line's whitespace
