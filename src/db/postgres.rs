@@ -27,8 +27,8 @@ use super::error::DbError;
 use super::export::ExportFormat;
 use super::pg_wire;
 use super::schema::{
-    ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, Internal, TableKind, TableMeta, TypeDetail,
-    TypeRef,
+    ColumnMeta, ForeignKeyMeta, Generated, IndexConstraint, IndexMeta, Internal, TableKind,
+    TableMeta, TypeDetail, TypeRef,
 };
 use super::script::final_read_may_close;
 use super::sql::Dialect;
@@ -962,6 +962,11 @@ struct CatalogShape {
     column_query: ColumnQuery,
     /// Whether the index query may bound its key columns with `indnkeyatts`.
     bounded_index_keys: bool,
+    /// Whether `pg_constraint` has `conindid` and `contype`, which say which
+    /// indexes a constraint owns ([`pg_index_constraint`]). Every engine
+    /// measured has both; one without them reports no constraint indexes
+    /// rather than an empty schema tree.
+    constraint_indexes: bool,
 }
 
 /// Asks the catalog which shape it is, once per introspection.
@@ -992,7 +997,7 @@ async fn catalog_shape(pool: &PgPool) -> CatalogShape {
     // not tell, since the probe-failure default and the right answer coincide
     // on every engine that works. `pg_attribute` is already load-bearing for
     // introspection, so asking it costs no new assumption.
-    let probe = sqlx::query_as::<_, (i64, i64)>(
+    let probe = sqlx::query_as::<_, (i64, i64, i64)>(
         "SELECT \
            (SELECT count(*) FROM pg_attribute a \
             JOIN pg_class c ON c.oid = a.attrelid \
@@ -1004,11 +1009,16 @@ async fn catalog_shape(pool: &PgPool) -> CatalogShape {
             JOIN pg_class c ON c.oid = a.attrelid \
             JOIN pg_namespace n ON n.oid = c.relnamespace \
             WHERE n.nspname = 'pg_catalog' AND c.relname = 'pg_index' \
-              AND a.attname = 'indnkeyatts')",
+              AND a.attname = 'indnkeyatts'), \
+           (SELECT count(*) FROM pg_attribute a \
+            JOIN pg_class c ON c.oid = a.attrelid \
+            JOIN pg_namespace n ON n.oid = c.relnamespace \
+            WHERE n.nspname = 'pg_catalog' AND c.relname = 'pg_constraint' \
+              AND a.attname IN ('conindid', 'contype'))",
     )
     .fetch_one(pool)
     .await;
-    let (columns, index_keys) = probe.unwrap_or((5, 1));
+    let (columns, index_keys, constraint_columns) = probe.unwrap_or((5, 1, 2));
     CatalogShape {
         // All five or none: the rich shape needs every one of them, and no
         // engine has been seen to offer a subset.
@@ -1018,6 +1028,80 @@ async fn catalog_shape(pool: &PgPool) -> CatalogShape {
             ColumnQuery::Portable
         },
         bounded_index_keys: index_keys > 0,
+        constraint_indexes: constraint_columns == 2,
+    }
+}
+
+/// The index query introspection runs: one row per key column. See the
+/// comment where it runs for the `indnkeyatts` bound and the `unnest` join.
+///
+/// `constraint_indexes` adds the type of the constraint owning each index,
+/// for [`pg_index_constraint`]. Only `p`, `u` and `x` own their index: a
+/// foreign key's `conindid` names the index on the *referenced* table it leans
+/// on (the trap `fetch_ddl`'s index query documents), so it must not be
+/// matched. Without those catalog columns the type is selected as a NULL, the
+/// constant it would decode to for an unowned index.
+fn index_query(bound_keys: bool, constraint_indexes: bool) -> String {
+    let constraint_type = if constraint_indexes {
+        "(SELECT con.contype::text FROM pg_constraint con \
+          WHERE con.conindid = ix.indexrelid AND con.contype IN ('p', 'u', 'x') \
+          LIMIT 1)"
+    } else {
+        "NULL::text"
+    };
+    let bound = if bound_keys {
+        "AND k.ord <= ix.indnkeyatts"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT n.nspname AS table_schema, t.relname AS table_name, \
+                i.relname AS index_name, ix.indisunique AS is_unique, \
+                ix.indpred IS NOT NULL AS is_partial, \
+                {constraint_type} AS constraint_type, \
+                k.ord AS key_position, a.attname AS column_name \
+         FROM pg_index ix \
+         JOIN pg_class t ON t.oid = ix.indrelid \
+         JOIN pg_class i ON i.oid = ix.indexrelid \
+         JOIN pg_namespace n ON n.oid = t.relnamespace \
+         CROSS JOIN unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) \
+         LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
+         WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
+           AND n.nspname NOT LIKE 'pg\\_%' \
+           {bound} \
+           AND ix.indisvalid \
+         ORDER BY n.nspname, t.relname, i.relname, k.ord"
+    )
+}
+
+/// The constraint that owns an index, from the `pg_constraint.contype` of the
+/// constraint whose `conindid` names it.
+///
+/// Measured on every Postgres-wire engine: PostgreSQL, TimescaleDB, Citus and
+/// YugabyteDB refuse `DROP INDEX` on a `p`, `u` or `x` constraint's index
+/// ("cannot drop index … because constraint … requires it") and drop a
+/// `CREATE [UNIQUE] INDEX` one. Materialize and RisingWave have no such
+/// constraints and an empty `pg_constraint`.
+///
+/// **CockroachDB's `u` is not taken at its word.** It lists a plain `CREATE
+/// UNIQUE INDEX` in `pg_constraint` as a `u` constraint too, with a `conindid`,
+/// and nothing in `pg_constraint`, `information_schema.table_constraints`,
+/// `SHOW CONSTRAINTS` or `pg_index` tells the two apart — yet it drops the
+/// index and refuses the constraint's ("index … is in use as unique
+/// constraint"). No catalog answers the question there, so the flavor decides
+/// not to claim one: a unique index on CockroachDB is offered for Drop and the
+/// engine's refusal is what the user sees for a constraint's. Its primary key
+/// is unambiguous and is reported ("cannot drop the primary index").
+pub(super) fn pg_index_constraint(
+    contype: Option<&str>,
+    flavor: PgFlavor,
+) -> Option<IndexConstraint> {
+    match contype? {
+        "p" => Some(IndexConstraint::PrimaryKey),
+        "u" if flavor == PgFlavor::CockroachDB => None,
+        "u" => Some(IndexConstraint::Unique),
+        "x" => Some(IndexConstraint::Exclusion),
+        _ => None,
     }
 }
 
@@ -1566,34 +1650,13 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     // failing it. On an engine without INCLUDE that changes nothing; there is
     // no engine with INCLUDE that hides the count, and if one appeared its
     // payload columns would read as key columns.
-    let index_sql = |bound_keys: bool| {
-        format!(
-            "SELECT n.nspname AS table_schema, t.relname AS table_name, \
-                    i.relname AS index_name, ix.indisunique AS is_unique, \
-                    ix.indpred IS NOT NULL AS is_partial, \
-                    k.ord AS key_position, a.attname AS column_name \
-             FROM pg_index ix \
-             JOIN pg_class t ON t.oid = ix.indrelid \
-             JOIN pg_class i ON i.oid = ix.indexrelid \
-             JOIN pg_namespace n ON n.oid = t.relnamespace \
-             CROSS JOIN unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) \
-             LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
-             WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
-               AND n.nspname NOT LIKE 'pg\\_%' \
-               {} \
-               AND ix.indisvalid \
-             ORDER BY n.nspname, t.relname, i.relname, k.ord",
-            if bound_keys {
-                "AND k.ord <= ix.indnkeyatts"
-            } else {
-                ""
-            }
-        )
-    };
-    let index_rows = sqlx::query(&index_sql(shape.bounded_index_keys))
-        .fetch_all(pool)
-        .await
-        .map_err(map_err)?;
+    let index_rows = sqlx::query(&index_query(
+        shape.bounded_index_keys,
+        shape.constraint_indexes,
+    ))
+    .fetch_all(pool)
+    .await
+    .map_err(map_err)?;
 
     // Foreign keys from pg_constraint; conkey/confkey arrays preserve the
     // multi-column ordering that information_schema loses.
@@ -1800,6 +1863,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
         let column = column.unwrap_or_else(|| "<expr>".to_string());
         let unique: bool = get(row, "is_unique")?;
         let partial: bool = get(row, "is_partial")?;
+        let contype: Option<String> = get(row, "constraint_type")?;
         let indexes = &mut tables[idx].indexes;
         match indexes.last_mut() {
             Some(last) if last.name == index_name => last.columns.push(column),
@@ -1808,7 +1872,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
                 unique,
                 partial,
                 columns: vec![column],
-                constraint: None,
+                constraint: pg_index_constraint(contype.as_deref(), conn.flavor()),
             }),
         }
     }
@@ -2838,5 +2902,53 @@ mod tests {
     fn line_col_counts_characters_not_bytes() {
         // "ыыы" is 6 bytes but 3 chars; position 5 is the 'X'.
         assert_eq!(line_col("ыыыаX", 5), Some((1, 5)));
+    }
+
+    #[test]
+    fn only_the_constraints_that_own_an_index_are_reported() {
+        for flavor in [PgFlavor::Postgres, PgFlavor::Yugabyte] {
+            assert_eq!(
+                pg_index_constraint(Some("p"), flavor),
+                Some(IndexConstraint::PrimaryKey)
+            );
+            assert_eq!(
+                pg_index_constraint(Some("u"), flavor),
+                Some(IndexConstraint::Unique)
+            );
+            assert_eq!(
+                pg_index_constraint(Some("x"), flavor),
+                Some(IndexConstraint::Exclusion)
+            );
+            // A foreign key's `conindid` names another table's index; the
+            // query never selects one, and the mapping would not claim it.
+            assert_eq!(pg_index_constraint(Some("f"), flavor), None);
+            assert_eq!(pg_index_constraint(None, flavor), None);
+        }
+        // CockroachDB reports a user's unique index as a `u` constraint too,
+        // so its `u` claims nothing; its primary key still does.
+        assert_eq!(pg_index_constraint(Some("u"), PgFlavor::CockroachDB), None);
+        assert_eq!(
+            pg_index_constraint(Some("p"), PgFlavor::CockroachDB),
+            Some(IndexConstraint::PrimaryKey)
+        );
+    }
+
+    #[test]
+    fn without_the_constraint_columns_the_index_query_selects_a_null_type() {
+        // An engine whose `pg_constraint` lacks `conindid` would fail the
+        // whole statement, emptying the schema tree. The degraded query must
+        // not name it, and must still return the column the decoder reads.
+        for bound in [true, false] {
+            let degraded = index_query(bound, false);
+            assert!(!degraded.contains("conindid"), "{degraded}");
+            assert!(!degraded.contains("pg_constraint"), "{degraded}");
+            assert!(
+                degraded.contains("NULL::text AS constraint_type"),
+                "{degraded}"
+            );
+            let rich = index_query(bound, true);
+            assert!(rich.contains("con.conindid = ix.indexrelid"), "{rich}");
+            assert!(rich.contains("con.contype IN ('p', 'u', 'x')"), "{rich}");
+        }
     }
 }

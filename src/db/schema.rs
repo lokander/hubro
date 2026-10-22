@@ -126,9 +126,12 @@ pub struct IndexMeta {
     /// for one rather than the user creating it. Such an index cannot be
     /// dropped on its own, so the Schema view does not offer to.
     ///
-    /// Only SQLite reports it today (`pragma_index_list.origin`). Postgres and
-    /// SQL Server leave it `None`, so there a Drop on a constraint's index is
-    /// still offered and the engine's refusal is what the user sees.
+    /// Read from each backend's catalog: SQLite's `pragma_index_list.origin`,
+    /// Postgres's `pg_constraint.conindid`, SQL Server's `is_primary_key` /
+    /// `is_unique_constraint`. `None` also where the catalog cannot tell — a
+    /// CockroachDB unique index (see `postgres::pg_index_constraint`) — and
+    /// there a Drop is offered and the engine's refusal, if any, is what the
+    /// user sees.
     pub constraint: Option<IndexConstraint>,
 }
 
@@ -138,6 +141,9 @@ pub struct IndexMeta {
 pub enum IndexConstraint {
     PrimaryKey,
     Unique,
+    /// A Postgres `EXCLUDE` constraint, whose index is as undroppable as the
+    /// other two (measured on PostgreSQL, TimescaleDB and Citus).
+    Exclusion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

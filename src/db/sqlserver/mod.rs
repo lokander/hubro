@@ -27,7 +27,8 @@ use tiberius::{ColumnType, Row};
 use super::caps::INSTEAD_OF_TRIGGER;
 use super::error::DbError;
 use super::schema::{
-    ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta, TypeDetail,
+    ColumnMeta, ForeignKeyMeta, Generated, IndexConstraint, IndexMeta, TableKind, TableMeta,
+    TypeDetail,
 };
 use super::sql::qualified;
 use super::stats::{size_bytes, RowCount, TableStats};
@@ -150,7 +151,8 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
     // must never rely on one (same contract as a Postgres partial index).
     let index_rows = query_with(
         pool,
-        "SELECT s.name, o.name, i.name, i.is_unique, i.has_filter, col.name \
+        "SELECT s.name, o.name, i.name, i.is_unique, i.has_filter, col.name, \
+                i.is_primary_key, i.is_unique_constraint \
          FROM sys.indexes i \
          JOIN sys.objects o ON o.object_id = i.object_id \
          JOIN sys.schemas s ON s.schema_id = o.schema_id \
@@ -271,6 +273,7 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
         let column = row_text(row, 5);
         let unique = row_flag(row, 3);
         let partial = row_flag(row, 4);
+        let constraint = mssql_index_constraint(row_flag(row, 6), row_flag(row, 7));
         let indexes = &mut tables[idx].indexes;
         match indexes.last_mut() {
             Some(last) if last.name == index_name => last.columns.push(column),
@@ -279,7 +282,7 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
                 unique,
                 partial,
                 columns: vec![column],
-                constraint: None,
+                constraint,
             }),
         }
     }
@@ -444,6 +447,23 @@ fn wrapped_in_matching_parens(s: &str) -> bool {
         }
     }
     false
+}
+
+/// The constraint that owns an index, from `sys.indexes`. Measured on SQL
+/// Server 2022: `DROP INDEX` refuses both ("An explicit DROP INDEX is not
+/// allowed on index … It is being used for PRIMARY KEY / UNIQUE KEY constraint
+/// enforcement", error 3723) and drops a `CREATE [UNIQUE] INDEX` one.
+fn mssql_index_constraint(
+    is_primary_key: bool,
+    is_unique_constraint: bool,
+) -> Option<IndexConstraint> {
+    if is_primary_key {
+        Some(IndexConstraint::PrimaryKey)
+    } else if is_unique_constraint {
+        Some(IndexConstraint::Unique)
+    } else {
+        None
+    }
 }
 
 /// Maps SQL Server's auto-assignment flavors onto [`Generated`] — every
@@ -781,5 +801,18 @@ mod tests {
         // the match is on the exact catalog type name, which is fine because
         // sys.types never reports `timestamp` for anything else.
         assert_eq!(mssql_generated(false, false, "datetime2"), Generated::Never);
+    }
+
+    #[test]
+    fn an_index_is_owned_by_the_constraint_sys_indexes_names() {
+        assert_eq!(
+            mssql_index_constraint(true, false),
+            Some(IndexConstraint::PrimaryKey)
+        );
+        assert_eq!(
+            mssql_index_constraint(false, true),
+            Some(IndexConstraint::Unique)
+        );
+        assert_eq!(mssql_index_constraint(false, false), None);
     }
 }
