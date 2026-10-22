@@ -699,7 +699,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         Shared::new(TableRenderMeta::build(
             find_table_meta(load, &render_table),
             dialect,
-            |fk| fk_jump_target(load, fk).is_some(),
+            |fk| dialect.is_some_and(|dialect| fk_jump_target(load, fk, dialect).is_some()),
         ))
     });
 

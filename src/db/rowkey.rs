@@ -76,7 +76,7 @@ pub fn detect_row_identity(table: &TableMeta, dialect: Dialect) -> Option<RowIde
         return None;
     }
     let pk = table.primary_key();
-    if !pk.is_empty() && pk.iter().all(|c| key_column_addressable(c)) {
+    if !pk.is_empty() && pk.iter().all(|c| key_column_addressable(c, dialect)) {
         let columns = pk.iter().map(|c| c.name.clone()).collect();
         return Some(RowIdentity::PrimaryKey { columns });
     }
@@ -86,7 +86,7 @@ pub fn detect_row_identity(table: &TableMeta, dialect: Dialect) -> Option<RowIde
                 table
                     .columns
                     .iter()
-                    .any(|c| c.name == *name && !c.nullable && key_column_addressable(c))
+                    .any(|c| c.name == *name && !c.nullable && key_column_addressable(c, dialect))
             });
         if usable {
             return Some(RowIdentity::UniqueIndex {
@@ -104,35 +104,76 @@ pub fn detect_row_identity(table: &TableMeta, dialect: Dialect) -> Option<RowIde
 /// Whether a value of `column`, as the grid reads it, can be bound back to
 /// find its row — the condition for the column to serve in a row's identity
 /// ([`detect_row_identity`]) or as the target of a foreign-key jump
-/// ([`fk_target_columns`](super::fk::fk_target_columns)).
+/// ([`fk_target_columns`](super::fk::fk_target_columns)). Over plain data —
+/// the column's type and the dialect — so a test can execute every answer.
 ///
-/// False for SQL Server's `sql_variant` alone. Each value carries its own
-/// base type, and a variant compares unequal to any value of another type
-/// family: measured on SQL Server 2022, a key holding `CAST(5 AS int)` or a
-/// `date` reads as text (or the `<ssvariant>` marker) and matches no row
-/// when bound back, so its long cell loaded as NULL, its save was refused
-/// and its jump showed an empty page — silently, since nothing failed. Only
-/// a variant that happens to hold a string re-addresses, and whether one
-/// does is a property of the row, not the column. Spelling each value with
-/// its base type would need `SQL_VARIANT_PROPERTY` in every read and a cast
-/// per bound value; refusing the key leaves the table browsable and
+/// **SQL Server: false for `sql_variant`.** Each value carries its own base
+/// type, and a variant compares unequal to any value of another type family:
+/// measured on SQL Server 2022, a key holding `CAST(5 AS int)` or a `date`
+/// reads as text (or the `<ssvariant>` marker) and matches no row when bound
+/// back, so its long cell loaded as NULL, its save was refused and its jump
+/// showed an empty page — silently, since nothing failed. Only a variant that
+/// happens to hold a string re-addresses, and whether one does is a property
+/// of the row, not the column. Refusing the key leaves the table browsable and
 /// read-only with the key-less table's reason, which the UI already handles.
-///
 /// The values decide, not the name: an alias type declared `FROM
 /// sql_variant` is reported by its alias name, so its system type
-/// ([`TypeDetail::Alias`]) is read too — measured on SQL Server 2022, a key
-/// of such an alias type missed its rows exactly as a plain `sql_variant`
-/// key did. No other engine reports a type named `sql_variant`.
+/// ([`TypeDetail::Alias`]) is read too — measured, a key of such an alias
+/// type missed its rows exactly as a plain `sql_variant` key did.
 ///
-/// Every other type re-addresses: Postgres's types without a decoder arm
-/// and SQL Server's `hierarchyid` are read through the server's text for
-/// that reason ([`fetched_as_server_text`](super::page::fetched_as_server_text)).
-pub fn key_column_addressable(column: &ColumnMeta) -> bool {
-    let is_variant = |name: &str| name.trim().eq_ignore_ascii_case("sql_variant");
-    let alias_of_variant =
-        matches!(&column.type_detail, TypeDetail::Alias { base } if is_variant(base));
-    !is_variant(&column.type_name) && !alias_of_variant
+/// **Postgres: false for the `reg*` types whose text depends on
+/// `search_path`** (`regclass`, `regtype`, `regproc`, …, and arrays of them).
+/// A key without a decoder is read as `::text` by one pooled session and
+/// parsed back by another ([`fetched_as_server_text`](super::page::fetched_as_server_text)),
+/// and `search_path` — which a role or database default can change for the
+/// sessions opened after it — decides both the spelling and what the spelling
+/// resolves to. Measured on PostgreSQL 17, with a `t` in schemas `sp1` and
+/// `sp2`: the key `sp2.t` prints as `t` under `search_path = sp2`, and `t`
+/// under `search_path = sp1` is `sp1.t` — another row, which a one-row guard
+/// cannot tell from the right one. The other settings the text depends on are
+/// pinned for every pooled session instead ([`super::postgres::key_text_pins`]);
+/// `search_path` is the user's name resolution, not hubro's to pin. A
+/// `regnamespace` or `regrole` prints the bare name whatever the path, and
+/// stays a key.
+///
+/// **SQLite: always true.** It echoes a declared type verbatim, so a
+/// `sql_variant` or `regclass` there is just a name, and its values bind as
+/// they read.
+pub fn key_column_addressable(column: &ColumnMeta, dialect: Dialect) -> bool {
+    match dialect {
+        Dialect::SqlServer => {
+            let is_variant = |name: &str| name.trim().eq_ignore_ascii_case("sql_variant");
+            let alias_of_variant =
+                matches!(&column.type_detail, TypeDetail::Alias { base } if is_variant(base));
+            !is_variant(&column.type_name) && !alias_of_variant
+        }
+        Dialect::Postgres => {
+            let lowered = column.type_name.trim().to_ascii_lowercase();
+            // An array reports `ARRAY` with its real name (`_regclass`) in the
+            // detail; a materialized view's column spells it `regclass[]`.
+            let element = match &column.type_detail {
+                TypeDetail::Array { type_ref } => type_ref.name.trim_start_matches('_').to_string(),
+                _ => lowered.trim_end_matches("[]").to_string(),
+            };
+            !SEARCH_PATH_DEPENDENT.contains(&element.as_str())
+        }
+        Dialect::Sqlite => true,
+    }
 }
+
+/// The `reg*` types whose text form is qualified, or not, by `search_path` —
+/// see [`key_column_addressable`].
+const SEARCH_PATH_DEPENDENT: &[&str] = &[
+    "regclass",
+    "regcollation",
+    "regconfig",
+    "regdictionary",
+    "regoper",
+    "regoperator",
+    "regproc",
+    "regprocedure",
+    "regtype",
+];
 
 /// First rowid accessor name not shadowed by a user column. SQLite resolves
 /// `rowid`/`_rowid_`/`oid` to an explicit column of that name when one
@@ -449,7 +490,10 @@ mod tests {
         );
         assert_eq!(detect_row_identity(&composite, Dialect::SqlServer), None);
         // Any other type name keys as before.
-        assert!(key_column_addressable(&col("k", false, Some(1))));
+        assert!(key_column_addressable(
+            &col("k", false, Some(1)),
+            Dialect::SqlServer
+        ));
         // An alias type is judged by the system type behind it, whatever it
         // is called.
         let aliased = |base: &str| ColumnMeta {
@@ -457,8 +501,70 @@ mod tests {
             type_detail: TypeDetail::Alias { base: base.into() },
             ..col("k", false, Some(1))
         };
-        assert!(!key_column_addressable(&aliased("sql_variant")));
-        assert!(key_column_addressable(&aliased("nvarchar")));
+        assert!(!key_column_addressable(
+            &aliased("sql_variant"),
+            Dialect::SqlServer
+        ));
+        assert!(key_column_addressable(
+            &aliased("nvarchar"),
+            Dialect::SqlServer
+        ));
+        // Only SQL Server has the type: SQLite echoes a declared
+        // `sql_variant` verbatim, and on Postgres it could only be a user's
+        // domain or type of that name. Both keep their identity.
+        assert_eq!(
+            detect_row_identity(&keyed, Dialect::Sqlite),
+            Some(RowIdentity::PrimaryKey {
+                columns: vec!["k".into()]
+            })
+        );
+        assert_eq!(
+            detect_row_identity(&keyed, Dialect::Postgres),
+            Some(RowIdentity::PrimaryKey {
+                columns: vec!["k".into()]
+            })
+        );
+    }
+
+    #[test]
+    fn a_postgres_key_whose_text_follows_search_path_is_refused() {
+        // `regclass` and its kin print qualified or not by `search_path`,
+        // which another pooled session may have set differently — and then
+        // parse the same text as another object. `regnamespace`/`regrole`
+        // print bare names whatever the path.
+        let typed = |type_name: &str, detail: TypeDetail| ColumnMeta {
+            type_name: type_name.into(),
+            type_detail: detail,
+            ..col("k", false, Some(1))
+        };
+        let array_of = |name: &str| TypeDetail::Array {
+            type_ref: crate::db::TypeRef {
+                schema: "pg_catalog".into(),
+                name: name.into(),
+            },
+        };
+        for refused in [
+            typed("regclass", TypeDetail::Plain),
+            typed("regtype", TypeDetail::Plain),
+            typed("regprocedure", TypeDetail::Plain),
+            typed("ARRAY", array_of("_regclass")),
+            typed("regclass[]", TypeDetail::Plain),
+        ] {
+            assert!(
+                !key_column_addressable(&refused, Dialect::Postgres),
+                "{refused:?}"
+            );
+            // The name means nothing special elsewhere.
+            assert!(key_column_addressable(&refused, Dialect::Sqlite));
+        }
+        for kept in [
+            typed("regnamespace", TypeDetail::Plain),
+            typed("regrole", TypeDetail::Plain),
+            typed("text", TypeDetail::Plain),
+            typed("ARRAY", array_of("_text")),
+        ] {
+            assert!(key_column_addressable(&kept, Dialect::Postgres), "{kept:?}");
+        }
     }
 
     #[test]

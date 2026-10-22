@@ -2028,21 +2028,83 @@ const PG_KEY_TYPES: &[(&str, &str, &[&str])] = &[
     // `<inet>` and the rest failed loudly ("invalid input syntax"); the
     // `<tsvector>` marker is itself a valid tsvector, so that key failed
     // silently: its long cell loaded as NULL and its jump found no row.
+    //
+    // Keys read as text sit beside a neighbour that differs by one detail
+    // the text has to keep (a prefix length, a closed bound, a last digit),
+    // so a spelling that lost it would name the neighbour: a write that hits
+    // the wrong row then shows in the tags the matrix reads back.
     (
         "inet",
         "inet",
-        &["'192.168.0.1'", "'10.0.0.0/8'", "'::ffff:1.2.3.4/120'"],
+        &[
+            "'192.168.0.1'",
+            "'10.0.0.1/24'",
+            "'10.0.0.1/25'",
+            "'::ffff:1.2.3.4/120'",
+        ],
     ),
-    ("cidr", "cidr", &["'10.0.0.0/8'", "'2001:db8::/32'"]),
-    ("macaddr", "macaddr", &["'08:00:2b:01:02:03'"]),
+    (
+        "cidr",
+        "cidr",
+        &[
+            "'10.0.0.0/8'",
+            "'10.0.0.0/24'",
+            "'10.0.0.0/25'",
+            "'2001:db8::/32'",
+        ],
+    ),
+    (
+        "macaddr",
+        "macaddr",
+        &["'08:00:2b:01:02:03'", "'08:00:2b:01:02:04'"],
+    ),
     ("macaddr8", "macaddr8", &["'08:00:2b:01:02:03:04:05'"]),
-    ("money", "money", &["12.34", "-0.5"]),
+    ("money", "money", &["12.34", "12.30", "12.03", "-0.5"]),
     ("oid", "oid", &["4294967295", "0"]),
-    ("int4range", "int4range", &["'[1,5)'", "'empty'", "'(,3]'"]),
+    (
+        "int4range",
+        "int4range",
+        &["'[1,5)'", "'[1,5]'", "'(1,5)'", "'empty'", "'(,3]'"],
+    ),
     (
         "tsrange",
         "tsrange",
-        &["'[2024-01-01 00:00,2024-01-02 12:30)'"],
+        &[
+            "'[2024-01-01 00:00,2024-01-02 12:30)'",
+            "'[2024-01-01 00:00,2024-01-02 12:30]'",
+        ],
+    ),
+    // The pair a `SQL, DMY` session would print alike: `[01/02/2024,…)` is
+    // the first under DMY and the second under MDY.
+    (
+        "daterange",
+        "daterange",
+        &["'[2024-02-01,2024-02-03)'", "'[2024-01-02,2024-03-02)'"],
+    ),
+    // Equal at 15 significant digits (`extra_float_digits = 0`), distinct
+    // at the shortest exact spelling every session is given.
+    (
+        "float8arr",
+        "float8[]",
+        &[
+            "ARRAY[0.1234567890123456]::float8[]",
+            "ARRAY[0.12345678901234567]::float8[]",
+        ],
+    ),
+    (
+        "float4arr",
+        "float4[]",
+        &["ARRAY[0.1]::float4[]", "ARRAY[0.10000001]::float4[]"],
+    ),
+    // One day minus two hours against one day plus two: what `sql_standard`
+    // would and `postgres` would not read alike.
+    (
+        "intervalarr",
+        "interval[]",
+        &[
+            "ARRAY['-1 days +02:00:00']::interval[]",
+            "ARRAY['-1 days -02:00:00']::interval[]",
+        ],
     ),
     ("tsvector", "tsvector", &["'a fat cat'", "'quote''s:1A'"]),
     // The decoder's array rendering quotes nothing, so `{a,b,c}` was both
@@ -2231,6 +2293,179 @@ async fn postgres_a_key_read_as_text_still_sorts_by_its_type() {
     pool.close().await;
 }
 
+/// Saves through each row of `table` — keyed by `k`, named by a unique `v`,
+/// with a `tag` to write — `rounds` times over, re-reading every tag after
+/// each save: a row's tag must be the last value its own save wrote, so a
+/// save that the one-row guard let through onto *another* row shows. Rows are
+/// found by `v`, never by the key under test. One line per wrong landing.
+async fn saves_by_text_key_land_on_their_rows(
+    pool: &DbPool,
+    table: &str,
+    rounds: usize,
+) -> Vec<String> {
+    let meta = pool
+        .introspect()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == table)
+        .unwrap();
+    let identity = detect_row_identity(&meta, pool.dialect()).unwrap();
+    let access = pool.backend_access(&meta);
+    let request = PageRequest {
+        schema: meta.schema.clone(),
+        table: meta.name.clone(),
+        limit: 10,
+        offset: 0,
+        sort: None,
+        filter: None,
+        extra_key_column: None,
+    };
+    let tags = || async {
+        let read = pool
+            .query(&format!("SELECT v, tag FROM {table} ORDER BY v"))
+            .await
+            .unwrap();
+        read.rows
+    };
+    let mut expected = tags().await;
+    let mut failures = Vec::new();
+    for round in 0..rounds {
+        for at in 0..expected.len() {
+            let name = expected[at][0].clone();
+            let page = pool
+                .fetch_page_bounded(&request, &meta.columns, &["k"])
+                .await
+                .unwrap();
+            let row = page.result.rows.iter().find(|row| row[1] == name).unwrap();
+            let tag = Value::Text(format!("edited {round}"));
+            let change = StagedChange::Update {
+                locator: RowLocator {
+                    identity_values: vec![row[0].clone()],
+                },
+                column: "tag".into(),
+                value: tag.clone(),
+            };
+            if let Err(e) = apply_staged(pool, &access, &meta, &identity, &[change]).await {
+                failures.push(format!("{table} {name:?} round {round}: {e}"));
+                continue;
+            }
+            expected[at][1] = tag;
+            let now = tags().await;
+            if now != expected {
+                failures.push(format!(
+                    "{table} {name:?} round {round}: the save landed elsewhere: {now:?}"
+                ));
+                expected = now;
+            }
+        }
+    }
+    failures
+}
+
+#[tokio::test]
+async fn postgres_a_role_default_never_respells_a_key_for_another_session() {
+    // A role's or database's default reaches only the sessions opened after
+    // it is set, and the pool opens new ones all the time. Measured with
+    // psql: after `ALTER ROLE … SET DateStyle = 'SQL, DMY'` a new session
+    // printed `[2024-02-01,2024-02-03)` as `[01/02/2024,03/02/2024)`, which an
+    // older `ISO, MDY` session reads as the other row; `IntervalStyle =
+    // 'sql_standard'` prints -1 day -2 hours as `-1 2:00:00`, which a
+    // `postgres` session reads as -1 day +2 hours. hubro's sessions are given
+    // both at login, which beats a role default: `DateStyle` by sqlx itself,
+    // `IntervalStyle` by `key_text_pins`.
+    let Some(url) = test_url().await else { return };
+    let setup = DbPool::open_postgres(&url).await.unwrap();
+    let who = setup
+        .query("SELECT quote_ident(current_user), quote_ident(current_database())")
+        .await
+        .unwrap();
+    let (Value::Text(role), Value::Text(database)) = (&who.rows[0][0], &who.rows[0][1]) else {
+        panic!("{who:?}");
+    };
+    let scope = format!("ALTER ROLE {role} IN DATABASE {database}");
+    // Run on its own task so a failure still reaches the reset below: the
+    // role default would otherwise outlive the test. A local task, since the
+    // body need not be `Send`.
+    let outcome = tokio::task::LocalSet::new()
+        .run_until(async {
+            tokio::task::spawn_local({
+                let url = url.clone();
+                let scope = scope.clone();
+                async move { role_default_body(&url, &scope).await }
+            })
+            .await
+        })
+        .await;
+    for setting in ["DateStyle", "IntervalStyle"] {
+        setup
+            .query(&format!("{scope} RESET {setting}"))
+            .await
+            .unwrap();
+    }
+    setup.close().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+async fn role_default_body(url: &str, scope: &str) {
+    let pool = DbPool::open_postgres_two_sessions(url).await.unwrap();
+    for sql in [
+        "DROP TABLE IF EXISTS role_dates",
+        "CREATE TABLE role_dates (k daterange PRIMARY KEY, v text, tag text)",
+        "INSERT INTO role_dates VALUES \
+         ('[2024-02-01,2024-02-03)', 'feb', 't'), ('[2024-01-02,2024-03-02)', 'jan', 't')",
+        "DROP TABLE IF EXISTS role_intervals",
+        "CREATE TABLE role_intervals (k interval[] PRIMARY KEY, v text, tag text)",
+        "INSERT INTO role_intervals VALUES \
+         (ARRAY['-1 days -02:00:00']::interval[], 'minus', 't'), \
+         (ARRAY['-1 days +02:00:00']::interval[], 'plus', 't')",
+    ] {
+        pool.query(sql).await.unwrap();
+    }
+    // Both sessions of the pool exist before the default changes.
+    let probe = "SELECT pg_backend_pid()::int8, current_setting('DateStyle'), \
+                 current_setting('IntervalStyle'), pg_sleep(0.3)::text";
+    let (a, b) = tokio::join!(pool.query(probe), pool.query(probe));
+    let before = [a.unwrap().rows[0][0].clone(), b.unwrap().rows[0][0].clone()];
+    for sql in [
+        format!("{scope} SET DateStyle = 'SQL, DMY'"),
+        format!("{scope} SET IntervalStyle = 'sql_standard'"),
+    ] {
+        pool.query(&sql).await.unwrap();
+    }
+    // A script's connection is closed after its run, so the next pair of
+    // reads finds one old session and opens one new one.
+    let caps = pool.backend_capabilities();
+    run_script(&pool, caps, &["SELECT 1".to_string()], |_| {})
+        .await
+        .unwrap();
+    let (a, b) = tokio::join!(pool.query(probe), pool.query(probe));
+    let after = [a.unwrap().rows[0].clone(), b.unwrap().rows[0].clone()];
+    assert!(
+        after.iter().any(|session| !before.contains(&session[0])),
+        "no session was opened after the role default changed: {before:?} {after:?}"
+    );
+    for session in &after {
+        assert_eq!(
+            session[1..3],
+            [
+                Value::Text("ISO, MDY".into()),
+                Value::Text("postgres".into())
+            ],
+            "a session took the role's default: {after:?}"
+        );
+    }
+    let mut failures = saves_by_text_key_land_on_their_rows(&pool, "role_dates", 4).await;
+    failures.extend(saves_by_text_key_land_on_their_rows(&pool, "role_intervals", 4).await);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    pool.query("DROP TABLE role_dates, role_intervals")
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
 #[tokio::test]
 async fn postgres_a_scripts_datestyle_never_respells_a_key_for_another_session() {
     // A key read through `::text` is spelled by the session that read it and
@@ -2285,61 +2520,8 @@ async fn postgres_a_scripts_datestyle_never_respells_a_key_for_another_session()
     // And end to end: the `feb` row is read, re-addressed and saved, and
     // only it changes — several rounds, so reads and writes fall on both
     // sessions.
-    let table = pool
-        .introspect()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|t| t.name == "style_keys")
-        .unwrap();
-    let identity = detect_row_identity(&table, pool.dialect()).unwrap();
-    let access = pool.backend_access(&table);
-    let request = PageRequest {
-        schema: table.schema.clone(),
-        table: table.name.clone(),
-        limit: 10,
-        offset: 0,
-        sort: None,
-        filter: None,
-        extra_key_column: None,
-    };
-    for round in 0..6 {
-        let page = pool
-            .fetch_page_bounded(&request, &table.columns, &["k"])
-            .await
-            .unwrap();
-        let feb = page
-            .result
-            .rows
-            .iter()
-            .find(|row| row[1] == Value::Text("feb".into()))
-            .unwrap();
-        let change = StagedChange::Update {
-            locator: RowLocator {
-                identity_values: vec![feb[0].clone()],
-            },
-            column: "tag".into(),
-            value: Value::Text(format!("edited {round}")),
-        };
-        apply_staged(&pool, &access, &table, &identity, &[change])
-            .await
-            .unwrap_or_else(|e| panic!("round {round}: {e}"));
-        let tags = pool
-            .query("SELECT v, tag FROM style_keys ORDER BY v")
-            .await
-            .unwrap();
-        assert_eq!(
-            tags.rows,
-            [
-                vec![
-                    Value::Text("feb".into()),
-                    Value::Text(format!("edited {round}"))
-                ],
-                vec![Value::Text("jan".into()), Value::Text("t".into())],
-            ],
-            "round {round}: the save landed on the wrong row"
-        );
-    }
+    let failures = saves_by_text_key_land_on_their_rows(&pool, "style_keys", 6).await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 
     pool.query("DROP TABLE style_keys").await.unwrap();
     pool.close().await;

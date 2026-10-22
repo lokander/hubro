@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use super::page::{Filter, KeyEquality};
 use super::rowkey::key_column_addressable;
 use super::schema::{ColumnMeta, ForeignKeyMeta, TableMeta};
+use super::sql::Dialect;
 use super::value::Value;
 
 /// The name of the target column the FK's `index`-th key column references.
@@ -47,8 +48,9 @@ pub fn build_fk_filter(
     fk: &ForeignKeyMeta,
     source_row: &HashMap<String, Value>,
     target: &TableMeta,
+    dialect: Dialect,
 ) -> Option<Filter> {
-    let referenced = fk_target_columns(fk, target)?;
+    let referenced = fk_target_columns(fk, target, dialect)?;
     let mut terms = Vec::with_capacity(referenced.len());
     for (column, meta) in fk.columns.iter().zip(referenced) {
         let value = source_row.get(column)?;
@@ -70,12 +72,13 @@ pub fn build_fk_filter(
 /// column at its position, a referenced column is missing from `target`
 /// (a stale schema, or a reference SQLite accepted to a column that does
 /// not exist), or a referenced column's values cannot be bound back to find
-/// their row ([`key_column_addressable`]: a jump on a `sql_variant` key
-/// landed on an empty page). Whether a row's link is offered at all is decided by this,
-/// so a link is never a dead click.
+/// their row on `dialect` ([`key_column_addressable`]: a jump on a SQL Server
+/// `sql_variant` key landed on an empty page). Whether a row's link is offered
+/// at all is decided by this, so a link is never a dead click.
 pub fn fk_target_columns<'a>(
     fk: &ForeignKeyMeta,
     target: &'a TableMeta,
+    dialect: Dialect,
 ) -> Option<Vec<&'a ColumnMeta>> {
     if fk.columns.is_empty() {
         return None;
@@ -92,7 +95,7 @@ pub fn fk_target_columns<'a>(
                 .columns
                 .iter()
                 .find(|c| c.name == name)
-                .filter(|c| key_column_addressable(c))
+                .filter(|c| key_column_addressable(c, dialect))
         })
         .collect()
 }
@@ -191,7 +194,8 @@ mod tests {
         source: &HashMap<String, Value>,
         target: &TableMeta,
     ) -> Option<Vec<(String, Value, String)>> {
-        let Filter::Equalities(terms) = build_fk_filter(fk, source, target)? else {
+        let Filter::Equalities(terms) = build_fk_filter(fk, source, target, Dialect::Postgres)?
+        else {
             panic!("a jump builds an equalities filter");
         };
         Some(
@@ -254,8 +258,11 @@ mod tests {
         );
         // A target with no primary key leaves the reference unresolvable.
         let keyless = target(&[("id", "integer", None)]);
-        assert_eq!(build_fk_filter(&fk, &source, &keyless), None);
-        assert_eq!(fk_target_columns(&fk, &keyless), None);
+        assert_eq!(
+            build_fk_filter(&fk, &source, &keyless, Dialect::Postgres),
+            None
+        );
+        assert_eq!(fk_target_columns(&fk, &keyless, Dialect::Postgres), None);
     }
 
     #[test]
@@ -284,12 +291,27 @@ mod tests {
     #[test]
     fn a_reference_to_a_sql_variant_key_offers_no_jump() {
         // A variant holding an `int` or a `date` matches no row when bound
-        // back, so the jump would land on an empty page; it is not offered.
+        // back, so the jump would land on an empty page; it is not offered —
+        // on SQL Server. Elsewhere `sql_variant` is only a name (SQLite echoes
+        // a declared type verbatim), and the jump stands.
         let fk = make_fk(&["ref"], vec![Some("k")]);
         let source = row(&[("ref", Value::Text("5".into()))]);
         let parent = target(&[("k", "sql_variant", Some(1))]);
-        assert_eq!(fk_target_columns(&fk, &parent), None);
-        assert_eq!(build_fk_filter(&fk, &source, &parent), None);
+        assert_eq!(fk_target_columns(&fk, &parent, Dialect::SqlServer), None);
+        assert_eq!(
+            build_fk_filter(&fk, &source, &parent, Dialect::SqlServer),
+            None
+        );
+        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+            assert!(
+                fk_target_columns(&fk, &parent, dialect).is_some(),
+                "{dialect:?}"
+            );
+            assert!(
+                build_fk_filter(&fk, &source, &parent, dialect).is_some(),
+                "{dialect:?}"
+            );
+        }
     }
 
     #[test]
@@ -299,11 +321,14 @@ mod tests {
         // so no link is offered and no jump is built.
         let fk = make_fk(&["parent_id"], vec![Some("nope")]);
         let source = row(&[("parent_id", Value::Integer(7))]);
-        assert_eq!(fk_target_columns(&fk, &by_id()), None);
-        assert_eq!(build_fk_filter(&fk, &source, &by_id()), None);
+        assert_eq!(fk_target_columns(&fk, &by_id(), Dialect::Postgres), None);
+        assert_eq!(
+            build_fk_filter(&fk, &source, &by_id(), Dialect::Postgres),
+            None
+        );
         let fine = make_fk(&["parent_id"], vec![Some("id")]);
         let parent = by_id();
-        let resolved = fk_target_columns(&fine, &parent).unwrap();
+        let resolved = fk_target_columns(&fine, &parent, Dialect::Postgres).unwrap();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].name, "id");
     }
@@ -312,7 +337,10 @@ mod tests {
     fn null_fk_value_yields_no_jump() {
         let fk = make_fk(&["composer_id"], vec![None]);
         let source = row(&[("composer_id", Value::Null)]);
-        assert_eq!(build_fk_filter(&fk, &source, &by_id()), None);
+        assert_eq!(
+            build_fk_filter(&fk, &source, &by_id(), Dialect::Postgres),
+            None
+        );
     }
 
     #[test]
@@ -320,13 +348,19 @@ mod tests {
         let fk = make_fk(&["a_id", "b_id"], vec![Some("a"), Some("b")]);
         let source = row(&[("a_id", Value::Integer(1)), ("b_id", Value::Null)]);
         let parent = target(&[("a", "integer", Some(1)), ("b", "integer", Some(2))]);
-        assert_eq!(build_fk_filter(&fk, &source, &parent), None);
+        assert_eq!(
+            build_fk_filter(&fk, &source, &parent, Dialect::Postgres),
+            None
+        );
     }
 
     #[test]
     fn missing_source_column_yields_no_jump() {
         let fk = make_fk(&["parent_id"], vec![Some("id")]);
         let source = row(&[("other", Value::Integer(1))]);
-        assert_eq!(build_fk_filter(&fk, &source, &by_id()), None);
+        assert_eq!(
+            build_fk_filter(&fk, &source, &by_id(), Dialect::Postgres),
+            None
+        );
     }
 }

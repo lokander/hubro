@@ -128,8 +128,8 @@ async fn jump(
         .iter()
         .find(|t| t.name == fk.referenced_table && t.schema == fk.referenced_schema)
         .expect("target table is introspected");
-    let filter =
-        build_fk_filter(fk, source, target).expect("a fully-populated FK builds a jump filter");
+    let filter = build_fk_filter(fk, source, target, pool.dialect())
+        .expect("a fully-populated FK builds a jump filter");
     let req = PageRequest {
         schema: target.schema.clone(),
         table: target.name.clone(),
@@ -190,9 +190,21 @@ async fn assert_fk_navigation(pool: &DbPool) {
     assert_eq!(rows[0][label_idx], Value::Text("Shelf A".into()));
 
     // An all-NULL child row references nothing: no jump is built.
-    assert!(build_fk_filter(child_fk(child, &["category_id"]), &row11, category).is_none());
+    assert!(build_fk_filter(
+        child_fk(child, &["category_id"]),
+        &row11,
+        category,
+        pool.dialect()
+    )
+    .is_none());
     assert!(
-        build_fk_filter(child_fk(child, &["region", "slot"]), &row11, parent).is_none(),
+        build_fk_filter(
+            child_fk(child, &["region", "slot"]),
+            &row11,
+            parent,
+            pool.dialect()
+        )
+        .is_none(),
         "a partial/whole NULL composite FK builds no jump"
     );
 }

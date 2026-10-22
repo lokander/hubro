@@ -40,8 +40,9 @@ use std::collections::HashMap;
 use tokio::sync::Mutex;
 
 use hubro::db::{
-    apply_staged, build_fk_filter, detect_row_identity, DbPool, ExportFormat, Filter, Internal,
-    PageRequest, RowIdentity, RowLocator, SortDir, StagedChange, TableKind, TableMeta, Value,
+    apply_staged, build_fk_filter, detect_row_identity, DbPool, Dialect, ExportFormat, Filter,
+    Internal, PageRequest, RowIdentity, RowLocator, SortDir, StagedChange, TableKind, TableMeta,
+    Value,
 };
 
 fn test_url() -> Option<String> {
@@ -444,7 +445,7 @@ async fn fk_navigation_crosses_from_distributed_to_reference() {
     let source_row: HashMap<String, Value> =
         HashMap::from([("country".to_string(), Value::Text("se".into()))]);
     let countries_meta = find(&tables, &countries);
-    let filter = build_fk_filter(fk, &source_row, countries_meta)
+    let filter = build_fk_filter(fk, &source_row, countries_meta, Dialect::Postgres)
         .expect("a filter pinning the referenced row");
 
     let page = pool

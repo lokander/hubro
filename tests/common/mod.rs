@@ -975,10 +975,19 @@ fn a_rewritten_url_keeps_everything_but_the_database() {
 /// go back to the server for the rest) and a short text column `tag`. Each
 /// row's locator is taken from the bounded page exactly as the grid takes it,
 /// then used twice: `fetch_cell` must return that row's full `body`, and an
-/// `apply_staged` update of `tag` must hit exactly one row. The two are the
+/// `apply_staged` update of `tag` must land on that row. The two are the
 /// same question asked by the expand popup and by Save, so a key type that
 /// one answers and the other does not is a cell that expands to NULL but
 /// saves — or the reverse.
+///
+/// "Lands on that row" is checked by reading the tags back, not by the write
+/// succeeding: the one-row guard passes a write that hit exactly one *other*
+/// row, which is the failure a key spelled ambiguously produces. Each row's
+/// edit names the row (`edited 0:`, from its own `body` prefix), and after
+/// every row is written each must carry its own name — a wrong-row write
+/// leaves one row unedited and another with a name not its own. Rows are told
+/// apart by `body`'s `n:` prefix, which the fixtures make unique, never by the
+/// key under test.
 ///
 /// Collected rather than asserted one at a time, so a single run reports the
 /// whole key-type matrix instead of stopping at its first gap.
@@ -1013,6 +1022,13 @@ pub async fn row_addressing_failures(pool: &DbPool, table: &hubro::db::TableMeta
     assert!(!page.result.rows.is_empty(), "{}: no rows", table.name);
     let access = pool.backend_access(table);
     let mut failures = Vec::new();
+    // `n:` → the tag that row's own write set, for the rows whose write
+    // reported success.
+    let mut written: Vec<(String, String)> = Vec::new();
+    let row_name = |body: &Value| match body {
+        Value::Text(text) => text.split_once(':').map(|(n, _)| format!("{n}:")),
+        _ => None,
+    };
     for (row, previews) in page.result.rows.iter().zip(&page.previews) {
         let locator = RowLocator {
             identity_values: key_at.iter().map(|&at| row[at].clone()).collect(),
@@ -1036,13 +1052,49 @@ pub async fn row_addressing_failures(pool: &DbPool, table: &hubro::db::TableMeta
             },
             Err(e) => failures.push(format!("{label}: fetch_cell failed: {e}")),
         }
+        let name = row_name(&row[body_at])
+            .unwrap_or_else(|| panic!("{label}: body must start with its row's `n:`"));
+        let tag = format!("edited {name}");
         let change = StagedChange::Update {
             locator: locator.clone(),
             column: "tag".into(),
-            value: Value::Text("edited".into()),
+            value: Value::Text(tag.clone()),
         };
-        if let Err(e) = apply_staged(pool, &access, table, &identity, &[change]).await {
-            failures.push(format!("{label}: the write did not address its row: {e}"));
+        match apply_staged(pool, &access, table, &identity, &[change]).await {
+            Ok(_) => written.push((name, tag)),
+            Err(e) => failures.push(format!("{label}: the write did not address its row: {e}")),
+        }
+    }
+    let after = pool
+        .fetch_page_bounded(&request, &table.columns, &keys)
+        .await
+        .unwrap_or_else(|e| panic!("{}: page re-read failed: {e}", table.name));
+    let tag_at = after
+        .result
+        .columns
+        .iter()
+        .position(|c| c.name == "tag")
+        .unwrap_or_else(|| panic!("{}: no column tag", table.name));
+    let after_body_at = after
+        .result
+        .columns
+        .iter()
+        .position(|c| c.name == "body")
+        .unwrap_or_else(|| panic!("{}: no column body", table.name));
+    for (name, tag) in &written {
+        let found: Vec<&Value> = after
+            .result
+            .rows
+            .iter()
+            .filter(|row| row_name(&row[after_body_at]).as_deref() == Some(name.as_str()))
+            .map(|row| &row[tag_at])
+            .collect();
+        if found != [&Value::Text(tag.clone())] {
+            failures.push(format!(
+                "{} row {name}: its save reported success, but its tag is now {found:?} \
+                 (another row's write landed on it, or its own landed elsewhere)",
+                table.name
+            ));
         }
     }
     failures
@@ -1122,7 +1174,7 @@ pub async fn fk_jump_failures(
         let Some(Value::Text(expect)) = source_row.get("expect") else {
             panic!("{label}: expect must be a text cell");
         };
-        let Some(filter) = build_fk_filter(fk, &source_row, parent) else {
+        let Some(filter) = build_fk_filter(fk, &source_row, parent, pool.dialect()) else {
             failures.push(format!("{label}: no jump was built"));
             continue;
         };
