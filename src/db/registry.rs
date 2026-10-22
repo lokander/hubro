@@ -563,6 +563,18 @@ impl DbPool {
         Ok(DbPool::Postgres(postgres::open_postgres(url).await?))
     }
 
+    /// Connects to a Postgres URL whose password is a Microsoft Entra access
+    /// token, renewing it from `tokens` for the connections the pool opens
+    /// later — see [`postgres::open_postgres_entra`].
+    pub async fn open_postgres_entra(
+        url: &str,
+        tokens: std::sync::Arc<super::entra::EntraTokens>,
+    ) -> Result<DbPool, DbError> {
+        Ok(DbPool::Postgres(
+            postgres::open_postgres_entra(url, tokens).await?,
+        ))
+    }
+
     /// Connects to a Postgres URL on a pool of exactly one connection, so every
     /// statement shares one session. The app never opens this — one connection
     /// would queue the grid behind introspection — but a test of session-local
@@ -762,9 +774,12 @@ impl DbPool {
     pub async fn begin_script_tx(&self) -> Result<ScriptTx<'_>, DbError> {
         match self {
             DbPool::Sqlite(pool) => sqlx_common::begin_for_run(pool).await.map(ScriptTx::Sqlite),
-            DbPool::Postgres(pg) => sqlx_common::begin_for_run(pg.pool())
-                .await
-                .map(ScriptTx::Postgres),
+            DbPool::Postgres(pg) => {
+                pg.renew_login().await?;
+                sqlx_common::begin_for_run(pg.pool())
+                    .await
+                    .map(ScriptTx::Postgres)
+            }
             DbPool::SqlServer(pool) => sqlserver::begin_script_tx(pool)
                 .await
                 .map(|tx| ScriptTx::SqlServer(Box::new(tx))),
@@ -804,10 +819,13 @@ impl DbPool {
     pub(super) async fn acquire_script_conn(&self) -> Result<ScriptConn, DbError> {
         let held = match self {
             DbPool::Sqlite(pool) => HeldConn::Sqlite(sqlx_common::acquire_for_run(pool).await?),
-            DbPool::Postgres(pg) => HeldConn::Postgres {
-                conn: sqlx_common::acquire_for_run(pg.pool()).await?,
-                flavor: pg.flavor(),
-            },
+            DbPool::Postgres(pg) => {
+                pg.renew_login().await?;
+                HeldConn::Postgres {
+                    conn: sqlx_common::acquire_for_run(pg.pool()).await?,
+                    flavor: pg.flavor(),
+                }
+            }
             DbPool::SqlServer(pool) => {
                 HeldConn::SqlServer(Box::new(sqlserver::acquire_script_conn(pool).await?))
             }
@@ -826,7 +844,10 @@ impl DbPool {
                 sqlite::open_read_only(pool).await?,
             ))),
             DbPool::Postgres(pg) => Ok(Some(ReadOnlyRun::Postgres {
-                conn: sqlx_common::acquire_for_run(pg.pool()).await?,
+                conn: {
+                    pg.renew_login().await?;
+                    sqlx_common::acquire_for_run(pg.pool()).await?
+                },
                 begin: pg.read_only_begin(),
             })),
             // Turned away above; kept as an arm so a new variant must decide.
