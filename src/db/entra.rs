@@ -40,10 +40,40 @@ pub const RENEW_MARGIN: Duration = Duration::from_secs(5 * 60);
 /// provider while it is down.
 pub const RETRY_AFTER: Duration = Duration::from_secs(30);
 
+/// A token's value — an access token or a refresh token. Its `Debug` and
+/// `Display` print `<redacted>`, so a token formatted into a log line or an
+/// error by mistake gives nothing away; the value itself is reached only
+/// through [`Self::expose`], which the logins call to hand it to the driver.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Secret(value.into())
+    }
+
+    /// The value, for the one thing that may read it: the login.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl std::fmt::Display for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 /// An access token and when it expires.
 #[derive(Clone)]
 pub struct Token {
-    pub secret: String,
+    pub secret: Secret,
     pub expires_at: SystemTime,
 }
 
@@ -51,7 +81,7 @@ pub struct Token {
 /// redeem next time when the identity provider rotated it.
 pub struct Renewed {
     pub token: Token,
-    pub refresh: Option<String>,
+    pub refresh: Option<Secret>,
 }
 
 /// Why a renewal failed.
@@ -68,7 +98,7 @@ pub type RenewFuture = Pin<Box<dyn Future<Output = Result<Renewed, RenewError>> 
 
 /// The silent renewal: given the refresh token held (if any), a new access
 /// token. Built by the connect flow for the connection's auth mode.
-pub type Renew = Arc<dyn Fn(Option<String>) -> RenewFuture + Send + Sync>;
+pub type Renew = Arc<dyn Fn(Option<Secret>) -> RenewFuture + Send + Sync>;
 
 /// The wall clock — injected so a test can move past an expiry.
 pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
@@ -97,7 +127,7 @@ pub fn token_step(
     can_renew: bool,
     last_failure: Option<SystemTime>,
 ) -> TokenStep {
-    if now + RENEW_MARGIN < expires_at {
+    if !renewal_due(now, expires_at) {
         return TokenStep::Use;
     }
     let backing_off = last_failure.is_some_and(|failed| {
@@ -116,6 +146,11 @@ pub fn token_step(
     }
 }
 
+/// Whether a token expiring at `expires_at` is within [`RENEW_MARGIN`] of it.
+pub fn renewal_due(now: SystemTime, expires_at: SystemTime) -> bool {
+    now + RENEW_MARGIN >= expires_at
+}
+
 /// Whether a token can be renewed without the user: a managed identity always
 /// can, an interactive sign-in only by redeeming a refresh token the connect
 /// kept. The same rule as `EntraAuth::can_acquire_silently`, over plain data.
@@ -125,7 +160,7 @@ pub fn may_renew(managed_identity: bool, holds_refresh: bool) -> bool {
 
 struct State {
     token: Token,
-    refresh: Option<String>,
+    refresh: Option<Secret>,
     last_failure: Option<SystemTime>,
     /// Why the last renewal failed, for the refusal.
     why: Option<String>,
@@ -148,7 +183,7 @@ impl EntraTokens {
     /// token it got back, if any — held here in memory only.
     pub fn new(
         token: Token,
-        refresh: Option<String>,
+        refresh: Option<Secret>,
         managed_identity: bool,
         renew: Renew,
         now: Clock,
@@ -169,7 +204,7 @@ impl EntraTokens {
     /// [`Self::new`] on the system clock.
     pub fn on_system_clock(
         token: Token,
-        refresh: Option<String>,
+        refresh: Option<Secret>,
         managed_identity: bool,
         renew: Renew,
     ) -> Self {
@@ -184,7 +219,13 @@ impl EntraTokens {
 
     /// The token to log a new connection in with, renewed first when
     /// [`token_step`] says so.
-    pub async fn current(&self) -> Result<String, DbError> {
+    ///
+    /// The clock is read again once a renewal returns: one can take as long
+    /// as its HTTP timeout, and a failure stamped with the time it *started*
+    /// would already be [`RETRY_AFTER`] old when it is recorded — measured,
+    /// five callers queued behind a renewal that hung made five renewals in
+    /// series — and a token that expired meanwhile would still be handed out.
+    pub async fn current(&self) -> Result<Secret, DbError> {
         let mut state = self.state.lock().await;
         let now = (self.now)();
         let can_renew = may_renew(self.managed_identity, state.refresh.is_some());
@@ -193,15 +234,26 @@ impl EntraTokens {
             TokenStep::Refuse => return Err(sign_in_again(state.why.as_deref())),
             TokenStep::Renew => {}
         }
-        match (self.renew)(state.refresh.clone()).await {
+        let renewed = (self.renew)(state.refresh.clone()).await;
+        let now = (self.now)();
+        match renewed {
             Ok(Renewed { token, refresh }) => {
                 state.token = token;
                 if refresh.is_some() {
                     state.refresh = refresh;
                 }
-                state.last_failure = None;
-                state.why = None;
-                Ok(state.token.secret.clone())
+                // A renewal can hand back a token that is itself inside the
+                // margin — a managed identity's endpoint returns its cached
+                // token until shortly before expiry. Counted as a failure for
+                // the backoff, or every login and every tick would renew
+                // again at once.
+                if renewal_due(now, state.token.expires_at) {
+                    state.last_failure = Some(now);
+                    state.why = Some("the renewed token expires within minutes".to_string());
+                } else {
+                    state.last_failure = None;
+                    state.why = None;
+                }
             }
             Err(error) => {
                 let why = match error {
@@ -213,12 +265,12 @@ impl EntraTokens {
                 };
                 state.last_failure = Some(now);
                 state.why = Some(why);
-                if now < state.token.expires_at {
-                    Ok(state.token.secret.clone())
-                } else {
-                    Err(sign_in_again(state.why.as_deref()))
-                }
             }
+        }
+        if now < state.token.expires_at {
+            Ok(state.token.secret.clone())
+        } else {
+            Err(sign_in_again(state.why.as_deref()))
         }
     }
 }
@@ -322,7 +374,10 @@ mod tests {
             let (calls, handed) = (Arc::clone(&calls), Arc::clone(&handed));
             Arc::new(move |refresh| {
                 let n = calls.fetch_add(1, Ordering::SeqCst);
-                handed.lock().unwrap().push(refresh);
+                handed
+                    .lock()
+                    .unwrap()
+                    .push(refresh.map(|r| r.expose().to_string()));
                 let answer = Arc::clone(&answer);
                 Box::pin(async move {
                     // Long enough for concurrent callers to pile up behind it.
@@ -337,10 +392,10 @@ mod tests {
         };
         let tokens = EntraTokens::new(
             Token {
-                secret: "first".into(),
+                secret: Secret::new("first"),
                 expires_at: at(3600),
             },
-            refresh.map(str::to_string),
+            refresh.map(Secret::new),
             managed,
             renew,
             now,
@@ -358,17 +413,17 @@ mod tests {
     fn renewed(secret: &str, refresh: Option<&str>) -> Result<Renewed, RenewError> {
         Ok(Renewed {
             token: Token {
-                secret: secret.into(),
+                secret: Secret::new(secret),
                 expires_at: at(7200),
             },
-            refresh: refresh.map(str::to_string),
+            refresh: refresh.map(Secret::new),
         })
     }
 
     #[tokio::test]
     async fn an_expiring_token_is_renewed_once_for_connections_opened_together() {
         let (tokens, rig) = rig(Some("r1"), false, |_| renewed("second", Some("r2")));
-        assert_eq!(tokens.current().await.unwrap(), "first");
+        assert_eq!(tokens.current().await.unwrap().expose(), "first");
         assert_eq!(rig.calls.load(Ordering::SeqCst), 0);
 
         rig.clock.store(3500, Ordering::SeqCst);
@@ -380,7 +435,7 @@ mod tests {
             })
             .collect();
         for login in logins {
-            assert_eq!(login.await.unwrap().unwrap(), "second");
+            assert_eq!(login.await.unwrap().unwrap().expose(), "second");
         }
         assert_eq!(rig.calls.load(Ordering::SeqCst), 1, "one renewal, shared");
 
@@ -397,7 +452,7 @@ mod tests {
     async fn without_a_refresh_token_an_interactive_sign_in_is_refused_once_expired() {
         let (tokens, rig) = rig(None, false, |_| renewed("never", None));
         rig.clock.store(3500, Ordering::SeqCst);
-        assert_eq!(tokens.current().await.unwrap(), "first");
+        assert_eq!(tokens.current().await.unwrap().expose(), "first");
         rig.clock.store(3600, Ordering::SeqCst);
         let refused = tokens.current().await.unwrap_err().to_string();
         assert!(refused.contains("reconnect to sign in again"), "{refused}");
@@ -408,7 +463,7 @@ mod tests {
     async fn a_managed_identity_renews_without_a_refresh_token() {
         let (tokens, rig) = rig(None, true, |_| renewed("second", None));
         rig.clock.store(3600, Ordering::SeqCst);
-        assert_eq!(tokens.current().await.unwrap(), "second");
+        assert_eq!(tokens.current().await.unwrap().expose(), "second");
         assert_eq!(*rig.handed.lock().unwrap(), vec![None]);
     }
 
@@ -419,7 +474,7 @@ mod tests {
         });
         rig.clock.store(3500, Ordering::SeqCst);
         // Still good: used, and the failure is remembered.
-        assert_eq!(tokens.current().await.unwrap(), "first");
+        assert_eq!(tokens.current().await.unwrap().expose(), "first");
         rig.clock.store(4000, Ordering::SeqCst);
         let refused = tokens.current().await.unwrap_err().to_string();
         assert!(refused.contains("invalid_grant"), "{refused}");
@@ -441,6 +496,108 @@ mod tests {
         assert_eq!(rig.calls.load(Ordering::SeqCst), 1, "no retry storm");
         rig.clock
             .store(3600 + RETRY_AFTER.as_secs(), Ordering::SeqCst);
-        assert_eq!(tokens.current().await.unwrap(), "second");
+        assert_eq!(tokens.current().await.unwrap().expose(), "second");
+    }
+
+    /// A provider whose renewal moves the injected clock on by `takes` while
+    /// it runs — a renewal waiting out its HTTP timeout — and then answers
+    /// with `answer`, counting its calls.
+    fn slow_rig(
+        start: u64,
+        takes: u64,
+        answer: impl Fn() -> Result<Renewed, RenewError> + Send + Sync + 'static,
+    ) -> (Arc<EntraTokens>, Arc<AtomicUsize>) {
+        let clock = Arc::new(AtomicU64::new(start));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let answer = Arc::new(answer);
+        let renew: Renew = {
+            let (clock, calls) = (Arc::clone(&clock), Arc::clone(&calls));
+            Arc::new(move |_refresh| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let (clock, answer) = (Arc::clone(&clock), Arc::clone(&answer));
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    clock.fetch_add(takes, Ordering::SeqCst);
+                    answer()
+                })
+            })
+        };
+        let now: Clock = {
+            let clock = Arc::clone(&clock);
+            Arc::new(move || at(clock.load(Ordering::SeqCst)))
+        };
+        let tokens = EntraTokens::new(
+            Token {
+                secret: Secret::new("first"),
+                expires_at: at(3600),
+            },
+            Some(Secret::new("r1")),
+            false,
+            renew,
+            now,
+        );
+        (Arc::new(tokens), calls)
+    }
+
+    #[tokio::test]
+    async fn a_renewal_that_hangs_is_not_repeated_by_the_callers_queued_behind_it() {
+        // Takes longer than `RETRY_AFTER`: stamped with the time it started,
+        // its failure was already stale, and each queued caller renewed again.
+        let takes = RETRY_AFTER.as_secs() + 10;
+        let (tokens, calls) = slow_rig(3600, takes, || Err(RenewError::Failed("timed out".into())));
+        let logins: Vec<_> = (0..5)
+            .map(|_| {
+                let tokens = Arc::clone(&tokens);
+                tokio::spawn(async move { tokens.current().await })
+            })
+            .collect();
+        for login in logins {
+            assert!(login.await.unwrap().is_err());
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one renewal, not one per caller"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_that_expires_while_its_renewal_runs_is_not_handed_out() {
+        // Inside the margin but still good when the renewal starts; expired by
+        // the time it fails.
+        let (tokens, _) = slow_rig(3550, 100, || Err(RenewError::Failed("timed out".into())));
+        let refused = tokens.current().await.unwrap_err().to_string();
+        assert!(refused.contains("reconnect to sign in again"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn a_renewed_token_still_inside_the_margin_backs_off_like_a_failure() {
+        // A managed identity's endpoint can hand back its cached token, a
+        // minute from expiry: renewing again on every login would hammer it.
+        let (tokens, calls) = slow_rig(3500, 0, || {
+            Ok(Renewed {
+                token: Token {
+                    secret: Secret::new("cached"),
+                    expires_at: at(3560),
+                },
+                refresh: None,
+            })
+        });
+        for _ in 0..5 {
+            assert_eq!(tokens.current().await.unwrap().expose(), "cached");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_secret_never_formats_its_value() {
+        let secret = Secret::new("eyJ0eXAi.secret");
+        assert_eq!(format!("{secret}"), "<redacted>");
+        assert_eq!(format!("{secret:?}"), "<redacted>");
+        let token = Token {
+            secret,
+            expires_at: at(0),
+        };
+        assert!(!format!("{:?}", token.secret).contains("eyJ0eXAi"));
     }
 }

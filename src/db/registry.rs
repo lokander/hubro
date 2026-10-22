@@ -575,6 +575,19 @@ impl DbPool {
         ))
     }
 
+    /// [`Self::open_postgres_entra`] with the renewal task ticking every
+    /// `every`. The app never opens this; a test of the task needs it, to see
+    /// it renew without waiting the real minute.
+    pub async fn open_postgres_entra_renewing_every(
+        url: &str,
+        tokens: std::sync::Arc<super::entra::EntraTokens>,
+        every: std::time::Duration,
+    ) -> Result<DbPool, DbError> {
+        Ok(DbPool::Postgres(
+            postgres::open_postgres_entra_every(url, tokens, every).await?,
+        ))
+    }
+
     /// Connects to a Postgres URL on a pool of exactly one connection, so every
     /// statement shares one session. The app never opens this — one connection
     /// would queue the grid behind introspection — but a test of session-local

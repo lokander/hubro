@@ -12,7 +12,7 @@ use super::*;
 
 use std::sync::Arc;
 
-use crate::db::entra::{EntraTokens, RenewError, Renewed, Token};
+use crate::db::entra::{EntraTokens, RenewError, Renewed, Secret, Token};
 
 /// Moves one keyring secret from `old` to `new`. Best-effort: a
 /// missing secret, or a keyring that refuses, just means nothing to carry.
@@ -763,9 +763,6 @@ pub(super) fn saved_server_settings(
         .unwrap_or((None, ServerAuth::Password))
 }
 
-/// The opener a *silent* acquisition passes: it refuses to open a browser, so
-/// an interactive sign-in with no usable refresh token errors here and the
-/// flow can park the sign-in card instead of popping a window unasked.
 /// The token provider an Entra connection's pool logs its later connections
 /// in with ([`EntraTokens`]), seeded with the connect's own token.
 ///
@@ -784,22 +781,22 @@ fn entra_renewal(
     token: &azure::AccessToken,
 ) -> Arc<EntraTokens> {
     let auth = entra.clone();
-    let renew = Arc::new(move |refresh: Option<String>| {
+    let renew = Arc::new(move |refresh: Option<Secret>| {
         let auth = auth.clone();
         Box::pin(async move {
             azure::renew_silently(
                 &auth,
                 resource,
-                refresh.as_deref(),
+                refresh.as_ref().map(Secret::expose),
                 &azure::Endpoints::default(),
             )
             .await
             .map(|renewed| Renewed {
                 token: Token {
-                    secret: renewed.secret,
+                    secret: Secret::new(renewed.secret),
                     expires_at: renewed.expires_at,
                 },
-                refresh: renewed.refresh_token,
+                refresh: renewed.refresh_token.map(Secret::new),
             })
             .map_err(|err| {
                 if azure::rejects_refresh(&err) {
@@ -812,15 +809,18 @@ fn entra_renewal(
     });
     Arc::new(EntraTokens::on_system_clock(
         Token {
-            secret: token.secret.clone(),
+            secret: Secret::new(token.secret.clone()),
             expires_at: token.expires_at,
         },
-        token.refresh_token.clone(),
+        token.refresh_token.clone().map(Secret::new),
         matches!(entra, EntraAuth::ManagedIdentity { .. }),
         renew,
     ))
 }
 
+/// The opener a *silent* acquisition passes: it refuses to open a browser, so
+/// an interactive sign-in with no usable refresh token errors here and the
+/// flow can park the sign-in card instead of popping a window unasked.
 fn refuse_browser(_url: &str) -> Result<(), azure::AzureError> {
     Err(azure::AzureError::Browser(
         "interactive sign-in required".to_string(),
@@ -2867,48 +2867,254 @@ mod tests {
         );
     }
 
-    /// A pool's token renewal writes no secret anywhere and cannot sign in
-    /// interactively: the whole of it — the provider (`db/entra.rs`), the
-    /// renewal the connect builds for it, and `azure::renew_silently` — names
-    /// no keyring or session-memory access and no browser path. The refresh
-    /// token's homes stay exactly the ones `keep_entra_refresh` chose by the
-    /// user's answer, and a rotated token never moves into the keyring.
-    #[test]
-    fn a_pools_token_renewal_stores_nothing_and_never_opens_a_browser() {
-        let provider = include_str!("../../db/entra.rs");
-        let provider = provider
-            .split("#[cfg(test)]")
-            .next()
-            .expect("the shipped half");
-        let glue = method_body(include_str!("connect.rs"), "fn entra_renewal(");
-        let renew = method_body(
-            include_str!("../../azure.rs"),
-            "pub async fn renew_silently(",
-        );
-        for (what, body) in [
-            ("db/entra.rs", provider.to_string()),
-            ("entra_renewal", glue),
-            ("azure::renew_silently", renew),
-        ] {
-            let code = code_of(&body);
-            for forbidden in [
-                "secrets::",
-                "session_passwords",
-                "keep_entra_refresh",
-                "place_entra_refresh",
-                "forget_entra_refresh",
-                "acquire_interactive",
-                "acquire_token",
-                "open_browser",
-                "webbrowser",
-            ] {
-                assert!(
-                    !code.contains(forbidden),
-                    "{what} reaches `{forbidden}`: a pool's renewal must store, delete \
-                     and prompt for nothing"
-                );
+    /// The calls of `macro_name` (`"format!("`, say) in `code`, each as the
+    /// text between its parentheses.
+    fn macro_calls(code: &str, macro_name: &str) -> Vec<String> {
+        let mut calls = Vec::new();
+        for (at, _) in code.match_indices(macro_name) {
+            let preceded = code[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+            if preceded {
+                continue;
+            }
+            let body = &code[at + macro_name.len()..];
+            let (mut depth, mut in_str, mut escaped) = (1usize, false, false);
+            for (offset, ch) in body.char_indices() {
+                match (in_str, ch) {
+                    (true, '\\') if !escaped => {
+                        escaped = true;
+                        continue;
+                    }
+                    (true, '"') if !escaped => in_str = false,
+                    (false, '"') => in_str = true,
+                    (false, '(') => depth += 1,
+                    (false, ')') => {
+                        depth -= 1;
+                        if depth == 0 {
+                            calls.push(body[..offset].to_string());
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                escaped = false;
             }
         }
+        calls
+    }
+
+    /// What of a macro call can name a binding: the code outside its string
+    /// literals, and the `{…}` placeholders inside them. A literal's own words
+    /// ("token endpoint") are not a value being formatted.
+    fn formatted_names(call: &str) -> String {
+        let (mut out, mut in_str, mut in_hole, mut escaped) = (String::new(), false, false, false);
+        for ch in call.chars() {
+            if in_str {
+                match ch {
+                    '\\' if !escaped => {
+                        escaped = true;
+                        continue;
+                    }
+                    '"' if !escaped => in_str = false,
+                    '{' => in_hole = true,
+                    '}' => {
+                        in_hole = false;
+                        out.push(' ');
+                    }
+                    _ if in_hole => out.push(ch),
+                    _ => {}
+                }
+                escaped = false;
+            } else if ch == '"' {
+                in_str = true;
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    /// Every function an Entra token travels through after the sign-in — the
+    /// whole wire, named in one place: the connect's renewal (`entra_renewal`)
+    /// and the open that hands it to the pool, the provider (`db/entra.rs`),
+    /// the silent renewal and the token endpoint calls under it, and each
+    /// login that asks for a token — SQL Server's per connection, Postgres's
+    /// task and its pre-run renewal, and the registry hooks that call it.
+    /// It starts after `finish_entra_connect`, whose one keyring write — the
+    /// refresh token, where the user's answer says — is the remember wire's
+    /// (`the_entra_remember_answer_is_not_inverted_at_any_hop_of_its_wire`).
+    ///
+    /// None of it may store, delete or read a secret from the keyring or
+    /// session memory — including a bare call after a `use` — prompt or open
+    /// a browser, log anything, or format a token, refresh token or password
+    /// into text. The token's own type ([`crate::db::entra::Secret`]) prints
+    /// `<redacted>`, so a `{}` of it gives nothing away; this catches the
+    /// exposed value and the raw strings around the edges.
+    #[test]
+    fn an_entra_tokens_wire_stores_logs_and_prompts_for_nothing() {
+        let connect = include_str!("connect.rs");
+        let azure = include_str!("../../azure.rs");
+        let postgres = include_str!("../../db/postgres.rs");
+        let mssql = include_str!("../../db/sqlserver/pool.rs");
+        let registry = include_str!("../../db/registry.rs");
+        let provider = include_str!("../../db/entra.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the shipped half")
+            .to_string();
+        let wire = [
+            ("db/entra.rs", provider),
+            ("entra_renewal", method_body(connect, "fn entra_renewal(")),
+            (
+                "ServerBackend::open",
+                method_body(connect, "async fn open("),
+            ),
+            (
+                "azure::renew_silently",
+                method_body(azure, "pub async fn renew_silently("),
+            ),
+            (
+                "azure::redeem_refresh_token",
+                method_body(azure, "async fn redeem_refresh_token("),
+            ),
+            (
+                "azure::post_token",
+                method_body(azure, "async fn post_token("),
+            ),
+            (
+                "azure::acquire_managed_identity",
+                method_body(azure, "async fn acquire_managed_identity("),
+            ),
+            (
+                "postgres::renew_login",
+                method_body(postgres, "pub(super) async fn renew_login(pool"),
+            ),
+            (
+                "PgConn::renew_login",
+                method_body(postgres, "pub(super) async fn renew_login(&self)"),
+            ),
+            (
+                "postgres::open_postgres_entra",
+                method_body(postgres, "pub async fn open_postgres_entra("),
+            ),
+            (
+                "postgres::open_postgres_entra_every",
+                method_body(postgres, "pub async fn open_postgres_entra_every("),
+            ),
+            (
+                "sqlserver login_config",
+                method_body(mssql, "async fn login_config("),
+            ),
+            (
+                "sqlserver open_mssql_with",
+                method_body(mssql, "pub async fn open_mssql_with("),
+            ),
+            (
+                "DbPool::begin_script_tx",
+                method_body(registry, "pub async fn begin_script_tx("),
+            ),
+            (
+                "DbPool::acquire_script_conn",
+                method_body(registry, "pub(super) async fn acquire_script_conn("),
+            ),
+            (
+                "DbPool::begin_read_only_run",
+                method_body(registry, "pub(super) async fn begin_read_only_run("),
+            ),
+            (
+                "DbPool::open_postgres_entra",
+                method_body(registry, "pub async fn open_postgres_entra("),
+            ),
+            (
+                "DbPool::open_postgres_entra_renewing_every",
+                method_body(registry, "pub async fn open_postgres_entra_renewing_every("),
+            ),
+        ];
+        const FORBIDDEN: &[&str] = &[
+            // Keyring and session memory, qualified or bare.
+            "secrets",
+            "keyring",
+            "get_password",
+            "store_password",
+            "delete_password",
+            "session_passwords",
+            "keep_entra_refresh",
+            "place_entra_refresh",
+            "forget_entra_refresh",
+            // A sign-in the user did not start.
+            "acquire_interactive",
+            "acquire_token",
+            "open_browser",
+            "webbrowser",
+            // Logging of any kind.
+            "println!",
+            "eprintln!",
+            "print!",
+            "eprint!",
+            "dbg!",
+            "log::",
+            "tracing::",
+        ];
+        const FORMATTERS: &[&str] = &[
+            "format!(",
+            "format_args!(",
+            "write!(",
+            "writeln!(",
+            "panic!(",
+        ];
+        const TOKEN_NAMES: &[&str] = &["secret", "token", "refresh", "password", "expose"];
+        for (what, body) in wire {
+            let code = code_of(&body);
+            for forbidden in FORBIDDEN {
+                assert!(
+                    !code.contains(forbidden),
+                    "{what} reaches `{forbidden}`: an Entra token's wire must store, \
+                     delete, log and prompt for nothing"
+                );
+            }
+            for formatter in FORMATTERS {
+                for call in macro_calls(&code, formatter) {
+                    let names = formatted_names(&call);
+                    for name in TOKEN_NAMES {
+                        assert!(
+                            !names.to_lowercase().contains(name),
+                            "{what} formats `{name}` into text: {formatter}{call})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The scan above, shown to catch what it is for: a token or password
+    /// logged or formatted, a bare keyring call, and not a literal's words.
+    #[test]
+    fn the_token_wire_scan_sees_a_leak() {
+        let leaks = [
+            "eprintln!(\"{}\", token.expose());",
+            "let t = format!(\"{}\", password);",
+            "let t = format!(\"{password}\");",
+            "store_password_async(key, refresh).await;",
+        ];
+        for leak in leaks {
+            let code = code_of(leak);
+            let caught = ["eprintln!", "store_password"]
+                .iter()
+                .any(|f| code.contains(f))
+                || macro_calls(&code, "format!(").iter().any(|call| {
+                    let names = formatted_names(call).to_lowercase();
+                    names.contains("password") || names.contains("token")
+                });
+            assert!(caught, "the scan missed: {leak}");
+        }
+        let literal = "let url = format!(\"{}/oauth2/v2.0/token\", endpoints.login);";
+        let names = formatted_names(&macro_calls(literal, "format!(")[0]);
+        assert!(
+            !names.contains("token"),
+            "a literal's word was read as a binding"
+        );
     }
 
     /// The renewal the connect builds for an interactive sign-in that kept no

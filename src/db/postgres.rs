@@ -202,7 +202,7 @@ const RENEW_EVERY: Duration = Duration::from_secs(60);
 /// those logins working past the first token's hour.
 pub(super) async fn renew_login(pool: &PgPool, tokens: &EntraTokens) -> Result<(), DbError> {
     let token = tokens.current().await?;
-    let options = (*pool.connect_options()).clone().password(&token);
+    let options = (*pool.connect_options()).clone().password(token.expose());
     pool.set_connect_options(options);
     Ok(())
 }
@@ -215,12 +215,23 @@ pub(super) async fn renew_login(pool: &PgPool, tokens: &EntraTokens) -> Result<(
 /// that has just expired, and an expired sign-in that cannot be renewed fails
 /// it with a reason rather than the server's password error.
 pub async fn open_postgres_entra(url: &str, tokens: Arc<EntraTokens>) -> Result<PgConn, DbError> {
+    open_postgres_entra_every(url, tokens, RENEW_EVERY).await
+}
+
+/// [`open_postgres_entra`] with the renewal task's interval chosen by the
+/// caller. Only a test passes anything but [`RENEW_EVERY`]: one that must see
+/// the task renew without waiting a minute.
+pub async fn open_postgres_entra_every(
+    url: &str,
+    tokens: Arc<EntraTokens>,
+    every: Duration,
+) -> Result<PgConn, DbError> {
     let mut conn = open_postgres(url).await?;
     let pool = conn.pool.clone();
     let task_tokens = Arc::clone(&tokens);
     let renewer = tokio::spawn(async move {
         loop {
-            tokio::time::sleep(RENEW_EVERY).await;
+            tokio::time::sleep(every).await;
             if pool.is_closed() {
                 break;
             }
