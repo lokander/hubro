@@ -1318,17 +1318,82 @@ fn remember_hint(
 /// connects (`submit_server_form` hands it to the same
 /// `stored_password_after_connect` decision the prompt does).
 ///
-/// Editing a saved connection gets the hedged line. The form cannot know
-/// whether that connection has a stored copy without reading the keyring as
-/// it opens, which could raise an unlock dialog for a form the user may only
-/// be renaming. A new connection gets none: nothing has stored a password for
-/// it yet.
-fn form_remember_hint(editing: bool) -> Option<&'static str> {
+/// The form cannot know whether a stored copy exists without reading the
+/// keyring as it opens, which could raise an unlock dialog for a form the user
+/// may only be renaming, so wherever one can exist it gets the hedged line:
+/// when editing a saved connection, and when `url` — the locator the fields
+/// currently build, which is the account the keyring files a password under —
+/// is a saved connection's locator. Adding a connection whose URL matches a
+/// saved one is that saved connection as far as the keyring is concerned, and
+/// a different password connecting unticked deletes its entry. Any other new
+/// connection gets no line: nothing saved can have stored a password under its
+/// locator. (`url` is `None` while the fields do not build one.)
+fn form_remember_hint(
+    editing: bool,
+    url: Option<&str>,
+    saved: &[SavedConnection],
+) -> Option<&'static str> {
     use super::state::{PromptKind, StoredCopy};
-    if editing {
+    let saved_locator = url.is_some_and(|url| saved.iter().any(|entry| entry.locator() == url));
+    if editing || saved_locator {
         remember_hint(PromptKind::DbPassword, StoredCopy::Unknown)
     } else {
         None
+    }
+}
+
+/// The locator the Postgres form's fields build: what its submit connects,
+/// saves, and keys the keyring under.
+fn postgres_form_url(
+    use_url: bool,
+    pasted: &str,
+    host: &str,
+    port: &str,
+    database: &str,
+    user: &str,
+    sslmode: &str,
+) -> Result<String, crate::db::DbError> {
+    if use_url {
+        crate::db::normalize_pg_url(pasted)
+    } else {
+        crate::db::build_url(host, port, database, user, sslmode)
+    }
+}
+
+/// The locator the SQL Server form's fields build — the encrypt option and
+/// the trust-server-certificate flag are SQL Server's alone. What its submit
+/// connects, saves, and keys the keyring under.
+#[allow(clippy::too_many_arguments)]
+fn sqlserver_form_url(
+    use_url: bool,
+    pasted: &str,
+    host: &str,
+    port: &str,
+    database: &str,
+    user: &str,
+    encrypt: &str,
+    trust_cert: bool,
+) -> Result<String, crate::db::DbError> {
+    if use_url {
+        crate::db::normalize_mssql_url(pasted)
+    } else {
+        crate::db::build_mssql_url(host, port, database, user, encrypt).map(|built| {
+            if trust_cert {
+                // build_mssql_url writes only the encrypt param; splice the
+                // trust flag in after it. The URL it returned always parses.
+                match url::Url::parse(&built) {
+                    Ok(mut parsed) => {
+                        parsed
+                            .query_pairs_mut()
+                            .append_pair("trustServerCertificate", "true");
+                        String::from(parsed)
+                    }
+                    Err(_) => built,
+                }
+            } else {
+                built
+            }
+        })
     }
 }
 
@@ -1753,17 +1818,15 @@ fn PostgresForm(
     let submit = move || {
         // The URL is this form's own step; everything else is the shared
         // pipeline.
-        let built = if *use_url.peek() {
-            crate::db::normalize_pg_url(&pasted_url.peek())
-        } else {
-            crate::db::build_url(
-                &host.peek(),
-                &port.peek(),
-                &database.peek(),
-                &user.peek(),
-                &sslmode.peek(),
-            )
-        };
+        let built = postgres_form_url(
+            *use_url.peek(),
+            &pasted_url.peek(),
+            &host.peek(),
+            &port.peek(),
+            &database.peek(),
+            &user.peek(),
+            &sslmode.peek(),
+        );
         // Cloned per attempt: the submit takes ownership, and `submit` has to
         // stay FnMut.
         submit_server_form(
@@ -1776,6 +1839,22 @@ fn PostgresForm(
         );
     };
 
+    // Read at render, so the line follows the fields as they are typed.
+    let remember_note = form_remember_hint(
+        editing,
+        postgres_form_url(
+            use_url(),
+            &pasted_url(),
+            &host(),
+            &port(),
+            &database(),
+            &user(),
+            &sslmode(),
+        )
+        .ok()
+        .as_deref(),
+        state.saved.read().entries(),
+    );
     let field_class = FORM_FIELD_CLASS;
     rsx! {
         // Opaque, and a step above the page's slate-950: this renders over the
@@ -1880,7 +1959,7 @@ fn PostgresForm(
                         }
                         "Remember in the system keyring (falls back to this session only)"
                     }
-                    if let Some(hint) = form_remember_hint(editing) {
+                    if let Some(hint) = remember_note {
                         p { class: "text-xs text-amber-700 dark:text-amber-400", "{hint}" }
                     }
                 }
@@ -1978,34 +2057,16 @@ fn SqlServerForm(
         // The URL is this form's own step — the encrypt option and the
         // trust-server-certificate flag are SQL Server's alone; everything
         // else is the shared pipeline.
-        let built = if *use_url.peek() {
-            crate::db::normalize_mssql_url(&pasted_url.peek())
-        } else {
-            crate::db::build_mssql_url(
-                &host.peek(),
-                &port.peek(),
-                &database.peek(),
-                &user.peek(),
-                &encrypt.peek(),
-            )
-            .map(|built| {
-                if *trust_cert.peek() {
-                    // build_mssql_url writes only the encrypt param; splice the
-                    // trust flag in after it. The URL it returned always parses.
-                    match url::Url::parse(&built) {
-                        Ok(mut parsed) => {
-                            parsed
-                                .query_pairs_mut()
-                                .append_pair("trustServerCertificate", "true");
-                            String::from(parsed)
-                        }
-                        Err(_) => built,
-                    }
-                } else {
-                    built
-                }
-            })
-        };
+        let built = sqlserver_form_url(
+            *use_url.peek(),
+            &pasted_url.peek(),
+            &host.peek(),
+            &port.peek(),
+            &database.peek(),
+            &user.peek(),
+            &encrypt.peek(),
+            *trust_cert.peek(),
+        );
         // Cloned per attempt: the submit takes ownership, and `submit` has to
         // stay FnMut.
         submit_server_form(
@@ -2018,6 +2079,23 @@ fn SqlServerForm(
         );
     };
 
+    // Read at render, so the line follows the fields as they are typed.
+    let remember_note = form_remember_hint(
+        editing,
+        sqlserver_form_url(
+            use_url(),
+            &pasted_url(),
+            &host(),
+            &port(),
+            &database(),
+            &user(),
+            &encrypt(),
+            trust_cert(),
+        )
+        .ok()
+        .as_deref(),
+        state.saved.read().entries(),
+    );
     let field_class = FORM_FIELD_CLASS;
     rsx! {
         // Opaque over the modal backdrop, matching the Postgres form.
@@ -2129,7 +2207,7 @@ fn SqlServerForm(
                         }
                         "Remember in the system keyring (falls back to this session only)"
                     }
-                    if let Some(hint) = form_remember_hint(editing) {
+                    if let Some(hint) = remember_note {
                         p { class: "text-xs text-amber-700 dark:text-amber-400", "{hint}" }
                     }
                 }
@@ -2234,19 +2312,64 @@ mod tests {
     }
 
     #[test]
-    fn the_form_hedges_about_a_stored_password_only_when_editing_a_saved_one() {
+    fn the_form_hedges_about_a_stored_password_wherever_one_can_be_stored() {
         use super::super::state::{PromptKind, StoredCopy};
-        assert_eq!(
-            form_remember_hint(true),
-            remember_hint(PromptKind::DbPassword, StoredCopy::Unknown),
-            "an edited connection may have a stored password the form cannot see"
-        );
-        assert!(form_remember_hint(true).is_some());
-        assert_eq!(
-            form_remember_hint(false),
-            None,
-            "a new connection has nothing stored to warn about"
-        );
+        let hedged = remember_hint(PromptKind::DbPassword, StoredCopy::Unknown);
+        assert!(hedged.is_some());
+        // Built the way the form builds them, so the match is on the exact
+        // string the keyring files the password under.
+        let typed = postgres_form_url(false, "", "db", "5432", "prod", "app", "prefer").unwrap();
+        let pasted = postgres_form_url(
+            true,
+            "postgres://app:hunter2@DB/prod?sslmode=prefer",
+            "",
+            "",
+            "",
+            "",
+            "",
+        )
+        .unwrap();
+        let other = postgres_form_url(false, "", "db", "5432", "other", "app", "prefer").unwrap();
+        let saved = [SavedConnection::Postgres {
+            name: "prod".to_string(),
+            url: typed.clone(),
+            tunnel: None,
+            auth: ServerAuth::Password,
+            protection: Default::default(),
+            color: None,
+            group: None,
+        }];
+        for (editing, url, expected, why) in [
+            (
+                true,
+                None,
+                hedged,
+                "an edited connection may have a stored password",
+            ),
+            (
+                false,
+                Some(typed.as_str()),
+                hedged,
+                "adding a saved connection's URL again is that connection to the \
+                 keyring, and an unticked different password deletes its entry",
+            ),
+            (
+                false,
+                Some(pasted.as_str()),
+                hedged,
+                "the same connection pasted with a password in it is still that \
+                 locator",
+            ),
+            (
+                false,
+                Some(other.as_str()),
+                None,
+                "a new locator has nothing saved under it",
+            ),
+            (false, None, None, "fields that build no URL match nothing"),
+        ] {
+            assert_eq!(form_remember_hint(editing, url, &saved), expected, "{why}");
+        }
     }
 
     #[test]
