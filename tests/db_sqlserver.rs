@@ -3246,6 +3246,8 @@ async fn sqlserver_a_temp_table_batch_that_loses_the_transaction_stops_the_scrip
     // transaction gone, the INSERT after it ran in autocommit and kept its
     // row, and the run failed only at its COMMIT (3902). Through
     // `sp_executesql`, 266 had stopped it at once with nothing kept.
+    // A failed earlier run's trigger is dropped first, and the database is
+    // this process's own, so a leftover reaches no other suite.
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
@@ -3285,6 +3287,16 @@ async fn sqlserver_a_temp_table_batch_that_loses_the_transaction_stops_the_scrip
             ),
             "affected 1",
             "statement 2 failed [None]",
+        ),
+        // Through the read path: a creator led by `SELECT … INTO #t`.
+        (
+            "INSERT INTO dbo.lost_tx VALUES (0)\nGO\n\
+             SELECT 1 AS a INTO #rt BEGIN TRY CREATE TABLE dbo.lost_tx_refused (a int) \
+             END TRY BEGIN CATCH PRINT 'x' END CATCH\nGO\n\
+             INSERT INTO dbo.lost_tx VALUES (1)"
+                .to_string(),
+            "affected 1",
+            "statement 1 failed [AlreadyEnded]",
         ),
     ];
     for (sql, ran, failed) in cases {

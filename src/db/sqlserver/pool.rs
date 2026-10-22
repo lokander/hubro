@@ -939,9 +939,14 @@ async fn run_statement(client: &mut TdsClient, sql: &str, batch: bool) -> Result
 /// Runs a raw SQL batch (no parameters, results discarded) — the vehicle for
 /// `BEGIN TRAN`/`COMMIT`/`ROLLBACK` and session `SET` options, which must run
 /// as plain batches rather than through `sp_executesql`.
+///
+/// Each row is dropped as it arrives, as the RPC path's `execute` drops them:
+/// a temp-table creator can trail a `SELECT`, and buffering its result
+/// (`into_results`) measured 600 MB peak for 5M rows, against 16 MB for the
+/// same statement through `sp_executesql`.
 async fn run_batch(client: &mut TdsClient, sql: &str) -> Result<(), TdsError> {
-    let stream = client.simple_query(sql).await?;
-    stream.into_results().await?;
+    let mut stream = client.simple_query(sql).await?;
+    while stream.try_next().await?.is_some() {}
     Ok(())
 }
 
@@ -993,7 +998,7 @@ impl TransactionChanged {
         DbError::Query(format!(
             "the statement changed the open transaction (@@TRANCOUNT {} before it, {} after, \
              or another transaction in its place) without an error reaching hubro — a trigger \
-             or a deadlock can roll it back inside TRY…CATCH. It ran as a plain batch so its \
+             can roll it back inside TRY…CATCH. It ran as a plain batch so its \
              temp table could outlast it, and is stopped here as error 266 would stop it \
              through sp_executesql",
             count(self.before),
@@ -1020,9 +1025,12 @@ fn transaction_unchanged(
 /// `@@TRANCOUNT` changed, *whatever* changed it. A word list cannot stand in
 /// for that — measured in review, a temp-table creator inside `BEGIN TRY …
 /// END TRY BEGIN CATCH … END CATCH` whose DDL a database trigger rolled back
-/// (3609; a deadlock victim, 1205, the same) returned normally with hubro's
-/// transaction gone, and the `INSERT` after it ran in autocommit and
-/// persisted under a run reported as failed. The state is read in requests of
+/// (3609) returned normally with hubro's transaction gone, and the `INSERT`
+/// after it ran in autocommit and persisted under a run reported as failed.
+/// A deadlock victim (1205) does not get that far: measured, it dooms the
+/// transaction, and the server ends the batch with 3998 on either route. The
+/// transaction id catches what 266 never did: a trigger that rolls back and
+/// opens another, leaving the count as it was. The state is read in requests of
 /// its own rather than appended to the statement's text: a batch can end
 /// early (`RETURN`) and carries result sets of its own. Two round trips, for
 /// temp-table creators only.
