@@ -41,7 +41,9 @@ use crate::db::entra::{EntraTokens, Secret};
 use crate::db::error::DbError;
 use crate::db::export::{export_io_err, ExportFormat, ExportSink};
 use crate::db::registry::RolledBack;
-use crate::db::script::{final_read_may_close, statement_needs, tsql_route, TsqlRoute};
+use crate::db::script::{
+    final_read_may_close, statement_needs, tsql_route, RowsAffected, TsqlRoute,
+};
 use crate::db::staged::CheckedStatement;
 use crate::db::value::{cap_value, ColumnInfo, QueryResult, Value};
 
@@ -856,8 +858,8 @@ async fn read_first_result_set<S: RowSink>(
 
 /// Runs a parameterized non-row statement via the driver's RPC path,
 /// returning every affected-row count its response carried, in arrival order:
-/// one per statement the server ran on its behalf, *triggers included*. Read
-/// it with [`statement_rows`] or sum it, and say which.
+/// one per statement the server ran on its behalf that sent one (none does
+/// under `NOCOUNT ON`), *triggers included*. Read it with [`statement_rows`] or [`script_rows_affected`], and say which.
 async fn run_execute(
     client: &mut TdsClient,
     sql: &str,
@@ -900,11 +902,11 @@ fn statement_rows(counts: &[u64]) -> u64 {
     counts.last().copied().unwrap_or(0)
 }
 
-/// Runs one script statement that returns no rows, reporting its affected
-/// rows. A statement SQL Server only accepts at the head of a batch
+/// Runs one script statement that returns no rows, reporting what it said
+/// about the rows it affected ([`script_rows_affected`]). A statement SQL
+/// Server only accepts at the head of a batch
 /// ([`tsql_leads_own_batch`](crate::db::script::tsql_leads_own_batch)) cannot go through `sp_executesql`, so it runs as
-/// a plain batch instead; nothing it does counts as an affected row, so it
-/// reports 0.
+/// a plain batch instead.
 ///
 /// Bare transaction control (`BEGIN TRAN`, `COMMIT`, `ROLLBACK`:
 /// [`tsql_is_transaction_control`](crate::db::script::tsql_is_transaction_control)) runs as a plain batch too. Inside
@@ -918,21 +920,55 @@ fn statement_rows(counts: &[u64]) -> u64 {
 /// ([`tsql_creates_temp_table`](crate::db::script::tsql_creates_temp_table)),
 /// and the caller checks it with [`checked_batch`]. `batch` is whether
 /// [`tsql_route`] sends it as a plain batch, for all three. A plain batch
-/// reports 0: tiberius's `simple_query` carries no affected-row counts at
-/// all, which is why a statement that writes rows is never sent as one.
-///
-/// The report is the *sum* of every count, trigger rows included — unlike
-/// [`statement_rows`], and deliberately: a script statement is a whole `GO`
-/// batch, and its several statements' counts arrive as the same token as
-/// their triggers', so no rule over the counts can tell the batch's own rows
-/// from theirs. The sum is what SQL Server reported; nothing is held to it.
-async fn run_statement(client: &mut TdsClient, sql: &str, batch: bool) -> Result<u64, TdsError> {
+/// reports [`RowsAffected::Unreported`]: tiberius's `simple_query` carries
+/// no affected-row counts at all, which is why a statement that writes rows
+/// is never sent as one — but a `SELECT … INTO #t` is, and it copies rows.
+async fn run_statement(
+    client: &mut TdsClient,
+    sql: &str,
+    batch: bool,
+) -> Result<RowsAffected, TdsError> {
     if batch {
-        run_batch(client, sql).await.map(|()| 0)
+        run_batch(client, sql)
+            .await
+            .map(|()| RowsAffected::Unreported)
     } else {
         run_execute(client, sql, &[])
             .await
-            .map(|counts| counts.iter().sum())
+            .map(|counts| script_rows_affected(&counts))
+    }
+}
+
+/// What a script statement's counts say about the rows it affected — unlike
+/// [`statement_rows`], which takes the last count as the statement's own.
+/// A script statement is the text between two separators (`;` or `GO`), and
+/// that can be several T-SQL statements — an `EXEC`, a `BEGIN … END`, an
+/// `IF`, statements written without semicolons — whose counts arrive as the
+/// same `DONEINPROC` token as their triggers'. tiberius 0.13 keeps the token
+/// kinds to itself (`ExecuteResult` is a bare `Vec<u64>`; `TokenDone` is not
+/// exported), and they would not help: through `sp_executesql` every count
+/// is a `DONEINPROC`, the statement's own and its triggers' alike. So no rule
+/// over the counts can tell the statement's rows from its triggers'.
+///
+/// - **None**: [`RowsAffected::Unreported`]. Measured, a statement run under
+///   `SET NOCOUNT ON` — `SET NOCOUNT ON` itself included — sends no count at
+///   all, where a statement that counts nothing (DDL) sends one that tiberius
+///   reads as 0.
+/// - **One**: [`RowsAffected::Exact`]. Nothing else reported a count, so
+///   there is nothing to tell it from. Measured, a trigger under `NOCOUNT ON`
+///   (the usual way to write one) sends no count either, so `[1]` for an
+///   `INSERT` whose trigger wrote two more rows elsewhere — the statement's
+///   own row. The one way the count is not the statement's is a statement
+///   under its own `NOCOUNT ON` whose trigger turns it off.
+/// - **Several**: [`RowsAffected::Summed`], their sum, which the result line
+///   says may hold trigger rows. Measured, `[3, 1]` for an `INSERT` of one
+///   row whose trigger wrote three. Zeros from statements that count nothing
+///   are among them and change nothing.
+fn script_rows_affected(counts: &[u64]) -> RowsAffected {
+    match counts {
+        [] => RowsAffected::Unreported,
+        [only] => RowsAffected::Exact(*only),
+        several => RowsAffected::Summed(several.iter().sum()),
     }
 }
 
@@ -1070,9 +1106,9 @@ pub async fn query_with(
     Ok(result)
 }
 
-/// Executes a statement without decoding rows, returning the driver's
-/// affected-row count.
-pub async fn execute(pool: &MssqlPool, sql: &str) -> Result<u64, DbError> {
+/// Executes a statement without decoding rows, returning what it reported
+/// about the rows it affected ([`script_rows_affected`]).
+pub async fn execute(pool: &MssqlPool, sql: &str) -> Result<RowsAffected, DbError> {
     let mut conn = pool.acquire().await?;
     // Never a checked batch: that route is a run's own connection's.
     let batch = tsql_route(sql, false) != TsqlRoute::Rpc;
@@ -1315,7 +1351,7 @@ pub async fn begin_tx(pool: &MssqlPool) -> Result<MssqlTx, DbError> {
 /// Runs a non-row statement in the script transaction, returning affected
 /// rows. Errors (instead of panicking) when an earlier fatal failure already
 /// discarded the transaction's connection.
-pub async fn execute_conn(tx: &mut MssqlTx, sql: &str) -> Result<u64, DbError> {
+pub async fn execute_conn(tx: &mut MssqlTx, sql: &str) -> Result<RowsAffected, DbError> {
     execute_held(&mut tx.conn, tx.discard_after, sql).await
 }
 
@@ -1326,7 +1362,7 @@ async fn execute_held(
     conn: &mut PooledConn,
     held_for_run: bool,
     sql: &str,
-) -> Result<u64, DbError> {
+) -> Result<RowsAffected, DbError> {
     if conn.is_discarded() {
         return Err(lost_connection());
     }
@@ -1458,7 +1494,10 @@ pub async fn acquire_script_conn(pool: &MssqlPool) -> Result<MssqlScriptConn, Db
 }
 
 /// [`execute_conn`] on a script's held connection.
-pub async fn execute_script_conn(conn: &mut MssqlScriptConn, sql: &str) -> Result<u64, DbError> {
+pub async fn execute_script_conn(
+    conn: &mut MssqlScriptConn,
+    sql: &str,
+) -> Result<RowsAffected, DbError> {
     execute_held(&mut conn.conn, true, sql).await
 }
 
@@ -2025,6 +2064,38 @@ mod tests {
         ];
         for (case, counts, expected) in cases {
             assert_eq!(statement_rows(counts), *expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn a_script_statement_sums_only_when_it_cannot_tell_its_rows_from_triggers() {
+        // The sequences SQL Server 2022 sent for one script statement through
+        // `sp_executesql`.
+        let cases: &[(&str, &[u64], RowsAffected)] = &[
+            ("an insert of one row", &[1], RowsAffected::Exact(1)),
+            ("an update matching nothing", &[0], RowsAffected::Exact(0)),
+            // A trigger under NOCOUNT ON sends nothing, so the one count is
+            // the statement's own.
+            (
+                "an insert whose NOCOUNT trigger wrote two rows",
+                &[1],
+                RowsAffected::Exact(1),
+            ),
+            (
+                "an insert of one row whose trigger wrote three",
+                &[3, 1],
+                RowsAffected::Summed(4),
+            ),
+            (
+                "two creates in one statement",
+                &[0, 0],
+                RowsAffected::Summed(0),
+            ),
+            // Not 0: rows may have changed with nothing said about them.
+            ("SET NOCOUNT ON", &[], RowsAffected::Unreported),
+        ];
+        for (case, counts, expected) in cases {
+            assert_eq!(script_rows_affected(counts), *expected, "{case}");
         }
     }
 

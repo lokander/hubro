@@ -1499,8 +1499,41 @@ pub fn statement_preview(sql: &str) -> String {
 pub enum StatementOutcome {
     /// A read: the fetched rows.
     Rows(QueryResult),
-    /// A write: the driver's affected-row count.
-    Affected(u64),
+    /// A write: what the driver reported about the rows it affected.
+    Affected(RowsAffected),
+}
+
+/// What a statement that returns no rows reported about the rows it affected
+/// — the number the result line states, and how far it can be read as the
+/// statement's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowsAffected {
+    /// One count, the statement's own. Every SQLite and Postgres write: their
+    /// counts (`changes()`, the command tag) already leave trigger work out.
+    Exact(u64),
+    /// Several counts added up: a SQL Server statement whose response carried
+    /// more than one — several T-SQL statements in one (an `EXEC`, a
+    /// `BEGIN … END`, statements written without semicolons), or one whose
+    /// triggers reported counts of their own. Which is which cannot be told
+    /// from the counts (`script_rows_affected` in the SQL Server backend), so
+    /// the result line says the sum may hold trigger rows.
+    Summed(u64),
+    /// No count at all: a SQL Server statement sent as a plain batch, which
+    /// the driver reads no counts from, or one run under `SET NOCOUNT ON`.
+    /// Reported as no number rather than as 0 — a `SELECT … INTO #t` that
+    /// copied rows went that way.
+    Unreported,
+}
+
+impl RowsAffected {
+    /// The number reported, and 0 for [`RowsAffected::Unreported`] — for the
+    /// callers that only ever held a count.
+    pub fn rows(self) -> u64 {
+        match self {
+            RowsAffected::Exact(n) | RowsAffected::Summed(n) => n,
+            RowsAffected::Unreported => 0,
+        }
+    }
 }
 
 /// One executed statement: its preview (for the result header) plus its

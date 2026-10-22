@@ -9,8 +9,8 @@ mod common;
 
 use common::FixtureDb;
 use hubro::db::{
-    run_script, split_statements, DbError, DbPool, OpenTransaction, Rollback, ScriptDone,
-    StatementOutcome, StatementResult, Value,
+    run_script, split_statements, DbError, DbPool, OpenTransaction, Rollback, RowsAffected,
+    ScriptDone, StatementOutcome, StatementResult, Value,
 };
 
 async fn pg_url() -> Option<String> {
@@ -87,8 +87,14 @@ async fn sqlite_script_rolls_back_the_whole_batch_on_error() {
 
     // Progress is reported for the statements that ran before the failure.
     assert_eq!(results.len(), 2);
-    assert_eq!(results[0].outcome, StatementOutcome::Affected(0));
-    assert_eq!(results[1].outcome, StatementOutcome::Affected(2));
+    assert_eq!(
+        results[0].outcome,
+        StatementOutcome::Affected(RowsAffected::Exact(0))
+    );
+    assert_eq!(
+        results[1].outcome,
+        StatementOutcome::Affected(RowsAffected::Exact(2))
+    );
     let err = outcome.unwrap_err();
     assert_eq!(err.statement_index, 2);
     assert_eq!(err.preview, "SELECT * FROM missing_table");
@@ -192,7 +198,10 @@ async fn sqlite_script_mixes_reads_and_writes() {
 
     outcome.unwrap();
     assert_eq!(results.len(), 3);
-    assert_eq!(results[0].outcome, StatementOutcome::Affected(3));
+    assert_eq!(
+        results[0].outcome,
+        StatementOutcome::Affected(RowsAffected::Exact(3))
+    );
     match &results[1].outcome {
         StatementOutcome::Rows(r) => {
             assert_eq!(
@@ -202,7 +211,10 @@ async fn sqlite_script_mixes_reads_and_writes() {
         }
         other => panic!("expected rows, got {other:?}"),
     }
-    assert_eq!(results[2].outcome, StatementOutcome::Affected(1));
+    assert_eq!(
+        results[2].outcome,
+        StatementOutcome::Affected(RowsAffected::Exact(1))
+    );
 
     pool.close().await;
 }
@@ -288,7 +300,10 @@ async fn postgres_script_rolls_back_the_whole_batch_on_error() {
     .await;
 
     assert_eq!(results.len(), 2);
-    assert_eq!(results[1].outcome, StatementOutcome::Affected(2));
+    assert_eq!(
+        results[1].outcome,
+        StatementOutcome::Affected(RowsAffected::Exact(2))
+    );
     let err = outcome.unwrap_err();
     assert_eq!(err.statement_index, 2);
     assert_eq!(
@@ -1264,7 +1279,7 @@ async fn sqlite_script_reports_no_rows_for_statements_that_change_none() {
         let got: Vec<_> = results
             .iter()
             .map(|r| match r.outcome {
-                StatementOutcome::Affected(n) => n,
+                StatementOutcome::Affected(RowsAffected::Exact(n)) => n,
                 ref other => panic!("{}: expected a count, got {other:?}", r.preview),
             })
             .collect();
