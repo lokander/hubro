@@ -163,13 +163,16 @@ pub(crate) mod tests {
     /// is the OS's store, so no integration test may name this module or the
     /// keyring crate. The other route there — a connect through an
     /// `AppState` — is closed by `no_integration_test_names_the_real_paths`.
-    /// Words inside string literals don't count: the help text's test asserts
-    /// that the help *mentions* the keyring.
+    /// The one allowed line is the help text's test asserting that the help
+    /// *mentions* the keyring, by its exact text.
     #[test]
     fn no_integration_test_reaches_the_keyring() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let found =
-            crate::config::tests::words_named_in(&root.join("tests"), &["secrets", "keyring"]);
+        let found = crate::config::tests::words_named_in(
+            &root.join("tests"),
+            &["secrets", "keyring"],
+            &["help.contains(\"keyring\"),"],
+        );
         assert!(
             found.is_empty(),
             "these reach the user's real keyring; drive the keyring from a \
