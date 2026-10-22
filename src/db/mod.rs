@@ -114,4 +114,4 @@ pub use staged::{
     apply_staged, AppliedCounts, CheckedStatement, RowLocator, StagedChange, StagedError,
 };
 pub use stats::{RowCount, TableStats};
-pub use value::{ColumnInfo, QueryResult, Value};
+pub use value::{ColumnInfo, QueryResult, RestOfRead, Value};

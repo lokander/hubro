@@ -22,8 +22,8 @@ use super::registry::{
     QUERY_CELL_CAP,
 };
 use super::sql::Dialect;
-use super::value::Capped;
 use super::value::QueryResult;
+use super::value::{Capped, RestOfRead};
 
 /// One lexed region of a SQL script. [`lex_regions`] is the single place
 /// that understands quote/comment/bracket/dollar-quote state — the statement
@@ -1565,20 +1565,19 @@ pub struct StatementResult {
     /// holds only the first N rows — the editor shows a "showing
     /// first N" indicator. Always false for writes.
     pub truncated: bool,
-    /// True when the server stopped a truncated read at the cap rather than
-    /// running it to its end — cancelled, or ended with its connection — so
-    /// whatever the rows past the cap would have done was not done. The
-    /// editor says so beside the truncation notice.
-    pub rest_cancelled: bool,
+    /// What became of the rest of a truncated read — whether the server
+    /// stopped the statement at the cap, and on what grounds. The editor says
+    /// so beside the truncation notice.
+    pub rest: RestOfRead,
 }
 
 /// A read's outcome as a run reports it: its rows, whether the row cap cut
 /// it short, and whether its rest was then stopped.
-fn rows_outcome(dialect: Dialect, capped: Capped) -> (StatementOutcome, bool, bool) {
+fn rows_outcome(dialect: Dialect, capped: Capped) -> (StatementOutcome, bool, RestOfRead) {
     (
         read_outcome(dialect, capped.result),
         capped.truncated,
-        capped.rest_cancelled,
+        capped.rest,
     )
 }
 
@@ -1911,14 +1910,14 @@ async fn run_script_sequential(
         } else {
             held.execute(statement)
                 .await
-                .map(|affected| (StatementOutcome::Affected(affected), false, false))
+                .map(|affected| (StatementOutcome::Affected(affected), false, RestOfRead::Ran))
         };
         match outcome {
-            Ok((outcome, truncated, rest_cancelled)) => on_result(StatementResult {
+            Ok((outcome, truncated, rest)) => on_result(StatementResult {
                 preview: statement_preview(statement),
                 outcome,
                 truncated,
-                rest_cancelled,
+                rest,
             }),
             Err(error) => {
                 failure = Some((statement_index, error));
@@ -2026,14 +2025,14 @@ async fn run_script_read_only(
         } else {
             held.execute(statement)
                 .await
-                .map(|affected| (StatementOutcome::Affected(affected), false, false))
+                .map(|affected| (StatementOutcome::Affected(affected), false, RestOfRead::Ran))
         };
         match result {
-            Ok((result, truncated, rest_cancelled)) => on_result(StatementResult {
+            Ok((result, truncated, rest)) => on_result(StatementResult {
                 preview: statement_preview(statement),
                 outcome: result,
                 truncated,
-                rest_cancelled,
+                rest,
             }),
             Err(error) => {
                 outcome = Err(ScriptError {
@@ -2091,14 +2090,14 @@ async fn run_script_atomic(
         } else {
             tx.execute(statement)
                 .await
-                .map(|affected| (StatementOutcome::Affected(affected), false, false))
+                .map(|affected| (StatementOutcome::Affected(affected), false, RestOfRead::Ran))
         };
         match outcome {
-            Ok((outcome, truncated, rest_cancelled)) => on_result(StatementResult {
+            Ok((outcome, truncated, rest)) => on_result(StatementResult {
                 preview: statement_preview(statement),
                 outcome,
                 truncated,
-                rest_cancelled,
+                rest,
             }),
             Err(error) => {
                 let found = tx.rollback().await;

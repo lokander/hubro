@@ -1579,7 +1579,7 @@ pub async fn finish_script_conn_with_read(
     cell_cap: usize,
 ) -> crate::db::registry::FinishedRead {
     use crate::db::registry::{AfterRead, FinishedRead};
-    use crate::db::value::Capped;
+    use crate::db::value::{Capped, RestOfRead};
     if !final_read_may_close(sql, crate::db::sql::Dialect::SqlServer) {
         let read = query_capped_held(&mut conn.conn, true, sql, max_rows, cell_cap)
             .await
@@ -1644,7 +1644,11 @@ pub async fn finish_script_conn_with_read(
                 read: Ok(Capped {
                     result,
                     truncated,
-                    rest_cancelled: truncated,
+                    rest: if truncated {
+                        RestOfRead::Stopped
+                    } else {
+                        RestOfRead::Ran
+                    },
                 }),
                 ended: Ok(open),
                 after: AfterRead::Close,

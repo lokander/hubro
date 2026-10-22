@@ -37,7 +37,7 @@ pub(super) use super::sqlx_common::Rest;
 use super::sqlx_common::{self, get};
 use super::staged::CheckedStatement;
 use super::stats::{size_bytes, RowCount, TableStats};
-use super::value::{real_from_f32, row_opt_text, row_text, Capped, QueryResult, Value};
+use super::value::{real_from_f32, row_opt_text, row_text, Capped, QueryResult, RestOfRead, Value};
 
 /// Splices a password into a Postgres URL — see [`super::url::with_password`].
 pub fn url_with_password(url: &str, password: &str) -> Result<String, DbError> {
@@ -867,7 +867,10 @@ pub async fn finish_script_conn_with_read(
     }
     if knows_whether_written(flavor) {
         if let Some(Probed {
-            session, in_block, ..
+            session,
+            in_block,
+            timeout_off,
+            ..
         }) = probe_session(conn, known).await
         {
             let target = CancelTarget::Backend(session);
@@ -876,6 +879,7 @@ pub async fn finish_script_conn_with_read(
                 target: &target,
                 sql,
                 unwritten_only: true,
+                timeout_off: Some(timeout_off),
             });
             let otherwise = if in_block { Rest::Leave } else { Rest::Read };
             let read = capped_read(conn, sql, max_rows, cell_cap, stopper, otherwise).await;
@@ -883,7 +887,7 @@ pub async fn finish_script_conn_with_read(
                 // Stopped by the close that follows.
                 return FinishedRead {
                     read: read.map(|capped| Capped {
-                        rest_cancelled: true,
+                        rest: RestOfRead::Stopped,
                         ..capped
                     }),
                     ended: Ok(true),
@@ -906,7 +910,7 @@ pub async fn finish_script_conn_with_read(
                     // Stopped by the close that follows.
                     return FinishedRead {
                         read: read.map(|capped| Capped {
-                            rest_cancelled: true,
+                            rest: RestOfRead::Stopped,
                             ..capped
                         }),
                         ended: Ok(true),
@@ -1094,19 +1098,29 @@ pub(super) fn knows_whether_written(flavor: PgFlavor) -> bool {
     }
 }
 
-/// The session `conn` runs on and whether it is inside a transaction
-/// block, in one round trip.
+/// What a writable read needs to know before it runs, in one round trip:
+/// the session, whether it is inside a transaction block, whether that
+/// transaction has written already, and whether `statement_timeout` is off.
 ///
-/// Sent as a simple query, where a statement outside a block is a
-/// transaction of its own and so starts when it does: measured, its
-/// `transaction_timestamp()` equalled its `statement_timestamp()` 200 times
-/// out of 200 outside a block, and never inside one. (Over the extended
-/// protocol the two differ outside a block too, so this needs `raw_sql`.)
+/// **Inside a block** is `transaction_timestamp() <> statement_timestamp()`,
+/// sent as a simple query, where a statement outside a block is a
+/// transaction of its own and starts when it does: measured, the two were
+/// equal 200 times out of 200 outside a block, and never inside one. (Over
+/// the extended protocol they differ outside a block too, so this needs
+/// `raw_sql`.) It rests on the timestamps' microsecond resolution: inside a
+/// block they could be equal only if the probe ran within the microsecond
+/// the transaction began, a round trip earlier. That wrong "outside" would
+/// leave a cancelled read without its savepoint, and the script's next
+/// statements would fail with "current transaction is aborted" — loudly, and
+/// with nothing written lost, since the transaction had written nothing. A
+/// wrong "inside" cannot happen (outside a block the two are one instant);
+/// it would only make the savepoint fail and the read be read to its end.
 const SESSION_PROBE: &str = "SELECT pg_backend_pid(), \
     (SELECT (extract(epoch FROM backend_start) * 1000000)::int8 \
      FROM pg_stat_activity WHERE pid = pg_backend_pid()), \
     transaction_timestamp() = statement_timestamp(), \
-    txid_current_if_assigned() IS NOT NULL";
+    txid_current_if_assigned() IS NOT NULL, \
+    current_setting('statement_timeout') = '0'";
 
 /// [`SESSION_PROBE`] without the start time, which only `pg_stat_activity`
 /// has: reading that view made the probe cost 0.5 ms a read on localhost,
@@ -1114,15 +1128,13 @@ const SESSION_PROBE: &str = "SELECT pg_backend_pid(), \
 /// has seen before is known already ([`probe_session`]).
 const BLOCK_PROBE: &str = "SELECT pg_backend_pid(), \
     transaction_timestamp() = statement_timestamp(), \
-    txid_current_if_assigned() IS NOT NULL";
+    txid_current_if_assigned() IS NOT NULL, \
+    current_setting('statement_timeout') = '0'";
 
-/// What a writable read needs to know before it runs: the session `conn`
-/// runs on, whether it is inside a transaction block, and whether that
-/// transaction has written already — in which case the read will not be
-/// cancelled, and needs no savepoint. [`BLOCK_PROBE`] when the backend is `known`'s, [`SESSION_PROBE`] (and
-/// `known` updated) when it is not — the first read of a run, or a pooler
-/// that moved the session to another backend. `None` when it cannot be had —
-/// the read is then read to its end.
+/// [`SESSION_PROBE`]'s answer — [`BLOCK_PROBE`]'s when the backend is
+/// `known`'s, the full probe (and `known` updated) when it is not: the first
+/// read of a run, or a pooler that moved the session to another backend.
+/// `None` when it cannot be had — the read is then read to its end.
 pub(super) async fn probe_session(
     conn: &mut sqlx::postgres::PgConnection,
     known: &mut Option<Session>,
@@ -1138,6 +1150,7 @@ pub(super) async fn probe_session(
                 session,
                 in_block: !row.try_get::<bool, _>(1).ok()?,
                 written: row.try_get(2).ok()?,
+                timeout_off: row.try_get(3).ok()?,
             });
         }
     }
@@ -1151,10 +1164,12 @@ pub(super) async fn probe_session(
         session,
         in_block: !row.try_get::<bool, _>(2).ok()?,
         written: row.try_get(3).ok()?,
+        timeout_off: row.try_get(4).ok()?,
     })
 }
 
 /// [`probe_session`]'s answer.
+#[derive(Debug, Clone, Copy)]
 pub(super) struct Probed {
     session: Session,
     in_block: bool,
@@ -1162,6 +1177,9 @@ pub(super) struct Probed {
     /// a block: a statement outside one is a transaction of its own, which
     /// has not started yet.
     written: bool,
+    /// `statement_timeout` is off, so a cancellation the read ends in cannot
+    /// be the timeout's ([`sqlx_common::cancel_landed`]).
+    timeout_off: bool,
 }
 
 /// The [`Session`] in a row's columns `at` and `at + 1`.
@@ -1196,6 +1214,9 @@ pub(super) struct Stopper<'a> {
     /// the engine refuses its writes, and its transaction is rolled back
     /// regardless.
     pub(super) unwritten_only: bool,
+    /// Whether the session's `statement_timeout` was off before the read
+    /// ([`sqlx_common::cancel_landed`]); `None` if not asked.
+    pub(super) timeout_off: Option<bool>,
 }
 
 impl Stopper<'_> {
@@ -1209,7 +1230,9 @@ impl Stopper<'_> {
         )
         .await;
         if matches!(sent, Ok(Ok(true))) {
-            Rest::Cancelled
+            Rest::Cancelled {
+                timeout_off: self.timeout_off,
+            }
         } else {
             otherwise
         }
@@ -1280,30 +1303,35 @@ async fn send_cancel(
 pub(super) async fn read_only_session(
     conn: &mut sqlx::postgres::PgConnection,
     flavor: PgFlavor,
-) -> Option<Session> {
+) -> Option<Probed> {
     if cancel_kind(flavor) != Some(CancelKind::Backend) {
         return None;
     }
-    probe_session(conn, &mut None)
-        .await
-        .map(|probed| probed.session)
+    probe_session(conn, &mut None).await
 }
 
-/// Who a marked connection's read is cancelled through: the run's
+/// Who a marked connection's read is cancelled through — the run's
 /// [`Session`], or on CockroachDB the session id, asked inside the
-/// statement's transaction (`CANCEL QUERIES` has no text to match).
+/// statement's transaction (`CANCEL QUERIES` has no text to match) — and
+/// whether `statement_timeout` was off, where asked. A `SET` in a marked run
+/// is rolled back with its statement, so the run's own answer holds.
 pub(super) async fn read_only_target(
     conn: &mut sqlx::postgres::PgConnection,
     flavor: PgFlavor,
-    session: Option<Session>,
-) -> Result<Option<CancelTarget>, DbError> {
+    session: Option<Probed>,
+) -> Result<Option<(CancelTarget, Option<bool>)>, DbError> {
     match cancel_kind(flavor) {
         None => Ok(None),
-        Some(CancelKind::Backend) => Ok(session.map(CancelTarget::Backend)),
+        Some(CancelKind::Backend) => Ok(session.map(|probed| {
+            (
+                CancelTarget::Backend(probed.session),
+                Some(probed.timeout_off),
+            )
+        })),
         Some(CancelKind::CockroachSession) => sqlx::query_scalar::<_, String>("SHOW session_id")
             .fetch_one(conn)
             .await
-            .map(|id| Some(CancelTarget::CockroachSession(id)))
+            .map(|id| Some((CancelTarget::CockroachSession(id), None)))
             .map_err(|e| DbError::Query(e.to_string())),
     }
 }
@@ -1322,6 +1350,9 @@ pub(super) async fn capped_read(
     stopper: Option<Stopper<'_>>,
     otherwise: Rest,
 ) -> Result<Capped, DbError> {
+    let unwritten_only = stopper
+        .as_ref()
+        .is_some_and(|stopper| stopper.unwritten_only);
     let stream = sqlx::query(sql).fetch(&mut *conn);
     let mut capped = sqlx_common::collect_capped_then(
         stream,
@@ -1337,6 +1368,9 @@ pub(super) async fn capped_read(
         },
     )
     .await?;
+    if unwritten_only && capped.rest.stopped() {
+        capped.rest = RestOfRead::CancelledUnwritten;
+    }
     sqlx_common::fill_headers(&mut capped.result, &mut *conn, sql).await;
     Ok(capped)
 }
@@ -1396,6 +1430,7 @@ pub(super) async fn writable_capped_read(
         session,
         in_block,
         written,
+        timeout_off,
     }) = probe_session(conn, known).await
     else {
         return capped_read(conn, sql, max_rows, cell_cap, None, Rest::Read).await;
@@ -1410,6 +1445,7 @@ pub(super) async fn writable_capped_read(
         target: &target,
         sql,
         unwritten_only: true,
+        timeout_off: Some(timeout_off),
     };
     if !in_block {
         return capped_read(conn, sql, max_rows, cell_cap, Some(stopper), Rest::Read).await;
@@ -1421,7 +1457,7 @@ pub(super) async fn writable_capped_read(
     }
     let read = capped_read(conn, sql, max_rows, cell_cap, Some(stopper), Rest::Read).await;
     if let Ok(capped) = &read {
-        if capped.rest_cancelled {
+        if capped.rest.stopped() {
             run_raw(conn, "ROLLBACK TO SAVEPOINT hubro_capped_read").await?;
         }
         run_raw(conn, "RELEASE SAVEPOINT hubro_capped_read").await?;
@@ -1431,33 +1467,50 @@ pub(super) async fn writable_capped_read(
 
 /// What hubro's own script transaction has learned for its reads
 /// ([`transaction_capped_read`]): the session, asked with the first read and
-/// kept, since the transaction holds one backend for the whole run; and
-/// whether [`READ_SAVEPOINT`] is still open.
+/// kept, since the transaction holds one backend for the whole run; whether
+/// the transaction has written, which once true stays true; and whether
+/// [`READ_SAVEPOINT`] is still open.
 #[derive(Debug, Default)]
 pub struct TransactionReads {
     session: Option<Option<Session>>,
+    written: bool,
     savepoint_open: bool,
 }
 
 /// [`READ_SAVEPOINT`] with the session asked in the same round trip — the
-/// first read of a script transaction.
+/// first read of a script transaction — and what every read asks: whether
+/// the transaction has written, and whether `statement_timeout` is off.
 const FIRST_READ_SAVEPOINT: &str = "SAVEPOINT hubro_capped_read; \
     SELECT pg_backend_pid(), \
     (SELECT (extract(epoch FROM backend_start) * 1000000)::int8 \
-     FROM pg_stat_activity WHERE pid = pg_backend_pid())";
+     FROM pg_stat_activity WHERE pid = pg_backend_pid()), \
+    txid_current_if_assigned() IS NOT NULL, \
+    current_setting('statement_timeout') = '0'";
 
-/// [`READ_SAVEPOINT`] after the previous read's.
-const NEXT_READ_SAVEPOINT: &str =
-    "RELEASE SAVEPOINT hubro_capped_read; SAVEPOINT hubro_capped_read";
+/// [`READ_SAVEPOINT`] after the previous read's, with the same questions.
+const NEXT_READ_SAVEPOINT: &str = "RELEASE SAVEPOINT hubro_capped_read; \
+    SAVEPOINT hubro_capped_read; \
+    SELECT txid_current_if_assigned() IS NOT NULL, \
+    current_setting('statement_timeout') = '0'";
+
+/// [`READ_SAVEPOINT`] alone, with the same questions.
+const READ_SAVEPOINT_ASKING: &str = "SAVEPOINT hubro_capped_read; \
+    SELECT txid_current_if_assigned() IS NOT NULL, \
+    current_setting('statement_timeout') = '0'";
 
 /// [`writable_capped_read`] in hubro's own script transaction (the atomic
 /// path), for one round trip per read: the savepoint is opened together with
-/// the release of the previous read's, and released before a write
-/// ([`release_read_savepoint`]) rather than straight after the read — so
-/// writes never run inside one, where each would take a subtransaction id,
-/// and a script of many reads and writes would overflow the 64 the server
-/// tracks per session. The script's statements cannot touch savepoints
-/// themselves: a script that does is not run in hubro's transaction.
+/// the release of the previous read's, and released before a statement hubro
+/// runs as a write ([`release_read_savepoint`]) rather than straight after the
+/// read — so those statements never run inside one, where each would take a
+/// subtransaction id, and a script of many reads and writes would overflow
+/// the 64 the server tracks per session. A write made *by* a read
+/// (`SELECT f()`, a data-modifying `WITH`) does run inside the read's
+/// savepoint. The script's statements cannot touch savepoints themselves: a
+/// script that does is not run in hubro's transaction.
+///
+/// Once the transaction is known to have written, no read in it can be
+/// cancelled, so the reads after that skip the savepoint and its round trip.
 pub(super) async fn transaction_capped_read(
     conn: &mut sqlx::postgres::PgConnection,
     pg: &PgConn,
@@ -1466,43 +1519,48 @@ pub(super) async fn transaction_capped_read(
     max_rows: u64,
     cell_cap: usize,
 ) -> Result<Capped, DbError> {
-    if !knows_whether_written(pg.flavor()) {
+    if !knows_whether_written(pg.flavor()) || reads.written || reads.session == Some(None) {
         return capped_read(conn, sql, max_rows, cell_cap, None, Rest::Read).await;
     }
-    let session = match reads.session {
-        None => {
-            let asked = sqlx::raw_sql(FIRST_READ_SAVEPOINT)
-                .fetch_one(&mut *conn)
-                .await
-                .ok()
-                .and_then(|row| session_from(&row, 0));
-            reads.session = Some(asked);
-            reads.savepoint_open = asked.is_some();
-            asked
-        }
-        Some(None) => None,
-        Some(Some(session)) => {
-            let opener = if reads.savepoint_open {
-                NEXT_READ_SAVEPOINT
-            } else {
-                READ_SAVEPOINT
-            };
-            reads.savepoint_open = run_raw(conn, opener).await.is_ok();
-            reads.savepoint_open.then_some(session)
-        }
+    let (opener, asks_session) = match reads.session {
+        None => (FIRST_READ_SAVEPOINT, true),
+        Some(_) if reads.savepoint_open => (NEXT_READ_SAVEPOINT, false),
+        Some(_) => (READ_SAVEPOINT_ASKING, false),
     };
-    let Some(session) = session else {
+    let answer = sqlx::raw_sql(opener).fetch_one(&mut *conn).await.ok();
+    reads.savepoint_open = answer.is_some();
+    let at = if asks_session { 2 } else { 0 };
+    let known = reads.session.flatten();
+    let asked = answer.and_then(|row| {
+        let session = if asks_session {
+            session_from(&row, 0)
+        } else {
+            known
+        };
+        let written: bool = row.try_get(at).ok()?;
+        let timeout_off: bool = row.try_get(at + 1).ok()?;
+        Some((session, written, timeout_off))
+    });
+    if asks_session {
+        reads.session = Some(asked.and_then(|(session, ..)| session));
+    }
+    let Some((Some(session), written, timeout_off)) = asked else {
         return capped_read(conn, sql, max_rows, cell_cap, None, Rest::Read).await;
     };
+    if written {
+        reads.written = true;
+        return capped_read(conn, sql, max_rows, cell_cap, None, Rest::Read).await;
+    }
     let target = CancelTarget::Backend(session);
     let stopper = Stopper {
         pool: pg.pool(),
         target: &target,
         sql,
         unwritten_only: true,
+        timeout_off: Some(timeout_off),
     };
     let read = capped_read(conn, sql, max_rows, cell_cap, Some(stopper), Rest::Read).await;
-    if matches!(&read, Ok(capped) if capped.rest_cancelled) {
+    if matches!(&read, Ok(capped) if capped.rest.stopped()) {
         run_raw(conn, "ROLLBACK TO SAVEPOINT hubro_capped_read").await?;
     }
     read

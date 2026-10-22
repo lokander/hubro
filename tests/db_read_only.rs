@@ -27,7 +27,7 @@
 mod common;
 
 use hubro::db::{
-    run_script, script_refusal, ConnectionRegistry, DbError, DbPool, Dialect, PgFlavor,
+    run_script, script_refusal, ConnectionRegistry, DbError, DbPool, Dialect, PgFlavor, RestOfRead,
     StatementOutcome, Value, WriteProtection,
 };
 
@@ -516,7 +516,7 @@ async fn assert_a_capped_read_is_not_read_to_its_end(pool: &DbPool) {
             "{script:?} waited {took:?} for the rest of its read"
         );
         assert!(results[0].truncated, "{script:?}");
-        assert!(results[0].rest_cancelled, "{script:?}");
+        assert_eq!(results[0].rest, RestOfRead::Stopped, "{script:?}");
         if let Some(after) = results.get(1) {
             match &after.outcome {
                 StatementOutcome::Rows(rows) => {

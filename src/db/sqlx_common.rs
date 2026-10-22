@@ -21,7 +21,7 @@ use sqlx::{Column as _, ColumnIndex, Database, Decode, Executor, IntoArguments, 
 
 use super::error::DbError;
 use super::export::{export_io_err, ExportFormat, ExportSink};
-use super::value::{cap_value, Capped, ColumnInfo, QueryResult, Value};
+use super::value::{cap_value, Capped, ColumnInfo, QueryResult, RestOfRead, Value};
 
 /// The affected-row count of a driver's execute result. sqlx has no trait for
 /// this — `rows_affected` is an inherent method on each backend's
@@ -212,7 +212,9 @@ pub(super) enum Rest {
     Read,
     /// A cancel has been sent for the statement: read, the same way, until
     /// the server reports it cancelled (or the statement ends first).
-    Cancelled,
+    /// `timeout_off` is whether the session's `statement_timeout` was off when
+    /// last asked, `None` if not asked ([`cancel_landed`]).
+    Cancelled { timeout_off: Option<bool> },
 }
 
 /// How often, in discarded rows, reading the rest of a cut-short result
@@ -243,6 +245,28 @@ async fn turn() {
 /// SQLSTATE `query_canceled`: what a cancelled Postgres-wire statement fails
 /// with (measured the same on PostgreSQL, YugabyteDB and CockroachDB).
 pub(super) const QUERY_CANCELED: &str = "57014";
+
+/// Whether a `57014` that ends a statement hubro has sent a cancel for is
+/// that cancel, and not the session's `statement_timeout` firing between
+/// the cap and the cancel — the same code, distinguished by the server only
+/// in its message.
+///
+/// The message is matched where it is known (PostgreSQL's, CockroachDB's —
+/// which does not translate its messages). `lc_messages` translates
+/// PostgreSQL's, so an unknown message is hubro's cancel only if the session
+/// had no `statement_timeout` to fire (`timeout_off`, asked before the read);
+/// otherwise, or not knowing, it is reported as the statement's error — a
+/// cancel shown as an error, rather than a timeout shown as a cancel.
+pub(super) fn cancel_landed(message: &str, timeout_off: Option<bool>) -> bool {
+    if message.contains("statement timeout") {
+        return false;
+    }
+    if message == "canceling statement due to user request" || message == "query execution canceled"
+    {
+        return true;
+    }
+    timeout_off == Some(true)
+}
 
 /// [`collect_capped`], with what happens to the rest of a cut-short result
 /// decided by `at_cap` when the cap is reached — while the statement is
@@ -277,7 +301,7 @@ where
         }
         out_rows.push(decode_row(&row, cell_cap, &decode_value)?);
     }
-    let rest_cancelled = if truncated {
+    let landed = if truncated {
         let rest = at_cap().await;
         read_rest(&mut stream, rest, &map_err).await?
     } else {
@@ -289,7 +313,11 @@ where
             rows: out_rows,
         },
         truncated,
-        rest_cancelled,
+        rest: if landed {
+            RestOfRead::Stopped
+        } else {
+            RestOfRead::Ran
+        },
     })
 }
 
@@ -324,7 +352,9 @@ where
             }
             Ok(None) => return Ok(false),
             Err(sqlx::Error::Database(e))
-                if rest == Rest::Cancelled && e.code().as_deref() == Some(QUERY_CANCELED) =>
+                if e.code().as_deref() == Some(QUERY_CANCELED)
+                    && matches!(rest, Rest::Cancelled { timeout_off }
+                        if cancel_landed(e.message(), timeout_off)) =>
             {
                 return Ok(true)
             }
@@ -441,13 +471,14 @@ where
 mod tests {
     use super::*;
 
-    /// A server error with a SQLSTATE, as the driver hands one over.
+    /// A server error with a SQLSTATE and message, as the driver hands one
+    /// over.
     #[derive(Debug)]
-    struct ServerError(&'static str);
+    struct ServerError(&'static str, &'static str);
 
     impl std::fmt::Display for ServerError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "server error {}", self.0)
+            write!(f, "{} ({})", self.1, self.0)
         }
     }
 
@@ -455,7 +486,7 @@ mod tests {
 
     impl sqlx::error::DatabaseError for ServerError {
         fn message(&self) -> &str {
-            "server error"
+            self.1
         }
         fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
             Some(self.0.into())
@@ -474,18 +505,29 @@ mod tests {
         }
     }
 
+    const USER_REQUEST: &str = "canceling statement due to user request";
+    const TIMEOUT: &str = "canceling statement due to statement timeout";
+    /// PostgreSQL's user-request message under `lc_messages = 'de_DE'`.
+    const TRANSLATED: &str = "storniere Anfrage wegen Benutzeraufforderung";
+
     /// The rest of a result: `rows` rows, then `end` — `None` for the
-    /// statement finishing, or the SQLSTATE it fails with.
+    /// statement finishing, or the SQLSTATE and message it fails with.
     fn rest(
         rows: usize,
-        end: Option<&'static str>,
+        end: Option<(&'static str, &'static str)>,
     ) -> impl Stream<Item = Result<(), sqlx::Error>> + Unpin {
         let rows = std::iter::repeat_with(|| Ok(())).take(rows);
-        let end = end.map(|code| Err(sqlx::Error::Database(Box::new(ServerError(code)))));
+        let end = end.map(|(code, message)| {
+            Err(sqlx::Error::Database(Box::new(ServerError(code, message))))
+        });
         futures_util::stream::iter(rows.chain(end))
     }
 
-    fn read(rows: usize, end: Option<&'static str>, how: Rest) -> Result<bool, DbError> {
+    fn read(
+        rows: usize,
+        end: Option<(&'static str, &'static str)>,
+        how: Rest,
+    ) -> Result<bool, DbError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -495,18 +537,42 @@ mod tests {
         }))
     }
 
+    const CANCELLED: Rest = Rest::Cancelled { timeout_off: None };
+
     #[test]
     fn a_cancel_is_reported_only_when_the_server_says_the_statement_was_cancelled() {
+        let cancelled = Some((QUERY_CANCELED, USER_REQUEST));
         // The cancel landed: the statement ended cancelled.
-        assert_eq!(
-            read(3, Some(QUERY_CANCELED), Rest::Cancelled).ok(),
-            Some(true)
-        );
+        assert_eq!(read(3, cancelled, CANCELLED).ok(), Some(true));
         // The cancel was taken but the statement finished first: nothing was
         // cancelled, and the read is reported as run to its end.
-        assert_eq!(read(3, None, Rest::Cancelled).ok(), Some(false));
+        assert_eq!(read(3, None, CANCELLED).ok(), Some(false));
         // Any other failure is the statement's own.
-        assert!(read(3, Some("23505"), Rest::Cancelled).is_err());
+        assert!(read(3, Some(("23505", "duplicate key")), CANCELLED).is_err());
+        // The session's `statement_timeout` firing between the cap and the
+        // cancel: the same code, and the statement's error, not a cancel.
+        assert!(read(3, Some((QUERY_CANCELED, TIMEOUT)), CANCELLED).is_err());
+    }
+
+    #[test]
+    fn a_cancel_whose_message_is_translated_counts_only_when_no_timeout_could_fire() {
+        let translated = Some((QUERY_CANCELED, TRANSLATED));
+        let with = |timeout_off| Rest::Cancelled { timeout_off };
+        assert_eq!(read(3, translated, with(Some(true))).ok(), Some(true));
+        assert!(read(3, translated, with(Some(false))).is_err());
+        assert!(read(3, translated, with(None)).is_err());
+        // A known message decides whatever the setting.
+        assert!(read(3, Some((QUERY_CANCELED, TIMEOUT)), with(Some(true))).is_err());
+        assert_eq!(
+            read(3, Some((QUERY_CANCELED, USER_REQUEST)), with(Some(false))).ok(),
+            Some(true)
+        );
+        // CockroachDB's own, untranslated.
+        assert!(cancel_landed("query execution canceled", None));
+        assert!(!cancel_landed(
+            "query execution canceled due to statement timeout",
+            Some(true)
+        ));
     }
 
     #[test]
@@ -514,11 +580,14 @@ mod tests {
         assert_eq!(read(3, None, Rest::Read).ok(), Some(false));
         // A unique violation past the cap fails the read, rather than the
         // connection's next question or nothing at all.
-        assert!(read(3, Some("23505"), Rest::Read).is_err());
+        assert!(read(3, Some(("23505", "duplicate key")), Rest::Read).is_err());
         // Without a cancel of hubro's, a cancellation is someone else's — a
         // `statement_timeout`, say — and is an error like any other.
-        assert!(read(3, Some(QUERY_CANCELED), Rest::Read).is_err());
+        assert!(read(3, Some((QUERY_CANCELED, USER_REQUEST)), Rest::Read).is_err());
         // Left unread: nothing is read, so nothing is reported.
-        assert_eq!(read(3, Some("23505"), Rest::Leave).ok(), Some(false));
+        assert_eq!(
+            read(3, Some(("23505", "duplicate key")), Rest::Leave).ok(),
+            Some(false)
+        );
     }
 }

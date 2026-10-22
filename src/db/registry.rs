@@ -19,7 +19,7 @@ use super::sqlserver::{self, MssqlPool, MssqlTx};
 use super::sqlx_common;
 use super::staged::{self, CheckedStatement, RowLocator};
 use super::stats::TableStats;
-use super::value::{Capped, QueryResult, Value};
+use super::value::{Capped, QueryResult, RestOfRead, Value};
 
 /// Hard cap on rows the free-form query path fetches into memory, independent
 /// of the editor's 500-row *render* cap. A `SELECT` returning more is
@@ -312,7 +312,7 @@ pub(super) enum ReadOnlyRun {
         /// how, and another of its connections sends it.
         pg: postgres::PgConn,
         /// The run's session ([`postgres::read_only_session`]), asked once.
-        session: Option<postgres::Session>,
+        session: Option<postgres::Probed>,
     },
 }
 
@@ -362,12 +362,15 @@ impl ReadOnlyRun {
                         None
                     }
                 };
-                let stopper = target.as_ref().map(|target| postgres::Stopper {
-                    pool: pg.pool(),
-                    target,
-                    sql,
-                    unwritten_only: false,
-                });
+                let stopper = target
+                    .as_ref()
+                    .map(|(target, timeout_off)| postgres::Stopper {
+                        pool: pg.pool(),
+                        target,
+                        sql,
+                        unwritten_only: false,
+                        timeout_off: *timeout_off,
+                    });
                 let result = postgres::capped_read(
                     &mut tx,
                     sql,
@@ -413,7 +416,7 @@ impl ReadOnlyRun {
                         match read {
                             // Stopped by the close below.
                             Ok(capped) if capped.truncated => Ok(Capped {
-                                rest_cancelled: true,
+                                rest: RestOfRead::Stopped,
                                 ..capped
                             }),
                             read => read_only_outcome(read, postgres::end_read_only(tx).await),

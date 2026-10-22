@@ -907,7 +907,7 @@ async fn a_capped_read_that_writes_keeps_its_writes_though_yugabyte_cannot_say_i
         .await
         .unwrap_or_else(|e| panic!("{script}: {e:?}"));
         assert!(results[0].truncated, "{script}");
-        assert!(!results[0].rest_cancelled, "{script}");
+        assert_eq!(results[0].rest, hubro::db::RestOfRead::Ran, "{script}");
         expected += 20_000;
         // The last read is read in the background before its transaction
         // commits.
