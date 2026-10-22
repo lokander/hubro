@@ -539,7 +539,7 @@ mod tests {
             "a deliberate later repeat confirms"
         );
         assert!(
-            !aged.confirms(Gesture { repeat: true }),
+            !aged.confirms(Gesture::key(true)),
             "a held key's repeat (Enter on a table button, Ctrl+E) never confirms"
         );
         assert!(
@@ -588,7 +588,7 @@ mod tests {
             save_action(
                 WriteProtection::Confirm,
                 Some(&settled(&changes)),
-                Gesture { repeat: true },
+                Gesture::key(true),
                 &changes
             ),
             SaveAction::Wait,

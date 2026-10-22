@@ -771,7 +771,7 @@ mod tests {
             Gesture::CLICK
         ));
         // A held key's repeat, however late.
-        assert!(!run(Some(&settled(SQL)), SQL, Gesture { repeat: true }));
+        assert!(!run(Some(&settled(SQL)), SQL, Gesture::key(true)));
         // The box changed after the dialog was drawn: what would run is not
         // what was confirmed.
         assert!(!run(

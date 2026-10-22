@@ -303,9 +303,14 @@ pub(crate) const CONFIRM_ARM_DELAY: Duration = Duration::from_millis(500);
 /// How a press reached a confirmation's decision. A held key's repeats are
 /// never deliberate presses, whatever the time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Its field is private: a gesture is either [`Gesture::CLICK`], which the
+/// wiring test holds to guarded buttons, or [`Gesture::key`] for a key handled
+/// directly, which it holds to the one shortcut that has one. No struct
+/// literal can claim a press is fresh anywhere else.
 pub struct Gesture {
     /// The key is being held down: this is one of its auto-repeats.
-    pub repeat: bool,
+    repeat: bool,
 }
 
 impl Gesture {
@@ -317,11 +322,16 @@ impl Gesture {
     /// holds each one to that.
     pub const CLICK: Gesture = Gesture { repeat: false };
 
-    /// A key handled directly, without going through a button.
-    pub fn of_key(evt: &KeyboardEvent) -> Self {
-        Gesture {
-            repeat: evt.is_auto_repeating(),
-        }
+    /// A key handled directly, without going through a button: `repeat` is
+    /// whether it is a held key's auto-repeat. Only the pane shortcut, whose
+    /// key arrives from the window listener as a message, builds one.
+    pub fn key(repeat: bool) -> Self {
+        Gesture { repeat }
+    }
+
+    /// Whether this is a held key's auto-repeat.
+    pub fn is_repeat(self) -> bool {
+        self.repeat
     }
 }
 
@@ -740,7 +750,7 @@ mod tests {
     #[test]
     fn only_a_fresh_deliberate_press_completes_a_confirmation() {
         let fresh = Gesture::CLICK;
-        let repeat = Gesture { repeat: true };
+        let repeat = Gesture::key(true);
         let just = Armed::new("x");
         assert!(!just.completes(fresh), "inside the delay");
         assert_eq!(just.subject(), &"x");
@@ -832,23 +842,37 @@ mod tests {
 
         let mut found: Vec<String> = Vec::new();
         let mut safe = Vec::new();
+        let mut keyed = 0;
         for (path, source) in ui_sources() {
-            let code = source
-                .split_once("\n#[cfg(test)]\nmod ")
-                .map_or(source.as_str(), |(code, _)| code);
-            let lines: Vec<&str> = code
-                .lines()
+            // The code above the test module, cut by lines so a CRLF checkout
+            // reads the same (see tests/line_endings.rs).
+            let all: Vec<&str> = source.lines().collect();
+            let end = (0..all.len())
+                .find(|&i| {
+                    all[i].trim() == "#[cfg(test)]"
+                        && all.get(i + 1).is_some_and(|next| next.starts_with("mod "))
+                })
+                .unwrap_or(all.len());
+            let lines: Vec<&str> = all[..end]
+                .iter()
+                .copied()
                 .filter(|line| !line.trim_start().starts_with("//"))
                 .collect();
             let name = path.join("/");
             for at in 0..lines.len() {
                 let line = lines[at];
-                if name != "notice.rs" {
-                    assert!(
-                        !line.contains("Gesture { repeat: false }"),
-                        "{name}: spell a click `Gesture::CLICK`, so this test can find it: {}",
+                // A gesture's field is private, so outside notice.rs the only
+                // ways to make one are `Gesture::CLICK`, walked below, and
+                // `Gesture::key`, which only the pane shortcut may call.
+                let squeezed: String = line.split_whitespace().collect();
+                if squeezed.contains("Gesture::key(") {
+                    assert_eq!(
+                        name,
+                        "shell.rs",
+                        "only the pane shortcut builds a key gesture: {}",
                         line.trim()
                     );
+                    keyed += 1;
                 }
                 if line.contains("Gesture::CLICK") {
                     check(&path, &lines, at, "a click gesture");
@@ -880,6 +904,7 @@ mod tests {
             );
         }
         assert_eq!(safe, ["grid/mod.rs", "notice.rs"], "the safe choices moved");
+        assert_eq!(keyed, 1, "the pane shortcut's key gesture moved");
     }
 
     /// Every modal in the app is an [`Overlay`], and each one's backdrop

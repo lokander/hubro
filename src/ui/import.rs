@@ -792,7 +792,7 @@ mod tests {
             import_action(
                 true,
                 Some(&settled(current.clone())),
-                Gesture { repeat: true },
+                Gesture::key(true),
                 &current
             ),
             ImportAction::Wait,
