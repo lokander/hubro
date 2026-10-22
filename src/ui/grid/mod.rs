@@ -56,8 +56,8 @@ use super::js::{
     focus_by_id_next_frame, focus_on_mount, reclaim_focus_by_id_next_frame, write_clipboard,
 };
 use super::notice::{
-    a_held_key_is_not_a_press, Armed, Banner, BannerKind, DelayedLoading, EmptyState, Overlay,
-    OverlayAlign,
+    a_held_key_is_not_a_press, Armed, Banner, BannerKind, DelayedLoading, EmptyState, Gesture,
+    Overlay, OverlayAlign,
 };
 use super::pick_export_path;
 use super::schema::display_type;
@@ -1554,8 +1554,8 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                                                     selected,
                                                     on_fk_jump: {
                                                         let origin = row_table.clone();
-                                                        move |(fk, row_values): (ForeignKeyMeta, HashMap<String, Value>)| {
-                                                            state.navigate_fk(id, &fk, &row_values, &origin, applied_filter.peek().clone());
+                                                        move |(fk, row_values, gesture): (ForeignKeyMeta, HashMap<String, Value>, Gesture)| {
+                                                            state.navigate_fk(id, &fk, &row_values, &origin, applied_filter.peek().clone(), gesture);
                                                         }
                                                     },
                                                 }
@@ -1625,8 +1625,8 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                         on_width: move |width: f64| state.set_row_detail_width(id, width),
                         on_fk_jump: {
                             let origin = row_table.clone();
-                            move |(fk, row_values): (ForeignKeyMeta, HashMap<String, Value>)| {
-                                state.navigate_fk(id, &fk, &row_values, &origin, applied_filter.peek().clone());
+                            move |(fk, row_values, gesture): (ForeignKeyMeta, HashMap<String, Value>, Gesture)| {
+                                state.navigate_fk(id, &fk, &row_values, &origin, applied_filter.peek().clone(), gesture);
                             }
                         },
                     }
@@ -1921,7 +1921,8 @@ fn GridToolbar(
                 button {
                     class: "rounded px-2 py-1 text-xs text-cyan-700 dark:text-cyan-300 hover:bg-cyan-100 dark:hover:bg-cyan-950/40",
                     title: "Back to the previous view",
-                    onclick: move |_| state.navigate_back(id),
+                    onkeydown: a_held_key_is_not_a_press,
+                    onclick: move |_| state.navigate_back(id, Gesture::CLICK),
                     "← Back"
                 }
             }
@@ -2340,21 +2341,18 @@ fn GridBars(
                             return;
                         }
                         let changes = stage.changes();
-                        let press = {
-                            let armed = confirm.peek();
-                            save_press(
-                                stage.delete_count(),
-                                armed.as_ref().map(|armed| armed.subject().as_slice()),
-                                armed.as_ref().is_some_and(Armed::settled),
-                                &changes,
-                            )
-                        };
+                        let press = save_press(
+                            stage.delete_count(),
+                            confirm.peek().as_ref(),
+                            Gesture::CLICK,
+                            &changes,
+                        );
                         match press {
                             SavePress::Arm => confirm.set(Some(Armed::new(changes))),
                             SavePress::Wait => {}
                             SavePress::Save => {
                                 confirm.set(None);
-                                state.save_staged(id, &save_table);
+                                state.save_staged(id, &save_table, Gesture::CLICK);
                             }
                         }
                     },
@@ -2388,7 +2386,7 @@ fn GridBars(
                 button {
                     class: "rounded bg-red-700 px-3 py-1 font-semibold text-white hover:bg-red-600",
                     onkeydown: a_held_key_is_not_a_press,
-                    onclick: move |_| state.confirm_pending_save(id, &confirm_save_table),
+                    onclick: move |_| state.confirm_pending_save(id, &confirm_save_table, Gesture::CLICK),
                     "Apply to \"{connection_name}\""
                 }
                 button {
@@ -2397,6 +2395,9 @@ fn GridBars(
                     // confirmation: Enter pressed at the prompt keeps the
                     // changes staged rather than writing them.
                     onmounted: focus_on_mount,
+                    // And a held Enter from Save parks the prompt and stays
+                    // parked, rather than parking it and then pressing this.
+                    onkeydown: a_held_key_is_not_a_press,
                     onclick: move |_| state.dismiss_pending_save(id, &dismiss_save_table),
                     "Cancel"
                 }
@@ -2483,27 +2484,27 @@ enum SavePress {
 }
 
 /// Resolves a Save press: `deletes` is how many deletes are staged, `armed`
-/// the change list a previous press armed (if any) and `settled` whether it
-/// has been armed long enough for a press to count ([`Armed::settled`]),
-/// `current` what is staged now.
+/// the change list a previous press armed (if any), `gesture` how this press
+/// arrived, `current` what is staged now.
 ///
 /// Stages without deletes save at once. With deletes, a press saves only the
-/// exact list it armed, and only once settled: Save relabels itself
-/// "Confirm: delete N" in place, so without that a double-click on Save was
-/// the confirmation. An unsettled press waits and stays armed; when to ask
-/// is unchanged.
+/// exact list it armed, and only as a fresh, deliberate press
+/// ([`Armed::completes`]): Save relabels itself "Confirm: delete N" in place,
+/// so without that a double-click or a held Enter on Save was the
+/// confirmation. Such a press waits and stays armed; when to ask is
+/// unchanged.
 fn save_press(
     deletes: usize,
-    armed: Option<&[StagedChange]>,
-    settled: bool,
+    armed: Option<&Armed<Vec<StagedChange>>>,
+    gesture: Gesture,
     current: &[StagedChange],
 ) -> SavePress {
     if deletes == 0 {
         return SavePress::Save;
     }
     match armed {
-        Some(armed) if armed == current && settled => SavePress::Save,
-        Some(armed) if armed == current => SavePress::Wait,
+        Some(armed) if armed.subject() == current && armed.completes(gesture) => SavePress::Save,
+        Some(armed) if armed.subject() == current => SavePress::Wait,
         _ => SavePress::Arm,
     }
 }
@@ -2988,30 +2989,47 @@ mod tests {
     }
 
     #[test]
-    fn a_double_click_on_save_does_not_confirm_the_deletes() {
+    fn a_double_click_or_a_held_key_on_save_does_not_confirm_the_deletes() {
         let delete = |id| StagedChange::Delete {
             locator: RowLocator {
                 identity_values: vec![Value::Integer(id)],
             },
         };
         let current = vec![delete(1)];
-        // The first press arms; its repeat, before the confirmation has
-        // settled, waits and stays armed; a settled press saves.
-        assert_eq!(save_press(1, None, false, &current), SavePress::Arm);
+        let settled = Armed::armed_ago(current.clone(), crate::ui::notice::CONFIRM_ARM_DELAY);
+        // The first press arms; its repeat inside the delay, or a held key's
+        // repeat however late, waits and stays armed; a settled fresh press
+        // saves.
         assert_eq!(
-            save_press(1, Some(&current), false, &current),
+            save_press(1, None, Gesture::CLICK, &current),
+            SavePress::Arm
+        );
+        assert_eq!(
+            save_press(
+                1,
+                Some(&Armed::new(current.clone())),
+                Gesture::CLICK,
+                &current
+            ),
             SavePress::Wait
         );
         assert_eq!(
-            save_press(1, Some(&current), true, &current),
+            save_press(1, Some(&settled), Gesture { repeat: true }, &current),
+            SavePress::Wait
+        );
+        assert_eq!(
+            save_press(1, Some(&settled), Gesture::CLICK, &current),
             SavePress::Save
         );
-        // A confirmation armed for another change list asks again, settled
-        // or not — the exact-count rule is unchanged.
-        let other = vec![delete(2)];
-        assert_eq!(save_press(1, Some(&other), true, &current), SavePress::Arm);
+        // A confirmation armed for another change list asks again — the
+        // exact-count rule is unchanged.
+        let other = Armed::armed_ago(vec![delete(2)], crate::ui::notice::CONFIRM_ARM_DELAY);
+        assert_eq!(
+            save_press(1, Some(&other), Gesture::CLICK, &current),
+            SavePress::Arm
+        );
         // No deletes, nothing to confirm on this side.
-        assert_eq!(save_press(0, None, false, &[]), SavePress::Save);
+        assert_eq!(save_press(0, None, Gesture::CLICK, &[]), SavePress::Save);
     }
 
     #[test]

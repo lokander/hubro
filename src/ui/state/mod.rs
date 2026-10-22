@@ -62,7 +62,7 @@ use crate::db::{
 };
 use crate::history::{HistoryStore, SaveOutcome};
 use crate::tunnel::{HostKeyInfo, Tunnel, TunnelAuth, TunnelConfig, TunnelError};
-use crate::ui::notice::{confirm_accepted, Armed, SPINNER_DELAY};
+use crate::ui::notice::{deliberate, Armed, Gesture, SPINNER_DELAY};
 use crate::ui::stage::TableStage;
 
 /// Which screen the main panel shows: the connections screen or one open
@@ -191,9 +191,11 @@ impl PendingNav {
         self.id == id && self.action == *action
     }
 
-    /// Whether the intent is old enough for a repeat to confirm it.
-    fn confirmable(&self) -> bool {
-        confirm_accepted(self.parked_at.elapsed())
+    /// Whether a repeated attempt, arriving as `gesture`, confirms this
+    /// intent: the same rule as every confirmation ([`deliberate`]), against
+    /// this intent's own park time.
+    fn confirms(&self, gesture: Gesture) -> bool {
+        deliberate(self.parked_at.elapsed(), gesture)
     }
 }
 
@@ -1646,7 +1648,7 @@ impl AppState {
     /// has staged edits takes two attempts (see [`Self::nav_guard`]); the
     /// second discards them. While that table's save is in flight the
     /// switch no-ops.
-    pub fn set_pane(mut self, id: ConnectionId, pane: Pane) {
+    pub fn set_pane(mut self, id: ConnectionId, pane: Pane, gesture: Gesture) {
         let (current_pane, selected) = {
             let tab_ui = self.tab_ui.read();
             let ui = tab_ui.get(&id);
@@ -1664,7 +1666,7 @@ impl AppState {
                     if self.stage_saving(id, table) {
                         return;
                     }
-                    if !self.nav_guard_allows(id, NavAction::SetPane(pane)) {
+                    if !self.nav_guard_allows(id, NavAction::SetPane(pane), gesture) {
                         return;
                     }
                     self.discard_staged(id, table);
@@ -1680,7 +1682,7 @@ impl AppState {
     /// pane). A no-op on the connections screen. Routed through
     /// [`Self::set_pane`], so the unsaved-changes guard still applies when
     /// leaving the browser with staged edits.
-    pub fn toggle_active_pane(self) {
+    pub fn toggle_active_pane(self, gesture: Gesture) {
         let ActiveView::Connection(id) = *self.active.read() else {
             return;
         };
@@ -1696,7 +1698,7 @@ impl AppState {
             Pane::Sql => Pane::Schema,
             Pane::Schema => Pane::Browser,
         };
-        self.set_pane(id, target);
+        self.set_pane(id, target, gesture);
     }
 
     /// Whether one tab has the row detail panel docked open.
@@ -1847,8 +1849,8 @@ impl AppState {
     /// A manual selection clears the foreign-key Back stack and any pending
     /// focus — the FK trail only makes sense relative to the jumps that built
     /// it, not to an unrelated sidebar pick.
-    pub fn select_table(self, id: ConnectionId, table: &TableRef) {
-        self.switch_table(id, table, true);
+    pub fn select_table(self, id: ConnectionId, table: &TableRef, gesture: Gesture) {
+        self.switch_table(id, table, true, gesture);
     }
 
     /// Switches the selected table, running the unsaved-changes guard. Returns
@@ -1857,7 +1859,13 @@ impl AppState {
     /// connection's FK Back stack and pending focus on a real switch —
     /// foreign-key jumps and Back pass `false` so they manage that stack
     /// themselves.
-    fn switch_table(mut self, id: ConnectionId, table: &TableRef, clear_fk_nav: bool) -> bool {
+    fn switch_table(
+        mut self,
+        id: ConnectionId,
+        table: &TableRef,
+        clear_fk_nav: bool,
+        gesture: Gesture,
+    ) -> bool {
         let current = self
             .tab_ui
             .read()
@@ -1871,7 +1879,7 @@ impl AppState {
                 if self.stage_saving(id, current_table) {
                     return false;
                 }
-                if !self.nav_guard_allows(id, NavAction::SelectTable(table.clone())) {
+                if !self.nav_guard_allows(id, NavAction::SelectTable(table.clone()), gesture) {
                     return false;
                 }
                 self.discard_staged(id, current_table);
@@ -1913,6 +1921,7 @@ impl AppState {
         source_row: &HashMap<String, Value>,
         origin: &TableRef,
         origin_filter: Option<Filter>,
+        gesture: Gesture,
     ) {
         let Some(rules) = self.registry.read().get(id).map(|c| c.pool.key_rules()) else {
             return;
@@ -1935,7 +1944,7 @@ impl AppState {
                 .entry(id)
                 .or_default()
                 .push(origin_focus);
-        } else if self.switch_table(id, &target, false) {
+        } else if self.switch_table(id, &target, false, gesture) {
             self.nav_history
                 .write()
                 .entry(id)
@@ -1948,7 +1957,7 @@ impl AppState {
     /// restoring its table and filter. A no-op when the stack is empty. The
     /// entry is only popped once the return actually happens, so a staged-edit
     /// guard parking the switch keeps it for the confirming click.
-    pub fn navigate_back(mut self, id: ConnectionId) {
+    pub fn navigate_back(mut self, id: ConnectionId, gesture: Gesture) {
         let target = self
             .nav_history
             .read()
@@ -1966,7 +1975,8 @@ impl AppState {
         self.pending_focus.write().insert(id, target);
         // Same-table restore only refocuses the filter (the grid's effect
         // consumes it); otherwise switch, honoring the unsaved-edits guard.
-        let restored = current.as_ref() == Some(&dest) || self.switch_table(id, &dest, false);
+        let restored =
+            current.as_ref() == Some(&dest) || self.switch_table(id, &dest, false, gesture);
         if restored {
             if let Some(stack) = self.nav_history.write().get_mut(&id) {
                 stack.pop();
@@ -2089,12 +2099,12 @@ impl AppState {
     /// inert; the second click still closes. A deliberate simplification,
     /// kept until a global toast/dialog exists. (Closing the OS window is
     /// guarded separately by the discard-and-quit confirmation.)
-    pub fn close_connection(mut self, id: ConnectionId) {
+    pub fn close_connection(mut self, id: ConnectionId, gesture: Gesture) {
         if self.any_stage_dirty(id) {
             if self.any_stage_saving(id) {
                 return;
             }
-            if !self.nav_guard_allows(id, NavAction::CloseConnection) {
+            if !self.nav_guard_allows(id, NavAction::CloseConnection, gesture) {
                 return;
             }
         }

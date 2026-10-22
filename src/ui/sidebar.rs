@@ -8,7 +8,9 @@ use super::filter::{
     FilterMode,
 };
 use super::js::focus_input_end_next_frame;
-use super::notice::{Banner, BannerKind, DelayedLoading, EmptyState, KindBadge};
+use super::notice::{
+    a_held_key_is_not_a_press, Banner, BannerKind, DelayedLoading, EmptyState, Gesture, KindBadge,
+};
 use super::state::{AppState, SchemaLoad, TableRef};
 use super::text_field::TextInput;
 
@@ -409,7 +411,8 @@ fn TableNode(
                     // assistive tech what the dimming carries visually.
                     title: unbrowsable,
                     "aria-disabled": unbrowsable.is_some(),
-                    onclick: move |_| state.select_table(id, &select_ref),
+                    onkeydown: a_held_key_is_not_a_press,
+                    onclick: move |_| state.select_table(id, &select_ref, Gesture::CLICK),
                     span {
                         class: if unbrowsable.is_some() {
                             "truncate font-mono text-slate-500 dark:text-slate-500 italic"
@@ -439,9 +442,10 @@ fn TableNode(
                         li {
                             button {
                                 class: "flex w-full min-w-0 items-baseline gap-2 py-0.5 pl-7 pr-2 text-left text-xs hover:bg-slate-200 dark:hover:bg-slate-800/60",
+                                onkeydown: a_held_key_is_not_a_press,
                                 onclick: {
                                     let table_ref = select_from_column.clone();
-                                    move |_| state.select_table(id, &table_ref)
+                                    move |_| state.select_table(id, &table_ref, Gesture::CLICK)
                                 },
                                 span { class: "truncate font-mono text-slate-700 dark:text-slate-400",
                                     "{column_name}"
@@ -554,7 +558,7 @@ mod tests {
         let (mut dom, state, id) = mounted_sidebar();
         let mounted = total_renders(&dom);
 
-        dom.in_runtime(|| state.select_table(id, &table_ref(7)));
+        dom.in_runtime(|| state.select_table(id, &table_ref(7), Gesture::CLICK));
         let edits = dom.render_immediate_to_vec().edits;
 
         // The highlight moves: one row lights up, the old one goes dark.

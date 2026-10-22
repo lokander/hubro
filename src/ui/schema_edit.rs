@@ -33,7 +33,9 @@ use crate::db::{
     TableMeta, NOTHING_TO_RUN,
 };
 
-use super::notice::{a_held_key_is_not_a_press, Armed, Banner, BannerKind, Overlay, OverlayAlign};
+use super::notice::{
+    a_held_key_is_not_a_press, Armed, Banner, BannerKind, Gesture, Overlay, OverlayAlign,
+};
 use super::state::{after_edit, AppState, SchemaEditRequest, TableRef};
 use super::text_field::{TextArea, TextInput};
 
@@ -95,16 +97,29 @@ pub(super) fn run_action(press: Press) -> RunAction {
     RunAction::Run
 }
 
-/// Whether a Run press runs the statement [`run_action`] resolved to: only
-/// when it resolved to [`RunAction::Run`], and, on a *confirm writes*
-/// connection, only once the confirmation has settled ([`Armed::settled`]).
-/// Run relabels itself "Yes, run it" in place, so without the second
-/// condition a double-click on Run was the confirmation.
+/// Whether a Run press runs `sql`, the statement in the box *at the press*.
 ///
-/// This only ever holds a press back: an unsettled press does nothing, and
-/// [`run_action`] still alone decides what is asked and when.
-pub(super) fn press_runs(action: &RunAction, confirms: bool, settled: bool) -> bool {
-    *action == RunAction::Run && (!confirms || settled)
+/// Only when [`run_action`] resolved to [`RunAction::Run`], and, on a
+/// *confirm writes* connection, only when `confirmed` is that very statement
+/// and the press completes it ([`Armed::completes`]: fresh and deliberate).
+/// `action` was resolved when the dialog was drawn, so it can describe an
+/// older box; comparing the confirmed statement with `sql` here is what makes
+/// the confirmation about the statement that would run. Run relabels itself
+/// "Yes, run it" in place, so without the press check a double-click or a
+/// held Enter on Run was the confirmation.
+///
+/// This only ever holds a press back: [`run_action`] still alone decides
+/// what is asked and when.
+pub(super) fn press_runs(
+    action: &RunAction,
+    confirms: bool,
+    confirmed: Option<&Armed<String>>,
+    sql: &str,
+    gesture: Gesture,
+) -> bool {
+    *action == RunAction::Run
+        && (!confirms
+            || confirmed.is_some_and(|armed| armed.subject() == sql && armed.completes(gesture)))
 }
 
 /// Everything a Run press is decided from — see [`run_action`], whose
@@ -269,17 +284,19 @@ pub fn SchemaEditDialog(
     });
     let armed = action == RunAction::Run && confirms;
 
-    let run = move |_| {
+    // Takes the press's gesture from the button, where
+    // `every_click_gesture_comes_from_a_guarded_button` can see it.
+    let mut run = move |gesture: Gesture| {
         let sql = sql();
         if action == RunAction::Confirm {
             confirmed.set(Some(Armed::new(sql)));
             return;
         }
-        // Asked now, at the press, not when `action` was rendered: whether
-        // the confirmation has settled is a matter of time, which no render
-        // follows.
-        let settled = confirmed.peek().as_ref().is_some_and(Armed::settled);
-        if !press_runs(&action, confirms, settled) {
+        // Decided against what holds at the press — the statement about to
+        // run, and how long ago it was confirmed — not against what `action`
+        // saw when it was drawn.
+        let runs = press_runs(&action, confirms, confirmed.peek().as_ref(), &sql, gesture);
+        if !runs {
             return;
         }
         let meta = table.read().clone();
@@ -409,7 +426,7 @@ pub fn SchemaEditDialog(
                         disabled: running
                             || matches!(action, RunAction::Refused(_) | RunAction::Incomplete(_) | RunAction::TypeTheName),
                         onkeydown: a_held_key_is_not_a_press,
-                        onclick: run,
+                        onclick: move |_| run(Gesture::CLICK),
                         if running {
                             "Running…"
                         } else if armed {
@@ -601,6 +618,7 @@ fn done_label(op: &SchemaOp, table: &TableMeta) -> String {
 mod tests {
     use super::*;
     use crate::db::{NOT_A_TABLE, NO_DDL};
+    use crate::ui::notice::CONFIRM_ARM_DELAY;
 
     const SQL: &str = "DROP TABLE \"t\";";
 
@@ -739,17 +757,47 @@ mod tests {
     }
 
     #[test]
-    fn a_double_click_on_run_does_not_confirm_the_statement() {
-        // The confirmed press runs only once the confirmation has settled;
-        // the click that armed it, repeated, does nothing.
-        assert!(!press_runs(&RunAction::Run, true, false));
-        assert!(press_runs(&RunAction::Run, true, true));
-        // An unprotected connection has no confirmation to settle: Run runs.
-        assert!(press_runs(&RunAction::Run, false, false));
-        // And nothing else ever runs, settled or not.
+    fn a_double_click_or_a_held_key_on_run_does_not_confirm_the_statement() {
+        let settled = |sql: &str| Armed::armed_ago(sql.to_string(), CONFIRM_ARM_DELAY);
+        let run = |confirmed: Option<&Armed<String>>, sql: &str, gesture| {
+            press_runs(&RunAction::Run, true, confirmed, sql, gesture)
+        };
+        // Settled, fresh, and the statement confirmed is the one in the box.
+        assert!(run(Some(&settled(SQL)), SQL, Gesture::CLICK));
+        // The click that armed it, repeated.
+        assert!(!run(
+            Some(&Armed::new(SQL.to_string())),
+            SQL,
+            Gesture::CLICK
+        ));
+        // A held key's repeat, however late.
+        assert!(!run(Some(&settled(SQL)), SQL, Gesture { repeat: true }));
+        // The box changed after the dialog was drawn: what would run is not
+        // what was confirmed.
+        assert!(!run(
+            Some(&settled(SQL)),
+            "DROP TABLE \"other\";",
+            Gesture::CLICK
+        ));
+        assert!(!run(None, SQL, Gesture::CLICK));
+        // An unprotected connection has nothing to confirm: Run runs.
+        assert!(press_runs(
+            &RunAction::Run,
+            false,
+            None,
+            SQL,
+            Gesture::CLICK
+        ));
+        // And nothing else ever runs.
         for action in [RunAction::Confirm, RunAction::TypeTheName] {
-            assert!(!press_runs(&action, true, true), "{action:?}");
-            assert!(!press_runs(&action, false, true), "{action:?}");
+            assert!(
+                !press_runs(&action, true, Some(&settled(SQL)), SQL, Gesture::CLICK),
+                "{action:?}"
+            );
+            assert!(
+                !press_runs(&action, false, None, SQL, Gesture::CLICK),
+                "{action:?}"
+            );
         }
     }
 

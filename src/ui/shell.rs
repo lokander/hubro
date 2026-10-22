@@ -14,7 +14,9 @@ use super::connections::ConnectionsScreen;
 use super::editor::SqlEditor;
 use super::grid::DataGrid;
 use super::icons::BackendIcon;
-use super::notice::{Banner, BannerKind, Overlay, OverlayAlign};
+use super::notice::{
+    a_held_key_is_not_a_press, Banner, BannerKind, Gesture, Overlay, OverlayAlign,
+};
 use super::schema::SchemaPane;
 use super::schema_edit::SchemaEditLine;
 use super::sidebar::SchemaSidebar;
@@ -78,7 +80,9 @@ const GLOBAL_KEYS_JS: &str = r#"
       if (f) { e.preventDefault(); f.focus(); f.select(); }
       return;
     }
-    if (accel(e) && (e.key === 'e' || e.key === 'E')) { e.preventDefault(); dioxus.send('pane'); return; }
+    // A held Ctrl+E says so: its repeats must never confirm the
+    // unsaved-changes guard (see `Gesture`).
+    if (accel(e) && (e.key === 'e' || e.key === 'E')) { e.preventDefault(); dioxus.send(e.repeat ? 'pane-repeat' : 'pane'); return; }
     // Ctrl+D docks/undocks the row detail panel beside the grid.
     if (accel(e) && (e.key === 'd' || e.key === 'D')) { e.preventDefault(); dioxus.send('rowdetail'); return; }
     if (accel(e) && (e.key === 'b' || e.key === 'B')) {
@@ -132,7 +136,12 @@ pub fn Shell() -> Element {
             while let Ok(msg) = channel.recv::<String>().await {
                 match msg.as_str() {
                     "cheatsheet" => state.toggle_cheatsheet(),
-                    "pane" => state.toggle_active_pane(),
+                    // A held Ctrl+E repeats, and says so; the unsaved-changes
+                    // guard must not take a repeat for a second, confirming
+                    // press.
+                    "pane" | "pane-repeat" => state.toggle_active_pane(Gesture {
+                        repeat: msg == "pane-repeat",
+                    }),
                     "rowdetail" => state.toggle_row_detail(),
                     _ => {}
                 }
@@ -611,9 +620,10 @@ fn TabBar() -> Element {
                     button {
                         class: "rounded px-1 py-1 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
                         aria_label: "Close connection",
+                        onkeydown: a_held_key_is_not_a_press,
                         onclick: {
                             let id = tab.id;
-                            move |_| state.close_connection(id)
+                            move |_| state.close_connection(id, Gesture::CLICK)
                         },
                         X { size: 12 }
                     }
@@ -745,7 +755,8 @@ fn PaneButton(
             } else {
                 "rounded px-3 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100"
             },
-            onclick: move |_| state.set_pane(id, target),
+            onkeydown: a_held_key_is_not_a_press,
+            onclick: move |_| state.set_pane(id, target, Gesture::CLICK),
             "{label}"
         }
     }
