@@ -6,7 +6,7 @@ on:
     tags:
       - "v*"
   # Escape hatch for an existing tag. A tag pushed while Actions is disabled
-  # (e.g. the monthly minutes ran out) never produces a run, and deleting and
+  # never produces a run, and deleting and
   # re-pushing that same tag afterwards does not reliably create one either —
   # observed on v0.7.0, where GitHub logged the deletes but no create. Build
   # and publish it by hand instead:
