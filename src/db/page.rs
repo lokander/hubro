@@ -151,6 +151,55 @@ fn is_scalar_base(base: &str) -> bool {
     )
 }
 
+/// Whether a column fetched *whole* — a key or foreign-key column, or a
+/// scalar — is read through the server's own text instead of the driver's
+/// decode of its wire value. The cast is the preview's ([`preview_exprs`]),
+/// without the cap.
+///
+/// Why: a key column's value becomes the row's locator, which is bound back
+/// through the column's own type to find the row again
+/// (`staged::row_where`, `staged::equalities_where`). A type the backend's
+/// decoder has no arm for reads as a `<typename>` marker, and no row has
+/// that key: measured on PostgreSQL 17, a table keyed on `inet`, `cidr`,
+/// `macaddr`, `macaddr8`, `money`, an `int4range` or `tsrange`, or
+/// `tsvector` could neither load a long cell nor save an edit, and a
+/// foreign-key jump from one landed nowhere. `tsvector` failed *silently*:
+/// `<tsvector>` is itself a valid tsvector, so the long cell loaded as NULL
+/// and the jump showed an empty page. SQL Server's `hierarchyid` read as
+/// `<udt>` the same way.
+///
+/// - **Postgres: every text-class column, and `money`.** A type's text
+///   output is what its input function reads back, which is the round trip
+///   a locator needs, and it is what the same column already shows when it
+///   is not a key (its preview is the same cast). That covers types no
+///   decoder arm exists for — including user-defined base types — rather
+///   than a list of the ones measured. It also replaces the decoder's array
+///   rendering for a key or foreign key, which quotes nothing: an element
+///   containing a comma read as two elements and bound back as a different
+///   array. `money` is a scalar, but its binary value is a count of the
+///   minor units of `lc_monetary`'s currency, which the client cannot see,
+///   so only the server can print it.
+/// - **SQL Server: `hierarchyid` only.** Its `CAST` to `nvarchar` is
+///   `ToString()` (`/1/2/`), which the server parses back on comparison.
+///   SQL Server cannot have the Postgres rule: `CAST` to `nvarchar` is
+///   lossy for the types an alias type can stand for (six significant
+///   digits of a `float`, two decimals of `money`, minutes of a `datetime`),
+///   and an alias type classifies as text by its alias name.
+///   `sql_variant` is not fixed here but refused as a key
+///   ([`super::rowkey::key_column_addressable`]).
+/// - **SQLite: never.** Its values arrive as the five storage classes, all
+///   of which decode.
+pub(crate) fn fetched_as_server_text(dialect: Dialect, column: &ColumnMeta) -> bool {
+    let lowered = column.type_name.trim().to_ascii_lowercase();
+    match dialect {
+        Dialect::Postgres => {
+            lowered == "money" || classify_column(&column.type_name) == ColumnClass::Text
+        }
+        Dialect::SqlServer => lowered == "hierarchyid",
+        Dialect::Sqlite => false,
+    }
+}
+
 /// One visible column of a bounded page, and how its value was fetched. The
 /// bounded fetch appends a `length` column for each previewed column; the
 /// decoder uses this plan to reunite them.
@@ -446,9 +495,11 @@ impl PageRequest {
     /// `columns` are the table's visible columns in `*` order (from
     /// introspection); `no_preview` names columns that must always be fetched
     /// whole (identity keys and foreign-key columns — a truncated key would
-    /// misaddress rows or misdirect a foreign-key jump). Falls back to the
-    /// plain [`Self::select_sql`] (empty plan) when nothing qualifies for a
-    /// preview, so callers without metadata behave exactly as before.
+    /// misaddress rows or misdirect a foreign-key jump) — through the
+    /// server's text where [`fetched_as_server_text`] says the driver's
+    /// decode of them could not be bound back. Falls back to the plain
+    /// [`Self::select_sql`] (empty plan) when nothing qualifies for a preview
+    /// or that text, so callers without metadata behave exactly as before.
     pub fn select_bounded_sql(
         &self,
         dialect: Dialect,
@@ -477,8 +528,16 @@ impl PageRequest {
                 previewed,
             });
         }
-        // Nothing large to bound → identical to the plain page select.
-        if columns.is_empty() || !specs.iter().any(|s| s.previewed) {
+        // Columns read through the server's text, by name. A previewed one
+        // is already read through it, so naming it here changes nothing.
+        let as_text: Vec<&str> = columns
+            .iter()
+            .filter(|column| fetched_as_server_text(dialect, column))
+            .map(|column| column.name.as_str())
+            .collect();
+        // Nothing large to bound and nothing to read as text → identical to
+        // the plain page select.
+        if columns.is_empty() || (!specs.iter().any(|s| s.previewed) && as_text.is_empty()) {
             let (sql, params) = self.select_sql(dialect);
             return (
                 sql,
@@ -495,7 +554,11 @@ impl PageRequest {
         for spec in &specs {
             let q = quote_ident(&spec.name);
             if !spec.previewed {
-                value_exprs.push(q);
+                if as_text.contains(&spec.name.as_str()) {
+                    value_exprs.push(format!("{} AS {q}", dialect.cast_expr(&q, "text")));
+                } else {
+                    value_exprs.push(q);
+                }
                 continue;
             }
             // Previewed columns are Text or Binary by construction (scalars
@@ -513,10 +576,26 @@ impl PageRequest {
             select_list.push_str(&length_exprs.join(", "));
         }
         let (where_clause, params) = self.where_clause(dialect);
+        // A sort on a column the select list wraps names the table's column,
+        // not the wrapper: both engines resolve a bare `ORDER BY "c"` to the
+        // output column `… AS "c"` first, which sorted a previewed column by
+        // its text (`[10,20)` before `[9,10)`, `/10/` before `/2/`) — and
+        // would sort a key read through its text the same way.
+        let wrapped = |column: &str| {
+            as_text.contains(&column) || specs.iter().any(|s| s.previewed && s.name == column)
+        };
+        let order = match &self.sort {
+            Some((column, dir)) if wrapped(column) => format!(
+                " ORDER BY {}.{} {}",
+                self.qualified_table(),
+                quote_ident(column),
+                dir.sql()
+            ),
+            _ => self.order_clause(),
+        };
         let sql = format!(
-            "SELECT {select_list} FROM {}{where_clause}{}{}",
+            "SELECT {select_list} FROM {}{where_clause}{order}{}",
             self.qualified_table(),
-            self.order_clause(),
             self.limit_offset(dialect),
         );
         (
@@ -1210,6 +1289,104 @@ mod tests {
         assert_eq!(sql, "SELECT * FROM \"tracks\" LIMIT 100 OFFSET 200");
         assert_eq!(plan.length_columns, 0);
         assert!(plan.columns.iter().all(|c| !c.previewed));
+    }
+
+    #[test]
+    fn postgres_keys_without_a_scalar_decode_are_read_as_the_servers_text() {
+        // A key or foreign key the class would preview is fetched whole as
+        // its `::text` — the same text its preview shows when it is not a
+        // key — and so is `money`, whose binary value only the server can
+        // print. Every other scalar is fetched as itself.
+        let columns = [
+            col("addr", "inet", Some(1)),
+            col("span", "int4range", None),
+            col("price", "money", None),
+            col("n", "integer", None),
+            col("oid", "oid", None),
+        ];
+        let (sql, _params, plan) =
+            base().select_bounded_sql(Dialect::Postgres, &columns, &["addr", "span"], 512);
+        assert_eq!(
+            sql,
+            "SELECT \"addr\"::text AS \"addr\", \"span\"::text AS \"span\", \
+             \"price\"::text AS \"price\", \"n\", \"oid\" \
+             FROM \"tracks\" LIMIT 100 OFFSET 200"
+        );
+        // Fetched whole: nothing about them is a preview.
+        assert_eq!(plan.length_columns, 0);
+        assert!(plan.columns.iter().all(|c| !c.previewed));
+    }
+
+    #[test]
+    fn sqlserver_reads_only_hierarchyid_keys_as_text() {
+        // `CAST(… AS nvarchar)` is lossy for what an alias type can stand
+        // for, so SQL Server reads a key as text only for `hierarchyid`,
+        // whose text is what it parses back.
+        let columns = [
+            col("node", "hierarchyid", Some(1)),
+            col("code", "nvarchar(10)", None),
+            col("stamp", "dbo.StampAlias", None),
+            col("v", "sql_variant", None),
+        ];
+        let (sql, _params, plan) = base().select_bounded_sql(
+            Dialect::SqlServer,
+            &columns,
+            &["node", "code", "stamp", "v"],
+            512,
+        );
+        assert_eq!(
+            sql,
+            "SELECT CAST(\"node\" AS nvarchar(max)) AS \"node\", \"code\", \"stamp\", \"v\" \
+             FROM \"tracks\" ORDER BY (SELECT NULL) OFFSET 200 ROWS FETCH NEXT 100 ROWS ONLY"
+        );
+        assert_eq!(plan.length_columns, 0);
+    }
+
+    #[test]
+    fn sqlite_keys_are_never_read_as_text() {
+        let columns = [col("k", "TEXT", Some(1)), col("n", "REAL", None)];
+        let (sql, _params, _plan) =
+            base().select_bounded_sql(Dialect::Sqlite, &columns, &["k"], 2048);
+        assert_eq!(sql, "SELECT * FROM \"tracks\" LIMIT 100 OFFSET 200");
+    }
+
+    #[test]
+    fn a_sort_on_a_wrapped_column_names_the_tables_column() {
+        // Both engines resolve a bare `ORDER BY "c"` to the output column
+        // `… AS "c"`, which sorts a range or `hierarchyid` by its text. A
+        // column the select list wraps — read as text, or previewed — is
+        // sorted by the table's own column; a plain one stays unqualified.
+        let columns = [
+            col("span", "int4range", Some(1)),
+            col("body", "text", None),
+            col("n", "integer", None),
+        ];
+        let sorted = |column: &str, dialect: Dialect| {
+            let req = PageRequest {
+                schema: Some("app".into()),
+                sort: Some((column.into(), SortDir::Desc)),
+                ..base()
+            };
+            req.select_bounded_sql(dialect, &columns, &["span"], 512).0
+        };
+        for (column, order) in [
+            ("span", " ORDER BY \"app\".\"tracks\".\"span\" DESC "),
+            ("body", " ORDER BY \"app\".\"tracks\".\"body\" DESC "),
+            ("n", " ORDER BY \"n\" DESC "),
+        ] {
+            let sql = sorted(column, Dialect::Postgres);
+            assert!(sql.contains(order), "{column}: {sql}");
+        }
+        let hierarchy = [col("node", "hierarchyid", Some(1))];
+        let req = PageRequest {
+            sort: Some(("node".into(), SortDir::Asc)),
+            ..base()
+        };
+        let (sql, _, _) = req.select_bounded_sql(Dialect::SqlServer, &hierarchy, &["node"], 512);
+        assert!(
+            sql.contains(" ORDER BY \"tracks\".\"node\" ASC OFFSET"),
+            "{sql}"
+        );
     }
 
     #[test]

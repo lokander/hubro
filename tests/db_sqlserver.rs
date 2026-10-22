@@ -2056,6 +2056,8 @@ const MSSQL_KEY_TYPES: &[(&str, &str, &[&str])] = &[
     ("char3", "char(3)", &["'ab'", "'abc'"]),
     ("bit", "bit", &["0", "1"]),
     ("money", "money", &["12.3456"]),
+    // Read as the `<udt>` marker before it was fetched through its text.
+    ("hierarchyid", "hierarchyid", &["'/'", "'/1/2/'", "'/1.5/'"]),
 ];
 
 /// Creates one table per [`MSSQL_KEY_TYPES`] entry — `<prefix>_<slug>`,
@@ -2160,6 +2162,96 @@ async fn sqlserver_every_key_type_reads_and_writes_the_same_row() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     drop_key_type_fixtures(&pool, "addr", &slugs).await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_variant_keys_are_refused_rather_than_missed() {
+    // A `sql_variant` key holding an `int` or a `date` read as the
+    // `<ssvariant>` marker, matched no row when bound back, and so loaded
+    // its long cell as NULL, had its save refused and jumped to an empty page
+    // — with nothing reporting why. Its text would not help either: a
+    // variant compares unequal to a value of another type family, which is
+    // the engine fact pinned first. So the key is refused: the table reads as
+    // key-less, and a foreign key into it offers no jump.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.variant_refs",
+            "DROP TABLE IF EXISTS dbo.variant_keys",
+            "CREATE TABLE dbo.variant_keys (k sql_variant NOT NULL PRIMARY KEY, \
+             alt int NOT NULL CONSTRAINT variant_alt UNIQUE, body nvarchar(max), tag nvarchar(20))",
+            "INSERT INTO dbo.variant_keys VALUES \
+             (CAST(CAST(5 AS int) AS sql_variant), 1, \
+              CONCAT(N'0:', REPLICATE(CAST(N'x' AS nvarchar(max)), 5000)), N't'), \
+             (CAST(N'five' AS sql_variant), 2, \
+              CONCAT(N'1:', REPLICATE(CAST(N'x' AS nvarchar(max)), 5000)), N't'), \
+             (CAST(CAST('2024-02-29' AS date) AS sql_variant), 3, \
+              CONCAT(N'2:', REPLICATE(CAST(N'x' AS nvarchar(max)), 5000)), N't')",
+            "CREATE TABLE dbo.variant_refs (ref sql_variant REFERENCES dbo.variant_keys (k))",
+            "INSERT INTO dbo.variant_refs VALUES (CAST(CAST(5 AS int) AS sql_variant))",
+        ],
+    )
+    .await;
+    let count = |predicate: &'static str| {
+        let pool = &pool;
+        async move {
+            let sql = format!("SELECT COUNT(*) FROM dbo.variant_keys WHERE k = {predicate}");
+            pool.query(&sql).await.unwrap().rows[0][0].clone()
+        }
+    };
+    assert_eq!(
+        count("N'five'").await,
+        Value::Integer(1),
+        "a string variant matches its text"
+    );
+    assert_eq!(
+        count("N'5'").await,
+        Value::Integer(0),
+        "an int variant does not"
+    );
+    assert_eq!(
+        count("N'2024-02-29'").await,
+        Value::Integer(0),
+        "nor a date one"
+    );
+
+    let keys = introspect_table(&pool, "variant_keys").await;
+    let refs = introspect_table(&pool, "variant_refs").await;
+    // The primary key is passed over; the NOT NULL unique `alt` still
+    // addresses the rows, which proves the refusal is per column rather than
+    // per table.
+    assert_eq!(
+        detect_row_identity(&keys, Dialect::SqlServer),
+        Some(RowIdentity::UniqueIndex {
+            name: "variant_alt".into(),
+            columns: vec!["alt".into()],
+        })
+    );
+    let failures = common::row_addressing_failures(&pool, &keys).await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    run_all(
+        &pool,
+        &[
+            "ALTER TABLE dbo.variant_keys DROP CONSTRAINT variant_alt",
+            "ALTER TABLE dbo.variant_keys DROP COLUMN alt",
+        ],
+    )
+    .await;
+    let keys = introspect_table(&pool, "variant_keys").await;
+    assert_eq!(detect_row_identity(&keys, Dialect::SqlServer), None);
+    assert!(
+        hubro::db::fk_target_columns(&refs.foreign_keys[0], &keys).is_none(),
+        "a jump into a variant key is not offered"
+    );
+
+    run_all(
+        &pool,
+        &["DROP TABLE dbo.variant_refs", "DROP TABLE dbo.variant_keys"],
+    )
+    .await;
     pool.close().await;
 }
 

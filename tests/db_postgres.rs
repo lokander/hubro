@@ -1927,9 +1927,10 @@ async fn postgres_accepts_every_explain_header_hubro_tolerates() {
 /// [`common::row_addressing_failures`] walks. Each entry is a slug, the
 /// column type and the key literals stored under it.
 ///
-/// Absent on purpose: a key whose type the grid cannot decode at all (`inet`
-/// reads as the marker `<inet>`), which no predicate can re-address; that is
-/// a decoding gap, not a disagreement between the read and the write.
+/// The types from `inet` on have no decoder arm (or, for `oid`, had none):
+/// each read as a `<typename>` marker no predicate can re-address, until a
+/// key column was fetched through the server's own text
+/// (`page::fetched_as_server_text`).
 const PG_KEY_TYPES: &[(&str, &str, &[&str])] = &[
     // A float's text spelling is the server's, not Rust's: `float8::text` of
     // 1e20 is `1e+20`, which a key bound as Rust's `Display` never equals.
@@ -2024,6 +2025,37 @@ const PG_KEY_TYPES: &[(&str, &str, &[&str])] = &[
     ("bit4", "bit(4)", &["B'1010'"]),
     // `{schema}` is the fixture schema, where the enum is created.
     ("mood", "{schema}.mood", &["'happy'", "'Sad'"]),
+    // `<inet>` and the rest failed loudly ("invalid input syntax"); the
+    // `<tsvector>` marker is itself a valid tsvector, so that key failed
+    // silently: its long cell loaded as NULL and its jump found no row.
+    (
+        "inet",
+        "inet",
+        &["'192.168.0.1'", "'10.0.0.0/8'", "'::ffff:1.2.3.4/120'"],
+    ),
+    ("cidr", "cidr", &["'10.0.0.0/8'", "'2001:db8::/32'"]),
+    ("macaddr", "macaddr", &["'08:00:2b:01:02:03'"]),
+    ("macaddr8", "macaddr8", &["'08:00:2b:01:02:03:04:05'"]),
+    ("money", "money", &["12.34", "-0.5"]),
+    ("oid", "oid", &["4294967295", "0"]),
+    ("int4range", "int4range", &["'[1,5)'", "'empty'", "'(,3]'"]),
+    (
+        "tsrange",
+        "tsrange",
+        &["'[2024-01-01 00:00,2024-01-02 12:30)'"],
+    ),
+    ("tsvector", "tsvector", &["'a fat cat'", "'quote''s:1A'"]),
+    // The decoder's array rendering quotes nothing, so `{a,b,c}` was both
+    // of the first two keys and neither; the server's text quotes them.
+    (
+        "textarr",
+        "text[]",
+        &[
+            "ARRAY['a,b', 'c']",
+            "ARRAY['a', 'b,c']",
+            "ARRAY['x y', '\"q\"']",
+        ],
+    ),
 ];
 
 /// Creates one table per [`PG_KEY_TYPES`] entry in `schema` — `k_<slug>`,
@@ -2141,6 +2173,59 @@ async fn postgres_every_key_type_reads_and_writes_the_same_row() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 
     pool.query("DROP SCHEMA addr_keys CASCADE").await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_a_column_read_as_text_still_sorts_by_its_type() {
+    // A key read through its text, and a previewed column, are both
+    // `… AS "c"` in the select list, which a bare `ORDER BY "c"` resolves to
+    // first — sorting `[10,20)` before `[9,10)`. The sort names the table's
+    // column, so both order as ranges.
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    for sql in [
+        "DROP TABLE IF EXISTS range_sort",
+        "CREATE TABLE range_sort (k int4range PRIMARY KEY, r int4range)",
+        "INSERT INTO range_sort VALUES ('[10,20)', '[10,20)'), ('[9,10)', '[9,10)'), \
+         ('[100,200)', '[100,200)')",
+    ] {
+        pool.query(sql).await.unwrap();
+    }
+    let table = pool
+        .introspect()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == "range_sort")
+        .unwrap();
+    for column in ["k", "r"] {
+        let request = PageRequest {
+            schema: table.schema.clone(),
+            table: table.name.clone(),
+            limit: 10,
+            offset: 0,
+            sort: Some((column.into(), SortDir::Asc)),
+            filter: None,
+            extra_key_column: None,
+        };
+        let page = pool
+            .fetch_page_bounded(&request, &table.columns, &["k"])
+            .await
+            .unwrap();
+        let at = if column == "k" { 0 } else { 1 };
+        let order: Vec<&Value> = page.result.rows.iter().map(|row| &row[at]).collect();
+        assert_eq!(
+            order,
+            [
+                &Value::Text("[9,10)".into()),
+                &Value::Text("[10,20)".into()),
+                &Value::Text("[100,200)".into()),
+            ],
+            "sorted by {column}"
+        );
+    }
+    pool.query("DROP TABLE range_sort").await.unwrap();
     pool.close().await;
 }
 

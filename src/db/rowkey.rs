@@ -8,7 +8,7 @@
 //! [`DbPool::execute_checked`](super::DbPool::execute_checked), which rolls
 //! back unless the affected-row count matches expectations.
 
-use super::schema::{TableKind, TableMeta};
+use super::schema::{ColumnMeta, TableKind, TableMeta};
 use super::sql::Dialect;
 
 /// How rows of one table are uniquely addressed by UPDATE/DELETE, in
@@ -75,16 +75,19 @@ pub fn detect_row_identity(table: &TableMeta, dialect: Dialect) -> Option<RowIde
     if matches!(table.kind, TableKind::View | TableKind::MaterializedView) {
         return None;
     }
-    let pk: Vec<String> = table.primary_key().iter().map(|c| c.name.clone()).collect();
-    if !pk.is_empty() {
-        return Some(RowIdentity::PrimaryKey { columns: pk });
+    let pk = table.primary_key();
+    if !pk.is_empty() && pk.iter().all(|c| key_column_addressable(c)) {
+        let columns = pk.iter().map(|c| c.name.clone()).collect();
+        return Some(RowIdentity::PrimaryKey { columns });
     }
     for index in table.indexes.iter().filter(|i| i.unique && !i.partial) {
         let usable = !index.columns.is_empty()
-            && index
-                .columns
-                .iter()
-                .all(|name| table.columns.iter().any(|c| c.name == *name && !c.nullable));
+            && index.columns.iter().all(|name| {
+                table
+                    .columns
+                    .iter()
+                    .any(|c| c.name == *name && !c.nullable && key_column_addressable(c))
+            });
         if usable {
             return Some(RowIdentity::UniqueIndex {
                 name: index.name.clone(),
@@ -96,6 +99,32 @@ pub fn detect_row_identity(table: &TableMeta, dialect: Dialect) -> Option<RowIde
         Dialect::Sqlite => rowid_accessor(table).map(|column| RowIdentity::Rowid { column }),
         Dialect::Postgres | Dialect::SqlServer => None,
     }
+}
+
+/// Whether a value of `column`, as the grid reads it, can be bound back to
+/// find its row — the condition for the column to serve in a row's identity
+/// ([`detect_row_identity`]) or as the target of a foreign-key jump
+/// ([`fk_target_columns`](super::fk::fk_target_columns)).
+///
+/// False for SQL Server's `sql_variant` alone. Each value carries its own
+/// base type, and a variant compares unequal to any value of another type
+/// family: measured on SQL Server 2022, a key holding `CAST(5 AS int)` or a
+/// `date` reads as text (or the `<ssvariant>` marker) and matches no row
+/// when bound back, so its long cell loaded as NULL, its save was refused
+/// and its jump showed an empty page — silently, since nothing failed. Only
+/// a variant that happens to hold a string re-addresses, and whether one
+/// does is a property of the row, not the column. Spelling each value with
+/// its base type would need `SQL_VARIANT_PROPERTY` in every read and a cast
+/// per bound value; refusing the key leaves the table browsable and
+/// read-only with the key-less table's reason, which the UI already handles.
+///
+/// Every other type re-addresses: Postgres's types without a decoder arm
+/// and SQL Server's `hierarchyid` are read through the server's text for
+/// that reason ([`fetched_as_server_text`](super::page::fetched_as_server_text)).
+/// No other engine reports a type named `sql_variant`, so the name alone
+/// decides.
+pub fn key_column_addressable(column: &ColumnMeta) -> bool {
+    !column.type_name.trim().eq_ignore_ascii_case("sql_variant")
 }
 
 /// First rowid accessor name not shadowed by a user column. SQLite resolves
@@ -380,6 +409,40 @@ mod tests {
                 columns: vec!["email".into()]
             })
         );
+    }
+
+    #[test]
+    fn a_sql_variant_column_never_serves_as_a_key() {
+        // Its values compare unequal to a value of another type family, so a
+        // locator built from one finds nothing: the key is passed over, and
+        // a usable unique index still stands in for it.
+        let variant = |name: &str, pk: Option<u32>| ColumnMeta {
+            type_name: "sql_variant".into(),
+            ..col(name, false, pk)
+        };
+        let keyed = table(
+            TableKind::Table,
+            vec![variant("k", Some(1)), col("alt", false, None)],
+            vec![
+                index("uniq_v", true, &["k"]),
+                index("uniq_alt", true, &["alt"]),
+            ],
+        );
+        assert_eq!(
+            detect_row_identity(&keyed, Dialect::SqlServer),
+            Some(RowIdentity::UniqueIndex {
+                name: "uniq_alt".into(),
+                columns: vec!["alt".into()]
+            })
+        );
+        let composite = table(
+            TableKind::Table,
+            vec![variant("k", Some(1)), col("n", false, Some(2))],
+            vec![],
+        );
+        assert_eq!(detect_row_identity(&composite, Dialect::SqlServer), None);
+        // Any other type name keys as before.
+        assert!(key_column_addressable(&col("k", false, Some(1))));
     }
 
     #[test]
