@@ -4870,6 +4870,104 @@ mod tests {
             .unwrap();
     }
 
+    /// A Postgres-wire stub on a loopback port that refuses every login with
+    /// SQLSTATE `28P01` — enough to raise the password prompt with no server.
+    async fn refusing_postgres() -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    loop {
+                        let mut header = [0u8; 8];
+                        if socket.read_exact(&mut header).await.is_err() {
+                            return;
+                        }
+                        let len = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+                        let code = u32::from_be_bytes(header[4..].try_into().unwrap());
+                        // SSLRequest / GSSENCRequest: decline, and the client
+                        // carries on in plain text on the same socket.
+                        if code == 80877103 || code == 80877104 {
+                            let _ = socket.write_all(b"N").await;
+                            continue;
+                        }
+                        let mut rest = vec![0u8; len.saturating_sub(8)];
+                        let _ = socket.read_exact(&mut rest).await;
+                        let fields: &[u8] =
+                            b"SFATAL\0VFATAL\0C28P01\0Mpassword authentication failed\0\0";
+                        let mut reply = vec![b'E'];
+                        reply.extend_from_slice(&(fields.len() as u32 + 4).to_be_bytes());
+                        reply.extend_from_slice(fields);
+                        let _ = socket.write_all(&reply).await;
+                        return;
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    // See the Postgres test above for why the keyring guard spans the awaits.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_refused_connect_tells_its_prompt_what_the_keyring_holds() {
+        // Executes the hop from `connect_server`'s reads into the prompt's
+        // `stored`, which decides whether the card warns that an unticked box
+        // removes a stored password. Inverting what the reads found would
+        // warn on a first connect with an empty keyring, and stay silent when
+        // the keyring supplied the refused password.
+        use dioxus::core::VirtualDom;
+
+        use crate::ui::test_dom::provide_state;
+
+        let _keyring = crate::secrets::tests::mock_keyring();
+        let port = refusing_postgres().await;
+        fn empty() -> Element {
+            rsx! {}
+        }
+        let mut dom = VirtualDom::new(empty);
+        let state = provide_state(&dom);
+        dom.rebuild_in_place();
+
+        for (case, keyring, session, expected) in [
+            ("keyring", Some("stored"), None, StoredCopy::Present),
+            ("nothing", None, None, StoredCopy::Absent),
+            (
+                "session",
+                Some("stored"),
+                Some("typed"),
+                StoredCopy::Unknown,
+            ),
+        ] {
+            let url = format!("postgres://demo@127.0.0.1:{port}/{case}");
+            if let Some(password) = keyring {
+                crate::secrets::store_password(&url, password).unwrap();
+            }
+            if let Some(password) = session {
+                let mut passwords = state.session_passwords;
+                dom.in_runtime(|| {
+                    passwords.write().insert(url.clone(), password.to_string());
+                });
+            }
+            let connect = state.connect_server(
+                ServerBackend::POSTGRES,
+                url.clone(),
+                case.to_string(),
+                None,
+                ServerAuth::Password,
+            );
+            drive(&mut dom, connect).await;
+            let prompt = dom.in_runtime(|| state.password_prompt.peek().clone());
+            let prompt = prompt.unwrap_or_else(|| panic!("{case}: the refusal raised no prompt"));
+            assert_eq!(prompt.url, url);
+            assert_eq!(prompt.stored, expected, "{case}");
+            let mut cleared = state.password_prompt;
+            dom.in_runtime(|| cleared.set(None));
+            crate::secrets::delete_password(&url).unwrap();
+        }
+    }
+
     #[allow(clippy::await_holding_lock)] // see the Postgres test above
     #[tokio::test]
     async fn an_edit_never_carries_a_password_a_different_one_replaced() {
