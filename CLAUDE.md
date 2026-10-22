@@ -46,7 +46,7 @@ Nothing in the suite covers rendering, so a UI change wants the app driven: one 
 
 ## Issue workflow
 
-Work is tracked in Linear (team FRE). **Never write a Linear issue ID into a tracked file** — code, comments, test names, docs, this file. The repository is public and the Linear project is not, so an ID is a dead link to every outside reader, and finished issues are deleted (see Milestones). State the reason itself; `tests/no_issue_ids.rs` fails on any ID in a tracked file.
+Work is tracked in Linear (team FRE). **Never write a Linear issue ID into a tracked file** — code, comments, test names, docs, this file. The repository is public and the Linear project is not, so an ID is a dead link to every outside reader, and finished issues are deleted (see Milestones). State the reason itself; `tests/no_issue_ids.rs` fails on any ID in a tracked file. The same goes for PR descriptions and PR comments, which are just as public: no "Closes" line naming the issue. Linear links the PR through the branch name. Older PRs that carry IDs stay as they are.
 
 Docs-only changes (CLAUDE.md, README, etc.) may be committed directly to `main`; all other work follows this flow:
 
