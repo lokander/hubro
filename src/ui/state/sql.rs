@@ -312,8 +312,11 @@ impl AppState {
     ///   that commits on its own (a cancelled autocommit UPDATE) may still
     ///   take effect; whatever the script left uncommitted is discarded by the
     ///   server. SQLite's worker thread runs the statement to completion
-    ///   before the close; Postgres and SQL Server notice the disconnect when
-    ///   they next send to the client.
+    ///   before the close, and keeps the write lock until then: an edit made
+    ///   meanwhile waits SQLite's 5 s busy timeout and fails with "database is
+    ///   locked" (measured the same on the atomic and sequential paths, before
+    ///   and after runs closed their connections). Postgres and SQL Server
+    ///   notice the disconnect when they next send to the client.
     /// - On a connection marked read-only, Postgres's per-statement
     ///   transaction ends with the connection, as its rollback would have
     ///   ended it; SQLite's read-only connection is closed.
