@@ -472,6 +472,7 @@ fn collect_index_ddl(rows: &[Vec<Value>]) -> Vec<IndexDdl> {
                     // guarantees uniqueness among the matching rows.
                     partial: filter.is_some(),
                     columns: Vec::new(),
+                    constraint: None,
                 },
                 extras: IndexExtras {
                     filter,

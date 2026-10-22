@@ -25,7 +25,7 @@
 //!   button labelled truncate.
 
 use super::caps::Capabilities;
-use super::schema::{TableKind, TableMeta};
+use super::schema::{IndexConstraint, TableKind, TableMeta};
 use super::script::script_refusal;
 use super::sql::{qualified, quote_ident, Dialect};
 
@@ -206,8 +206,34 @@ pub fn schema_edit_refusal(
     if table.kind != TableKind::Table {
         return Some(NOT_A_TABLE);
     }
+    if let Some(reason) = constraint_index_refusal(table, op) {
+        return Some(reason);
+    }
     let statements = [schema_op_sql(dialect, table, op)];
     script_refusal(caps, &statements, dialect).map(|(_, reason)| reason)
+}
+
+/// Why a Drop of an index the engine built for a constraint is not offered.
+pub const PRIMARY_KEY_INDEX: &str =
+    "This index enforces the table's primary key and can't be dropped on its own.";
+/// As [`PRIMARY_KEY_INDEX`], for a UNIQUE constraint's index.
+pub const UNIQUE_CONSTRAINT_INDEX: &str =
+    "This index enforces a UNIQUE constraint and can't be dropped on its own.";
+
+/// Refuses dropping an index that exists to enforce a constraint
+/// ([`IndexMeta::constraint`](super::schema::IndexMeta::constraint)): the engine refuses `DROP INDEX` on one
+/// (measured on SQLite), so offering it would only offer a failure. Unlike the
+/// capability half, this is a fact about the one object, which no statement
+/// text reveals — the generated `DROP INDEX` reads the same either way.
+fn constraint_index_refusal(table: &TableMeta, op: &SchemaOp) -> Option<&'static str> {
+    let SchemaOp::DropIndex { name } = op else {
+        return None;
+    };
+    let index = table.indexes.iter().find(|index| index.name == *name)?;
+    match index.constraint? {
+        IndexConstraint::PrimaryKey => Some(PRIMARY_KEY_INDEX),
+        IndexConstraint::Unique => Some(UNIQUE_CONSTRAINT_INDEX),
+    }
 }
 
 /// The statement `op` generates against `table` on `dialect`, terminated.
@@ -378,6 +404,7 @@ mod tests {
                 unique: false,
                 partial: false,
                 columns: vec!["id".into()],
+                constraint: None,
             }],
             foreign_keys: vec![],
             restriction: None,
@@ -884,6 +911,43 @@ mod tests {
             // time, not data — so it must not demand the typed-name ritual.
             if matches!(op, SchemaOp::DropIndex { .. }) {
                 assert!(!op.destroys_data());
+            }
+        }
+    }
+
+    #[test]
+    fn dropping_an_index_built_for_a_constraint_is_refused_on_every_dialect() {
+        let mut meta = table(None, "t");
+        let mut constrained = |name: &str, constraint| {
+            meta.indexes.push(IndexMeta {
+                name: name.into(),
+                unique: true,
+                partial: false,
+                columns: vec!["id".into()],
+                constraint: Some(constraint),
+            })
+        };
+        constrained("t_pk", IndexConstraint::PrimaryKey);
+        constrained("t_uq", IndexConstraint::Unique);
+        let drop = |name: &str| SchemaOp::DropIndex { name: name.into() };
+        for dialect in DIALECTS {
+            let refusal =
+                |op: &SchemaOp| schema_edit_refusal(Capabilities::FULL, dialect, &meta, op);
+            assert_eq!(
+                refusal(&drop("t_pk")),
+                Some(PRIMARY_KEY_INDEX),
+                "{dialect:?}"
+            );
+            assert_eq!(
+                refusal(&drop("t_uq")),
+                Some(UNIQUE_CONSTRAINT_INDEX),
+                "{dialect:?}"
+            );
+            // An index the user made is offered — `table`'s own, unique or
+            // not — and so is every other operation on the same table.
+            assert_eq!(refusal(&drop("idx_t_id")), None, "{dialect:?}");
+            for op in every_op() {
+                assert_eq!(refusal(&op), None, "{dialect:?} {op:?}");
             }
         }
     }

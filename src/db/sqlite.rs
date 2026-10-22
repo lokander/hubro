@@ -23,7 +23,8 @@ use super::ddl::{create_index_sql, terminate, Ddl, DdlObject, IndexExtras};
 use super::error::DbError;
 use super::export::ExportFormat;
 use super::schema::{
-    ColumnMeta, ForeignKeyMeta, Generated, IndexMeta, TableKind, TableMeta, TypeDetail,
+    ColumnMeta, ForeignKeyMeta, Generated, IndexConstraint, IndexMeta, TableKind, TableMeta,
+    TypeDetail,
 };
 use super::sql::Dialect;
 use super::sqlx_common::{self, get};
@@ -909,6 +910,19 @@ pub(super) fn rowid_alias(
     }
 }
 
+/// The constraint behind an index, from `pragma_index_list.origin`: `pk` for
+/// a PRIMARY KEY's, `u` for a UNIQUE constraint's, `c` for one made by
+/// `CREATE INDEX`. Measured on SQLite 3.46: `DROP INDEX` refuses both
+/// constraint kinds ("index associated with UNIQUE or PRIMARY KEY constraint
+/// cannot be dropped") and drops a `c` index, unique or not.
+pub(super) fn index_constraint(origin: &str) -> Option<IndexConstraint> {
+    match origin {
+        "pk" => Some(IndexConstraint::PrimaryKey),
+        "u" => Some(IndexConstraint::Unique),
+        _ => None,
+    }
+}
+
 /// Indexes of every table, keyed by table name, and the names of the tables
 /// that have an `origin = 'pk'` index (see [`rowid_alias`]). Two queries: the
 /// per-table index list, and every index's key columns keyed by index name —
@@ -961,7 +975,8 @@ async fn table_indexes(
         let unique: i64 = get(&row, "unique")?;
         let partial: i64 = get(&row, "partial")?;
         let origin: String = get(&row, "origin")?;
-        if origin == "pk" {
+        let constraint = index_constraint(&origin);
+        if constraint == Some(IndexConstraint::PrimaryKey) {
             pk_indexed.insert(table.clone());
         }
         let mut columns = index_columns.remove(&name).unwrap_or_default();
@@ -975,6 +990,7 @@ async fn table_indexes(
                 .into_iter()
                 .map(|(_, name)| name.unwrap_or_else(|| "<expr>".to_string()))
                 .collect(),
+            constraint,
         });
     }
     Ok((indexes, pk_indexed))
@@ -1930,5 +1946,12 @@ mod tests {
         // proves nothing about a key it declares.
         let keyed = vec![key_column("id", "INTEGER", Some(1))];
         assert_eq!(rowid_alias(false, &keyed, false), None);
+    }
+
+    #[test]
+    fn only_pk_and_unique_origins_are_constraint_indexes() {
+        assert_eq!(index_constraint("pk"), Some(IndexConstraint::PrimaryKey));
+        assert_eq!(index_constraint("u"), Some(IndexConstraint::Unique));
+        assert_eq!(index_constraint("c"), None);
     }
 }

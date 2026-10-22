@@ -122,6 +122,22 @@ pub struct IndexMeta {
     /// predicate, so row identity (rowkey.rs) must never rely on one.
     pub partial: bool,
     pub columns: Vec<String>,
+    /// The constraint this index exists to enforce, when the engine built it
+    /// for one rather than the user creating it. Such an index cannot be
+    /// dropped on its own, so the Schema view does not offer to.
+    ///
+    /// Only SQLite reports it today (`pragma_index_list.origin`). Postgres and
+    /// SQL Server leave it `None`, so there a Drop on a constraint's index is
+    /// still offered and the engine's refusal is what the user sees.
+    pub constraint: Option<IndexConstraint>,
+}
+
+/// What kind of constraint an engine-built index enforces — see
+/// [`IndexMeta::constraint`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexConstraint {
+    PrimaryKey,
+    Unique,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

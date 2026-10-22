@@ -59,7 +59,7 @@ mod common;
 use common::FixtureDb;
 use hubro::db::{
     run_script, schema_edit_refusal, schema_op_sql, split_statements, Capabilities, DbPool,
-    Dialect, SchemaOp, TableMeta, Value,
+    Dialect, SchemaOp, TableMeta, Value, PRIMARY_KEY_INDEX, UNIQUE_CONSTRAINT_INDEX,
 };
 
 /// What happened to one operation on one engine.
@@ -458,6 +458,64 @@ async fn sqlite_truncate_is_a_delete_and_says_so() {
     assert_eq!(row_count(&pool, meta).await, 0);
     // The table is still there, which is what makes it a truncate.
     assert!(find(&pool.introspect().await.unwrap(), "widgets").is_some());
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_an_index_built_for_a_constraint_is_not_offered_for_drop() {
+    // SQLite refuses `DROP INDEX` on the index behind a PRIMARY KEY or UNIQUE
+    // constraint. The gate must refuse exactly those, and still offer an index
+    // the user created — unique or not, which is why `unique` cannot decide it.
+    let fixture = FixtureDb::with_sql(
+        "CREATE TABLE tagged (code TEXT PRIMARY KEY, slug TEXT UNIQUE, a INT, b INT,
+                              UNIQUE (a, b));
+         CREATE UNIQUE INDEX tagged_made_unique ON tagged (a);
+         CREATE INDEX tagged_made ON tagged (b);",
+    )
+    .await;
+    let pool = fixture.open().await;
+    let tables = pool.introspect().await.unwrap();
+    let meta = table(&tables, "tagged");
+    let caps = pool.backend_capabilities();
+
+    let mut refused = Vec::new();
+    for index in &meta.indexes {
+        let op = SchemaOp::DropIndex {
+            name: index.name.clone(),
+        };
+        match schema_edit_refusal(caps, Dialect::Sqlite, meta, &op) {
+            Some(reason) => {
+                refused.push(reason);
+                // The engine agrees: what the gate withholds really fails.
+                let sql = schema_op_sql(Dialect::Sqlite, meta, &op);
+                let err = pool.execute(&sql).await.expect_err(&sql);
+                assert!(
+                    err.to_string()
+                        .contains("associated with UNIQUE or PRIMARY KEY constraint"),
+                    "{err}"
+                );
+            }
+            None => apply(&pool, meta, &op).await.unwrap(),
+        }
+    }
+    refused.sort();
+    let mut expected = vec![
+        PRIMARY_KEY_INDEX,
+        UNIQUE_CONSTRAINT_INDEX,
+        UNIQUE_CONSTRAINT_INDEX,
+    ];
+    expected.sort();
+    assert_eq!(refused, expected);
+    // Both indexes the user made were dropped; the constraints' remain.
+    let left = pool.introspect().await.unwrap();
+    let left: Vec<_> = table(&left, "tagged")
+        .indexes
+        .iter()
+        .map(|i| i.constraint)
+        .collect();
+    assert_eq!(left.len(), 3, "{left:?}");
+    assert!(left.iter().all(Option::is_some), "{left:?}");
 
     pool.close().await;
 }

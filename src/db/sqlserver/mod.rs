@@ -278,6 +278,7 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
                 unique,
                 partial,
                 columns: vec![column],
+                constraint: None,
             }),
         }
     }

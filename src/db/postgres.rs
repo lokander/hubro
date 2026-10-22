@@ -1697,6 +1697,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
                 unique,
                 partial,
                 columns: vec![column],
+                constraint: None,
             }),
         }
     }
