@@ -5450,7 +5450,7 @@ mod tests {
         let saved = dom.in_runtime(|| state.paths.peek().connections.clone());
         let saved = std::fs::read_to_string(saved.unwrap()).unwrap();
         assert!(saved.contains("hubro_expired_login"), "{saved}");
-        dom.in_runtime(|| state.close_connection(id));
+        dom.in_runtime(|| state.close_connection(id, crate::ui::notice::Gesture::CLICK));
 
         // A different password, unticked: the stale stored one is deleted.
         sqlx::query("ALTER ROLE hubro_expired_login PASSWORD 'replacement'")
@@ -5460,14 +5460,14 @@ mod tests {
         drive(&mut dom, connect(Some(("replacement", false)))).await;
         let id = open_id(&dom).expect("the new password must connect");
         assert_eq!(keyring(), None, "a different password connected unticked");
-        dom.in_runtime(|| state.close_connection(id));
+        dom.in_runtime(|| state.close_connection(id, crate::ui::notice::Gesture::CLICK));
 
         // A different password, ticked: it replaces the stored one.
         crate::secrets::store_password(&url, "stored").unwrap();
         drive(&mut dom, connect(Some(("replacement", true)))).await;
         let id = open_id(&dom).expect("the new password must connect");
         assert_eq!(keyring().as_deref(), Some("replacement"));
-        dom.in_runtime(|| state.close_connection(id));
+        dom.in_runtime(|| state.close_connection(id, crate::ui::notice::Gesture::CLICK));
 
         crate::secrets::delete_password(&url).unwrap();
         sqlx::query("DROP ROLE hubro_expired_login")
@@ -5852,7 +5852,7 @@ mod tests {
             );
         });
         // Closing a tab ends its session; that is not news to report.
-        dom.in_runtime(|| state.close_connection(closed));
+        dom.in_runtime(|| state.close_connection(closed, crate::ui::notice::Gesture::CLICK));
         drop(end_closed);
         drop(end_open);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);

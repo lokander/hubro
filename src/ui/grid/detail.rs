@@ -250,7 +250,7 @@ pub(super) fn RowDetailPanel(
     on_step: EventHandler<RowStep>,
     on_close: EventHandler<()>,
     on_width: EventHandler<f64>,
-    on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>)>,
+    on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>, Gesture)>,
 ) -> Element {
     // Install the resize listener once per mount; it reads no signals, so it
     // never re-installs, and the eval channel dies with the panel.
@@ -367,7 +367,7 @@ pub(super) fn RowDetailFields(
     /// as column and cannot reappear on a same-named field of another row.
     row_key: String,
     editing: Signal<Option<ActiveEdit>>,
-    on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>)>,
+    on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>, Gesture)>,
 ) -> Element {
     // Tab order: the editable fields, top to bottom.
     //
@@ -423,7 +423,7 @@ pub(super) fn RowDetailRow(
     row_key: String,
     editing: Signal<Option<ActiveEdit>>,
     grid_editing: Signal<Option<ActiveEdit>>,
-    on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>)>,
+    on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>, Gesture)>,
 ) -> Element {
     rsx! {
         div {
@@ -450,7 +450,7 @@ pub(super) fn RowDetailRow(
                     a {
                         class: "shrink-0 cursor-pointer select-none text-cyan-600 dark:text-cyan-400 hover:underline",
                         title: "Go to {fk.referenced_table}",
-                        onclick: move |_| on_fk_jump.call((fk.clone(), (*row_values).clone())),
+                        onclick: move |_| on_fk_jump.call((fk.clone(), (*row_values).clone(), Gesture::CLICK)),
                         "↗"
                     }
                 }

@@ -292,18 +292,52 @@ pub fn Overlay(
 /// is (the saved-queries panel's "Delete for good" sat exactly where
 /// "Delete" had been; Import, Run and the grid's Save relabel themselves in
 /// place), so without this a double-click is a confirmed action.
+///
+/// A heuristic, not a structural guard. A slow double-click — Windows lets
+/// the setting go to 900 ms — or a tremor can put a second click past it,
+/// and nothing then tells it from a deliberate one; the relabelled buttons
+/// cannot move out from under the pointer, so time is all there is to go
+/// on. A press held back inside the window is dropped without feedback.
 pub(crate) const CONFIRM_ARM_DELAY: Duration = Duration::from_millis(500);
 
-/// Whether a confirming press arriving `since` the confirmation was armed is
-/// taken. Anything sooner is the press that armed it, repeated.
-pub(crate) fn confirm_accepted(since: Duration) -> bool {
-    since >= CONFIRM_ARM_DELAY
+/// How a press reached a confirmation's decision. A held key's repeats are
+/// never deliberate presses, whatever the time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gesture {
+    /// The key is being held down: this is one of its auto-repeats.
+    pub repeat: bool,
 }
 
-/// What a first press armed, and when. Every two-step confirmation holds its
-/// armed state in one of these, so the press that completes it can ask
-/// [`Armed::settled`] whether it is a second, deliberate press or the first
-/// one repeated — one rule, [`confirm_accepted`], for all of them.
+impl Gesture {
+    /// A click on a button: the pointer, or a key activating the focused
+    /// button. Never a repeat, *because* every button that passes this
+    /// carries [`a_held_key_is_not_a_press`], which stops a held key's
+    /// repeats before they become clicks — a click event itself cannot say
+    /// whether a key produced it. `every_click_gesture_comes_from_a_guarded_button`
+    /// holds each one to that.
+    pub const CLICK: Gesture = Gesture { repeat: false };
+
+    /// A key handled directly, without going through a button.
+    pub fn of_key(evt: &KeyboardEvent) -> Self {
+        Gesture {
+            repeat: evt.is_auto_repeating(),
+        }
+    }
+}
+
+/// The one rule every confirmation's decision applies: a press completes a
+/// confirmation armed `since` ago only when it is a fresh, deliberate press —
+/// not a held key's repeat, and not inside [`CONFIRM_ARM_DELAY`] (the press
+/// that armed it, repeated). Callers reach it through [`Armed::completes`] or,
+/// for the navigation guard, which keeps its own park time, directly.
+pub(crate) fn deliberate(since: Duration, gesture: Gesture) -> bool {
+    !gesture.repeat && since >= CONFIRM_ARM_DELAY
+}
+
+/// What a first press armed, and when. Every two-step confirmation's
+/// decision takes its armed state as one of these, plus the [`Gesture`] of
+/// the press in front of it, and asks [`Armed::completes`] — so no handler
+/// holds a "may confirm" boolean it could get wrong.
 ///
 /// Comparing two of these compares the instant too, so callers match on
 /// [`Armed::subject`].
@@ -322,27 +356,39 @@ impl<T> Armed<T> {
         }
     }
 
+    /// Armed `ago` already: what a test uses to stand on either side of
+    /// [`CONFIRM_ARM_DELAY`] without sleeping.
+    #[cfg(test)]
+    pub(crate) fn armed_ago(subject: T, ago: Duration) -> Self {
+        Self {
+            subject,
+            at: Instant::now() - ago,
+        }
+    }
+
     /// What was armed: the exact request, statement or change list the
     /// confirmation is about.
     pub(crate) fn subject(&self) -> &T {
         &self.subject
     }
 
-    /// Whether a confirming press now is taken (see [`CONFIRM_ARM_DELAY`]).
-    pub(crate) fn settled(&self) -> bool {
-        confirm_accepted(self.at.elapsed())
+    /// Whether `gesture`, now, completes this confirmation ([`deliberate`]).
+    pub(crate) fn completes(&self, gesture: Gesture) -> bool {
+        deliberate(self.at.elapsed(), gesture)
     }
 }
 
-/// A `keydown` handler for any button whose press can complete a
-/// confirmation: a key held down never presses it again. A held Enter on a
-/// focused button repeats its click every few tens of milliseconds once the
-/// key starts repeating, which outlasts [`CONFIRM_ARM_DELAY`] — measured
-/// against schema editing's Run and the import dialog's Import, which a 1.5 s
-/// held Enter took straight through their confirm-writes prompts. Blocking
-/// the repeat's default action stops the button from being activated.
+/// A `keydown` handler for every button whose click passes
+/// [`Gesture::CLICK`], and for the safe choice focus moves to: a held key
+/// never presses it again. A held Enter on a focused button repeats its click
+/// every few tens of milliseconds once the key starts repeating, which
+/// outlasts [`CONFIRM_ARM_DELAY`] — measured against schema editing's Run and
+/// the import dialog's Import, which a 1.5 s held Enter took straight through
+/// their confirm-writes prompts. Blocking the repeat's default action stops
+/// the button from being activated; only the activation keys are touched.
 pub(crate) fn a_held_key_is_not_a_press(evt: KeyboardEvent) {
-    if evt.is_auto_repeating() {
+    let activates = matches!(evt.key(), Key::Enter) || evt.key() == Key::Character(" ".into());
+    if activates && evt.is_auto_repeating() {
         evt.prevent_default();
     }
 }
@@ -353,9 +399,8 @@ pub(crate) fn a_held_key_is_not_a_press(evt: KeyboardEvent) {
 /// one row armed at a time.
 ///
 /// One click never confirms. The confirm button ignores clicks for
-/// [`CONFIRM_ARM_DELAY`] after this mounts and is never pressed by a held
-/// key, and focus goes to **Keep**, so a repeating Enter from the arming
-/// button lands on the safe choice. Escape
+/// [`CONFIRM_ARM_DELAY`] after this mounts, neither button is pressed by a
+/// held key, and focus goes to **Keep**, the safe choice. Escape
 /// cancels, heard on the wrapper while focus is anywhere inside it. Nothing
 /// disarms it on its own (no blur, no timeout): it stays until answered,
 /// like every confirmation before this component.
@@ -386,7 +431,7 @@ pub fn ConfirmInline(
                 class: "cursor-pointer rounded bg-amber-600 px-2 py-0.5 text-xs font-semibold text-slate-950 hover:bg-amber-500",
                 onkeydown: a_held_key_is_not_a_press,
                 onclick: move |_| {
-                    if shown.settled() {
+                    if shown.completes(Gesture::CLICK) {
                         on_confirm.call(());
                     }
                 },
@@ -395,6 +440,9 @@ pub fn ConfirmInline(
             button {
                 class: "cursor-pointer rounded border border-slate-400 dark:border-slate-600 px-2 py-0.5 text-xs text-slate-900 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
                 onmounted: focus_on_mount,
+                // So a held Enter from the arming button arms and stays
+                // armed, rather than arming and then pressing Keep.
+                onkeydown: a_held_key_is_not_a_press,
                 onclick: move |_| on_cancel.call(()),
                 "Keep"
             }
@@ -621,12 +669,16 @@ mod tests {
             let [confirm, keep] = listeners(&edits, "click")[..] else {
                 panic!("expected confirm and Keep: {edits:#?}");
             };
-            // Mount order: the wrapper's Escape, then the confirm button's
-            // held-key guard.
-            let [wrapper, held] = listeners(&edits, "keydown")[..] else {
-                panic!("expected two keydown listeners: {edits:#?}");
+            // Mount order: the wrapper's Escape, then each button's held-key
+            // guard.
+            let [wrapper, held_confirm, held_keep] = listeners(&edits, "keydown")[..] else {
+                panic!("expected three keydown listeners: {edits:#?}");
             };
-            assert_eq!(held, confirm, "the confirm button ignores a held key");
+            assert_eq!(
+                [held_confirm, held_keep],
+                [confirm, keep],
+                "both buttons ignore a held key"
+            );
             assert_eq!(
                 listeners(&edits, "mounted"),
                 [keep],
@@ -656,10 +708,10 @@ mod tests {
     /// press keeps it.
     #[test]
     fn a_held_key_never_presses_a_confirming_button() {
-        for repeating in [false, true] {
+        let blocked = |key: Key, code: Code, repeating: bool| {
             let data = KeyboardData::new(SerializedKeyboardData::new(
-                Key::Enter,
-                Code::Enter,
+                key,
+                code,
                 Location::Standard,
                 repeating,
                 Modifiers::empty(),
@@ -667,24 +719,167 @@ mod tests {
             ));
             let evt = Event::new(Rc::new(data), true);
             a_held_key_is_not_a_press(evt.clone());
-            assert_eq!(
-                evt.default_action_enabled(),
-                !repeating,
-                "repeating: {repeating}"
-            );
-        }
+            !evt.default_action_enabled()
+        };
+        assert!(blocked(Key::Enter, Code::Enter, true), "a held Enter");
+        assert!(
+            blocked(Key::Character(" ".into()), Code::Space, true),
+            "a held Space"
+        );
+        assert!(!blocked(Key::Enter, Code::Enter, false), "a fresh Enter");
+        // Only activation is touched: a held arrow still walks the sidebar.
+        assert!(
+            !blocked(Key::ArrowDown, Code::ArrowDown, true),
+            "a held arrow"
+        );
     }
 
-    /// [`Armed`] is unsettled when armed and settles after the delay — the
-    /// gate the relabelled-in-place buttons (Import, Run, the grid's Save)
-    /// put in front of their confirming press.
+    /// The rule every confirmation decides with: a press completes an armed
+    /// confirmation only when it is fresh (not a held key's repeat) and
+    /// deliberate (past the delay).
     #[test]
-    fn an_armed_confirmation_settles_only_after_the_delay() {
-        let armed = Armed::new("x");
-        assert!(!armed.settled(), "settled the instant it was armed");
-        assert_eq!(armed.subject(), &"x");
-        std::thread::sleep(CONFIRM_ARM_DELAY + Duration::from_millis(50));
-        assert!(armed.settled(), "never settled");
+    fn only_a_fresh_deliberate_press_completes_a_confirmation() {
+        let fresh = Gesture::CLICK;
+        let repeat = Gesture { repeat: true };
+        let just = Armed::new("x");
+        assert!(!just.completes(fresh), "inside the delay");
+        assert_eq!(just.subject(), &"x");
+        let aged = Armed::armed_ago("x", CONFIRM_ARM_DELAY);
+        assert!(aged.completes(fresh), "a settled, fresh press");
+        assert!(!aged.completes(repeat), "a held key's repeat, however late");
+    }
+
+    /// The one place a confirmation's decision cannot see a held key is a
+    /// button click: the click event does not say whether a key produced it.
+    /// So every click that tells a decision it is fresh ([`Gesture::CLICK`])
+    /// must come from an element where a held key cannot produce one — a
+    /// `button` carrying [`a_held_key_is_not_a_press`], or an `a` with no
+    /// `href` or `tabindex`, which no key activates. The safe choices focus
+    /// moves to (Keep, the write prompt's Cancel) carry the guard too, so a
+    /// held Enter that arms a confirmation leaves it armed.
+    ///
+    /// Read from the source of every file under `src/ui`, comment lines and
+    /// test modules left out. From each `Gesture::CLICK`, it walks outward
+    /// by indentation to the enclosing element and reads that element's own
+    /// attributes. What it cannot see: a `Gesture::CLICK` stored in a binding
+    /// and passed on elsewhere, or handed through a closure prop to a child
+    /// component (the ↗ links show the shape that *is* covered: the child's
+    /// own element passes it); the guard wrapped in a closure of its own; and
+    /// an element that a key activates by some other means.
+    #[test]
+    fn every_click_gesture_comes_from_a_guarded_button() {
+        let guard = "onkeydown: a_held_key_is_not_a_press,";
+        let indent = |line: &str| line.len() - line.trim_start().len();
+        // The element whose body holds `lines[at]`, as the index of its
+        // opening line.
+        let enclosing = |lines: &[&str], at: usize| -> Option<usize> {
+            let mut level = indent(lines[at]);
+            for i in (0..at).rev() {
+                let line = lines[i];
+                if line.trim().is_empty() || indent(line) >= level {
+                    continue;
+                }
+                level = indent(line);
+                let opener = line.trim();
+                if opener == "button {" || opener == "a {" {
+                    return Some(i);
+                }
+                if opener.starts_with("fn ")
+                    || opener.starts_with("pub ")
+                    || opener.contains("rsx!")
+                {
+                    return None;
+                }
+            }
+            None
+        };
+        // The element's own attribute lines: one level in, up to its close.
+        let attributes = |lines: &[&str], open: usize| -> Vec<String> {
+            let own = indent(lines[open]) + 4;
+            lines[open + 1..]
+                .iter()
+                .take_while(|line| line.trim().is_empty() || indent(line) > indent(lines[open]))
+                .filter(|line| indent(line) == own)
+                .map(|line| line.trim().to_string())
+                .collect()
+        };
+        let check = |path: &[String], lines: &[&str], at: usize, what: &str| -> &'static str {
+            let Some(open) = enclosing(lines, at) else {
+                panic!(
+                    "{path:?}: {what} is not inside a button: {}",
+                    lines[at].trim()
+                );
+            };
+            let attrs = attributes(lines, open);
+            if lines[open].trim() == "button {" {
+                assert!(
+                    attrs.iter().any(|a| a == guard),
+                    "{path:?}: the button around {what} lacks `{guard}`: {}",
+                    lines[at].trim()
+                );
+                "button"
+            } else {
+                assert!(
+                    !attrs
+                        .iter()
+                        .any(|a| a.starts_with("href") || a.starts_with("tabindex")),
+                    "{path:?}: a key can activate the link around {what}: {}",
+                    lines[at].trim()
+                );
+                "a"
+            }
+        };
+
+        let mut found: Vec<String> = Vec::new();
+        let mut safe = Vec::new();
+        for (path, source) in ui_sources() {
+            let code = source
+                .split_once("\n#[cfg(test)]\nmod ")
+                .map_or(source.as_str(), |(code, _)| code);
+            let lines: Vec<&str> = code
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect();
+            let name = path.join("/");
+            for at in 0..lines.len() {
+                let line = lines[at];
+                if name != "notice.rs" {
+                    assert!(
+                        !line.contains("Gesture { repeat: false }"),
+                        "{name}: spell a click `Gesture::CLICK`, so this test can find it: {}",
+                        line.trim()
+                    );
+                }
+                if line.contains("Gesture::CLICK") {
+                    check(&path, &lines, at, "a click gesture");
+                    found.push(name.clone());
+                }
+                let is_safe_choice = (name == "notice.rs"
+                    && line.trim() == "onclick: move |_| on_cancel.call(()),")
+                    || (name == "grid/mod.rs" && line.contains("state.dismiss_pending_save("));
+                if is_safe_choice {
+                    assert_eq!(check(&path, &lines, at, "a safe choice"), "button");
+                    safe.push(name.clone());
+                }
+            }
+        }
+        // Not vacuous: every site this guards is among what was walked.
+        for file in [
+            "notice.rs",
+            "import.rs",
+            "schema_edit.rs",
+            "grid/mod.rs",
+            "grid/rows.rs",
+            "grid/detail.rs",
+            "shell.rs",
+            "sidebar.rs",
+        ] {
+            assert!(
+                found.iter().any(|f| f == file),
+                "no click gesture found in {file}"
+            );
+        }
+        assert_eq!(safe, ["grid/mod.rs", "notice.rs"], "the safe choices moved");
     }
 
     /// Every modal in the app is an [`Overlay`], and each one's backdrop

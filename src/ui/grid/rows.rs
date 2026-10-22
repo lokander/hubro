@@ -509,7 +509,7 @@ pub(super) fn GridRow(
     mut selected: Signal<HashMap<String, RowLocator>>,
     /// Follows the FK a clicked cell belongs to, carrying that FK plus this
     /// row's column → value map (the source of the jump's equality filter).
-    on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>)>,
+    on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>, Gesture)>,
 ) -> Element {
     // Every cell resolved against the table metadata exactly once:
     // the editor kind and nullability, whether the cell may open an editor,
@@ -656,7 +656,7 @@ pub(super) fn GridCellSlot(
     /// cell value stays on double-click/Enter, so navigation and editing never
     /// contend for the same gesture.
     fk_jump: Option<(ForeignKeyMeta, Shared<HashMap<String, Value>>)>,
-    on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>)>,
+    on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>, Gesture)>,
 ) -> Element {
     let state = use_context::<AppState>();
     let is_active = editable
@@ -786,7 +786,7 @@ pub(super) fn GridCellSlot(
                             title: "Go to {fk.referenced_table}",
                             onclick: move |evt| {
                                 evt.stop_propagation();
-                                on_fk_jump.call((fk.clone(), (*row_values).clone()));
+                                on_fk_jump.call((fk.clone(), (*row_values).clone(), Gesture::CLICK));
                             },
                             "↗"
                         }

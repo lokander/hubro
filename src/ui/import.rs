@@ -37,7 +37,9 @@ use crate::db::{
     SourceField, SourceFormat, SourcePreview, TableMeta,
 };
 
-use super::notice::{a_held_key_is_not_a_press, Armed, Banner, BannerKind, Overlay, OverlayAlign};
+use super::notice::{
+    a_held_key_is_not_a_press, Armed, Banner, BannerKind, Gesture, Overlay, OverlayAlign,
+};
 use super::state::{AppState, ImportRequest};
 
 /// How many records the preview reads. Enough to show the shape of the file
@@ -132,10 +134,12 @@ pub fn ImportDialog(
     // from a deliberate second press (see `import_action`).
     let mut confirmed = use_signal(|| Option::<Armed<ImportRequest>>::None);
     let confirms = confirm_connection.is_some();
-    let start = {
+    // Takes the press's gesture from the button, where
+    // `every_click_gesture_comes_from_a_guarded_button` can see it.
+    let mut start = {
         let table = table.clone();
         let path = path.clone();
-        move |_| {
+        move |gesture: Gesture| {
             let request = ImportRequest {
                 path: path.clone(),
                 format: format.peek().to_owned(),
@@ -150,15 +154,7 @@ pub fn ImportDialog(
             // Resolved before the write below, so the peek's borrow is
             // released — a signal borrow must never span the write that
             // follows it.
-            let action = {
-                let armed = confirmed.peek();
-                import_action(
-                    confirms,
-                    armed.as_ref().map(Armed::subject),
-                    armed.as_ref().is_some_and(Armed::settled),
-                    &request,
-                )
-            };
+            let action = import_action(confirms, confirmed.peek().as_ref(), gesture, &request);
             match action {
                 ImportAction::Confirm => {
                     confirmed.set(Some(Armed::new(request)));
@@ -441,7 +437,7 @@ pub fn ImportDialog(
                         },
                         disabled: refusal.is_some() || problem().is_some(),
                         onkeydown: a_held_key_is_not_a_press,
-                        onclick: start,
+                        onclick: move |_| start(Gesture::CLICK),
                         if armed { "Import anyway" } else { "Import" }
                     }
                 }
@@ -464,9 +460,8 @@ enum ImportAction {
 
 /// Resolves an Import press: `confirms` is whether the connection is marked
 /// *confirm writes*, `confirmed` the request a previous press already
-/// confirmed (if any), `settled` whether that confirmation has been showing
-/// long enough for a press to count ([`Armed::settled`]), and `current` what
-/// the dialog holds now.
+/// armed (if any), `gesture` how this press arrived, and `current` what the
+/// dialog holds now.
 ///
 /// The comparison between `confirmed` and `current` is the substance, and it
 /// is the same rule Save follows
@@ -482,20 +477,25 @@ enum ImportAction {
 /// disabled with that reason. `Confirm` narrows nothing by design, which is
 /// why it needs this instead — and why it was missed.
 ///
-/// `settled` only ever holds a press back: an unsettled confirmation of this
-/// same import waits, and nothing about *when* a prompt is shown changes.
+/// The press that completes it must also be a fresh, deliberate one
+/// ([`Armed::completes`]): "Import" relabels itself "Import anyway" in place,
+/// so the press that armed it, repeated — a double-click, a held Enter —
+/// lands on the confirmation. Such a press waits. That only ever holds a
+/// press back; nothing about *when* the prompt is shown changes.
 fn import_action(
     confirms: bool,
-    confirmed: Option<&ImportRequest>,
-    settled: bool,
+    confirmed: Option<&Armed<ImportRequest>>,
+    gesture: Gesture,
     current: &ImportRequest,
 ) -> ImportAction {
     if !confirms {
         return ImportAction::Start;
     }
     match confirmed {
-        Some(previous) if previous == current && settled => ImportAction::Start,
-        Some(previous) if previous == current => ImportAction::Wait,
+        Some(armed) if armed.subject() == current && armed.completes(gesture) => {
+            ImportAction::Start
+        }
+        Some(armed) if armed.subject() == current => ImportAction::Wait,
         _ => ImportAction::Confirm,
     }
 }
@@ -734,10 +734,15 @@ mod tests {
         }
     }
 
+    /// Armed long enough ago for a fresh press to complete it.
+    fn settled(request: ImportRequest) -> Armed<ImportRequest> {
+        Armed::armed_ago(request, crate::ui::notice::CONFIRM_ARM_DELAY)
+    }
+
     #[test]
     fn an_unmarked_connection_imports_without_a_prompt() {
         assert_eq!(
-            import_action(false, None, false, &request(ErrorMode::Abort)),
+            import_action(false, None, Gesture::CLICK, &request(ErrorMode::Abort)),
             ImportAction::Start
         );
     }
@@ -750,31 +755,58 @@ mod tests {
         // one.
         let current = request(ErrorMode::Abort);
         assert_eq!(
-            import_action(true, None, false, &current),
+            import_action(true, None, Gesture::CLICK, &current),
             ImportAction::Confirm,
             "the first press must only arm"
         );
         assert_eq!(
-            import_action(true, Some(&current), true, &current),
+            import_action(
+                true,
+                Some(&settled(current.clone())),
+                Gesture::CLICK,
+                &current
+            ),
             ImportAction::Start,
             "the second press, unchanged, runs it"
         );
     }
 
     #[test]
-    fn a_double_click_on_import_does_not_confirm_the_write() {
+    fn a_double_click_or_a_held_key_on_import_does_not_confirm_the_write() {
         // The first press relabels the button "Import anyway" in place, so a
-        // double-click's second click lands on the confirmation. It waits
-        // rather than starting — and it neither disarms nor re-arms.
+        // double-click's second click, or a held Enter's repeat, lands on the
+        // confirmation. Either waits rather than starting — and neither
+        // disarms nor re-arms.
         let current = request(ErrorMode::Abort);
         assert_eq!(
-            import_action(true, Some(&current), false, &current),
-            ImportAction::Wait
+            import_action(
+                true,
+                Some(&Armed::new(current.clone())),
+                Gesture::CLICK,
+                &current
+            ),
+            ImportAction::Wait,
+            "inside the delay"
         );
-        // An unsettled confirmation of a *different* import is still the
-        // prompt for this one, as before.
         assert_eq!(
-            import_action(true, Some(&request(ErrorMode::Skip)), false, &current),
+            import_action(
+                true,
+                Some(&settled(current.clone())),
+                Gesture { repeat: true },
+                &current
+            ),
+            ImportAction::Wait,
+            "a held key's repeat, however late"
+        );
+        // A confirmation of a *different* import is still the prompt for
+        // this one, as before.
+        assert_eq!(
+            import_action(
+                true,
+                Some(&Armed::new(request(ErrorMode::Skip))),
+                Gesture::CLICK,
+                &current
+            ),
             ImportAction::Confirm
         );
     }
@@ -788,7 +820,7 @@ mod tests {
         let confirmed = request(ErrorMode::Abort);
         let changed = request(ErrorMode::Skip);
         assert_eq!(
-            import_action(true, Some(&confirmed), true, &changed),
+            import_action(true, Some(&settled(confirmed)), Gesture::CLICK, &changed),
             ImportAction::Confirm
         );
     }
