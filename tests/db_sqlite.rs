@@ -1044,3 +1044,77 @@ async fn an_update_cannot_store_null_in_the_rowid_alias() {
     assert!(err.to_string().contains("datatype mismatch"), "{err}");
     pool.close().await;
 }
+
+/// The objects next to an ordinary table that the rowid decision must leave
+/// alone, measured rather than argued: a view over an alias table, an FTS5
+/// virtual table (whose `rowid` is real but no declared column aliases it),
+/// and a table with generated columns beside its alias. TEMP and ATTACHed
+/// tables are per-connection, so they are pinned in `src/db/sqlite.rs`, on a
+/// one-connection pool, where the introspection is sure to see them.
+#[tokio::test]
+async fn views_virtual_and_generated_shapes_never_claim_the_alias() {
+    let fixture = FixtureDb::with_sql(
+        "CREATE TABLE base (id INTEGER PRIMARY KEY, x INT);
+         CREATE VIEW over_base AS SELECT id, x FROM base;
+         CREATE VIRTUAL TABLE docs USING fts5(id, body);
+         CREATE TABLE computed (id INTEGER PRIMARY KEY, x INT,
+                                doubled INT GENERATED ALWAYS AS (x * 2) VIRTUAL,
+                                stored INT GENERATED ALWAYS AS (x + 1) STORED);",
+    )
+    .await;
+    let pool = fixture.open().await;
+    let tables = pool.introspect().await.unwrap();
+    let generated = |name: &str| -> Vec<(String, Generated)> {
+        table(&tables, name)
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.generated))
+            .collect()
+    };
+    let never = |cols: &[&str]| -> Vec<(String, Generated)> {
+        cols.iter()
+            .map(|c| (c.to_string(), Generated::Never))
+            .collect()
+    };
+
+    assert_eq!(generated("base")[0], ("id".into(), Generated::RowidAlias));
+    // The view's `id` *reads* the alias, but an insert into the view is not
+    // an insert into the table, and the view has no key of its own.
+    assert_eq!(generated("over_base"), never(&["id", "x"]));
+    let docs = table(&tables, "docs");
+    assert!(docs.primary_key().is_empty(), "{docs:?}");
+    assert_eq!(generated("docs"), never(&["id", "body"]));
+    assert_eq!(
+        generated("computed"),
+        vec![
+            ("id".to_string(), Generated::RowidAlias),
+            ("x".to_string(), Generated::Never),
+            ("doubled".to_string(), Generated::Always),
+            ("stored".to_string(), Generated::Always),
+        ]
+    );
+    pool.close().await;
+}
+
+/// Show DDL for an alias table is SQLite's stored text, verbatim. Introspection
+/// marks the alias NOT NULL (it can never hold NULL), and the metadata-built
+/// fallback in `ddl.rs` would print that as `NOT NULL` — but SQLite never
+/// reaches the fallback: a table's definition always comes from
+/// `sqlite_master`. This pins that the marking stays out of the DDL.
+#[tokio::test]
+async fn show_ddl_for_an_alias_table_is_its_stored_text() {
+    let fixture = FixtureDb::with_sql("CREATE TABLE plain (id INTEGER PRIMARY KEY, x TEXT);").await;
+    let pool = fixture.open().await;
+    let tables = pool.introspect().await.unwrap();
+    let meta = table(&tables, "plain");
+    assert!(!meta.columns[0].nullable);
+    let ddl = pool
+        .fetch_ddl(meta, &hubro::db::DdlObject::Object)
+        .await
+        .unwrap();
+    assert_eq!(
+        ddl.text(),
+        "CREATE TABLE plain (id INTEGER PRIMARY KEY, x TEXT);"
+    );
+    pool.close().await;
+}
