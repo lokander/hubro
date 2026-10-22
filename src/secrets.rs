@@ -181,7 +181,7 @@ pub(crate) mod tests {
         let found = crate::config::tests::words_named_in(
             &root.join("tests"),
             &["secrets", "keyring"],
-            &["help.contains(\"keyring\"),"],
+            &[("cli_secrets.rs", "help.contains(\"keyring\"),")],
         );
         assert!(
             found.is_empty(),
