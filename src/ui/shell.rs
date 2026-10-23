@@ -365,8 +365,9 @@ fn WindowPersistence() -> Element {
     //   un-maximize, in the `Resized` handler, would close it.
     // - The gate needs both axes non-negative, so a sub-pixel negative on one
     //   axis (possible for one session after a DPI change) also skips the
-    //   correction on the other. It heals on the next launch; applying the
-    //   correction per axis would close it.
+    //   correction on the other. The next launch corrects again, but the
+    //   height lost that session stays lost; applying the correction per axis
+    //   would close it.
     {
         let window = window.clone();
         use_effect(move || {
