@@ -357,6 +357,16 @@ fn WindowPersistence() -> Element {
     // on platforms where builder and read-back agree nothing happens, and a
     // window manager that *clamped* the size (negative shortfall) is left
     // alone.
+    //
+    // Two known limits, both left as they are until they bite:
+    // - A window launched maximized skips the correction, so un-maximizing
+    //   returns to the builder's menu-inclusive size and that session still
+    //   loses one menu-height on close. Applying the correction on the first
+    //   un-maximize, in the `Resized` handler, would close it.
+    // - The gate needs both axes non-negative, so a sub-pixel negative on one
+    //   axis (possible for one session after a DPI change) also skips the
+    //   correction on the other. It heals on the next launch; applying the
+    //   correction per axis would close it.
     {
         let window = window.clone();
         use_effect(move || {
