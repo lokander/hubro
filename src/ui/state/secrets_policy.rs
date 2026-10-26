@@ -665,16 +665,22 @@ mod tests {
             "connected, but the password could not be stored in the system keyring — it \
              is remembered for this session only"
         );
-        // Every such notice is built here: no shipped code spells the wording
-        // out itself, and each kind of secret has its call.
+        // Every such notice is built here. No shipped string literal spells
+        // the wording out itself — read as the compiler joins it, since
+        // rustfmt wraps a long message across lines and a search of the raw
+        // text misses it wherever the wrap fell — and each kind of secret has
+        // its call.
         let mut calls = Vec::new();
         for (file, source) in super::super::source_reading::all_sources() {
             let code = crate::source_scan::code_outside_test_modules(&source);
-            assert!(
-                file == "ui/state/secrets_policy.rs"
-                    || !code.contains("could not be stored in the system keyring"),
-                "src/{file} words a refused keyring store itself"
-            );
+            if file != "ui/state/secrets_policy.rs" {
+                for literal in crate::source_scan::string_literals(&code) {
+                    assert!(
+                        !literal.contains("could not be stored in the system keyring"),
+                        "src/{file} words a refused keyring store itself: {literal}"
+                    );
+                }
+            }
             for (at, _) in code.match_indices("keyring_store_failed(\"") {
                 let what = &code[at + "keyring_store_failed(\"".len()..];
                 calls.push(what[..what.find('"').unwrap()].to_string());
@@ -685,6 +691,24 @@ mod tests {
             calls,
             ["the SSH key passphrase", "the password", "the sign-in"]
         );
+
+        // And each notice is raised exactly when the store failed, as
+        // written (whitespace removed, so a rustfmt wrap is no failure).
+        let flows: String = super::super::source_reading::connect_code()
+            .split_whitespace()
+            .collect();
+        for gate in [
+            "ifstore.is_err(){self.connect_error.set(Some(keyring_store_failed(\"thepassword\")));",
+            ".await.is_err(){self.connect_error.set(Some(keyring_store_failed(\"theSSHkeypassphrase\")));",
+            "RefreshKeyringOutcome::StoreRefused(refresh)=>{self.session_passwords.write().insert(entra_secret_key(url),refresh);self.connect_error.set(Some(keyring_store_failed(\"thesign-in\")));",
+            "Ok(())=>RefreshKeyringOutcome::Applied,Err(_)=>RefreshKeyringOutcome::StoreRefused(refresh),",
+        ] {
+            assert!(
+                flows.contains(gate),
+                "a refused-store notice is raised on something other than the \
+                 store failing: `{gate}` is gone"
+            );
+        }
     }
 
     #[test]
