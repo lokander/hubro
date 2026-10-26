@@ -92,8 +92,9 @@ where
 pub(super) type Query<'q, DB> = sqlx::query::Query<'q, DB, <DB as Database>::Arguments<'q>>;
 
 /// What one sqlx backend supplies to the generic paths below. Implemented by
-/// a zero-sized type per backend (`sqlite::Sqlite`, `postgres::Postgres`), so
-/// a generic path is named `query_with::<Sqlite, _>` and costs nothing at run
+/// a zero-sized type per backend (`sqlite::SqliteBackend`,
+/// `postgres::PgBackend`), so a generic path is named
+/// `query_with::<SqliteBackend, _>` and costs nothing at run
 /// time.
 pub(super) trait SqlxBackend {
     type DB: Database;
@@ -727,6 +728,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// The checked write's per-statement decision: only an exact count
     /// lets the batch go on — one row more or one fewer rolls it back.
     #[test]
@@ -741,8 +744,6 @@ mod tests {
             );
         }
     }
-
-    use super::*;
 
     /// A server error with a SQLSTATE and message, as the driver hands one
     /// over.

@@ -1707,8 +1707,9 @@ mod tests {
     ];
 
     /// What may follow `sqlx_common::` outside the door: the helpers that
-    /// take rows, a pool or a transaction, not text, and the generic paths
-    /// ([`COMMON_GENERIC`]).
+    /// take rows, a pool or a transaction, not text, the backend trait, and
+    /// the generic paths ([`COMMON_GENERIC`], [`COMMON_PREPARING`]) — see
+    /// [`common_allowed`], which is the list the detector reads.
     const COMMON_ALLOWED: &[&str] = &[
         "get",
         "acquire_for_run",
@@ -1720,22 +1721,14 @@ mod tests {
         "commit_tx",
         "rollback_tx",
         "SqlxBackend",
-        "query_all",
-        "query_with",
-        "query_capped",
-        "query_capped_rows",
-        "execute_with",
-        "export_query",
-        "execute_all_checked",
     ];
 
-    /// The generic sqlx paths this file calls. They do take text, which is
-    /// why each is listed by name rather than the allowlist taking any: on
-    /// SQLite their text is a [`SqlText`], so the door has already checked
-    /// it — `the_generic_paths_take_text_only_as_backend_text` pins that each
-    /// takes it so, and `every_sqlite_entry_point_refuses_a_nul` runs them.
-    /// `execute_all_checked` takes whole statements, so it prepares each
-    /// itself, through [`SqlxBackend::prepare`](sqlx_common::SqlxBackend).
+    /// The generic sqlx paths this file calls with text. They do take text,
+    /// which is why each is listed by name rather than the allowlist taking
+    /// any: on SQLite their text is a [`SqlText`], so the door has already
+    /// checked it — `the_generic_paths_take_text_only_as_backend_text` pins
+    /// that each takes it so and that SQLite's `Text` is `SqlText`, and
+    /// `every_sqlite_entry_point_refuses_a_nul` runs them.
     const COMMON_GENERIC: &[&str] = &[
         "query_all",
         "query_with",
@@ -1744,6 +1737,19 @@ mod tests {
         "execute_with",
         "export_query",
     ];
+
+    /// The generic paths that take whole statements rather than a `Text`, so
+    /// prepare each themselves, through
+    /// [`SqlxBackend::prepare`](sqlx_common::SqlxBackend).
+    const COMMON_PREPARING: &[&str] = &["execute_all_checked"];
+
+    /// Whether `name` may follow `sqlx_common::` outside the door: the three
+    /// lists above, so none of them can drift from what the detector allows.
+    fn common_allowed(name: &str) -> bool {
+        [COMMON_ALLOWED, COMMON_GENERIC, COMMON_PREPARING]
+            .iter()
+            .any(|list| list.contains(&name))
+    }
 
     /// Every way `code` reaches the driver with text, as `(offset, what)`.
     ///
@@ -1759,7 +1765,10 @@ mod tests {
     ///   it is what lets a pool or connection run a bare `&str`.
     fn reaches_driver(code: &str) -> Vec<(usize, String)> {
         let mut found = Vec::new();
-        for (root, allowed) in [("sqlx", SQLX_ALLOWED), ("sqlx_common", COMMON_ALLOWED)] {
+        let sqlx_allowed = |name: &str| SQLX_ALLOWED.contains(&name);
+        let roots: [(&str, &dyn Fn(&str) -> bool); 2] =
+            [("sqlx", &sqlx_allowed), ("sqlx_common", &common_allowed)];
+        for (root, allowed) in roots {
             for at in ident_at(code, root) {
                 let rest = &code[at + root.len()..];
                 let Some(rest) = rest.strip_prefix("::") else {
@@ -1780,7 +1789,7 @@ mod tests {
                         break;
                     }
                 }
-                let named = checked.iter().all(|segment| allowed.contains(segment))
+                let named = checked.iter().all(|segment| allowed(segment))
                     || (root == "sqlx" && checked == ["query", "Query"]);
                 // A macro metavariable (`sqlx::$m($s)`) names whatever its
                 // caller passes, so no allowlist can vouch for it.
@@ -1807,7 +1816,7 @@ mod tests {
             }
             for token in tokens {
                 let fine = SQLX_ALLOWED.contains(&token)
-                    || COMMON_ALLOWED.contains(&token)
+                    || common_allowed(token)
                     || ["sqlx", "sqlx_common", "self", "as", "_"].contains(&token);
                 if !fine {
                     found.push((at, format!("`{token}` in: {statement}")));
@@ -1903,41 +1912,103 @@ mod tests {
         }
     }
 
-    /// What makes [`COMMON_GENERIC`] safe to allow: each generic path takes
-    /// its text as `B::Text`, which SQLite's backend makes a [`SqlText`], and
-    /// no `str` in its signature, so a `&str` parameter that skipped the door
-    /// cannot be added to one unnoticed. `execute_all_checked`, which takes
-    /// raw statements, must prepare each through the backend.
+    /// What makes [`COMMON_GENERIC`] and [`COMMON_PREPARING`] safe to allow,
+    /// as properties rather than spellings:
+    ///
+    /// - each path in [`COMMON_GENERIC`] takes exactly one text parameter,
+    ///   `text: B::Text<'q>`, and every other parameter is one of a closed
+    ///   list of kinds that carry no text — so a `&str`, `String` or bytes
+    ///   parameter added to one fails here, whatever its name;
+    /// - each path in [`COMMON_PREPARING`] prepares its statements through
+    ///   the backend before anything else;
+    /// - across every shipped file there are exactly two `SqlxBackend`
+    ///   impls, one per driver, and the SQLite one's `Text` is [`SqlText`] —
+    ///   so no second impl over `sqlx::Sqlite`, in a file the driver scan
+    ///   exempts (`postgres.rs`) or anywhere else, can hand the generic paths
+    ///   SQLite text the door never saw.
     #[test]
     fn the_generic_paths_take_text_only_as_backend_text() {
-        let common = crate::source_scan::code_outside_test_modules(include_str!("sqlx_common.rs"));
+        use crate::source_scan::{block_end, code_outside_test_modules, rust_files};
         let collapsed = |code: &str| code.split_whitespace().collect::<Vec<_>>().join(" ");
-        for name in COMMON_GENERIC {
-            let start = common
+        let common = collapsed(&code_outside_test_modules(include_str!("sqlx_common.rs")));
+        let at = |name: &str| {
+            common
                 .find(&format!("pub(super) async fn {name}<"))
-                .unwrap_or_else(|| panic!("no generic fn {name}"));
-            let signature = &common[start..start + common[start..].find("where").unwrap()];
-            assert!(
-                collapsed(signature).contains("text: B::Text<'q>,"),
-                "{name} does not take its text as B::Text: {signature}"
+                .unwrap_or_else(|| panic!("no generic fn {name}"))
+        };
+        const TEXTLESS: &[&str] = &[
+            "executor: E",
+            "pool: &sqlx::Pool<B::DB>",
+            "conn: &mut <B::DB as Database>::Connection",
+            "params: &[Value]",
+            "max_rows: u64",
+            "cell_cap: usize",
+            "format: ExportFormat",
+            "out: &mut impl Write",
+        ];
+        for name in COMMON_GENERIC {
+            let start = at(name);
+            let sig = start + "pub(super) async fn ".len();
+            let open = sig + common[sig..].find('(').unwrap();
+            let close = open + common[open..].find(')').unwrap();
+            let params: Vec<&str> = common[open + 1..close]
+                .split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .collect();
+            let texts = params.iter().filter(|p| **p == "text: B::Text<'q>").count();
+            assert_eq!(
+                texts, 1,
+                "{name} must take one `text: B::Text<'q>`: {params:?}"
             );
+            for param in &params {
+                assert!(
+                    *param == "text: B::Text<'q>" || TEXTLESS.contains(param),
+                    "{name} takes `{param}`, which is not a kind known to carry no text"
+                );
+            }
+        }
+        for name in COMMON_PREPARING {
+            let start = at(name);
+            let body = &common[start..start + block_end(&common[start..]).unwrap()];
+            let body = &body[body.find('{').unwrap()..];
             assert!(
-                !signature.contains("str"),
-                "{name} takes text past the door: {signature}"
+                body.starts_with("{ let texts = statements .iter() .enumerate() .map(|(index, statement)| B::prepare(&statement.sql)"),
+                "{name} does not prepare its statements through the backend first"
             );
         }
-        let start = common
-            .find("pub(super) async fn execute_all_checked<")
-            .unwrap();
-        let body = &common[start..start + crate::source_scan::block_end(&common[start..]).unwrap()];
-        assert!(
-            collapsed(body).contains(".map(|(index, statement)| B::prepare(&statement.sql)"),
-            "execute_all_checked does not prepare its statements through the backend"
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut impls = Vec::new();
+        for file in rust_files(&root) {
+            let code = collapsed(&code_outside_test_modules(
+                &std::fs::read_to_string(&file).unwrap(),
+            ));
+            for (at, _) in code.match_indices("SqlxBackend for ") {
+                let start = code[..at].rfind("impl").expect("an impl header");
+                let end = start + block_end(&code[start..]).expect("the impl closes");
+                impls.push((file.clone(), code[start..end].to_string()));
+            }
+        }
+        assert_eq!(
+            impls.len(),
+            2,
+            "one SqlxBackend impl per driver: {impls:#?}"
         );
-        let this = collapsed(&shipped_code(include_str!("sqlite.rs")).join("\n"));
+        let sqlite: Vec<_> = impls
+            .iter()
+            .filter(|(_, block)| !block.contains("type DB = sqlx::Postgres;"))
+            .collect();
+        assert_eq!(
+            sqlite.len(),
+            1,
+            "one impl that is not Postgres's: {impls:#?}"
+        );
+        let (file, block) = sqlite[0];
+        assert!(file.ends_with("db/sqlite.rs"), "{file:?}");
+        assert!(block.contains("type DB = sqlx::Sqlite;"), "{block}");
         assert!(
-            this.contains("type Text<'q> = SqlText<'q>;"),
-            "SQLite's generic text is not SqlText"
+            block.contains("type Text<'q> = SqlText<'q>;"),
+            "SQLite's generic text is not SqlText: {block}"
         );
     }
 
