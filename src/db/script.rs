@@ -1862,6 +1862,16 @@ trait StatementExecutor: Sized {
     /// How letting go of the hold went.
     type Ended;
 
+    /// Whether the script's last statement, when it reads, lets go of the
+    /// hold with it ([`Self::finish_with_read`]) rather than being reported
+    /// first and the hold let go after ([`Self::end`]). Stated by each hold
+    /// ([`step`] reads it): `true` where the read's end is how a cut-short
+    /// read gets closed rather than read to its end (`ScriptConn`,
+    /// `ReadOnlyRun`); `false` for the atomic run, whose last read is
+    /// reported before the commit — so the editor shows it while the commit
+    /// runs, and a run cancelled during the commit has shown it already.
+    const ENDS_WITH_FINAL_READ: bool;
+
     /// Runs a row-returning statement, capped.
     async fn read(&mut self, sql: &str, max_rows: u64, cell_cap: usize) -> Result<Capped, DbError>;
 
@@ -1875,7 +1885,9 @@ trait StatementExecutor: Sized {
 
     /// Runs the script's last statement, a read, and lets go of the hold with
     /// it — so a hold that would otherwise wait for the rest of a cut-short
-    /// result can close instead. By default, the read and then [`Self::end`].
+    /// result can close instead. Called only where
+    /// [`Self::ENDS_WITH_FINAL_READ`]; by default, the read and then
+    /// [`Self::end`].
     async fn finish_with_read(
         mut self,
         sql: &str,
@@ -1893,6 +1905,7 @@ trait StatementExecutor: Sized {
 /// ([`ScriptConn::end`]), whether a statement failed or not.
 impl StatementExecutor for ScriptConn {
     type Ended = Result<bool, DbError>;
+    const ENDS_WITH_FINAL_READ: bool = true;
 
     async fn read(&mut self, sql: &str, max_rows: u64, cell_cap: usize) -> Result<Capped, DbError> {
         self.query_capped_to(sql, max_rows, cell_cap).await
@@ -1919,6 +1932,7 @@ impl StatementExecutor for ScriptConn {
 /// The read-only run: letting go closes the connection, failed or not.
 impl StatementExecutor for ReadOnlyRun {
     type Ended = ();
+    const ENDS_WITH_FINAL_READ: bool = true;
 
     async fn read(&mut self, sql: &str, max_rows: u64, cell_cap: usize) -> Result<Capped, DbError> {
         self.query_capped_to(sql, max_rows, cell_cap).await
@@ -1962,10 +1976,11 @@ fn tx_commits(failed: bool) -> bool {
 }
 
 /// The atomic run: the statements share one transaction, committed only if
-/// all of them ran ([`tx_commits`]). Its last read takes the default
-/// [`StatementExecutor::finish_with_read`]: read, then commit or roll back.
+/// all of them ran ([`tx_commits`]). Its last read is an ordinary one,
+/// reported before the commit (`ENDS_WITH_FINAL_READ` is `false`).
 impl StatementExecutor for ScriptTx<'_> {
     type Ended = TxEnded;
+    const ENDS_WITH_FINAL_READ: bool = false;
 
     async fn read(&mut self, sql: &str, max_rows: u64, cell_cap: usize) -> Result<Capped, DbError> {
         self.query_capped_to(sql, max_rows, cell_cap).await
@@ -1990,15 +2005,16 @@ impl StatementExecutor for ScriptTx<'_> {
 enum Step {
     /// A read that is not the script's last.
     Read,
-    /// The script's last statement, a read: run it and let go of the hold
-    /// together ([`StatementExecutor::finish_with_read`]).
+    /// The script's last statement, a read, on a hold that lets go with it:
+    /// run it and let go of the hold together
+    /// ([`StatementExecutor::finish_with_read`]), then report it.
     FinishWithRead,
     /// Anything that does not return rows.
     Write,
 }
 
-fn step(reads: bool, is_last: bool) -> Step {
-    match (reads, is_last) {
+fn step(ends_with_final_read: bool, reads: bool, is_last: bool) -> Step {
+    match (reads, is_last && ends_with_final_read) {
         (true, true) => Step::FinishWithRead,
         (true, false) => Step::Read,
         (false, _) => Step::Write,
@@ -2027,7 +2043,7 @@ async fn run_statements<E: StatementExecutor>(
     for (statement_index, statement) in statements.iter().enumerate() {
         let reads = classify_statement(statement, dialect).returns_rows();
         let cap = cell_cap(statement, dialect);
-        let outcome = match step(reads, statement_index == last) {
+        let outcome = match step(E::ENDS_WITH_FINAL_READ, reads, statement_index == last) {
             Step::FinishWithRead => {
                 let (read, end) = exec
                     .take()
@@ -5700,12 +5716,13 @@ mod statement_loop {
     use std::rc::Rc;
 
     /// A hold that logs what the loop asks of it and fails any statement
-    /// naming `FAIL`. Takes the default `finish_with_read`, as `ScriptTx`
-    /// does.
+    /// naming `FAIL`. Like `ScriptTx`, its last read is an ordinary one,
+    /// reported before the hold is let go of.
     struct Fake(Rc<RefCell<Vec<String>>>);
 
     impl StatementExecutor for Fake {
         type Ended = bool;
+        const ENDS_WITH_FINAL_READ: bool = false;
 
         async fn read(&mut self, sql: &str, _: u64, _: usize) -> Result<Capped, DbError> {
             self.0.borrow_mut().push(format!("read {sql}"));
@@ -5730,12 +5747,13 @@ mod statement_loop {
         }
     }
 
-    /// [`Fake`] with a `finish_with_read` of its own, as `ScriptConn` and
-    /// `ReadOnlyRun` have.
+    /// [`Fake`] that lets go of the hold with its final read, as
+    /// `ScriptConn` and `ReadOnlyRun` do.
     struct Closing(Fake);
 
     impl StatementExecutor for Closing {
         type Ended = bool;
+        const ENDS_WITH_FINAL_READ: bool = true;
 
         async fn read(&mut self, sql: &str, rows: u64, cap: usize) -> Result<Capped, DbError> {
             self.0.read(sql, rows, cap).await
@@ -5765,34 +5783,35 @@ mod statement_loop {
     }
 
     /// Runs `sql` through the loop on a [`Fake`] (or a [`Closing`] one),
-    /// returning the failure's index, what `end` was told, the hold's log and
-    /// how many statements were reported.
-    async fn drive(sql: &[&str], closing: bool) -> (Option<usize>, bool, Vec<String>, usize) {
+    /// returning the failure's index, what `end` was told, and one log of
+    /// what the hold was asked and what was reported (`report <statement>`),
+    /// in the order they happened.
+    async fn drive(sql: &[&str], closing: bool) -> (Option<usize>, bool, Vec<String>) {
         let log = Rc::new(RefCell::new(Vec::new()));
-        let mut reported = 0;
         let statements = stmts(sql);
+        let report = {
+            let log = log.clone();
+            move |r: StatementResult| log.borrow_mut().push(format!("report {}", r.preview))
+        };
         let (failure, ended) = if closing {
             run_statements(
                 Closing(Fake(log.clone())),
                 Dialect::Postgres,
                 &statements,
-                |_| reported += 1,
+                report,
             )
             .await
         } else {
-            run_statements(Fake(log.clone()), Dialect::Postgres, &statements, |_| {
-                reported += 1
-            })
-            .await
+            run_statements(Fake(log.clone()), Dialect::Postgres, &statements, report).await
         };
         let log = log.borrow().clone();
-        (failure.map(|(at, _)| at), ended, log, reported)
+        (failure.map(|(at, _)| at), ended, log)
     }
 
     #[tokio::test]
     async fn nothing_runs_after_a_failed_statement_and_the_hold_is_told() {
         for closing in [false, true] {
-            let (failed_at, ended, log, reported) = drive(
+            let (failed_at, ended, log) = drive(
                 &[
                     "INSERT INTO t VALUES (1)",
                     "INSERT FAIL",
@@ -5807,18 +5826,18 @@ mod statement_loop {
                 log,
                 [
                     "write INSERT INTO t VALUES (1)",
+                    "report INSERT INTO t VALUES (1)",
                     "write INSERT FAIL",
                     "end failed=true"
                 ],
                 "closing: {closing}"
             );
-            assert_eq!(reported, 1);
         }
     }
 
     #[tokio::test]
     async fn a_clean_run_lets_go_of_the_hold_as_unfailed_once() {
-        let (failed_at, ended, log, reported) = drive(
+        let (failed_at, ended, log) = drive(
             &["INSERT INTO t VALUES (1)", "SELECT 1", "DELETE FROM t"],
             false,
         )
@@ -5829,43 +5848,81 @@ mod statement_loop {
             log,
             [
                 "write INSERT INTO t VALUES (1)",
+                "report INSERT INTO t VALUES (1)",
                 "read SELECT 1",
+                "report SELECT 1",
                 "write DELETE FROM t",
+                "report DELETE FROM t",
                 "end failed=false"
             ]
         );
-        assert_eq!(reported, 3);
     }
 
-    /// Only the last statement, and only a read, lets go of the hold itself —
-    /// and then the hold is not let go of a second time.
+    /// A hold that lets go with its final read does so with the last
+    /// statement, a read, and is not let go of a second time. One that does
+    /// not — the atomic run — reports its last read **before** the hold is
+    /// let go of: the commit comes after the result is shown.
     #[tokio::test]
-    async fn only_a_final_read_lets_go_of_the_hold_with_it() {
-        let (_, _, log, reported) = drive(&["SELECT 1", "SELECT 2"], true).await;
-        assert_eq!(log, ["read SELECT 1", "finish SELECT 2"]);
-        assert_eq!(reported, 2);
-        // The default: the read, then the end, told whether the read failed.
-        let (_, _, log, _) = drive(&["SELECT 1", "SELECT 2"], false).await;
-        assert_eq!(log, ["read SELECT 1", "read SELECT 2", "end failed=false"]);
-        let (failed_at, ended, log, _) = drive(&["SELECT 1", "SELECT FAIL"], false).await;
+    async fn the_final_read_is_reported_before_a_commit_and_ends_only_a_closing_hold() {
+        let (_, _, log) = drive(&["SELECT 1", "SELECT 2"], true).await;
+        assert_eq!(
+            log,
+            [
+                "read SELECT 1",
+                "report SELECT 1",
+                "finish SELECT 2",
+                "report SELECT 2"
+            ]
+        );
+        let (_, _, log) = drive(&["SELECT 1", "SELECT 2"], false).await;
+        assert_eq!(
+            log,
+            [
+                "read SELECT 1",
+                "report SELECT 1",
+                "read SELECT 2",
+                "report SELECT 2",
+                "end failed=false"
+            ]
+        );
+        let (failed_at, ended, log) = drive(&["SELECT 1", "SELECT FAIL"], false).await;
         assert_eq!(failed_at, Some(1));
         assert!(ended);
         assert_eq!(
             log,
-            ["read SELECT 1", "read SELECT FAIL", "end failed=true"]
+            [
+                "read SELECT 1",
+                "report SELECT 1",
+                "read SELECT FAIL",
+                "end failed=true"
+            ]
         );
-        for (reads, is_last, expected) in [
-            (true, true, Step::FinishWithRead),
-            (true, false, Step::Read),
-            (false, true, Step::Write),
-            (false, false, Step::Write),
+        for (ends, reads, is_last, expected) in [
+            (true, true, true, Step::FinishWithRead),
+            (true, true, false, Step::Read),
+            (true, false, true, Step::Write),
+            (false, true, true, Step::Read),
+            (false, false, true, Step::Write),
+            (false, true, false, Step::Read),
         ] {
             assert_eq!(
-                step(reads, is_last),
+                step(ends, reads, is_last),
                 expected,
-                "reads {reads}, last {is_last}"
+                "ends {ends}, reads {reads}, last {is_last}"
             );
         }
+    }
+
+    /// Which holds let go with their final read: the atomic run's does not,
+    /// so its last result is reported before its commit.
+    #[test]
+    fn only_the_sequential_and_read_only_holds_end_with_their_final_read() {
+        let (sequential, read_only, atomic) = (
+            <ScriptConn as StatementExecutor>::ENDS_WITH_FINAL_READ,
+            <ReadOnlyRun as StatementExecutor>::ENDS_WITH_FINAL_READ,
+            <ScriptTx<'static> as StatementExecutor>::ENDS_WITH_FINAL_READ,
+        );
+        assert_eq!((sequential, read_only, atomic), (true, true, false));
     }
 
     #[test]
