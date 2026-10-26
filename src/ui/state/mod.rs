@@ -60,8 +60,8 @@ use crate::cli::OpenTarget;
 use crate::config::{
     load_session, load_settings_checked, plan_session_restore, save_session,
     save_show_internal_objects, save_theme, AppPaths, BackendKind, ConfigError, ConnectionColor,
-    GroupError, RestoreCandidate, SavedConnection, SavedList, ServerAuth, Session, SessionPane,
-    SessionTab, Settings, SettingsProblem, Theme,
+    GroupError, GroupStep, RestoreCandidate, SavedConnection, SavedList, ServerAuth, Session,
+    SessionPane, SessionTab, Settings, SettingsProblem, Theme,
 };
 use crate::db::{
     apply_staged, build_fk_filter, explain_statement, fk_target_columns, mssql_url_target,
@@ -803,6 +803,62 @@ impl SavedStatus {
     }
 }
 
+/// The user's answer to "remember this secret in the system keyring?" — a
+/// database password, an SSH key passphrase, or an Entra sign-in. Either way
+/// the secret is kept for the session; the answer decides the keyring.
+///
+/// A type rather than a `bool` because the answer travels: from a checkbox,
+/// through a submit, parked across prompts, into a policy that writes or
+/// deletes a keyring entry. A `bool` on that wire was inverted by a single
+/// `!` that moved no call, and every gate around it went on reading
+/// correctly. The checkbox is the one place it meets a `bool`
+/// ([`Self::from_checkbox`], [`Self::checkbox`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Remember {
+    /// Ticked: keep it in the system keyring.
+    Keyring,
+    /// Cleared: keep it for this session only.
+    SessionOnly,
+}
+
+impl Remember {
+    /// The answer a "remember" checkbox gives: ticked is [`Remember::Keyring`].
+    pub fn from_checkbox(checked: bool) -> Remember {
+        if checked {
+            Remember::Keyring
+        } else {
+            Remember::SessionOnly
+        }
+    }
+
+    /// Whether a "remember" checkbox offering this answer is ticked.
+    pub fn checkbox(self) -> bool {
+        match self {
+            Remember::Keyring => true,
+            Remember::SessionOnly => false,
+        }
+    }
+}
+
+/// Where [`AppState::save_query`] files a saved query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveScope {
+    /// Under the connection it was saved from, listed only there.
+    Connection,
+    /// For every connection.
+    Global,
+}
+
+/// What a table switch does to the connection's foreign-key trail — its Back
+/// stack and pending focus ([`AppState::switch_table`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FkTrail {
+    /// A manual pick: the trail no longer leads anywhere, so drop it.
+    Clear,
+    /// A foreign-key jump or Back, which manages the trail itself.
+    Keep,
+}
+
 /// What a pending [`PasswordPrompt`] is asking for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
@@ -831,7 +887,7 @@ pub struct PasswordPrompt {
     /// asks with it ticked; a re-prompt after a rejected SSH passphrase offers
     /// the answer the user already gave, so a mistyped passphrase cannot
     /// silently restore a decision to store one they had cleared.
-    pub remember: bool,
+    pub remember: Remember,
     /// What the connect knew about a stored database password when it raised
     /// the prompt — what the card tells the user unticking "remember" puts at
     /// risk. Gathered from the reads the connect already made, never from a
@@ -901,7 +957,7 @@ pub struct EntraPrompt {
     /// Whether to remember the sign-in — keep its refresh token in the OS
     /// keyring rather than for this session only. What the card offers, and
     /// once it is submitted, what the user answered.
-    pub remember: bool,
+    pub remember: Remember,
     /// Whether a remembered sign-in — a refresh token in the OS keyring — is
     /// still there when the card is raised, which an unticked box deletes
     /// once the sign-in connects. Known from where the silent attempt found
@@ -983,8 +1039,18 @@ pub struct ConnectRequest {
     /// Root-scope task running the connect. Cancelling drops it mid-await,
     /// which drops any half-open tunnel with it.
     task: Task,
-    /// False for a shift-click: open the tab, but stay on the list.
-    focus: bool,
+    /// [`TabFocus::Background`] for a shift-click: open the tab, but stay
+    /// on the list.
+    focus: TabFocus,
+}
+
+/// Where a connect started from the connections list opens its tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabFocus {
+    /// Switch to the tab once it opens — a plain click.
+    Front,
+    /// Open it behind the list — a shift-click, or a session restore.
+    Background,
 }
 
 #[cfg(test)]
@@ -992,7 +1058,10 @@ impl ConnectRequest {
     /// A focusing request around `task`, for a test that needs a row to show
     /// its connect as cancellable.
     pub(crate) fn for_test(task: Task) -> Self {
-        Self { task, focus: true }
+        Self {
+            task,
+            focus: TabFocus::Front,
+        }
     }
 }
 
@@ -1142,7 +1211,7 @@ pub struct AppState {
     /// a rejected passphrase offers a ticked box only in the second case, and
     /// the connection form reaches `open_tunnel` with a passphrase and no
     /// parked answer at all.
-    pub ssh_remember: Signal<HashMap<String, bool>>,
+    pub ssh_remember: Signal<HashMap<String, Remember>>,
     /// Introspected schema per open connection.
     pub schemas: Signal<HashMap<ConnectionId, SchemaLoad>>,
     /// Sidebar/grid UI state per open connection.
@@ -1793,20 +1862,20 @@ impl AppState {
     /// focus — the FK trail only makes sense relative to the jumps that built
     /// it, not to an unrelated sidebar pick.
     pub fn select_table(self, id: ConnectionId, table: &TableRef, gesture: Gesture) {
-        self.switch_table(id, table, true, gesture);
+        self.switch_table(id, table, FkTrail::Clear, gesture);
     }
 
     /// Switches the selected table, running the unsaved-changes guard. Returns
     /// whether the selection actually changed: a no-op (already selected) or a
-    /// parked/blocked guard returns `false`. `clear_fk_nav` drops this
+    /// parked/blocked guard returns `false`. [`FkTrail::Clear`] drops this
     /// connection's FK Back stack and pending focus on a real switch —
-    /// foreign-key jumps and Back pass `false` so they manage that stack
-    /// themselves.
+    /// foreign-key jumps and Back pass [`FkTrail::Keep`] so they manage that
+    /// stack themselves.
     fn switch_table(
         mut self,
         id: ConnectionId,
         table: &TableRef,
-        clear_fk_nav: bool,
+        fk_trail: FkTrail,
         gesture: Gesture,
     ) -> bool {
         let current = self
@@ -1837,7 +1906,7 @@ impl AppState {
                 !tab.nav_history.is_empty() || tab.pending_focus.is_some()
             })
             .unwrap_or(false);
-        if clear_fk_nav && fk_nav {
+        if fk_trail == FkTrail::Clear && fk_nav {
             self.tab_mut(id, |tab| {
                 tab.nav_history.clear();
                 tab.pending_focus = None;
@@ -1888,7 +1957,7 @@ impl AppState {
         // A self-referencing FK keeps the grid mounted and just refocuses
         // its filter (consumed by its pending-focus effect); the origin is
         // recorded either way, so Back can restore the prior filter.
-        if &target == origin || self.switch_table(id, &target, false, gesture) {
+        if &target == origin || self.switch_table(id, &target, FkTrail::Keep, gesture) {
             self.tab_mut(id, |tab| tab.nav_history.push(origin_focus));
         }
     }
@@ -1914,7 +1983,7 @@ impl AppState {
         // Same-table restore only refocuses the filter (the grid's effect
         // consumes it); otherwise switch, honoring the unsaved-edits guard.
         let restored =
-            current.as_ref() == Some(&dest) || self.switch_table(id, &dest, false, gesture);
+            current.as_ref() == Some(&dest) || self.switch_table(id, &dest, FkTrail::Keep, gesture);
         if restored {
             self.tab_mut(id, |tab| tab.nav_history.pop());
         }
@@ -2908,6 +2977,20 @@ mod tests {
             fields,
             "the constructor slice does not build every field: {ctor}"
         );
+    }
+
+    #[test]
+    fn a_ticked_box_is_the_keyring_answer_and_back() {
+        // The one place a "remember" answer meets a `bool`: every box reads
+        // its tick through `from_checkbox` and shows an answer through
+        // `checkbox`. Turned round, every box stores what the user declined.
+        assert_eq!(Remember::from_checkbox(true), Remember::Keyring);
+        assert_eq!(Remember::from_checkbox(false), Remember::SessionOnly);
+        assert!(Remember::Keyring.checkbox());
+        assert!(!Remember::SessionOnly.checkbox());
+        for ticked in [false, true] {
+            assert_eq!(Remember::from_checkbox(ticked).checkbox(), ticked);
+        }
     }
 
     fn rows_statement() -> SharedStatement {

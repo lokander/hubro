@@ -113,7 +113,8 @@ pub(super) fn forget_failed_ssh_passphrase(
 /// would make every later passphrase for that connection persist, including
 /// ones the user deliberately declined to save.
 ///
-/// A declined choice is recorded as `false` rather than by removing the entry,
+/// A declined choice is recorded as [`Remember::SessionOnly`] rather than by
+/// removing the entry,
 /// because "answered no" and "never asked" are different states and the
 /// difference is user-visible: only the second may offer a ticked box on the
 /// next prompt. They were the same state while this was a set, which quietly
@@ -126,9 +127,9 @@ pub(super) fn forget_failed_ssh_passphrase(
 /// was unticked. Withdrawing on `None` closes that for a hidden box as well,
 /// without recording a "no" the user never gave.
 pub(super) fn park_ssh_remember(
-    pending: &mut HashMap<String, bool>,
+    pending: &mut HashMap<String, Remember>,
     url: &str,
-    remember: Option<bool>,
+    remember: Option<Remember>,
 ) {
     match remember {
         Some(remember) => pending.insert(url.to_string(), remember),
@@ -154,8 +155,11 @@ pub(super) fn park_ssh_remember(
 /// why [`park_ssh_remember`] records both.
 #[must_use = "the verdict is the re-prompt's checkbox; dropping it re-ticks a box the \
               user deliberately cleared"]
-pub(super) fn withdraw_ssh_remember(pending: &mut HashMap<String, bool>, url: &str) -> bool {
-    pending.remove(url).unwrap_or(true)
+pub(super) fn withdraw_ssh_remember(
+    pending: &mut HashMap<String, Remember>,
+    url: &str,
+) -> Remember {
+    pending.remove(url).unwrap_or(Remember::Keyring)
 }
 
 /// Consumes any parked choice for `url` and reports whether the passphrase
@@ -174,12 +178,12 @@ pub(super) fn withdraw_ssh_remember(pending: &mut HashMap<String, bool>, url: &s
 /// stores a secret they declined.
 #[must_use = "the verdict decides whether the passphrase is written to the keyring"]
 pub(super) fn redeem_ssh_remember(
-    pending: &mut HashMap<String, bool>,
+    pending: &mut HashMap<String, Remember>,
     url: &str,
     source: Option<PassphraseSource>,
 ) -> bool {
-    let parked = pending.remove(url).unwrap_or(false);
-    parked && source == Some(PassphraseSource::Session)
+    let parked = pending.remove(url);
+    parked == Some(Remember::Keyring) && source == Some(PassphraseSource::Session)
 }
 
 /// Keyring key for a connection's cached Entra refresh token. Disjoint from the
@@ -208,16 +212,22 @@ pub(super) enum RefreshSource {
 /// A rotated token must not change homes on its own — out of the keyring it
 /// would sign a remembered user out at the next start, and into it it would
 /// store a sign-in the user declined to have remembered.
-pub(super) fn redeemed_refresh_remembered(source: Option<RefreshSource>) -> bool {
-    source == Some(RefreshSource::Keyring)
+pub(super) fn redeemed_refresh_remembered(source: Option<RefreshSource>) -> Remember {
+    match source {
+        Some(RefreshSource::Keyring) => Remember::Keyring,
+        Some(RefreshSource::Session) | None => Remember::SessionOnly,
+    }
 }
 
 /// What the sign-in card offers after a silent attempt failed: unticked when
 /// the token it tried was kept for the session only, because the user said
 /// "don't remember" this run — a transient failure must not turn that into a
 /// ticked box and a keyring write. Otherwise ticked, as the password prompt is.
-pub(super) fn card_offers_remember(source: Option<RefreshSource>) -> bool {
-    source != Some(RefreshSource::Session)
+pub(super) fn card_offers_remember(source: Option<RefreshSource>) -> Remember {
+    match source {
+        Some(RefreshSource::Session) => Remember::SessionOnly,
+        Some(RefreshSource::Keyring) | None => Remember::Keyring,
+    }
 }
 
 /// Whether a remembered sign-in is still in the keyring after a sign-in
@@ -264,15 +274,18 @@ pub(super) fn place_entra_refresh(
     session: &mut HashMap<String, String>,
     url: &str,
     refresh: String,
-    remember: bool,
+    remember: Remember,
 ) -> RefreshKeyring {
     let key = entra_secret_key(url);
-    if remember {
-        session.remove(&key);
-        RefreshKeyring::Store(refresh)
-    } else {
-        session.insert(key, refresh);
-        RefreshKeyring::Delete
+    match remember {
+        Remember::Keyring => {
+            session.remove(&key);
+            RefreshKeyring::Store(refresh)
+        }
+        Remember::SessionOnly => {
+            session.insert(key, refresh);
+            RefreshKeyring::Delete
+        }
     }
 }
 
@@ -527,13 +540,14 @@ pub(super) fn carry_session_secrets(session: &mut HashMap<String, String>, old: 
 /// outliving its connection means recreating the same URL in the same session
 /// writes back to the keyring the very passphrase the deletion removed.
 ///
-/// The answer is *removed* rather than set to `false`, because those are
+/// The answer is *removed* rather than set to [`Remember::SessionOnly`],
+/// because those are
 /// different states here too: a recreated connection has never been asked, so
 /// its first prompt must come up ticked like any other
 /// ([`withdraw_ssh_remember`] is what tells them apart).
 pub(super) fn forget_connection_secrets(
     session: &mut HashMap<String, String>,
-    pending: &mut HashMap<String, bool>,
+    pending: &mut HashMap<String, Remember>,
     locator: &str,
 ) {
     for key in secret_keys(locator) {
@@ -643,14 +657,16 @@ pub(super) enum StoredPassword {
 /// stored password is a decision the "remember" box takes.
 #[must_use = "the verdict decides whether the keyring entry is written or deleted"]
 pub(super) fn stored_password_after_connect(
-    remember: Option<bool>,
+    remember: Option<Remember>,
     stored: Option<&str>,
     connected: &str,
 ) -> StoredPassword {
     match remember {
-        Some(true) => StoredPassword::Store,
-        Some(false) if stored.is_some_and(|stored| stored != connected) => StoredPassword::Delete,
-        _ => StoredPassword::Keep,
+        Some(Remember::Keyring) => StoredPassword::Store,
+        Some(Remember::SessionOnly) if stored.is_some_and(|stored| stored != connected) => {
+            StoredPassword::Delete
+        }
+        Some(Remember::SessionOnly) | None => StoredPassword::Keep,
     }
 }
 
@@ -743,15 +759,27 @@ mod tests {
         // there; one kept for the session stays for the session. No source
         // (managed identity, which returns no refresh token) is never a
         // reason to start remembering.
-        assert!(redeemed_refresh_remembered(Some(RefreshSource::Keyring)));
-        assert!(!redeemed_refresh_remembered(Some(RefreshSource::Session)));
-        assert!(!redeemed_refresh_remembered(None));
+        assert_eq!(
+            redeemed_refresh_remembered(Some(RefreshSource::Keyring)),
+            Remember::Keyring
+        );
+        assert_eq!(
+            redeemed_refresh_remembered(Some(RefreshSource::Session)),
+            Remember::SessionOnly
+        );
+        assert_eq!(redeemed_refresh_remembered(None), Remember::SessionOnly);
 
         // The card after a failed silent attempt: a "don't remember" given
         // this run stands, anything else is offered ticked.
-        assert!(!card_offers_remember(Some(RefreshSource::Session)));
-        assert!(card_offers_remember(Some(RefreshSource::Keyring)));
-        assert!(card_offers_remember(None));
+        assert_eq!(
+            card_offers_remember(Some(RefreshSource::Session)),
+            Remember::SessionOnly
+        );
+        assert_eq!(
+            card_offers_remember(Some(RefreshSource::Keyring)),
+            Remember::Keyring
+        );
+        assert_eq!(card_offers_remember(None), Remember::Keyring);
     }
 
     #[test]
@@ -768,7 +796,7 @@ mod tests {
             (other.clone(), "theirs".to_string()),
         ]);
         assert_eq!(
-            place_entra_refresh(&mut session, url, "fresh".to_string(), true),
+            place_entra_refresh(&mut session, url, "fresh".to_string(), Remember::Keyring),
             RefreshKeyring::Store("fresh".to_string())
         );
         assert!(!session.contains_key(&key));
@@ -776,7 +804,12 @@ mod tests {
         // Declined: for the session only, and any remembered one is deleted,
         // since keeping it would sign the user in at the next start anyway.
         assert_eq!(
-            place_entra_refresh(&mut session, url, "fresh".to_string(), false),
+            place_entra_refresh(
+                &mut session,
+                url,
+                "fresh".to_string(),
+                Remember::SessionOnly
+            ),
             RefreshKeyring::Delete
         );
         assert_eq!(session.get(&key).map(String::as_str), Some("fresh"));
@@ -801,7 +834,7 @@ mod tests {
         let mut pending = HashMap::new();
 
         // Ticked, then accepted from a passphrase just typed: stored.
-        park_ssh_remember(&mut pending, url, Some(true));
+        park_ssh_remember(&mut pending, url, Some(Remember::Keyring));
         assert!(redeem_ssh_remember(
             &mut pending,
             url,
@@ -809,7 +842,7 @@ mod tests {
         ));
 
         // Unticked: never stored, however the passphrase was accepted.
-        park_ssh_remember(&mut pending, url, Some(false));
+        park_ssh_remember(&mut pending, url, Some(Remember::SessionOnly));
         assert!(!redeem_ssh_remember(
             &mut pending,
             url,
@@ -818,8 +851,8 @@ mod tests {
 
         // An earlier tick must not survive a later untick — the intent is
         // keyed by locator and outlives the attempt that made it.
-        park_ssh_remember(&mut pending, url, Some(true));
-        park_ssh_remember(&mut pending, url, Some(false));
+        park_ssh_remember(&mut pending, url, Some(Remember::Keyring));
+        park_ssh_remember(&mut pending, url, Some(Remember::SessionOnly));
         assert!(!redeem_ssh_remember(
             &mut pending,
             url,
@@ -836,16 +869,17 @@ mod tests {
         // Nobody asked (the form's box hidden): an earlier tick is withdrawn,
         // so it cannot store this passphrase — and no "no" is recorded in its
         // place, so a re-prompt is a first prompt and offers the box ticked.
-        park_ssh_remember(&mut pending, url, Some(true));
+        park_ssh_remember(&mut pending, url, Some(Remember::Keyring));
         park_ssh_remember(&mut pending, url, None);
         assert!(
             !redeem_ssh_remember(&mut pending, url, Some(PassphraseSource::Session)),
             "an answer left by an earlier attempt survived an unasked one"
         );
-        park_ssh_remember(&mut pending, url, Some(false));
+        park_ssh_remember(&mut pending, url, Some(Remember::SessionOnly));
         park_ssh_remember(&mut pending, url, None);
-        assert!(
+        assert_eq!(
             withdraw_ssh_remember(&mut pending, url),
+            Remember::Keyring,
             "an unasked answer was recorded as a no"
         );
     }
@@ -856,7 +890,7 @@ mod tests {
 
         // One tick, one write: the next acceptance must not store again.
         let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, url, Some(true));
+        park_ssh_remember(&mut pending, url, Some(Remember::Keyring));
         assert!(redeem_ssh_remember(
             &mut pending,
             url,
@@ -872,7 +906,7 @@ mod tests {
         // re-written — but the intent is still consumed, so it cannot lie in
         // wait for an unrelated later attempt.
         let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, url, Some(true));
+        park_ssh_remember(&mut pending, url, Some(Remember::Keyring));
         assert!(!redeem_ssh_remember(
             &mut pending,
             url,
@@ -886,14 +920,18 @@ mod tests {
         // No passphrase at all (agent auth, or an unencrypted key) stores
         // nothing and leaves nothing behind either.
         let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, url, Some(true));
+        park_ssh_remember(&mut pending, url, Some(Remember::Keyring));
         assert!(!redeem_ssh_remember(&mut pending, url, None));
         assert!(pending.is_empty());
 
         // Other locators are untouched throughout.
         let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, url, Some(true));
-        park_ssh_remember(&mut pending, "postgres://u@other:5432/db", Some(true));
+        park_ssh_remember(&mut pending, url, Some(Remember::Keyring));
+        park_ssh_remember(
+            &mut pending,
+            "postgres://u@other:5432/db",
+            Some(Remember::Keyring),
+        );
         assert!(redeem_ssh_remember(
             &mut pending,
             url,
@@ -1042,7 +1080,7 @@ mod tests {
         const URL: &str = "postgres://u@h:5432/db";
         let mut session = session_for(URL);
         let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, URL, Some(true));
+        park_ssh_remember(&mut pending, URL, Some(Remember::Keyring));
 
         forget_connection_secrets(&mut session, &mut pending, URL);
 
@@ -1056,10 +1094,11 @@ mod tests {
         // is user-visible: a recreated connection has never been asked, so its
         // first prompt must come up ticked.
         let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, URL, Some(true));
+        park_ssh_remember(&mut pending, URL, Some(Remember::Keyring));
         forget_connection_secrets(&mut session_for(URL), &mut pending, URL);
-        assert!(
+        assert_eq!(
             withdraw_ssh_remember(&mut pending, URL),
+            Remember::Keyring,
             "the deleted connection left an answer behind, so recreating it \
              offers an unticked box the user never cleared"
         );
@@ -1067,7 +1106,7 @@ mod tests {
 
         let mut session = session_for(URL);
         let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, URL, Some(true));
+        park_ssh_remember(&mut pending, URL, Some(Remember::Keyring));
         forget_connection_secrets(&mut session, &mut pending, URL);
         for key in secret_keys(URL) {
             assert!(
@@ -1080,7 +1119,7 @@ mod tests {
         const OTHER: &str = "postgres://u@other:5432/db";
         let mut session = session_for(OTHER);
         let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, OTHER, Some(true));
+        park_ssh_remember(&mut pending, OTHER, Some(Remember::Keyring));
         forget_connection_secrets(&mut session, &mut pending, URL);
         assert_eq!(session, session_for(OTHER));
         assert!(pending.contains_key(OTHER));
@@ -1095,17 +1134,18 @@ mod tests {
 
         // Unticked, typed, rejected: the re-prompt still offers unticked.
         let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, URL, Some(false));
-        assert!(
-            !withdraw_ssh_remember(&mut pending, URL),
+        park_ssh_remember(&mut pending, URL, Some(Remember::SessionOnly));
+        assert_eq!(
+            withdraw_ssh_remember(&mut pending, URL),
+            Remember::SessionOnly,
             "a mistyped passphrase re-ticked a box the user had cleared"
         );
 
         // Ticked, typed, rejected: still ticked, and the intent is withdrawn
         // either way — it was made about the passphrase that just failed.
         let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, URL, Some(true));
-        assert!(withdraw_ssh_remember(&mut pending, URL));
+        park_ssh_remember(&mut pending, URL, Some(Remember::Keyring));
+        assert_eq!(withdraw_ssh_remember(&mut pending, URL), Remember::Keyring);
         assert!(
             !redeem_ssh_remember(&mut pending, URL, Some(PassphraseSource::Session)),
             "the choice for a rejected passphrase stayed parked, where a later \
@@ -1119,19 +1159,29 @@ mod tests {
         // answer itself is stored. While this was a `HashSet` the two were the
         // same state, which silently unticked the form user's re-prompt.
         let mut pending = HashMap::new();
-        assert!(
+        assert_eq!(
             withdraw_ssh_remember(&mut pending, URL),
+            Remember::Keyring,
             "a first prompt for this connection came up unticked"
         );
-        park_ssh_remember(&mut pending, "postgres://u@other:5432/db", Some(false));
-        assert!(
+        park_ssh_remember(
+            &mut pending,
+            "postgres://u@other:5432/db",
+            Some(Remember::SessionOnly),
+        );
+        assert_eq!(
             withdraw_ssh_remember(&mut pending, URL),
+            Remember::Keyring,
             "another connection's declined choice decided this prompt"
         );
 
         // Another connection's parked choice is not withdrawn with it.
         let mut pending = HashMap::new();
-        park_ssh_remember(&mut pending, "postgres://u@other:5432/db", Some(true));
+        park_ssh_remember(
+            &mut pending,
+            "postgres://u@other:5432/db",
+            Some(Remember::Keyring),
+        );
         let _ = withdraw_ssh_remember(&mut pending, URL);
         assert_eq!(pending.len(), 1);
     }
@@ -1284,38 +1334,38 @@ mod tests {
         use StoredPassword::{Delete, Keep, Store};
         for (remember, stored, expected, why) in [
             (
-                Some(true),
+                Some(Remember::Keyring),
                 Some("old"),
                 Store,
                 "ticked: the new password replaces the stored one",
             ),
             (
-                Some(true),
+                Some(Remember::Keyring),
                 None,
                 Store,
                 "ticked with nothing stored: the new one is stored",
             ),
             (
-                Some(true),
+                Some(Remember::Keyring),
                 Some("new"),
                 Store,
                 "ticked: rewriting the same value is harmless",
             ),
             (
-                Some(false),
+                Some(Remember::SessionOnly),
                 Some("old"),
                 Delete,
                 "unticked: a different password connected, so the stored one is stale \
                  and the user declined to keep any",
             ),
             (
-                Some(false),
+                Some(Remember::SessionOnly),
                 Some("new"),
                 Keep,
                 "unticked, but the stored password is the one that just connected",
             ),
             (
-                Some(false),
+                Some(Remember::SessionOnly),
                 None,
                 Keep,
                 "unticked with nothing stored: nothing to delete",

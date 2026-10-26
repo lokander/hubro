@@ -437,6 +437,69 @@ fn percent_decode(raw: &str) -> String {
         .unwrap_or_else(|_| raw.to_string())
 }
 
+/// Which way [`SavedList::move_group`] moves a group in the display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupStep {
+    /// One place towards the top.
+    Up,
+    /// One place towards the bottom.
+    Down,
+}
+
+/// How a server connection authenticates, as the connection form's Auth
+/// selector offers it. [`ServerAuth`] is the saved form, with the Entra
+/// settings inside; this is the selector's choice before those fields are
+/// read, so a form can hold it while the user is still typing them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthMode {
+    /// A database password.
+    Password,
+    /// A Microsoft Entra ID browser sign-in.
+    EntraInteractive,
+    /// A Microsoft Entra ID managed identity.
+    EntraManagedIdentity,
+}
+
+impl AuthMode {
+    /// Every mode, in the order the selector lists them.
+    pub const ALL: [AuthMode; 3] = [
+        AuthMode::Password,
+        AuthMode::EntraInteractive,
+        AuthMode::EntraManagedIdentity,
+    ];
+
+    /// The selector option's value for this mode — what
+    /// [`AuthMode::from_str`](std::str::FromStr::from_str) reads back.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthMode::Password => "password",
+            AuthMode::EntraInteractive => "entra-interactive",
+            AuthMode::EntraManagedIdentity => "entra-mi",
+        }
+    }
+
+    /// Whether the mode signs in through Entra rather than with a password.
+    pub fn is_entra(self) -> bool {
+        match self {
+            AuthMode::Password => false,
+            AuthMode::EntraInteractive | AuthMode::EntraManagedIdentity => true,
+        }
+    }
+}
+
+impl std::str::FromStr for AuthMode {
+    type Err = String;
+
+    /// Reads a selector option's value back. Anything else is an error rather
+    /// than a quiet fallback to a password.
+    fn from_str(value: &str) -> Result<AuthMode, String> {
+        AuthMode::ALL
+            .into_iter()
+            .find(|mode| mode.as_str() == value)
+            .ok_or_else(|| format!("unknown auth mode `{value}`"))
+    }
+}
+
 /// A saved entry decomposed into the connection forms' field values.
 /// Secrets are deliberately absent: the password and SSH passphrase fields
 /// always start empty, and an empty field on save means "keep whatever is in
@@ -451,7 +514,7 @@ pub(crate) struct EditPrefill {
     /// `sslmode` for Postgres, `encrypt` for SQL Server.
     pub option: Option<String>,
     pub trust_cert: bool,
-    pub auth_mode: String,
+    pub auth_mode: AuthMode,
     pub entra_tenant: String,
     pub entra_client_id: String,
     pub tunnel: Option<TunnelConfig>,
@@ -465,7 +528,7 @@ pub(crate) struct EditPrefill {
 impl Default for EditPrefill {
     /// The add flow's starting point. Note `auth_mode`/`entra_tenant` are
     /// the forms' real defaults rather than empty strings — the password
-    /// field only renders while `auth_mode` is "password".
+    /// field only renders while `auth_mode` is [`AuthMode::Password`].
     fn default() -> Self {
         EditPrefill {
             name: String::new(),
@@ -475,7 +538,7 @@ impl Default for EditPrefill {
             user: String::new(),
             option: None,
             trust_cert: false,
-            auth_mode: "password".to_string(),
+            auth_mode: AuthMode::Password,
             entra_tenant: "organizations".to_string(),
             entra_client_id: String::new(),
             tunnel: None,
@@ -517,14 +580,14 @@ impl EditPrefill {
         };
         let fields = split_url(&url, option_key);
         let (auth_mode, entra_tenant, entra_client_id) = match auth {
-            ServerAuth::Password => ("password".into(), "organizations".into(), String::new()),
+            ServerAuth::Password => (AuthMode::Password, "organizations".into(), String::new()),
             ServerAuth::Entra(EntraAuth::Interactive { tenant, client_id }) => (
-                "entra-interactive".to_string(),
+                AuthMode::EntraInteractive,
                 tenant,
                 client_id.unwrap_or_default(),
             ),
             ServerAuth::Entra(EntraAuth::ManagedIdentity { client_id }) => (
-                "entra-mi".to_string(),
+                AuthMode::EntraManagedIdentity,
                 "organizations".to_string(),
                 client_id.unwrap_or_default(),
             ),
@@ -891,19 +954,17 @@ impl SavedList {
     /// buttons can drive without a drag-and-drop dependency. Returns false at
     /// the ends of the list (and for an unknown name), which is what greys
     /// the button out.
-    pub fn move_group(&mut self, name: &str, up: bool) -> bool {
+    pub fn move_group(&mut self, name: &str, step: GroupStep) -> bool {
         let Some(index) = self.groups.iter().position(|g| g == name) else {
             return false;
         };
-        let target = if up {
-            match index.checked_sub(1) {
+        let target = match step {
+            GroupStep::Up => match index.checked_sub(1) {
                 Some(target) => target,
                 None => return false,
-            }
-        } else if index + 1 < self.groups.len() {
-            index + 1
-        } else {
-            return false;
+            },
+            GroupStep::Down if index + 1 < self.groups.len() => index + 1,
+            GroupStep::Down => return false,
         };
         self.groups.swap(index, target);
         true
@@ -1292,24 +1353,24 @@ mod tests {
         for name in ["a", "b", "c"] {
             list.create_group(name).unwrap();
         }
-        assert!(list.move_group("c", true));
+        assert!(list.move_group("c", GroupStep::Up));
         assert_eq!(list.groups(), ["a", "c", "b"]);
-        assert!(list.move_group("c", true));
+        assert!(list.move_group("c", GroupStep::Up));
         assert_eq!(list.groups(), ["c", "a", "b"]);
         // At the ends the move is refused, which is what greys the button out.
-        assert!(!list.move_group("c", true));
+        assert!(!list.move_group("c", GroupStep::Up));
         assert_eq!(list.groups(), ["c", "a", "b"]);
-        assert!(list.move_group("c", false));
+        assert!(list.move_group("c", GroupStep::Down));
         assert_eq!(list.groups(), ["a", "c", "b"]);
-        assert!(!list.move_group("b", false));
-        assert!(!list.move_group("nope", true));
+        assert!(!list.move_group("b", GroupStep::Down));
+        assert!(!list.move_group("nope", GroupStep::Up));
 
         // The display order follows the group order, not the entry order.
         let mut list = list_of(&[saved("z", "/tmp/z.db")]);
         list.create_group("one").unwrap();
         list.create_group("two").unwrap();
         assert!(list.assign_group("/tmp/z.db", Some("two")));
-        assert!(list.move_group("two", true));
+        assert!(list.move_group("two", GroupStep::Up));
         let names: Vec<Option<String>> = list.arrange("").into_iter().map(|s| s.name).collect();
         assert_eq!(
             names,
@@ -2390,7 +2451,7 @@ mod tests {
         assert_eq!(prefill.option.as_deref(), Some("require"));
         // sslmode is not trustServerCertificate; the flag stays off.
         assert!(!prefill.trust_cert);
-        assert_eq!(prefill.auth_mode, "password");
+        assert_eq!(prefill.auth_mode, AuthMode::Password);
 
         // SQL Server owns `encrypt`, and reads the trust flag whatever its
         // casing — a hand-pasted URL may spell it any way.
@@ -2431,7 +2492,7 @@ mod tests {
             group: None,
         };
         let prefill = EditPrefill::from_saved(entra);
-        assert_eq!(prefill.auth_mode, "entra-interactive");
+        assert_eq!(prefill.auth_mode, AuthMode::EntraInteractive);
         assert_eq!(prefill.entra_tenant, "contoso.com");
         assert_eq!(prefill.entra_client_id, "abc-123");
         assert_eq!(prefill.ssh_host, "bastion");
@@ -2457,7 +2518,7 @@ mod tests {
             group: None,
         };
         let prefill = EditPrefill::from_saved(mi);
-        assert_eq!(prefill.auth_mode, "entra-mi");
+        assert_eq!(prefill.auth_mode, AuthMode::EntraManagedIdentity);
         assert_eq!(prefill.entra_tenant, "organizations");
         assert_eq!(prefill.entra_client_id, "");
         assert!(!prefill.ssh_use_key);

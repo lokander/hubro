@@ -14,7 +14,9 @@ use dioxus_icons::lucide::{
     Trash2, X,
 };
 
-use crate::config::{BackendKind, ConnectionColor, EditPrefill, SavedConnection, ServerAuth};
+use crate::config::{
+    AuthMode, BackendKind, ConnectionColor, EditPrefill, GroupStep, SavedConnection, ServerAuth,
+};
 use crate::db::{engine_has_read_only_mode, Dialect, WriteProtection};
 use crate::ui::classes::{BTN_CANCEL, BTN_ICON, BTN_PRIMARY, FORM_INPUT, FORM_SELECT, SELECT};
 
@@ -23,7 +25,7 @@ use super::js::focus_on_mount;
 use super::notice::{
     Banner, BannerKind, ConfirmInline, EmptyState, Overlay, OverlayAlign, Spinner,
 };
-use super::state::{ActiveView, AppState, ConnectStep, ServerBackend};
+use super::state::{ActiveView, AppState, ConnectStep, Remember, ServerBackend, TabFocus};
 use super::text_field::TextInput;
 
 /// One saved connection's per-row settings, edited inline under its row in
@@ -413,7 +415,7 @@ fn GroupHeader(
                     aria_label: "Move group up",
                     onclick: {
                         let name = name.clone();
-                        move |_| state.move_saved_group(&name, true)
+                        move |_| state.move_saved_group(&name, GroupStep::Up)
                     },
                     ChevronUp { size: 14 }
                 }
@@ -428,7 +430,7 @@ fn GroupHeader(
                     aria_label: "Move group down",
                     onclick: {
                         let name = name.clone();
-                        move |_| state.move_saved_group(&name, false)
+                        move |_| state.move_saved_group(&name, GroupStep::Down)
                     },
                     ChevronDown { size: 14 }
                 }
@@ -574,7 +576,11 @@ fn SavedConnectionRow(
                                 row.backend,
                                 row.tunnel.clone(),
                                 row.auth.clone(),
-                                !evt.modifiers().shift(),
+                                if evt.modifiers().shift() {
+                                    TabFocus::Background
+                                } else {
+                                    TabFocus::Front
+                                },
                             );
                     }
                 },
@@ -1260,8 +1266,8 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
             label { class: "mt-2 flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
                 input {
                     r#type: "checkbox",
-                    checked: remember(),
-                    onchange: move |evt| remember.set(evt.checked()),
+                    checked: remember().checkbox(),
+                    onchange: move |evt| remember.set(Remember::from_checkbox(evt.checked())),
                 }
                 "Remember in the system keyring (falls back to this session only)"
             }
@@ -1498,8 +1504,8 @@ fn EntraSignInCard(prompt: super::state::EntraPrompt) -> Element {
             label { class: "mt-2 flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
                 input {
                     r#type: "checkbox",
-                    checked: remember(),
-                    onchange: move |evt| remember.set(evt.checked()),
+                    checked: remember().checkbox(),
+                    onchange: move |evt| remember.set(Remember::from_checkbox(evt.checked())),
                 }
                 "Stay signed in: remember in the system keyring (falls back to this session only)"
             }
@@ -1544,10 +1550,10 @@ struct ServerFormState {
     trust_cert: Signal<bool>,
     /// Never prefilled; empty means "keep whatever the keyring holds".
     password: Signal<String>,
-    remember: Signal<bool>,
+    remember: Signal<Remember>,
     use_url: Signal<bool>,
     pasted_url: Signal<String>,
-    auth_mode: Signal<String>,
+    auth_mode: Signal<AuthMode>,
     entra_tenant: Signal<String>,
     entra_client_id: Signal<String>,
     use_tunnel: Signal<bool>,
@@ -1648,7 +1654,7 @@ fn submit_server_form(
     // Authentication mode from the selector. Entra takes the
     // `user` field as the Entra principal; a token replaces the password.
     let auth: ServerAuth = match auth_from_form(
-        &form.auth_mode.peek(),
+        *form.auth_mode.peek(),
         &form.entra_tenant.peek(),
         &form.entra_client_id.peek(),
     ) {
@@ -1673,7 +1679,7 @@ fn submit_server_form(
         &url,
     );
     // `None` when the box was not on screen: nobody was asked.
-    let remember_choice = asks_remember(&form.auth_mode.peek()).then(|| *form.remember.peek());
+    let remember_choice = asks_remember(*form.auth_mode.peek()).then(|| *form.remember.peek());
     form_error.set(None);
     // spawn_forever: closing the modal (X or Escape) unmounts the form, and a
     // scope-tied `spawn` would be cancelled at its next await — abandoning the
@@ -1818,8 +1824,8 @@ fn form_password(
 /// Whether the connection form shows its "remember" box for `auth_mode`.
 /// The box is rendered on this and its answer read on this, so a hidden box —
 /// which keeps its default tick — is never taken for an answer.
-fn asks_remember(auth_mode: &str) -> bool {
-    auth_mode == "password"
+fn asks_remember(auth_mode: AuthMode) -> bool {
+    auth_mode == AuthMode::Password
 }
 
 /// The password pasted inside a URL, when the form is in paste mode. Used for
@@ -2049,12 +2055,11 @@ fn ServerForm(
         // Never prefilled: the stored secret isn't shown, and an empty field
         // on save means "keep the existing keyring entry".
         password: use_signal(String::new),
-        remember: use_signal(|| true),
+        remember: use_signal(|| Remember::Keyring),
         use_url: use_signal(|| false),
         pasted_url: use_signal(String::new),
-        // Authentication: "password" (default), "entra-interactive", or
-        // "entra-mi".
-        auth_mode: use_signal(|| seed.auth_mode.clone()),
+        // Authentication: a password unless the entry says otherwise.
+        auth_mode: use_signal(|| seed.auth_mode),
         entra_tenant: use_signal(|| seed.entra_tenant.clone()),
         entra_client_id: use_signal(|| seed.entra_client_id.clone()),
         use_tunnel: use_signal(|| seed.tunnel.is_some()),
@@ -2203,7 +2208,7 @@ fn ServerForm(
                 // Authentication mode. Entra uses the user field as the
                 // principal and a token instead of a password.
                 AuthModeFields { auth_mode, entra_tenant, entra_client_id }
-                if auth_mode() == "password" {
+                if auth_mode() == AuthMode::Password {
                     TextInput {
                         r#type: "password",
                         class: FORM_INPUT,
@@ -2224,12 +2229,12 @@ fn ServerForm(
                 }
                 // Only meaningful for password auth — Entra asks on its
                 // sign-in card.
-                if asks_remember(&auth_mode()) {
+                if asks_remember(auth_mode()) {
                     label { class: "flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
                         input {
                             r#type: "checkbox",
-                            checked: remember(),
-                            onchange: move |evt| remember.set(evt.checked()),
+                            checked: remember().checkbox(),
+                            onchange: move |evt| remember.set(Remember::from_checkbox(evt.checked())),
                         }
                         "Remember in the system keyring (falls back to this session only)"
                     }
@@ -2571,7 +2576,7 @@ mod tests {
             }
             // The line renders inside the box's gate, after the box: shown
             // exactly when the box is, so it never speaks for a hidden one.
-            let gate = "if asks_remember(&auth_mode()) { label {";
+            let gate = "if asks_remember(auth_mode()) { label {";
             let at = body.find(gate).expect("the box's gate");
             let block = &body[at..];
             let block = &block[..block.find("div { class:").unwrap_or(block.len())];
@@ -2637,7 +2642,8 @@ mod tests {
         let body = setup.join("\n");
         let rendered = rendered.join("\n");
         assert!(
-            !body.contains("use_signal(|| true)"),
+            !body.contains("use_signal(|| true)")
+                && !body.contains("use_signal(|| Remember::Keyring)"),
             "the card re-ticks the remember box on every prompt, so unticking \
              it and then mistyping the passphrase silently restores the \
              decision to store it: {body}"
@@ -2671,12 +2677,12 @@ mod tests {
         );
         // And the third place the same value passes through: what the rendered
         // box displays. Rendering is not testable without a runtime, but the
-        // *binding* is text like the other two, and `checked: !remember()`
+        // *binding* is text like the other two, and `checked: !remember().checkbox()`
         // shows every user the opposite of the state they are about to submit.
         // Split at `rsx!`, so all three ends of the value — seed, display,
         // submit — are covered by one test.
         assert!(
-            rendered.contains("checked: remember(),"),
+            rendered.contains("checked: remember().checkbox(),"),
             "the checkbox displays something other than the choice it holds, \
              so the box the user sees and the answer the card submits can \
              disagree: {rendered}"
@@ -2690,24 +2696,28 @@ mod tests {
         // the one that hands the answer on — runs for whatever
         // `auth_from_form` maps to `Password`, so the two must agree for
         // every mode the selector offers.
-        let source = include_str!("connections.rs");
         // The selector's option values, read off its `select`.
-        let modes: Vec<&str> = source
-            .lines()
-            .skip_while(|line| line.trim() != "fn AuthModeFields(")
-            .take_while(|line| !line.trim_start().starts_with("if auth_mode()"))
-            .filter_map(|line| line.split_once("value: \"").map(|(_, rest)| rest))
-            .filter_map(|rest| rest.split('"').next())
-            .collect();
-        assert_eq!(modes, ["password", "entra-interactive", "entra-mi"]);
-        for mode in modes {
+        // The selector offers every mode, and nothing else.
+        let selector = shipped_code_of("fn AuthModeFields(");
+        assert!(
+            selector.contains("for mode in AuthMode::ALL { option { value: mode.as_str(),"),
+            "{selector}"
+        );
+        for mode in AuthMode::ALL {
+            assert_eq!(
+                mode.as_str().parse(),
+                Ok(mode),
+                "{mode:?} does not read back"
+            );
             assert_eq!(
                 asks_remember(mode),
                 matches!(auth_from_form(mode, "tenant", ""), Ok(ServerAuth::Password)),
-                "{mode}: the box's visibility and the password route disagree"
+                "{mode:?}: the box's visibility and the password route disagree"
             );
         }
-        assert!(!asks_remember("entra-mi"));
+        assert!(asks_remember(AuthMode::Password));
+        assert!(!asks_remember(AuthMode::EntraManagedIdentity));
+        assert!("Password".parse::<AuthMode>().is_err());
     }
 
     /// The shipped code of the item `signature` opens in this file, through
@@ -2884,9 +2894,12 @@ mod tests {
         // further down the wire passes through both. Pinned as written, read
         // as code alone, for all three boxes: the connection form's, the
         // password prompt's and the Entra sign-in card's.
-        let write_back = "checked: remember(), onchange: move |evt| remember.set(evt.checked()),";
+        let write_back = "checked: remember().checkbox(), onchange: move |evt| remember.set(Remember::from_checkbox(evt.checked())),";
         for (signature, seed) in [
-            ("fn ServerForm(", &["remember: use_signal(|| true),"][..]),
+            (
+                "fn ServerForm(",
+                &["remember: use_signal(|| Remember::Keyring),"][..],
+            ),
             (
                 "fn PasswordPromptCard(",
                 &[
@@ -2933,7 +2946,7 @@ mod tests {
         // inside that gate.
         let form = "fn ServerForm(";
         let code = shipped_code_of(form);
-        let gate = "if asks_remember(&auth_mode()) { label {";
+        let gate = "if asks_remember(auth_mode()) { label {";
         assert_eq!(
             code.matches(gate).count(),
             1,
@@ -2951,7 +2964,7 @@ mod tests {
         let end = label
             + crate::source_scan::block_end(&code[label..]).expect("the label's block closes");
         assert!(
-            code[label..end].contains("checked: remember(),"),
+            code[label..end].contains("checked: remember().checkbox(),"),
             "{form}: the box is not the checkbox in the label its gate opens, so \
              it renders outside the gate its answer is read under: {}",
             &code[label..end]
@@ -2962,7 +2975,7 @@ mod tests {
         )));
         assert_eq!(shipped.matches("form.remember").count(), 1, "{shipped}");
         assert!(shipped.contains(
-            "let remember_choice = asks_remember(&form.auth_mode.peek()).then(|| *form.remember.peek());"
+            "let remember_choice = asks_remember(*form.auth_mode.peek()).then(|| *form.remember.peek());"
         ));
     }
 
@@ -3214,11 +3227,11 @@ fn tunnel_from_form(
 /// Builds the auth mode from the form's Auth selector ("password",
 /// "entra-interactive", or "entra-mi") and Entra fields — the validation
 /// shared by both server forms.
-fn auth_from_form(mode: &str, tenant: &str, client_id: &str) -> Result<ServerAuth, String> {
+fn auth_from_form(mode: AuthMode, tenant: &str, client_id: &str) -> Result<ServerAuth, String> {
     use crate::azure::EntraAuth;
     let client = client_id.trim().to_string();
     match mode {
-        "entra-interactive" => {
+        AuthMode::EntraInteractive => {
             let tenant = tenant.trim().to_string();
             if tenant.is_empty() {
                 return Err("the Entra tenant must not be empty".to_string());
@@ -3228,10 +3241,10 @@ fn auth_from_form(mode: &str, tenant: &str, client_id: &str) -> Result<ServerAut
                 client_id: (!client.is_empty()).then_some(client),
             }))
         }
-        "entra-mi" => Ok(ServerAuth::Entra(EntraAuth::ManagedIdentity {
+        AuthMode::EntraManagedIdentity => Ok(ServerAuth::Entra(EntraAuth::ManagedIdentity {
             client_id: (!client.is_empty()).then_some(client),
         })),
-        _ => Ok(ServerAuth::Password),
+        AuthMode::Password => Ok(ServerAuth::Password),
     }
 }
 
@@ -3244,32 +3257,41 @@ fn entra_principal_missing(url: &str) -> bool {
         .is_none_or(|u| u.username().is_empty())
 }
 
+/// The Auth selector's label for `mode`.
+fn auth_mode_label(mode: AuthMode) -> &'static str {
+    match mode {
+        AuthMode::Password => "Auth: password",
+        AuthMode::EntraInteractive => "Auth: Microsoft Entra ID (browser sign-in)",
+        AuthMode::EntraManagedIdentity => "Auth: Microsoft Entra ID (managed identity)",
+    }
+}
+
 /// The Auth dropdown (password / Entra interactive / Entra managed identity)
 /// plus the Entra fields it reveals, in [`ServerForm`], which hands its
 /// signals in (signals are `Copy`).
 #[component]
 fn AuthModeFields(
-    auth_mode: Signal<String>,
+    auth_mode: Signal<AuthMode>,
     entra_tenant: Signal<String>,
     entra_client_id: Signal<String>,
 ) -> Element {
     rsx! {
         select {
             class: FORM_SELECT,
-            onchange: move |evt| auth_mode.set(evt.value()),
-            option { value: "password", selected: auth_mode() == "password", "Auth: password" }
-            option {
-                value: "entra-interactive",
-                selected: auth_mode() == "entra-interactive",
-                "Auth: Microsoft Entra ID (browser sign-in)"
-            }
-            option {
-                value: "entra-mi",
-                selected: auth_mode() == "entra-mi",
-                "Auth: Microsoft Entra ID (managed identity)"
+            onchange: move |evt| {
+                if let Ok(mode) = evt.value().parse() {
+                    auth_mode.set(mode);
+                }
+            },
+            for mode in AuthMode::ALL {
+                option {
+                    value: mode.as_str(),
+                    selected: auth_mode() == mode,
+                    {auth_mode_label(mode)}
+                }
             }
         }
-        if auth_mode() == "entra-interactive" {
+        if auth_mode() == AuthMode::EntraInteractive {
             TextInput {
                 class: FORM_INPUT,
                 placeholder: "Entra tenant — id, domain, or 'organizations'",
@@ -3277,7 +3299,7 @@ fn AuthModeFields(
                 oninput: move |evt: FormEvent| entra_tenant.set(evt.value()),
             }
         }
-        if auth_mode().starts_with("entra") {
+        if auth_mode().is_entra() {
             TextInput {
                 class: FORM_INPUT,
                 placeholder: "application (client) ID — optional",

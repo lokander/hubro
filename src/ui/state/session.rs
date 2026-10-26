@@ -238,7 +238,7 @@ impl AppState {
                 saved_conn.backend(),
                 tunnel,
                 auth,
-                false,
+                TabFocus::Background,
             );
         }
     }
@@ -817,7 +817,7 @@ mod tests {
         .await;
         assert_eq!(
             focus(&dom),
-            Some(false),
+            Some(TabFocus::Background),
             "a restore opens in the background"
         );
 
@@ -829,10 +829,14 @@ mod tests {
                 BackendKind::Postgres,
                 None,
                 ServerAuth::Password,
-                true,
+                TabFocus::Front,
             )
         });
-        assert_eq!(focus(&dom), Some(true), "a click asks for it in front");
+        assert_eq!(
+            focus(&dom),
+            Some(TabFocus::Front),
+            "a click asks for it in front"
+        );
 
         // And a connect with no request of its own — the command line, a file
         // the OS handed over — reaching the reserved locator.
@@ -842,7 +846,7 @@ mod tests {
             dom.in_runtime(|| state.connecting.peek().iter().any(|c| c.locator == locator))
         })
         .await;
-        assert_eq!(focus(&dom), Some(false));
+        assert_eq!(focus(&dom), Some(TabFocus::Background));
         dom.in_runtime(|| {
             spawn_forever(state.connect_server(
                 ServerBackend::of(BackendKind::Postgres),
@@ -853,7 +857,7 @@ mod tests {
             ));
         });
         run_until(&mut dom, Duration::from_secs(5), |dom| {
-            focus(dom) == Some(true)
+            focus(dom) == Some(TabFocus::Front)
         })
         .await;
         dom.in_runtime(|| state.cancel_connect(&locator));

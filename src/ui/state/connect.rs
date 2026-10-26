@@ -52,9 +52,9 @@ pub(super) enum EntraOpener {
 /// is deleted at its next renewal.
 fn sign_in_remembered(
     opener: EntraOpener,
-    card_answer: bool,
+    card_answer: Remember,
     source: Option<RefreshSource>,
-) -> bool {
+) -> Remember {
     match opener {
         EntraOpener::Browser => card_answer,
         EntraOpener::Silent => redeemed_refresh_remembered(source),
@@ -88,7 +88,7 @@ pub(super) enum CredentialSource {
     /// for a command-line password ([`stored_password_after_connect`]).
     Typed {
         password: String,
-        remember: Option<bool>,
+        remember: Option<Remember>,
     },
     /// An Entra sign-in. `card` is the sign-in card this connect parks or
     /// completes, and its `remember` the answer: given on the card for a
@@ -285,7 +285,7 @@ impl AppState {
                     entra,
                     backend: backend.kind,
                     // Decided by the silent attempt, either way it goes.
-                    remember: true,
+                    remember: Remember::Keyring,
                     // Likewise: the attempt finds out where its token was.
                     stored: StoredCopy::Unknown,
                 },
@@ -307,7 +307,7 @@ impl AppState {
         url: String,
         name: String,
         password: String,
-        remember: Option<bool>,
+        remember: Option<Remember>,
         tunnel: Option<TunnelConfig>,
     ) {
         let source = CredentialSource::Typed { password, remember };
@@ -459,7 +459,7 @@ impl AppState {
                     // Nothing parks a database-password choice — it is acted
                     // on the moment the connect succeeds — so there is no
                     // earlier answer to carry and this prompt asks fresh.
-                    remember: true,
+                    remember: Remember::Keyring,
                     stored,
                 }));
                 return;
@@ -586,7 +586,7 @@ impl AppState {
         mut self,
         url: &str,
         refresh: String,
-        remember: bool,
+        remember: Remember,
         redeemed_at: Option<u64>,
     ) {
         if !kept_after_sign_in(redeemed_at, self.entra_sign_out_generation(url)) {
@@ -813,7 +813,7 @@ impl AppState {
         mut self,
         connect: ServerConnect,
         password: String,
-        remember: Option<bool>,
+        remember: Option<Remember>,
     ) {
         let ServerConnect {
             backend,
@@ -838,11 +838,11 @@ impl AppState {
             // unreadable keyring reads as nothing stored, so it never licenses
             // a delete.
             let in_keyring = match remember {
-                Some(false) => crate::secrets::get_password_async(url.clone())
+                Some(Remember::SessionOnly) => crate::secrets::get_password_async(url.clone())
                     .await
                     .ok()
                     .flatten(),
-                _ => None,
+                Some(Remember::Keyring) | None => None,
             };
             match stored_password_after_connect(remember, in_keyring.as_deref(), &password) {
                 StoredPassword::Store => {
@@ -892,7 +892,7 @@ impl AppState {
         mut self,
         prompt: PasswordPrompt,
         passphrase: String,
-        remember: bool,
+        remember: Remember,
     ) {
         let PasswordPrompt {
             url,
@@ -934,7 +934,7 @@ impl AppState {
     /// Records — or withdraws — the user's "remember this SSH passphrase"
     /// choice for `url`, pending a tunnel open that accepts it. The policy
     /// itself is [`park_ssh_remember`], where a test can execute it.
-    pub fn set_ssh_remember(mut self, url: &str, remember: Option<bool>) {
+    pub fn set_ssh_remember(mut self, url: &str, remember: Option<Remember>) {
         park_ssh_remember(&mut self.ssh_remember.write(), url, remember);
     }
 
@@ -1177,8 +1177,9 @@ impl AppState {
         self.connect_error.set(Some(message));
     }
 
-    /// Starts a connect for a row in the connections list. `focus` is false
-    /// for a shift-click, which opens the tab in the background.
+    /// Starts a connect for a row in the connections list. `focus` is
+    /// [`TabFocus::Background`] for a shift-click, which opens the tab behind
+    /// the list.
     ///
     /// The connect runs on a **root** task, not the caller's: with connects
     /// running in parallel, the first one to finish switches to its tab and
@@ -1192,7 +1193,7 @@ impl AppState {
         backend: BackendKind,
         tunnel: Option<TunnelConfig>,
         auth: ServerAuth,
-        focus: bool,
+        focus: TabFocus,
     ) {
         // SQLite reserves under the canonicalized path, so key on that or the
         // row would never match its own progress.
@@ -1203,7 +1204,9 @@ impl AppState {
         // whose connect runs in the background — a shift-click's, or a
         // session restore's — asks for the tab in front, and gets it.
         if let Some(request) = self.connect_requests.write().get_mut(&key) {
-            request.focus |= focus;
+            if focus == TabFocus::Front {
+                request.focus = TabFocus::Front;
+            }
             return;
         }
         // "The next connect asks you to sign in" is answered by this one.
@@ -1255,7 +1258,7 @@ impl AppState {
         self.connecting.write().retain(|c| c.locator != locator);
         self.restoring.write().remove(locator);
         let request = self.connect_requests.write().remove(locator);
-        request.is_none_or(|r| r.focus)
+        request.is_none_or(|r| r.focus == TabFocus::Front)
     }
 
     /// Advances the step shown on a connecting row. A no-op once the connect
@@ -1317,7 +1320,7 @@ impl AppState {
                     }
                     // Not ours, so this connect has no request: one under
                     // the same locator would be the one just matched.
-                    Some(request) => request.focus = true,
+                    Some(request) => request.focus = TabFocus::Front,
                     None => {}
                 }
                 return true;
@@ -1797,28 +1800,29 @@ mod tests {
             Some(RefreshSource::Session),
             Some(RefreshSource::Keyring),
         ] {
-            for answer in [false, true] {
+            for answer in [Remember::SessionOnly, Remember::Keyring] {
                 assert_eq!(
                     sign_in_remembered(EntraOpener::Browser, answer, source),
                     answer,
-                    "the card's answer {answer} is overridden after {source:?}"
+                    "the card's answer {answer:?} is overridden after {source:?}"
                 );
             }
         }
         // Silently, there is no fresh answer: where the redeemed token was
         // kept stands, whatever the placeholder the saved connect built.
-        for answer in [false, true] {
-            assert!(sign_in_remembered(
-                EntraOpener::Silent,
-                answer,
-                Some(RefreshSource::Keyring)
-            ));
-            assert!(!sign_in_remembered(
-                EntraOpener::Silent,
-                answer,
-                Some(RefreshSource::Session)
-            ));
-            assert!(!sign_in_remembered(EntraOpener::Silent, answer, None));
+        for answer in [Remember::SessionOnly, Remember::Keyring] {
+            assert_eq!(
+                sign_in_remembered(EntraOpener::Silent, answer, Some(RefreshSource::Keyring)),
+                Remember::Keyring
+            );
+            assert_eq!(
+                sign_in_remembered(EntraOpener::Silent, answer, Some(RefreshSource::Session)),
+                Remember::SessionOnly
+            );
+            assert_eq!(
+                sign_in_remembered(EntraOpener::Silent, answer, None),
+                Remember::SessionOnly
+            );
         }
     }
 
@@ -1830,7 +1834,7 @@ mod tests {
             tunnel: None,
             entra: EntraAuth::interactive_default(),
             backend: BackendKind::Postgres,
-            remember: true,
+            remember: Remember::Keyring,
             stored: StoredCopy::Unknown,
         };
         for (source, answers) in [
@@ -1838,7 +1842,7 @@ mod tests {
             (
                 CredentialSource::Typed {
                     password: "pw".to_string(),
-                    remember: Some(true),
+                    remember: Some(Remember::Keyring),
                 },
                 false,
             ),
@@ -1933,6 +1937,10 @@ mod tests {
         // - `is_open` — edits apply exactly when the connect *failed*, which
         //   is the premise `carry_session_secrets` rests its whole
         //   don't-migrate-the-answer argument on.
+        //
+        // The answer itself is a [`Remember`], not a `bool`, so `!remember`
+        // no longer compiles; what is left to negate on the boxes' side is
+        // the event they read (`!evt.checked()`), swept as `checked`.
         const NAMES: &[&str] = &[
             "redeem",
             "withdraw",
@@ -1941,12 +1949,14 @@ mod tests {
             "forget",
             "is_open",
             "offered",
+            "checked",
         ];
         let source = &connect_code();
         let card = &shipped(include_str!("../connections.rs"));
         let form = method_body(card, "fn submit_server_form(");
         let hops = [
             ("the card", method_body(card, "fn PasswordPromptCard(")),
+            ("the form's box", method_body(card, "fn ServerForm(")),
             ("the form's submit", form.clone()),
             (
                 "the form's question",
@@ -2040,7 +2050,7 @@ mod tests {
         // and hands that one answer to both the passphrase and the password.
         let form = collapsed(&code_of(&form));
         for binding in [
-            "let remember_choice = asks_remember(&form.auth_mode.peek()).then(|| *form.remember.peek());",
+            "let remember_choice = asks_remember(*form.auth_mode.peek()).then(|| *form.remember.peek());",
             "state.set_ssh_remember(&url, remember_choice);",
             "entered_password, remember_choice, tunnel.clone(),",
         ] {
@@ -2048,6 +2058,27 @@ mod tests {
                 form.contains(binding),
                 "the connection form no longer has `{binding}`, so the answer its \
                  box gives is not the one parked or acted on: {form}"
+            );
+        }
+        // Where a box's tick becomes an answer and back: the one meeting of
+        // `Remember` and `bool`, executed by
+        // `a_ticked_box_is_the_keyring_answer_and_back`, and pinned as written
+        // here so the wire names its first hop.
+        let boundary = shipped(include_str!("mod.rs"));
+        for (signature, binding) in [
+            (
+                "pub fn from_checkbox(",
+                "if checked { Remember::Keyring } else { Remember::SessionOnly }",
+            ),
+            (
+                "pub fn checkbox(",
+                "Remember::Keyring => true, Remember::SessionOnly => false,",
+            ),
+        ] {
+            let body = collapsed(&code_of(&method_body(&boundary, signature)));
+            assert!(
+                body.contains(binding),
+                "`{binding}` is gone, so a ticked box is read as some other answer: {body}"
             );
         }
         assert!(
@@ -2278,6 +2309,7 @@ mod tests {
             "card_offers_remember",
             "sign_in_remembered",
             "has_refresh",
+            "checked",
         ];
         let source = &connect_code();
         let card = method_body(
@@ -2326,7 +2358,7 @@ mod tests {
             (&card, "let offered = prompt.remember;"),
             (&card, "use_signal(move || offered)"),
             (&card, "prompt.remember = *remember.peek();"),
-            (&card, "checked: remember(),"),
+            (&card, "checked: remember().checkbox(),"),
             (
                 &finish,
                 "self.keep_entra_refresh(&url, refresh, remember, redeemed_at)",
@@ -2582,14 +2614,16 @@ mod tests {
         // parks that choice — so its default is a literal, and a literal can
         // be flipped without moving a call or failing any policy test.
         // Read off the prompt it raises, not the whole connect: the Entra
-        // card a saved connect builds carries a `remember: true` of its own.
+        // card a saved connect builds carries a `remember: Remember::Keyring` of its own.
         let body = collapsed(&code_of(&method_body(
             &connect_code(),
             "async fn connect_remembered_password(",
         )));
         assert!(
             body.contains("kind: PromptKind::DbPassword,")
-                && body.contains("auth: ServerAuth::Password, remember: true, stored, }));"),
+                && body.contains(
+                    "auth: ServerAuth::Password, remember: Remember::Keyring, stored, }));"
+                ),
             "the password prompt no longer offers to remember by default, so \
              every saved connection quietly starts re-asking: {body}"
         );
@@ -3146,8 +3180,8 @@ mod tests {
         let mut from = 0;
         for step in [
             "let in_keyring = match remember { \
-             Some(false) => crate::secrets::get_password_async(url.clone()) .await .ok() .flatten(), \
-             _ => None, };",
+             Some(Remember::SessionOnly) => crate::secrets::get_password_async(url.clone()) .await .ok() .flatten(), \
+             Some(Remember::Keyring) | None => None, };",
             "match stored_password_after_connect(remember, in_keyring.as_deref(), &password) {",
             "StoredPassword::Store => {",
             "crate::secrets::store_password_async(url.clone(), password.clone()).await;",
@@ -3601,7 +3635,7 @@ mod tests {
                                 url,
                                 name,
                                 password,
-                                Some(remember),
+                                Some(Remember::from_checkbox(remember)),
                                 None,
                             )
                             .await
@@ -3890,7 +3924,12 @@ mod tests {
             dom.in_runtime(|| {
                 spawn_forever(async move {
                     state
-                        .keep_entra_refresh(&task_url, "fresh".to_string(), remember, None)
+                        .keep_entra_refresh(
+                            &task_url,
+                            "fresh".to_string(),
+                            Remember::from_checkbox(remember),
+                            None,
+                        )
                         .await;
                     // Marks the task done, whatever it decided.
                     crate::secrets::store_password(&format!("{task_key}-done"), "1").unwrap();
@@ -4056,7 +4095,7 @@ mod tests {
             tunnel: None,
             entra: EntraAuth::interactive_default(),
             backend: BackendKind::Postgres,
-            remember: true,
+            remember: Remember::Keyring,
             stored: StoredCopy::Present,
         };
         for k in [&key, &other_key] {
@@ -4139,7 +4178,7 @@ mod tests {
         dom.in_runtime(|| {
             spawn_forever(async move {
                 state
-                    .keep_entra_refresh(URL, "rotated".to_string(), true, Some(began))
+                    .keep_entra_refresh(URL, "rotated".to_string(), Remember::Keyring, Some(began))
                     .await;
                 *flag.lock().unwrap() = true;
             });
@@ -4252,7 +4291,7 @@ mod tests {
                 // An interactive token: `acquired.redeemed` is false.
                 let redeemed_at = false.then_some(began);
                 state
-                    .keep_entra_refresh(URL, "fresh".to_string(), true, redeemed_at)
+                    .keep_entra_refresh(URL, "fresh".to_string(), Remember::Keyring, redeemed_at)
                     .await;
                 *flag.lock().unwrap() = true;
             });

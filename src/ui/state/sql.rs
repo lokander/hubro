@@ -496,7 +496,7 @@ impl AppState {
     }
 
     /// Saves editor text under a name, scoped to this connection or
-    /// global. Best-effort and off the UI path like the history writes; the
+    /// global ([`SaveScope`]). Best-effort and off the UI path like the history writes; the
     /// outcome — including a failure — lands in [`Self::saved_status`], and a
     /// success bumps [`Self::saved_nonce`] so open panels re-query.
     ///
@@ -509,7 +509,7 @@ impl AppState {
         name: String,
         description: Option<String>,
         sql: String,
-        global: bool,
+        scope: SaveScope,
     ) {
         let locator = self.connection_locator(id);
         let store = self.history.read().clone();
@@ -523,14 +523,17 @@ impl AppState {
         // A connection-scoped save needs a scope; without a locator the tab
         // is already gone, and silently writing a global would put the query
         // somewhere the user did not ask for.
-        if !global && locator.is_none() {
+        if scope == SaveScope::Connection && locator.is_none() {
             self.set_saved_status(
                 id,
                 SavedStatus::Failed("this connection is no longer open".to_string()),
             );
             return;
         }
-        let scope = (!global).then_some(locator).flatten();
+        let scope = match scope {
+            SaveScope::Connection => locator,
+            SaveScope::Global => None,
+        };
         spawn_forever(async move {
             let outcome = store
                 .save_query(&name, description.as_deref(), &sql, scope.as_deref())
