@@ -12,7 +12,7 @@
 //! in, so an override would win or lose by accident.
 
 /// A borderless text button in a toolbar: the grid's Copy, Export, Import,
-/// Row detail and Refresh, and the session strip's settings link.
+/// Row detail and Refresh, and the theme toggle.
 pub(super) const BTN_GHOST: &str = "rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100";
 
 /// A square icon-only button on a connection row (protection, edit, sign
@@ -40,7 +40,7 @@ pub(super) const BTN_PRIMARY: &str = "rounded px-4 py-2 text-sm font-medium text
 pub(super) const BTN_CANCEL: &str = "rounded px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100";
 
 /// A compact text field: panel forms, search boxes, the grid's filter value,
-/// and the schema-editing dialog.
+/// and the schema-editing dialog, its SQL box included.
 pub(super) const INPUT: &str = "rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 text-xs text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600";
 
 /// A compact native select, matching [`INPUT`]: the grid's filter column and
