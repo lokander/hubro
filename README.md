@@ -123,7 +123,11 @@ opening a file while hubro is already running starts a second copy.
   than run. That mode covers the database's own transaction, not a function
   that acts through a connection of its own — `dblink_exec`, or Citus's
   `run_command_on_*`. SQL Server has no such mode, so there a write hidden in
-  a function or procedure call gets through. Where either matters, use a login without write permission.
+  a procedure call, or in a statement hubro misreads, gets through. Browsing
+  is safe there anyway: SQL Server's views and functions cannot write (it
+  refuses `NEXT VALUE FOR` in a view and an `INSERT` in a function), so only
+  CLR code, a loopback linked server or an extended procedure could. Where
+  any of this matters, use a login without write permission.
 - **Export** query and table results to CSV or JSON (streamed).
 - **Foreign-key navigation**, keyboard shortcuts (with a cheatsheet),
   dark/light theme, and window/session restore.

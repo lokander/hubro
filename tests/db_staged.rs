@@ -11,7 +11,7 @@
 
 mod common;
 
-use hubro::db::Capabilities;
+use hubro::db::Reading;
 use std::collections::HashSet;
 
 use common::FixtureDb;
@@ -286,7 +286,7 @@ async fn sqlite_rowid_identity_table_edits_end_to_end() {
         filter: None,
         extra_key_column: Some(column.clone()),
     };
-    let page = pool.fetch_page(Capabilities::FULL, &request).await.unwrap();
+    let page = pool.fetch_page(Reading::UNMARKED, &request).await.unwrap();
     assert_eq!(page.columns[0].name, "rowid");
     assert_eq!(page.columns[1].name, "body");
     assert_eq!(page.rows.len(), 3);

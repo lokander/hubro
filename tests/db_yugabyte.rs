@@ -122,6 +122,7 @@
 //! so "0 B" beside sixteen rows never reaches the screen. It is only the shared
 //! suite that has to guard its size assertions, and only those.
 
+use hubro::db::Reading;
 use std::sync::OnceLock;
 
 use hubro::db::{
@@ -314,11 +315,11 @@ async fn yugabyte_pages_sorts_and_filters() {
         extra_key_column: None,
     };
     assert_eq!(
-        pool.count_rows(Capabilities::FULL, &request).await.unwrap(),
+        pool.count_rows(Reading::UNMARKED, &request).await.unwrap(),
         8
     );
 
-    let page = pool.fetch_page(Capabilities::FULL, &request).await.unwrap();
+    let page = pool.fetch_page(Reading::UNMARKED, &request).await.unwrap();
     assert_eq!(page.rows.len(), 3);
     let ids: Vec<i64> = page.rows.iter().map(|row| integer(&row[0])).collect();
     // Rows are distributed by hash, so the storage order is arbitrary; an
@@ -327,7 +328,7 @@ async fn yugabyte_pages_sorts_and_filters() {
 
     let next = pool
         .fetch_page(
-            Capabilities::FULL,
+            Reading::UNMARKED,
             &PageRequest {
                 offset: 3,
                 ..request
@@ -442,7 +443,7 @@ async fn yugabyte_table_without_a_key_is_read_only_like_postgres() {
 
     let page = pool
         .fetch_page(
-            Capabilities::FULL,
+            Reading::UNMARKED,
             &PageRequest {
                 schema: Some("public".into()),
                 table: "yb_nokey".into(),
@@ -499,7 +500,7 @@ async fn yugabyte_materialized_view_browses_but_refuses_writes() {
 
     let page = pool
         .fetch_page(
-            Capabilities::FULL,
+            Reading::UNMARKED,
             &PageRequest {
                 schema: Some("public".into()),
                 table: view.clone(),
@@ -840,7 +841,7 @@ async fn yugabyte_row_estimate_arrives_but_its_size_accounting_lags() {
 
     // And the exact count is unaffected by any of it.
     assert_eq!(
-        pool.count_table_rows(Capabilities::FULL, &meta)
+        pool.count_table_rows(Reading::UNMARKED, &meta)
             .await
             .unwrap(),
         16

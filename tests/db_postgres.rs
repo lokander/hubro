@@ -15,6 +15,7 @@
 
 mod common;
 
+use hubro::db::Reading;
 use hubro::db::{
     apply_staged, detect_row_identity, explain_statement, needs_confirmation,
     plan_reached_cell_cap, run_script, script_refusal, url_with_password, Capabilities, DbError,
@@ -222,10 +223,10 @@ async fn postgres_paging_sorting_filtering_and_values_work() {
         extra_key_column: None,
     };
     assert_eq!(
-        pool.count_rows(Capabilities::FULL, &request).await.unwrap(),
+        pool.count_rows(Reading::UNMARKED, &request).await.unwrap(),
         4
     );
-    let page = pool.fetch_page(Capabilities::FULL, &request).await.unwrap();
+    let page = pool.fetch_page(Reading::UNMARKED, &request).await.unwrap();
     assert_eq!(page.rows.len(), 2);
     assert_eq!(page.rows[0][1], Value::Text("a_c".into()));
     assert_eq!(page.rows[1][1], Value::Text("apple".into()));
@@ -233,13 +234,13 @@ async fn postgres_paging_sorting_filtering_and_values_work() {
     // Contains filter with an underscore matches literally, not as a wildcard.
     request.filter = Some(Filter::contains("name", "a_"));
     request.limit = 10;
-    let filtered = pool.fetch_page(Capabilities::FULL, &request).await.unwrap();
+    let filtered = pool.fetch_page(Reading::UNMARKED, &request).await.unwrap();
     assert_eq!(filtered.rows.len(), 1);
     assert_eq!(filtered.rows[0][1], Value::Text("a_c".into()));
 
     // Equals filter on a numeric column via the ::text cast.
     request.filter = Some(Filter::equals("id", "1"));
-    let by_id = pool.fetch_page(Capabilities::FULL, &request).await.unwrap();
+    let by_id = pool.fetch_page(Reading::UNMARKED, &request).await.unwrap();
     assert_eq!(by_id.rows.len(), 1);
     // serial/int4, real, text, bytea, and NULL all decode.
     assert_eq!(by_id.rows[0][0], Value::Integer(1));
@@ -798,13 +799,13 @@ async fn postgres_multi_schema_introspection_has_parity_metadata() {
         extra_key_column: None,
     };
     assert_eq!(
-        pool.count_rows(Capabilities::FULL, &mv_request)
+        pool.count_rows(Reading::UNMARKED, &mv_request)
             .await
             .unwrap(),
         1
     );
     let mv_page = pool
-        .fetch_page(Capabilities::FULL, &mv_request)
+        .fetch_page(Reading::UNMARKED, &mv_request)
         .await
         .unwrap();
     assert_eq!(mv_page.rows[0][1], Value::Text("first".into()));
@@ -820,10 +821,10 @@ async fn postgres_multi_schema_introspection_has_parity_metadata() {
         extra_key_column: None,
     };
     assert_eq!(
-        pool.count_rows(Capabilities::FULL, &request).await.unwrap(),
+        pool.count_rows(Reading::UNMARKED, &request).await.unwrap(),
         1
     );
-    let page = pool.fetch_page(Capabilities::FULL, &request).await.unwrap();
+    let page = pool.fetch_page(Reading::UNMARKED, &request).await.unwrap();
     assert_eq!(page.rows[0][3], Value::Text("first".into()));
 
     pool.close().await;
@@ -951,7 +952,7 @@ async fn postgres_bounded_page_previews_large_text_and_bytea() {
     };
 
     let page = pool
-        .fetch_page_bounded(Capabilities::FULL, &request, &docs.columns, &["id"])
+        .fetch_page_bounded(Reading::UNMARKED, &request, &docs.columns, &["id"])
         .await
         .unwrap();
     assert_eq!(page.result.columns.len(), 4, "length columns stripped");
@@ -977,7 +978,7 @@ async fn postgres_bounded_page_previews_large_text_and_bytea() {
         identity_values: vec![Value::Integer(1)],
     };
     let cell = pool
-        .fetch_cell(Capabilities::FULL, &docs, &identity, &locator, "big_text")
+        .fetch_cell(Reading::UNMARKED, &docs, &identity, &locator, "big_text")
         .await
         .unwrap();
     assert_eq!(cell.full_len, 50_000);
@@ -992,7 +993,7 @@ async fn postgres_bounded_page_previews_large_text_and_bytea() {
         .await
         .unwrap();
     match pool
-        .fetch_cell(Capabilities::FULL, &docs, &identity, &locator, "big_text")
+        .fetch_cell(Reading::UNMARKED, &docs, &identity, &locator, "big_text")
         .await
     {
         Err(DbError::Query(message)) => assert_eq!(message, MISSING_ROW),
@@ -1514,7 +1515,7 @@ async fn table_stats_estimate_rows_only_once_something_has_measured_them() {
     // The exact count is the same number arriving a completely different way,
     // and it must never be confused for the estimate.
     assert_eq!(
-        pool.count_table_rows(Capabilities::FULL, &meta)
+        pool.count_table_rows(Reading::UNMARKED, &meta)
             .await
             .unwrap(),
         4
@@ -1571,7 +1572,7 @@ async fn a_view_reports_no_size_because_it_occupies_none() {
     // Counting a view exactly is still meaningful — it is the rows it would
     // return, and it is the only number available for one.
     assert_eq!(
-        pool.count_table_rows(Capabilities::FULL, &meta_of(&pool, "stats_view").await)
+        pool.count_table_rows(Reading::UNMARKED, &meta_of(&pool, "stats_view").await)
             .await
             .unwrap(),
         4
@@ -1617,7 +1618,7 @@ async fn an_exact_count_ignores_a_quoted_name_and_a_non_public_schema() {
     // app uses; a schema with a space and a table with a dot in its name are
     // where a hand-built name would silently resolve elsewhere.
     assert_eq!(
-        pool.count_table_rows(Capabilities::FULL, &meta)
+        pool.count_table_rows(Reading::UNMARKED, &meta)
             .await
             .unwrap(),
         2
@@ -1667,7 +1668,7 @@ async fn an_analyzed_empty_table_reports_zero_rows_rather_than_nothing() {
     assert!(!stats.is_empty());
 
     assert_eq!(
-        pool.count_table_rows(Capabilities::FULL, &meta)
+        pool.count_table_rows(Reading::UNMARKED, &meta)
             .await
             .unwrap(),
         0
@@ -2313,7 +2314,7 @@ async fn postgres_a_key_read_as_text_still_sorts_by_its_type() {
         extra_key_column: None,
     };
     let page = pool
-        .fetch_page_bounded(Capabilities::FULL, &sorted("k"), &table.columns, &["k"])
+        .fetch_page_bounded(Reading::UNMARKED, &sorted("k"), &table.columns, &["k"])
         .await
         .unwrap();
     let keys: Vec<&Value> = page.result.rows.iter().map(|row| &row[0]).collect();
@@ -2326,7 +2327,7 @@ async fn postgres_a_key_read_as_text_still_sorts_by_its_type() {
         ]
     );
     let page = pool
-        .fetch_page_bounded(Capabilities::FULL, &sorted("j"), &table.columns, &["k"])
+        .fetch_page_bounded(Reading::UNMARKED, &sorted("j"), &table.columns, &["k"])
         .await
         .expect("a json column sorts by its preview's text");
     assert_eq!(page.result.rows[0][0], Value::Text("[100,200)".into()));
@@ -2375,7 +2376,7 @@ async fn saves_by_text_key_land_on_their_rows(
         for at in 0..expected.len() {
             let name = expected[at][0].clone();
             let page = pool
-                .fetch_page_bounded(Capabilities::FULL, &request, &meta.columns, &["k"])
+                .fetch_page_bounded(Reading::UNMARKED, &request, &meta.columns, &["k"])
                 .await
                 .unwrap();
             let row = page.result.rows.iter().find(|row| row[1] == name).unwrap();

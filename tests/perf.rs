@@ -28,7 +28,7 @@
 mod common;
 
 use common::{budgets, perf_scale, FixtureDb, Timings};
-use hubro::db::Capabilities;
+use hubro::db::Reading;
 use hubro::db::{DbPool, PageRequest, Value, PREVIEW_BYTES};
 
 fn request(table: &str) -> PageRequest {
@@ -53,13 +53,13 @@ async fn wide_generator_builds_a_queryable_table() {
     let pool = fixture.open().await;
 
     let count = pool
-        .count_rows(Capabilities::FULL, &request("wide"))
+        .count_rows(Reading::UNMARKED, &request("wide"))
         .await
         .unwrap();
     assert_eq!(count, 200);
 
     let page = pool
-        .fetch_page(Capabilities::FULL, &request("wide"))
+        .fetch_page(Reading::UNMARKED, &request("wide"))
         .await
         .unwrap();
     assert_eq!(page.rows.len(), 100);
@@ -74,7 +74,7 @@ async fn big_values_generator_stores_multi_kb_payloads() {
     let pool = fixture.open().await;
 
     let page = pool
-        .fetch_page(Capabilities::FULL, &request("big_values"))
+        .fetch_page(Reading::UNMARKED, &request("big_values"))
         .await
         .unwrap();
     assert_eq!(page.rows.len(), 3);
@@ -133,8 +133,8 @@ async fn budget_wide_table_operations() {
         let pool = &pool;
         let req = base.clone();
         async move {
-            let _ = pool.count_rows(Capabilities::FULL, &req).await.unwrap();
-            let _ = pool.fetch_page(Capabilities::FULL, &req).await.unwrap();
+            let _ = pool.count_rows(Reading::UNMARKED, &req).await.unwrap();
+            let _ = pool.fetch_page(Reading::UNMARKED, &req).await.unwrap();
         }
     })
     .await
@@ -144,7 +144,7 @@ async fn budget_wide_table_operations() {
         let pool = &pool;
         let req = base.clone();
         async move {
-            let _ = pool.count_rows(Capabilities::FULL, &req).await.unwrap();
+            let _ = pool.count_rows(Reading::UNMARKED, &req).await.unwrap();
         }
     })
     .await
@@ -154,7 +154,7 @@ async fn budget_wide_table_operations() {
         let pool = &pool;
         let req = base.clone();
         async move {
-            let _ = pool.fetch_page(Capabilities::FULL, &req).await.unwrap();
+            let _ = pool.fetch_page(Reading::UNMARKED, &req).await.unwrap();
         }
     })
     .await
@@ -168,7 +168,7 @@ async fn budget_wide_table_operations() {
         let pool = &pool;
         let req = deep.clone();
         async move {
-            let _ = pool.fetch_page(Capabilities::FULL, &req).await.unwrap();
+            let _ = pool.fetch_page(Reading::UNMARKED, &req).await.unwrap();
         }
     })
     .await
@@ -208,7 +208,7 @@ async fn budget_big_value_page() {
         let pool = &pool;
         let req = req.clone();
         async move {
-            let page = pool.fetch_page(Capabilities::FULL, &req).await.unwrap();
+            let page = pool.fetch_page(Reading::UNMARKED, &req).await.unwrap();
             assert_eq!(page.rows.len() as u64, perf_scale::BIG_VALUE_ROWS);
         }
     })
@@ -240,7 +240,7 @@ async fn budget_big_value_page_bounded() {
     // Memory bound: every large cell is capped at PREVIEW_BYTES, so the whole
     // decoded page is a few KB — not rows × 4 MB.
     let page = pool
-        .fetch_page_bounded(Capabilities::FULL, &req, &cols, &["id"])
+        .fetch_page_bounded(Reading::UNMARKED, &req, &cols, &["id"])
         .await
         .unwrap();
     let decoded: usize = page
@@ -272,7 +272,7 @@ async fn budget_big_value_page_bounded() {
         let cols = cols.clone();
         async move {
             let page = pool
-                .fetch_page_bounded(Capabilities::FULL, &req, &cols, &["id"])
+                .fetch_page_bounded(Reading::UNMARKED, &req, &cols, &["id"])
                 .await
                 .unwrap();
             assert_eq!(page.result.rows.len() as u64, perf_scale::BIG_VALUE_ROWS);
@@ -324,8 +324,8 @@ async fn budget_postgres_parity() {
         let pool = &pool;
         let req = base.clone();
         async move {
-            let _ = pool.count_rows(Capabilities::FULL, &req).await.unwrap();
-            let _ = pool.fetch_page(Capabilities::FULL, &req).await.unwrap();
+            let _ = pool.count_rows(Reading::UNMARKED, &req).await.unwrap();
+            let _ = pool.fetch_page(Reading::UNMARKED, &req).await.unwrap();
         }
     })
     .await;
@@ -343,7 +343,7 @@ async fn budget_postgres_parity() {
         let pool = &pool;
         let req = deep.clone();
         async move {
-            let _ = pool.fetch_page(Capabilities::FULL, &req).await.unwrap();
+            let _ = pool.fetch_page(Reading::UNMARKED, &req).await.unwrap();
         }
     })
     .await;

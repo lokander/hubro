@@ -3,6 +3,7 @@
 mod common;
 
 use common::FixtureDb;
+use hubro::db::Reading;
 use hubro::db::{
     apply_staged, explain_statement, Capabilities, DbError, DbPool, ExportFormat, Generated,
     PageRequest, PlanDisplay, Restriction, RowCount, RowIdentity, RowLocator, StagedChange,
@@ -615,7 +616,7 @@ async fn sqlite_reports_rows_only_after_analyze_and_never_reports_a_size() {
     );
 
     let exact = pool
-        .count_table_rows(Capabilities::FULL, &artists)
+        .count_table_rows(Reading::UNMARKED, &artists)
         .await
         .unwrap();
     assert!(exact > 0, "the fixture seeds artists");
@@ -643,7 +644,7 @@ async fn sqlite_reports_rows_only_after_analyze_and_never_reports_a_size() {
     // Quoted and keyword identifiers go through the same qualifier as
     // everything else.
     assert_eq!(
-        pool.count_table_rows(Capabilities::FULL, table(&tables, "we\"ird table"))
+        pool.count_table_rows(Reading::UNMARKED, table(&tables, "we\"ird table"))
             .await
             .unwrap(),
         3
@@ -736,7 +737,7 @@ async fn sql_text_holding_a_nul_is_refused_at_every_entry_point() {
     assert_eq!(
         within(
             "export",
-            pool.export(Capabilities::FULL, read, &[], ExportFormat::Csv, &mut out)
+            pool.export(Reading::UNMARKED, read, &[], ExportFormat::Csv, &mut out)
         )
         .await,
         Err(nul_refused())
@@ -800,26 +801,26 @@ async fn a_table_whose_catalog_name_holds_a_nul_is_refused_not_hung() {
         extra_key_column: None,
     };
     assert_eq!(
-        within("fetch_page", pool.fetch_page(Capabilities::FULL, &request)).await,
+        within("fetch_page", pool.fetch_page(Reading::UNMARKED, &request)).await,
         Err(nul_refused())
     );
     assert_eq!(
         within(
             "fetch_page_bounded",
-            pool.fetch_page_bounded(Capabilities::FULL, &request, &crafted.columns, &["id"])
+            pool.fetch_page_bounded(Reading::UNMARKED, &request, &crafted.columns, &["id"])
         )
         .await
         .err(),
         Some(nul_refused())
     );
     assert_eq!(
-        within("count_rows", pool.count_rows(Capabilities::FULL, &request)).await,
+        within("count_rows", pool.count_rows(Reading::UNMARKED, &request)).await,
         Err(nul_refused())
     );
     assert_eq!(
         within(
             "count_table_rows",
-            pool.count_table_rows(Capabilities::FULL, &crafted)
+            pool.count_table_rows(Reading::UNMARKED, &crafted)
         )
         .await,
         Err(nul_refused())
@@ -830,7 +831,7 @@ async fn a_table_whose_catalog_name_holds_a_nul_is_refused_not_hung() {
         within(
             "export",
             pool.export(
-                Capabilities::FULL,
+                Reading::UNMARKED,
                 &sql,
                 &params,
                 ExportFormat::Json,

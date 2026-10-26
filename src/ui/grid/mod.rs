@@ -714,25 +714,21 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         // and `remove` (which unmounts this tab) — so there is no pool
         // change to react to; a reconnect is a new id and a new grid.
         //
-        // The capabilities are taken with it, at fetch time: they say whether
-        // the read runs where the engine refuses writes (a marked
-        // connection — see `DbPool::fetch_page`), and a marking changed since
-        // the last fetch applies to the next one.
-        let pool = state
-            .registry
-            .peek()
-            .get(id)
-            .map(|c| (c.pool.clone(), c.capabilities()));
+        // `browse` hands over the connection's `Reading` with it, at fetch
+        // time: it says whether the read runs where the engine refuses
+        // writes (a marked connection — see `DbPool::fetch_page`), and a
+        // marking changed since the last fetch applies to the next one.
+        let pool = state.registry.peek().get(id).map(|c| c.browse());
         async move {
             if let Some(reason) = refused {
                 return Err(crate::db::DbError::Unsupported(reason.to_string()));
             }
-            let Some((pool, caps)) = pool else {
+            let Some((pool, reading)) = pool else {
                 return Err(crate::db::DbError::Query("connection closed".into()));
             };
             let no_preview_refs: Vec<&str> = no_preview.iter().map(String::as_str).collect();
             let page = pool
-                .fetch_page_bounded(caps, &request, &columns, &no_preview_refs)
+                .fetch_page_bounded(reading, &request, &columns, &no_preview_refs)
                 .await?;
             // The offset travels with the rows, so whatever describes them —
             // the footer's range, the paging rule — describes the rows on
@@ -763,22 +759,18 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         // Peeked for the same reason as in `rows_resource`: the pool for a
         // ConnectionId is fixed for the connection's lifetime, and reading
         // `registry` would re-count on unrelated connection opens/closes.
-        // The capabilities come with it, as for the page.
-        let pool = state
-            .registry
-            .peek()
-            .get(id)
-            .map(|c| (c.pool.clone(), c.capabilities()));
+        // With its `Reading`, as for the page.
+        let pool = state.registry.peek().get(id).map(|c| c.browse());
         async move {
             // Gated as well as the page: counting rows an object does not have
             // is the same query failing for the same reason.
             if let Some(reason) = refused {
                 return Err(crate::db::DbError::Unsupported(reason.to_string()));
             }
-            let Some((pool, caps)) = pool else {
+            let Some((pool, reading)) = pool else {
                 return Err(crate::db::DbError::Query("connection closed".into()));
             };
-            pool.count_rows(caps, &request).await
+            pool.count_rows(reading, &request).await
         }
     });
 
