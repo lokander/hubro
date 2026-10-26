@@ -238,6 +238,9 @@ async fn a_refused_refresh_token_is_reported_so_the_caller_forgets_it() {
     );
     // Still falls through to the interactive flow, which this opener refuses.
     assert!(matches!(acquired.token, Err(AzureError::Browser(_))));
+    // Whatever that flow returns is a sign-in the user makes now, not the
+    // cached token redeemed, though one was handed in.
+    assert!(!acquired.redeemed);
 }
 
 #[tokio::test]
