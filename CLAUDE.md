@@ -74,7 +74,7 @@ Milestones are **scoped deliverables that complete**, not categories. Three rule
 
 - **Never add an issue to a finished milestone.** Finished milestones get deleted with their issues (below), so the added issue would be deleted with them. Linear also computes progress from the issues, so it would drop a 100% milestone below 100% until then, and has no way to un-complete a milestone.
 - **Don't create catch-all milestones.** A milestone with no completion condition ("Misc polish", "Follow-ups") sits at partial progress forever. Loose work gets **no milestone** plus a `Feature`/`Bug`/`Improvement` label and lives in the project backlog. `Nice to have (future)` is the one deliberate exception — designed-but-deferred work, not a general backlog.
-- **Finished milestones and their issues get deleted** to stay under Linear's issue limit, which has blocked issue creation before. So nothing may depend on an issue surviving: the reasoning lives in the code, its comments, commit subjects and PR descriptions.
+- **Finished milestones and their issues get deleted** to stay under Linear's issue limit, which has blocked issue creation before. So nothing may depend on an issue surviving: the reasoning lives in the code, its comments, commit subjects and PR descriptions. **The user does the deleting:** the Linear tools agents have can delete comments and attachments, not issues or milestones. Deleting the milestone alone would free nothing, since its issues hold the quota. When the last issue in a milestone reaches Done, tell the user it is ready to delete rather than attempting it.
 
 ## Releases
 
