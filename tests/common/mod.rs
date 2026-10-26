@@ -585,17 +585,28 @@ pub fn engine_url(var: &str) -> Option<String> {
          common::pg_test_url / common::mssql_test_url, and every other engine is \
          one of {SHARED_DATABASE_URLS:?}"
     );
-    match std::env::var(var) {
-        Ok(url) => Some(url),
-        Err(_) if is_required(var) => panic!(
+    match url_from_env(var) {
+        Some(url) => Some(url),
+        None if is_required(var) => panic!(
             "{var} is not set, but {REQUIRE_TEST_URLS} says this run needs it — \
              every one of this engine's tests would skip and pass"
         ),
-        Err(_) => {
+        None => {
             eprintln!("skipping: {var} not set");
             None
         }
     }
+}
+
+/// The value of the engine-URL variable `var`, if set.
+///
+/// The one place in `tests/` that reads a `…_TEST_URL` from the environment:
+/// [`engine_url`] and the per-process lookups go through it, and
+/// `tests/engine_urls.rs` exempts this body and nothing else. A new lookup
+/// that needs the environment has to come through here too, past the checks
+/// its callers make.
+fn url_from_env(var: &str) -> Option<String> {
+    std::env::var(var).ok()
 }
 
 /// Which server a per-process database is being built on. The two differ in
@@ -610,7 +621,7 @@ pub enum Engine {
 impl Engine {
     /// Whether this engine's variable is set at all.
     pub fn is_set(self) -> bool {
-        std::env::var(self.env()).is_ok()
+        url_from_env(self.env()).is_some()
     }
 
     pub fn env(self) -> &'static str {
@@ -807,9 +818,9 @@ pub fn pg_major_mismatch(declared: &str, server_version_num: &str) -> Option<Str
 /// run instead sweeps databases older than [`STALE_TEST_DB_SECONDS`] first,
 /// which self-cleans without a race.
 async fn per_process_database(engine: Engine) -> Option<String> {
-    let base = match std::env::var(engine.env()) {
-        Ok(url) => url,
-        Err(_) => {
+    let base = match url_from_env(engine.env()) {
+        Some(url) => url,
+        None => {
             if is_required(engine.env()) {
                 panic!(
                     "{} is not set, but {REQUIRE_TEST_URLS} says this run needs it — \

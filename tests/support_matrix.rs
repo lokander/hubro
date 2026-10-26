@@ -94,8 +94,8 @@ fn body_rows(section: &str) -> Vec<Vec<String>> {
     let mut table = section
         .lines()
         .take_while(|line| !line.starts_with("## "))
-        .skip_while(|line| !line.starts_with('|'))
-        .take_while(|line| line.starts_with('|'))
+        .skip_while(|line| !line.trim_start().starts_with('|'))
+        .take_while(|line| line.trim_start().starts_with('|'))
         .map(cells);
     let header = table.next().expect("the section has no table");
     let separator = table.next().unwrap_or_default();
@@ -127,24 +127,28 @@ fn is_separator_cell(cell: &str) -> bool {
     dashes.len() >= 3 && dashes.bytes().all(|b| b == b'-')
 }
 
-/// Whether a Verified version cell records a version that ran: some word in
-/// it, brackets aside, is a dotted number — `17.10`, `v26.2.5`,
-/// `2026.1.0.1` — optionally with a packaging revision, as in Citus's
-/// `14.1-1`.
+/// Whether a Verified version cell records a version that ran: it *starts*
+/// with a dotted number (`17.10`, `v26.2.5`, `2026.1.0.1`, optionally with a
+/// packaging revision, as in Citus's `14.1-1`), and anything after that is
+/// one bracketed aside, such as the Postgres it runs on.
 ///
 /// What it refuses is an image tag standing in for one: `17-alpine`, `pg17`,
 /// `latest`, `2022-latest`. A bare major number is refused too, because "17"
-/// is the tag rather than what `SELECT version()` reported; SQL Server's row
-/// names its year *and* the build that ran, and the build is what passes.
+/// is the tag rather than what `SELECT version()` reported. It is the leading
+/// word that has to be the version, not just some word: "any dotted word"
+/// let `17-alpine (sqlx 0.8.6)` through on the driver's version.
 fn records_a_version(cell: &str) -> bool {
-    cell.split_whitespace()
-        .map(|word| word.trim_matches(|c| c == '(' || c == ')' || c == ','))
-        .any(|word| {
-            let word = word.strip_prefix('v').unwrap_or(word);
-            let (number, revision) = word.split_once('-').unwrap_or((word, "0"));
-            let parts: Vec<&str> = number.split('.').collect();
-            parts.len() >= 2 && parts.iter().all(|part| is_digits(part)) && is_digits(revision)
-        })
+    let cell = cell.trim();
+    let (first, aside) = cell.split_once(' ').unwrap_or((cell, ""));
+    let aside = aside.trim();
+    let first = first.strip_prefix('v').unwrap_or(first);
+    let (number, revision) = first.split_once('-').unwrap_or((first, "0"));
+    let parts: Vec<&str> = number.split('.').collect();
+    parts.len() >= 2
+        && parts.iter().all(|part| is_digits(part))
+        && is_digits(revision)
+        && (aside.is_empty()
+            || (aside.starts_with('(') && aside.ends_with(')') && aside.matches('(').count() == 1))
 }
 
 fn is_digits(text: &str) -> bool {
@@ -166,6 +170,14 @@ fn the_table_is_read_by_its_shape_not_its_words() {
     let engines: Vec<&str> = rows.iter().map(|row| row[0].as_str()).collect();
     assert_eq!(engines, ["A", "B"]);
     assert_eq!(rows[0][2], "Has --- in its notes.");
+
+    // An indented row is still a row, not the end of the table.
+    let indented = "| E | N |\n| --- | --- |\n| A | x |\n  | B | y |\n| C | z |\n";
+    let engines: Vec<String> = body_rows(indented)
+        .into_iter()
+        .map(|row| row[0].clone())
+        .collect();
+    assert_eq!(engines, ["A", "B", "C"]);
 
     for (no_separator, why) in [
         (
@@ -191,7 +203,7 @@ fn a_version_is_a_dotted_number_not_an_image_tag() {
     for version in [
         "3.46.0",
         "17.10",
-        "2022 (16.0.4265.3)",
+        "16.0.4265.3 (SQL Server 2022)",
         "2.29.1 (on PostgreSQL 17.10)",
         "14.1-1 (on PostgreSQL 18.4)",
         "v26.2.5",
@@ -207,6 +219,11 @@ fn a_version_is_a_dotted_number_not_an_image_tag() {
         "latest",
         "2022-latest",
         "17.x",
+        // Some dotted word is not enough: the version leads.
+        "17-alpine (sqlx 0.8.6)",
+        "pg17, see 1.2",
+        "2022 (16.0.4265.3)",
+        "17.10 and 18.4",
         "1.",
         ".5",
         "",
