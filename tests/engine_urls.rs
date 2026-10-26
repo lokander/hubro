@@ -243,19 +243,22 @@ fn url_reads(src: &str, exempt: Option<std::ops::Range<usize>>) -> Vec<String> {
     let toks_with_lines = tokens(src);
     let toks: Vec<Tok> = toks_with_lines.iter().map(|(t, _)| t.clone()).collect();
     let consts = string_consts(&toks);
-    let names_a_test_url = |argument: &[Tok]| {
-        match argument {
-            [Tok::Str(name)] => Some(name.clone()),
-            [Tok::Ident(constant)] => consts
+    let is_plain = |name: &str| {
+        !name.ends_with("_TEST_URL") && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    let names_a_test_url = |argument: &[Tok]| match argument {
+        [Tok::Str(name)] => !is_plain(name),
+        // Every same-named constant is checked, not the first: a shadowing
+        // `const` in an inner scope may be the one the call really reads.
+        [Tok::Ident(constant)] => {
+            let values: Vec<&str> = consts
                 .iter()
-                .find(|(name, _)| name == constant)
-                .map(|(_, value)| value.clone()),
-            _ => None,
+                .filter(|(name, _)| name == constant)
+                .map(|(_, value)| value.as_str())
+                .collect();
+            values.is_empty() || !values.into_iter().all(is_plain)
         }
-        .is_none_or(|name| {
-            name.ends_with("_TEST_URL")
-                || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        })
+        _ => true,
     };
     let exempt = exempt.unwrap_or(0..0);
     let uses: Vec<std::ops::Range<usize>> = (0..toks.len())
@@ -406,6 +409,7 @@ fn the_scan_tells_a_raw_url_read_from_everything_else() {
         "fn url(var: &str) -> Option<String> { std::env::var(var).ok() }",
         // A constant is judged by what it holds.
         "const V: &str = \"HUBRO_PG_TEST_URL\";\nfn u() { std::env::var(V) }",
+        "const V: &str = \"HUBRO_X\";\nfn u() { const V: &str = \"HUBRO_PG_TEST_URL\"; std::env::var(V) }",
         "fn u() { std::env::var(format!(\"HUBRO_{}_TEST_URL\", 1)) }",
         "use std::env::var;\nfn u() { var(\"HUBRO_PG_TEST_URL\") }",
         "use std::env as e;\nfn u() { e::var(\"HUBRO_PG_TEST_URL\") }",
@@ -484,6 +488,85 @@ fn tests_common_holds_no_tests() {
             );
         }
     }
+}
+
+/// The name of the innermost `fn` whose body holds token `at`, if any.
+fn enclosing_fn(toks: &[Tok], at: usize) -> Option<String> {
+    let mut best: Option<(usize, String)> = None;
+    for start in 0..toks.len() {
+        if !is_ident(toks.get(start), "fn") {
+            continue;
+        }
+        let Some(Tok::Ident(name)) = toks.get(start + 1) else {
+            continue;
+        };
+        let Some(open) =
+            (start..toks.len()).find(|&i| is_punct(toks.get(i), "{") || is_punct(toks.get(i), ";"))
+        else {
+            continue;
+        };
+        if !is_punct(toks.get(open), "{") {
+            continue;
+        }
+        let body = open..matching(toks, open) + 1;
+        if body.contains(&at) && best.as_ref().is_none_or(|(b, _)| *b < body.start) {
+            best = Some((body.start, name.clone()));
+        }
+    }
+    best.map(|(_, name)| name)
+}
+
+#[test]
+fn tests_common_never_introspects_on_its_own() {
+    // How a suite may introspect is the suite's business: SQL Server's must
+    // trade its catalog turn for the exclusive half first. A shared helper
+    // that called `introspect()` itself would do it under whatever its caller
+    // held, which review found one doing. So helpers take the metadata, or a
+    // closure that fetches it.
+    for path in rust_files(&tests_dir().join("common")) {
+        let src = std::fs::read_to_string(&path).unwrap();
+        let toks: Vec<Tok> = tokens(&src).into_iter().map(|(t, _)| t).collect();
+        for at in 0..toks.len() {
+            assert!(
+                !(is_punct(toks.get(at), ".")
+                    && is_ident(toks.get(at + 1), "introspect")
+                    && is_punct(toks.get(at + 2), "(")),
+                "{} calls introspect() in {:?}: take the TableMeta, or an introspect \
+                 closure, from the suite instead",
+                path.display(),
+                enclosing_fn(&toks, at)
+            );
+        }
+    }
+}
+
+#[test]
+fn only_the_url_lookups_read_through_url_from_env() {
+    // `url_from_env` is exempt from the scan, so whatever calls it is a road
+    // to a raw URL. These are the roads that apply the checks (the
+    // per-engine refusals and `HUBRO_REQUIRE_TEST_URLS`), plus `is_set`,
+    // which hands back only whether the variable is there.
+    let src = std::fs::read_to_string(tests_dir().join("common").join("mod.rs")).unwrap();
+    let toks: Vec<Tok> = tokens(&src).into_iter().map(|(t, _)| t).collect();
+    let mut callers: Vec<String> = (0..toks.len())
+        .filter(|&at| {
+            is_ident(toks.get(at), "url_from_env")
+                && is_punct(toks.get(at + 1), "(")
+                && !is_ident(at.checked_sub(1).and_then(|b| toks.get(b)), "fn")
+        })
+        .map(|at| enclosing_fn(&toks, at).unwrap_or_else(|| "(no fn)".into()))
+        .collect();
+    callers.sort();
+    assert_eq!(callers, ["engine_url", "is_set", "per_process_database"]);
+    // Named nowhere else either: passed as a value, it could be called from
+    // anywhere.
+    let mentions = (0..toks.len())
+        .filter(|&at| is_ident(toks.get(at), "url_from_env"))
+        .count();
+    assert_eq!(
+        mentions, 4,
+        "url_from_env is named outside its definition and three calls"
+    );
 }
 
 // ---------------------------------------------------------------------------

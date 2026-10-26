@@ -2764,7 +2764,14 @@ async fn postgres_contains_filter_is_a_substring_search_whatever_the_needle_hold
 async fn postgres_a_real_reads_as_its_shortest_decimal_and_writes_back_unchanged() {
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
-    let failures = common::real_round_trip_failures(&pool, "real_trip").await;
+    let failures = common::real_round_trip_failures(&pool, "real_trip", async |name| {
+        let tables = pool.introspect().await.unwrap();
+        tables
+            .into_iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} missing from introspection"))
+    })
+    .await;
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     pool.close().await;
 }
@@ -2775,7 +2782,14 @@ async fn postgres_a_real_reads_as_its_shortest_decimal_and_writes_back_unchanged
 async fn postgres_nan_and_infinity_go_through_the_editor_and_back() {
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
-    let failures = common::non_finite_edit_failures(&pool, "non_finite_edits").await;
+    let failures = common::non_finite_edit_failures(&pool, "non_finite_edits", async |name| {
+        let tables = pool.introspect().await.unwrap();
+        tables
+            .into_iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} missing from introspection"))
+    })
+    .await;
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     pool.close().await;
 }

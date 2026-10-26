@@ -1141,7 +1141,14 @@ async fn cockroach_a_script_whose_show_commit_timestamp_commits_is_not_wrapped()
 async fn cockroach_a_real_reads_as_its_shortest_decimal_and_writes_back_unchanged() {
     let Some(url) = test_url() else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
-    let failures = common::real_round_trip_failures(&pool, "real_trip").await;
+    let failures = common::real_round_trip_failures(&pool, "real_trip", async |name| {
+        let tables = pool.introspect().await.unwrap();
+        tables
+            .into_iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} missing from introspection"))
+    })
+    .await;
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     pool.close().await;
 }
@@ -1152,7 +1159,14 @@ async fn cockroach_a_real_reads_as_its_shortest_decimal_and_writes_back_unchange
 async fn cockroach_nan_and_infinity_go_through_the_editor_and_back() {
     let Some(url) = test_url() else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
-    let failures = common::non_finite_edit_failures(&pool, "non_finite_edits").await;
+    let failures = common::non_finite_edit_failures(&pool, "non_finite_edits", async |name| {
+        let tables = pool.introspect().await.unwrap();
+        tables
+            .into_iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} missing from introspection"))
+    })
+    .await;
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     pool.close().await;
 }
