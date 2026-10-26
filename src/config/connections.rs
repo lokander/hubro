@@ -95,6 +95,20 @@ impl ServerAuth {
     pub fn is_password(&self) -> bool {
         matches!(self, ServerAuth::Password)
     }
+
+    /// Whether a connection with this auth can have an Entra sign-in kept for
+    /// it: only an interactive sign-in hands back a refresh token, which is
+    /// what a kept sign-in is. A managed identity asks Azure afresh every time
+    /// and a password connection never signs in at all.
+    ///
+    /// Two decisions read this, so they cannot disagree: whether a saved
+    /// connection offers "Sign out", and whether an edit forgets the token the
+    /// connection kept before it. An edit away from interactive sign-in that
+    /// kept the token would leave a sign-in no "Sign out" could reach, and an
+    /// edit back would then redeem it silently.
+    pub fn keeps_entra_sign_in(&self) -> bool {
+        matches!(self, ServerAuth::Entra(EntraAuth::Interactive { .. }))
+    }
 }
 
 /// One entry in the saved-connections list. Internally tagged on `kind`, so
@@ -332,6 +346,17 @@ impl SavedConnection {
             SavedConnection::Sqlite { path, .. } => path.display().to_string(),
             SavedConnection::Postgres { url, .. } | SavedConnection::SqlServer { url, .. } => {
                 url.clone()
+            }
+        }
+    }
+
+    /// How a server connection authenticates; `None` for SQLite, which has no
+    /// login.
+    pub fn auth(&self) -> Option<&ServerAuth> {
+        match self {
+            SavedConnection::Sqlite { .. } => None,
+            SavedConnection::Postgres { auth, .. } | SavedConnection::SqlServer { auth, .. } => {
+                Some(auth)
             }
         }
     }

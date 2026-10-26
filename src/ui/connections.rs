@@ -10,7 +10,8 @@ use std::path::PathBuf;
 
 use dioxus::prelude::*;
 use dioxus_icons::lucide::{
-    ChevronDown, ChevronRight, ChevronUp, FolderPlus, Pencil, Plug, Search, ShieldAlert, Trash2, X,
+    ChevronDown, ChevronRight, ChevronUp, FolderPlus, LogOut, Pencil, Plug, Search, ShieldAlert,
+    Trash2, X,
 };
 
 use crate::config::{BackendKind, ConnectionColor, EditPrefill, SavedConnection, ServerAuth};
@@ -727,6 +728,23 @@ fn SavedConnectionRow(
                             Pencil { size: 14 }
                         }
                     }
+                    // Offered whether or not a sign-in is kept right now:
+                    // knowing would take a keyring read per row on every
+                    // render of this screen, and signing out of nothing is
+                    // harmless. Only a connection that can keep one is
+                    // offered it at all.
+                    if row.auth.keeps_entra_sign_in() {
+                        button {
+                            class: "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
+                            title: "Sign out: forget the remembered Microsoft sign-in",
+                            aria_label: "Sign out of Microsoft Entra ID",
+                            onclick: {
+                                let (locator, name) = (row.locator.clone(), row.name.clone());
+                                move |_| state.sign_out_entra(locator.clone(), name.clone())
+                            },
+                            LogOut { size: 14 }
+                        }
+                    }
                     button {
                         class: "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
                         title: "Remove",
@@ -789,6 +807,7 @@ pub(super) fn ConnectionsScreen() -> Element {
     // typed into.
     let mut group_error = use_signal(|| Option::<String>::None);
     let error = state.connect_error.read().clone();
+    let notice = state.connect_notice.read().clone();
     let prompt = state.password_prompt.read().clone();
     let host_key_prompt = state.host_key_prompt.read().clone();
     let entra_prompt = state.entra_prompt.read().clone();
@@ -1130,6 +1149,15 @@ pub(super) fn ConnectionsScreen() -> Element {
                         kind: BannerKind::Error,
                         message: err,
                         on_dismiss: move |_| state.connect_error.clone().set(None),
+                    }
+                }
+            }
+            if let (Some(message), None) = (notice, open_form()) {
+                div { class: "w-full max-w-xl px-8",
+                    Banner {
+                        kind: BannerKind::Info,
+                        message,
+                        on_dismiss: move |_| state.connect_notice.clone().set(None),
                     }
                 }
             }
