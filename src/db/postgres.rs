@@ -673,70 +673,74 @@ fn friendly_connect_error(err: &sqlx::Error) -> String {
 
 type PgQuery<'q> = sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>;
 
-/// Binds backend-neutral [`Value`] parameters onto a prepared query.
-///
-/// NULL caveat: `Value::Null` binds as `None::<String>`, i.e. a NULL of
-/// type text. That is fine for the current uses (filter values are text),
-/// but Postgres rejects a text NULL for non-text columns in e.g.
-/// `SET col = $n`. Cell editing solves this at the SQL level: the staged
-/// SQL builders (`staged::ParamSql::value_sql`) render NULL values inline
-/// as the literal `NULL` instead of binding them, so a NULL never reaches
-/// this function from an edit.
-///
-/// Statement-cache caveat: each variant binds as its own Postgres type, and
-/// sqlx caches a prepared statement by its SQL text alone, with the types of
-/// its first execution. A builder whose one SQL text can be executed with
-/// different variants in one position must make them one type first — the
-/// staged builders bind everything under a cast as text for exactly this
-/// reason (see `staged::ParamSql::value_sql`).
-fn bind_params<'q>(mut query: PgQuery<'q>, params: &[Value]) -> PgQuery<'q> {
-    for param in params {
-        query = match param {
+/// The Postgres half of the generic sqlx paths ([`sqlx_common::SqlxBackend`]).
+/// sqlx-postgres sends a statement whole, so the text needs no door.
+pub(super) struct PgBackend;
+
+impl sqlx_common::SqlxBackend for PgBackend {
+    type DB = sqlx::Postgres;
+    type Text<'q> = &'q str;
+
+    fn prepare(sql: &str) -> Result<&str, DbError> {
+        Ok(sql)
+    }
+
+    fn sql<'q>(text: Self::Text<'q>) -> &'q str {
+        text
+    }
+
+    fn query<'q>(text: Self::Text<'q>) -> PgQuery<'q> {
+        sqlx::query(text)
+    }
+
+    /// NULL caveat: `Value::Null` binds as `None::<String>`, i.e. a NULL of
+    /// type text. That is fine for the current uses (filter values are text),
+    /// but Postgres rejects a text NULL for non-text columns in e.g.
+    /// `SET col = $n`. Cell editing solves this at the SQL level: the staged
+    /// SQL builders (`staged::ParamSql::value_sql`) render NULL values inline
+    /// as the literal `NULL` instead of binding them, so a NULL never reaches
+    /// this function from an edit.
+    ///
+    /// Statement-cache caveat: each variant binds as its own Postgres type, and
+    /// sqlx caches a prepared statement by its SQL text alone, with the types of
+    /// its first execution. A builder whose one SQL text can be executed with
+    /// different variants in one position must make them one type first — the
+    /// staged builders bind everything under a cast as text for exactly this
+    /// reason (see `staged::ParamSql::value_sql`).
+    fn bind<'q>(query: PgQuery<'q>, value: &Value) -> PgQuery<'q> {
+        match value {
             Value::Null => query.bind(None::<String>),
             Value::Integer(i) => query.bind(*i),
             Value::Real(r) => query.bind(*r),
             Value::Text(t) => query.bind(t.clone()),
             Value::Blob(b) => query.bind(b.clone()),
-        };
+        }
     }
-    query
+
+    fn decode(row: &PgRow, idx: usize) -> Result<Value, DbError> {
+        decode_value(row, idx)
+    }
+
+    fn map_err(err: sqlx::Error, sql: &str) -> DbError {
+        query_error(err, sql)
+    }
 }
 
 /// Runs an arbitrary query, decoding every cell into the backend-neutral
 /// [`Value`] model. Free-form SQL whose result is shown to the user, so a
 /// zero-row result recovers its headers.
 pub async fn query(pool: &PgPool, sql: &str) -> Result<QueryResult, DbError> {
-    let mut result = query_with(pool, sql, &[]).await?;
-    sqlx_common::fill_headers(&mut result, pool, sql).await;
-    Ok(result)
+    sqlx_common::query_all::<PgBackend>(pool, sql).await
 }
 
-/// Like [`query`], with bound parameters.
-///
-/// No header recovery on a zero-row result here — see
-/// [`super::sqlite::query_with`] for why the projection-built callers skip it.
-/// It costs more on this backend: sqlx's Postgres `describe` issues a second
-/// `pg_attribute` query whose result would be discarded with the rest.
+/// Like [`query`], with bound parameters — see [`sqlx_common::query_with`],
+/// including why it recovers no headers.
 pub async fn query_with(
     pool: &PgPool,
     sql: &str,
     params: &[Value],
 ) -> Result<QueryResult, DbError> {
-    query_with_on(pool, sql, params).await
-}
-
-/// [`query_with`] on any executor — the pool, or the read-only transaction a
-/// marked connection's browsing runs in ([`read_only_query_with`]).
-async fn query_with_on<'c, E>(
-    executor: E,
-    sql: &str,
-    params: &[Value],
-) -> Result<QueryResult, DbError>
-where
-    E: sqlx::Executor<'c, Database = sqlx::Postgres>,
-{
-    let stream = bind_params(sqlx::query(sql), params).fetch(executor);
-    sqlx_common::collect_all(stream, decode_value, |e| query_error(e, sql)).await
+    sqlx_common::query_with::<PgBackend, _>(pool, sql, params).await
 }
 
 /// [`query_with`] for a connection the user marked read-only: the statement
@@ -785,7 +789,7 @@ async fn read_only_query_on(
     // has ended by the time a failed `BEGIN` closes it.
     let error = match begin_read_only(&mut conn, begin).await {
         Ok(mut tx) => {
-            let result = query_with_on(&mut *tx, sql, params).await;
+            let result = sqlx_common::query_with::<PgBackend, _>(&mut *tx, sql, params).await;
             return (result, end_read_only(tx).await);
         }
         Err(error) => error,
@@ -794,11 +798,8 @@ async fn read_only_query_on(
     (Err(error), Ok(()))
 }
 
-/// Streams `sql` one row at a time (`fetch`, not `fetch_all`), decoding and
-/// retaining at most `max_rows` rows and capping each cell to `cell_cap`
-/// bytes, so the free-form query path never scales with table or value size.
-/// Returns the (bounded) result and whether more rows existed
-/// beyond the cap.
+/// A free-form query with its rows and cells capped — see
+/// [`sqlx_common::query_capped`].
 pub async fn query_capped(
     pool: &PgPool,
     sql: &str,
@@ -806,14 +807,7 @@ pub async fn query_capped(
     max_rows: u64,
     cell_cap: usize,
 ) -> Result<(QueryResult, bool), DbError> {
-    let stream = bind_params(sqlx::query(sql), params).fetch(pool);
-    let (mut result, truncated) =
-        sqlx_common::collect_capped(stream, max_rows, cell_cap, decode_value, |e| {
-            query_error(e, sql)
-        })
-        .await?;
-    sqlx_common::fill_headers(&mut result, pool, sql).await;
-    Ok((result, truncated))
+    sqlx_common::query_capped::<PgBackend>(pool, sql, params, max_rows, cell_cap).await
 }
 
 /// Runs a non-row statement on a single connection (e.g. one borrowed from a
@@ -1649,26 +1643,18 @@ pub(super) async fn release_read_savepoint(
     run_raw(conn, "RELEASE SAVEPOINT hubro_capped_read").await
 }
 
-/// [`execute_conn`] with bound parameters — the write path for a batch of
-/// imported rows, which must run inside the caller's transaction
-/// and must not interpolate its values into the SQL.
+/// [`execute_conn`] with bound parameters — see
+/// [`sqlx_common::execute_with`].
 pub async fn execute_with_conn(
     conn: &mut sqlx::postgres::PgConnection,
     sql: &str,
     params: &[Value],
 ) -> Result<u64, DbError> {
-    bind_params(sqlx::query(sql), params)
-        .execute(conn)
-        .await
-        .map(|done| done.rows_affected())
-        .map_err(|e| query_error(e, sql))
+    sqlx_common::execute_with::<PgBackend, _>(conn, sql, params).await
 }
 
-/// Streams a query to `out` in the given format, pulling rows one at a time
-/// (`fetch`, not `fetch_all`) and writing each incrementally — peak memory is
-/// one decoded row plus the writer's buffer. Returns the number of data rows
-/// written. When the result is empty the column names come from a statement
-/// describe so the header (CSV) / empty array (JSON) still reflect the query.
+/// Streams a query to `out` in the given format — see
+/// [`sqlx_common::export_query`].
 pub async fn export(
     pool: &PgPool,
     sql: &str,
@@ -1677,33 +1663,7 @@ pub async fn export(
     out: &mut impl Write,
 ) -> Result<u64, DbError> {
     let mut conn = pool.acquire().await.map_err(|e| query_error(e, sql))?;
-    export_on(&mut conn, sql, params, format, out).await
-}
-
-/// [`export`] on one connection — a pooled one, or the read-only transaction
-/// a marked connection's export runs in ([`read_only_export`]).
-async fn export_on(
-    conn: &mut sqlx::postgres::PgConnection,
-    sql: &str,
-    params: &[Value],
-    format: ExportFormat,
-    out: &mut impl Write,
-) -> Result<u64, DbError> {
-    let stream = bind_params(sqlx::query(sql), params).fetch(&mut *conn);
-    if let Some(rows) =
-        sqlx_common::export_stream(stream, format, out, decode_value, |e| query_error(e, sql))
-            .await?
-    {
-        return Ok(rows);
-    }
-    // No rows streamed, so no row carried the column names: describe the
-    // statement instead. This one propagates its failure — an export whose
-    // header cannot be determined is an empty file that says nothing.
-    let columns = sqlx_common::describe_columns(&mut *conn, sql)
-        .await
-        .map_err(|e| query_error(e, sql))?;
-    sqlx_common::export_empty(format, columns, out)?;
-    Ok(0)
+    sqlx_common::export_query::<PgBackend>(&mut conn, sql, params, format, out).await
 }
 
 /// [`export`] for a connection the user marked read-only, in a read-only
@@ -1736,7 +1696,8 @@ async fn read_only_export_on(
     };
     let error = match begin_read_only(&mut conn, begin).await {
         Ok(mut tx) => {
-            let result = export_on(&mut tx, sql, params, format, out).await;
+            let result =
+                sqlx_common::export_query::<PgBackend>(&mut tx, sql, params, format, out).await;
             return (result, end_read_only(tx).await);
         }
         Err(error) => error,
@@ -1752,47 +1713,13 @@ pub async fn execute(pool: &PgPool, sql: &str) -> Result<u64, DbError> {
 }
 
 /// Executes parameterized writes inside ONE transaction, committing only
-/// when every statement affected exactly its `expected_rows` rows. Any SQL
-/// error or count mismatch rolls the whole batch back; the error carries the
-/// index of the failing statement (`None` for begin/commit failures, which
-/// belong to no statement). This is the safety net for row edits: a WHERE
-/// clause that unexpectedly matches more (or fewer) rows than the one being
-/// edited must never commit — and with staged edits, neither may
-/// any sibling change in the same batch.
+/// when every statement affected exactly its `expected_rows` rows — see
+/// [`sqlx_common::execute_all_checked`].
 pub async fn execute_all_checked(
     pool: &PgPool,
     statements: &[CheckedStatement],
 ) -> Result<(), (Option<usize>, DbError)> {
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|e| (None, DbError::Query(e.to_string())))?;
-    for (index, statement) in statements.iter().enumerate() {
-        let result = bind_params(sqlx::query(&statement.sql), &statement.params)
-            .execute(&mut *tx)
-            .await;
-        // Dropping the transaction would roll back too; do it explicitly and
-        // ignore secondary errors — the original failure is what the caller
-        // needs.
-        let done = match result {
-            Ok(done) => done,
-            Err(e) => {
-                let _ = tx.rollback().await;
-                return Err((Some(index), query_error(e, &statement.sql)));
-            }
-        };
-        let affected = done.rows_affected();
-        if affected != statement.expected_rows {
-            let _ = tx.rollback().await;
-            return Err((
-                Some(index),
-                DbError::row_count_mismatch(affected, statement.expected_rows),
-            ));
-        }
-    }
-    tx.commit()
-        .await
-        .map_err(|e| (None, DbError::Query(e.to_string())))
+    sqlx_common::execute_all_checked::<PgBackend>(pool, statements).await
 }
 
 /// Builds a query error, appending "line L, column C" when the server
