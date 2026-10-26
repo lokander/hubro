@@ -184,10 +184,26 @@ pub(crate) fn shipped(text: &str) -> String {
                 continue;
             }
             if is_mod {
-                let end = block_end(&joined[starts[item]..])
-                    .map_or(joined.len(), |len| starts[item] + len);
+                // Fails closed: a block that never closes, or closes anywhere
+                // but on a `}` of its own at the `mod` line's indentation, is
+                // a mis-lex, and reading on from it would silently drop — or
+                // keep — the wrong code.
+                let len = block_end(&joined[starts[item]..]).unwrap_or_else(|| {
+                    panic!("the test module `{head}` on line {} never closes", item + 1)
+                });
+                let end = starts[item] + len;
+                let closing = starts.partition_point(|&start| start < end) - 1;
+                let indent = &lines[item][..lines[item].len() - lines[item].trim_start().len()];
+                assert_eq!(
+                    lines[closing].trim_end(),
+                    format!("{indent}}}"),
+                    "the test module `{head}` on line {} closes on line {}, not on a `}}` \
+                     of its own at its indentation",
+                    item + 1,
+                    closing + 1
+                );
                 // Resume on the line after the one the block closes on.
-                i = starts.partition_point(|&start| start < end);
+                i = closing + 1;
                 continue;
             }
         }
@@ -246,6 +262,21 @@ mod tests {
             uncommented.contains("fn a() {}") && !uncommented.contains("probe"),
             "{uncommented}"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "the test module `mod tests {` on line 3 never closes")]
+    fn a_test_module_that_never_closes_is_refused() {
+        shipped("fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "the test module `mod tests {` on line 3 closes on line 4, \
+                               not on a `}` of its own at its indentation"
+    )]
+    fn a_test_module_that_closes_off_its_indentation_is_refused() {
+        shipped("fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {} }\nfn b() {}\n");
     }
 
     #[test]
