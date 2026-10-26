@@ -204,10 +204,46 @@ pub async fn open_read_only(pool: &SqlitePool) -> Result<SqliteConnection, DbErr
 /// [`Value`] model. Free-form SQL whose result is shown to the user, so a
 /// zero-row result recovers its headers.
 pub async fn query(pool: &SqlitePool, sql: &str) -> Result<QueryResult, DbError> {
-    let checked = SqlText::new(sql)?;
-    let mut result = query_with(pool, sql, &[]).await?;
-    checked.fill_headers(&mut result, pool).await;
-    Ok(result)
+    sqlx_common::query_all::<SqliteBackend>(pool, SqlText::new(sql)?).await
+}
+
+/// The SQLite half of the generic sqlx paths ([`sqlx_common::SqlxBackend`]):
+/// text reaches the driver as a [`SqlText`], so through the door.
+pub(super) struct SqliteBackend;
+
+impl sqlx_common::SqlxBackend for SqliteBackend {
+    type DB = sqlx::Sqlite;
+    type Text<'q> = SqlText<'q>;
+
+    fn prepare(sql: &str) -> Result<SqlText<'_>, DbError> {
+        SqlText::new(sql)
+    }
+
+    fn sql<'q>(text: Self::Text<'q>) -> &'q str {
+        text.as_str()
+    }
+
+    fn query<'q>(text: Self::Text<'q>) -> SqliteQuery<'q> {
+        text.query()
+    }
+
+    fn bind<'q>(query: SqliteQuery<'q>, value: &Value) -> SqliteQuery<'q> {
+        match value {
+            Value::Null => query.bind(None::<i64>),
+            Value::Integer(i) => query.bind(*i),
+            Value::Real(r) => query.bind(*r),
+            Value::Text(t) => query.bind(t.clone()),
+            Value::Blob(b) => query.bind(b.clone()),
+        }
+    }
+
+    fn decode(row: &SqliteRow, idx: usize) -> Result<Value, DbError> {
+        decode_value(row, idx)
+    }
+
+    fn map_err(err: sqlx::Error, _sql: &str) -> DbError {
+        query_error(err)
+    }
 }
 
 /// Maps a driver error onto [`DbError::Query`]. sqlx 0.8 does not expose
@@ -297,7 +333,7 @@ mod door {
     /// builder keeps quoting, which is the per-path proof this type replaces, and
     /// refusing every NUL gives that table a sentence instead.
     #[derive(Debug, Clone, Copy)]
-    pub(super) struct SqlText<'a>(&'a str);
+    pub(in crate::db) struct SqlText<'a>(&'a str);
 
     impl<'a> SqlText<'a> {
         /// `sql`, or [`NUL_IN_SQL`] when it holds a NUL anywhere. The only
@@ -312,6 +348,12 @@ mod door {
         /// A prepared (not simple-protocol) query over this text.
         pub(super) fn query(self) -> SqliteQuery<'a> {
             sqlx::query(self.0)
+        }
+
+        /// The checked text, for the generic paths' describes and error
+        /// messages ([`SqlxBackend::sql`](super::sqlx_common::SqlxBackend::sql)).
+        pub(super) fn as_str(self) -> &'a str {
+            self.0
         }
 
         /// Runs this text without decoding rows — see [`sqlx_common::execute`] —
@@ -339,17 +381,6 @@ mod door {
         {
             sqlx_common::fill_headers(result, executor, self.0).await;
         }
-
-        /// See [`sqlx_common::describe_columns`].
-        pub(super) async fn describe_columns<'c, E>(
-            self,
-            executor: E,
-        ) -> Result<Vec<String>, sqlx::Error>
-        where
-            E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
-        {
-            sqlx_common::describe_columns(executor, self.0).await
-        }
     }
 
     /// The connection's `total_changes()`: every row an `INSERT`, `UPDATE` or
@@ -369,97 +400,31 @@ pub async fn execute(pool: &SqlitePool, sql: &str) -> Result<u64, DbError> {
 }
 
 /// Executes parameterized writes inside ONE transaction, committing only
-/// when every statement affected exactly its `expected_rows` rows. Any SQL
-/// error or count mismatch rolls the whole batch back; the error carries the
-/// index of the failing statement (`None` for begin/commit failures, which
-/// belong to no statement). This is the safety net for row edits: a WHERE
-/// clause that unexpectedly matches more (or fewer) rows than the one being
-/// edited must never commit — and with staged edits, neither may
-/// any sibling change in the same batch.
+/// when every statement affected exactly its `expected_rows` rows — see
+/// [`sqlx_common::execute_all_checked`]. A statement holding a NUL is refused
+/// before the transaction opens.
 pub async fn execute_all_checked(
     pool: &SqlitePool,
     statements: &[CheckedStatement],
 ) -> Result<(), (Option<usize>, DbError)> {
-    // Every statement is checked before the transaction opens, so a refused
-    // one leaves nothing to roll back.
-    let checked = statements
-        .iter()
-        .enumerate()
-        .map(|(index, statement)| SqlText::new(&statement.sql).map_err(|e| (Some(index), e)))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|e| (None, DbError::Query(e.to_string())))?;
-    for (index, (statement, sql)) in statements.iter().zip(checked).enumerate() {
-        let result = bind_params(sql.query(), &statement.params)
-            .execute(&mut *tx)
-            .await;
-        // Dropping the transaction would roll back too; do it explicitly and
-        // ignore secondary errors — the original failure is what the caller
-        // needs.
-        let done = match result {
-            Ok(done) => done,
-            Err(e) => {
-                let _ = tx.rollback().await;
-                return Err((Some(index), query_error(e)));
-            }
-        };
-        let affected = done.rows_affected();
-        if affected != statement.expected_rows {
-            let _ = tx.rollback().await;
-            return Err((
-                Some(index),
-                DbError::row_count_mismatch(affected, statement.expected_rows),
-            ));
-        }
-    }
-    tx.commit()
-        .await
-        .map_err(|e| (None, DbError::Query(e.to_string())))
+    sqlx_common::execute_all_checked::<SqliteBackend>(pool, statements).await
 }
 
 type SqliteQuery<'q> = sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>;
 
-/// Binds backend-neutral [`Value`] parameters onto a prepared query.
-fn bind_params<'q>(mut query: SqliteQuery<'q>, params: &[Value]) -> SqliteQuery<'q> {
-    for param in params {
-        query = match param {
-            Value::Null => query.bind(None::<i64>),
-            Value::Integer(i) => query.bind(*i),
-            Value::Real(r) => query.bind(*r),
-            Value::Text(t) => query.bind(t.clone()),
-            Value::Blob(b) => query.bind(b.clone()),
-        };
-    }
-    query
-}
-
 /// Like [`query`], with bound parameters (used by the paged table reader so
-/// filter values never touch the SQL text).
-///
-/// No header recovery on a zero-row result here, unlike [`query`] and
-/// [`query_capped`]: every caller of this builds its own projection (a page
-/// fetch, a cell fetch, a catalog read for DDL) and so already knows the
-/// columns, and nothing downstream reads them off the result. Describing the
-/// statement to fill in headers no one looks at would put an extra round trip
-/// on each of those — two on Postgres, whose `describe` also issues a
-/// `pg_attribute` query — and empty catalog reads are ordinary (a table with
-/// no table-level constraints, no non-constraint indexes).
+/// filter values never touch the SQL text) — see
+/// [`sqlx_common::query_with`], including why it recovers no headers.
 pub async fn query_with(
     pool: &SqlitePool,
     sql: &str,
     params: &[Value],
 ) -> Result<QueryResult, DbError> {
-    let stream = bind_params(SqlText::new(sql)?.query(), params).fetch(pool);
-    sqlx_common::collect_all(stream, decode_value, query_error).await
+    sqlx_common::query_with::<SqliteBackend, _>(pool, SqlText::new(sql)?, params).await
 }
 
-/// Streams `sql` one row at a time (`fetch`, not `fetch_all`), decoding and
-/// retaining at most `max_rows` rows and capping each cell to `cell_cap`
-/// bytes, so neither the row count nor a pathologically large cell can make
-/// the free-form query path scale with table or value size. Returns
-/// the (bounded) result and whether more rows existed beyond the cap.
+/// A free-form query with its rows and cells capped — see
+/// [`sqlx_common::query_capped`].
 pub async fn query_capped(
     pool: &SqlitePool,
     sql: &str,
@@ -468,11 +433,7 @@ pub async fn query_capped(
     cell_cap: usize,
 ) -> Result<(QueryResult, bool), DbError> {
     let sql = SqlText::new(sql)?;
-    let stream = bind_params(sql.query(), params).fetch(pool);
-    let (mut result, truncated) =
-        sqlx_common::collect_capped(stream, max_rows, cell_cap, decode_value, query_error).await?;
-    sql.fill_headers(&mut result, pool).await;
-    Ok((result, truncated))
+    sqlx_common::query_capped::<SqliteBackend>(pool, sql, params, max_rows, cell_cap).await
 }
 
 /// [`query_capped`] against a single connection (e.g. one borrowed from a
@@ -485,9 +446,14 @@ pub async fn query_capped_conn(
     cell_cap: usize,
 ) -> Result<(QueryResult, bool), DbError> {
     let sql = SqlText::new(sql)?;
-    let stream = sql.query().fetch(&mut *conn);
-    let (mut result, truncated) =
-        sqlx_common::collect_capped(stream, max_rows, cell_cap, decode_value, query_error).await?;
+    let (mut result, truncated) = sqlx_common::query_capped_rows::<SqliteBackend, _>(
+        &mut *conn,
+        sql,
+        &[],
+        max_rows,
+        cell_cap,
+    )
+    .await?;
     sql.fill_headers(&mut result, &mut *conn).await;
     Ok((result, truncated))
 }
@@ -533,26 +499,20 @@ pub(super) fn script_end(begun: bool, rollback: Result<u64, DbError>) -> Result<
     rollback.map(|_| !begun)
 }
 
-/// [`execute_conn`] with bound parameters — the write path for a batch of
-/// imported rows, which must run inside the caller's transaction
-/// and must not interpolate its values into the SQL.
+/// [`execute_conn`] with bound parameters — see
+/// [`sqlx_common::execute_with`]. The driver's count, unlike
+/// [`execute_conn`]'s: an import runs only the `INSERT`s it builds.
 pub async fn execute_with_conn(
     conn: &mut sqlx::sqlite::SqliteConnection,
     sql: &str,
     params: &[Value],
 ) -> Result<u64, DbError> {
-    bind_params(SqlText::new(sql)?.query(), params)
-        .execute(conn)
-        .await
-        .map(|done| done.rows_affected())
-        .map_err(query_error)
+    sqlx_common::execute_with::<SqliteBackend, _>(conn, SqlText::new(sql)?, params).await
 }
 
-/// Streams a query to `out` in the given format, pulling rows one at a time
-/// (`fetch`, not `fetch_all`) and writing each incrementally — peak memory is
-/// one decoded row plus the writer's buffer. Returns the number of data rows
-/// written. When the result is empty the column names come from a statement
-/// describe so the header (CSV) / empty array (JSON) still reflect the query.
+/// Streams a query to `out` in the given format — see
+/// [`sqlx_common::export_query`]. The export holds one of the pool's
+/// connections for its read and, for an empty result, the describe.
 pub async fn export(
     pool: &SqlitePool,
     sql: &str,
@@ -561,18 +521,8 @@ pub async fn export(
     out: &mut impl Write,
 ) -> Result<u64, DbError> {
     let sql = SqlText::new(sql)?;
-    let stream = bind_params(sql.query(), params).fetch(pool);
-    if let Some(rows) =
-        sqlx_common::export_stream(stream, format, out, decode_value, query_error).await?
-    {
-        return Ok(rows);
-    }
-    // No rows streamed, so no row carried the column names: describe the
-    // statement instead. This one propagates its failure — an export whose
-    // header cannot be determined is an empty file that says nothing.
-    let columns = sql.describe_columns(pool).await.map_err(query_error)?;
-    sqlx_common::export_empty(format, columns, out)?;
-    Ok(0)
+    let mut conn = pool.acquire().await.map_err(query_error)?;
+    sqlx_common::export_query::<SqliteBackend>(&mut conn, sql, params, format, out).await
 }
 
 /// Lists tables and views with columns, indexes, and foreign keys: five
@@ -1757,7 +1707,8 @@ mod tests {
     ];
 
     /// What may follow `sqlx_common::` outside the door: the helpers that
-    /// take rows, a pool or a transaction, not text.
+    /// take rows, a pool or a transaction, not text, and the generic paths
+    /// ([`COMMON_GENERIC`]).
     const COMMON_ALLOWED: &[&str] = &[
         "get",
         "acquire_for_run",
@@ -1768,6 +1719,30 @@ mod tests {
         "export_empty",
         "commit_tx",
         "rollback_tx",
+        "SqlxBackend",
+        "query_all",
+        "query_with",
+        "query_capped",
+        "query_capped_rows",
+        "execute_with",
+        "export_query",
+        "execute_all_checked",
+    ];
+
+    /// The generic sqlx paths this file calls. They do take text, which is
+    /// why each is listed by name rather than the allowlist taking any: on
+    /// SQLite their text is a [`SqlText`], so the door has already checked
+    /// it — `the_generic_paths_take_text_only_as_backend_text` pins that each
+    /// takes it so, and `every_sqlite_entry_point_refuses_a_nul` runs them.
+    /// `execute_all_checked` takes whole statements, so it prepares each
+    /// itself, through [`SqlxBackend::prepare`](sqlx_common::SqlxBackend).
+    const COMMON_GENERIC: &[&str] = &[
+        "query_all",
+        "query_with",
+        "query_capped",
+        "query_capped_rows",
+        "execute_with",
+        "export_query",
     ];
 
     /// Every way `code` reaches the driver with text, as `(offset, what)`.
@@ -1928,6 +1903,125 @@ mod tests {
         }
     }
 
+    /// What makes [`COMMON_GENERIC`] safe to allow: each generic path takes
+    /// its text as `B::Text`, which SQLite's backend makes a [`SqlText`], and
+    /// no `str` in its signature, so a `&str` parameter that skipped the door
+    /// cannot be added to one unnoticed. `execute_all_checked`, which takes
+    /// raw statements, must prepare each through the backend.
+    #[test]
+    fn the_generic_paths_take_text_only_as_backend_text() {
+        let common = crate::source_scan::code_outside_test_modules(include_str!("sqlx_common.rs"));
+        let collapsed = |code: &str| code.split_whitespace().collect::<Vec<_>>().join(" ");
+        for name in COMMON_GENERIC {
+            let start = common
+                .find(&format!("pub(super) async fn {name}<"))
+                .unwrap_or_else(|| panic!("no generic fn {name}"));
+            let signature = &common[start..start + common[start..].find("where").unwrap()];
+            assert!(
+                collapsed(signature).contains("text: B::Text<'q>,"),
+                "{name} does not take its text as B::Text: {signature}"
+            );
+            assert!(
+                !signature.contains("str"),
+                "{name} takes text past the door: {signature}"
+            );
+        }
+        let start = common
+            .find("pub(super) async fn execute_all_checked<")
+            .unwrap();
+        let body = &common[start..start + crate::source_scan::block_end(&common[start..]).unwrap()];
+        assert!(
+            collapsed(body).contains(".map(|(index, statement)| B::prepare(&statement.sql)"),
+            "execute_all_checked does not prepare its statements through the backend"
+        );
+        let this = collapsed(&shipped_code(include_str!("sqlite.rs")).join("\n"));
+        assert!(
+            this.contains("type Text<'q> = SqlText<'q>;"),
+            "SQLite's generic text is not SqlText"
+        );
+    }
+
+    /// Every SQLite entry point that takes SQL text refuses one holding a
+    /// NUL with [`NUL_IN_SQL`], the generic paths' callers included. The NUL
+    /// sits inside a string literal, where SQLite fails on it cleanly
+    /// (`unrecognized token`) rather than hanging, so a path that bypassed
+    /// the door fails here with that error instead of spinning a core.
+    #[tokio::test]
+    async fn every_sqlite_entry_point_refuses_a_nul() {
+        let pool = one_connection().await;
+        run(&pool, "CREATE TABLE t (a TEXT)").await;
+        let read = "SELECT 'a\0'";
+        let write = "INSERT INTO t VALUES ('a\0')";
+        let refused = || DbError::Query(NUL_IN_SQL.to_string());
+        fn within<T>(what: &str) -> impl FnOnce(Result<T, tokio::time::error::Elapsed>) -> T + '_ {
+            move |outcome| outcome.unwrap_or_else(|_| panic!("{what} handed a NUL to the driver"))
+        }
+        let t = std::time::Duration::from_secs(10);
+        use tokio::time::timeout;
+        assert_eq!(
+            within("query")(timeout(t, query(&pool, read)).await).err(),
+            Some(refused())
+        );
+        assert_eq!(
+            within("query_with")(timeout(t, query_with(&pool, read, &[])).await).err(),
+            Some(refused())
+        );
+        assert_eq!(
+            within("query_capped")(timeout(t, query_capped(&pool, read, &[], 10, 100)).await).err(),
+            Some(refused())
+        );
+        assert_eq!(
+            within("execute")(timeout(t, execute(&pool, write)).await).err(),
+            Some(refused())
+        );
+        let mut out = Vec::new();
+        assert_eq!(
+            within("export")(
+                timeout(t, export(&pool, read, &[], ExportFormat::Csv, &mut out)).await
+            )
+            .err(),
+            Some(refused())
+        );
+        assert_eq!(
+            within("execute_all_checked")(
+                timeout(
+                    t,
+                    execute_all_checked(
+                        &pool,
+                        &[CheckedStatement {
+                            sql: write.into(),
+                            params: vec![],
+                            expected_rows: 1,
+                        }]
+                    )
+                )
+                .await
+            )
+            .err(),
+            Some((Some(0), refused()))
+        );
+        let mut conn = pool.acquire().await.unwrap();
+        assert_eq!(
+            within("query_capped_conn")(
+                timeout(t, query_capped_conn(&mut conn, read, 10, 100)).await
+            )
+            .err(),
+            Some(refused())
+        );
+        assert_eq!(
+            within("execute_conn")(timeout(t, execute_conn(&mut conn, write)).await).err(),
+            Some(refused())
+        );
+        assert_eq!(
+            within("execute_with_conn")(timeout(t, execute_with_conn(&mut conn, write, &[])).await)
+                .err(),
+            Some(refused())
+        );
+        drop(conn);
+        let rows = query(&pool, "SELECT count(*) FROM t").await.unwrap();
+        assert_eq!(rows.rows, vec![vec![Value::Integer(0)]]);
+    }
+
     /// Every shipped file under `src/`, as `(path relative to src, contents)`.
     fn all_sources() -> Vec<(String, String)> {
         fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
@@ -1959,9 +2053,11 @@ mod tests {
     /// - `db/postgres.rs`: sqlx-postgres sends a statement whole, with no
     ///   prepare loop to stall in, and a Postgres-wire server has no NUL in
     ///   its names to build text from.
-    /// - `db/sqlx_common.rs`: the shared helpers, generic over the driver;
-    ///   their text-taking ones are off [`COMMON_ALLOWED`], so only the door
-    ///   and `postgres.rs` call them.
+    /// - `db/sqlx_common.rs`: the shared helpers, generic over the driver.
+    ///   The ones that take `&str` are off [`COMMON_ALLOWED`], so only the
+    ///   door and `postgres.rs` call them; the generic paths on it
+    ///   ([`COMMON_GENERIC`]) take text as a backend's `Text`, a [`SqlText`]
+    ///   on SQLite.
     /// - `history.rs`: hubro's own history database, which is SQLite — so
     ///   it may reach the driver only by `sqlx::query(` or
     ///   `sqlx::query_scalar(` with a string literal, or the setup loop over

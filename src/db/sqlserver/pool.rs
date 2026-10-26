@@ -781,7 +781,7 @@ fn catalog_error(err: &TdsError) -> DbError {
 /// [`catalog_error`] over plain data — the server's error code and the
 /// driver's message — where a test can reach it (tiberius has no public way
 /// to build a server error).
-fn catalog_error_from(code: Option<u32>, message: String) -> DbError {
+pub(super) fn catalog_error_from(code: Option<u32>, message: String) -> DbError {
     match code {
         Some(DEADLOCK_VICTIM) => DbError::Transient(message),
         _ => DbError::Query(message),

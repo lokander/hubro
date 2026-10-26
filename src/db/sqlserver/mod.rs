@@ -792,6 +792,25 @@ mod tests {
 
     use super::*;
 
+    /// The step between a catalog read's error and the retry: introspection
+    /// and stats map every failure through [`introspect_error`], and a
+    /// deadlock victim must come out of it still [`DbError::Transient`], or
+    /// `registry::retry_transient` never sees it and the read fails at once.
+    /// Fed from [`pool::catalog_error_from`], so the test follows the code
+    /// from the server's error number, not from a hand-made `Transient`.
+    #[test]
+    fn introspection_keeps_a_deadlock_victim_retryable_and_nothing_else() {
+        let deadlock = pool::catalog_error_from(Some(1205), "deadlock victim".into());
+        let mapped = introspect_error(deadlock);
+        assert_eq!(mapped, DbError::Transient("deadlock victim".into()));
+        assert!(mapped.is_transient());
+        let other = pool::catalog_error_from(Some(208), "invalid object name".into());
+        assert_eq!(
+            introspect_error(other),
+            DbError::Introspect("invalid object name".into())
+        );
+    }
+
     #[test]
     fn url_wrappers_bind_the_mssql_scheme() {
         // One probe per wrapper; the shared behavior is covered in db::url.

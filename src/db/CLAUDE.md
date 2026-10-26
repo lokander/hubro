@@ -13,7 +13,7 @@ Rules for `src/db/`. The project-wide guidance is in the root `CLAUDE.md`.
 
 ## SQL text and the SQLite driver
 
-- **SQLite text reaches sqlx only through `SqlText`** (`sqlite.rs`), which refuses a NUL anywhere in it. sqlx-sqlite 0.8.6 (and 0.9.0) loops forever at 100% CPU on a statement followed by a NUL: its prepare loop advances by SQLite's tail, which stops on the NUL. No timeout reaches the worker thread. A new SQLite path builds its statement with `SqlText::new(..)?.query()`, not `sqlx::query`. `the_driver_is_handed_text_only_through_sql_text` and `only_known_files_hand_sql_text_to_sqlx` fail otherwise. Names from a crafted file's `sqlite_master` can hold a NUL, so "hubro built this text itself" is no exemption.
+- **SQLite text reaches sqlx only through `SqlText`** (`sqlite.rs`), which refuses a NUL anywhere in it. sqlx-sqlite 0.8.6 (and 0.9.0) loops forever at 100% CPU on a statement followed by a NUL: its prepare loop advances by SQLite's tail, which stops on the NUL. No timeout reaches the worker thread. A new SQLite path builds its statement with `SqlText::new(..)?.query()`, not `sqlx::query`. `the_driver_is_handed_text_only_through_sql_text` and `only_known_files_hand_sql_text_to_sqlx` fail otherwise. The generic sqlx paths (`sqlx_common::SqlxBackend`) take their text as the backend's `Text`, which on SQLite is `SqlText`, so a generic path cannot be handed unchecked text; `every_sqlite_entry_point_refuses_a_nul` runs each entry point with a NUL. Names from a crafted file's `sqlite_master` can hold a NUL, so "hubro built this text itself" is no exemption.
 
 ## Retrying
 

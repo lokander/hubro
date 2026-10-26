@@ -1,18 +1,22 @@
 //! Execution scaffolding shared by the two sqlx backends (SQLite, Postgres).
 //!
-//! The two differ in exactly three things — the `Database` type parameter, how
-//! a cell is decoded, and how a driver error is mapped (SQLite has no error
-//! position to enrich with; Postgres appends line/column) — so everything
-//! between "the driver handed us a row stream" and "the caller gets a
-//! [`QueryResult`]" is written once here and parameterized on those three.
+//! The two differ in a handful of things — the `Database` type parameter, how
+//! SQL text becomes a statement (SQLite's passes its NUL door first), how a
+//! parameter is bound, how a cell is decoded, and how a driver error is mapped
+//! (SQLite has no error position to enrich with; Postgres appends
+//! line/column). [`SqlxBackend`] names those, and everything between "here is
+//! the text and its parameters" and "the caller gets a [`QueryResult`]" is
+//! written once here, the checked write ([`execute_all_checked`]) included.
 //!
 //! Generic functions rather than a macro: the backend modules stay ordinary
 //! Rust that a reader can follow and a compiler error can point into, and the
 //! shared code has one signature to read instead of an expansion to imagine.
-//! The price is per-call closures (`decode_value`, `map_err`), which is why
-//! the sharing stops where the bounds would start costing more than the
-//! duplication does — binding parameters and the checked-write transaction
-//! stay per backend.
+//!
+//! **No SQLite text reaches the driver here unchecked.** The generic paths
+//! take a [`SqlxBackend::Text`], never a `&str`, and SQLite's is its
+//! `SqlText`, which only its door builds. So the type, not a reading of this
+//! file, is what keeps a generic path from handing sqlx-sqlite a NUL —
+//! `every_sqlite_entry_point_refuses_a_nul` (`sqlite.rs`) runs each of them.
 
 use std::io::Write;
 
@@ -21,6 +25,7 @@ use sqlx::{Column as _, ColumnIndex, Database, Decode, Executor, IntoArguments, 
 
 use super::error::DbError;
 use super::export::{export_io_err, ExportFormat, ExportSink};
+use super::staged::CheckedStatement;
 use super::value::{cap_value, Capped, ColumnInfo, QueryResult, RestOfRead, Value};
 
 /// The affected-row count of a driver's execute result. sqlx has no trait for
@@ -81,6 +86,259 @@ where
         .await
         .map(|done| done.affected_rows())
         .map_err(map_err)
+}
+
+/// A prepared statement over a backend's text, with its arguments.
+pub(super) type Query<'q, DB> = sqlx::query::Query<'q, DB, <DB as Database>::Arguments<'q>>;
+
+/// What one sqlx backend supplies to the generic paths below. Implemented by
+/// a zero-sized type per backend (`sqlite::Sqlite`, `postgres::Postgres`), so
+/// a generic path is named `query_with::<Sqlite, _>` and costs nothing at run
+/// time.
+pub(super) trait SqlxBackend {
+    type DB: Database;
+
+    /// SQL text this backend lets reach its driver. On SQLite, `SqlText`,
+    /// which refuses a NUL; on Postgres, the text itself.
+    type Text<'q>: Copy;
+
+    /// `sql` as [`Self::Text`], or the error that keeps it from the driver.
+    /// The one way the generic paths' callers get a `Text`.
+    fn prepare(sql: &str) -> Result<Self::Text<'_>, DbError>;
+
+    /// The text, for a describe or an error message.
+    fn sql<'q>(text: Self::Text<'q>) -> &'q str;
+
+    /// A prepared (not simple-protocol) statement over `text`.
+    fn query<'q>(text: Self::Text<'q>) -> Query<'q, Self::DB>;
+
+    /// Binds one backend-neutral parameter.
+    fn bind<'q>(query: Query<'q, Self::DB>, value: &Value) -> Query<'q, Self::DB>;
+
+    /// Decodes one cell of a fetched row.
+    fn decode(row: &<Self::DB as Database>::Row, idx: usize) -> Result<Value, DbError>;
+
+    /// Maps a driver error from running `sql`.
+    fn map_err(err: sqlx::Error, sql: &str) -> DbError;
+}
+
+/// Binds backend-neutral [`Value`] parameters onto a prepared query.
+fn bind_params<'q, B: SqlxBackend>(
+    mut query: Query<'q, B::DB>,
+    params: &[Value],
+) -> Query<'q, B::DB> {
+    for param in params {
+        query = B::bind(query, param);
+    }
+    query
+}
+
+/// Runs a query and reads its whole result, recovering a zero-row result's
+/// headers. Uncapped, so only tests read through it
+/// (`DbPool::query_unbounded`).
+pub(super) async fn query_all<'q, B>(
+    pool: &sqlx::Pool<B::DB>,
+    text: B::Text<'q>,
+) -> Result<QueryResult, DbError>
+where
+    B: SqlxBackend,
+    for<'p> &'p sqlx::Pool<B::DB>: Executor<'p, Database = B::DB>,
+    <B::DB as Database>::Arguments<'q>: IntoArguments<'q, B::DB>,
+{
+    let mut result = query_with::<B, _>(pool, text, &[]).await?;
+    fill_headers(&mut result, pool, B::sql(text)).await;
+    Ok(result)
+}
+
+/// Runs a query with bound parameters and reads its whole result.
+///
+/// No header recovery on a zero-row result here, unlike [`query_all`] and
+/// [`query_capped`]: every caller of this builds its own projection (a page
+/// fetch, a cell fetch, a catalog read for DDL) and so already knows the
+/// columns, and nothing downstream reads them off the result. Describing the
+/// statement to fill in headers no one looks at would put an extra round trip
+/// on each of those — two on Postgres, whose `describe` also issues a
+/// `pg_attribute` query — and empty catalog reads are ordinary (a table with
+/// no table-level constraints, no non-constraint indexes).
+pub(super) async fn query_with<'c, 'q, B, E>(
+    executor: E,
+    text: B::Text<'q>,
+    params: &[Value],
+) -> Result<QueryResult, DbError>
+where
+    B: SqlxBackend,
+    E: Executor<'c, Database = B::DB>,
+    <B::DB as Database>::Arguments<'q>: IntoArguments<'q, B::DB>,
+{
+    let stream = bind_params::<B>(B::query(text), params).fetch(executor);
+    collect_all(stream, B::decode, |e| B::map_err(e, B::sql(text))).await
+}
+
+/// Streams a query one row at a time (`fetch`, not `fetch_all`), decoding and
+/// retaining at most `max_rows` rows and capping each cell to `cell_cap`
+/// bytes, so neither the row count nor a pathologically large cell can make
+/// the free-form query path scale with table or value size. Returns the
+/// (bounded) result and whether more rows existed beyond the cap. No header
+/// recovery — [`query_capped`] adds it on a pool, and a caller holding one
+/// connection describes on it once the stream is gone.
+pub(super) async fn query_capped_rows<'c, 'q, B, E>(
+    executor: E,
+    text: B::Text<'q>,
+    params: &[Value],
+    max_rows: u64,
+    cell_cap: usize,
+) -> Result<(QueryResult, bool), DbError>
+where
+    B: SqlxBackend,
+    E: Executor<'c, Database = B::DB>,
+    <B::DB as Database>::Arguments<'q>: IntoArguments<'q, B::DB>,
+{
+    let stream = bind_params::<B>(B::query(text), params).fetch(executor);
+    collect_capped(stream, max_rows, cell_cap, B::decode, |e| {
+        B::map_err(e, B::sql(text))
+    })
+    .await
+}
+
+/// [`query_capped_rows`] on a pool, with a zero-row result's headers
+/// recovered. The describe takes a connection of its own: a read cut short at
+/// a cap of 0 keeps no row and so no header, and on the read's own connection
+/// the describe would wait for the rest of its result first.
+pub(super) async fn query_capped<'q, B>(
+    pool: &sqlx::Pool<B::DB>,
+    text: B::Text<'q>,
+    params: &[Value],
+    max_rows: u64,
+    cell_cap: usize,
+) -> Result<(QueryResult, bool), DbError>
+where
+    B: SqlxBackend,
+    for<'p> &'p sqlx::Pool<B::DB>: Executor<'p, Database = B::DB>,
+    <B::DB as Database>::Arguments<'q>: IntoArguments<'q, B::DB>,
+{
+    let (mut result, truncated) =
+        query_capped_rows::<B, _>(pool, text, params, max_rows, cell_cap).await?;
+    fill_headers(&mut result, pool, B::sql(text)).await;
+    Ok((result, truncated))
+}
+
+/// Runs a statement with bound parameters without decoding rows, returning
+/// the driver's affected-row count — the write path for a batch of imported
+/// rows, which runs inside the caller's transaction and must not interpolate
+/// its values into the SQL.
+pub(super) async fn execute_with<'c, 'q, B, E>(
+    executor: E,
+    text: B::Text<'q>,
+    params: &[Value],
+) -> Result<u64, DbError>
+where
+    B: SqlxBackend,
+    E: Executor<'c, Database = B::DB>,
+    <B::DB as Database>::Arguments<'q>: IntoArguments<'q, B::DB>,
+    <B::DB as Database>::QueryResult: AffectedRows,
+{
+    bind_params::<B>(B::query(text), params)
+        .execute(executor)
+        .await
+        .map(|done| done.affected_rows())
+        .map_err(|e| B::map_err(e, B::sql(text)))
+}
+
+/// Streams a query to `out` in the given format, pulling rows one at a time
+/// (`fetch`, not `fetch_all`) and writing each incrementally — peak memory is
+/// one decoded row plus the writer's buffer. Returns the number of data rows
+/// written. When the result is empty the column names come from a statement
+/// describe, on the same connection, so the header (CSV) / empty array (JSON)
+/// still reflect the query.
+pub(super) async fn export_query<'q, B>(
+    conn: &mut <B::DB as Database>::Connection,
+    text: B::Text<'q>,
+    params: &[Value],
+    format: ExportFormat,
+    out: &mut impl Write,
+) -> Result<u64, DbError>
+where
+    B: SqlxBackend,
+    for<'e> &'e mut <B::DB as Database>::Connection: Executor<'e, Database = B::DB>,
+    <B::DB as Database>::Arguments<'q>: IntoArguments<'q, B::DB>,
+{
+    let sql = B::sql(text);
+    let stream = bind_params::<B>(B::query(text), params).fetch(&mut *conn);
+    if let Some(rows) =
+        export_stream(stream, format, out, B::decode, |e| B::map_err(e, sql)).await?
+    {
+        return Ok(rows);
+    }
+    // No rows streamed, so no row carried the column names: describe the
+    // statement instead. This one propagates its failure — an export whose
+    // header cannot be determined is an empty file that says nothing.
+    let columns = describe_columns(&mut *conn, sql)
+        .await
+        .map_err(|e| B::map_err(e, sql))?;
+    export_empty(format, columns, out)?;
+    Ok(0)
+}
+
+/// Executes parameterized writes inside ONE transaction, committing only
+/// when every statement affected exactly its `expected_rows` rows. Any SQL
+/// error or count mismatch rolls the whole batch back; the error carries the
+/// index of the failing statement (`None` for begin/commit failures, which
+/// belong to no statement). This is the safety net for row edits: a WHERE
+/// clause that unexpectedly matches more (or fewer) rows than the one being
+/// edited must never commit — and with staged edits, neither may
+/// any sibling change in the same batch.
+///
+/// Every statement is prepared ([`SqlxBackend::prepare`]) before the
+/// transaction opens, so one refused there — SQLite's NUL — leaves nothing
+/// to roll back and none of the batch run.
+pub(super) async fn execute_all_checked<B>(
+    pool: &sqlx::Pool<B::DB>,
+    statements: &[CheckedStatement],
+) -> Result<(), (Option<usize>, DbError)>
+where
+    B: SqlxBackend,
+    for<'e> &'e mut <B::DB as Database>::Connection: Executor<'e, Database = B::DB>,
+    for<'q> <B::DB as Database>::Arguments<'q>: IntoArguments<'q, B::DB>,
+    <B::DB as Database>::QueryResult: AffectedRows,
+{
+    let texts = statements
+        .iter()
+        .enumerate()
+        .map(|(index, statement)| B::prepare(&statement.sql).map_err(|e| (Some(index), e)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| (None, DbError::Query(e.to_string())))?;
+    for (index, (statement, text)) in statements.iter().zip(texts).enumerate() {
+        let result = bind_params::<B>(B::query(text), &statement.params)
+            .execute(&mut *tx)
+            .await;
+        // Dropping the transaction would roll back too; do it explicitly and
+        // ignore secondary errors — the original failure is what the caller
+        // needs.
+        let affected = match result {
+            Ok(done) => done.affected_rows(),
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err((Some(index), B::map_err(e, B::sql(text))));
+            }
+        };
+        if let Some(mismatch) = row_count_mismatch(affected, statement.expected_rows) {
+            let _ = tx.rollback().await;
+            return Err((Some(index), mismatch));
+        }
+    }
+    tx.commit()
+        .await
+        .map_err(|e| (None, DbError::Query(e.to_string())))
+}
+
+/// The checked write's decision for one statement, over plain counts: an
+/// error — and the batch rolled back — unless the statement changed exactly
+/// the rows it was built to change.
+fn row_count_mismatch(affected: u64, expected: u64) -> Option<DbError> {
+    (affected != expected).then(|| DbError::row_count_mismatch(affected, expected))
 }
 
 /// A connection for one script run, checked out of `pool` and marked to be
@@ -469,6 +727,21 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// The checked write's per-statement decision: only an exact count
+    /// lets the batch go on — one row more or one fewer rolls it back.
+    #[test]
+    fn only_the_expected_row_count_lets_a_checked_write_commit() {
+        assert_eq!(super::row_count_mismatch(1, 1), None);
+        assert_eq!(super::row_count_mismatch(0, 0), None);
+        for (affected, expected) in [(2, 1), (0, 1), (1, 0)] {
+            assert_eq!(
+                super::row_count_mismatch(affected, expected),
+                Some(DbError::row_count_mismatch(affected, expected)),
+                "{affected} of {expected}"
+            );
+        }
+    }
+
     use super::*;
 
     /// A server error with a SQLSTATE and message, as the driver hands one
