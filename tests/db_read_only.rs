@@ -810,7 +810,7 @@ async fn browsing_a_writing_view_on_a_marked_postgres_connection_is_refused() {
 
 #[tokio::test]
 async fn browsing_a_writing_view_on_a_marked_timescale_connection_is_refused() {
-    let Some(url) = url("HUBRO_TIMESCALE_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_TIMESCALE_TEST_URL") else {
         return;
     };
     let pool = DbPool::open_postgres(&url).await.unwrap();
@@ -821,7 +821,7 @@ async fn browsing_a_writing_view_on_a_marked_timescale_connection_is_refused() {
 
 #[tokio::test]
 async fn browsing_a_writing_view_on_a_marked_citus_connection_is_refused() {
-    let Some(url) = url("HUBRO_CITUS_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_CITUS_TEST_URL") else {
         return;
     };
     let pool = DbPool::open_postgres(&url).await.unwrap();
@@ -832,7 +832,7 @@ async fn browsing_a_writing_view_on_a_marked_citus_connection_is_refused() {
 
 #[tokio::test]
 async fn browsing_a_writing_view_on_a_marked_cockroach_connection_is_refused() {
-    let Some(url) = url("HUBRO_CRDB_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_CRDB_TEST_URL") else {
         return;
     };
     let pool = DbPool::open_postgres(&url).await.unwrap();
@@ -843,7 +843,7 @@ async fn browsing_a_writing_view_on_a_marked_cockroach_connection_is_refused() {
 
 #[tokio::test]
 async fn browsing_a_writing_view_on_a_marked_yugabyte_connection_is_refused() {
-    let Some(url) = url("HUBRO_YUGABYTE_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_YUGABYTE_TEST_URL") else {
         return;
     };
     let _ddl = YUGABYTE_DDL.lock().await;
@@ -858,7 +858,7 @@ async fn browsing_a_writing_view_on_a_marked_yugabyte_connection_is_refused() {
 /// their read-only transactions still works.
 #[tokio::test]
 async fn browsing_on_a_marked_materialize_connection_still_reads() {
-    let Some(url) = url("HUBRO_MATERIALIZE_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_MATERIALIZE_TEST_URL") else {
         return;
     };
     let pool = DbPool::open_postgres(&url).await.unwrap();
@@ -868,7 +868,7 @@ async fn browsing_on_a_marked_materialize_connection_still_reads() {
 
 #[tokio::test]
 async fn browsing_on_a_marked_risingwave_connection_still_reads() {
-    let Some(url) = url("HUBRO_RISINGWAVE_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_RISINGWAVE_TEST_URL") else {
         return;
     };
     let pool = DbPool::open_postgres(&url).await.unwrap();
