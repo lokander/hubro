@@ -881,3 +881,60 @@ async fn a_sqlite_read_cannot_load_an_extension() {
     );
     pool.close().await;
 }
+
+/// How many notifications `listener` receives before half a second passes
+/// without one.
+async fn notifications_delivered(listener: &mut sqlx::postgres::PgListener) -> usize {
+    let mut got = 0;
+    while let Ok(Ok(_)) =
+        tokio::time::timeout(std::time::Duration::from_millis(500), listener.recv()).await
+    {
+        got += 1;
+    }
+    got
+}
+
+/// A marked connection's browse is rolled back, never committed: the one
+/// effect a read-only transaction allows and a commit would make real is a
+/// notification, which `pg_notify` queues and only a commit delivers. A view
+/// calling it is browsed every way, marked — nothing arrives — and the same
+/// browse unmarked delivers, so the listener is listening.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn browsing_a_marked_postgres_connection_delivers_no_notification() {
+    let Some(url) = common::pg_test_url().await else {
+        return;
+    };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let channel = format!("hubro_ro_browse_{}", std::process::id());
+    let v = format!("hubro_ro_notify_view_{}", std::process::id());
+    let _ = pool.execute(&format!("DROP VIEW IF EXISTS {v}")).await;
+    pool.execute(&format!(
+        "CREATE VIEW {v} AS SELECT 1 AS id, pg_notify('{channel}', 'x')::text AS n"
+    ))
+    .await
+    .unwrap();
+    let view = object_named(&pool, &v).await;
+    let full = pool.backend_capabilities();
+    let marked = WriteProtection::ReadOnly.apply(full);
+    let mut listener = sqlx::postgres::PgListener::connect(&url).await.unwrap();
+    listener.listen(&channel).await.unwrap();
+
+    for how in BROWSES {
+        browse(&pool, marked, &view, how)
+            .await
+            .unwrap_or_else(|e| panic!("{how:?} failed marked: {e:?}"));
+        assert_eq!(
+            notifications_delivered(&mut listener).await,
+            0,
+            "{how:?}: a marked browse's transaction was committed"
+        );
+    }
+    browse(&pool, full, &view, Browse::Page).await.unwrap();
+    assert_eq!(
+        notifications_delivered(&mut listener).await,
+        1,
+        "unmarked, the page's notification must arrive, or the marked case proves nothing"
+    );
+    pool.execute(&format!("DROP VIEW {v}")).await.unwrap();
+    pool.close().await;
+}
