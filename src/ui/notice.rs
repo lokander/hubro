@@ -937,7 +937,7 @@ mod tests {
             (&["shell.rs"], "fn Cheatsheet(", true),
             (&["schema.rs"], "fn DdlOverlay(", true),
             (
-                &["grid", "mod.rs"],
+                &["grid", "expand.rs"],
                 "if let Some(view) = expanded.read().clone() {",
                 true,
             ),

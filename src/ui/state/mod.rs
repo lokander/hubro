@@ -2401,7 +2401,11 @@ mod tests {
                 file.display()
             );
         }
-        let grid = code_of(include_str!("../grid/mod.rs"));
+        // Every grid file, so the calls are found wherever the grid keeps them.
+        let grid: String = crate::source_scan::rust_files(&ui.join("grid"))
+            .iter()
+            .map(|file| code_of(&std::fs::read_to_string(file).unwrap()))
+            .collect();
         for call in [
             "letpool=state.registry.peek().get(id).map(|c|c.browse());asyncmove{",
             ".fetch_page_bounded(reading,&request,&columns,&no_preview_refs)",

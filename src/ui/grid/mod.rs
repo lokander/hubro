@@ -1,35 +1,50 @@
 //! The paged data grid: the [`DataGrid`] orchestrator and the subsystems it
 //! drives, split by concern.
 //!
+//! - [`page`] — the page, sort and filter asked for, the page and count
+//!   fetched for them, and the paging rules;
+//! - [`focus`] — the focus ring, the cell selection, the two editors that can
+//!   take the keyboard, and the key handler;
+//! - [`body`] — the windowed rows and the states shown in their place;
+//! - [`expand`] — the value-expand popup;
 //! - [`rows`] — the per-row/per-cell view model and the components that draw
 //!   it;
-//! - [`nav`] — keyboard navigation and the windowed row range;
+//! - [`nav`] — keyboard navigation and the windowed row range, as rules;
 //! - [`copy`] — copying a cell selection to the clipboard;
 //! - [`stats`] — the footer's aggregate readout for a cell selection;
 //! - [`detail`] — the row detail panel;
 //! - [`viewer`] — the rich cell viewers (JSON, images, binary, long text).
 //!
-//! This file keeps the orchestrator itself: the ~20 hooks that hold a table's
-//! page, sort, filter, selection and stage, the effects that keep them
-//! consistent, and the toolbar/save-bar/footer chrome around the body. The
-//! five submodules reference each other only through small shared types
-//! ([`GridNav`], [`Selection`], [`ActiveEdit`], [`RowDetail`]), which live
-//! here.
+//! This file keeps the orchestrator itself — the hooks called in order, the
+//! table's access and stage read once, and the layout — and the chrome
+//! around the body: the toolbar, the save bars and the footer. The
+//! submodules reference each other only through small shared types
+//! ([`GridNav`], [`Selection`], [`ActiveEdit`], [`RowDetail`], and the
+//! handle bundles [`GridQuery`], [`GridPage`], [`GridFocus`]), which live
+//! beside the code that builds them.
 //!
 //! The submodules open with `use super::*`: they are one component tree split
 //! across files rather than modules with a surface of their own, so they
-//! inherit this file's imports instead of restating them four times.
+//! inherit this file's imports instead of restating them every time.
 
+mod body;
 mod copy;
 mod detail;
+mod expand;
+mod focus;
 mod nav;
+mod page;
 mod rows;
 mod stats;
 mod viewer;
 
+use body::*;
 use copy::*;
 use detail::*;
+use expand::*;
+use focus::*;
 use nav::*;
+use page::*;
 use rows::*;
 use stats::*;
 use viewer::*;
@@ -69,151 +84,6 @@ use super::state::{
     find_table_meta, fk_jump_target, grid_export_line, AppState, ImportStatus, TableRef,
 };
 use super::text_field::TextInput;
-
-const PAGE_SIZE: u32 = 100;
-
-/// The table's row count, as far as paging may rely on it: `None` while the
-/// count is running or has failed. A *re-running* count still holds its old
-/// value (`use_resource` keeps it and flips its state to Pending), so it is
-/// unknown rather than stale — new rows are never paired with a count from
-/// before a filter change or a write.
-fn settled_count<E>(pending: bool, count: Option<&Result<u64, E>>) -> Option<u64> {
-    if pending {
-        return None;
-    }
-    count.and_then(|count| count.as_ref().ok().copied())
-}
-
-/// Whether `page`, holding `loaded` rows, is the last one there is — the one
-/// rule both Next and PageDown obey. `loaded` is `None` while the page is
-/// still being fetched, and that is the end for now: the rows on screen are
-/// the previous page's, and a full previous page would otherwise wave the
-/// user on past rows nobody has seen — measured on a view whose deep pages
-/// take seconds, PageDown queued a fetch per press, ahead of all of them.
-///
-/// A known count decides it. An unknown one (see [`settled_count`]) does not
-/// block paging: a short page is the end whatever the count says, and a full
-/// one may have more behind it. Treating unknown as the end left a slow
-/// `COUNT(*)` holding the grid on its page for the whole count — 38 s on a
-/// large view — and a failed count holding it there for good. The price is a
-/// table of exactly a multiple of [`PAGE_SIZE`] rows, whose last full page
-/// offers a next one that comes back empty; that page is short, so it is the
-/// end, and the clamp pulls it back once the count is known.
-fn at_end(count: Option<u64>, page: u64, loaded: Option<u64>) -> bool {
-    let Some(loaded) = loaded else {
-        return true;
-    };
-    match count {
-        Some(count) => page * PAGE_SIZE as u64 + loaded >= count,
-        None => loaded < PAGE_SIZE as u64,
-    }
-}
-
-/// The page to pull the grid back to when `page` is past the last one, or
-/// `None` to leave it where it is.
-///
-/// A delete or an external write (via Refresh) can leave the table with fewer
-/// pages than the one being viewed, and [`at_end`] lets the user page ahead of
-/// a count still running — onto an empty page, when the rows are an exact
-/// multiple of [`PAGE_SIZE`]. Either way the footer would read "rows 301–300
-/// of 250" over an empty page. Only a known count moves the page: while it is
-/// unknown, paging ahead of it is what the user asked for.
-fn clamped_page(count: Option<u64>, page: u64) -> Option<u64> {
-    let last_page = count?.saturating_sub(1) / PAGE_SIZE as u64;
-    (page > last_page).then_some(last_page)
-}
-
-/// What the rows resource holds: the page, the hidden key column it fetched
-/// beside the visible ones, and the offset it was fetched at.
-type FetchedPage = (Page, Option<String>, u64);
-
-/// The offset a page fetch was made at and the rows it returned, out of the
-/// rows resource; `None` while it has nothing (or failed).
-fn fetched_rows<E>(fetched: Option<&Result<FetchedPage, E>>) -> Option<(u64, u64)> {
-    match fetched? {
-        Ok((page, _, offset)) => Some((*offset, page.result.rows.len() as u64)),
-        Err(_) => None,
-    }
-}
-
-/// Whether Next and PageDown may move on from `page` — the whole rule, for
-/// both, from the resources' plain data.
-///
-/// `fetched` is the offset the rows on screen were fetched at and how many
-/// there are. While the page asked for is still being fetched those are the
-/// previous page's rows, and a full previous page says nothing about the one
-/// after: answering from them let PageDown run ahead of a slow deep-page
-/// fetch, queueing a fetch per press. So rows count only when they were
-/// fetched for `page` itself — compared by offset, which does not depend on
-/// the resource having flipped to Pending by the time the next key arrives.
-fn next_page_offered<E>(
-    count_pending: bool,
-    count: Option<&Result<u64, E>>,
-    page: u64,
-    fetched: Option<(u64, u64)>,
-) -> bool {
-    let loaded =
-        fetched.and_then(|(offset, rows)| (offset == page * PAGE_SIZE as u64).then_some(rows));
-    !at_end(settled_count(count_pending, count), page, loaded)
-}
-
-/// The footer's account of the rows on screen: fetched at `offset`, `rows` of
-/// them, out of `count` when it is known. Driven by the fetched offset rather
-/// than the page asked for, so it never labels one page's rows with another's
-/// range while a fetch is in flight. A page with nothing on it says so: past
-/// the first it is the empty page beyond a table of an exact multiple of
-/// [`PAGE_SIZE`] rows, which a failed count leaves in place for good.
-fn row_range(offset: u64, rows: u64, count: Option<u64>) -> String {
-    let of = count.map_or_else(|| "…".to_string(), |count| count.to_string());
-    match (rows, offset) {
-        (0, 0) => "no rows".to_string(),
-        (0, _) => "no more rows".to_string(),
-        _ => format!("rows {}–{} of {of}", offset + 1, offset + rows),
-    }
-}
-
-/// Fixed data-row height in CSS pixels. Rows render one truncated
-/// line at `text-xs` + `py-1`, so their height is uniform; pinning it lets the
-/// windowed renderer compute exact scroll offsets and spacer heights. Measured
-/// in the WebKitGTK webview (rows sit on a 33px pitch). The GridRow `<tr>` is
-/// held to this height so an open inline editor can't shift the offsets.
-const ROW_HEIGHT: f64 = 33.0;
-
-/// Rows rendered above and below the viewport. A margin so a fast
-/// flick rarely reveals a blank spacer before the range updates, and so small
-/// errors from the sticky header offset never uncover an unrendered row.
-const ROW_OVERSCAN: usize = 12;
-
-/// Scroll/resize listener installed on `#dv-grid`. rAF-coalesces
-/// bursts and reports `[scrollTop, clientHeight]` back over the eval channel so
-/// the component can derive the visible row range. Installed once per mount.
-const GRID_SCROLL_JS: &str = r#"
-(() => {
-  const el = document.getElementById('dv-grid');
-  if (!el) return;
-  let scheduled = false, settle = null;
-  const report = () => { scheduled = false; dioxus.send([el.scrollTop, el.clientHeight]); };
-  const onScroll = () => {
-    if (!scheduled) { scheduled = true; requestAnimationFrame(report); }
-    // Trailing settle: guarantee a final report at the resting position even
-    // if momentum scrolling ends without a last 'scroll' event, so the window
-    // can never stay stale (blank) after a fast fling.
-    clearTimeout(settle);
-    settle = setTimeout(report, 120);
-  };
-  el.addEventListener('scroll', onScroll, { passive: true });
-  // Observe the grid element's own size instead of a window 'resize'
-  // listener: a ResizeObserver is garbage-collected together with `el` when
-  // the grid unmounts (a table switch remounts DataGrid), so it can't leak a
-  // listener per opened table the way a never-removed window listener would.
-  // It also catches layout-driven resizes (sidebar/pane), not just window
-  // resizes.
-  if (window.ResizeObserver) {
-    new ResizeObserver(onScroll).observe(el);
-  }
-  requestAnimationFrame(report);
-})();
-"#;
 
 /// Render data shared by many components, cloned by refcount rather than
 /// deep-copied into every one of them.
@@ -300,102 +170,6 @@ impl ActiveEdit {
     }
 }
 
-/// What the value-expand popup shows: a short value already in hand, or a
-/// truncated cell whose full value is loaded lazily via
-/// [`AppState::load_cell`].
-#[derive(Debug, Clone, PartialEq)]
-enum ExpandView {
-    /// A value already fully in the page — rendered directly, and safe to
-    /// copy.
-    ///
-    /// Carries the [`Value`], not its display string: the popup renders it
-    /// through [`CellViewer`], and "Copy raw" has to put the same
-    /// text on the clipboard as a Ctrl+C over that cell —
-    /// [`raw_cell_text`], i.e. the blob's hex and nothing at all for NULL.
-    /// Holding only the display string copied the placeholder.
-    ///
-    /// The column travels with it so the popup can look up the declared type
-    /// the viewer classifies on, exactly as the detail panel does.
-    Text { value: Value, column: String },
-    /// A truncated cell whose row can't be addressed (a view, a keyless
-    /// table), so the full value can never be loaded. The popup shows the
-    /// preview for reading but refuses to copy it — the same call
-    /// [`plan_copy`] makes for this cell. Copying here would put a
-    /// prefix plus a literal `…` on the clipboard.
-    Truncated { display: String, column: String },
-    /// A truncated cell: fetch and show its full value.
-    Fetch { locator: RowLocator, column: String },
-}
-
-/// What Enter on a non-editable focused cell expands to: the value already in
-/// hand, or — for a truncated preview — a fetch of the full value,
-/// which needs the row to be addressable.
-fn expand_view(cell: &GridNavCell, locator: Option<RowLocator>) -> ExpandView {
-    match (cell.truncated(), locator) {
-        (true, Some(locator)) => ExpandView::Fetch {
-            locator,
-            column: cell.column.clone(),
-        },
-        // Truncated but unaddressable: show the preview, but don't offer it
-        // as a value to copy.
-        (true, None) => ExpandView::Truncated {
-            display: cell.display.clone(),
-            column: cell.column.clone(),
-        },
-        (false, _) => ExpandView::Text {
-            value: cell.value.clone(),
-            column: cell.column.clone(),
-        },
-    }
-}
-
-/// What Enter does on the focused cell.
-#[derive(Debug, Clone, PartialEq)]
-enum EnterAction {
-    /// Open the in-place editor on this cell.
-    Edit(ActiveEdit),
-    /// Show the cell's full value in the popup.
-    Expand(ExpandView),
-    /// Nothing: an empty page, or a pending insert's locked cell (a blob or
-    /// generated column, which stays "default" until saved).
-    Nothing,
-}
-
-/// Resolves Enter at focus `pos`, which may be on a fetched row or a pending
-/// insert: an editable cell opens its editor — a pending insert's under its
-/// own row key, the one [`InsertCellSlot`] opens for — and a fetched cell that
-/// can't be edited expands instead. A phantom row has nothing to expand.
-fn enter_action(nav: &GridNav, pos: (usize, usize)) -> EnterAction {
-    let (rows, cols) = nav.focus_dims();
-    if rows == 0 || cols == 0 {
-        return EnterAction::Nothing;
-    }
-    let (r, c) = (pos.0.min(rows - 1), pos.1.min(cols - 1));
-    let edit = |row_key: String| {
-        EnterAction::Edit(ActiveEdit {
-            row_key,
-            column: nav.headers[c].clone(),
-            draft: None,
-        })
-    };
-    if let Some(insert) = nav.insert_at(r) {
-        return match insert.editable.get(c) {
-            Some(true) => edit(insert.key.clone()),
-            _ => EnterAction::Nothing,
-        };
-    }
-    let Some(row) = nav.rows.get(r) else {
-        return EnterAction::Nothing;
-    };
-    let Some(cell) = row.cells.get(c) else {
-        return EnterAction::Nothing;
-    };
-    match (cell.editable, row.key.clone()) {
-        (true, Some(key)) => edit(key),
-        _ => EnterAction::Expand(expand_view(cell, row.locator.clone())),
-    }
-}
-
 /// Paged grid for one table: sortable headers, per-column contains/equals
 /// filter, page navigation, row-count indicator, refresh — plus staged-edit
 /// rendering: dirty cells and deletes are tinted, pending inserts
@@ -420,632 +194,58 @@ fn enter_action(nav: &GridNav, pos: (usize, usize)) -> EnterAction {
 /// per-table and resets when another table is selected. (The refresh nonce
 /// is NOT local: it lives in [`AppState::grid_refresh`] so a successful save
 /// can force a refetch from outside the component.)
+///
+/// The state lives in hooks named for what they hold — [`use_grid_query`]
+/// and [`use_grid_page`] (the page), [`use_grid_editors`], [`use_grid_focus`]
+/// and [`use_selection`] (the keyboard), [`use_row_window`] and
+/// [`use_visible_rows`] (the windowed rows) — called in the order their
+/// effects have to be installed. What is left here is reading the table's
+/// access and stage, and laying out the chrome around [`GridBody`].
 #[component]
 pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let state = use_context::<AppState>();
-    let mut page = use_signal(|| 0u64);
-    // Which cell's editor is open (by row key + column).
-    let mut editing = use_signal(|| Option::<ActiveEdit>::None);
-    // The row detail panel's open editor. Lives here, above the
-    // panel, because `RowDetailFields` is keyed by row: anything held inside
-    // it is destroyed by every row move, which silently discarded whatever
-    // the user had typed. Hoisting it is what lets a half-typed draft survive.
-    let mut detail_editing = use_signal(|| Option::<ActiveEdit>::None);
-    // One editor open anywhere, enforced in one place rather than at each of
-    // the grid's six activation sites. Both editors render the same element
-    // id, so two mounted at once fight over focus and leave one orphaned and
-    // unreachable by Escape. The panel's own activation closes the grid's
-    // directly; this closes the panel's whenever the grid opens one.
-    //
-    // It only ever *has* to act in one case, and that case is the whole
-    // point. Any route to the grid blurs the panel's input first, which
-    // commits and closes it — unless the text doesn't parse. So the panel
-    // still being open here means unparseable text, which is exactly when its
-    // `on_draft` would otherwise resurrect it on unmount. Clearing the signal
-    // is what makes that stash see itself as stale and decline; the two are
-    // load-bearing together, and neither works alone.
-    use_effect(move || {
-        if editing.read().is_some() && detail_editing.peek().is_some() {
-            detail_editing.set(None);
-        }
-    });
-    // Keyboard focus ring in the grid (row, col into the visible page's
-    // rows × columns), and the value-expand popup.
-    let mut focused_cell = use_signal(|| Option::<(usize, usize)>::None);
-    // The other corner of a rectangular cell selection; the focus
-    // ring is the near corner. `None` means the selection is exactly the
-    // focused cell — the common case, and why this is a separate signal
-    // rather than a rewrite of `focused_cell`: every existing focus behaviour
-    // (clamping, scroll-into-view, Enter) keeps working untouched.
-    let mut selection_anchor = use_signal(|| Option::<(usize, usize)>::None);
-    // Outcome of the most recent copy, shown in the toolbar until the next
-    // copy or a page/selection reset. Also carries a refusal.
-    let mut copy_status = use_signal(|| Option::<CopyStatus>::None);
+    let editors = use_grid_editors();
+    let editing = editors.editing;
+    let focus = use_grid_focus();
+    let GridFocus {
+        focused_cell,
+        copy_status,
+        ..
+    } = focus;
     // Whether the copy-as menu is open.
-    let mut copy_menu = use_signal(|| false);
+    let copy_menu = use_signal(|| false);
     // The value-expand popup: either an already-known short value
     // rendered inline, or a truncated cell whose full value is fetched on
     // demand.
-    let mut expanded = use_signal(|| Option::<ExpandView>::None);
-    let mut sort = use_signal(|| Option::<(String, SortDir)>::None);
-    // Windowed rendering: the grid's live scroll offset and viewport
-    // height, fed by a scroll/resize listener installed on `#dv-grid`. The
-    // visible row range is derived from these; only rows in that range (plus
-    // overscan) are put in the DOM. `viewport_h` seeds non-zero so the first
-    // render before the listener reports still windows to a sane range.
-    let mut scroll_top = use_signal(|| 0.0f64);
-    let mut viewport_h = use_signal(|| 600.0f64);
+    let expanded = use_signal(|| Option::<ExpandView>::None);
+    let window = use_row_window();
     // Rows ticked for deletion (row key → locator). UI-only state: nothing
     // is staged until "Delete N selected".
-    let mut selected = use_signal(HashMap::<String, RowLocator>::new);
-    // The armed save confirmation: the exact change list shown to the user
-    // when the Save button turned into "Confirm: delete N…". The second
-    // click only proceeds while the stage still generates this exact list.
-    let mut confirm = use_signal(|| Option::<Armed<Vec<StagedChange>>>::None);
-    // Once armed, the FIRST divergence of the stage from the snapshot
-    // permanently disarms — clearing `confirm`, not just hiding it. Without
-    // this, staging then un-staging back to an identical change list (e.g.
-    // add a phantom insert, then remove it) would silently re-arm the
-    // confirmation, letting the next single click save without a fresh
-    // confirm step. Requiring a new first click after any change keeps the
-    // "two clicks per confirmation instance" guarantee.
-    let confirm_reset_table = table.clone();
-    use_effect(move || {
-        let Some(snapshot) = confirm.read().as_ref().map(|armed| armed.subject().clone()) else {
-            return;
-        };
-        let current = state
-            .table_stage(id, &confirm_reset_table)
-            .map(|s| s.changes())
-            .unwrap_or_default();
-        if current != snapshot {
-            confirm.set(None);
-        }
-    });
-    // The filter inputs are staged locally and only hit the query when
-    // applied, so typing doesn't fire a query per keystroke.
-    let filter_column = use_signal(String::new);
-    let filter_op = use_signal(|| FilterOp::Contains);
-    let filter_text = use_signal(String::new);
-    // Seed the filter from a pending foreign-key focus targeting this table,
-    // so a jump paints the referenced row with no unfiltered flash.
-    // The consuming effect below clears the focus (and handles a same-table
-    // jump, where the grid stays mounted and only the filter changes).
-    let seed_table = table.clone();
-    let mut applied_filter = use_signal(move || {
-        state
-            .pending_focus
-            .peek()
-            .get(&id)
-            .filter(|focus| focus.table == seed_table)
-            .and_then(|focus| focus.filter.clone())
-    });
-    let focus_table = table.clone();
-    use_effect(move || {
-        let mut state = state;
-        let matched = state
-            .pending_focus
-            .read()
-            .get(&id)
-            .filter(|focus| focus.table == focus_table)
-            .cloned();
-        if let Some(focus) = matched {
-            applied_filter.set(focus.filter);
-            page.set(0);
-            // Reading pending_focus above subscribes this effect; removing the
-            // consumed entry re-runs it once (now no match) — no loop.
-            state.pending_focus.write().remove(&id);
-        }
-    });
-
-    // This grid's own refresh nonce, pulled out of the whole-map signal
-    // through a memo: signal subscription is per-signal, not per-key, so a
-    // raw `grid_refresh.read()` re-runs its readers on ANY write to the map —
-    // a save bumping another table's nonce, or `close_connection` pruning a
-    // closed tab's entries. The memo re-runs on those writes too, but its
-    // PartialEq gate stops the propagation there: the reset effect and the
-    // resources below only re-run when THIS grid's nonce actually changed.
-    let nonce_table_key = table.key();
-    let refresh_nonce = use_memo(move || {
-        state
-            .grid_refresh
-            .read()
-            .get(&(id, nonce_table_key.clone()))
-            .copied()
-    });
-
-    // Close any open editor and drop the row selection when the rows change
-    // under them: a page flip, sort/filter change, or refetch replaces the
-    // grid's contents — a stale ActiveEdit would spontaneously re-open the
-    // editor if its row key scrolled back into view, and a stale selection
-    // could stage deletes for rows the user no longer sees.
-    use_effect(move || {
-        let _ = page();
-        let _ = sort.read();
-        let _ = applied_filter.read();
-        let _ = refresh_nonce();
-        // Peeked first: a set is unconditional, and every write wakes the
-        // focus effect below — which is how applying a filter used to pull
-        // focus out of the filter box.
-        if editing.peek().is_some() {
-            editing.set(None);
-        }
-        selected.set(HashMap::new());
-        // Re-seed the focus ring at the first cell and drop any expand popup;
-        // the clamp effect below trims it to None for an empty page.
-        focused_cell.set(Some((0, 0)));
-        // …and collapse the cell selection to it: the rows under a
-        // rectangle spanning the old page are not the rows the user picked.
-        selection_anchor.set(None);
-        copy_status.set(None);
-        copy_menu.set(false);
-        expanded.set(None);
-        // Reset the windowed scroll position too so a new page/sort/
-        // filter starts at the top, both the tracked offset and the container.
-        scroll_top.set(0.0);
-        document::eval(
-            "requestAnimationFrame(() => { \
-                const el = document.getElementById('dv-grid'); \
-                if (el) el.scrollTop = 0; \
-            });",
-        );
-        // A reset can take away whatever held focus: Save's button goes with
-        // the pending-changes bar once the stage empties, and a refresh
-        // closes an open value popup. Either leaves focus on the body, so
-        // hand it back — but only from there, never from the filter box a
-        // filter was just applied from, nor from the Refresh button.
-        reclaim_focus_by_id_next_frame("dv-grid");
-    });
-
-    // Rowid-identity tables (SQLite, keyless) need the rowid in every
-    // fetched row to build row locators, but `SELECT *` doesn't include
-    // it — ask the page reader for it explicitly. The fetch's extra
-    // column is returned alongside the result so rendering hides
-    // exactly what this fetch prepended (never a stale render-time
-    // guess).
-    //
-    // The bounded fetch also needs the table's columns (to preview large
-    // ones) and the columns that must NOT be previewed: identity keys and
-    // foreign-key columns, whose truncation would misaddress rows or
-    // misdirect a jump.
-    //
-    // Derived through a memo because `registry` and `schemas` are whole-map
-    // signals: a raw read in the resource would re-issue this grid's SQL
-    // fetch on any other connection's open/close or schema load. The memo's
-    // PartialEq gate lets the fetch re-run only when this table's own inputs
-    // change.
-    let meta_table = table.clone();
-    let fetch_meta = use_memo(move || {
-        let registry = state.registry.read();
-        let schemas = state.schemas.read();
-        let meta = find_table_meta(schemas.get(&id), &meta_table);
-        match (meta, registry.get(id)) {
-            (Some(meta), Some(connection)) => {
-                // Row identity is a read concern here — it decides which
-                // columns must be fetched whole — so it comes from the
-                // resolved access, not from whether editing is allowed.
-                let identity = connection.pool.backend_row_identity(meta);
-                let extra = match &identity {
-                    Some(RowIdentity::Rowid { column }) => Some(column.clone()),
-                    _ => None,
-                };
-                let mut no_preview: Vec<String> = identity
-                    .as_ref()
-                    .map(|i| i.key_columns().iter().map(|s| s.to_string()).collect())
-                    .unwrap_or_default();
-                for fk in &meta.foreign_keys {
-                    no_preview.extend(fk.columns.iter().cloned());
-                }
-                (meta.columns.clone(), no_preview, extra)
-            }
-            _ => (Vec::new(), Vec::new(), None),
-        }
-    });
-
-    // Whether this object has any rows to list at all, so that a
-    // declared-unbrowsable object never reaches the server: the query it would
-    // otherwise run is one the engine can only answer with an error. Two cases:
-    // a RisingWave sink, which writes outward to Kafka or another database and
-    // stores nothing, and a SQLite object the engine can list but not resolve
-    // (a virtual table whose module is missing, a view over a dropped table).
-    //
-    // Resolved through a memo for the reason `fetch_meta` above is: `registry`
-    // and `schemas` are whole-map signals, so a raw read would make every
-    // other connection's open, close or protection change re-run this grid's
-    // page fetch and its `COUNT(*)`. `Option<Option<_>>` because
-    // "unknown" and "browsable" are different answers — a reload sets
-    // `SchemaLoad::Loading`, which empties the table list, so the outer `None`
-    // is the ordinary state during a sidebar Refresh rather than an edge case.
-    let gate_table = table.clone();
-    let resolved_gate = use_memo(move || {
-        let registry = state.registry.read();
-        let schemas = state.schemas.read();
-        match (
-            find_table_meta(schemas.get(&id), &gate_table),
-            registry.get(id),
-        ) {
-            (Some(meta), Some(connection)) => Some(connection.access(meta).unreadable),
-            _ => None,
-        }
-    });
-    let mut unbrowsable = use_signal(|| resolved_gate().flatten());
-    use_effect(move || {
-        // Keeps the last known answer while the schema reloads, instead of
-        // falling open and sending the very query the gate exists to stop —
-        // the same treatment the SQL editor gives its completions. A table
-        // does not stop being a sink because its schema is being re-read.
-        //
-        // Covers reloads, not the first load: a grid mounted by session
-        // restore before its schema has ever arrived has no answer to keep, so
-        // one refused query can still go out and be corrected when the schema
-        // lands. Self-correcting, because the resources read this signal.
-        //
-        // Peeked before writing: `Signal::set` is unconditional, and both
-        // resources subscribe to this, so setting an unchanged value would
-        // re-fetch the page and re-count the rows for nothing — undoing the
-        // memo's gate one line above.
-        if let Some(reason) = resolved_gate() {
-            if *unbrowsable.peek() != reason {
-                unbrowsable.set(reason);
-            }
-        }
-    });
-
-    let table_for_resource = table.clone();
-    let rows_resource = use_resource(move || {
-        let table = table_for_resource.clone();
-        // Read reactive deps before any await so the resource re-runs when
-        // they change and no borrow spans the await.
-        let (columns, no_preview, extra_key_column) = fetch_meta();
-        let request = PageRequest {
-            schema: table.schema.clone(),
-            table: table.name.clone(),
-            limit: PAGE_SIZE,
-            offset: page() * PAGE_SIZE as u64,
-            sort: sort(),
-            filter: applied_filter(),
-            extra_key_column,
-        };
-        let _ = refresh_nonce();
-        let refused = unbrowsable();
-        // Peeked, not read: subscribing to `registry` here would re-fetch on
-        // any connection open/close. The pool for a ConnectionId never
-        // changes while this grid is mounted — the registry's only writes
-        // are `insert` (mints a fresh id), `set_protection` (pool untouched)
-        // and `remove` (which unmounts this tab) — so there is no pool
-        // change to react to; a reconnect is a new id and a new grid.
-        //
-        // `browse` hands over the connection's `Reading` with it, at fetch
-        // time: it says whether the read runs where the engine refuses
-        // writes (a marked connection — see `DbPool::fetch_page`), and a
-        // marking changed since the last fetch applies to the next one.
-        let pool = state.registry.peek().get(id).map(|c| c.browse());
-        async move {
-            if let Some(reason) = refused {
-                return Err(crate::db::DbError::Unsupported(reason.to_string()));
-            }
-            let Some((pool, reading)) = pool else {
-                return Err(crate::db::DbError::Query("connection closed".into()));
-            };
-            let no_preview_refs: Vec<&str> = no_preview.iter().map(String::as_str).collect();
-            let page = pool
-                .fetch_page_bounded(reading, &request, &columns, &no_preview_refs)
-                .await?;
-            // The offset travels with the rows, so whatever describes them —
-            // the footer's range, the paging rule — describes the rows on
-            // screen rather than the page asked for since.
-            Ok::<FetchedPage, crate::db::DbError>((page, request.extra_key_column, request.offset))
-        }
-    });
-
-    // Row count, fetched separately from the page so it is NOT re-run on every
-    // page flip or sort change: `COUNT(*)` depends only on the table
-    // and filter. It re-runs when the filter changes or a write bumps
-    // `grid_refresh`; between those, Dioxus keeps the resolved value, so
-    // flipping pages reuses the cached count with no extra query.
-    let count_table = table.clone();
-    let count_resource = use_resource(move || {
-        let table = count_table.clone();
-        let request = PageRequest {
-            schema: table.schema.clone(),
-            table: table.name.clone(),
-            limit: PAGE_SIZE,
-            offset: 0,
-            sort: None, // COUNT(*) ignores ordering
-            filter: applied_filter(),
-            extra_key_column: None,
-        };
-        let _ = refresh_nonce();
-        let refused = unbrowsable();
-        // Peeked for the same reason as in `rows_resource`: the pool for a
-        // ConnectionId is fixed for the connection's lifetime, and reading
-        // `registry` would re-count on unrelated connection opens/closes.
-        // With its `Reading`, as for the page.
-        let pool = state.registry.peek().get(id).map(|c| c.browse());
-        async move {
-            // Gated as well as the page: counting rows an object does not have
-            // is the same query failing for the same reason.
-            if let Some(reason) = refused {
-                return Err(crate::db::DbError::Unsupported(reason.to_string()));
-            }
-            let Some((pool, reading)) = pool else {
-                return Err(crate::db::DbError::Query("connection closed".into()));
-            };
-            pool.count_rows(reading, &request).await
-        }
-    });
-
-    // Clamp the page if it is past the last — see [`clamped_page`]. Setting
-    // the page re-runs this once with a now-valid page, so it settles without
-    // looping. (Reactive; verified live, not by unit test.)
-    use_effect(move || {
-        let count = settled_count(
-            *count_resource.state().read() == UseResourceState::Pending,
-            count_resource.read().as_ref(),
-        );
-        if let Some(last_page) = clamped_page(count, page()) {
-            page.set(last_page);
-        }
-    });
-
-    // The introspected metadata every row of this table renders against,
-    // built once here and handed to the row components as a single
-    // pointer-compared prop instead of a `HashMap`/`Vec` deep-cloned into each
-    // of the ~30 windowed rows on every render.
-    //
-    // A memo because `schemas` and `registry` are whole-map signals: a raw
-    // read would rebuild — and re-render every row — on any other connection's
-    // schema load. The memo re-runs then too, but its PartialEq gate stops the
-    // propagation there (the same gate that keeps another tab's writes from
-    // resetting this grid).
-    let render_table = table.clone();
-    let render_meta = use_memo(move || {
-        let schemas = state.schemas.read();
-        let (dialect, rules) = state
-            .registry
-            .read()
-            .get(id)
-            .map(|c| (c.pool.dialect(), c.pool.key_rules()))
-            .unzip();
-        let load = schemas.get(&id);
-        Shared::new(TableRenderMeta::build(
-            find_table_meta(load, &render_table),
-            dialect,
-            |fk| rules.is_some_and(|rules| fk_jump_target(load, fk, rules).is_some()),
-        ))
-    });
-
-    // The fetched page reduced to what the grid renders: headers,
-    // the rows with the stage applied, and the rows "select all on this page"
-    // ticks.
-    //
-    // This is the grid's expensive derivation — it clones every cell `Value`
-    // of the 100-row page. Deriving it in the render body re-ran it on every
-    // arrow key, shift-click, copy and checkbox tick, because the render also
-    // reads `focused_cell`, `selection`, `copy_status` and `selected`. Behind
-    // a memo none of those reach it: a focus move now costs the two `GridRow`
-    // diffs it should.
-    //
-    // It is not fully insulated, and doesn't need to be. `schemas`, `registry`
-    // and `stages` are whole-map signals, so this still re-runs on an
-    // unrelated connection's schema load or save — as the render body always
-    // did. What changed is that the PartialEq gate below stops such a rebuild
-    // from reaching the rows, so the cost is one derivation rather than a
-    // re-render of the grid.
-    let page_table = table.clone();
-    let page_view = use_memo(move || {
-        let meta = render_meta();
-        let current = rows_resource.read();
-        let Some(Ok((page, extra_key, _))) = current.as_ref() else {
-            return PageView::default();
-        };
-        let result = &page.result;
-        // Same resolution the render uses, so keyboard navigation offers
-        // exactly the editors the grid shows — the user's marking
-        // included. Resolving the *backend's* answer here instead would let
-        // Enter open an editor on a cell the mouse correctly refuses.
-        let access = find_table_meta(state.schemas.read().get(&id), &page_table)
-            .and_then(|meta| state.table_access(id, meta));
-        let identity = access.as_ref().and_then(|a| a.identity.clone());
-        let can_mutate = access.as_ref().is_some_and(TableAccess::can_mutate);
-        let stage = state.table_stage(id, &page_table);
-        // The fetch prepended the row-identity key column (rowid) when one was
-        // requested; keep it for locators, hide it from display.
-        let hidden = usize::from(extra_key.is_some());
-        let headers: Vec<String> = if result.columns.is_empty() {
-            meta.schema_columns.clone()
-        } else {
-            result
-                .columns
-                .iter()
-                .skip(hidden)
-                .map(|c| c.name.clone())
-                .collect()
-        };
-        let rows = view_rows(
-            result,
-            &page.previews,
-            hidden,
-            identity.as_ref(),
-            stage.as_ref(),
-            can_mutate,
-        );
-        PageView {
-            headers: Shared::new(headers),
-            selectable: Shared::new(selectable_rows(&rows)),
-            rows,
-        }
-    });
-
-    // Keyboard-navigation model of the visible page: read by the grid
-    // container's key handler for focus movement and Enter. Built from the
-    // same `page_view` the render consumes — one row derivation, two readers —
-    // but owning its data so the `'static` key closure can read it off-render.
-    let nav_table = table.clone();
-    let grid_nav = use_memo(move || {
-        let view = page_view.read();
-        let meta = render_meta();
-        // The phantom rows render only under a loaded page, so they join
-        // the focus ring only then too.
-        let inserts = match (
-            rows_resource.read().as_ref(),
-            state.table_stage(id, &nav_table),
-        ) {
-            (Some(Ok(_)), Some(stage)) => stage.inserts().to_vec(),
-            _ => Vec::new(),
-        };
-        GridNav::build((*view.headers).clone(), &view.rows, &meta.column_kinds)
-            .with_inserts(&inserts, &meta.column_kinds)
-    });
-
-    // Keep the focus ring inside the current page and seed it once data
-    // arrives, so it is visible and never indexes out of range after a page or
-    // filter change shrinks the grid.
-    // The selection's far corner is clamped alongside the focus: a
-    // rectangle reaching past a page that just shrank would address rows the
-    // grid no longer has.
-    use_effect(move || {
-        let (rows, cols) = grid_nav.read().focus_dims();
-        let focus = *focused_cell.peek();
-        let anchor = *selection_anchor.peek();
-        let current = match focus {
-            Some(focus) => Selection {
-                anchor: anchor.unwrap_or(focus),
-                focus,
-            },
-            // Nothing focused yet: seed at the first cell if the page has one.
-            None => Selection::single((0, 0)),
-        };
-        match current.clamped(rows, cols) {
-            None => {
-                if focus.is_some() {
-                    focused_cell.set(None);
-                }
-                if anchor.is_some() {
-                    selection_anchor.set(None);
-                }
-            }
-            Some(clamped) => {
-                if focus != Some(clamped.focus) {
-                    focused_cell.set(Some(clamped.focus));
-                }
-                // Only re-pin an anchor that was actually set; a collapsed
-                // selection must stay collapsed.
-                if anchor.is_some() && anchor != Some(clamped.anchor) {
-                    selection_anchor.set(Some(clamped.anchor));
-                }
-            }
-        }
-    });
-
-    // The live cell selection: the focus ring's cell plus the
-    // anchor, when one is pinned. `None` only for a page with nothing to
-    // select. Derived rather than stored so the two corners can never drift
-    // apart from the focus the rest of the grid navigates by.
-    //
-    // `None` too while the focus ring is on a pending insert, which no
-    // selection covers (see `GridNav`).
-    let selection = use_memo(move || {
-        selection_of(
-            *focused_cell.read(),
-            *selection_anchor.read(),
-            grid_nav.read().rows.len(),
-        )
-    });
-
-    // Scroll the focused cell into view as it moves. With windowed rows an
-    // offscreen focused row may not be in the DOM yet, so we can't rely on
-    // its node: instead scroll the container to the focused
-    // row's computed offset (rows are `ROW_HEIGHT` tall), which also updates
-    // the visible range so the row renders. A second frame then nudges the
-    // now-rendered cell into view horizontally (column offsets aren't fixed).
-    use_effect(move || {
-        let Some((r, _c)) = *focused_cell.read() else {
-            return;
-        };
-        let top = r as f64 * ROW_HEIGHT;
-        document::eval(&format!(
-            "requestAnimationFrame(() => {{ \
-                const el = document.getElementById('dv-grid'); \
-                if (!el) return; \
-                const h = {ROW_HEIGHT}; const top = {top}; const pad = 2 * h; \
-                if (top < el.scrollTop + pad) {{ \
-                    el.scrollTop = Math.max(0, top - pad); \
-                }} else if (top + h > el.scrollTop + el.clientHeight - pad) {{ \
-                    el.scrollTop = top + h - el.clientHeight + pad; \
-                }} \
-                requestAnimationFrame(() => {{ \
-                    const c = document.getElementById('dv-focused-cell'); \
-                    if (c) c.scrollIntoView({{ block: 'nearest', inline: 'nearest' }}); \
-                }}); \
-            }});",
-        ));
-    });
-
-    // Install a scroll/resize listener on the grid container once per mount and
-    // pump the offset/height it reports into `scroll_top`/`viewport_h`, which
-    // drive the visible-row range. rAF-coalesced so a scroll burst
-    // yields at most one update per frame. The channel stays open for the
-    // component's life; it reads no signals, so it installs exactly once.
-    use_effect(move || {
-        spawn(async move {
-            let mut channel = document::eval(GRID_SCROLL_JS);
-            while let Ok(msg) = channel.recv::<(f64, f64)>().await {
-                let (top, height) = msg;
-                if *scroll_top.peek() != top {
-                    scroll_top.set(top);
-                }
-                if height > 0.0 && *viewport_h.peek() != height {
-                    viewport_h.set(height);
-                }
-            }
-        });
-    });
-
-    // The rows to actually put in the DOM: a contiguous window around
-    // the viewport. Arrow-keying to an offscreen row is handled by the
-    // focus-scroll effect below, which scrolls that row into view (updating
-    // `scroll_top`, so this window then includes it) rather than widening the
-    // window to the focus — the latter would drag the window back to a
-    // now-offscreen focus and defeat windowing after a mouse scroll.
-    let visible_range = use_memo(move || {
-        let total = grid_nav.read().rows.len();
-        compute_visible_range(scroll_top(), viewport_h(), ROW_HEIGHT, total, ROW_OVERSCAN)
-    });
-
-    // Give keyboard focus to the grid container on mount, and hand it back
-    // after an editor closes (the editor input, not the container, held
-    // focus), so arrow navigation keeps working without a mouse click.
-    //
-    // Both editors count: watching only the grid's left the arrow
-    // keys dead after a commit in the panel, because focus stayed on the
-    // closed panel editor's input and nothing handed it back.
-    //
-    // `grid_refocus` decides from the *edge*, not the level: this effect
-    // re-runs on every write to either signal, and a write of `None` over
-    // `None` (any page, sort, filter or refresh reset) used to pull focus
-    // out of the filter box the user had just pressed Enter in. And handing
-    // focus back only reclaims it — it leaves alone a focus the user moved
-    // elsewhere, as clicking the filter box while an editor was open does
-    // (the click's blur is what commits and closes the editor).
-    let mut editor_was_open = use_hook(|| CopyValue::new(None::<bool>));
-    use_effect(move || {
-        let open = editing.read().is_some() || detail_editing.read().is_some();
-        let was_open = *editor_was_open.peek();
-        editor_was_open.set(Some(open));
-        match grid_refocus(was_open, open) {
-            GridRefocus::Take => focus_by_id_next_frame("dv-grid"),
-            GridRefocus::Reclaim => reclaim_focus_by_id_next_frame("dv-grid"),
-            GridRefocus::Leave => {}
-        }
-    });
+    let selected = use_signal(HashMap::<String, RowLocator>::new);
+    let confirm = use_save_confirm(id, &table);
+    let query = use_grid_query(id, &table);
+    use_grid_reset(
+        query,
+        editing,
+        focus,
+        copy_menu,
+        expanded,
+        selected,
+        window.scroll_top,
+    );
+    let grid_page = use_grid_page(id, &table, query);
+    let grid_nav = grid_page.nav;
+    let render_meta = grid_page.render_meta;
+    let selection = use_selection(focus, grid_nav);
+    let visible_range = use_visible_rows(window, grid_nav);
+    use_editor_refocus(editors);
 
     // The row detail panel's model. The panel's row is derived from
     // the selection's focus, never stored: it cannot drift from the cell the
     // grid has focused.
     //
     // Memoized: it clones the focused row's every value, and the
-    // render body below re-runs on every copy, tick and selection change.
+    // grid re-renders on every stage change and every panel toggle.
     // Reading `focused_cell` here is
     // deliberate — the panel follows the grid's focus — but the memo's
     // PartialEq gate means a move *within* one row (a left/right arrow)
@@ -1114,7 +314,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         .unwrap_or(0);
     let delete_count = stage.as_ref().map(TableStage::delete_count).unwrap_or(0);
     // The confirmation stays armed only while its snapshot still matches
-    // the stage exactly (see `confirm` above).
+    // the stage exactly (see `use_save_confirm`).
     let armed = delete_count > 0
         && stage.as_ref().is_some_and(|s| {
             confirm
@@ -1124,8 +324,6 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                 == Some(s.changes().as_slice())
         });
 
-    let current = rows_resource.read();
-    let sort_value = sort();
     let row_table = table.clone();
     let detail_table = table.clone();
     // The row detail panel. Open/closed and width live on the tab,
@@ -1133,24 +331,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     // and the open flag rides the persisted session.
     let detail_open = state.row_detail_open(id);
     let detail_width = clamp_detail_width(state.row_detail_width(id).unwrap_or(DETAIL_WIDTH));
-    // Prev/Next in the panel move the GRID's focus, through the same
-    // resolution an arrow key takes — the panel steers the one selection
-    // rather than keeping a second row of its own.
-    let on_detail_step = move |step: RowStep| {
-        let (rows, cols) = grid_nav.peek().dims();
-        if rows == 0 || cols == 0 {
-            return;
-        }
-        let pos = focused_cell.peek().unwrap_or((0, 0));
-        if let FocusOutcome::Cell(next) = apply_grid_move(pos, step.grid_move(), rows, cols) {
-            // Collapses the selection, exactly like an unmodified arrow key.
-            selection_anchor.set(None);
-            focused_cell.set(Some(next));
-            copy_status.set(None);
-        }
-    };
     // Everything a clipboard copy needs besides the selection itself.
-    // Cloned per event handler; all of it is cheap.
     let copy_ctx = CopyContext {
         state,
         id,
@@ -1158,142 +339,28 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         dialect,
         status: copy_status,
     };
-
-    // Moves the focus ring to a clicked cell, extending the selection instead
-    // of collapsing it when Shift is held. A run of shift-clicks all
-    // extend from the same corner, because the anchor never moves.
-    let on_select_cell = move |(row, col, shift): (usize, usize, bool)| {
-        let focus = focused_cell.peek().unwrap_or((row, col));
-        let current = Selection {
-            anchor: selection_anchor.peek().unwrap_or(focus),
-            focus,
-        };
-        let (anchor, focus) = select_to(current, (row, col), shift, grid_nav.peek().rows.len());
-        selection_anchor.set(anchor);
-        focused_cell.set(Some(focus));
-        copy_status.set(None);
+    let on_grid_key = grid_key_handler(
+        editing, expanded, focus, copy_menu, copy_ctx, grid_page, query.page,
+    );
+    // What every row renders against, handed to each as one prop.
+    let row_ctx = RowContext {
+        id,
+        table: table.clone(),
+        meta: meta.clone(),
+        dialect: dialect.unwrap_or(Dialect::Sqlite),
+        editing,
     };
-
-    // Grid keyboard navigation. Attached to the focusable scroll
-    // container, so it also receives keydowns bubbling from focused children;
-    // it no-ops while an editor is open (whose own keys bubble here). Movement
-    // and Enter act on `grid_nav`/`focused_cell`; PageUp/PageDown flip pages.
-    // Selection and copy ride on the same model: Shift extends
-    // instead of collapsing, Ctrl+A / Shift+Space / Ctrl+Space select the
-    // page / row / column, and Ctrl+C copies.
-    let key_copy_ctx = copy_ctx.clone();
-    // Closes the value-expand popup and hands focus back to the grid: the
-    // popup held it, and it is about to be removed.
-    let mut close_expanded = move || {
-        expanded.set(None);
-        focus_by_id_next_frame("dv-grid");
+    let pending_inserts: Vec<PendingInsert> = stage
+        .as_ref()
+        .map(|s| s.inserts().to_vec())
+        .unwrap_or_default();
+    let grid_selection = GridSelection {
+        selection,
+        grid_nav,
+        copy_status,
+        copy_menu,
     };
-    let on_grid_key = move |evt: KeyboardEvent| {
-        if editing.peek().is_some() {
-            return;
-        }
-        let code = evt.code();
-        // Escape closes the value-expand popup, if one is open — and
-        // otherwise collapses a multi-cell selection back to the focus.
-        if code == Code::Escape {
-            if expanded.peek().is_some() {
-                evt.prevent_default();
-                close_expanded();
-            } else if selection_anchor.peek().is_some() {
-                evt.prevent_default();
-                selection_anchor.set(None);
-            }
-            return;
-        }
-        let modifiers = evt.modifiers();
-        let ctrl = accel_held(modifiers);
-        let shift = modifiers.shift();
-        // Two extents: the focus ring moves over the pending inserts too,
-        // while a selection — and so copying, and selecting a whole row or
-        // page — covers the fetched rows only.
-        let (focus_rows, cols) = grid_nav.peek().focus_dims();
-        let rows = grid_nav.peek().rows.len();
-        if focus_rows == 0 || cols == 0 {
-            return;
-        }
-        let pos = focused_cell.peek().unwrap_or((0, 0));
-        let current = Selection {
-            anchor: selection_anchor.peek().unwrap_or(pos),
-            focus: pos,
-        };
-        let on_insert = pos.0 >= rows;
-        // Copy: the plain shortcut, so `None` — a single cell
-        // copies its raw value, a block copies TSV. A pending insert has no
-        // value to copy.
-        if ctrl && code == Code::KeyC {
-            evt.prevent_default();
-            if !on_insert {
-                copy_menu.set(false);
-                start_copy(&key_copy_ctx, &grid_nav.peek(), current, None);
-            }
-            return;
-        }
-        // Select all / whole row / whole column. Ctrl+A must also suppress
-        // the webview's own "select the page's text".
-        let axis = match code {
-            Code::KeyA if ctrl => Selection::all(rows, cols),
-            Code::Space if ctrl => Selection::column(pos.1, rows),
-            Code::Space if shift && !on_insert => Selection::row(pos.0, cols),
-            _ => None,
-        };
-        if let Some(axis) = axis {
-            evt.prevent_default();
-            selection_anchor.set(Some(axis.anchor));
-            focused_cell.set(Some(axis.focus));
-            copy_status.set(None);
-            return;
-        }
-        if code == Code::Enter || code == Code::NumpadEnter {
-            evt.prevent_default();
-            // Editable cell → open the in-place editor; otherwise expand
-            // the value. A truncated cell fetches its full value on demand;
-            // a complete one shows the in-hand text.
-            let action = enter_action(&grid_nav.peek(), pos);
-            match action {
-                EnterAction::Edit(edit) => editing.set(Some(edit)),
-                EnterAction::Expand(view) => expanded.set(Some(view)),
-                EnterAction::Nothing => {}
-            }
-            return;
-        }
-        let Some(mv) = grid_move_for(code, ctrl) else {
-            return;
-        };
-        evt.prevent_default();
-        match apply_grid_move(pos, mv, focus_rows, cols) {
-            FocusOutcome::Cell(next) => {
-                // Shift extends the rectangle (the anchor stays where the
-                // selection started); an unmodified move collapses it.
-                let (anchor, focus) = select_to(current, next, shift, rows);
-                selection_anchor.set(anchor);
-                focused_cell.set(Some(focus));
-            }
-            FocusOutcome::PrevPage => {
-                let p = *page.peek();
-                if p > 0 {
-                    page.set(p - 1);
-                }
-            }
-            FocusOutcome::NextPage => {
-                // The Next button's rule, so the two cannot disagree.
-                let p = *page.peek();
-                let offered = next_page_offered(
-                    *count_resource.state().peek() == UseResourceState::Pending,
-                    count_resource.peek().as_ref(),
-                    p,
-                    fetched_rows(rows_resource.peek().as_ref()),
-                );
-                if offered {
-                    page.set(p + 1);
-                }
-            }
-        }
-    };
+    let applied_filter = query.filter.applied;
 
     rsx! {
         div { class: "flex h-full min-h-0 flex-col",
@@ -1309,16 +376,8 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                 import_file,
                 detail_open,
                 meta: meta.clone(),
-                filter_column,
-                filter_op,
-                filter_text,
-                applied_filter,
-                page,
-                sort,
-                selection,
-                grid_nav,
-                copy_status,
-                copy_menu,
+                query,
+                selection: grid_selection,
             }
             GridBars {
                 id,
@@ -1362,258 +421,16 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     class: "min-h-0 flex-1 select-none overflow-auto outline-none",
                     tabindex: "0",
                     onkeydown: on_grid_key,
-                    match current.as_ref() {
-                        None => rsx! {
-                            DelayedLoading { label: "Loading…" }
-                        },
-                        // An object the backend declares has no rows to show
-                        // is not a failure to report in red: it is a known
-                        // property of the object, not something that just went
-                        // wrong, and there is simply nothing to list. A
-                        // RisingWave sink stores nothing itself; a SQLite
-                        // object the engine cannot resolve has rows hubro
-                        // cannot reach. The sentence is the backend's own, so
-                        // it explains the object rather than naming the engine.
-                        //
-                        // Guarded on the error alone would be wrong:
-                        // `Unsupported` is also how `refuse_paged_read` reports
-                        // a connection that cannot query or cannot page by
-                        // offset, and rendering *that* as "nothing to browse
-                        // here" would be a false claim about the object. No
-                        // backend declares either today, which is exactly why
-                        // the arm has to say which case it means.
-                        //
-                        // The guard reads the *same* signal the resources
-                        // refused on, not the resolved `can_read`: that one
-                        // comes back through `find_table_meta`, which reports
-                        // nothing while the schema reloads — so during a
-                        // Refresh it would say "readable" exactly when the
-                        // resource is returning this error, and the empty state
-                        // would flip to a red banner.
-                        Some(Err(crate::db::DbError::Unsupported(reason)))
-                            if unbrowsable().is_some() =>
-                        rsx! {
-                            EmptyState {
-                                icon: rsx! { File { size: 40 } },
-                                title: "Nothing to browse here",
-                                hint: "{reason}",
-                            }
-                        },
-                        Some(Err(err)) => rsx! {
-                            div { class: "p-3",
-                                Banner { kind: BannerKind::Error, message: err.to_string() }
-                            }
-                        },
-                        Some(Ok(_)) => {
-                            // Rows, headers and the selectable set all come from
-                            // the `page_view` memo — this arm no longer
-                            // re-derives them from the resource, so a focus move
-                            // or a copy costs nothing here.
-                            let view = page_view.read();
-                            let headers = view.headers.clone();
-                            let selectable = view.selectable.clone();
-                            let pending_inserts: Vec<PendingInsert> = stage
-                                .as_ref()
-                                .map(|s| s.inserts().to_vec())
-                                .unwrap_or_default();
-                            let all_selected = !selectable.is_empty() && {
-                                let sel = selected.read();
-                                selectable.iter().all(|(key, _)| sel.contains_key(key))
-                            };
-                            let insert_parent_table = row_table.clone();
-                            let new_row_table = row_table.clone();
-                            let empty = empty_state(
-                                view.rows.is_empty() && pending_inserts.is_empty(),
-                                applied_filter.read().is_some(),
-                            );
-                            // Windowed rendering: only rows in the visible
-                            // range go in the DOM; a top and bottom spacer row of
-                            // the elided rows' total height keeps the scrollbar and
-                            // offsets correct. `total_cols` sizes the spacers'
-                            // single colspan cell across every column.
-                            let total_rows = view.rows.len();
-                            let total_cols = headers.len() + usize::from(select_enabled);
-                            let (win_start, win_end) = *visible_range.read();
-                            let (win_start, win_end) = (win_start.min(total_rows), win_end.min(total_rows));
-                            let top_spacer = win_start as f64 * ROW_HEIGHT;
-                            let bottom_spacer = (total_rows - win_end) as f64 * ROW_HEIGHT;
-                            // Only the window's rows are cloned out of the memo;
-                            // the rest of the page stays in it.
-                            let windowed_rows = window_rows(&view.rows, win_start, win_end);
-                            drop(view);
-                            rsx! {
-                                match empty {
-                                    // No-filter-match: distinct from an empty
-                                    // table, with a Clear-filter action.
-                                    Some(GridEmpty::NoMatch) => rsx! {
-                                        EmptyState {
-                                            icon: rsx! { SearchX { size: 40 } },
-                                            title: "No rows match the filter",
-                                            hint: "No rows in this table match the current filter.",
-                                            button {
-                                                class: "rounded border border-slate-300 dark:border-slate-700 px-3 py-1 text-xs text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800",
-                                                onclick: move |_| clear_filter(
-                                                    filter_text,
-                                                    applied_filter,
-                                                    page,
-                                                ),
-                                                "Clear filter"
-                                            }
-                                        }
-                                    },
-                                    // Empty table: the "+ New row" affordance below
-                                    // stays available for editable tables.
-                                    Some(GridEmpty::Table) => rsx! {
-                                        EmptyState {
-                                            icon: rsx! { File { size: 40 } },
-                                            title: "This table has no rows",
-                                            hint: "There is no data here yet.",
-                                        }
-                                    },
-                                    None => rsx! {
-                                    table { class: "w-full border-collapse text-left",
-                                        thead { class: "sticky top-0 bg-slate-100 dark:bg-slate-900",
-                                            tr {
-                                                if select_enabled {
-                                                    th { class: "w-8 border-b border-slate-300 dark:border-slate-700 px-2 py-1.5",
-                                                        input {
-                                                            r#type: "checkbox",
-                                                            class: "accent-red-500",
-                                                            title: "Select all rows on this page",
-                                                            checked: all_selected,
-                                                            oninput: move |_| {
-                                                                let currently_all = !selectable.is_empty() && {
-                                                                    let sel = selected.peek();
-                                                                    selectable.iter().all(|(key, _)| sel.contains_key(key))
-                                                                };
-                                                                if currently_all {
-                                                                    selected.set(HashMap::new());
-                                                                } else {
-                                                                    let mut map = selected.peek().clone();
-                                                                    for (key, locator) in selectable.iter() {
-                                                                        map.insert(key.clone(), locator.clone());
-                                                                    }
-                                                                    selected.set(map);
-                                                                }
-                                                            },
-                                                        }
-                                                    }
-                                                }
-                                                for (col_index , header) in headers.iter().cloned().enumerate() {
-                                                    GridHeader {
-                                                        // The name carries the identity; the
-                                                        // index only separates a result that
-                                                        // repeats one.
-                                                        key: "{col_index}:{header}",
-                                                        name: header,
-                                                        sort: sort_value.clone(),
-                                                        on_sort: move |name: String| {
-                                                            let next = next_sort(&sort.peek(), &name);
-                                                            sort.set(next);
-                                                            page.set(0);
-                                                        },
-                                                        // Shift-click selects the whole column;
-                                                        // a plain click keeps sorting.
-                                                        on_select_column: move |_| {
-                                                            let rows = grid_nav.peek().rows.len();
-                                                            if let Some(axis) = Selection::column(col_index, rows) {
-                                                                selection_anchor.set(Some(axis.anchor));
-                                                                focused_cell.set(Some(axis.focus));
-                                                                copy_status.set(None);
-                                                            }
-                                                        },
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        tbody {
-                                            // Top spacer: the height of the rows
-                                            // elided above the window.
-                                            if top_spacer > 0.0 {
-                                                tr {
-                                                    td {
-                                                        colspan: "{total_cols}",
-                                                        style: "height:{top_spacer}px;padding:0;border:0;",
-                                                    }
-                                                }
-                                            }
-                                            for (index, row) in windowed_rows {
-                                                GridRow {
-                                                    key: "{row_render_key(&row, index)}",
-                                                    id,
-                                                    table: row_table.clone(),
-                                                    row,
-                                                    meta: meta.clone(),
-                                                    dialect: dialect.unwrap_or(Dialect::Sqlite),
-                                                    editing,
-                                                    // The focused column in this row, else None; only the
-                                                    // two rows whose focus changed re-render on a move.
-                                                    focused_col: match focused_cell() {
-                                                        Some((r, c)) if r == index => Some(c),
-                                                        _ => None,
-                                                    },
-                                                    row_index: index,
-                                                    // The inclusive span of selected columns in this row, or None
-                                                    // outside the rectangle — so only rows whose span changed re-render.
-                                                    selected_cols: selection().and_then(|sel| sel.columns_in(index)),
-                                                    on_select_cell,
-                                                    select_enabled,
-                                                    selected,
-                                                    on_fk_jump: {
-                                                        let origin = row_table.clone();
-                                                        move |(fk, row_values, gesture): (ForeignKeyMeta, HashMap<String, Value>, Gesture)| {
-                                                            state.navigate_fk(id, &fk, &row_values, &origin, applied_filter.peek().clone(), gesture);
-                                                        }
-                                                    },
-                                                }
-                                            }
-                                            // Bottom spacer: the height of the rows
-                                            // elided below the window.
-                                            if bottom_spacer > 0.0 {
-                                                tr {
-                                                    td {
-                                                        colspan: "{total_cols}",
-                                                        style: "height:{bottom_spacer}px;padding:0;border:0;",
-                                                    }
-                                                }
-                                            }
-                                            // Pending inserts: phantom rows with
-                                            // editable "database default" cells.
-                                            for (offset , insert) in pending_inserts.into_iter().enumerate() {
-                                                InsertRow {
-                                                    key: "{insert.row_key()}",
-                                                    row_index: total_rows + offset,
-                                                    focused_col: match focused_cell() {
-                                                        Some((r, c)) if r == total_rows + offset => Some(c),
-                                                        _ => None,
-                                                    },
-                                                    on_select_cell,
-                                                    id,
-                                                    table: insert_parent_table.clone(),
-                                                    insert,
-                                                    headers: headers.clone(),
-                                                    meta: meta.clone(),
-                                                    dialect: dialect.unwrap_or(Dialect::Sqlite),
-                                                    lead_cell: select_enabled,
-                                                    editing,
-                                                }
-                                            }
-                                        }
-                                    }
-                                    },
-                                }
-                                // Insert affordance (editable tables only):
-                                // appends a phantom row, all columns defaulted.
-                                if select_enabled {
-                                    button {
-                                        class: "m-2 rounded border border-dashed border-emerald-300 dark:border-emerald-700/70 px-3 py-1 \
-                                                text-xs text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-950/40",
-                                        onclick: move |_| state.stage_insert_row(id, &new_row_table),
-                                        "+ New row"
-                                    }
-                                }
-                            }
-                        }
+                    GridBody {
+                        ctx: row_ctx,
+                        grid: grid_page,
+                        query,
+                        focus,
+                        selection,
+                        visible_range,
+                        select_enabled,
+                        selected,
+                        inserts: pending_inserts,
                     }
                 }
                 if detail_open {
@@ -1625,9 +442,8 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                         width: detail_width,
                         dialect: dialect.unwrap_or(Dialect::Sqlite),
                         read_only_notice: read_only_notice.map(str::to_string),
-                        grid_editing: editing,
-                        editing: detail_editing,
-                        on_step: on_detail_step,
+                        editors,
+                        on_step: move |step: RowStep| focus.step_row(grid_nav, step),
                         on_close: move |_| state.set_row_detail(id, false),
                         on_width: move |width: f64| state.set_row_detail_width(id, width),
                         on_fk_jump: {
@@ -1640,71 +456,11 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                 }
             }
             // Footer: paging + counts
-            GridFooter { rows_resource, count_resource, page, selection, grid_nav, copy_status }
+            GridFooter { grid: grid_page, page: query.page, selection: grid_selection }
             // Value-expand popup: Enter on a read-only / non-editable
             // focused cell shows its full value — fetched on demand for a
-            // truncated cell. Dismissed by a backdrop click, the ✕,
-            // or Escape.
-            //
-            // The popup owns its Escape, like every `Overlay`: it renders
-            // beside `#dv-grid`, not inside it, so once a click on its text or
-            // its Copy raw button has taken focus the grid's handler never
-            // sees the key. The backdrop takes focus when it opens and holds
-            // it for any click inside that lands on nothing focusable; closing
-            // hands focus back to the grid, since the element that had it is
-            // gone.
-            if let Some(view) = expanded.read().clone() {
-                Overlay {
-                    on_close: move |_| close_expanded(),
-                    dismiss_on_backdrop: true,
-                    align: OverlayAlign::Center,
-                    div {
-                        class: "max-h-[70vh] w-full max-w-2xl overflow-auto rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 p-4 shadow-xl",
-                        div { class: "mb-2 flex items-center justify-between",
-                            span { class: "text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400",
-                                "Cell value"
-                            }
-                            button {
-                                class: "rounded px-2 py-0.5 text-sm text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
-                                aria_label: "Close",
-                                onclick: move |_| close_expanded(),
-                                X { size: 16 }
-                            }
-                        }
-                        match view {
-                            // A short value already in hand is always the full
-                            // value, so the rich viewers may decode it: JSON
-                            // as a tree, an image as a picture.
-                            ExpandView::Text { value, column } => {
-                                let type_name = meta.type_of(&column);
-                                rsx! {
-                                    CopyRawButton { value: value.clone() }
-                                    CellViewer { value, type_name, truncated: None }
-                                }
-                            },
-                            // Preview of an unloadable value: readable, but no
-                            // Copy raw — it would put a prefix on the clipboard.
-                            // Not pretty-printed either; the text is
-                            // cut mid-document.
-                            ExpandView::Truncated { display, column } => rsx! {
-                                Banner {
-                                    kind: BannerKind::Warning,
-                                    message: CopyRefusal::Unaddressable { column }.message(),
-                                }
-                                pre { class: "mt-2 whitespace-pre-wrap break-words font-mono text-xs text-slate-900 dark:text-slate-200",
-                                    "{display}"
-                                }
-                            },
-                            ExpandView::Fetch { locator, column } => {
-                                let type_name = meta.type_of(&column);
-                                rsx! {
-                                    ExpandedValue { id, table: table.clone(), locator, column, type_name }
-                                }
-                            },
-                        }
-                    }
-                }
-            }
+            // truncated cell.
+            ExpandPopup { id, table: table.clone(), meta: meta.clone(), expanded }
             // The import dialog, open once a file has been picked.
             // Mounted here rather than in the toolbar because it needs the
             // table's columns, which this scope already has.
@@ -1720,6 +476,104 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
             }
         }
     }
+}
+
+/// Closes any open editor and drops the row selection when the rows change
+/// under them: a page flip, sort/filter change, or refetch replaces the
+/// grid's contents — a stale ActiveEdit would spontaneously re-open the
+/// editor if its row key scrolled back into view, and a stale selection
+/// could stage deletes for rows the user no longer sees.
+fn use_grid_reset(
+    query: GridQuery,
+    mut editing: Signal<Option<ActiveEdit>>,
+    focus: GridFocus,
+    mut copy_menu: Signal<bool>,
+    mut expanded: Signal<Option<ExpandView>>,
+    mut selected: Signal<HashMap<String, RowLocator>>,
+    mut scroll_top: Signal<f64>,
+) {
+    let GridQuery {
+        page,
+        sort,
+        filter,
+        refresh: refresh_nonce,
+    } = query;
+    let applied_filter = filter.applied;
+    let GridFocus {
+        mut focused_cell,
+        mut selection_anchor,
+        mut copy_status,
+    } = focus;
+    use_effect(move || {
+        let _ = page();
+        let _ = sort.read();
+        let _ = applied_filter.read();
+        let _ = refresh_nonce();
+        // Peeked first: a set is unconditional, and every write wakes the
+        // focus effect in `use_editor_refocus` — which is how applying a
+        // filter used to pull focus out of the filter box.
+        if editing.peek().is_some() {
+            editing.set(None);
+        }
+        selected.set(HashMap::new());
+        // Re-seed the focus ring at the first cell and drop any expand popup;
+        // the clamp effect in `use_selection` trims it to None for an empty
+        // page.
+        focused_cell.set(Some((0, 0)));
+        // …and collapse the cell selection to it: the rows under a
+        // rectangle spanning the old page are not the rows the user picked.
+        selection_anchor.set(None);
+        copy_status.set(None);
+        copy_menu.set(false);
+        expanded.set(None);
+        // Reset the windowed scroll position too so a new page/sort/
+        // filter starts at the top, both the tracked offset and the container.
+        scroll_top.set(0.0);
+        document::eval(
+            "requestAnimationFrame(() => { \
+                const el = document.getElementById('dv-grid'); \
+                if (el) el.scrollTop = 0; \
+            });",
+        );
+        // A reset can take away whatever held focus: Save's button goes with
+        // the pending-changes bar once the stage empties, and a refresh
+        // closes an open value popup. Either leaves focus on the body, so
+        // hand it back — but only from there, never from the filter box a
+        // filter was just applied from, nor from the Refresh button.
+        reclaim_focus_by_id_next_frame("dv-grid");
+    });
+}
+
+/// The armed save confirmation: the exact change list shown to the user
+/// when the Save button turned into "Confirm: delete N…". The second
+/// click only proceeds while the stage still generates this exact list.
+fn use_save_confirm(
+    id: ConnectionId,
+    table: &TableRef,
+) -> Signal<Option<Armed<Vec<StagedChange>>>> {
+    let state = use_context::<AppState>();
+    let mut confirm = use_signal(|| Option::<Armed<Vec<StagedChange>>>::None);
+    // Once armed, the FIRST divergence of the stage from the snapshot
+    // permanently disarms — clearing `confirm`, not just hiding it. Without
+    // this, staging then un-staging back to an identical change list (e.g.
+    // add a phantom insert, then remove it) would silently re-arm the
+    // confirmation, letting the next single click save without a fresh
+    // confirm step. Requiring a new first click after any change keeps the
+    // "two clicks per confirmation instance" guarantee.
+    let confirm_reset_table = table.clone();
+    use_effect(move || {
+        let Some(snapshot) = confirm.read().as_ref().map(|armed| armed.subject().clone()) else {
+            return;
+        };
+        let current = state
+            .table_stage(id, &confirm_reset_table)
+            .map(|s| s.changes())
+            .unwrap_or_default();
+        if current != snapshot {
+            confirm.set(None);
+        }
+    });
+    confirm
 }
 
 /// Opens a file picker and, on a chosen file, opens the import dialog over
@@ -1832,18 +686,26 @@ fn GridToolbar(
     /// layout anyway.
     detail_open: bool,
     meta: Shared<TableRenderMeta>,
-    filter_column: Signal<String>,
-    filter_op: Signal<FilterOp>,
-    filter_text: Signal<String>,
-    applied_filter: Signal<Option<Filter>>,
-    page: Signal<u64>,
-    sort: Signal<Option<(String, SortDir)>>,
-    selection: ReadSignal<Option<Selection>>,
-    grid_nav: Memo<GridNav>,
-    copy_status: Signal<Option<CopyStatus>>,
-    copy_menu: Signal<bool>,
+    /// The filter inputs this bar edits, and the sort and filter an export
+    /// writes the view under.
+    query: GridQuery,
+    /// The cell selection the copy-as menu copies.
+    selection: GridSelection,
 ) -> Element {
     let state = use_context::<AppState>();
+    let sort = query.sort;
+    let GridFilter {
+        column: mut filter_column,
+        op: mut filter_op,
+        text: mut filter_text,
+        applied: applied_filter,
+    } = query.filter;
+    let GridSelection {
+        selection,
+        grid_nav,
+        copy_status,
+        mut copy_menu,
+    } = selection;
     // Whether the FK Back stack has anywhere to return to (reactive).
     let can_back = state.can_go_back(id);
     let export_line = grid_export_line(
@@ -1962,13 +824,13 @@ fn GridToolbar(
                 oninput: move |evt: FormEvent| filter_text.set(evt.value()),
                 onkeydown: move |evt: KeyboardEvent| {
                     if evt.key() == Key::Enter {
-                        apply_filter(filter_column, filter_op, filter_text, applied_filter, page);
+                        query.apply_filter();
                     }
                 },
             }
             button {
                 class: "rounded bg-slate-300 dark:bg-slate-700 px-3 py-1 text-xs text-slate-900 dark:text-slate-100 hover:bg-slate-400 dark:hover:bg-slate-600",
-                onclick: move |_| apply_filter(filter_column, filter_op, filter_text, applied_filter, page),
+                onclick: move |_| query.apply_filter(),
                 "Apply"
             }
             // An FK jump installs an equality filter the single-column
@@ -1983,7 +845,7 @@ fn GridToolbar(
             if applied_filter.read().is_some() {
                 button {
                     class: "rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
-                    onclick: move |_| clear_filter(filter_text, applied_filter, page),
+                    onclick: move |_| query.clear_filter(),
                     "Clear"
                 }
             }
@@ -2117,15 +979,25 @@ fn GridToolbar(
 /// a row of equal values) repaints nothing.
 #[component]
 fn GridFooter(
-    rows_resource: Resource<Result<FetchedPage, crate::db::DbError>>,
-    count_resource: Resource<Result<u64, crate::db::DbError>>,
+    /// The page and the row count, read here for the range and the stepper.
+    grid: GridPage,
     page: Signal<u64>,
-    selection: ReadSignal<Option<Selection>>,
-    grid_nav: Memo<GridNav>,
-    /// Where the click-to-copy confirmation goes — the same line a copy-as
-    /// reports on, so there is one place to look for "what just got copied".
-    copy_status: Signal<Option<CopyStatus>>,
+    /// The selection the readout sums, and `copy_status` — where the
+    /// click-to-copy confirmation goes: the same line a copy-as reports on,
+    /// so there is one place to look for "what just got copied".
+    selection: GridSelection,
 ) -> Element {
+    let GridPage {
+        rows: rows_resource,
+        count: count_resource,
+        ..
+    } = grid;
+    let GridSelection {
+        selection,
+        grid_nav,
+        mut copy_status,
+        ..
+    } = selection;
     let current = rows_resource.read();
     // Cells already in memory only: `SelectionStats::compute` is a pure
     // function of the page snapshot and the selection rectangle.
@@ -2439,30 +1311,6 @@ fn GridBars(
     }
 }
 
-/// Which designed empty state a zero-row grid page shows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GridEmpty {
-    /// The table (matching the active filter, if any) has no rows.
-    Table,
-    /// A filter is active and nothing matches it — offers "Clear filter".
-    NoMatch,
-}
-
-/// Selects the grid's empty state: `None` when the page has rows or pending
-/// inserts to render, otherwise the no-filter-match state when a filter is
-/// applied ([`GridEmpty::NoMatch`]) or the empty-table state
-/// ([`GridEmpty::Table`]) when the whole table is empty.
-fn empty_state(no_visible_rows: bool, has_filter: bool) -> Option<GridEmpty> {
-    if !no_visible_rows {
-        return None;
-    }
-    Some(if has_filter {
-        GridEmpty::NoMatch
-    } else {
-        GridEmpty::Table
-    })
-}
-
 /// Save is blocked while a save is in flight, while any pending insert still
 /// lacks a required column, or when the table's resolved capabilities forbid
 /// writing. The last case shouldn't arise — changes can only be
@@ -2598,52 +1446,6 @@ fn equality_filter_label(filter: Option<&Filter>) -> Option<String> {
     }
 }
 
-/// Clears the filter and returns to the first page — what both "Clear"
-/// affordances do (the toolbar's button and the no-rows-match empty state).
-///
-/// Both the applied filter and the input text go: leaving the text behind
-/// would show a filter that isn't in effect.
-fn clear_filter(
-    mut filter_text: Signal<String>,
-    mut applied_filter: Signal<Option<Filter>>,
-    mut page: Signal<u64>,
-) {
-    applied_filter.set(None);
-    filter_text.set(String::new());
-    page.set(0);
-}
-
-/// Applies the staged filter inputs and resets to the first page.
-fn apply_filter(
-    filter_column: Signal<String>,
-    filter_op: Signal<FilterOp>,
-    filter_text: Signal<String>,
-    mut applied_filter: Signal<Option<Filter>>,
-    mut page: Signal<u64>,
-) {
-    let column = filter_column.peek().clone();
-    let value = filter_text.peek().clone();
-    if column.is_empty() || value.is_empty() {
-        applied_filter.set(None);
-    } else {
-        applied_filter.set(Some(Filter::Column {
-            column,
-            op: *filter_op.peek(),
-            value,
-        }));
-    }
-    page.set(0);
-}
-
-/// Sort cycles none → asc → desc → none per column.
-fn next_sort(current: &Option<(String, SortDir)>, column: &str) -> Option<(String, SortDir)> {
-    match current {
-        Some((c, SortDir::Asc)) if c == column => Some((column.to_string(), SortDir::Desc)),
-        Some((c, SortDir::Desc)) if c == column => None,
-        _ => Some((column.to_string(), SortDir::Asc)),
-    }
-}
-
 /// Fixtures shared by the grid submodules' tests. Lives here because more
 /// than one of them builds a page against the same two-column table.
 #[cfg(test)]
@@ -2727,130 +1529,49 @@ mod fixtures {
         let rows = view_rows(&result, &previews, 0, identity, None, true);
         GridNav::build(vec!["id".into(), "body".into()], &rows, &HashMap::new())
     }
+
+    /// The top-level item of the grid's shipped code — across every file
+    /// under `src/ui/grid`, so a pin follows its code when it moves between
+    /// them — whose first line contains `start`, through the line closing
+    /// it. Comments are dropped and each line's whitespace collapsed, lines
+    /// joined by single spaces: a comment cannot satisfy an assertion and a
+    /// rustfmt reflow cannot fail one.
+    ///
+    /// Exactly one item may match, so a pin cannot quietly read a namesake.
+    pub(in crate::ui::grid) fn grid_item(start: &str) -> String {
+        use crate::source_scan::{rust_files, shipped, without_comments};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/grid");
+        let files = rust_files(&dir);
+        assert!(files.len() > 8, "found only {} grid files", files.len());
+        let mut found = Vec::new();
+        for file in files {
+            let code = without_comments(&shipped(&std::fs::read_to_string(&file).unwrap()));
+            let lines: Vec<&str> = code.lines().collect();
+            let Some(at) = lines.iter().position(|line| line.contains(start)) else {
+                continue;
+            };
+            let end = lines[at..]
+                .iter()
+                .position(|line| *line == "}")
+                .unwrap_or_else(|| panic!("{}: `{start}` never closes", file.display()));
+            found.push(
+                lines[at..=at + end]
+                    .iter()
+                    .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+                    .filter(|line| !line.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        }
+        assert_eq!(found.len(), 1, "`{start}` starts {} items", found.len());
+        found.remove(0)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::fixtures::*;
     use super::*;
-    use crate::db::PREVIEW_BYTES;
-
-    #[test]
-    fn a_running_count_is_unknown_even_while_it_holds_an_old_value() {
-        let stale: Result<u64, ()> = Ok(1_000);
-        assert_eq!(settled_count(true, Some(&stale)), None);
-        assert_eq!(settled_count(false, Some(&stale)), Some(1_000));
-        assert_eq!(settled_count(false, Some(&Err::<u64, ()>(()))), None);
-        assert_eq!(settled_count::<()>(false, None), None);
-        // A stale count is not believed: the old one said 1 000 rows, yet a
-        // short third page is the end while the new one runs.
-        assert!(!at_end(settled_count(false, Some(&stale)), 2, Some(40)));
-        assert!(at_end(settled_count(true, Some(&stale)), 2, Some(40)));
-    }
-
-    #[test]
-    fn the_last_page_is_where_the_rows_reach_the_count() {
-        let full = PAGE_SIZE as u64;
-        // Exactly two pages: the first has a next, the second does not.
-        assert!(!at_end(Some(2 * full), 0, Some(full)));
-        assert!(at_end(Some(2 * full), 1, Some(full)));
-        // One row past a page boundary is a page of its own.
-        assert!(!at_end(Some(full + 1), 0, Some(full)));
-        assert!(at_end(Some(full + 1), 1, Some(1)));
-        // A short page is the last, and an empty table has no next page.
-        assert!(at_end(Some(40), 0, Some(40)));
-        assert!(at_end(Some(0), 0, Some(0)));
-    }
-
-    /// A slow count must not hold paging for its whole run, nor a failed
-    /// one for good: with the count unknown, a full page may have more
-    /// behind it and a short page is the end.
-    #[test]
-    fn an_unknown_count_lets_a_full_page_go_on_and_stops_a_short_one() {
-        let full = PAGE_SIZE as u64;
-        assert!(!at_end(None, 0, Some(full)));
-        assert!(!at_end(None, 7, Some(full)));
-        assert!(at_end(None, 0, Some(full - 1)));
-        assert!(at_end(None, 3, Some(1)));
-        // Rows an exact multiple of the page: the last full page offers a
-        // next, which comes back empty — and that empty page is the end, so
-        // PageDown stops there rather than walking on through empty pages.
-        assert!(!at_end(None, 1, Some(full)));
-        assert!(at_end(None, 2, Some(0)));
-        // Once the count lands, the empty page is past the last and is
-        // pulled back to it…
-        assert_eq!(clamped_page(Some(2 * full), 2), Some(1));
-        // …but while it is unknown, paging ahead of it is left alone.
-        assert_eq!(clamped_page(None, 2), None);
-        assert_eq!(clamped_page(None, 40), None);
-    }
-
-    /// While a page is being fetched the rows on screen are the previous
-    /// page's, so their being a full page says nothing about the next one.
-    #[test]
-    fn a_page_still_loading_is_the_end_for_now() {
-        assert!(at_end(None, 3, None));
-        assert!(at_end(Some(1_000_000), 3, None));
-    }
-
-    /// The rule both Next and PageDown call, from the resources' raw data:
-    /// rows count only when they were fetched for the page now asked for.
-    #[test]
-    fn a_next_page_is_offered_only_from_rows_fetched_for_this_page() {
-        let full = PAGE_SIZE as u64;
-        let unknown: Option<&Result<u64, ()>> = None;
-        // Page 3 asked for; page 2's full rows still on screen: no next yet,
-        // whatever the count — this is what stops PageDown queueing fetches.
-        assert!(!next_page_offered(true, unknown, 3, Some((2 * full, full))));
-        assert!(!next_page_offered(
-            false,
-            Some(&Ok::<u64, ()>(1_000_000)),
-            3,
-            Some((2 * full, full))
-        ));
-        // Page 3's own rows arrived: a full page goes on while counting…
-        assert!(next_page_offered(true, unknown, 3, Some((3 * full, full))));
-        // …and a failed count does not stop it either.
-        assert!(next_page_offered(
-            false,
-            Some(&Err(())),
-            3,
-            Some((3 * full, full))
-        ));
-        // A known count still has the last word.
-        assert!(!next_page_offered(
-            false,
-            Some(&Ok::<u64, ()>(4 * full)),
-            3,
-            Some((3 * full, full))
-        ));
-        // Nothing fetched yet, or the fetch failed: no next page.
-        assert!(!next_page_offered(true, unknown, 0, None));
-        let failed: Result<FetchedPage, ()> = Err(());
-        assert_eq!(fetched_rows(Some(&failed)), None);
-    }
-
-    #[test]
-    fn the_row_range_describes_the_rows_on_screen() {
-        let full = PAGE_SIZE as u64;
-        assert_eq!(row_range(0, full, Some(250)), "rows 1–100 of 250");
-        assert_eq!(row_range(2 * full, 50, None), "rows 201–250 of …");
-        // The empty page past an exact multiple — with the count failed it
-        // stays, so it must not claim a range.
-        assert_eq!(row_range(2 * full, 0, None), "no more rows");
-        assert_eq!(row_range(0, 0, Some(0)), "no rows");
-    }
-
-    #[test]
-    fn the_page_is_clamped_only_when_past_a_known_last_page() {
-        let full = PAGE_SIZE as u64;
-        assert_eq!(clamped_page(Some(250), 2), None);
-        assert_eq!(clamped_page(Some(250), 3), Some(2));
-        assert_eq!(clamped_page(Some(2 * full), 1), None);
-        // An empty table's only page is the first.
-        assert_eq!(clamped_page(Some(0), 0), None);
-        assert_eq!(clamped_page(Some(0), 4), Some(0));
-    }
 
     #[test]
     fn an_open_editor_is_matched_on_row_as_well_as_column() {
@@ -2867,36 +1588,6 @@ mod tests {
         assert!(!open.is_on("2", "name"), "same column, different row");
         assert!(!open.is_on("1", "email"), "same row, different column");
         assert!(!open.is_on("2", "email"));
-    }
-
-    #[test]
-    fn empty_state_selector_distinguishes_the_four_cases() {
-        // Rows present (or pending inserts): no empty state at all.
-        assert_eq!(empty_state(false, false), None);
-        assert_eq!(empty_state(false, true), None);
-        // Zero rows, no filter: the empty-table state.
-        assert_eq!(empty_state(true, false), Some(GridEmpty::Table));
-        // Zero rows with an active filter: the no-match state (distinct).
-        assert_eq!(empty_state(true, true), Some(GridEmpty::NoMatch));
-    }
-
-    #[test]
-    fn sort_cycles_per_column() {
-        let none = None;
-        let asc = next_sort(&none, "a");
-        assert_eq!(asc, Some(("a".to_string(), SortDir::Asc)));
-        let desc = next_sort(&asc, "a");
-        assert_eq!(desc, Some(("a".to_string(), SortDir::Desc)));
-        assert_eq!(next_sort(&desc, "a"), None);
-    }
-
-    #[test]
-    fn sorting_another_column_starts_at_asc() {
-        let current = Some(("a".to_string(), SortDir::Desc));
-        assert_eq!(
-            next_sort(&current, "b"),
-            Some(("b".to_string(), SortDir::Asc))
-        );
     }
 
     #[test]
@@ -2935,63 +1626,6 @@ mod tests {
         assert_eq!(
             required_missing_message(2),
             Some("2 required column(s) missing in pending insert(s)".into())
-        );
-    }
-
-    #[test]
-    fn expanding_an_in_hand_cell_keeps_the_value_so_copy_raw_matches_a_grid_copy() {
-        // A small blob is not truncated, so Enter expands it from the page.
-        // The popup must still copy what Ctrl+C over that cell copies — the
-        // hex, never the `<blob 2 B>` placeholder it displays.
-        let result = QueryResult {
-            columns: vec![
-                crate::db::ColumnInfo { name: "id".into() },
-                crate::db::ColumnInfo {
-                    name: "cover".into(),
-                },
-            ],
-            rows: vec![vec![Value::Null, Value::Blob(vec![0xde, 0xad])]],
-        };
-        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), None, true);
-        let nav = GridNav::build(vec!["id".into(), "cover".into()], &rows, &HashMap::new());
-        let blob = &nav.rows[0].cells[1];
-        assert_eq!(blob.display, "<blob 2 B>", "the grid shows a placeholder");
-        let ExpandView::Text { value, column } = expand_view(blob, nav.rows[0].locator.clone())
-        else {
-            panic!("a complete value expands in hand");
-        };
-        assert_eq!(raw_cell_text(&value), "\\xdead");
-        // The column travels with the value so the popup can classify it on
-        // the declared type, like the detail panel.
-        assert_eq!(column, "cover");
-        // Same for NULL: the popup reads "NULL", a copy yields nothing —
-        // exactly as `plan_copy` + `raw_cell_text` do for the same cell.
-        let ExpandView::Text { value, .. } = expand_view(&nav.rows[0].cells[0], None) else {
-            panic!("a complete value expands in hand");
-        };
-        assert_eq!(value.display(), "NULL");
-        assert_eq!(raw_cell_text(&value), "");
-    }
-
-    #[test]
-    fn expanding_a_truncated_cell_fetches_it_or_refuses_to_copy_it() {
-        let nav = previewed_nav(PREVIEW_BYTES as u64 * 4, Some(&pk_identity()));
-        assert_eq!(
-            expand_view(&nav.rows[0].cells[1], nav.rows[0].locator.clone()),
-            ExpandView::Fetch {
-                locator: RowLocator {
-                    identity_values: vec![Value::Integer(1)],
-                },
-                column: "body".into(),
-            }
-        );
-        // Unaddressable: the preview is readable but not copyable.
-        assert_eq!(
-            expand_view(&nav.rows[0].cells[1], None),
-            ExpandView::Truncated {
-                display: "prefix…".into(),
-                column: "body".into(),
-            }
         );
     }
 
@@ -3244,113 +1878,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn enter_opens_a_pending_inserts_own_editor_and_never_expands_it() {
-        let kinds: HashMap<String, (EditorKind, bool)> = [
-            ("id".to_string(), (EditorKind::Text, false)),
-            ("title".to_string(), (EditorKind::Text, true)),
-        ]
-        .into_iter()
-        .collect();
-        let result = two_column_result();
-        let rows = view_rows(&result, &[], 0, Some(&pk_identity()), None, true);
-        let mut stage = TableStage::default();
-        let insert = stage.add_insert();
-        let nav = GridNav::build(vec!["id".into(), "title".into()], &rows, &kinds)
-            .with_inserts(stage.inserts(), &kinds);
-
-        // Two fetched rows, then the insert at focus row 2.
-        // The insert's cell: its editor, under the key `InsertCellSlot`
-        // matches on.
-        assert_eq!(
-            enter_action(&nav, (2, 1)),
-            EnterAction::Edit(ActiveEdit {
-                row_key: format!("insert:{insert}"),
-                column: "title".into(),
-                draft: None,
-            })
-        );
-        // A fetched cell is unchanged: its own row key.
-        let EnterAction::Edit(edit) = enter_action(&nav, (0, 1)) else {
-            panic!("a fetched editable cell opens its editor");
-        };
-        assert_eq!(edit.row_key, nav.rows[0].key.clone().unwrap());
-        // A stale focus past the inserts clamps onto the last one.
-        assert!(
-            matches!(enter_action(&nav, (9, 1)), EnterAction::Edit(e) if e.row_key.starts_with("insert:"))
-        );
-        // An empty page: nothing.
-        assert_eq!(
-            enter_action(&GridNav::default(), (0, 0)),
-            EnterAction::Nothing
-        );
-    }
-
-    #[test]
-    fn enter_on_a_pending_inserts_locked_cell_does_nothing() {
-        let mut nav = GridNav::build(vec!["id".into(), "cover".into()], &[], &HashMap::new());
-        nav.inserts = vec![GridNavInsert {
-            key: "insert:7".into(),
-            editable: vec![true, false],
-        }];
-        assert_eq!(enter_action(&nav, (0, 1)), EnterAction::Nothing);
-        assert!(matches!(enter_action(&nav, (0, 0)), EnterAction::Edit(_)));
-    }
-
-    /// This file's code with comment lines dropped and each line's
-    /// whitespace collapsed, joined by single spaces — so a comment cannot
-    /// satisfy an assertion and a rustfmt reflow cannot fail one.
-    fn grid_code() -> String {
-        include_str!("mod.rs")
-            .lines()
-            .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
-            .filter(|line| !line.is_empty() && !line.starts_with("//"))
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    /// The span of `code` from `start` to the next `end` after it.
-    fn span<'a>(code: &'a str, start: &str, end: &str) -> &'a str {
-        let from = code
-            .find(start)
-            .unwrap_or_else(|| panic!("{start} is gone"));
-        let rest = &code[from..];
-        let to = rest[start.len()..]
-            .find(end)
-            .map_or(rest.len(), |i| i + start.len());
-        &rest[..to]
-    }
-
-    /// `grid_refocus` is pinned by its own test; this pins that the focus
-    /// effect acts on its answer as written — each arm its own focus call,
-    /// and the edge remembered — which a driven run cannot repeat.
-    #[test]
-    fn the_focus_effect_does_what_grid_refocus_says() {
-        let code = grid_code();
-        let effect = span(&code, "let mut editor_was_open", "});");
-        for wire in [
-            "let open = editing.read().is_some() || detail_editing.read().is_some();",
-            "let was_open = *editor_was_open.peek();",
-            "editor_was_open.set(Some(open));",
-            "match grid_refocus(was_open, open) {",
-            r#"GridRefocus::Take => focus_by_id_next_frame("dv-grid"),"#,
-            r#"GridRefocus::Reclaim => reclaim_focus_by_id_next_frame("dv-grid"),"#,
-            "GridRefocus::Leave => {}",
-        ] {
-            assert!(
-                effect.contains(wire),
-                "the focus effect lost `{wire}`: {effect}"
-            );
-        }
-    }
-
     /// The reset after a page, sort, filter or refresh hands focus back when
     /// it took it away (Save's button leaves with the pending bar), and only
     /// reclaims it — it must not take focus from the filter box.
     #[test]
     fn the_reset_effect_reclaims_focus_and_never_takes_it() {
-        let code = grid_code();
-        let reset = span(&code, "let _ = refresh_nonce();", "use_effect(");
+        let reset = grid_item("fn use_grid_reset(");
         assert!(
             reset.contains(r#"reclaim_focus_by_id_next_frame("dv-grid");"#),
             "the reset no longer hands focus back: {reset}"
@@ -3361,27 +1894,5 @@ mod tests {
             reset.matches("reclaim_focus_by_id_next_frame").count(),
             "the reset takes focus outright: {reset}"
         );
-    }
-
-    /// The grid's shortcuts follow the app's one Ctrl rule, `accel_held` —
-    /// the window-level half is `every_window_shortcut_takes_ctrl_or_cmd`.
-    #[test]
-    fn the_grid_reads_ctrl_through_the_shared_rule() {
-        let code = grid_code();
-        let handler = span(
-            &code,
-            "let on_grid_key = move |evt: KeyboardEvent| {",
-            "rsx! {",
-        );
-        assert!(
-            handler.contains("let ctrl = accel_held(modifiers);"),
-            "the grid's Ctrl is not `accel_held`: {handler}"
-        );
-        for direct in [".ctrl()", ".meta()"] {
-            assert!(
-                !handler.contains(direct),
-                "the grid reads `{direct}` directly instead of through `accel_held`"
-            );
-        }
     }
 }
