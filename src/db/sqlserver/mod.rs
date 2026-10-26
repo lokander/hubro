@@ -27,8 +27,8 @@ use tiberius::{ColumnType, Row};
 use super::caps::INSTEAD_OF_TRIGGER;
 use super::error::DbError;
 use super::schema::{
-    ColumnMeta, ForeignKeyMeta, Generated, IndexConstraint, IndexMeta, TableKind, TableMeta,
-    TypeDetail,
+    push_index_row, table_index, ColumnMeta, ForeignKeyMeta, Generated, IndexConstraint, IndexMeta,
+    TableKind, TableMeta, TypeDetail,
 };
 use super::sql::qualified;
 use super::stats::{size_bytes, RowCount, TableStats};
@@ -73,6 +73,16 @@ pub fn build_mssql_url(
     super::url::MSSQL.build(host, port, database, user, encrypt)
 }
 
+/// A failed catalog read as introspection reports it: a deadlock victim stays
+/// [`DbError::Transient`] for `registry::retry_transient` to run once more
+/// (`pool::catalog_query_with`); anything else is an introspection failure.
+fn introspect_error(err: DbError) -> DbError {
+    match err {
+        DbError::Transient(_) => err,
+        other => DbError::Introspect(other.message().to_string()),
+    }
+}
+
 /// Full multi-schema introspection from the sys catalog views: every user
 /// schema's tables and views with columns (PK membership, defaults,
 /// identity/computed/rowversion detection), indexes, and foreign keys —
@@ -89,16 +99,11 @@ pub fn build_mssql_url(
 /// Indexed views map to plain `View` too — unlike a Postgres materialized
 /// view they are transparently maintained (never stale, no REFRESH), so the
 /// matview-specific handling doesn't apply; `MaterializedView` stays PG-only.
-/// A failed catalog read as introspection reports it: a deadlock victim stays
-/// [`DbError::Transient`] for `registry::retry_transient` to run once more
-/// (`pool::catalog_query_with`); anything else is an introspection failure.
-fn introspect_error(err: DbError) -> DbError {
-    match err {
-        DbError::Transient(_) => err,
-        other => DbError::Introspect(other.message().to_string()),
-    }
-}
-
+///
+/// The four catalog reads stay here, each through `catalog_query_with`, so a
+/// deadlock victim among them is retried; grouping their rows onto tables is
+/// [`list_relations`], [`attach_columns`], [`attach_indexes`] and
+/// [`attach_foreign_keys`], over plain rows.
 pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
     let map_err = introspect_error;
 
@@ -211,11 +216,23 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
     .await
     .map_err(map_err)?;
 
-    // The catalog columns below are read positionally with the shared row
-    // accessors (`row_text`/`row_int`/`row_flag`) — sys.columns' `bit` flags
-    // decode as Integer 0/1, which `row_flag` is exactly for.
-    let mut tables: Vec<TableMeta> = Vec::with_capacity(table_rows.rows.len());
-    for row in &table_rows.rows {
+    let mut tables = list_relations(&table_rows.rows);
+    let index = table_index(&tables);
+    attach_columns(&mut tables, &index, &column_rows.rows);
+    attach_indexes(&mut tables, &index, &index_rows.rows);
+    attach_foreign_keys(&mut tables, &index, &fk_rows.rows);
+    Ok(tables)
+}
+
+/// The object rows of [`introspect`] as tables, with no columns, indexes or
+/// foreign keys yet.
+///
+/// Every catalog row, here and in the `attach_*` functions, is read
+/// positionally with the shared row accessors (`row_text`/`row_int`/`row_flag`) — sys.columns' `bit` flags
+/// decode as Integer 0/1, which `row_flag` is exactly for.
+fn list_relations(rows: &[Vec<Value>]) -> Vec<TableMeta> {
+    let mut tables: Vec<TableMeta> = Vec::with_capacity(rows.len());
+    for row in rows {
         tables.push(TableMeta {
             schema: Some(row_text(row, 0)),
             name: row_text(row, 1),
@@ -238,19 +255,17 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
             kind_label: None,
         });
     }
-    // (schema, table) → index into `tables`, built once so grouping the
-    // column/index/FK rows below is a hash lookup per row instead of a linear
-    // scan over every table.
-    let mut table_index: HashMap<(String, String), usize> = HashMap::with_capacity(tables.len());
-    for (idx, table) in tables.iter().enumerate() {
-        if let Some(schema) = &table.schema {
-            table_index
-                .entry((schema.clone(), table.name.clone()))
-                .or_insert(idx);
-        }
-    }
+    tables
+}
 
-    for row in &column_rows.rows {
+/// Each column row onto its table, by [`table_index`]; a row whose table was
+/// not listed is dropped.
+fn attach_columns(
+    tables: &mut [TableMeta],
+    table_index: &HashMap<(String, String), usize>,
+    rows: &[Vec<Value>],
+) {
+    for row in rows {
         let schema = row_text(row, 0);
         let table = row_text(row, 1);
         let Some(&idx) = table_index.get(&(schema, table)) else {
@@ -284,8 +299,16 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
             },
         });
     }
+}
 
-    for row in &index_rows.rows {
+/// Each index row onto its table, consecutive rows of one index becoming its
+/// columns in key order ([`push_index_row`]).
+fn attach_indexes(
+    tables: &mut [TableMeta],
+    table_index: &HashMap<(String, String), usize>,
+    rows: &[Vec<Value>],
+) {
+    for row in rows {
         let schema = row_text(row, 0);
         let table = row_text(row, 1);
         let Some(&idx) = table_index.get(&(schema, table)) else {
@@ -296,24 +319,30 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
         let unique = row_flag(row, 3);
         let partial = row_flag(row, 4);
         let constraint = mssql_index_constraint(row_flag(row, 6), row_flag(row, 7));
-        let indexes = &mut tables[idx].indexes;
-        match indexes.last_mut() {
-            Some(last) if last.name == index_name => last.columns.push(column),
-            _ => indexes.push(IndexMeta {
+        push_index_row(
+            &mut tables[idx].indexes,
+            IndexMeta {
                 name: index_name,
                 unique,
                 partial,
                 columns: vec![column],
                 constraint,
-            }),
-        }
+            },
+        );
     }
+}
 
+/// Each foreign-key row onto its table, one row per key column.
+fn attach_foreign_keys(
+    tables: &mut [TableMeta],
+    table_index: &HashMap<(String, String), usize>,
+    rows: &[Vec<Value>],
+) {
     // FK rows are ordered by (schema, table, fk name, key position); rows of
     // one constraint are contiguous, so track the last (table, name) pair to
     // append follow-up key columns to the entry that opened the constraint.
     let mut last_fk: Option<(usize, String)> = None;
-    for row in &fk_rows.rows {
+    for row in rows {
         let schema = row_text(row, 0);
         let table = row_text(row, 1);
         let Some(&idx) = table_index.get(&(schema, table)) else {
@@ -342,8 +371,6 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
             last_fk = Some((idx, fk_name));
         }
     }
-
-    Ok(tables)
 }
 
 /// Row count and on-disk size for one object, from
@@ -808,6 +835,95 @@ mod tests {
         assert_eq!(
             introspect_error(other),
             DbError::Introspect("invalid object name".into())
+        );
+    }
+
+    /// The grouping half of introspection, over plain rows: objects become
+    /// tables, a row naming an unlisted table is dropped, consecutive rows of
+    /// one index or one foreign key become its columns in order, and a
+    /// second key on the same table starts a new entry.
+    #[test]
+    fn catalog_rows_group_onto_their_tables() {
+        let text = |s: &str| Value::Text(s.to_string());
+        let flag = |b: bool| Value::Integer(b as i64);
+        let mut tables = list_relations(&[
+            vec![text("dbo"), text("t"), text("U "), flag(true)],
+            vec![text("dbo"), text("v"), text("V "), flag(false)],
+        ]);
+        assert_eq!(tables[0].kind, TableKind::Table);
+        assert_eq!(tables[0].restriction, Some(INSTEAD_OF_TRIGGER));
+        assert_eq!(tables[1].kind, TableKind::View);
+        assert_eq!(tables[1].restriction, None);
+        let index = table_index(&tables);
+        let index_row = |table: &str, name: &str, column: &str| {
+            vec![
+                text("dbo"),
+                text(table),
+                text(name),
+                flag(true),
+                flag(false),
+                text(column),
+                flag(false),
+                flag(true),
+            ]
+        };
+        attach_indexes(
+            &mut tables,
+            &index,
+            &[
+                index_row("t", "uq", "a"),
+                index_row("t", "uq", "b"),
+                index_row("gone", "x", "c"),
+                index_row("t", "uq2", "c"),
+            ],
+        );
+        let indexes: Vec<(&str, Vec<&str>)> = tables[0]
+            .indexes
+            .iter()
+            .map(|i| {
+                (
+                    i.name.as_str(),
+                    i.columns.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(indexes, [("uq", vec!["a", "b"]), ("uq2", vec!["c"])]);
+        let fk_row = |name: &str, column: &str, ref_column: &str| {
+            vec![
+                text("dbo"),
+                text("t"),
+                text(name),
+                text("dbo"),
+                text("v"),
+                text(column),
+                text(ref_column),
+            ]
+        };
+        attach_foreign_keys(
+            &mut tables,
+            &index,
+            &[
+                fk_row("fk1", "a", "x"),
+                fk_row("fk1", "b", "y"),
+                fk_row("fk2", "c", "z"),
+            ],
+        );
+        let fks: Vec<(Vec<&str>, Vec<Option<&str>>)> = tables[0]
+            .foreign_keys
+            .iter()
+            .map(|fk| {
+                (
+                    fk.columns.iter().map(String::as_str).collect(),
+                    fk.referenced_columns.iter().map(|c| c.as_deref()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            fks,
+            [
+                (vec!["a", "b"], vec![Some("x"), Some("y")]),
+                (vec!["c"], vec![Some("z")]),
+            ]
         );
     }
 
