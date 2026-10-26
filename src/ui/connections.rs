@@ -1107,19 +1107,30 @@ pub(super) fn ConnectionsScreen() -> Element {
                     on_dismiss_error: move |_| state.connect_error.set(None),
                     match kind {
                         ConnectForm::Postgres => rsx! {
-                            ServerForm { spec: ServerSpec::Postgres, on_done: move |_| open_form.set(None) }
-                        },
-                        ConnectForm::SqlServer => rsx! {
-                            ServerForm { spec: ServerSpec::SqlServer, on_done: move |_| open_form.set(None) }
-                        },
-                        // Only server connections reach here; the Edit action
-                        // isn't offered on SQLite entries.
-                        ConnectForm::Edit(saved) => rsx! {
                             ServerForm {
-                                spec: ServerSpec::editing(&saved),
-                                edit: (*saved).clone(),
+                                key: "{ServerSpec::Postgres.form_key(None)}",
+                                spec: ServerSpec::Postgres,
                                 on_done: move |_| open_form.set(None),
                             }
+                        },
+                        ConnectForm::SqlServer => rsx! {
+                            ServerForm {
+                                key: "{ServerSpec::SqlServer.form_key(None)}",
+                                spec: ServerSpec::SqlServer,
+                                on_done: move |_| open_form.set(None),
+                            }
+                        },
+                        ConnectForm::Edit(saved) => match ServerSpec::editing(&saved) {
+                            Some(spec) => rsx! {
+                                ServerForm {
+                                    key: "{spec.form_key(Some(&saved))}",
+                                    spec,
+                                    edit: (*saved).clone(),
+                                    on_done: move |_| open_form.set(None),
+                                }
+                            },
+                            // The Edit action isn't offered on SQLite entries.
+                            None => rsx! {},
                         },
                     }
                 }
@@ -1586,12 +1597,15 @@ impl ServerFormState {
 fn submit_server_form(
     state: AppState,
     on_done: EventHandler<()>,
-    backend: ServerBackend,
+    spec: ServerSpec,
     form: ServerFormState,
     old_locator: Option<String>,
     built: Result<String, crate::db::DbError>,
 ) {
     use crate::tunnel::{TunnelAuth, TunnelConfig};
+    // The engine connected is the one the form is for: derived here, so no
+    // caller can hand the submit one engine's form and another's backend.
+    let backend = spec.backend();
     let mut form_error = form.form_error;
     // Tunnel settings are validated first so a bad SSH field fails before any
     // connect attempt.
@@ -1855,12 +1869,24 @@ enum ServerSpec {
 }
 
 impl ServerSpec {
-    /// The form for editing `saved`. Only server connections are edited in a
-    /// form; SQLite is offered no Edit action.
-    fn editing(saved: &SavedConnection) -> Self {
-        match saved {
-            SavedConnection::SqlServer { .. } => ServerSpec::SqlServer,
-            _ => ServerSpec::Postgres,
+    /// The form for editing `saved`, or `None` for SQLite, which has no form
+    /// (and is offered no Edit action). Matched on every engine, so a new one
+    /// has to say which form edits it rather than falling into Postgres's.
+    fn editing(saved: &SavedConnection) -> Option<Self> {
+        match saved.backend() {
+            BackendKind::Postgres => Some(ServerSpec::Postgres),
+            BackendKind::SqlServer => Some(ServerSpec::SqlServer),
+            BackendKind::Sqlite => None,
+        }
+    }
+
+    /// What the modal keys the form on: the engine, and the entry being
+    /// edited. A change of either remounts the form instead of carrying one
+    /// form's fields, and its "remember" answer, into another's.
+    fn form_key(self, edit: Option<&SavedConnection>) -> String {
+        match edit {
+            Some(saved) => format!("{self:?}:edit:{}", saved.locator()),
+            None => format!("{self:?}:new"),
         }
     }
 
@@ -2071,14 +2097,7 @@ fn ServerForm(
         let built = spec.form_url(&form.fields());
         // Cloned per attempt: the submit takes ownership, and `submit` has to
         // stay FnMut.
-        submit_server_form(
-            state,
-            on_done,
-            spec.backend(),
-            form,
-            old_locator.clone(),
-            built,
-        );
+        submit_server_form(state, on_done, spec, form, old_locator.clone(), built);
     };
 
     // Read at render, so the line follows the fields as they are typed — on
@@ -2811,11 +2830,96 @@ mod tests {
         };
         assert_eq!(
             ServerSpec::editing(&server(BackendKind::SqlServer)),
-            ServerSpec::SqlServer
+            Some(ServerSpec::SqlServer)
         );
         assert_eq!(
             ServerSpec::editing(&server(BackendKind::Postgres)),
-            ServerSpec::Postgres
+            Some(ServerSpec::Postgres)
+        );
+        let sqlite = SavedConnection::Sqlite {
+            name: "x".to_string(),
+            path: PathBuf::from("x.db"),
+            protection: Default::default(),
+            color: None,
+            group: None,
+        };
+        assert_eq!(ServerSpec::editing(&sqlite), None);
+    }
+
+    #[test]
+    fn the_form_is_keyed_on_its_engine_and_the_entry_it_edits() {
+        let saved = |url: &str| SavedConnection::Postgres {
+            name: "x".to_string(),
+            url: url.to_string(),
+            tunnel: None,
+            auth: ServerAuth::Password,
+            protection: Default::default(),
+            color: None,
+            group: None,
+        };
+        let (a, b) = (saved("postgres://u@a/db"), saved("postgres://u@b/db"));
+        let keys = [
+            ServerSpec::Postgres.form_key(None),
+            ServerSpec::SqlServer.form_key(None),
+            ServerSpec::Postgres.form_key(Some(&a)),
+            ServerSpec::Postgres.form_key(Some(&b)),
+        ];
+        for (i, key) in keys.iter().enumerate() {
+            for other in &keys[i + 1..] {
+                assert_ne!(key, other);
+            }
+        }
+        assert_eq!(
+            ServerSpec::Postgres.form_key(Some(&a)),
+            ServerSpec::Postgres.form_key(Some(&a))
+        );
+    }
+
+    #[test]
+    fn every_remember_box_starts_from_its_seed_and_records_what_is_ticked() {
+        // The other two ends of each box's value: what it starts as, and what
+        // a click writes back. `remember.set(!evt.checked())` records the
+        // opposite of every click, and a seed of `false` (or `!offered`) asks
+        // as if the user had already declined; every test that reads the box
+        // further down the wire passes through both. Pinned as written, read
+        // as code alone, for all three boxes: the connection form's, the
+        // password prompt's and the Entra sign-in card's.
+        let write_back = "checked: remember(), onchange: move |evt| remember.set(evt.checked()),";
+        for (signature, seed) in [
+            ("fn ServerForm(", &["remember: use_signal(|| true),"][..]),
+            (
+                "fn PasswordPromptCard(",
+                &[
+                    "let offered = prompt.remember;",
+                    "let mut remember = use_signal(move || offered);",
+                ][..],
+            ),
+            (
+                "fn EntraSignInCard(",
+                &[
+                    "let offered = prompt.remember;",
+                    "let mut remember = use_signal(move || offered);",
+                ][..],
+            ),
+        ] {
+            let code = shipped_code_of(signature);
+            for pin in seed.iter().chain([&write_back]) {
+                assert!(
+                    code.contains(pin),
+                    "{signature}: `{pin}` is gone, so the box starts from, or \
+                     records, something other than the answer: {code}"
+                );
+            }
+            assert_eq!(
+                code.matches("remember.set(").count(),
+                1,
+                "{signature}: the box's value is written somewhere besides its \
+                 own `onchange`: {code}"
+            );
+        }
+        // The Entra card hands the box's value to its sign-in as read.
+        assert!(
+            shipped_code_of("fn EntraSignInCard(").contains("prompt.remember = *remember.peek();")
         );
     }
 
@@ -2840,13 +2944,17 @@ mod tests {
             1,
             "{form}: the box is read somewhere besides its own `checked:`: {code}"
         );
-        // The gate's block, by brace matching, holds the box.
-        let at = code.find(gate).unwrap();
-        let end = at + crate::source_scan::block_end(&code[at..]).expect("the gate's block closes");
+        // The gate's first block is the box's `label`, and that block, by
+        // brace matching, holds the box — not merely somewhere in the gate,
+        // where it could sit in the hint instead.
+        let label = code.find(gate).unwrap() + gate.len() - "label {".len();
+        let end = label
+            + crate::source_scan::block_end(&code[label..]).expect("the label's block closes");
         assert!(
-            code[at..end].contains("checked: remember(),"),
-            "{form}: the box is rendered outside the gate its answer is read \
-             under: {code}"
+            code[label..end].contains("checked: remember(),"),
+            "{form}: the box is not the checkbox in the label its gate opens, so \
+             it renders outside the gate its answer is read under: {}",
+            &code[label..end]
         );
         // And the submit's producer is the only read of the form's box.
         let shipped = crate::source_scan::code_only(&crate::source_scan::shipped(include_str!(
