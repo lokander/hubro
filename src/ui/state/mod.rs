@@ -2341,7 +2341,9 @@ mod tests {
         // The scan reads the code that follows a test module, not only what
         // precedes it: the place that once ended it early. (The other one,
         // `connections.rs`, became a module whose files each end in their
-        // tests, so nothing there follows one any more.)
+        // tests, so nothing there follows one any more; the block shape it
+        // stood for is defended by
+        // `source_scan::a_test_module_is_dropped_and_what_follows_it_is_read`.)
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/mod.rs");
         let code = code_outside_test_modules(&std::fs::read_to_string(path).unwrap());
         assert!(
