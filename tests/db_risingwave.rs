@@ -127,9 +127,9 @@ use common::pg_family::{
 
 use hubro::db::Reading;
 use hubro::db::{
-    apply_staged, detect_row_identity, run_script, split_statements, Capabilities, DbPool, Filter,
-    PageRequest, PgFlavor, Restriction, Rollback, RowIdentity, RowLocator, SortDir, StagedChange,
-    TableKind, Value, NO_GUARDED_WRITE,
+    apply_staged, detect_row_identity, run_script, split_statements, Capabilities, DbError, DbPool,
+    Filter, PageRequest, PgFlavor, Restriction, Rollback, RowIdentity, RowLocator, SortDir,
+    StagedChange, TableKind, Value, NO_GUARDED_WRITE,
 };
 
 fn test_url() -> Option<String> {
@@ -221,11 +221,16 @@ async fn risingwave_refuses_to_begin_a_transaction() {
         .await
         .err()
         .expect("RisingWave has no read-write transactions");
-    let message = error.message().to_lowercase();
+    // That it is the transaction being refused, rather than the connection,
+    // is shown by contrast instead of by the driver's wording: the same pool
+    // answers an ordinary statement straight after.
     assert!(
-        message.contains("transaction"),
-        "expected the failure to name transactions, got: {message}"
+        matches!(error, DbError::Query(_)),
+        "expected a refused statement, got: {error:?}"
     );
+    pool.query_unbounded("SELECT 1")
+        .await
+        .unwrap_or_else(|e| panic!("the pool must still run a plain statement: {e}"));
 
     pool.close().await;
 }
@@ -545,14 +550,19 @@ async fn risingwave_source_and_sink_are_read_only_and_say_which_they_are() {
     );
 
     // And the claim is true of the engine, not just of hubro's model: the read
-    // the gate suppresses is one RisingWave itself refuses.
+    // the gate suppresses is one RisingWave itself refuses. Shown against the
+    // same read of the table the sink reads from, which succeeds, rather than
+    // by the engine's wording: the sink is what makes it fail.
+    pool.query_unbounded("SELECT * FROM rw_edge_base LIMIT 1")
+        .await
+        .unwrap_or_else(|e| panic!("the same read of a table must succeed: {e}"));
     let attempted = pool
         .query_unbounded("SELECT * FROM rw_edge_sink LIMIT 1")
         .await
         .expect_err("a sink stores no rows");
     assert!(
-        attempted.message().contains("not found"),
-        "the engine's own refusal is what the gate exists to pre-empt: {attempted}"
+        matches!(attempted, DbError::Query(_)),
+        "the engine's own refusal is what the gate exists to pre-empt: {attempted:?}"
     );
 
     for sql in [

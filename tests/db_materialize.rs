@@ -99,8 +99,8 @@ use common::pg_family::{assert_schema_is_internal, find, integer};
 
 use hubro::db::Reading;
 use hubro::db::{
-    detect_row_identity, Capabilities, DbPool, Filter, Generated, KeyTextPinned, PageRequest,
-    PgFlavor, Restriction, SortDir, TableKind, TableMeta, TypeDetail, Value,
+    detect_row_identity, Capabilities, DbError, DbPool, Filter, Generated, KeyTextPinned,
+    PageRequest, PgFlavor, Restriction, SortDir, TableKind, TableMeta, TypeDetail, Value,
 };
 
 fn test_url() -> Option<String> {
@@ -248,13 +248,21 @@ async fn materialize_refuses_keys_so_no_table_is_editable() {
 
     // Not a property of this fixture but of the engine: Materialize rejects
     // both ways of declaring a key, so *no* table here can ever have one.
+    // Asserted as a contrast rather than by the engine's wording: the same
+    // table without the key is accepted, so the key is what was refused.
+    pool.query_unbounded("DROP TABLE IF EXISTS mz_keyless_probe")
+        .await
+        .unwrap();
+    pool.query_unbounded("CREATE TABLE mz_keyless_probe (id int)")
+        .await
+        .unwrap_or_else(|e| panic!("the same table without a key must be accepted: {e}"));
     let refused = pool
         .query_unbounded("CREATE TABLE mz_keyed_probe (id int PRIMARY KEY)")
         .await
         .expect_err("Materialize does not support primary keys");
     assert!(
-        refused.message().contains("primary key"),
-        "expected the engine to say why, got: {refused:?}"
+        matches!(refused, DbError::Query(_)),
+        "expected the server's refusal, got: {refused:?}"
     );
 
     let tables = pool.introspect().await.unwrap();

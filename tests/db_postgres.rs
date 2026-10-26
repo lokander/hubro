@@ -113,7 +113,6 @@ async fn force_serialization_failure(pool: &DbPool, table: &str) -> DbError {
         .await
         .expect_err("a REPEATABLE READ update of a row changed since its snapshot must be refused");
     let _ = tx.rollback().await;
-    pool.execute(&format!("DROP TABLE {table}")).await.unwrap();
     refused
 }
 
@@ -188,7 +187,6 @@ async fn a_deadlock_is_not_classified_as_transient() {
         !deadlock.is_transient(),
         "a deadlock is deliberately not classified as transient: {deadlock:?}"
     );
-    pool.execute("DROP TABLE deadlock_pair").await.unwrap();
 
     pool.close().await;
 }
@@ -641,121 +639,192 @@ async fn postgres_only_a_refused_password_is_a_credential_rejection() {
     assert!(err.credentials_rejected(), "got {err:?}");
 }
 
+/// A schema named `schema` holding one of each shape the multi-schema
+/// introspection tests below read: a composite-key table, a table with a
+/// multi-column FK into it and a unique and an expression index, a view, a
+/// materialized view with a unique index, and a keyless table. Each test gets
+/// a schema of its own, so the tests can run side by side, and each claim
+/// fails on its own instead of hiding behind the first one that broke.
+/// Dropped at the start only, like every fixture in this file.
+async fn warehouse(pool: &DbPool, schema: &str) -> Vec<TableMeta> {
+    for sql in [
+        format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+        format!("CREATE SCHEMA {schema}"),
+        format!(
+            "CREATE TABLE {schema}.locations (
+                region text NOT NULL,
+                slot integer NOT NULL,
+                label text,
+                PRIMARY KEY (region, slot)
+            )"
+        ),
+        format!(
+            "CREATE TABLE {schema}.stock (
+                id serial PRIMARY KEY,
+                region text NOT NULL,
+                slot integer NOT NULL,
+                note text,
+                FOREIGN KEY (region, slot) REFERENCES {schema}.locations (region, slot)
+            )"
+        ),
+        format!("CREATE UNIQUE INDEX stock_note_unique ON {schema}.stock (note)"),
+        format!("CREATE INDEX stock_expr_idx ON {schema}.stock (lower(note))"),
+        format!("CREATE VIEW {schema}.stock_notes AS SELECT note FROM {schema}.stock"),
+        format!("INSERT INTO {schema}.locations VALUES ('eu', 1, 'shelf A')"),
+        format!("INSERT INTO {schema}.stock (region, slot, note) VALUES ('eu', 1, 'first')"),
+        // Materialized view created after the insert so it snapshots the row;
+        // a unique index on it must NOT make it look editable.
+        format!(
+            "CREATE MATERIALIZED VIEW {schema}.stock_mv AS SELECT id, note FROM {schema}.stock"
+        ),
+        format!("CREATE UNIQUE INDEX stock_mv_id ON {schema}.stock_mv (id)"),
+        // No PK and no usable unique index: nothing addresses one row.
+        format!("CREATE TABLE {schema}.keyless (a integer, b text)"),
+    ] {
+        pool.query_unbounded(&sql).await.unwrap();
+    }
+    pool.introspect().await.unwrap()
+}
+
+/// `schema.name` among `tables`.
+fn in_schema<'a>(tables: &'a [TableMeta], schema: &str, name: &str) -> &'a TableMeta {
+    tables
+        .iter()
+        .find(|t| t.schema.as_deref() == Some(schema) && t.name == name)
+        .unwrap_or_else(|| panic!("no introspected table {schema}.{name}"))
+}
+
 #[tokio::test]
-async fn postgres_multi_schema_introspection_has_parity_metadata() {
+async fn postgres_same_named_tables_in_two_schemas_keep_their_own_columns() {
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     for sql in [
-        "DROP SCHEMA IF EXISTS warehouse CASCADE",
-        "CREATE SCHEMA warehouse",
-        // Same-named table in two schemas: attribution must not bleed.
+        "DROP SCHEMA IF EXISTS wh_probe_ns CASCADE",
         "DROP TABLE IF EXISTS wh_probe",
+        "CREATE SCHEMA wh_probe_ns",
         "CREATE TABLE wh_probe (public_only integer)",
-        "CREATE TABLE warehouse.wh_probe (warehouse_only text)",
-        "CREATE TABLE warehouse.locations (
-            region text NOT NULL,
-            slot integer NOT NULL,
-            label text,
-            PRIMARY KEY (region, slot)
-        )",
-        "CREATE TABLE warehouse.stock (
-            id serial PRIMARY KEY,
-            region text NOT NULL,
-            slot integer NOT NULL,
-            note text,
-            FOREIGN KEY (region, slot) REFERENCES warehouse.locations (region, slot)
-        )",
-        "CREATE UNIQUE INDEX stock_note_unique ON warehouse.stock (note)",
-        "CREATE INDEX stock_expr_idx ON warehouse.stock (lower(note))",
-        "CREATE VIEW warehouse.stock_notes AS SELECT note FROM warehouse.stock",
-        "INSERT INTO warehouse.locations VALUES ('eu', 1, 'shelf A')",
-        "INSERT INTO warehouse.stock (region, slot, note) VALUES ('eu', 1, 'first')",
-        // Materialized view created after the insert so it snapshots the row;
-        // a unique index on it must NOT make it look editable.
-        "CREATE MATERIALIZED VIEW warehouse.stock_mv AS \
-         SELECT id, note FROM warehouse.stock",
-        "CREATE UNIQUE INDEX stock_mv_id ON warehouse.stock_mv (id)",
-        // No PK and no usable unique index: nothing addresses one row.
-        "CREATE TABLE warehouse.keyless (a integer, b text)",
+        "CREATE TABLE wh_probe_ns.wh_probe (warehouse_only text)",
     ] {
         pool.query_unbounded(sql).await.unwrap();
     }
-
     let tables = pool.introspect().await.unwrap();
 
-    // Multi-schema: same-named tables in different schemas stay separate,
-    // each with its own columns.
-    let public_probe = tables
+    // Attribution must not bleed: each copy has its own columns, and only
+    // its own.
+    let public_probe = in_schema(&tables, "public", "wh_probe");
+    let columns: Vec<&str> = public_probe
+        .columns
         .iter()
-        .find(|t| t.schema.as_deref() == Some("public") && t.name == "wh_probe")
-        .unwrap();
-    assert_eq!(public_probe.columns.len(), 1);
-    assert_eq!(public_probe.columns[0].name, "public_only");
-    let warehouse_probe = tables
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(columns, ["public_only"]);
+    let other_probe = in_schema(&tables, "wh_probe_ns", "wh_probe");
+    let columns: Vec<&str> = other_probe
+        .columns
         .iter()
-        .find(|t| t.schema.as_deref() == Some("warehouse") && t.name == "wh_probe")
-        .unwrap();
-    assert_eq!(warehouse_probe.columns[0].name, "warehouse_only");
-    let locations = tables
-        .iter()
-        .find(|t| t.schema.as_deref() == Some("warehouse") && t.name == "locations")
-        .unwrap();
-    // Composite PK in declaration order.
-    let pk: Vec<&str> = locations
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(columns, ["warehouse_only"]);
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_a_composite_primary_key_keeps_its_declaration_order() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let tables = warehouse(&pool, "wh_pk").await;
+
+    let pk: Vec<&str> = in_schema(&tables, "wh_pk", "locations")
         .primary_key()
         .iter()
         .map(|c| c.name.as_str())
         .collect();
     assert_eq!(pk, ["region", "slot"]);
 
-    let stock = tables
-        .iter()
-        .find(|t| t.schema.as_deref() == Some("warehouse") && t.name == "stock")
-        .unwrap();
-    // Unique and expression indexes.
-    assert!(stock
-        .indexes
-        .iter()
-        .any(|i| i.name == "stock_note_unique" && i.unique && i.columns == ["note"]));
-    assert!(stock
-        .indexes
-        .iter()
-        .any(|i| i.name == "stock_expr_idx" && !i.unique && i.columns == ["<expr>"]));
-    // Multi-column FK with ordering and referenced schema.
-    let fk = stock
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_unique_and_expression_indexes_introspect() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let tables = warehouse(&pool, "wh_idx").await;
+    let stock = in_schema(&tables, "wh_idx", "stock");
+
+    assert!(
+        stock
+            .indexes
+            .iter()
+            .any(|i| i.name == "stock_note_unique" && i.unique && i.columns == ["note"]),
+        "{:?}",
+        stock.indexes
+    );
+    assert!(
+        stock
+            .indexes
+            .iter()
+            .any(|i| i.name == "stock_expr_idx" && !i.unique && i.columns == ["<expr>"]),
+        "{:?}",
+        stock.indexes
+    );
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_a_multi_column_foreign_key_keeps_its_order_and_referenced_schema() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let tables = warehouse(&pool, "wh_fk").await;
+
+    let fk = in_schema(&tables, "wh_fk", "stock")
         .foreign_keys
         .iter()
         .find(|fk| fk.referenced_table == "locations")
-        .unwrap();
+        .expect("the stock -> locations foreign key");
     assert_eq!(fk.columns, ["region", "slot"]);
-    assert_eq!(fk.referenced_schema.as_deref(), Some("warehouse"));
+    assert_eq!(fk.referenced_schema.as_deref(), Some("wh_fk"));
     assert_eq!(
         fk.referenced_columns,
         [Some("region".to_string()), Some("slot".to_string())]
     );
 
-    let view = tables
-        .iter()
-        .find(|t| t.schema.as_deref() == Some("warehouse") && t.name == "stock_notes")
-        .unwrap();
-    assert_eq!(view.kind, TableKind::View);
+    pool.close().await;
+}
 
-    // Materialized view: introspected with its own kind and columns
-    // (from pg_catalog, since information_schema omits matviews), and read-only
-    // — its unique index must not yield a row identity.
-    // Exactly once: the pg_catalog UNION must not double-list it alongside an
-    // information_schema row.
+#[tokio::test]
+async fn postgres_a_view_introspects_as_a_view() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let tables = warehouse(&pool, "wh_view").await;
+
+    assert_eq!(
+        in_schema(&tables, "wh_view", "stock_notes").kind,
+        TableKind::View
+    );
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_a_materialized_view_introspects_once_with_its_columns_and_no_row_identity() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let tables = warehouse(&pool, "wh_mv").await;
+
+    // Introspected with its own kind and columns (from pg_catalog, since
+    // information_schema omits matviews), and read-only — its unique index
+    // must not yield a row identity. Exactly once: the pg_catalog UNION must
+    // not double-list it alongside an information_schema row.
     assert_eq!(
         tables
             .iter()
-            .filter(|t| t.schema.as_deref() == Some("warehouse") && t.name == "stock_mv")
+            .filter(|t| t.schema.as_deref() == Some("wh_mv") && t.name == "stock_mv")
             .count(),
         1
     );
-    let matview = tables
-        .iter()
-        .find(|t| t.schema.as_deref() == Some("warehouse") && t.name == "stock_mv")
-        .unwrap();
+    let matview = in_schema(&tables, "wh_mv", "stock_mv");
     assert_eq!(matview.kind, TableKind::MaterializedView);
     let mv_columns: Vec<&str> = matview.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(mv_columns, ["id", "note"]);
@@ -764,56 +833,91 @@ async fn postgres_multi_schema_introspection_has_parity_metadata() {
         "a matview must be read-only even with a unique index"
     );
 
-    // Capabilities. Postgres declares the full set at the
-    // connection level; the per-object resolution is what differs, and each
-    // narrowing states its own reason.
+    pool.close().await;
+}
+
+// Capabilities. Postgres declares the full set at the connection level; the
+// per-object resolution is what differs, and each narrowing states its own
+// reason.
+
+#[tokio::test]
+async fn postgres_a_keyed_table_resolves_the_full_capability_set() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let tables = warehouse(&pool, "wh_caps").await;
+
     assert_eq!(pool.backend_capabilities(), Capabilities::FULL);
-    let stock_access = pool.backend_access(stock);
+    let stock_access = pool.backend_access(in_schema(&tables, "wh_caps", "stock"));
     assert_eq!(stock_access.caps, Capabilities::FULL);
     assert_eq!(stock_access.restriction, None);
     assert!(stock_access.identity.is_some());
 
-    let view_access = pool.backend_access(view);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_views_narrow_to_read_only_with_their_own_reason() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let tables = warehouse(&pool, "wh_ro").await;
+
+    let view_access = pool.backend_access(in_schema(&tables, "wh_ro", "stock_notes"));
     assert!(!view_access.can_mutate());
     assert_eq!(view_access.restriction, Some(Restriction::View));
 
-    let mv_access = pool.backend_access(matview);
+    let mv_access = pool.backend_access(in_schema(&tables, "wh_ro", "stock_mv"));
     assert!(!mv_access.can_mutate());
     assert_eq!(mv_access.restriction, Some(Restriction::MaterializedView));
     // Reduced, not disabled: browsing and paging a matview still work.
     assert!(mv_access.caps.read_query);
     assert!(mv_access.caps.offset_paging);
 
-    let keyless = tables
-        .iter()
-        .find(|t| t.schema.as_deref() == Some("warehouse") && t.name == "keyless")
-        .unwrap();
-    let keyless_access = pool.backend_access(keyless);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_a_keyless_table_narrows_for_having_no_row_identity() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let tables = warehouse(&pool, "wh_keyless").await;
+
+    let keyless_access = pool.backend_access(in_schema(&tables, "wh_keyless", "keyless"));
     assert!(!keyless_access.can_mutate());
     assert_eq!(keyless_access.restriction, Some(Restriction::NoRowIdentity));
     assert_eq!(keyless_access.identity, None);
 
-    // Browsing the matview's data works through the normal paged read path.
-    let mv_request = PageRequest {
-        schema: Some("warehouse".into()),
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_a_materialized_view_browses_through_the_paged_read() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    warehouse(&pool, "wh_mv_page").await;
+
+    let request = PageRequest {
+        schema: Some("wh_mv_page".into()),
         limit: 10,
         ..common::page("stock_mv")
     };
     assert_eq!(
-        pool.count_rows(Reading::UNMARKED, &mv_request)
-            .await
-            .unwrap(),
+        pool.count_rows(Reading::UNMARKED, &request).await.unwrap(),
         1
     );
-    let mv_page = pool
-        .fetch_page(Reading::UNMARKED, &mv_request)
-        .await
-        .unwrap();
-    assert_eq!(mv_page.rows[0][1], Value::Text("first".into()));
+    let page = pool.fetch_page(Reading::UNMARKED, &request).await.unwrap();
+    assert_eq!(page.rows[0][1], Value::Text("first".into()));
 
-    // Schema-qualified paging works end to end.
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_a_table_outside_public_pages_by_its_schema() {
+    let Some(url) = test_url().await else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    warehouse(&pool, "wh_page").await;
+
     let request = PageRequest {
-        schema: Some("warehouse".into()),
+        schema: Some("wh_page".into()),
         limit: 10,
         ..common::page("stock")
     };
@@ -952,9 +1056,6 @@ async fn postgres_bounded_page_previews_large_text_and_bytea() {
         .unwrap();
     assert_a_deleted_rows_cell_does_not_load(&pool, &docs, 1).await;
 
-    pool.query_unbounded("DROP TABLE IF EXISTS bounded_docs")
-        .await
-        .unwrap();
     pool.close().await;
 }
 
@@ -1114,8 +1215,6 @@ async fn postgres_introspection_resolves_enum_variants_and_array_columns() {
     assert_eq!(col("plain").type_detail, TypeDetail::Plain);
     assert_eq!(col("id").type_detail, TypeDetail::Plain);
 
-    pool.query_unbounded("DROP TABLE enum_intro").await.unwrap();
-    pool.query_unbounded("DROP TYPE intro_mood").await.unwrap();
     pool.close().await;
 }
 
@@ -1183,12 +1282,6 @@ async fn postgres_quoted_camelcase_enum_saves_through_the_staged_cast() {
         .unwrap();
     assert_eq!(after.rows[0][0], Value::Text("happy".into()));
 
-    pool.query_unbounded("DROP TABLE camel_intro")
-        .await
-        .unwrap();
-    pool.query_unbounded("DROP SCHEMA camel_ns CASCADE")
-        .await
-        .unwrap();
     pool.close().await;
 }
 
@@ -1272,7 +1365,6 @@ async fn bit_and_char_columns_save_through_the_staged_cast() {
     // what a `::character` cast would have done.
     assert_eq!(after.rows[0][2], Value::Text("xyz".into()));
 
-    pool.query_unbounded("DROP TABLE bit_intro").await.unwrap();
     pool.close().await;
 }
 
@@ -1344,7 +1436,6 @@ async fn bit_values_are_readable_and_a_bit_key_round_trips() {
         .unwrap();
     assert_eq!(after.rows[0][0], Value::Text("b".into()));
 
-    pool.query_unbounded("DROP TABLE bit_key").await.unwrap();
     pool.close().await;
 }
 
@@ -1384,9 +1475,6 @@ async fn partition_children_are_internal_but_their_parent_is_not() {
         Some(Internal::Partition)
     );
 
-    pool.query_unbounded("DROP TABLE parted_intro CASCADE")
-        .await
-        .unwrap();
     pool.close().await;
 }
 
@@ -1464,9 +1552,6 @@ async fn table_stats_estimate_rows_only_once_something_has_measured_them() {
     );
     assert_ne!(after.rows, Some(RowCount::Exact(4)));
 
-    pool.query_unbounded("DROP TABLE stats_intro")
-        .await
-        .unwrap();
     pool.close().await;
 }
 
@@ -1524,11 +1609,6 @@ async fn a_view_reports_no_size_because_it_occupies_none() {
         4
     );
 
-    pool.query_unbounded("DROP VIEW stats_view").await.unwrap();
-    pool.query_unbounded("DROP MATERIALIZED VIEW stats_matview")
-        .await
-        .unwrap();
-    pool.query_unbounded("DROP TABLE stats_base").await.unwrap();
     pool.close().await;
 }
 
@@ -1572,12 +1652,6 @@ async fn an_exact_count_ignores_a_quoted_name_and_a_non_public_schema() {
     let stats = pool.fetch_table_stats(&meta).await.unwrap();
     assert_eq!(stats.rows, Some(RowCount::Estimated(2)));
 
-    pool.query_unbounded("DROP TABLE \"stats sch\".\"odd.name\"")
-        .await
-        .unwrap();
-    pool.query_unbounded("DROP SCHEMA \"stats sch\"")
-        .await
-        .unwrap();
     pool.close().await;
 }
 
@@ -1622,9 +1696,6 @@ async fn an_analyzed_empty_table_reports_zero_rows_rather_than_nothing() {
         0
     );
 
-    pool.query_unbounded("DROP TABLE stats_empty")
-        .await
-        .unwrap();
     pool.close().await;
 }
 
@@ -1679,9 +1750,6 @@ async fn postgres_explains_a_query_as_a_structured_plan() {
     assert_eq!(tree.total_cost, tree.root.total_cost.unwrap());
     assert!(rows.iter().any(|(_, node)| node.expensive));
 
-    pool.query_unbounded("DROP TABLE fruits_plan")
-        .await
-        .unwrap();
     pool.close().await;
 }
 
@@ -1782,7 +1850,6 @@ async fn postgres_a_plan_larger_than_the_display_cap_still_parses() {
         assert_eq!(cell.len(), QUERY_CELL_CAP, "{sql}");
     }
 
-    pool.execute("DROP TABLE big_plan CASCADE").await.unwrap();
     pool.close().await;
 }
 
@@ -1856,9 +1923,6 @@ async fn postgres_explain_analyze_of_a_write_cannot_slip_past_the_gate() {
         .iter()
         .all(|name| name == "analyzed"));
 
-    pool.query_unbounded("DROP TABLE fruits_guard")
-        .await
-        .unwrap();
     pool.close().await;
 }
 
@@ -2230,9 +2294,6 @@ async fn postgres_every_key_type_reads_and_writes_the_same_row() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 
-    pool.query_unbounded("DROP SCHEMA addr_keys CASCADE")
-        .await
-        .unwrap();
     pool.close().await;
 }
 
@@ -2284,7 +2345,6 @@ async fn postgres_a_key_read_as_text_still_sorts_by_its_type() {
         .await
         .expect("a json column sorts by its preview's text");
     assert_eq!(page.result.rows[0][0], Value::Text("[100,200)".into()));
-    pool.query_unbounded("DROP TABLE range_sort").await.unwrap();
     pool.close().await;
 }
 
@@ -2470,9 +2530,6 @@ async fn role_default_body(url: &str, scope: &str) {
     let mut failures = saves_by_text_key_land_on_their_rows(&pool, "role_dates", 4).await;
     failures.extend(saves_by_text_key_land_on_their_rows(&pool, "role_intervals", 4).await);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-    pool.query_unbounded("DROP TABLE role_dates, role_intervals")
-        .await
-        .unwrap();
     pool.close().await;
 }
 
@@ -2533,7 +2590,6 @@ async fn postgres_a_scripts_datestyle_never_respells_a_key_for_another_session()
     let failures = saves_by_text_key_land_on_their_rows(&pool, "style_keys", 6).await;
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 
-    pool.query_unbounded("DROP TABLE style_keys").await.unwrap();
     pool.close().await;
 }
 
@@ -2553,9 +2609,6 @@ async fn postgres_every_key_type_jumps_to_the_row_it_references() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 
-    pool.query_unbounded("DROP SCHEMA fk_keys CASCADE")
-        .await
-        .unwrap();
     pool.close().await;
 }
 
@@ -2615,9 +2668,6 @@ async fn postgres_jumps_from_differently_typed_sources_share_no_statement() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 
-    pool.query_unbounded("DROP SCHEMA mixed_fk CASCADE")
-        .await
-        .unwrap();
     pool.close().await;
 }
 
@@ -2685,9 +2735,6 @@ async fn postgres_writes_of_differently_typed_values_share_no_statement() {
         );
     }
 
-    pool.query_unbounded("DROP TABLE mixed_writes")
-        .await
-        .unwrap();
     pool.close().await;
 }
 
@@ -2707,9 +2754,6 @@ async fn postgres_contains_filter_is_a_substring_search_whatever_the_needle_hold
     }
     let mismatches = common::contains_filter_mismatches(&pool, None, "like_hostile").await;
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
-    pool.query_unbounded("DROP TABLE like_hostile")
-        .await
-        .unwrap();
     pool.close().await;
 }
 
@@ -2822,9 +2866,5 @@ async fn postgres_a_do_instead_rule_refuses_editing_before_anything_is_written()
         .unwrap();
     assert_eq!(unchanged.rows, vec![vec![Value::Text("first".into())]]);
 
-    pool.query_unbounded("DROP VIEW rule_view").await.unwrap();
-    pool.query_unbounded("DROP TABLE rule_redirected, rule_also, rule_log")
-        .await
-        .unwrap();
     pool.close().await;
 }
