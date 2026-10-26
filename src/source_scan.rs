@@ -223,6 +223,50 @@ pub(crate) fn without_comments(text: &str) -> String {
         .collect()
 }
 
+/// The contents of every string literal in `text`, as the compiler reads
+/// them as far as matching words goes: a `\` line continuation joins its
+/// lines, and every run of whitespace is one space. So a message rustfmt has
+/// wrapped across lines is found by its words, which a search of the raw text
+/// would miss wherever the wrap fell. Char literals are not strings and are
+/// left out; escapes other than the continuation are kept as written.
+pub(crate) fn string_literals(text: &str) -> Vec<String> {
+    // A CRLF checkout reads the same.
+    let text = &text.replace("\r\n", "\n");
+    let classes = classify(text);
+    let mut literals = Vec::new();
+    let mut at = 0;
+    while at < text.len() {
+        if classes[at] != Class::Literal {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        while at < text.len() && classes[at] == Class::Literal {
+            at += 1;
+        }
+        let literal = &text[start..at];
+        // A char literal — `'"'` too — is not a string.
+        if literal.starts_with('\'') {
+            continue;
+        }
+        // Past a raw prefix (`r`, `r#`, …) to the opening quote.
+        let Some(open) = literal.find('"') else {
+            continue;
+        };
+        let inner = literal[open + 1..].trim_end_matches('#');
+        let inner = inner.strip_suffix('"').unwrap_or(inner);
+        let mut joined = String::new();
+        let mut rest = inner;
+        while let Some(at) = rest.find("\\\n") {
+            joined.push_str(&rest[..at]);
+            rest = rest[at + 2..].trim_start();
+        }
+        joined.push_str(rest);
+        literals.push(joined.split_whitespace().collect::<Vec<_>>().join(" "));
+    }
+    literals
+}
+
 /// The code of a Rust file outside its test modules, comments removed.
 pub(crate) fn code_outside_test_modules(text: &str) -> String {
     without_comments(&shipped(text))
@@ -330,6 +374,22 @@ mod tests {
     )]
     fn a_test_module_that_closes_off_its_indentation_is_refused() {
         shipped("fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {} }\nfn b() {}\n");
+    }
+
+    #[test]
+    fn a_wrapped_literal_is_read_as_the_compiler_joins_it() {
+        let source = "let a = \"could not be stored in the system \\\n         keyring\";\n\
+                      let b = r#\"raw \"quoted\" text\"#;\n\
+                      let c = '\"'; // \"a comment\"\n\
+                      let d = \"two   spaces\";\n";
+        assert_eq!(
+            string_literals(source),
+            [
+                "could not be stored in the system keyring",
+                "raw \"quoted\" text",
+                "two spaces"
+            ]
+        );
     }
 
     #[test]
