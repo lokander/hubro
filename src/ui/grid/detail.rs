@@ -241,12 +241,11 @@ pub(super) fn RowDetailPanel(
     /// Why editing is unavailable — the grid's sentence, from the grid's
     /// resolution, stated once instead of per field.
     read_only_notice: Option<String>,
-    /// The grid's in-place editor, closed when a field here opens one: only
-    /// one cell editor can hold the keyboard at a time.
-    grid_editing: Signal<Option<ActiveEdit>>,
-    /// The panel's open editor, owned above this component so it survives the
-    /// keyed remount of `RowDetailFields`.
-    editing: Signal<Option<ActiveEdit>>,
+    /// The grid's in-place editor, closed when a field here opens one (only
+    /// one cell editor can hold the keyboard at a time), and the panel's own,
+    /// owned above this component so it survives the keyed remount of
+    /// `RowDetailFields`.
+    editors: GridEditors,
     on_step: EventHandler<RowStep>,
     on_close: EventHandler<()>,
     on_width: EventHandler<f64>,
@@ -325,12 +324,8 @@ pub(super) fn RowDetailPanel(
                             id,
                             table,
                             dialect,
-                            fields: detail.fields.clone(),
-                            locator: detail.locator.clone(),
-                            row_values: detail.row_values.clone(),
-                            row_key: detail.row_key.clone(),
-                            grid_editing,
-                            editing,
+                            detail: detail.clone(),
+                            editors,
                             on_fk_jump,
                         }
                     },
@@ -355,20 +350,17 @@ pub(super) fn RowDetailPanel(
 pub(super) fn RowDetailFields(
     id: ConnectionId,
     table: TableRef,
-    fields: Vec<DetailField>,
-    locator: Option<RowLocator>,
-    row_values: Shared<HashMap<String, Value>>,
     dialect: Dialect,
-    grid_editing: Signal<Option<ActiveEdit>>,
-    /// The open editor, owned by `DataGrid` rather than created here. This
-    /// component is keyed by row, so a signal created here would be destroyed
-    /// by every row move — taking the user's uncommitted text with it.
-    /// The focused row's identity, so an open editor is matched on row as well
-    /// as column and cannot reappear on a same-named field of another row.
-    row_key: String,
-    editing: Signal<Option<ActiveEdit>>,
+    /// The focused row: its fields, locator, values and identity.
+    detail: Shared<RowDetail>,
+    /// The panel's open editor, owned by `DataGrid` rather than created here.
+    /// This component is keyed by row, so a signal created here would be
+    /// destroyed by every row move — taking the user's uncommitted text with
+    /// it. And the grid's, which a field here closes when it opens one.
+    editors: GridEditors,
     on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>, Gesture)>,
 ) -> Element {
+    let fields = &detail.fields;
     // Tab order: the editable fields, top to bottom.
     //
     // A field whose full value exceeds the fetch cap renders a note instead of
@@ -385,21 +377,26 @@ pub(super) fn RowDetailFields(
             .map(|field| field.column.clone())
             .collect::<Vec<String>>(),
     );
+    let edit = DetailEdit {
+        cell: EditContext {
+            id,
+            table,
+            dialect,
+            editable_columns,
+            editing: editors.detail_editing,
+        },
+        row_key: detail.row_key.clone(),
+        grid_editing: editors.editing,
+    };
     rsx! {
         dl { class: "divide-y divide-slate-200 dark:divide-slate-800",
-            for field in fields {
+            for field in fields.iter().cloned() {
                 RowDetailRow {
                     key: "{field.column}",
-                    id,
-                    table: table.clone(),
-                    dialect,
                     field,
-                    locator: locator.clone(),
-                    row_values: row_values.clone(),
-                    editable_columns: editable_columns.clone(),
-                    row_key: row_key.clone(),
-                    editing,
-                    grid_editing,
+                    locator: detail.locator.clone(),
+                    row_values: detail.row_values.clone(),
+                    edit: edit.clone(),
                     on_fk_jump,
                 }
             }
@@ -407,22 +404,28 @@ pub(super) fn RowDetailFields(
     }
 }
 
+/// What a field of the detail form is wired to, shared by every field of the
+/// focused row: the panel's [`EditContext`], plus the two things a grid cell
+/// has no need of.
+#[derive(Clone, PartialEq)]
+pub(super) struct DetailEdit {
+    /// Opens and closes the panel's own editor; the Tab order is the form's.
+    pub(super) cell: EditContext,
+    /// The focused row's identity, so an open editor is matched on row as well
+    /// as column and cannot reappear on a same-named field of another row.
+    pub(super) row_key: String,
+    /// The grid's in-place editor, closed when a field here opens one.
+    pub(super) grid_editing: Signal<Option<ActiveEdit>>,
+}
+
 /// One column of the focused row: its name and type, an FK jump when it has
 /// one, and its value — the full value, not the grid's preview.
 #[component]
 pub(super) fn RowDetailRow(
-    id: ConnectionId,
-    table: TableRef,
     field: DetailField,
     locator: Option<RowLocator>,
     row_values: Shared<HashMap<String, Value>>,
-    dialect: Dialect,
-    editable_columns: Shared<Vec<String>>,
-    /// The focused row's identity, so an open editor is matched on row as well
-    /// as column and cannot reappear on a same-named field of another row.
-    row_key: String,
-    editing: Signal<Option<ActiveEdit>>,
-    grid_editing: Signal<Option<ActiveEdit>>,
+    edit: DetailEdit,
     on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>, Gesture)>,
 ) -> Element {
     rsx! {
@@ -461,15 +464,9 @@ pub(super) fn RowDetailRow(
                     // whole value through the shared cell-fetch path.
                     (Some(_), Some(locator)) => rsx! {
                         RowDetailFullValue {
-                            id,
-                            table,
-                            dialect,
                             field: field.clone(),
                             locator: locator.clone(),
-                            editable_columns,
-                            row_key: row_key.clone(),
-                            editing,
-                            grid_editing,
+                            edit: edit.clone(),
                         }
                     },
                     // Truncated and unaddressable (a view, a keyless table):
@@ -496,16 +493,10 @@ pub(super) fn RowDetailRow(
                     // Already complete in the page.
                     (None, _) => rsx! {
                         RowDetailValue {
-                            id,
-                            table,
-                            dialect,
                             value: field.value.clone(),
                             field: field.clone(),
                             locator: locator.clone(),
-                            editable_columns,
-                            row_key: row_key.clone(),
-                            editing,
-                            grid_editing,
+                            edit: edit.clone(),
                         }
                     },
                 }
@@ -522,25 +513,16 @@ pub(super) fn RowDetailRow(
 /// prefix would silently truncate what is stored.
 #[component]
 pub(super) fn RowDetailFullValue(
-    id: ConnectionId,
-    table: TableRef,
     field: DetailField,
     locator: RowLocator,
-    dialect: Dialect,
-    editable_columns: Shared<Vec<String>>,
-    /// The focused row's identity, so an open editor is matched on row as well
-    /// as column and cannot reappear on a same-named field of another row.
-    row_key: String,
-    editing: Signal<Option<ActiveEdit>>,
-    grid_editing: Signal<Option<ActiveEdit>>,
+    edit: DetailEdit,
 ) -> Element {
-    let loaded_table = table.clone();
     let loaded_locator = locator.clone();
     let column = field.column.clone();
     rsx! {
         LoadedCell {
-            id,
-            table,
+            id: edit.cell.id,
+            table: edit.cell.table.clone(),
             locator,
             column,
             loaded: move |fetch: CellFetch| {
@@ -565,16 +547,10 @@ pub(super) fn RowDetailFullValue(
                 }
                 rsx! {
                     RowDetailValue {
-                        id,
-                        table: loaded_table.clone(),
-                        dialect,
                         value: fetch.value,
                         field: field.clone(),
                         locator: Some(loaded_locator.clone()),
-                        editable_columns: editable_columns.clone(),
-                        row_key: row_key.clone(),
-                        editing,
-                        grid_editing,
+                        edit: edit.clone(),
                     }
                 }
             },
@@ -590,22 +566,26 @@ pub(super) fn RowDetailFullValue(
 /// same Save button. There is deliberately no second write route.
 #[component]
 pub(super) fn RowDetailValue(
-    id: ConnectionId,
-    table: TableRef,
     field: DetailField,
     /// The complete value: fetched for a previewed cell, `field.value`
     /// otherwise. The editor must never start from a preview.
     value: Value,
     locator: Option<RowLocator>,
-    dialect: Dialect,
-    editable_columns: Shared<Vec<String>>,
-    /// The focused row's identity, so an open editor is matched on row as well
-    /// as column and cannot reappear on a same-named field of another row.
-    row_key: String,
-    mut editing: Signal<Option<ActiveEdit>>,
-    mut grid_editing: Signal<Option<ActiveEdit>>,
+    edit: DetailEdit,
 ) -> Element {
     let state = use_context::<AppState>();
+    let DetailEdit {
+        cell:
+            EditContext {
+                id,
+                table,
+                dialect,
+                editable_columns,
+                mut editing,
+            },
+        row_key,
+        mut grid_editing,
+    } = edit;
     // `field.editable` already folds in the resolved capability and the
     // user's marking; the locator is what makes the row addressable.
     let editable = field.editable && locator.is_some();

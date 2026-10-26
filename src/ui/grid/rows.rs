@@ -8,7 +8,6 @@
 //! test without rendering anything.
 
 use super::*;
-use crate::ui::classes::BTN_SECONDARY_SM;
 
 /// One cell prepared for rendering.
 #[derive(Debug, Clone, PartialEq)]
@@ -450,6 +449,59 @@ pub(super) fn edit_callbacks(
     (Box::new(on_commit), Box::new(on_draft))
 }
 
+/// What every row of one grid renders against, handed to each row as one
+/// prop: the table and its metadata, the dialect its editors parse for, and
+/// the grid's open editor.
+#[derive(Clone, PartialEq)]
+pub(super) struct RowContext {
+    pub(super) id: ConnectionId,
+    pub(super) table: TableRef,
+    /// The table's introspected render metadata, shared by pointer with every
+    /// other row rather than deep-cloned into each of them.
+    pub(super) meta: Shared<TableRenderMeta>,
+    pub(super) dialect: Dialect,
+    pub(super) editing: Signal<Option<ActiveEdit>>,
+}
+
+impl RowContext {
+    /// The editing half, for one row whose Tab order is `editable_columns`.
+    pub(super) fn edit(&self, editable_columns: Shared<Vec<String>>) -> EditContext {
+        EditContext {
+            id: self.id,
+            table: self.table.clone(),
+            dialect: self.dialect,
+            editable_columns,
+            editing: self.editing,
+        }
+    }
+}
+
+/// What a cell editor of one row or form is wired to, shared by every cell
+/// in it: where a commit stages, the dialect the editor parses for, the Tab
+/// order, and the open-editor signal it opens and closes.
+#[derive(Clone, PartialEq)]
+pub(super) struct EditContext {
+    pub(super) id: ConnectionId,
+    pub(super) table: TableRef,
+    pub(super) dialect: Dialect,
+    /// The row's (or the detail form's) Tab order: its editable columns.
+    pub(super) editable_columns: Shared<Vec<String>>,
+    pub(super) editing: Signal<Option<ActiveEdit>>,
+}
+
+/// Where a cell sits in the grid's focus ring and how it shows it.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct CellFocus {
+    /// This cell's focus-ring coordinates, for the click-to-select handler.
+    pub(super) row: usize,
+    pub(super) col: usize,
+    /// Whether this cell holds the grid's keyboard focus ring.
+    pub(super) focused: bool,
+    /// Whether this cell is inside the selection rectangle. Always false on
+    /// a pending insert, which no selection covers.
+    pub(super) selected: bool,
+}
+
 #[component]
 pub(super) fn GridHeader(
     name: String,
@@ -488,14 +540,8 @@ pub(super) fn GridHeader(
 /// in-place editor).
 #[component]
 pub(super) fn GridRow(
-    id: ConnectionId,
-    table: TableRef,
+    ctx: RowContext,
     row: RowView,
-    /// The table's introspected render metadata, shared by pointer with every
-    /// other row rather than deep-cloned into each of them.
-    meta: Shared<TableRenderMeta>,
-    dialect: Dialect,
-    editing: Signal<Option<ActiveEdit>>,
     /// The keyboard-focused column in this row, or `None` when the
     /// focus ring is on another row.
     focused_col: Option<usize>,
@@ -512,6 +558,15 @@ pub(super) fn GridRow(
     /// row's column → value map (the source of the jump's equality filter).
     on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>, Gesture)>,
 ) -> Element {
+    let meta = &ctx.meta;
+    // The row's values by column, the source for any FK jump from this row.
+    // Shared, so the cells carry a pointer to it rather than a copy each.
+    let row_values = Shared::new(
+        row.cells
+            .iter()
+            .map(|cell| (cell.column.clone(), cell.value.clone()))
+            .collect::<HashMap<String, Value>>(),
+    );
     // Every cell resolved against the table metadata exactly once:
     // the editor kind and nullability, whether the cell may open an editor,
     // and the foreign key it can jump through. The slot below used to redo
@@ -523,7 +578,13 @@ pub(super) fn GridRow(
             let (kind, nullable) = meta.kind_of(&cell.column);
             RowCell {
                 editable: editable_for_kind(cell, &kind),
-                fk: meta.fk_of(&cell.column, &cell.value).cloned(),
+                // FK cells (non-NULL value belonging to an FK) carry the
+                // jump payload: the FK plus this row's values. A NULL FK
+                // references nothing, so it renders as a plain cell.
+                fk_jump: meta
+                    .fk_of(&cell.column, &cell.value)
+                    .cloned()
+                    .map(|fk| (fk, row_values.clone())),
                 cell: cell.clone(),
                 kind,
                 nullable,
@@ -538,14 +599,7 @@ pub(super) fn GridRow(
             .map(|resolved| resolved.cell.column.clone())
             .collect::<Vec<String>>(),
     );
-    // The row's values by column, the source for any FK jump from this row.
-    // Shared, so the cells carry a pointer to it rather than a copy each.
-    let row_values = Shared::new(
-        row.cells
-            .iter()
-            .map(|cell| (cell.column.clone(), cell.value.clone()))
-            .collect::<HashMap<String, Value>>(),
-    );
+    let edit = ctx.edit(editable_columns);
     // Rows pending delete (or unaddressable) can't be (re)selected; their
     // leading cell stays empty.
     let checkbox: Option<(String, RowLocator)> = match (&row.key, &row.locator) {
@@ -585,27 +639,18 @@ pub(super) fn GridRow(
             for (col_index , resolved) in cells.into_iter().enumerate() {
                 GridCellSlot {
                     key: "{resolved.cell.column}",
-                    id,
-                    table: table.clone(),
+                    edit: edit.clone(),
                     row_key: row.key.clone(),
                     locator: row.locator.clone(),
-                    kind: resolved.kind,
-                    nullable: resolved.nullable,
-                    editable: resolved.editable,
-                    focused: focused_col == Some(col_index),
-                    selected: selected_cols
-                        .is_some_and(|(left, right)| (left..=right).contains(&col_index)),
-                    row_index,
-                    col_index,
+                    focus: CellFocus {
+                        row: row_index,
+                        col: col_index,
+                        focused: focused_col == Some(col_index),
+                        selected: selected_cols
+                            .is_some_and(|(left, right)| (left..=right).contains(&col_index)),
+                    },
                     on_select_cell,
-                    dialect,
-                    editable_columns: editable_columns.clone(),
-                    editing,
-                    // FK cells (non-NULL value belonging to an FK) carry the
-                    // jump payload: the FK plus this row's values. A NULL FK
-                    // references nothing, so it renders as a plain cell.
-                    fk_jump: resolved.fk.map(|fk| (fk, row_values.clone())),
-                    cell: resolved.cell,
+                    cell: resolved,
                     on_fk_jump,
                 }
             }
@@ -616,6 +661,7 @@ pub(super) fn GridRow(
 /// One cell of a rendered row, resolved against [`TableRenderMeta`] once
 /// instead of looked up again for each of the three answers a
 /// [`GridCellSlot`] needs.
+#[derive(Clone, PartialEq)]
 pub(super) struct RowCell {
     pub(super) cell: CellView,
     pub(super) kind: EditorKind,
@@ -623,8 +669,11 @@ pub(super) struct RowCell {
     /// Row-level editability narrowed by the column's type — the same answer
     /// [`cell_editable`] gives.
     pub(super) editable: bool,
-    /// The foreign key this cell can be followed through, if any.
-    pub(super) fk: Option<ForeignKeyMeta>,
+    /// `Some((fk, row_values))` when this cell belongs to a foreign key and
+    /// has a non-NULL value — renders a ↗ jump link. Editing the
+    /// cell value stays on double-click/Enter, so navigation and editing never
+    /// contend for the same gesture.
+    pub(super) fk_jump: Option<(ForeignKeyMeta, Shared<HashMap<String, Value>>)>,
 }
 
 /// One cell of an editable-capable row: the display cell normally, or the
@@ -633,33 +682,38 @@ pub(super) struct RowCell {
 /// commits walk `editable_columns`.
 #[component]
 pub(super) fn GridCellSlot(
-    id: ConnectionId,
-    table: TableRef,
+    /// The row's editing wiring, shared by every cell in it.
+    edit: EditContext,
     row_key: Option<String>,
     locator: Option<RowLocator>,
-    cell: CellView,
-    kind: EditorKind,
-    nullable: bool,
-    editable: bool,
-    /// Whether this cell holds the grid's keyboard focus ring.
-    focused: bool,
-    /// Whether this cell is inside the selection rectangle.
-    selected: bool,
-    /// This cell's page coordinates, for the click-to-select handler.
-    row_index: usize,
-    col_index: usize,
+    /// The cell, resolved against the table's metadata by its row.
+    cell: RowCell,
+    focus: CellFocus,
+    /// A click on a cell: `(row, column, shift held)`.
     on_select_cell: EventHandler<(usize, usize, bool)>,
-    dialect: Dialect,
-    editable_columns: Shared<Vec<String>>,
-    mut editing: Signal<Option<ActiveEdit>>,
-    /// `Some((fk, row_values))` when this cell belongs to a foreign key and
-    /// has a non-NULL value — renders a ↗ jump link. Editing the
-    /// cell value stays on double-click/Enter, so navigation and editing never
-    /// contend for the same gesture.
-    fk_jump: Option<(ForeignKeyMeta, Shared<HashMap<String, Value>>)>,
     on_fk_jump: EventHandler<(ForeignKeyMeta, HashMap<String, Value>, Gesture)>,
 ) -> Element {
     let state = use_context::<AppState>();
+    let RowCell {
+        cell,
+        kind,
+        nullable,
+        editable,
+        fk_jump,
+    } = cell;
+    let CellFocus {
+        row: row_index,
+        col: col_index,
+        focused,
+        selected,
+    } = focus;
+    let EditContext {
+        id,
+        table,
+        dialect,
+        editable_columns,
+        mut editing,
+    } = edit.clone();
     let is_active = editable
         && editing.read().as_ref().is_some_and(|active| {
             row_key.as_deref() == Some(active.row_key.as_str()) && active.column == cell.column
@@ -676,16 +730,12 @@ pub(super) fn GridCellSlot(
         if cell.preview.is_some() {
             return rsx! {
                 TruncatedCellEditor {
-                    id,
-                    table: table.clone(),
+                    edit,
                     locator,
                     row_key,
                     column,
                     kind,
-                    dialect,
                     nullable,
-                    editable_columns,
-                    editing,
                 }
             };
         }
@@ -804,19 +854,15 @@ pub(super) fn GridCellSlot(
 /// visible column, sharing the grid's editing state and interaction model.
 #[component]
 pub(super) fn InsertRow(
-    id: ConnectionId,
-    table: TableRef,
+    /// The table, its metadata — the editor kinds and the required-column
+    /// set — and the grid's open editor.
+    ctx: RowContext,
     insert: PendingInsert,
     /// The visible columns, shared with the grid's header row.
     headers: Shared<Vec<String>>,
-    /// The table's introspected render metadata — the editor kinds and the
-    /// required-column set, shared by pointer with every other row.
-    meta: Shared<TableRenderMeta>,
-    dialect: Dialect,
     /// Whether the grid renders the leading checkbox column (it does
     /// whenever inserts are possible; this keeps the phantom row aligned).
     lead_cell: bool,
-    editing: Signal<Option<ActiveEdit>>,
     /// This row's focus-ring row: the fetched rows' count plus its position
     /// among the inserts (see [`GridNav`]).
     row_index: usize,
@@ -827,6 +873,12 @@ pub(super) fn InsertRow(
     on_select_cell: EventHandler<(usize, usize, bool)>,
 ) -> Element {
     let state = use_context::<AppState>();
+    let RowContext {
+        id,
+        ref table,
+        ref meta,
+        ..
+    } = ctx;
     let insert_id = insert.id();
     let row_key = insert.row_key();
     // Each column resolved against the metadata once, like a fetched row's
@@ -849,6 +901,7 @@ pub(super) fn InsertRow(
             .map(|(column, _, _)| column.clone())
             .collect::<Vec<String>>(),
     );
+    let edit = ctx.edit(editable_columns);
     let remove_table = table.clone();
     rsx! {
         tr { class: "border-t border-dashed border-emerald-300 dark:border-emerald-700/60 bg-emerald-100 dark:bg-emerald-950/40",
@@ -865,26 +918,40 @@ pub(super) fn InsertRow(
             for (col_index , (column , kind , nullable)) in columns.into_iter().enumerate() {
                 InsertCellSlot {
                     key: "{column}",
-                    focused: focused_col == Some(col_index),
-                    row_index,
-                    col_index,
+                    focus: CellFocus {
+                        row: row_index,
+                        col: col_index,
+                        focused: focused_col == Some(col_index),
+                        selected: false,
+                    },
                     on_select_cell,
-                    id,
-                    table: table.clone(),
+                    edit: edit.clone(),
                     insert_id,
                     row_key: row_key.clone(),
-                    override_value: insert.value(&column).cloned(),
-                    missing: meta.required.contains(&column) && insert.lacks_value(&column),
-                    kind,
-                    nullable,
-                    dialect,
-                    editable_columns: editable_columns.clone(),
-                    editing,
-                    column,
+                    cell: InsertCell {
+                        override_value: insert.value(&column).cloned(),
+                        missing: meta.required.contains(&column) && insert.lacks_value(&column),
+                        kind,
+                        nullable,
+                        column,
+                    },
                 }
             }
         }
     }
+}
+
+/// One column of a pending insert, resolved against the table's metadata by
+/// its row.
+#[derive(Clone, PartialEq)]
+pub(super) struct InsertCell {
+    pub(super) column: String,
+    /// The staged value, or `None` while the column is left to the database.
+    pub(super) override_value: Option<Value>,
+    pub(super) kind: EditorKind,
+    pub(super) nullable: bool,
+    /// Whether the column is required and still unfilled.
+    pub(super) missing: bool,
 }
 
 /// One cell of a phantom insert row. Displays dim italic "default" until
@@ -901,26 +968,35 @@ pub(super) fn InsertRow(
 /// the phantom row must be removed instead.
 #[component]
 pub(super) fn InsertCellSlot(
-    id: ConnectionId,
-    table: TableRef,
+    /// The phantom row's editing wiring, shared by every cell in it.
+    edit: EditContext,
     insert_id: u64,
     row_key: String,
-    column: String,
-    override_value: Option<Value>,
-    kind: EditorKind,
-    nullable: bool,
-    missing: bool,
-    dialect: Dialect,
-    editable_columns: Shared<Vec<String>>,
-    mut editing: Signal<Option<ActiveEdit>>,
-    /// Whether this cell holds the grid's keyboard focus ring.
-    focused: bool,
-    /// This cell's focus-ring coordinates, for the click handler.
-    row_index: usize,
-    col_index: usize,
+    cell: InsertCell,
+    focus: CellFocus,
     on_select_cell: EventHandler<(usize, usize, bool)>,
 ) -> Element {
     let state = use_context::<AppState>();
+    let InsertCell {
+        column,
+        override_value,
+        kind,
+        nullable,
+        missing,
+    } = cell;
+    let CellFocus {
+        row: row_index,
+        col: col_index,
+        focused,
+        ..
+    } = focus;
+    let EditContext {
+        id,
+        table,
+        dialect,
+        editable_columns,
+        mut editing,
+    } = edit;
     let editable = !kind.is_read_only();
     let is_active = editable
         && editing
@@ -1114,18 +1190,22 @@ fn RowCellNotice(kind: BannerKind, message: String, on_close: EventHandler<()>) 
 /// (the prefix would still corrupt it); it shows a read-only note instead.
 #[component]
 pub(super) fn TruncatedCellEditor(
-    id: ConnectionId,
-    table: TableRef,
+    /// The row's editing wiring, as the cell it stands in for has it.
+    edit: EditContext,
     locator: RowLocator,
     row_key: String,
     column: String,
     kind: EditorKind,
-    dialect: Dialect,
     nullable: bool,
-    editable_columns: Shared<Vec<String>>,
-    mut editing: Signal<Option<ActiveEdit>>,
 ) -> Element {
     let state = use_context::<AppState>();
+    let EditContext {
+        id,
+        table,
+        dialect,
+        editable_columns,
+        mut editing,
+    } = edit;
     let loaded_table = table.clone();
     let loaded_locator = locator.clone();
     let loaded_column = column.clone();
@@ -1179,91 +1259,6 @@ pub(super) fn TruncatedCellEditor(
                     }
                 }
             },
-        }
-    }
-}
-
-/// The full-value body of the expand popup for a truncated cell:
-/// loads the value via [`AppState::load_cell`] and hands it to [`CellViewer`]
-/// — a JSON tree, a picture, a hex dump or a text pane. A value over
-/// the fetch cap arrives as a prefix, and the viewer is told so, which is what
-/// keeps it from decoding half a document or half an image as a whole one.
-#[component]
-pub(super) fn ExpandedValue(
-    id: ConnectionId,
-    table: TableRef,
-    locator: RowLocator,
-    column: String,
-    /// The column's declared type, looked up by the popup (empty when the
-    /// schema doesn't name it) — see [`TableRenderMeta::type_of`].
-    type_name: String,
-) -> Element {
-    let refused_column = column.clone();
-    rsx! {
-        LoadedCell {
-            id,
-            table,
-            locator,
-            column,
-            loaded: move |fetch: CellFetch| {
-                let capped = fetch.capped;
-                // A capped fetch holds a prefix, so Copy raw is withdrawn rather
-                // than handed a truncated value — the same refusal `plan_copy`
-                // makes for this cell, worded identically. What is on
-                // screen is the viewer's to describe; this says only what was
-                // loaded and what that costs.
-                let capped_note = capped.then(|| {
-                    format!(
-                        "Value is very large; only the first {} was loaded. {}",
-                        human_bytes(FETCH_CELL_MAX_BYTES as u64),
-                        CopyRefusal::TooLarge {
-                            column: refused_column.clone(),
-                            full_len: fetch.full_len,
-                        }
-                        .message(),
-                    )
-                });
-                rsx! {
-                    if let Some(note) = capped_note {
-                        Banner { kind: BannerKind::Warning, message: note }
-                    } else {
-                        // The clipboard gets the value, never the rendering: a
-                        // blob copies as its hex, exactly as Ctrl+C over the cell.
-                        // Rendered on click — see [`CopyRawButton`].
-                        CopyRawButton { value: fetch.value.clone() }
-                    }
-                    div { class: "mt-2",
-                        CellViewer {
-                            value: fetch.value,
-                            type_name: type_name.clone(),
-                            truncated: capped.then_some(fetch.full_len),
-                        }
-                    }
-                }
-            },
-        }
-    }
-}
-
-/// A right-aligned "Copy raw" action for the expand popup: always
-/// copies the raw cell value — the pane may be showing an image, a hex dump or
-/// a JSON tree, which are for reading, not round-tripping.
-///
-/// Takes the [`Value`] and renders it **on click** rather than being handed a
-/// finished string. [`raw_cell_text`] hexes a blob to twice its size, so the
-/// eager form retained ~17 MB for an 8 MiB cell nobody had asked to copy —
-/// beside a dump that deliberately stops at 16 KiB. Now that cost is paid once,
-/// by the click that wants it, and dropped after.
-#[component]
-pub(super) fn CopyRawButton(value: Value) -> Element {
-    rsx! {
-        div { class: "mb-1 flex justify-end",
-            button {
-                class: BTN_SECONDARY_SM,
-                title: "Copy the raw value (not the formatted view)",
-                onclick: move |_| write_clipboard(&raw_cell_text(&value)),
-                "Copy raw"
-            }
         }
     }
 }
