@@ -3636,22 +3636,37 @@ mod tests {
     #[test]
     fn only_risingwave_reads_its_keys_from_pg_constraint() {
         use super::{column_query, pk_source, ColumnQuery, PgFlavor, PkSource};
-        // The source each flavor must read, by an exhaustive match: a new
-        // flavor fails to compile here until it states its own.
-        let expected = |flavor: PgFlavor| match flavor {
-            PgFlavor::RisingWave => PkSource::PgConstraint,
-            PgFlavor::Postgres
-            | PgFlavor::CockroachDB
-            | PgFlavor::Yugabyte
-            | PgFlavor::Materialize => PkSource::InformationSchema,
+        // Each flavor's place in declaration order and the source it must
+        // read, by an exhaustive match: a new flavor fails to compile here
+        // until it states both.
+        let placed = |flavor: PgFlavor| match flavor {
+            PgFlavor::Postgres => (0, PkSource::InformationSchema),
+            PgFlavor::CockroachDB => (1, PkSource::InformationSchema),
+            PgFlavor::Yugabyte => (2, PkSource::InformationSchema),
+            PgFlavor::Materialize => (3, PkSource::InformationSchema),
+            PgFlavor::RisingWave => (4, PkSource::PgConstraint),
         };
-        for flavor in [
+        let expected = |flavor: PgFlavor| placed(flavor).1;
+        let flavors = [
             PgFlavor::Postgres,
             PgFlavor::CockroachDB,
             PgFlavor::Yugabyte,
             PgFlavor::Materialize,
             PgFlavor::RisingWave,
-        ] {
+        ];
+        // The loop below covers what the match names: each flavor listed
+        // once, in its place, and in declaration order, so a flavor declared
+        // between two listed ones cannot be left out of it. A flavor declared
+        // last and given the next place could still go unlisted; plain Rust
+        // cannot enumerate an enum's variants.
+        for (index, flavor) in flavors.iter().enumerate() {
+            assert_eq!(placed(*flavor).0, index, "{flavor:?} out of place");
+            assert_eq!(
+                *flavor as usize, index,
+                "{flavor:?} not in declaration order"
+            );
+        }
+        for flavor in flavors {
             assert_eq!(pk_source(flavor), expected(flavor), "{flavor:?}");
             // The whole path, flavor to SQL: what the query sent for this
             // flavor actually reads.
