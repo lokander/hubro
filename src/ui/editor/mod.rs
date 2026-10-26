@@ -112,7 +112,8 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
     });
 
     // Whether the active buffer's run is in flight, for the Cancel button.
-    // Its results are [`RunResults`]'s to read.
+    // Reading the run subscribes this pane to its progress; the results
+    // themselves are [`RunResults`]'s to draw.
     let running = matches!(
         state.sql_runs.read().get(&(id, active)).map(|r| &r.status),
         Some(RunStatus::Running)

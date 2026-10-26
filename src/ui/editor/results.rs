@@ -37,8 +37,11 @@ fn truncation_notice(rest: RestOfRead) -> String {
 /// plan, for an Explain), an export line orphaned by a rerun, and the
 /// script's status line.
 ///
-/// Its own component, reading the run and the pending script itself, so a
-/// finished run repaints the results rather than the whole pane.
+/// Its own component, reading the run, the pending script and the export
+/// line itself: a pending script or an export finishing repaints the results
+/// alone. A run's progress still re-renders [`SqlEditor`](super::SqlEditor)
+/// too, which reads the run for its Cancel button; the children it passes
+/// unchanged props to skip.
 #[component]
 pub(super) fn RunResults(
     id: ConnectionId,
