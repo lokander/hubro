@@ -176,6 +176,8 @@ pub async fn assert_pages_sorts_and_filters(
     expected: Expected,
 ) -> (QueryResult, QueryResult) {
     assert_eq!(request.offset, 0, "the first page starts at offset 0");
+    // Two rows at least, or the in-page order check has no pair to look at.
+    assert!(request.limit >= 2, "a page of at least two rows");
     let (column, dir) = request.sort.clone().expect("a sorted request");
     let total = pool.count_rows(Reading::UNMARKED, request).await.unwrap();
     match expected {
