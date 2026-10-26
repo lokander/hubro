@@ -100,6 +100,23 @@ pub(super) enum CredentialSource {
     },
 }
 
+/// Whether a connect with `source` is the sign-in card being answered — its
+/// browser sign-in. That connect takes the card off screen as it starts, and
+/// saves nothing when its locator is already open: it completes a connect
+/// that has been through [`AppState::connect_with`] once already. Every other
+/// source leaves a card that is up alone (a silent connect must not wipe one
+/// the user is answering) and saves on an already-open locator, which is how
+/// an edit of an open connection lands.
+fn answers_the_card(source: &CredentialSource) -> bool {
+    matches!(
+        source,
+        CredentialSource::Entra {
+            opener: EntraOpener::Browser,
+            ..
+        }
+    )
+}
+
 impl CredentialSource {
     /// The auth mode a connect with this credential opens its tunnel for and
     /// saves.
@@ -334,20 +351,13 @@ impl AppState {
         source: CredentialSource,
     ) {
         self.connect_error.set(None);
-        let browser_sign_in = matches!(
-            source,
-            CredentialSource::Entra {
-                opener: EntraOpener::Browser,
-                ..
-            }
-        );
-        if browser_sign_in {
-            // The card is being answered.
+        let answers_card = answers_the_card(&source);
+        if answers_card {
             self.entra_prompt.set(None);
         }
         let auth = source.auth();
         if self.focus_or_reserve(&url) {
-            if !browser_sign_in {
+            if !answers_card {
                 self.save_server_if_open(backend, &url, &name, tunnel, auth);
             }
             return;
@@ -1817,6 +1827,81 @@ mod tests {
     }
 
     #[test]
+    fn only_the_card_s_browser_sign_in_answers_the_card() {
+        let card = EntraPrompt {
+            url: "postgres://u@h:5432/db".to_string(),
+            name: "db".to_string(),
+            tunnel: None,
+            entra: EntraAuth::interactive_default(),
+            backend: BackendKind::Postgres,
+            remember: true,
+            stored: StoredCopy::Unknown,
+        };
+        for (source, answers) in [
+            (CredentialSource::Remembered, false),
+            (
+                CredentialSource::Typed {
+                    password: "pw".to_string(),
+                    remember: Some(true),
+                },
+                false,
+            ),
+            (
+                CredentialSource::Entra {
+                    card: card.clone(),
+                    opener: EntraOpener::Silent,
+                },
+                false,
+            ),
+            (
+                CredentialSource::Entra {
+                    card,
+                    opener: EntraOpener::Browser,
+                },
+                true,
+            ),
+        ] {
+            assert_eq!(answers_the_card(&source), answers, "{:?}", source.auth());
+        }
+        // And both of `connect_with`'s uses of it, as written: the card goes
+        // only when it is being answered, and an already-open locator saves
+        // for every other source.
+        let dispatch = collapsed(&code_of(&method_body(
+            &connect_code(),
+            "async fn connect_with(",
+        )));
+        for binding in [
+            "let answers_card = answers_the_card(&source); if answers_card { self.entra_prompt.set(None); }",
+            "if self.focus_or_reserve(&url) { if !answers_card { \
+             self.save_server_if_open(backend, &url, &name, tunnel, auth); } return; }",
+        ] {
+            assert!(dispatch.contains(binding), "`{binding}` is gone: {dispatch}");
+        }
+    }
+
+    #[test]
+    fn a_silent_sign_in_never_opens_a_browser() {
+        // Executed: the silent opener refuses, so a saved or restored Entra
+        // connect parks the card rather than open a window nobody asked for.
+        assert!(matches!(
+            EntraOpener::Silent.open()("https://login.example/authorize"),
+            Err(azure::AzureError::Browser(_))
+        ));
+        // The browser opener cannot be executed here without opening one, so
+        // its mapping is read as written.
+        let open = collapsed(&code_of(&method_body(
+            &connect_code(),
+            "fn open(self) -> fn(&str) -> Result<(), azure::AzureError> {",
+        )));
+        assert!(
+            open.contains(
+                "EntraOpener::Silent => refuse_browser, EntraOpener::Browser => open_browser,"
+            ),
+            "{open}"
+        );
+    }
+
+    #[test]
     fn the_remember_answer_is_not_inverted_at_any_hop_of_its_wire() {
         // One `!` anywhere on this wire inverts a decision about a secret
         // while moving no call, leaving every gate, label and ordering
@@ -2290,8 +2375,10 @@ mod tests {
             );
         }
         for (hop, body) in [("the sign-in", &signin), ("connect_with", &dispatch)] {
+            // Assigned, or rebuilt with struct-update syntax.
+            let code = collapsed(&code_of(body));
             assert!(
-                !collapsed(&code_of(body)).contains(".remember ="),
+                !code.contains(".remember =") && !code.contains("remember:"),
                 "{hop} rewrites the card's answer on its way: {body}"
             );
         }
