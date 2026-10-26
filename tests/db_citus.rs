@@ -35,7 +35,7 @@
 
 mod common;
 
-use hubro::db::Capabilities;
+use hubro::db::Reading;
 use std::collections::HashMap;
 
 use tokio::sync::Mutex;
@@ -224,10 +224,10 @@ async fn distributed_table_pages_sorts_and_filters_across_shards() {
         filter: Some(Filter::equals("country", "no")),
         extra_key_column: None,
     };
-    let total = pool.count_rows(Capabilities::FULL, &request).await.unwrap();
+    let total = pool.count_rows(Reading::UNMARKED, &request).await.unwrap();
     assert!(total > 50, "expected a spread of rows, got {total}");
 
-    let page = pool.fetch_page(Capabilities::FULL, &request).await.unwrap();
+    let page = pool.fetch_page(Reading::UNMARKED, &request).await.unwrap();
     assert_eq!(page.rows.len(), 5);
     let ids: Vec<i64> = page
         .rows
@@ -245,7 +245,7 @@ async fn distributed_table_pages_sorts_and_filters_across_shards() {
     // shard, which is the thing a fan-out merge could plausibly get wrong.
     let next = pool
         .fetch_page(
-            Capabilities::FULL,
+            Reading::UNMARKED,
             &PageRequest {
                 offset: 5,
                 ..request
@@ -380,7 +380,7 @@ async fn changing_the_distribution_column_is_refused_with_citus_own_message() {
     // And the row is untouched — the failed statement took nothing with it.
     let page = pool
         .fetch_page(
-            Capabilities::FULL,
+            Reading::UNMARKED,
             &PageRequest {
                 schema: Some("public".into()),
                 table: orders.clone(),
@@ -457,7 +457,7 @@ async fn fk_navigation_crosses_from_distributed_to_reference() {
 
     let page = pool
         .fetch_page(
-            Capabilities::FULL,
+            Reading::UNMARKED,
             &PageRequest {
                 schema: Some("public".into()),
                 table: countries.clone(),
@@ -591,7 +591,7 @@ async fn scripts_and_exports_span_distributed_and_reference_tables() {
     let mut csv = Vec::new();
     let exported = pool
         .export(
-            Capabilities::FULL,
+            Reading::UNMARKED,
             &format!("SELECT id, country, total FROM {orders} WHERE country = $1 ORDER BY id"),
             &[Value::Text("no".into())],
             ExportFormat::Csv,

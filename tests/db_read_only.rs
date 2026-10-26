@@ -37,8 +37,8 @@ mod common;
 
 use hubro::db::{
     run_script, script_refusal, Capabilities, ConnectionRegistry, DbError, DbPool, Dialect,
-    ExportFormat, PageRequest, PgFlavor, RestOfRead, RowIdentity, RowLocator, StatementOutcome,
-    TableMeta, Value, WriteProtection,
+    ExportFormat, PageRequest, PgFlavor, Reading, RestOfRead, RowIdentity, RowLocator,
+    StatementOutcome, TableMeta, Value, WriteProtection,
 };
 
 fn url(var: &str) -> Option<String> {
@@ -618,6 +618,7 @@ async fn browse(
     table: &TableMeta,
     how: Browse,
 ) -> Result<String, DbError> {
+    let reading = Reading::of(caps);
     let request = PageRequest {
         schema: table.schema.clone(),
         table: table.name.clone(),
@@ -629,12 +630,15 @@ async fn browse(
     };
     match how {
         Browse::Page => pool
-            .fetch_page_bounded(caps, &request, &table.columns, &["id"])
+            .fetch_page_bounded(reading, &request, &table.columns, &["id"])
             .await
             .map(|page| format!("{:?}", page.result.rows)),
-        Browse::Count => pool.count_rows(caps, &request).await.map(|n| n.to_string()),
+        Browse::Count => pool
+            .count_rows(reading, &request)
+            .await
+            .map(|n| n.to_string()),
         Browse::TableCount => pool
-            .count_table_rows(caps, table)
+            .count_table_rows(reading, table)
             .await
             .map(|n| n.to_string()),
         Browse::Cell => {
@@ -650,14 +654,14 @@ async fn browse(
                 .find(|c| c.name != "id")
                 .expect("a column besides id")
                 .name;
-            pool.fetch_cell(caps, table, &identity, &locator, column)
+            pool.fetch_cell(reading, table, &identity, &locator, column)
                 .await
                 .map(|cell| format!("{:?}", cell.value))
         }
         Browse::Export => {
             let (sql, params) = request.select_sql(pool.dialect());
             let mut out = Vec::new();
-            pool.export(caps, &sql, &params, ExportFormat::Csv, &mut out)
+            pool.export(reading, &sql, &params, ExportFormat::Csv, &mut out)
                 .await
                 .map(|_| String::from_utf8(out).unwrap())
         }
@@ -676,7 +680,13 @@ async fn object_named(pool: &DbPool, name: &str) -> TableMeta {
 /// Browsing a view that writes when read, on one engine with sequences: the
 /// marked read is refused by the engine and the sequence does not move, and
 /// the same read unmarked does move it — so the refusal is what stopped it.
-async fn assert_browsing_does_not_write(var: &str, pool: &DbPool) {
+///
+/// `every_browse_writes` is what the engine is known to do: PostgreSQL (and
+/// TimescaleDB and Citus, which are it) runs the view's function on all five
+/// browses, so there a browse that stopped writing unmarked — and so would
+/// pass marked by having nothing to refuse — fails instead. CockroachDB and
+/// YugabyteDB are asked which browses write, and held to the page.
+async fn assert_browsing_does_not_write(var: &str, pool: &DbPool, every_browse_writes: bool) {
     let s = format!("hubro_ro_browse_seq_{}", std::process::id());
     let v = format!("hubro_ro_browse_view_{}", std::process::id());
     let _ = pool.execute(&format!("DROP VIEW IF EXISTS {v}")).await;
@@ -740,6 +750,13 @@ async fn assert_browsing_does_not_write(var: &str, pool: &DbPool) {
         }
     }
     eprintln!("{var}: writes when browsed unmarked: {wrote:?}");
+    if every_browse_writes {
+        assert_eq!(
+            wrote.len(),
+            BROWSES.len(),
+            "{var}: only {wrote:?} wrote unmarked, so the others' marked runs refused nothing"
+        );
+    }
     // The page is the browse every engine runs the view for; without it,
     // nothing above was refused and the test would prove nothing.
     assert!(
@@ -796,7 +813,7 @@ async fn browsing_a_writing_view_on_a_marked_postgres_connection_is_refused() {
         return;
     };
     let pool = DbPool::open_postgres(&url).await.unwrap();
-    assert_browsing_does_not_write("HUBRO_PG_TEST_URL", &pool).await;
+    assert_browsing_does_not_write("HUBRO_PG_TEST_URL", &pool, true).await;
     assert_marked_browsing_reads("HUBRO_PG_TEST_URL", &pool).await;
     pool.close().await;
 }
@@ -807,7 +824,7 @@ async fn browsing_a_writing_view_on_a_marked_timescale_connection_is_refused() {
         return;
     };
     let pool = DbPool::open_postgres(&url).await.unwrap();
-    assert_browsing_does_not_write("HUBRO_TIMESCALE_TEST_URL", &pool).await;
+    assert_browsing_does_not_write("HUBRO_TIMESCALE_TEST_URL", &pool, true).await;
     assert_marked_browsing_reads("HUBRO_TIMESCALE_TEST_URL", &pool).await;
     pool.close().await;
 }
@@ -818,7 +835,7 @@ async fn browsing_a_writing_view_on_a_marked_citus_connection_is_refused() {
         return;
     };
     let pool = DbPool::open_postgres(&url).await.unwrap();
-    assert_browsing_does_not_write("HUBRO_CITUS_TEST_URL", &pool).await;
+    assert_browsing_does_not_write("HUBRO_CITUS_TEST_URL", &pool, true).await;
     assert_marked_browsing_reads("HUBRO_CITUS_TEST_URL", &pool).await;
     pool.close().await;
 }
@@ -829,7 +846,7 @@ async fn browsing_a_writing_view_on_a_marked_cockroach_connection_is_refused() {
         return;
     };
     let pool = DbPool::open_postgres(&url).await.unwrap();
-    assert_browsing_does_not_write("HUBRO_CRDB_TEST_URL", &pool).await;
+    assert_browsing_does_not_write("HUBRO_CRDB_TEST_URL", &pool, false).await;
     assert_marked_browsing_reads("HUBRO_CRDB_TEST_URL", &pool).await;
     pool.close().await;
 }
@@ -841,7 +858,7 @@ async fn browsing_a_writing_view_on_a_marked_yugabyte_connection_is_refused() {
     };
     let _ddl = YUGABYTE_DDL.lock().await;
     let pool = DbPool::open_postgres(&url).await.unwrap();
-    assert_browsing_does_not_write("HUBRO_YUGABYTE_TEST_URL", &pool).await;
+    assert_browsing_does_not_write("HUBRO_YUGABYTE_TEST_URL", &pool, false).await;
     assert_marked_browsing_reads("HUBRO_YUGABYTE_TEST_URL", &pool).await;
     pool.close().await;
 }

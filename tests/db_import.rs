@@ -18,7 +18,7 @@
 
 mod common;
 
-use hubro::db::Capabilities;
+use hubro::db::Reading;
 use std::io::BufReader;
 
 use common::FixtureDb;
@@ -268,7 +268,7 @@ async fn sqlite_a_bad_row_rolls_back_every_row_already_inserted() {
     // ...and the table is exactly what it was.
     assert_eq!(snapshot(&pool, people, "id").await, before);
     assert_eq!(
-        pool.count_table_rows(Capabilities::FULL, people)
+        pool.count_table_rows(Reading::UNMARKED, people)
             .await
             .unwrap(),
         1
@@ -455,7 +455,7 @@ async fn sqlite_a_read_only_marking_refuses_the_import_before_reading_the_file()
     assert!(err.message.contains("marked"), "{}", err.message);
     assert_eq!(err.undone_rows, 0);
     assert_eq!(
-        pool.count_table_rows(Capabilities::FULL, people)
+        pool.count_table_rows(Reading::UNMARKED, people)
             .await
             .unwrap(),
         0
@@ -497,7 +497,7 @@ async fn sqlite_import_round_trips_the_export_of_the_same_table() {
     let mut buffer: Vec<u8> = Vec::new();
     let exported = pool
         .export(
-            Capabilities::FULL,
+            Reading::UNMARKED,
             &sql,
             &params,
             hubro::db::ExportFormat::Csv,
@@ -642,7 +642,7 @@ async fn postgres_a_bad_row_rolls_back_every_row_already_inserted() {
     );
     assert_eq!(snapshot(&pool, table, "id").await, before);
     assert_eq!(
-        pool.count_table_rows(Capabilities::FULL, table)
+        pool.count_table_rows(Reading::UNMARKED, table)
             .await
             .unwrap(),
         1
@@ -686,7 +686,7 @@ async fn postgres_a_server_side_failure_also_rolls_the_whole_import_back() {
             err.message
         );
         assert_eq!(
-            pool.count_table_rows(Capabilities::FULL, table)
+            pool.count_table_rows(Reading::UNMARKED, table)
                 .await
                 .unwrap(),
             1,
@@ -736,7 +736,7 @@ async fn postgres_skip_mode_reports_lines_and_commits_the_rest() {
         vec![3, 4]
     );
     assert_eq!(
-        pool.count_table_rows(Capabilities::FULL, table)
+        pool.count_table_rows(Reading::UNMARKED, table)
             .await
             .unwrap(),
         2
@@ -791,7 +791,7 @@ async fn mssql_csv_import_lands_rows_and_rolls_a_bad_file_back() {
     .unwrap();
     assert_eq!(report.inserted_rows, 1200);
     assert_eq!(
-        pool.count_table_rows(Capabilities::FULL, table)
+        pool.count_table_rows(Reading::UNMARKED, table)
             .await
             .unwrap(),
         1201
@@ -823,7 +823,7 @@ async fn mssql_csv_import_lands_rows_and_rolls_a_bad_file_back() {
     );
     assert_eq!(snapshot(&pool, table, "id").await, before);
     assert_eq!(
-        pool.count_table_rows(Capabilities::FULL, table)
+        pool.count_table_rows(Reading::UNMARKED, table)
             .await
             .unwrap(),
         1201
@@ -871,7 +871,7 @@ async fn mssql_skip_mode_reports_lines_and_commits_the_rest() {
         vec![3, 4]
     );
     assert_eq!(
-        pool.count_table_rows(Capabilities::FULL, table)
+        pool.count_table_rows(Reading::UNMARKED, table)
             .await
             .unwrap(),
         2
@@ -911,7 +911,7 @@ async fn mssql_import_counts_its_own_rows_not_the_triggers() {
     .expect("the trigger's rows are not the import's");
     assert_eq!(report.inserted_rows, 3);
     assert_eq!(
-        pool.count_table_rows(Capabilities::FULL, table)
+        pool.count_table_rows(Reading::UNMARKED, table)
             .await
             .unwrap(),
         3
@@ -964,7 +964,7 @@ async fn mssql_an_instead_of_insert_trigger_refuses_the_import() {
     );
     assert_eq!(err.undone_rows, 0);
     assert_eq!(
-        pool.count_table_rows(Capabilities::FULL, table)
+        pool.count_table_rows(Reading::UNMARKED, table)
             .await
             .unwrap(),
         0
@@ -1025,7 +1025,7 @@ async fn postgres_a_partially_applied_batch_is_rolled_back_and_counted() {
     // reporting 0 here would under-count the one case the guard fires in.
     assert_eq!(err.undone_rows, 2);
     assert_eq!(
-        pool.count_table_rows(Capabilities::FULL, table)
+        pool.count_table_rows(Reading::UNMARKED, table)
             .await
             .unwrap(),
         0
@@ -1296,7 +1296,7 @@ async fn sqlite_a_batch_split_into_statements_counts_every_row_it_undid() {
     assert!(err.message.contains("UNIQUE"), "{}", err.message);
     assert_eq!(err.undone_rows, 2);
     assert_eq!(
-        pool.count_table_rows(Capabilities::FULL, table)
+        pool.count_table_rows(Reading::UNMARKED, table)
             .await
             .unwrap(),
         1
@@ -1341,7 +1341,7 @@ async fn sqlite_a_short_statement_in_a_split_batch_counts_every_row_it_undid() {
     );
     assert_eq!(err.undone_rows, 3);
     assert_eq!(
-        pool.count_table_rows(Capabilities::FULL, table)
+        pool.count_table_rows(Reading::UNMARKED, table)
             .await
             .unwrap(),
         0
@@ -1522,7 +1522,7 @@ async fn mssql_import_a_committing_trigger_kept_is_not_reported_undone() {
     .await
     .unwrap_err();
     let kept = pool
-        .count_table_rows(Capabilities::FULL, table)
+        .count_table_rows(Reading::UNMARKED, table)
         .await
         .unwrap();
     assert_eq!(

@@ -94,6 +94,7 @@
 
 mod common;
 
+use hubro::db::Reading;
 use hubro::db::{
     apply_staged, detect_row_identity, run_script, split_statements, Capabilities, DbPool, Filter,
     Internal, KeyTextPinned, OpenTransaction, PageRequest, PgFlavor, Restriction, Rollback,
@@ -291,11 +292,11 @@ async fn cockroach_pages_sorts_and_filters() {
         extra_key_column: None,
     };
     assert_eq!(
-        pool.count_rows(Capabilities::FULL, &request).await.unwrap(),
+        pool.count_rows(Reading::UNMARKED, &request).await.unwrap(),
         8
     );
 
-    let page = pool.fetch_page(Capabilities::FULL, &request).await.unwrap();
+    let page = pool.fetch_page(Reading::UNMARKED, &request).await.unwrap();
     assert_eq!(page.rows.len(), 3);
     let ids: Vec<i64> = page.rows.iter().map(|row| integer(&row[0])).collect();
     assert_eq!(ids, [8, 7, 6], "rows should come back highest id first");
@@ -303,7 +304,7 @@ async fn cockroach_pages_sorts_and_filters() {
     // Offsets keep walking the same ordering.
     let next = pool
         .fetch_page(
-            Capabilities::FULL,
+            Reading::UNMARKED,
             &PageRequest {
                 offset: 3,
                 ..request
@@ -460,7 +461,7 @@ async fn cockroach_view_is_readable_but_never_editable() {
 
     let page = pool
         .fetch_page(
-            Capabilities::FULL,
+            Reading::UNMARKED,
             &PageRequest {
                 schema: Some("public".into()),
                 table: view.clone(),
@@ -782,7 +783,7 @@ async fn cockroach_keeps_no_statistics_this_can_read_so_the_pane_stays_empty() {
     // The exact count is the number this engine *can* give, and the reason
     // the action exists separately from the estimate.
     assert_eq!(
-        pool.count_table_rows(Capabilities::FULL, meta)
+        pool.count_table_rows(Reading::UNMARKED, meta)
             .await
             .unwrap(),
         16

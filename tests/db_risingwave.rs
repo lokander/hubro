@@ -119,6 +119,7 @@
 //! `table_type = 'SINK'`, the server's own classification, so any engine that
 //! reports one inherits the gate without a flavor check.
 
+use hubro::db::Reading;
 use hubro::db::{
     apply_staged, detect_row_identity, run_script, split_statements, Capabilities, DbPool, Filter,
     Internal, PageRequest, PgFlavor, Restriction, Rollback, RowIdentity, RowLocator, SortDir,
@@ -451,10 +452,10 @@ async fn risingwave_pages_sorts_and_filters_over_a_materialized_view() {
         extra_key_column: None,
     };
     assert_eq!(
-        pool.count_rows(Capabilities::FULL, &request).await.unwrap(),
+        pool.count_rows(Reading::UNMARKED, &request).await.unwrap(),
         3
     );
-    let page = pool.fetch_page(Capabilities::FULL, &request).await.unwrap();
+    let page = pool.fetch_page(Reading::UNMARKED, &request).await.unwrap();
     let ids: Vec<i64> = page.rows.iter().map(|row| integer(&row[0])).collect();
     assert_eq!(ids, [3, 2]);
 
@@ -470,7 +471,7 @@ async fn risingwave_pages_sorts_and_filters_over_a_materialized_view() {
         extra_key_column: None,
     };
     let mv_page = pool
-        .fetch_page(Capabilities::FULL, &mv_request)
+        .fetch_page(Reading::UNMARKED, &mv_request)
         .await
         .unwrap();
     assert_eq!(mv_page.rows.len(), 1);
@@ -623,13 +624,13 @@ async fn risingwave_has_no_pg_class_statistics_so_none_are_invented() {
     // Counting still works on both, which is what makes the empty estimate
     // tolerable rather than a dead end.
     assert_eq!(
-        pool.count_table_rows(Capabilities::FULL, find(&tables, &readings))
+        pool.count_table_rows(Reading::UNMARKED, find(&tables, &readings))
             .await
             .unwrap(),
         5
     );
     assert_eq!(
-        pool.count_table_rows(Capabilities::FULL, find(&tables, &matview))
+        pool.count_table_rows(Reading::UNMARKED, find(&tables, &matview))
             .await
             .unwrap(),
         2
@@ -700,7 +701,7 @@ async fn risingwave_long_cells_load_through_every_key_type() {
             extra_key_column: None,
         };
         let page = pool
-            .fetch_page_bounded(Capabilities::FULL, &request, &table.columns, &["k"])
+            .fetch_page_bounded(Reading::UNMARKED, &request, &table.columns, &["k"])
             .await
             .unwrap();
         assert_eq!(page.result.rows.len(), literals.len(), "{slug}");
@@ -709,7 +710,7 @@ async fn risingwave_long_cells_load_through_every_key_type() {
                 identity_values: vec![row[0].clone()],
             };
             match pool
-                .fetch_cell(Capabilities::FULL, table, &identity, &locator, "body")
+                .fetch_cell(Reading::UNMARKED, table, &identity, &locator, "body")
                 .await
             {
                 Ok(cell) if cell.full_len > 5000 => {}

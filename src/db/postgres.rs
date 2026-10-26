@@ -753,21 +753,44 @@ where
 /// as it does on any connection — the class
 /// [`WriteProtection::ReadOnly`](super::caps::WriteProtection::ReadOnly)
 /// names.
+///
+/// **A connection whose `BEGIN` failed is closed, not returned.** CockroachDB's
+/// `BEGIN` is two statements ([`BEGIN_READ_ONLY_KEEPING_DDL`]); if the first
+/// opens the transaction and the second fails, sqlx reports the failure with
+/// no transaction it knows to roll back, and the pool would take the
+/// connection back inside an aborted transaction — every later read on it
+/// failing with "current transaction is aborted" (pinned by
+/// `a_browse_whose_begin_fails_does_not_strand_its_connection`).
 pub async fn read_only_query_with(
     pg: &PgConn,
     sql: &str,
     params: &[Value],
 ) -> (Result<QueryResult, DbError>, Result<(), DbError>) {
-    let mut conn = match pg.pool().acquire().await {
+    read_only_query_on(pg.pool(), pg.read_only_begin(), sql, params).await
+}
+
+/// [`read_only_query_with`] with the `BEGIN` given, so a test can make it fail.
+async fn read_only_query_on(
+    pool: &PgPool,
+    begin: &'static str,
+    sql: &str,
+    params: &[Value],
+) -> (Result<QueryResult, DbError>, Result<(), DbError>) {
+    let mut conn = match pool.acquire().await {
         Ok(conn) => conn,
         Err(e) => return (Err(query_error(e, sql)), Ok(())),
     };
-    let mut tx = match begin_read_only(&mut conn, pg.read_only_begin()).await {
-        Ok(tx) => tx,
-        Err(e) => return (Err(e), Ok(())),
+    // The work happens inside the arm, so the transaction's borrow of `conn`
+    // has ended by the time a failed `BEGIN` closes it.
+    let error = match begin_read_only(&mut conn, begin).await {
+        Ok(mut tx) => {
+            let result = query_with_on(&mut *tx, sql, params).await;
+            return (result, end_read_only(tx).await);
+        }
+        Err(error) => error,
     };
-    let result = query_with_on(&mut *tx, sql, params).await;
-    (result, end_read_only(tx).await)
+    conn.close_on_drop();
+    (Err(error), Ok(()))
 }
 
 /// Streams `sql` one row at a time (`fetch`, not `fetch_all`), decoding and
@@ -1684,8 +1707,9 @@ async fn export_on(
 
 /// [`export`] for a connection the user marked read-only, in a read-only
 /// transaction that is always rolled back — see [`read_only_query_with`],
-/// whose shape and reasons this shares. The describe that recovers an empty
-/// export's header runs inside the same transaction.
+/// whose shape and reasons this shares — a connection whose `BEGIN` failed
+/// is closed here too. The describe that recovers an empty export's header
+/// runs inside the same transaction.
 pub async fn read_only_export(
     pg: &PgConn,
     sql: &str,
@@ -1693,16 +1717,31 @@ pub async fn read_only_export(
     format: ExportFormat,
     out: &mut impl Write,
 ) -> (Result<u64, DbError>, Result<(), DbError>) {
-    let mut conn = match pg.pool().acquire().await {
+    read_only_export_on(pg.pool(), pg.read_only_begin(), sql, params, format, out).await
+}
+
+/// [`read_only_export`] with the `BEGIN` given, so a test can make it fail.
+async fn read_only_export_on(
+    pool: &PgPool,
+    begin: &'static str,
+    sql: &str,
+    params: &[Value],
+    format: ExportFormat,
+    out: &mut impl Write,
+) -> (Result<u64, DbError>, Result<(), DbError>) {
+    let mut conn = match pool.acquire().await {
         Ok(conn) => conn,
         Err(e) => return (Err(query_error(e, sql)), Ok(())),
     };
-    let mut tx = match begin_read_only(&mut conn, pg.read_only_begin()).await {
-        Ok(tx) => tx,
-        Err(e) => return (Err(e), Ok(())),
+    let error = match begin_read_only(&mut conn, begin).await {
+        Ok(mut tx) => {
+            let result = export_on(&mut tx, sql, params, format, out).await;
+            return (result, end_read_only(tx).await);
+        }
+        Err(error) => error,
     };
-    let result = export_on(&mut tx, sql, params, format, out).await;
-    (result, end_read_only(tx).await)
+    conn.close_on_drop();
+    (Err(error), Ok(()))
 }
 
 /// Executes a statement without decoding rows, returning the driver's
@@ -3448,6 +3487,46 @@ fn format_interval(iv: &PgInterval) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A marked browse whose `BEGIN` opens the transaction and then fails —
+    /// CockroachDB's two-statement one, standing in for a `SET LOCAL` the
+    /// server refuses — leaves no aborted transaction on a pooled
+    /// connection. Through a pool of one, the next query gets either a new
+    /// connection or a clean one; returned as it was, it failed with
+    /// "current transaction is aborted".
+    #[tokio::test]
+    async fn a_browse_whose_begin_fails_does_not_strand_its_connection() {
+        let Ok(url) = std::env::var("HUBRO_PG_TEST_URL") else {
+            eprintln!("skipping: HUBRO_PG_TEST_URL not set");
+            return;
+        };
+        const FAILING_BEGIN: &str = "BEGIN READ ONLY; SET LOCAL hubro_no_such_setting = off";
+        let pg = super::open_postgres_sized(&url, 1).await.unwrap();
+        let pool = pg.pool();
+        let (read, _) = super::read_only_query_on(pool, FAILING_BEGIN, "SELECT 1", &[]).await;
+        assert!(read.is_err(), "the failing BEGIN failed nothing: {read:?}");
+        super::query_with(pool, "SELECT 1", &[])
+            .await
+            .expect("the read after a failed browse BEGIN");
+        let mut out = Vec::new();
+        let (export, _) = super::read_only_export_on(
+            pool,
+            FAILING_BEGIN,
+            "SELECT 1",
+            &[],
+            super::ExportFormat::Csv,
+            &mut out,
+        )
+        .await;
+        assert!(
+            export.is_err(),
+            "the failing BEGIN failed nothing: {export:?}"
+        );
+        super::query_with(pool, "SELECT 1", &[])
+            .await
+            .expect("the read after a failed export BEGIN");
+        pool.close().await;
+    }
+
     use super::*;
 
     #[test]

@@ -1157,17 +1157,22 @@ impl DbPool {
     ///   does neither (`a_sqlite_read_cannot_load_an_extension` pins that
     ///   `load_extension` is refused). A read-only open per page would buy
     ///   nothing.
-    /// - **SQL Server**: the pool, unchanged — no read-only mode exists
-    ///   ([`engine_has_read_only_mode`]), as for its scripts.
+    /// - **SQL Server**: the pool, unchanged. It has no read-only mode
+    ///   ([`engine_has_read_only_mode`]), and needs none for this: its views
+    ///   and functions cannot write in the reading transaction — measured,
+    ///   `NEXT VALUE FOR` in a view is refused (Msg 11719) and an `INSERT` in
+    ///   a function is too (Msg 443). What is left is the class that acts
+    ///   through a connection of its own: CLR code, a loopback linked server,
+    ///   an extended procedure.
     async fn browse_with(
         &self,
-        caps: Capabilities,
+        reading: Reading,
         sql: &str,
         params: &[Value],
     ) -> Result<QueryResult, DbError> {
         match self {
             DbPool::Sqlite(pool) => sqlite::query_with(pool, sql, params).await,
-            DbPool::Postgres(pg) if engine_enforces_read_only(caps) => {
+            DbPool::Postgres(pg) if engine_enforces_read_only(reading.caps) => {
                 let (result, ended) = postgres::read_only_query_with(pg, sql, params).await;
                 read_only_outcome(result, ended)
             }
@@ -1176,18 +1181,18 @@ impl DbPool {
         }
     }
 
-    /// One page of a table, honoring the request's sort and filter. `caps`
-    /// are the connection's effective capabilities
-    /// ([`Connection::capabilities`]), which decide whether the read runs
-    /// where the engine refuses writes — see [`Self::browse_with`].
+    /// One page of a table, honoring the request's sort and filter. `reading`
+    /// carries the connection's effective capabilities
+    /// ([`Connection::browse`]), which decide whether the read runs where the
+    /// engine refuses writes — see [`Self::browse_with`].
     pub async fn fetch_page(
         &self,
-        caps: Capabilities,
+        reading: Reading,
         request: &PageRequest,
     ) -> Result<QueryResult, DbError> {
         refuse_paged_read(self.backend_capabilities())?;
         let (sql, params) = request.select_sql(self.dialect());
-        self.browse_with(caps, &sql, &params).await
+        self.browse_with(reading, &sql, &params).await
     }
 
     /// One page of a table with **bounded previews** of large columns (long
@@ -1197,10 +1202,10 @@ impl DbPool {
     /// foreign-key columns, whose truncation would misaddress rows or
     /// misdirect a foreign-key jump. The returned [`Page`] carries per-cell
     /// truncation metadata; the full value of a truncated cell is loaded on
-    /// demand via [`Self::fetch_cell`]. `caps` as for [`Self::fetch_page`].
+    /// demand via [`Self::fetch_cell`]. `reading` as for [`Self::fetch_page`].
     pub async fn fetch_page_bounded(
         &self,
-        caps: Capabilities,
+        reading: Reading,
         request: &PageRequest,
         columns: &[ColumnMeta],
         no_preview: &[&str],
@@ -1208,7 +1213,7 @@ impl DbPool {
         refuse_paged_read(self.backend_capabilities())?;
         let (sql, params, plan) =
             request.select_bounded_sql(self.dialect(), columns, no_preview, PREVIEW_BYTES);
-        let raw = self.browse_with(caps, &sql, &params).await?;
+        let raw = self.browse_with(reading, &sql, &params).await?;
         Ok(plan.assemble(raw, PREVIEW_BYTES))
     }
 
@@ -1264,10 +1269,10 @@ impl DbPool {
     /// [`MISSING_ROW`], not a NULL value: every consumer shows, edits or
     /// copies what this returns, so an empty value would read as data.
     ///
-    /// `caps` as for [`Self::fetch_page`].
+    /// `reading` as for [`Self::fetch_page`].
     pub async fn fetch_cell(
         &self,
-        caps: Capabilities,
+        reading: Reading,
         table: &TableMeta,
         identity: &RowIdentity,
         locator: &RowLocator,
@@ -1293,7 +1298,7 @@ impl DbPool {
             &where_clause,
             FETCH_CELL_MAX_BYTES,
         );
-        let result = self.browse_with(caps, &sql, &params).await?;
+        let result = self.browse_with(reading, &sql, &params).await?;
         let Some(row) = result.rows.into_iter().next() else {
             // No row matched: deleted underneath the grid, or a key the
             // server cannot be asked for again. Either way it is a failure,
@@ -1314,14 +1319,14 @@ impl DbPool {
     }
 
     /// Total row count for the request's table and filter (paging ignored).
-    /// `caps` as for [`Self::fetch_page`].
+    /// `reading` as for [`Self::fetch_page`].
     pub async fn count_rows(
         &self,
-        caps: Capabilities,
+        reading: Reading,
         request: &PageRequest,
     ) -> Result<u64, DbError> {
         let (sql, params) = request.count_sql(self.dialect());
-        self.count_query(caps, &sql, &params).await
+        self.count_query(reading, &sql, &params).await
     }
 
     /// Exactly how many rows `table` holds, by running `COUNT(*)`.
@@ -1336,27 +1341,27 @@ impl DbPool {
     /// [`Self::count_rows`] with the page's filter, and the two must not be
     /// confused for each other.
     ///
-    /// `caps` as for [`Self::fetch_page`]: counting a view runs it.
+    /// `reading` as for [`Self::fetch_page`]: counting a view runs it.
     pub async fn count_table_rows(
         &self,
-        caps: Capabilities,
+        reading: Reading,
         table: &TableMeta,
     ) -> Result<u64, DbError> {
         let sql = format!(
             "SELECT COUNT(*) FROM {}",
             super::sql::qualified(table.schema.as_deref(), &table.name)
         );
-        self.count_query(caps, &sql, &[]).await
+        self.count_query(reading, &sql, &[]).await
     }
 
     /// Runs a single-value `COUNT(*)` query and decodes it.
     async fn count_query(
         &self,
-        caps: Capabilities,
+        reading: Reading,
         sql: &str,
         params: &[Value],
     ) -> Result<u64, DbError> {
-        let result = self.browse_with(caps, sql, params).await?;
+        let result = self.browse_with(reading, sql, params).await?;
         match result.rows.first().and_then(|r| r.first()) {
             Some(Value::Integer(n)) => Ok(*n as u64),
             other => Err(DbError::Query(format!(
@@ -1391,12 +1396,12 @@ impl DbPool {
     /// pulling one row at a time so the export never buffers the full result.
     /// Returns the number of data rows written. See [`export`](super::export).
     ///
-    /// `caps` as for [`Self::fetch_page`]: on a connection that may not write,
+    /// `reading` as for [`Self::fetch_page`]: on a connection that may not write,
     /// a Postgres-wire export streams inside a read-only transaction, always
     /// rolled back ([`postgres::read_only_export`]).
     pub async fn export(
         &self,
-        caps: Capabilities,
+        reading: Reading,
         sql: &str,
         params: &[Value],
         format: ExportFormat,
@@ -1404,7 +1409,7 @@ impl DbPool {
     ) -> Result<u64, DbError> {
         match self {
             DbPool::Sqlite(pool) => sqlite::export(pool, sql, params, format, out).await,
-            DbPool::Postgres(pg) if engine_enforces_read_only(caps) => {
+            DbPool::Postgres(pg) if engine_enforces_read_only(reading.caps) => {
                 let (result, ended) =
                     postgres::read_only_export(pg, sql, params, format, out).await;
                 read_only_outcome(result, ended)
@@ -1504,6 +1509,36 @@ fn refuse_paged_read(caps: Capabilities) -> Result<(), DbError> {
     Ok(())
 }
 
+/// What a browse read needs to know about the connection it runs on: its
+/// effective capabilities, which decide whether the read runs where the engine
+/// refuses writes ([`DbPool::fetch_page`] and the other browse reads).
+///
+/// A type of its own rather than a [`Capabilities`] argument, so the app
+/// cannot hand a browse the wrong ones: inside the app the only way to get one
+/// is [`Connection::browse`], which takes them from the connection's marking.
+/// A plain `Capabilities` parameter let any caller pass
+/// `Capabilities::FULL`, which compiles, browses unmarked and stays green in
+/// every test that does not mount the caller. [`Self::UNMARKED`] and
+/// [`Self::of`] exist for code outside the app — the integration tests,
+/// which have a pool and no connection — and no file under `src/ui` may name
+/// them (`no_ui_code_builds_its_own_reading`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reading {
+    caps: Capabilities,
+}
+
+impl Reading {
+    /// A connection nobody marked: every backend's reads, as they were.
+    pub const UNMARKED: Reading = Reading {
+        caps: Capabilities::FULL,
+    };
+
+    /// Reads with these effective capabilities.
+    pub fn of(caps: Capabilities) -> Reading {
+        Reading { caps }
+    }
+}
+
 /// One open connection: a display name plus its pool.
 #[derive(Clone)]
 pub struct Connection {
@@ -1541,6 +1576,13 @@ impl Connection {
             table,
             self.pool.key_rules(),
         )
+    }
+
+    /// The pool and the [`Reading`] a browse on this connection runs with —
+    /// the one place the app gets either for a page, a count, a cell or an
+    /// export, so every such read carries the marking as it is right now.
+    pub fn browse(&self) -> (DbPool, Reading) {
+        (self.pool.clone(), Reading::of(self.capabilities()))
     }
 
     /// Whether a write through this connection must be confirmed first.

@@ -1997,13 +1997,9 @@ impl AppState {
         locator: RowLocator,
         column: String,
     ) -> Result<CellFetch, String> {
-        let pool = self
-            .registry
-            .read()
-            .get(id)
-            .map(|c| (c.pool.clone(), c.capabilities()));
+        let pool = self.registry.read().get(id).map(|c| c.browse());
         let meta = self.table_meta(id, &table);
-        let (Some((pool, caps)), Some(meta)) = (pool, meta) else {
+        let (Some((pool, reading)), Some(meta)) = (pool, meta) else {
             return Err("connection or schema no longer available".into());
         };
         // A read path: it only needs the row to be addressable, so it asks
@@ -2013,9 +2009,9 @@ impl AppState {
         let Some(identity) = pool.backend_row_identity(&meta) else {
             return Err("this table has no usable row identity".into());
         };
-        // The effective capabilities decide whether the fetch runs where the
+        // `reading`, from `browse`, decides whether the fetch runs where the
         // engine refuses writes — see `DbPool::fetch_page`.
-        pool.fetch_cell(caps, &meta, &identity, &locator, &column)
+        pool.fetch_cell(reading, &meta, &identity, &locator, &column)
             .await
             .map_err(|e| e.to_string())
     }
@@ -2069,16 +2065,12 @@ impl AppState {
     /// Only ever from an explicit "count exactly" action — see
     /// [`DbPool::count_table_rows`], which is where the reason lives.
     pub async fn count_table_rows(self, id: ConnectionId, table: TableRef) -> Result<u64, String> {
-        let pool = self
-            .registry
-            .read()
-            .get(id)
-            .map(|c| (c.pool.clone(), c.capabilities()));
+        let pool = self.registry.read().get(id).map(|c| c.browse());
         let meta = self.table_meta(id, &table);
-        let (Some((pool, caps)), Some(meta)) = (pool, meta) else {
+        let (Some((pool, reading)), Some(meta)) = (pool, meta) else {
             return Err("connection or schema no longer available".into());
         };
-        pool.count_table_rows(caps, &meta)
+        pool.count_table_rows(reading, &meta)
             .await
             .map_err(|e| e.to_string())
     }
@@ -2235,13 +2227,210 @@ mod tests {
     use super::*;
     use crate::db::Dialect;
 
+    /// Every `Reading` the UI hands a browse comes from `Connection::browse`,
+    /// which takes it from the connection's marking: no non-test code under
+    /// `src/ui` names `Reading::` (its other constructors, for code that has
+    /// no connection), and the grid's page and count both ask `browse`.
+    /// Comments are stripped first, so a doc mentioning either proves
+    /// nothing, and all whitespace is removed before matching, so a rustfmt
+    /// rewrap is not a failure.
+    #[test]
+    fn no_ui_code_builds_its_own_reading() {
+        fn code_of(text: &str) -> String {
+            let mut code = String::new();
+            let mut lines = text.lines().peekable();
+            while let Some(line) = lines.next() {
+                let opens_test_module = line.trim() == "#[cfg(test)]"
+                    && lines
+                        .peek()
+                        .is_some_and(|next| next.trim_start().starts_with("mod "));
+                if opens_test_module {
+                    // The rest is a test module, which may build any reading.
+                    break;
+                }
+                let line = match line.find("//") {
+                    Some(at) => &line[..at],
+                    None => line,
+                };
+                code.push_str(line);
+                code.push(' ');
+            }
+            code.split_whitespace().collect()
+        }
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let ui = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui");
+        let mut files = Vec::new();
+        rust_files(&ui, &mut files);
+        assert!(
+            files.len() > 20,
+            "found only {} files under src/ui",
+            files.len()
+        );
+        for file in &files {
+            let code = code_of(&std::fs::read_to_string(file).unwrap());
+            assert!(
+                !code.contains("Reading::"),
+                "{}: builds a Reading of its own instead of asking Connection::browse",
+                file.display()
+            );
+        }
+        let grid = code_of(include_str!("../grid/mod.rs"));
+        for call in [
+            "letpool=state.registry.peek().get(id).map(|c|c.browse());asyncmove{",
+            ".fetch_page_bounded(reading,&request,&columns,&no_preview_refs)",
+            "pool.count_rows(reading,&request).await",
+        ] {
+            assert!(grid.contains(call), "the grid no longer reads: {call}");
+        }
+        assert_eq!(
+            grid.matches(".map(|c|c.browse())").count(),
+            2,
+            "the grid's page and count each take their Reading from browse"
+        );
+    }
+
+    /// The cell fetch's half of the test above, on a table rather than a view
+    /// (a view has no row identity, so `load_cell` refuses it before any
+    /// fetch): a row-security policy calling `setval` writes on every read of
+    /// the table. Superusers bypass row security, so the table is read
+    /// through a role of its own.
+    #[tokio::test]
+    async fn a_marked_connections_cell_fetch_runs_where_the_engine_refuses_writes() {
+        use crate::db::{RowLocator, Value, WriteProtection};
+        use std::future::Future as _;
+        let Ok(url) = std::env::var("HUBRO_PG_TEST_URL") else {
+            eprintln!("skipping: HUBRO_PG_TEST_URL not set");
+            return;
+        };
+        let admin = DbPool::open_postgres(&url).await.unwrap();
+        let pid = std::process::id();
+        let (role, s, t) = (
+            format!("hubro_cell_role_{pid}"),
+            format!("hubro_cell_seq_{pid}"),
+            format!("hubro_cell_t_{pid}"),
+        );
+        let cleanup = |admin: DbPool| {
+            let (role, s, t) = (role.clone(), s.clone(), t.clone());
+            async move {
+                let _ = admin.execute(&format!("DROP TABLE IF EXISTS {t}")).await;
+                let _ = admin.execute(&format!("DROP SEQUENCE IF EXISTS {s}")).await;
+                let _ = admin.execute(&format!("DROP ROLE IF EXISTS {role}")).await;
+            }
+        };
+        cleanup(admin.clone()).await;
+        for statement in [
+            format!("CREATE ROLE {role} LOGIN PASSWORD 'hubro-cell'"),
+            format!("CREATE SEQUENCE {s}"),
+            format!("CREATE TABLE {t} (id int PRIMARY KEY, body text)"),
+            format!("INSERT INTO {t} VALUES (1, 'one')"),
+            format!("ALTER TABLE {t} ENABLE ROW LEVEL SECURITY"),
+            format!("CREATE POLICY hubro_cell ON {t} USING (setval('{s}', 3001) > 0)"),
+            format!("GRANT SELECT ON {t} TO {role}"),
+            format!("GRANT USAGE, SELECT, UPDATE ON SEQUENCE {s} TO {role}"),
+        ] {
+            admin
+                .execute(&statement)
+                .await
+                .unwrap_or_else(|e| panic!("{statement}: {e}"));
+        }
+        let mut as_role = url::Url::parse(&url).unwrap();
+        as_role.set_username(&role).unwrap();
+        as_role.set_password(Some("hubro-cell")).unwrap();
+        let pool = DbPool::open_postgres(as_role.as_str()).await.unwrap();
+        let meta = pool
+            .introspect()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.name == t)
+            .expect("the table is listed");
+        let table = TableRef {
+            schema: meta.schema.clone(),
+            name: t.clone(),
+        };
+        let last_value = || {
+            let admin = admin.clone();
+            let s = s.clone();
+            async move {
+                admin
+                    .query(&format!("SELECT last_value FROM {s}"))
+                    .await
+                    .unwrap()
+                    .rows[0][0]
+                    .clone()
+            }
+        };
+
+        let dom = dioxus::core::VirtualDom::new(|| rsx! {});
+        let state = crate::ui::test_dom::provide_state(&dom);
+        let id = dom.in_runtime(|| {
+            let mut registry = state.registry;
+            let id = registry
+                .write()
+                .insert("pg", pool.clone(), WriteProtection::ReadOnly);
+            let mut schemas = state.schemas;
+            schemas
+                .write()
+                .insert(id, SchemaLoad::Ready(vec![meta.clone()]));
+            id
+        });
+        for (protection, marked) in [
+            (WriteProtection::ReadOnly, true),
+            (WriteProtection::Open, false),
+        ] {
+            dom.in_runtime(|| {
+                let mut registry = state.registry;
+                registry.write().set_protection(id, protection);
+            });
+            admin
+                .query(&format!("SELECT setval('{s}', 1)"))
+                .await
+                .unwrap();
+            let locator = RowLocator {
+                identity_values: vec![Value::Integer(1)],
+            };
+            let mut cell = std::pin::pin!(dom.in_runtime(|| state.load_cell(
+                id,
+                table.clone(),
+                locator,
+                "body".into()
+            )));
+            let fetched =
+                std::future::poll_fn(|cx| dom.in_runtime(|| cell.as_mut().poll(cx))).await;
+            match (&fetched, marked) {
+                (Err(e), true) => assert!(e.contains("read-only transaction"), "{e}"),
+                (Ok(cell), false) => assert_eq!(cell.value, Value::Text("one".into())),
+                _ => panic!("{protection:?}: the cell fetch gave {fetched:?}"),
+            }
+            assert_eq!(
+                last_value().await == Value::Integer(1),
+                marked,
+                "{protection:?}: the cell fetch's write"
+            );
+        }
+        pool.close().await;
+        cleanup(admin.clone()).await;
+        admin.close().await;
+    }
+
     /// The app state's own reads of a table — the exact count and the grid
     /// export — take the connection's *effective* capabilities from the
     /// registry when they run, so on a marked Postgres connection a view that
     /// writes when read is refused by the engine; and unmarked through
     /// `set_protection`, the same reads run and write, which is what makes
-    /// the refusal mean something. The grid's page and count take theirs the
-    /// same way, in a component no test mounts.
+    /// the refusal mean something. The cell fetch is the next test; the
+    /// grid's page and count get theirs from the same `Connection::browse`,
+    /// in a component no test mounts — `no_ui_code_builds_its_own_reading`
+    /// pins that nothing under `src/ui` can get a `Reading` any other way.
     #[tokio::test]
     async fn a_marked_connections_count_and_export_run_where_the_engine_refuses_writes() {
         use crate::db::{ExportFormat, Value, WriteProtection};

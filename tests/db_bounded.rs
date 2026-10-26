@@ -6,7 +6,7 @@
 mod common;
 
 use common::FixtureDb;
-use hubro::db::Capabilities;
+use hubro::db::Reading;
 use hubro::db::{
     detect_row_identity, DbError, Generated, PageRequest, RowLocator, TableMeta, Value,
     MISSING_ROW, PREVIEW_BYTES, QUERY_CELL_CAP,
@@ -60,7 +60,7 @@ async fn fetch_page_bounded_previews_large_columns_and_stays_small() {
     let docs = tables.iter().find(|t| t.name == "docs").unwrap();
 
     let page = pool
-        .fetch_page_bounded(Capabilities::FULL, &request("docs"), &docs.columns, &["id"])
+        .fetch_page_bounded(Reading::UNMARKED, &request("docs"), &docs.columns, &["id"])
         .await
         .unwrap();
 
@@ -143,7 +143,7 @@ async fn bounded_page_keeps_generated_columns() {
     );
 
     let page = pool
-        .fetch_page_bounded(Capabilities::FULL, &request("gen"), &gen.columns, &["a"])
+        .fetch_page_bounded(Reading::UNMARKED, &request("gen"), &gen.columns, &["a"])
         .await
         .unwrap();
     let cols: Vec<&str> = page
@@ -174,7 +174,7 @@ async fn fetch_cell_loads_the_full_value() {
         identity_values: vec![Value::Integer(1)],
     };
     let fetched = pool
-        .fetch_cell(Capabilities::FULL, docs, &identity, &locator, "big_text")
+        .fetch_cell(Reading::UNMARKED, docs, &identity, &locator, "big_text")
         .await
         .unwrap();
     assert_eq!(fetched.full_len, 50_000);
@@ -190,7 +190,7 @@ async fn fetch_cell_loads_the_full_value() {
     // editor must reload via fetch_cell before staging, never stage the page
     // value. Prove the two differ in length.
     let page = pool
-        .fetch_page_bounded(Capabilities::FULL, &request("docs"), &docs.columns, &["id"])
+        .fetch_page_bounded(Reading::UNMARKED, &request("docs"), &docs.columns, &["id"])
         .await
         .unwrap();
     if let Value::Text(preview) = &page.result.rows[0][2] {
@@ -222,7 +222,7 @@ async fn fetch_cell_reports_a_missing_row_as_an_error_not_null() {
     };
 
     let stored_null = pool
-        .fetch_cell(Capabilities::FULL, docs, &identity, &at(3), "big_text")
+        .fetch_cell(Reading::UNMARKED, docs, &identity, &at(3), "big_text")
         .await
         .unwrap();
     assert_eq!(stored_null.value, Value::Null);
@@ -230,7 +230,7 @@ async fn fetch_cell_reports_a_missing_row_as_an_error_not_null() {
     pool.query("DELETE FROM docs WHERE id = 1").await.unwrap();
     for id in [1, 999] {
         match pool
-            .fetch_cell(Capabilities::FULL, docs, &identity, &at(id), "big_text")
+            .fetch_cell(Reading::UNMARKED, docs, &identity, &at(id), "big_text")
             .await
         {
             Err(DbError::Query(message)) => assert_eq!(message, MISSING_ROW),
@@ -409,7 +409,7 @@ async fn fetch_cell_refuses_a_locator_that_does_not_fit_the_key() {
             identity_values: values,
         };
         match pool
-            .fetch_cell(Capabilities::FULL, albums, &identity, &locator, "title")
+            .fetch_cell(Reading::UNMARKED, albums, &identity, &locator, "title")
             .await
         {
             Err(DbError::Query(message)) => {
@@ -423,7 +423,7 @@ async fn fetch_cell_refuses_a_locator_that_does_not_fit_the_key() {
         identity_values: vec![Value::Integer(1), Value::Integer(2)],
     };
     let cell = pool
-        .fetch_cell(Capabilities::FULL, albums, &identity, &locator, "title")
+        .fetch_cell(Reading::UNMARKED, albums, &identity, &locator, "title")
         .await
         .unwrap();
     assert_eq!(cell.value, Value::Text("Second".into()));
