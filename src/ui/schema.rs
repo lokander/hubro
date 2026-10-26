@@ -21,6 +21,7 @@ use super::js::write_clipboard;
 use super::notice::{
     Banner, BannerKind, DelayedLoading, EmptyState, KindBadge, Overlay, OverlayAlign,
 };
+use super::offer::Offer;
 use super::schema_edit::SchemaEditDialog;
 use super::state::{AppState, SchemaLoad, TableRef};
 
@@ -124,12 +125,11 @@ fn SchemaBody(id: ConnectionId, meta: TableMeta) -> Element {
                 column: String::new(),
                 new_name: String::new(),
             };
-            match schema_edit_refusal(*caps, *dialect, &meta, &probe) {
-                Some(reason) => Rename::Disabled(reason),
-                None => Rename::Offered,
-            }
+            // A view has no columns to rename, so the button is hidden there
+            // rather than drawn dead in every row.
+            Offer::shown(schema_edit_refusal(*caps, *dialect, &meta, &probe))
         }
-        _ => Rename::Hidden,
+        _ => Offer::Hidden,
     };
     // Plain views have no indexes, so the section (and its "No indexes."
     // line) would just be noise. Materialized views are indexed on purpose,
@@ -195,7 +195,7 @@ fn SchemaBody(id: ConnectionId, meta: TableMeta) -> Element {
                             th { class: "px-3 py-1.5 text-xs uppercase tracking-wide text-slate-500", "Null" }
                             th { class: "px-3 py-1.5 text-xs uppercase tracking-wide text-slate-500", "Key" }
                             th { class: "px-3 py-1.5 text-xs uppercase tracking-wide text-slate-500", "Default" }
-                            if rename_column != Rename::Hidden {
+                            if rename_column.is_shown() {
                                 th { class: "px-3 py-1.5" }
                             }
                         }
@@ -589,22 +589,11 @@ fn CopyDdlButton(text: String) -> Element {
     }
 }
 
-/// Whether a column row offers to rename the column, and why it does not when
-/// it is offered but unavailable.
-///
-/// [`Hidden`](Self::Hidden) is for objects where the operation makes no sense
-/// at all — a view — so the column list keeps its shape instead of growing a
-/// column of permanently dead buttons. The other two are the ordinary rule:
-/// visible, with its reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Rename {
-    Hidden,
-    Disabled(&'static str),
-    Offered,
-}
-
+/// One column of the Structure table. `rename` is whether the row offers to
+/// rename its column: hidden for an object where that makes no sense, shown
+/// with its reason where the connection refuses it.
 #[component]
-fn ColumnRow(column: ColumnMeta, editing: Signal<Option<SchemaOp>>, rename: Rename) -> Element {
+fn ColumnRow(column: ColumnMeta, editing: Signal<Option<SchemaOp>>, rename: Offer) -> Element {
     let type_name = display_type(&column);
     rsx! {
         tr { class: "border-b border-slate-200 dark:border-slate-800/60",
@@ -649,13 +638,10 @@ fn ColumnRow(column: ColumnMeta, editing: Signal<Option<SchemaOp>>, rename: Rena
                     },
                 }
             }
-            if rename != Rename::Hidden {
+            if rename.is_shown() {
                 td { class: "px-3 py-1 text-right",
                     SchemaAction {
-                        refusal: match rename {
-                            Rename::Disabled(reason) => Some(reason),
-                            _ => None,
-                        },
+                        refusal: rename.refusal().copied(),
                         op: SchemaOp::RenameColumn {
                             column: column.name.clone(),
                             // Seeded with the current name: the field shows

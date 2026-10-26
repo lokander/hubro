@@ -237,7 +237,8 @@ pub(super) fn RowDetailPanel(
     /// rather than an empty page.
     on_pending_insert: bool,
     width: f64,
-    dialect: Dialect,
+    /// See [`RowContext::dialect`].
+    dialect: Option<Dialect>,
     /// Why editing is unavailable — the grid's sentence, from the grid's
     /// resolution, stated once instead of per field.
     read_only_notice: Option<String>,
@@ -350,7 +351,7 @@ pub(super) fn RowDetailPanel(
 pub(super) fn RowDetailFields(
     id: ConnectionId,
     table: TableRef,
-    dialect: Dialect,
+    dialect: Option<Dialect>,
     /// The focused row: its fields, locator, values and identity.
     detail: Shared<RowDetail>,
     /// The panel's open editor, owned by `DataGrid` rather than created here.
@@ -612,7 +613,7 @@ pub(super) fn RowDetailValue(
         return rsx! {
             CellEditor {
                 // A block wrapper, not a table cell: this is a form, not a row.
-                block: true,
+                frame: EditorFrame::Block,
                 kind: field.kind.clone(),
                 dialect,
                 nullable: field.nullable,

@@ -12,6 +12,7 @@ mod icons;
 mod import;
 mod js;
 mod notice;
+mod offer;
 mod saved_panel;
 mod schema;
 mod schema_edit;

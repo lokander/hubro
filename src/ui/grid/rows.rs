@@ -459,7 +459,10 @@ pub(super) struct RowContext {
     /// The table's introspected render metadata, shared by pointer with every
     /// other row rather than deep-cloned into each of them.
     pub(super) meta: Shared<TableRenderMeta>,
-    pub(super) dialect: Dialect,
+    /// The connection's dialect, which every editor stages for. `None` once
+    /// the connection is gone (the tab is closing): the editors then refuse
+    /// rather than stage a value written for a guessed one.
+    pub(super) dialect: Option<Dialect>,
     pub(super) editing: Signal<Option<ActiveEdit>>,
 }
 
@@ -483,10 +486,33 @@ impl RowContext {
 pub(super) struct EditContext {
     pub(super) id: ConnectionId,
     pub(super) table: TableRef,
-    pub(super) dialect: Dialect,
+    /// See [`RowContext::dialect`].
+    pub(super) dialect: Option<Dialect>,
     /// The row's (or the detail form's) Tab order: its editable columns.
     pub(super) editable_columns: Shared<Vec<String>>,
     pub(super) editing: Signal<Option<ActiveEdit>>,
+}
+
+/// Whether the grid draws its leading column of row checkboxes — the
+/// selection that stages deletes, which only exists where the table can be
+/// written. Every row draws the column or none does, so the rows stay
+/// aligned with the header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TickColumn {
+    Shown,
+    Absent,
+}
+
+impl TickColumn {
+    /// The column for a grid whose rows can (or cannot) be ticked for
+    /// deletion.
+    pub(super) fn for_selectable(select_enabled: bool) -> Self {
+        if select_enabled {
+            TickColumn::Shown
+        } else {
+            TickColumn::Absent
+        }
+    }
 }
 
 /// Where a cell sits in the grid's focus ring and how it shows it.
@@ -552,7 +578,8 @@ pub(super) fn GridRow(
     selected_cols: Option<(usize, usize)>,
     /// A click on a cell: `(row, column, shift held)`.
     on_select_cell: EventHandler<(usize, usize, bool)>,
-    select_enabled: bool,
+    /// Whether this row draws its checkbox cell.
+    ticks: TickColumn,
     mut selected: Signal<HashMap<String, RowLocator>>,
     /// Follows the FK a clicked cell belongs to, carrying that FK plus this
     /// row's column → value map (the source of the jump's equality filter).
@@ -618,7 +645,7 @@ pub(super) fn GridRow(
             // by `ROW_HEIGHT`, so pin it here — this also stops an open inline
             // editor from making its row taller and drifting the offsets.
             style: "height:{ROW_HEIGHT}px;",
-            if select_enabled {
+            if ticks == TickColumn::Shown {
                 td { class: "w-8 px-2 py-1",
                     if let Some((key, locator)) = checkbox {
                         input {
@@ -860,9 +887,9 @@ pub(super) fn InsertRow(
     insert: PendingInsert,
     /// The visible columns, shared with the grid's header row.
     headers: Shared<Vec<String>>,
-    /// Whether the grid renders the leading checkbox column (it does
-    /// whenever inserts are possible; this keeps the phantom row aligned).
-    lead_cell: bool,
+    /// Whether the grid draws its checkbox column; the phantom row puts its
+    /// ✕ there, and draws the cell either way the grid does to stay aligned.
+    ticks: TickColumn,
     /// This row's focus-ring row: the fetched rows' count plus its position
     /// among the inserts (see [`GridNav`]).
     row_index: usize,
@@ -905,7 +932,7 @@ pub(super) fn InsertRow(
     let remove_table = table.clone();
     rsx! {
         tr { class: "border-t border-dashed border-emerald-300 dark:border-emerald-700/60 bg-emerald-100 dark:bg-emerald-950/40",
-            if lead_cell {
+            if ticks == TickColumn::Shown {
                 td { class: "w-8 px-2 py-1",
                     button {
                         class: "rounded px-1.5 text-xs text-emerald-700 dark:text-emerald-300/80 hover:bg-red-100 dark:hover:bg-red-900/40 hover:text-red-600 dark:hover:text-red-300",
