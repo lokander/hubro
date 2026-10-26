@@ -102,16 +102,7 @@ impl UrlScheme {
     ///
     /// Query params (e.g. the TLS param) and the database path are left as-is.
     pub fn normalize(&self, url: &str) -> Result<String, DbError> {
-        let mut parsed = url::Url::parse(url.trim())
-            .map_err(|e| DbError::Connect(format!("invalid URL: {e}")))?;
-        if parsed.scheme() != self.canonical && parsed.scheme() != self.alias {
-            return Err(DbError::Connect(format!(
-                "expected {} {}:// URL, got {}://",
-                self.article,
-                self.canonical,
-                parsed.scheme()
-            )));
-        }
+        let mut parsed = self.parse(url)?;
         if parsed.scheme() == self.alias {
             // Both are non-special schemes, so this never fails; ignore
             // defensively.
@@ -126,27 +117,49 @@ impl UrlScheme {
                     .map_err(|e| DbError::Connect(format!("invalid host: {e}")))?;
             }
         }
-        match parsed.port() {
-            // 0 is not a usable port; reject it here so a pasted URL is held
-            // to the same rule as the connection form.
-            Some(0) => return Err(DbError::Connect("port must be between 1 and 65535".into())),
+        if parsed.port().is_none() {
             // Both engines use non-special schemes, so the url crate always
             // serializes an explicit port — the bare and `:<default>` forms
             // now serialize equal.
-            None => {
-                let _ = parsed.set_port(Some(self.default_port));
-            }
-            Some(_) => {}
+            let _ = parsed.set_port(Some(self.default_port));
         }
         Ok(parsed.into())
     }
 
+    /// Parses a URL for this engine: the one place its scheme and port are
+    /// checked, for [`Self::normalize`], [`Self::target`] and the SQL Server
+    /// driver's own parse alike, so no path accepts what another refuses.
+    ///
+    /// - the scheme must be this engine's, or its alias;
+    /// - an explicit port must be usable: 0 is refused, so a pasted URL is
+    ///   held to the same rule as the connection form.
+    pub fn parse(&self, url: &str) -> Result<url::Url, DbError> {
+        let parsed = url::Url::parse(url.trim())
+            .map_err(|e| DbError::Connect(format!("invalid URL: {e}")))?;
+        if parsed.scheme() != self.canonical && parsed.scheme() != self.alias {
+            return Err(DbError::Connect(format!(
+                "expected {} {}:// URL, got {}://",
+                self.article,
+                self.canonical,
+                parsed.scheme()
+            )));
+        }
+        if parsed.port() == Some(0) {
+            return Err(DbError::Connect("port must be between 1 and 65535".into()));
+        }
+        Ok(parsed)
+    }
+
     /// The host and port a URL points at (falling back to the engine default
     /// port) — with an SSH tunnel this is the address the SSH server must
-    /// reach.
+    /// reach. Parsed by [`Self::parse`], so a URL with another engine's
+    /// scheme or port 0 is refused here too.
     pub fn target(&self, url: &str) -> Result<(String, u16), DbError> {
-        let parsed =
-            url::Url::parse(url).map_err(|e| DbError::Connect(format!("invalid URL: {e}")))?;
+        self.host_port(&self.parse(url)?)
+    }
+
+    /// [`Self::target`] for a URL already [`parse`](Self::parse)d.
+    pub fn host_port(&self, parsed: &url::Url) -> Result<(String, u16), DbError> {
         let host = parsed
             .host_str()
             .ok_or_else(|| DbError::Connect("URL has no host".into()))?
@@ -404,6 +417,27 @@ mod tests {
         );
         assert!(POSTGRES.target("not a url").is_err());
         assert!(MSSQL.target("not a url").is_err());
+    }
+
+    /// The target is read through the same parse as the locator, so it
+    /// refuses what `normalize` refuses: a port of 0, and another engine's
+    /// URL. Before, `target` took either and handed the tunnel port 0.
+    #[test]
+    fn target_refuses_what_normalize_refuses() {
+        for (scheme, url) in [
+            (&POSTGRES, "postgres://u@db.internal:0/app"),
+            (&POSTGRES, "mssql://u@db.internal/app"),
+            (&MSSQL, "mssql://u@db.internal:0/app"),
+            (&MSSQL, "postgres://u@db.internal/app"),
+        ] {
+            assert!(scheme.normalize(url).is_err(), "{url}");
+            assert!(scheme.target(url).is_err(), "{url}");
+        }
+        assert_eq!(
+            MSSQL.target("sqlserver://u@db.internal/app").unwrap(),
+            ("db.internal".to_string(), 1433),
+            "the alias is still this engine's"
+        );
     }
 
     #[test]

@@ -163,18 +163,9 @@ struct MssqlUrlParts {
 /// (`on`/`off`/`plaintext`) and `trustServerCertificate` (`true`/`false`);
 /// anything else is rejected so a typo can't silently weaken TLS settings.
 fn parse_mssql_url(url: &str) -> Result<MssqlUrlParts, DbError> {
-    let parsed = url::Url::parse(url).map_err(|e| DbError::Connect(format!("invalid URL: {e}")))?;
-    if parsed.scheme() != "mssql" && parsed.scheme() != "sqlserver" {
-        return Err(DbError::Connect(format!(
-            "expected an mssql:// URL, got {}://",
-            parsed.scheme()
-        )));
-    }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| DbError::Connect("URL has no host".into()))?
-        .trim_matches(['[', ']'])
-        .to_string();
+    // Scheme, host and port as every other path reads them, port 0 refused.
+    let parsed = super::super::url::MSSQL.parse(url)?;
+    let (host, port) = super::super::url::MSSQL.host_port(&parsed)?;
     let decode = |s: &str| -> Result<String, DbError> {
         percent_encoding::percent_decode_str(s)
             .decode_utf8()
@@ -230,7 +221,7 @@ fn parse_mssql_url(url: &str) -> Result<MssqlUrlParts, DbError> {
     }
     Ok(MssqlUrlParts {
         host,
-        port: parsed.port().unwrap_or(1433),
+        port,
         user,
         password,
         database,
@@ -751,19 +742,56 @@ fn is_fatal(err: &TdsError) -> bool {
 /// Resolves a driver-level result against the checked-out connection: errors
 /// that may have corrupted the stream discard the connection instead of
 /// returning it to the pool.
-fn settle<T>(conn: &mut PooledConn, result: Result<T, TdsError>, sql: &str) -> Result<T, DbError> {
+fn settle<T>(conn: &mut PooledConn, result: Result<T, TdsError>) -> Result<T, DbError> {
+    settle_as(conn, result, query_error)
+}
+
+/// [`settle`] with the error mapped by `map` rather than [`query_error`].
+fn settle_as<T>(
+    conn: &mut PooledConn,
+    result: Result<T, TdsError>,
+    map: impl FnOnce(&TdsError) -> DbError,
+) -> Result<T, DbError> {
     result.map_err(|e| {
         if is_fatal(&e) {
             conn.discard();
         }
-        query_error(&e, sql)
+        map(&e)
     })
+}
+
+/// SQL Server's deadlock-victim error: the server chose this statement's
+/// session to end a deadlock and rolled the statement back.
+const DEADLOCK_VICTIM: u32 = 1205;
+
+/// The error a failed *catalog* read reports: [`DbError::Transient`] for a
+/// deadlock victim (1205), the server's own word that running the read again
+/// may succeed — the counterpart of PostgreSQL's `40001` — and
+/// [`query_error`]'s otherwise. Classified on the code alone, never the text.
+///
+/// Only the catalog reads map this way ([`catalog_query_with`]): a schema
+/// change landing while introspection reads `sys.*` can make introspection
+/// the victim, which is nobody's mistake and nothing the user can act on, and
+/// `registry::retry_transient` runs it once more. A script's or a write's
+/// 1205 stays an ordinary error, as the retry rule says writes never retry.
+fn catalog_error(err: &TdsError) -> DbError {
+    catalog_error_from(err.code(), err.to_string())
+}
+
+/// [`catalog_error`] over plain data — the server's error code and the
+/// driver's message — where a test can reach it (tiberius has no public way
+/// to build a server error).
+fn catalog_error_from(code: Option<u32>, message: String) -> DbError {
+    match code {
+        Some(DEADLOCK_VICTIM) => DbError::Transient(message),
+        _ => DbError::Query(message),
+    }
 }
 
 /// Maps a driver error onto [`DbError::Query`]. No position post-processing:
 /// SQL Server reports the failing batch line inside the message itself
 /// (tiberius renders `'…' on server … on line N`).
-fn query_error(err: &TdsError, _sql: &str) -> DbError {
+fn query_error(err: &TdsError) -> DbError {
     DbError::Query(err.to_string())
 }
 
@@ -1103,11 +1131,31 @@ pub async fn query_with(
     sql: &str,
     params: &[Value],
 ) -> Result<QueryResult, DbError> {
+    query_with_as(pool, sql, params, query_error).await
+}
+
+/// [`query_with`] for a catalog read: a deadlock victim comes back as
+/// [`DbError::Transient`] ([`catalog_error`]), so the caller's one retry can
+/// act on it.
+pub(super) async fn catalog_query_with(
+    pool: &MssqlPool,
+    sql: &str,
+    params: &[Value],
+) -> Result<QueryResult, DbError> {
+    query_with_as(pool, sql, params, catalog_error).await
+}
+
+async fn query_with_as(
+    pool: &MssqlPool,
+    sql: &str,
+    params: &[Value],
+    map: impl FnOnce(&TdsError) -> DbError,
+) -> Result<QueryResult, DbError> {
     let mut conn = pool.acquire().await?;
     let result = conn
         .request(async |c| run_query(c, sql, params).await)
         .await;
-    let (result, abandoned) = settle(&mut conn, result, sql)?;
+    let (result, abandoned) = settle_as(&mut conn, result, map)?;
     // Unread result sets left on the stream must not ride back to the pool —
     // the next borrower would pay for draining them.
     if abandoned {
@@ -1125,7 +1173,7 @@ pub async fn execute(pool: &MssqlPool, sql: &str) -> Result<RowsAffected, DbErro
     let result = conn
         .request(async |c| run_statement(c, sql, batch).await)
         .await;
-    settle(&mut conn, result, sql)
+    settle(&mut conn, result)
 }
 
 /// Streams `sql`, decoding and retaining at most `max_rows` rows and capping
@@ -1151,7 +1199,7 @@ pub async fn query_capped(
     let result = conn
         .request(async |c| run_query_capped(c, sql, params, false, max_rows, cell_cap).await)
         .await;
-    let (result, truncated, abandoned) = settle(&mut conn, result, sql)?;
+    let (result, truncated, abandoned) = settle(&mut conn, result)?;
     if truncated || abandoned {
         let needs = statement_needs(sql, crate::db::sql::Dialect::SqlServer);
         if needs.mutate || needs.ddl {
@@ -1160,7 +1208,7 @@ pub async fn query_capped(
             // been read; discarding the connection here aborted it. Read the
             // rest, and report an error it ends in.
             let drained = conn.request(async |c| run_batch(c, "SELECT 1").await).await;
-            settle(&mut conn, drained, sql)?;
+            settle(&mut conn, drained)?;
         } else {
             conn.discard();
         }
@@ -1206,7 +1254,7 @@ async fn query_capped_held(
             .await
         })
         .await;
-    let (result, truncated, _abandoned) = settle(conn, result, sql)?.map_err(|c| c.error())?;
+    let (result, truncated, _abandoned) = settle(conn, result)?.map_err(|c| c.error())?;
     Ok((result, truncated))
 }
 
@@ -1341,7 +1389,7 @@ pub async fn begin_tx(pool: &MssqlPool) -> Result<MssqlTx, DbError> {
             Ok::<_, TdsError>(row.and_then(|row| row.get::<i64, _>(0)))
         })
         .await;
-    match settle(&mut conn, begin, BEGIN)? {
+    match settle(&mut conn, begin)? {
         Some(id) => Ok(MssqlTx {
             conn,
             resolved: false,
@@ -1383,7 +1431,7 @@ async fn execute_held(
             checked_batch(c, route, async |c| run_statement(c, sql, batch).await).await
         })
         .await;
-    settle(conn, result, sql)?.map_err(|c| c.error())
+    settle(conn, result)?.map_err(|c| c.error())
 }
 
 /// [`execute_conn`] with bound parameters — the write path for a batch of
@@ -1403,7 +1451,7 @@ pub async fn execute_with_conn(
         .conn
         .request(async |c| run_execute(c, sql, params).await)
         .await;
-    settle(&mut tx.conn, result, sql).map(|counts| statement_rows(&counts))
+    settle(&mut tx.conn, result).map(|counts| statement_rows(&counts))
 }
 
 /// Commits a script transaction — its statements all take effect. A failed
@@ -1422,7 +1470,7 @@ pub async fn commit_tx(mut tx: MssqlTx) -> Result<(), (DbError, RolledBack)> {
         .conn
         .request(async |c| run_batch(c, "COMMIT TRAN").await)
         .await;
-    match settle(&mut tx.conn, commit, "COMMIT TRAN") {
+    match settle(&mut tx.conn, commit) {
         Ok(()) => {
             tx.resolved = true;
             Ok(())
@@ -1547,7 +1595,7 @@ pub async fn end_script_conn(conn: &mut MssqlScriptConn) -> Result<bool, DbError
             Ok::<_, TdsError>(row.and_then(|row| row.get::<i32, _>(0)) == Some(1))
         })
         .await;
-    let ended = settle(held, ended, END_SCRIPT);
+    let ended = settle(held, ended);
     if ended.is_err() {
         held.discard();
     }
@@ -1609,7 +1657,7 @@ pub async fn finish_script_conn_with_read(
             Ok::<_, TdsError>(row.and_then(|row| row.get::<i32, _>(0)).unwrap_or(0) > 0)
         })
         .await;
-    let open = match settle(held, before, "SELECT @@TRANCOUNT") {
+    let open = match settle(held, before) {
         Ok(open) => open,
         Err(error) => {
             held.discard();
@@ -1635,7 +1683,7 @@ pub async fn finish_script_conn_with_read(
             .await
         })
         .await;
-    match settle(held, read, sql).and_then(|read| read.map_err(|c| c.error())) {
+    match settle(held, read).and_then(|read| read.map_err(|c| c.error())) {
         Ok((result, truncated, abandoned)) if truncated || abandoned => {
             held.discard();
             FinishedRead {
@@ -1700,7 +1748,7 @@ pub async fn export(
             Ok((rows.written, abandoned))
         })
         .await;
-    let (written, abandoned) = settle(&mut conn, outcome, sql)?;
+    let (written, abandoned) = settle(&mut conn, outcome)?;
     // An abandoned second result set must not ride back to the pool.
     if abandoned {
         conn.discard();
@@ -1839,6 +1887,25 @@ mod tests {
         assert!(parse_mssql_url("mssql://u@h?encrypt=maybe").is_err());
     }
 
+    /// A deadlock victim on a catalog read is the server saying "run it
+    /// again", so it is the one code that comes back transient; every other
+    /// code (and none, for a lost connection) is an ordinary failure. The
+    /// message is kept either way.
+    #[test]
+    fn a_catalog_reads_deadlock_is_transient_and_nothing_else_is() {
+        assert_eq!(
+            catalog_error_from(Some(1205), "chosen as the deadlock victim".into()),
+            DbError::Transient("chosen as the deadlock victim".into())
+        );
+        for code in [None, Some(208), Some(1222), Some(3998), Some(18456)] {
+            assert_eq!(
+                catalog_error_from(code, "m".into()),
+                DbError::Query("m".into()),
+                "{code:?}"
+            );
+        }
+    }
+
     #[test]
     fn parse_url_rejects_unknown_params_and_wrong_scheme() {
         // Unknown params are rejected rather than ignored, so a typo can't
@@ -1846,6 +1913,10 @@ mod tests {
         assert!(parse_mssql_url("mssql://u@h?sslmode=require").is_err());
         assert!(parse_mssql_url("mssql://u@h?trustServerCertificate=maybe").is_err());
         assert!(parse_mssql_url("postgres://u@h/db").is_err());
+        // Port 0 is refused here as the locator refuses it (`UrlScheme::parse`);
+        // before, the driver's own parse took it and tried to connect there.
+        assert!(parse_mssql_url("mssql://u@h:0/db").is_err());
+        assert_eq!(parse_mssql_url("sqlserver://u@h/db").unwrap().port, 1433);
     }
 
     #[test]

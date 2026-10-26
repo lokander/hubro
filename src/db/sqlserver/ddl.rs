@@ -3,7 +3,7 @@
 //! indexes (SSMS scripts those client-side through SMO) — a reconstruction
 //! from the sys catalog, rendered by the shared writers in [`crate::db::ddl`].
 
-use super::pool::{query_with, MssqlPool};
+use super::pool::{catalog_query_with, MssqlPool};
 use super::{format_mssql_type, strip_default_parens};
 use crate::db::ddl::{
     create_index_sql, create_table_sql, ColumnExtra, Ddl, DdlObject, IndexExtras, TableExtras,
@@ -36,7 +36,7 @@ pub async fn fetch_ddl(
     }
 
     if matches!(table.kind, TableKind::View | TableKind::MaterializedView) {
-        let rows = query_with(
+        let rows = catalog_query_with(
             pool,
             "SELECT m.definition \
              FROM sys.sql_modules m \
@@ -58,7 +58,7 @@ pub async fn fetch_ddl(
         return Ok(Ddl::native(definition.trim_end()));
     }
 
-    let extras = match table_ddl_extras(pool, &params).await {
+    let extras = match table_ddl_extras(pool, table, &params).await {
         Ok(extras) => extras,
         // A failed catalog read degrades to the metadata-only rebuild rather
         // than failing the action outright. The standing caveats are extended,
@@ -93,11 +93,16 @@ fn mssql_standing_caveats() -> Vec<String> {
 /// Per-table facts for the `CREATE TABLE` rebuild: column collations,
 /// identity specifications, computed-column expressions, every constraint
 /// (primary key, unique, foreign key *with its referential actions*, check),
-/// and the indexes that do not back a constraint.
-async fn table_ddl_extras(pool: &MssqlPool, params: &[Value]) -> Result<TableExtras, DbError> {
+/// and the indexes that do not back a constraint. `params` are `table`'s
+/// schema and name as the catalog queries bind them.
+async fn table_ddl_extras(
+    pool: &MssqlPool,
+    table: &TableMeta,
+    params: &[Value],
+) -> Result<TableExtras, DbError> {
     // A column's collation is only worth writing when it differs from the
     // database default — otherwise every char column would carry noise.
-    let column_rows = query_with(
+    let column_rows = catalog_query_with(
         pool,
         "SELECT c.name, t.name, c.max_length, c.precision, c.scale, \
                 CASE WHEN c.collation_name <> \
@@ -124,7 +129,7 @@ async fn table_ddl_extras(pool: &MssqlPool, params: &[Value]) -> Result<TableExt
     // Primary key first, then unique constraints, each with its backing
     // index's clustering — not cosmetic on SQL Server, where a clustered
     // index *is* the table's row storage.
-    let key_rows = query_with(
+    let key_rows = catalog_query_with(
         pool,
         "SELECT kc.name, kc.type, i.type_desc, col.name, ic.is_descending_key \
          FROM sys.key_constraints kc \
@@ -144,7 +149,7 @@ async fn table_ddl_extras(pool: &MssqlPool, params: &[Value]) -> Result<TableExt
 
     // The referential actions are the reason this query exists: a rebuilt FK
     // that lost its ON DELETE CASCADE is a different constraint.
-    let fk_rows = query_with(
+    let fk_rows = catalog_query_with(
         pool,
         "SELECT fk.name, rs.name, ro.name, pc.name, rc.name, \
                 fk.delete_referential_action_desc, fk.update_referential_action_desc, \
@@ -167,7 +172,7 @@ async fn table_ddl_extras(pool: &MssqlPool, params: &[Value]) -> Result<TableExt
 
     // Column-level CHECKs are table-level constraints in the catalog, so they
     // come back here too and are re-emitted as such.
-    let check_rows = query_with(
+    let check_rows = catalog_query_with(
         pool,
         "SELECT cc.name, cc.definition, cc.is_disabled, cc.is_not_trusted \
          FROM sys.check_constraints cc \
@@ -179,7 +184,7 @@ async fn table_ddl_extras(pool: &MssqlPool, params: &[Value]) -> Result<TableExt
     )
     .await?;
 
-    let index_rows = query_with(
+    let index_rows = catalog_query_with(
         pool,
         &format!(
             "{INDEX_DDL_SELECT} AND i.is_primary_key = 0 AND i.is_unique_constraint = 0 \
@@ -281,7 +286,7 @@ async fn table_ddl_extras(pool: &MssqlPool, params: &[Value]) -> Result<TableExt
     }
 
     for index in collect_index_ddl(&index_rows.rows) {
-        match index.rowstore_ddl(params.first(), params.get(1)) {
+        match index.rowstore_ddl(table) {
             Some(sql) => extras.indexes.push(sql),
             // A columnstore/XML/spatial/hash index has no key list this
             // renderer can produce; emitting `CREATE INDEX … ()` would be a
@@ -429,29 +434,18 @@ impl IndexDdl {
         matches!(self.type_desc.as_str(), "CLUSTERED" | "NONCLUSTERED")
     }
 
-    /// The rendered `CREATE INDEX` statement without the reconstruction header
-    /// (this one is embedded in a table's DDL, which carries its own), or
-    /// `None` when the index is not a rowstore index.
-    fn rowstore_ddl(&self, schema: Option<&Value>, name: Option<&Value>) -> Option<String> {
+    /// The rendered `CREATE INDEX` statement on `table` without the
+    /// reconstruction header (this one is embedded in a table's DDL, which
+    /// carries its own), or `None` when the index is not a rowstore index.
+    ///
+    /// Takes the table itself: rebuilt from the bound query parameters, a
+    /// missing name defaulted to `""` and rendered `CREATE INDEX … ON
+    /// "schema".""` without complaint.
+    fn rowstore_ddl(&self, table: &TableMeta) -> Option<String> {
         if !self.is_rowstore() {
             return None;
         }
-        let text = |value: Option<&Value>| match value {
-            Some(Value::Text(t)) => Some(t.clone()),
-            _ => None,
-        };
-        let table = TableMeta {
-            schema: text(schema),
-            name: text(name).unwrap_or_default(),
-            kind: TableKind::Table,
-            columns: Vec::new(),
-            indexes: Vec::new(),
-            foreign_keys: Vec::new(),
-            restriction: None,
-            internal: None,
-            kind_label: None,
-        };
-        Some(create_index_sql(Dialect::SqlServer, &table, &self.meta, &self.extras).sql)
+        Some(create_index_sql(Dialect::SqlServer, table, &self.meta, &self.extras).sql)
     }
 }
 
@@ -510,7 +504,7 @@ async fn index_ddl(
 ) -> Result<Ddl, DbError> {
     let mut params = params.to_vec();
     params.push(Value::Text(name.to_string()));
-    let rows = query_with(
+    let rows = catalog_query_with(
         pool,
         &format!(
             "{INDEX_DDL_SELECT} AND i.name = @P3 \
