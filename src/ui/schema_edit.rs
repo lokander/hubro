@@ -32,16 +32,13 @@ use crate::db::{
     op_problem, schema_edit_refusal, schema_op_sql, Capabilities, ConnectionId, Dialect, SchemaOp,
     TableMeta, NOTHING_TO_RUN,
 };
+use crate::ui::classes::INPUT;
 
 use super::notice::{
     a_held_key_is_not_a_press, Armed, Banner, BannerKind, Gesture, Overlay, OverlayAlign,
 };
 use super::state::{after_edit, AppState, SchemaEditRequest, TableRef};
 use super::text_field::{TextArea, TextInput};
-
-const INPUT_CLASS: &str = "rounded border border-slate-300 dark:border-slate-700 bg-white \
-                           dark:bg-slate-800 px-2 py-1 text-xs text-slate-900 dark:text-slate-100 \
-                           focus:outline-none focus:ring-1 focus:ring-sky-500";
 
 /// What pressing Run should do, given everything the dialog holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,10 +152,10 @@ pub fn SchemaEditLine(id: ConnectionId) -> Element {
     let Some(status) = state.schema_edit_status(id) else {
         return rsx! {};
     };
-    let (text, color) = status.line();
+    let (text, tone) = status.line();
     rsx! {
         div { class: "flex items-center gap-2 border-b border-slate-200 dark:border-slate-800 px-3 py-1 text-xs",
-            span { class: "{color}", "{text}" }
+            span { class: "{tone.class()}", "{text}" }
             button {
                 class: "rounded px-1 text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-800",
                 aria_label: "Dismiss",
@@ -382,7 +379,7 @@ pub fn SchemaEditDialog(
                     label { class: "mb-2 flex flex-wrap items-center gap-2 text-xs text-slate-600 dark:text-slate-300",
                         "Type {table.read().name} to confirm"
                         TextInput {
-                            class: INPUT_CLASS,
+                            class: INPUT,
                             text: "{typed_name()}",
                             oninput: move |evt: FormEvent| typed_name.set(evt.value()),
                         }
@@ -453,7 +450,7 @@ fn OpForm(table: TableMeta, op: Signal<SchemaOp>) -> Element {
                     label { class: "flex items-center gap-2",
                         "Name"
                         TextInput {
-                            class: INPUT_CLASS,
+                            class: INPUT,
                             text: "{name}",
                             oninput: move |evt: FormEvent| {
                                 if let SchemaOp::CreateIndex { name, .. } = &mut *op.write() {
@@ -509,7 +506,7 @@ fn OpForm(table: TableMeta, op: Signal<SchemaOp>) -> Element {
                     label { class: "flex items-center gap-2",
                         "Name"
                         TextInput {
-                            class: INPUT_CLASS,
+                            class: INPUT,
                             text: "{name}",
                             oninput: move |evt: FormEvent| {
                                 if let SchemaOp::AddColumn { name, .. } = &mut *op.write() {
@@ -521,7 +518,7 @@ fn OpForm(table: TableMeta, op: Signal<SchemaOp>) -> Element {
                     label { class: "flex items-center gap-2",
                         "Type"
                         TextInput {
-                            class: INPUT_CLASS,
+                            class: INPUT,
                             text: "{type_name}",
                             oninput: move |evt: FormEvent| {
                                 if let SchemaOp::AddColumn { type_name, .. } = &mut *op.write() {
@@ -539,7 +536,7 @@ fn OpForm(table: TableMeta, op: Signal<SchemaOp>) -> Element {
                     label { class: "flex items-center gap-2",
                         "New name"
                         TextInput {
-                            class: INPUT_CLASS,
+                            class: INPUT,
                             text: "{new_name}",
                             oninput: move |evt: FormEvent| {
                                 if let SchemaOp::RenameTable { new_name } = &mut *op.write() {
@@ -554,7 +551,7 @@ fn OpForm(table: TableMeta, op: Signal<SchemaOp>) -> Element {
                     label { class: "flex items-center gap-2",
                         "New name"
                         TextInput {
-                            class: INPUT_CLASS,
+                            class: INPUT,
                             text: "{new_name}",
                             oninput: move |evt: FormEvent| {
                                 if let SchemaOp::RenameColumn { new_name, .. } = &mut *op.write() {

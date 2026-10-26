@@ -36,6 +36,7 @@ use crate::db::{
     ConnectionId, CsvDialect, EmptyField, Encoding, ErrorMode, ImportOptions, JsonShape,
     SourceField, SourceFormat, SourcePreview, TableMeta,
 };
+use crate::ui::classes::SELECT;
 
 use super::notice::{
     a_held_key_is_not_a_press, Armed, Banner, BannerKind, Gesture, Overlay, OverlayAlign,
@@ -196,7 +197,7 @@ pub fn ImportDialog(
                         label { class: "flex items-center gap-1",
                             "Format"
                             select {
-                                class: SELECT_CLASS,
+                                class: SELECT,
                                 value: "{format_key(&format())}",
                                 onchange: move |evt| {
                                     let current = *format.peek();
@@ -220,7 +221,7 @@ pub fn ImportDialog(
                             label { class: "flex items-center gap-1",
                                 "Delimiter"
                                 select {
-                                    class: SELECT_CLASS,
+                                    class: SELECT,
                                     value: "{csv_of(&format()).delimiter}",
                                     onchange: move |evt| {
                                         let mut dialect = csv_of(&format.peek());
@@ -242,7 +243,7 @@ pub fn ImportDialog(
                             label { class: "flex items-center gap-1",
                                 "Quote"
                                 select {
-                                    class: SELECT_CLASS,
+                                    class: SELECT,
                                     value: "{csv_of(&format()).quote}",
                                     onchange: move |evt| {
                                         let mut dialect = csv_of(&format.peek());
@@ -277,7 +278,7 @@ pub fn ImportDialog(
                         label { class: "flex items-center gap-1",
                             "Encoding"
                             select {
-                                class: SELECT_CLASS,
+                                class: SELECT,
                                 value: if encoding() == Encoding::Latin1 { "latin1" } else { "utf8" },
                                 onchange: move |evt| {
                                     encoding.set(match evt.value().as_str() {
@@ -304,7 +305,7 @@ pub fn ImportDialog(
                         label { class: "flex items-center gap-1",
                             "Empty fields"
                             select {
-                                class: SELECT_CLASS,
+                                class: SELECT,
                                 value: if empty_field() == EmptyField::EmptyText { "text" } else { "null" },
                                 onchange: move |evt| {
                                     empty_field.set(match evt.value().as_str() {
@@ -327,7 +328,7 @@ pub fn ImportDialog(
                         label { class: "flex items-center gap-1",
                             "A row that can't be imported"
                             select {
-                                class: SELECT_CLASS,
+                                class: SELECT,
                                 value: if on_error() == ErrorMode::Skip { "skip" } else { "abort" },
                                 onchange: move |evt| {
                                     on_error.set(match evt.value().as_str() {
@@ -500,13 +501,12 @@ fn import_action(
     }
 }
 
+/// One field's target-column picker.
+///
 /// A `<select>` shows whichever `<option>` carries `selected` — setting a
 /// `value` attribute on the select itself does nothing, which is how every
 /// picker in this dialog first came up reading "don't import" while the
 /// mapping underneath was correct.
-const SELECT_CLASS: &str = "rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-1 py-0.5 text-xs text-slate-900 dark:text-slate-100";
-
-/// One field's target-column picker.
 #[component]
 fn ColumnPicker(
     table: TableMeta,
@@ -517,7 +517,7 @@ fn ColumnPicker(
     let current = selected.clone().unwrap_or_else(|| UNMAPPED.to_string());
     rsx! {
         select {
-            class: "mt-0.5 w-full {SELECT_CLASS}",
+            class: "mt-0.5 w-full {SELECT}",
             title: "Which column of the table {label} is imported into",
             value: "{current}",
             onchange: move |evt| on_pick.call(evt.value()),

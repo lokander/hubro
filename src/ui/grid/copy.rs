@@ -7,6 +7,7 @@
 //! data — worse than copying nothing.
 
 use super::*;
+use crate::ui::classes::Tone;
 
 /// The clipboard formats in copy-as menu order. TSV leads: it is
 /// what the plain shortcut produces and what spreadsheets want.
@@ -37,11 +38,11 @@ impl CopyStatus {
         CopyStatus { text, error: true }
     }
 
-    pub(super) fn class(&self) -> &'static str {
+    pub(super) fn tone(&self) -> Tone {
         if self.error {
-            "text-red-600 dark:text-red-400"
+            Tone::Error
         } else {
-            "text-emerald-700 dark:text-emerald-400"
+            Tone::Ok
         }
     }
 }

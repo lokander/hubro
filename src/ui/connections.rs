@@ -16,6 +16,7 @@ use dioxus_icons::lucide::{
 
 use crate::config::{BackendKind, ConnectionColor, EditPrefill, SavedConnection, ServerAuth};
 use crate::db::{engine_has_read_only_mode, Dialect, WriteProtection};
+use crate::ui::classes::{BTN_CANCEL, BTN_ICON, BTN_PRIMARY, FORM_INPUT, FORM_SELECT, SELECT};
 
 use super::icons::BackendIcon;
 use super::js::focus_on_mount;
@@ -63,7 +64,7 @@ fn RowSettings(
                     }
                 } else {
                     select {
-                        class: "rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 px-2 py-1 text-xs text-slate-900 dark:text-slate-200",
+                        class: SELECT,
                         aria_label: "Group",
                         onchange: {
                             let locator = locator.clone();
@@ -388,7 +389,7 @@ fn GroupHeader(
                     span { class: "shrink-0 text-xs text-slate-500 dark:text-slate-400", "{count}" }
                 }
                 button {
-                    class: "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
+                    class: BTN_ICON,
                     title: "Rename group",
                     aria_label: "Rename group",
                     onclick: {
@@ -405,7 +406,7 @@ fn GroupHeader(
                     class: if first {
                         "rounded p-1.5 text-slate-300 dark:text-slate-700"
                     } else {
-                        "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200"
+                        BTN_ICON
                     },
                     disabled: first,
                     title: "Move group up",
@@ -420,7 +421,7 @@ fn GroupHeader(
                     class: if last {
                         "rounded p-1.5 text-slate-300 dark:text-slate-700"
                     } else {
-                        "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200"
+                        BTN_ICON
                     },
                     disabled: last,
                     title: "Move group down",
@@ -432,7 +433,7 @@ fn GroupHeader(
                     ChevronDown { size: 14 }
                 }
                 button {
-                    class: "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
+                    class: BTN_ICON,
                     title: "Delete group",
                     aria_label: "Delete group",
                     onclick: {
@@ -588,20 +589,7 @@ fn SavedConnectionRow(
                     span { class: "truncate text-sm font-medium text-slate-900 dark:text-slate-200",
                         "{row.name}"
                     }
-                    span {
-                        class: match row.backend {
-                            BackendKind::Postgres => "rounded bg-cyan-100 dark:bg-cyan-900/50 px-1.5 py-0.5 text-xs text-cyan-700 dark:text-cyan-300",
-                            BackendKind::SqlServer => "rounded bg-red-100 dark:bg-red-900/50 px-1.5 py-0.5 text-xs text-red-700 dark:text-red-300",
-                            // A step darker than the row's hover shade; at
-                            // bg-slate-200 the badge disappeared into it.
-                            BackendKind::Sqlite => "rounded bg-slate-300 dark:bg-slate-700 px-1.5 py-0.5 text-xs text-slate-600 dark:text-slate-300",
-                        },
-                        match row.backend {
-                            BackendKind::Postgres => "postgres",
-                            BackendKind::SqlServer => "sql server",
-                            BackendKind::Sqlite => "sqlite",
-                        }
-                    }
+                    span { class: row.backend.badge_classes(), "{row.backend.label()}" }
                     if row.tunnel.is_some() {
                         span { class: "rounded bg-teal-100 dark:bg-teal-900/50 px-1.5 py-0.5 text-xs text-teal-700 dark:text-teal-300",
                             "ssh"
@@ -656,7 +644,7 @@ fn SavedConnectionRow(
                     // only action offered is calling it off.
                     if row.cancellable {
                         button {
-                            class: "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
+                            class: BTN_ICON,
                             title: "Cancel",
                             aria_label: "Cancel connecting",
                             onclick: {
@@ -691,7 +679,7 @@ fn SavedConnectionRow(
                         class: if settings_shown {
                             "cursor-pointer rounded bg-slate-300 dark:bg-slate-700 p-1.5 text-slate-900 dark:text-slate-200"
                         } else {
-                            "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200"
+                            BTN_ICON
                         },
                         title: "Group, write protection and colour",
                         aria_label: "Group, write protection and colour",
@@ -707,7 +695,7 @@ fn SavedConnectionRow(
                     }
                     if row.backend != BackendKind::Sqlite {
                         button {
-                            class: "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
+                            class: BTN_ICON,
                             title: "Edit",
                             aria_label: "Edit saved connection",
                             onclick: {
@@ -735,7 +723,7 @@ fn SavedConnectionRow(
                     // offered it at all.
                     if row.auth.keeps_entra_sign_in() {
                         button {
-                            class: "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
+                            class: BTN_ICON,
                             title: "Sign out: forget the remembered Microsoft sign-in",
                             aria_label: "Sign out of Microsoft Entra ID",
                             onclick: {
@@ -746,7 +734,7 @@ fn SavedConnectionRow(
                         }
                     }
                     button {
-                        class: "cursor-pointer rounded p-1.5 text-slate-500 hover:bg-slate-300 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-200",
+                        class: BTN_ICON,
                         title: "Remove",
                         aria_label: "Remove saved connection",
                         onclick: {
@@ -779,7 +767,7 @@ fn SavedConnectionRow(
 /// SQLite (native file picker) and Postgres (form or URL).
 #[component]
 pub(super) fn ConnectionsScreen() -> Element {
-    let state = use_context::<AppState>();
+    let mut state = use_context::<AppState>();
     // One open form at a time (they were a mutually-exclusive bool pair
     // before the forms moved into a modal); `None` means no modal is up.
     let mut open_form = use_signal(|| Option::<ConnectForm>::None);
@@ -1091,22 +1079,22 @@ pub(super) fn ConnectionsScreen() -> Element {
             }
             div { class: "flex gap-3",
                 button {
-                    class: "flex items-center gap-2 rounded bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500",
+                    class: "flex items-center gap-2 {BTN_PRIMARY} bg-sky-600 hover:bg-sky-500",
                     onclick: pick_file,
                     BackendIcon { dialect: Dialect::Sqlite, size: 16 }
                     "Add SQLite file…"
                 }
                 button {
-                    class: "flex items-center gap-2 rounded bg-cyan-700 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-600",
+                    class: "flex items-center gap-2 {BTN_PRIMARY} bg-cyan-700 hover:bg-cyan-600",
                     onclick: move |_| open_form.set(Some(ConnectForm::Postgres)),
                     BackendIcon { dialect: Dialect::Postgres, size: 16 }
-                    "Add Postgres…"
+                    "Add {BackendKind::Postgres.label()}…"
                 }
                 button {
-                    class: "flex items-center gap-2 rounded bg-red-800 px-4 py-2 text-sm font-medium text-white hover:bg-red-700",
+                    class: "flex items-center gap-2 {BTN_PRIMARY} bg-red-800 hover:bg-red-700",
                     onclick: move |_| open_form.set(Some(ConnectForm::SqlServer)),
                     BackendIcon { dialect: Dialect::SqlServer, size: 16 }
-                    "Add SQL Server…"
+                    "Add {BackendKind::SqlServer.label()}…"
                 }
             }
             if let Some(kind) = open_form() {
@@ -1116,7 +1104,7 @@ pub(super) fn ConnectionsScreen() -> Element {
                         open_form.set(None);
                     },
                     error: error.clone(),
-                    on_dismiss_error: move |_| state.connect_error.clone().set(None),
+                    on_dismiss_error: move |_| state.connect_error.set(None),
                     match kind {
                         ConnectForm::Postgres => rsx! {
                             PostgresForm { on_done: move |_| open_form.set(None) }
@@ -1148,7 +1136,7 @@ pub(super) fn ConnectionsScreen() -> Element {
                     Banner {
                         kind: BannerKind::Error,
                         message: err,
-                        on_dismiss: move |_| state.connect_error.clone().set(None),
+                        on_dismiss: move |_| state.connect_error.set(None),
                     }
                 }
             }
@@ -1157,7 +1145,7 @@ pub(super) fn ConnectionsScreen() -> Element {
                     Banner {
                         kind: BannerKind::Info,
                         message,
-                        on_dismiss: move |_| state.connect_notice.clone().set(None),
+                        on_dismiss: move |_| state.connect_notice.set(None),
                     }
                 }
             }
@@ -1239,7 +1227,7 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
             div { class: "flex gap-2",
                 TextInput {
                     r#type: "password",
-                    class: "min-w-0 flex-1 rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-3 py-2 font-mono text-sm text-slate-900 dark:text-slate-200",
+                    class: "min-w-0 flex-1 {FORM_INPUT}",
                     "autofocus": "true",
                     text: "{password}",
                     oninput: move |evt: FormEvent| password.set(evt.value()),
@@ -1253,12 +1241,12 @@ fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {
                     },
                 }
                 button {
-                    class: "rounded bg-cyan-700 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-600",
+                    class: "{BTN_PRIMARY} bg-cyan-700 hover:bg-cyan-600",
                     onclick: move |_| submit(),
                     "Connect"
                 }
                 button {
-                    class: "rounded px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
+                    class: BTN_CANCEL,
                     onclick: move |_| cancel_prompt(state, state.password_prompt),
                     "Cancel"
                 }
@@ -1439,12 +1427,12 @@ fn HostKeyPromptCard(prompt: super::state::HostKeyPrompt) -> Element {
             }
             div { class: "flex gap-2",
                 button {
-                    class: "rounded bg-amber-600 px-4 py-2 text-sm font-medium text-white hover:bg-amber-500",
+                    class: "{BTN_PRIMARY} bg-amber-600 hover:bg-amber-500",
                     onclick: move |_| trust(),
                     "Trust and connect"
                 }
                 button {
-                    class: "rounded px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
+                    class: BTN_CANCEL,
                     onclick: move |_| cancel_prompt(state, state.host_key_prompt),
                     "Cancel"
                 }
@@ -1491,12 +1479,12 @@ fn EntraSignInCard(prompt: super::state::EntraPrompt) -> Element {
             }
             div { class: "flex gap-2",
                 button {
-                    class: "rounded bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500",
+                    class: "{BTN_PRIMARY} bg-sky-600 hover:bg-sky-500",
                     onclick: move |_| sign_in(),
                     "Sign in with Microsoft"
                 }
                 button {
-                    class: "rounded px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
+                    class: BTN_CANCEL,
                     onclick: move |_| cancel_prompt(state, state.entra_prompt),
                     "Cancel"
                 }
@@ -1942,14 +1930,13 @@ fn PostgresForm(
         hint_url.as_deref(),
         state.saved.read().entries(),
     );
-    let field_class = FORM_FIELD_CLASS;
     rsx! {
         // Opaque, and a step above the page's slate-950: this renders over the
         // modal backdrop, and at 80% the connections list showed through it.
         div { class: "w-full max-w-xl rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 p-4",
             div { class: "mb-3 flex items-center justify-between",
                 span { class: "text-sm font-medium text-slate-900 dark:text-slate-200",
-                    if editing { "Edit a Postgres connection" } else { "Add a Postgres connection" }
+                    if editing { "Edit a {BackendKind::Postgres.label()} connection" } else { "Add a {BackendKind::Postgres.label()} connection" }
                 }
                 button {
                     class: "text-xs text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
@@ -1962,14 +1949,14 @@ fn PostgresForm(
             }
             div { class: "flex flex-col gap-2",
                 TextInput {
-                    class: field_class,
+                    class: FORM_INPUT,
                     placeholder: "display name (optional)",
                     text: "{name}",
                     oninput: move |evt: FormEvent| name.set(evt.value()),
                 }
                 if use_url() {
                     TextInput {
-                        class: field_class,
+                        class: FORM_INPUT,
                         placeholder: "postgres://user@host:5432/database?sslmode=require",
                         text: "{pasted_url}",
                         oninput: move |evt: FormEvent| pasted_url.set(evt.value()),
@@ -1977,13 +1964,13 @@ fn PostgresForm(
                 } else {
                     div { class: "flex gap-2",
                         TextInput {
-                            class: "{field_class} flex-[3]",
+                            class: "{FORM_INPUT} flex-[3]",
                             placeholder: "host",
                             text: "{host}",
                             oninput: move |evt: FormEvent| host.set(evt.value()),
                         }
                         TextInput {
-                            class: "{field_class} flex-1",
+                            class: "{FORM_INPUT} flex-1",
                             placeholder: "5432",
                             text: "{port}",
                             oninput: move |evt: FormEvent| port.set(evt.value()),
@@ -1991,13 +1978,13 @@ fn PostgresForm(
                     }
                     div { class: "flex gap-2",
                         TextInput {
-                            class: field_class,
+                            class: FORM_INPUT,
                             placeholder: "database",
                             text: "{database}",
                             oninput: move |evt: FormEvent| database.set(evt.value()),
                         }
                         TextInput {
-                            class: field_class,
+                            class: FORM_INPUT,
                             placeholder: "user",
                             text: "{user}",
                             oninput: move |evt: FormEvent| user.set(evt.value()),
@@ -2005,7 +1992,7 @@ fn PostgresForm(
                     }
                     div { class: "flex gap-2",
                         select {
-                            class: FORM_SELECT_CLASS,
+                            class: FORM_SELECT,
                             onchange: move |evt| sslmode.set(evt.value()),
                             option { value: "prefer", selected: *sslmode.read() == "prefer", "sslmode: prefer" }
                             option { value: "require", selected: *sslmode.read() == "require", "sslmode: require" }
@@ -2019,7 +2006,7 @@ fn PostgresForm(
                 if auth_mode() == "password" {
                     TextInput {
                         r#type: "password",
-                        class: field_class,
+                        class: FORM_INPUT,
                         placeholder: if editing { "password (unchanged if left empty)" } else { "password" },
                         text: "{password}",
                         oninput: move |evt: FormEvent| password.set(evt.value()),
@@ -2052,12 +2039,12 @@ fn PostgresForm(
                 }
                 div { class: "flex justify-end gap-2",
                     button {
-                        class: "rounded px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
+                        class: BTN_CANCEL,
                         onclick: move |_| on_done.call(()),
                         "Cancel"
                     }
                     button {
-                        class: "rounded bg-cyan-700 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-600",
+                        class: "{BTN_PRIMARY} bg-cyan-700 hover:bg-cyan-600",
                         onclick: move |_| submit(),
                         if editing { "Save & connect" } else { "Connect & save" }
                     }
@@ -2191,13 +2178,12 @@ fn SqlServerForm(
         hint_url.as_deref(),
         state.saved.read().entries(),
     );
-    let field_class = FORM_FIELD_CLASS;
     rsx! {
         // Opaque over the modal backdrop, matching the Postgres form.
         div { class: "w-full max-w-xl rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 p-4",
             div { class: "mb-3 flex items-center justify-between",
                 span { class: "text-sm font-medium text-slate-900 dark:text-slate-200",
-                    if editing { "Edit a SQL Server connection" } else { "Add a SQL Server connection" }
+                    if editing { "Edit a {BackendKind::SqlServer.label()} connection" } else { "Add a {BackendKind::SqlServer.label()} connection" }
                 }
                 button {
                     class: "text-xs text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
@@ -2210,14 +2196,14 @@ fn SqlServerForm(
             }
             div { class: "flex flex-col gap-2",
                 TextInput {
-                    class: field_class,
+                    class: FORM_INPUT,
                     placeholder: "display name (optional)",
                     text: "{name}",
                     oninput: move |evt: FormEvent| name.set(evt.value()),
                 }
                 if use_url() {
                     TextInput {
-                        class: field_class,
+                        class: FORM_INPUT,
                         placeholder: "mssql://user@host:1433/database?encrypt=on",
                         text: "{pasted_url}",
                         oninput: move |evt: FormEvent| pasted_url.set(evt.value()),
@@ -2225,13 +2211,13 @@ fn SqlServerForm(
                 } else {
                     div { class: "flex gap-2",
                         TextInput {
-                            class: "{field_class} flex-[3]",
+                            class: "{FORM_INPUT} flex-[3]",
                             placeholder: "host",
                             text: "{host}",
                             oninput: move |evt: FormEvent| host.set(evt.value()),
                         }
                         TextInput {
-                            class: "{field_class} flex-1",
+                            class: "{FORM_INPUT} flex-1",
                             placeholder: "1433",
                             text: "{port}",
                             oninput: move |evt: FormEvent| port.set(evt.value()),
@@ -2239,13 +2225,13 @@ fn SqlServerForm(
                     }
                     div { class: "flex gap-2",
                         TextInput {
-                            class: field_class,
+                            class: FORM_INPUT,
                             placeholder: "database",
                             text: "{database}",
                             oninput: move |evt: FormEvent| database.set(evt.value()),
                         }
                         TextInput {
-                            class: field_class,
+                            class: FORM_INPUT,
                             placeholder: "user",
                             text: "{user}",
                             oninput: move |evt: FormEvent| user.set(evt.value()),
@@ -2253,7 +2239,7 @@ fn SqlServerForm(
                     }
                     div { class: "flex gap-2",
                         select {
-                            class: FORM_SELECT_CLASS,
+                            class: FORM_SELECT,
                             onchange: move |evt| encrypt.set(evt.value()),
                             option { value: "on", selected: *encrypt.read() == "on", "encrypt: on" }
                             option { value: "off", selected: *encrypt.read() == "off", "encrypt: off (login only)" }
@@ -2275,7 +2261,7 @@ fn SqlServerForm(
                 if auth_mode() == "password" {
                     TextInput {
                         r#type: "password",
-                        class: field_class,
+                        class: FORM_INPUT,
                         placeholder: if editing { "password (unchanged if left empty)" } else { "password" },
                         text: "{password}",
                         oninput: move |evt: FormEvent| password.set(evt.value()),
@@ -2308,12 +2294,12 @@ fn SqlServerForm(
                 }
                 div { class: "flex justify-end gap-2",
                     button {
-                        class: "rounded px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
+                        class: BTN_CANCEL,
                         onclick: move |_| on_done.call(()),
                         "Cancel"
                     }
                     button {
-                        class: "rounded bg-red-800 px-4 py-2 text-sm font-medium text-white hover:bg-red-700",
+                        class: "{BTN_PRIMARY} bg-red-800 hover:bg-red-700",
                         onclick: move |_| submit(),
                         if editing { "Save & connect" } else { "Connect & save" }
                     }
@@ -2343,12 +2329,6 @@ fn close_form(state: &AppState, on_done: &EventHandler<()>) {
         on_done.call(());
     }
 }
-
-/// Text-input class shared by the Postgres and SQL Server connection forms.
-const FORM_FIELD_CLASS: &str ="w-full rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-3 py-2 font-mono text-sm text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600";
-
-/// Select class shared by the connection forms' dropdowns.
-const FORM_SELECT_CLASS: &str = "rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-2 text-sm text-slate-900 dark:text-slate-200";
 
 #[cfg(test)]
 mod tests {
@@ -3181,10 +3161,9 @@ fn AuthModeFields(
     entra_tenant: Signal<String>,
     entra_client_id: Signal<String>,
 ) -> Element {
-    let field_class = FORM_FIELD_CLASS;
     rsx! {
         select {
-            class: FORM_SELECT_CLASS,
+            class: FORM_SELECT,
             onchange: move |evt| auth_mode.set(evt.value()),
             option { value: "password", selected: auth_mode() == "password", "Auth: password" }
             option {
@@ -3200,7 +3179,7 @@ fn AuthModeFields(
         }
         if auth_mode() == "entra-interactive" {
             TextInput {
-                class: field_class,
+                class: FORM_INPUT,
                 placeholder: "Entra tenant — id, domain, or 'organizations'",
                 text: "{entra_tenant}",
                 oninput: move |evt: FormEvent| entra_tenant.set(evt.value()),
@@ -3208,7 +3187,7 @@ fn AuthModeFields(
         }
         if auth_mode().starts_with("entra") {
             TextInput {
-                class: field_class,
+                class: FORM_INPUT,
                 placeholder: "application (client) ID — optional",
                 text: "{entra_client_id}",
                 oninput: move |evt: FormEvent| entra_client_id.set(evt.value()),
@@ -3234,7 +3213,6 @@ fn SshTunnelFields(
     ssh_passphrase: Signal<String>,
     radio_group: String,
 ) -> Element {
-    let field_class = FORM_FIELD_CLASS;
     rsx! {
         label { class: "flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
             input {
@@ -3248,20 +3226,20 @@ fn SshTunnelFields(
             div { class: "flex flex-col gap-2 rounded border border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-900/60 p-3",
                 div { class: "flex gap-2",
                     TextInput {
-                        class: "{field_class} flex-[3]",
+                        class: "{FORM_INPUT} flex-[3]",
                         placeholder: "ssh host",
                         text: "{ssh_host}",
                         oninput: move |evt: FormEvent| ssh_host.set(evt.value()),
                     }
                     TextInput {
-                        class: "{field_class} flex-1",
+                        class: "{FORM_INPUT} flex-1",
                         placeholder: "22",
                         text: "{ssh_port}",
                         oninput: move |evt: FormEvent| ssh_port.set(evt.value()),
                     }
                 }
                 TextInput {
-                    class: field_class,
+                    class: FORM_INPUT,
                     placeholder: "ssh user",
                     text: "{ssh_user}",
                     oninput: move |evt: FormEvent| ssh_user.set(evt.value()),
@@ -3288,14 +3266,14 @@ fn SshTunnelFields(
                 }
                 if ssh_use_key() {
                     TextInput {
-                        class: field_class,
+                        class: FORM_INPUT,
                         placeholder: "key file path, e.g. ~/.ssh/id_ed25519",
                         text: "{ssh_key_path}",
                         oninput: move |evt: FormEvent| ssh_key_path.set(evt.value()),
                     }
                     TextInput {
                         r#type: "password",
-                        class: field_class,
+                        class: FORM_INPUT,
                         placeholder: "key passphrase (if the key is encrypted)",
                         text: "{ssh_passphrase}",
                         oninput: move |evt: FormEvent| ssh_passphrase.set(evt.value()),
