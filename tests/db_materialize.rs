@@ -95,10 +95,12 @@
 
 mod common;
 
+use common::pg_family::{assert_schema_is_internal, find, integer};
+
 use hubro::db::Reading;
 use hubro::db::{
-    detect_row_identity, Capabilities, DbPool, Filter, Generated, Internal, KeyTextPinned,
-    PageRequest, PgFlavor, Restriction, SortDir, TableKind, TableMeta, TypeDetail, Value,
+    detect_row_identity, Capabilities, DbPool, Filter, Generated, KeyTextPinned, PageRequest,
+    PgFlavor, Restriction, SortDir, TableKind, TableMeta, TypeDetail, Value,
 };
 
 fn test_url() -> Option<String> {
@@ -133,20 +135,6 @@ async fn fresh_fixture(pool: &DbPool, suffix: &str) -> (String, String, String) 
         pool.query_unbounded(&sql).await.unwrap();
     }
     (readings, view, matview)
-}
-
-fn find<'a>(tables: &'a [TableMeta], name: &str) -> &'a TableMeta {
-    tables
-        .iter()
-        .find(|t| t.name == name && t.schema.as_deref() == Some("public"))
-        .unwrap_or_else(|| panic!("{name} missing from introspection"))
-}
-
-fn integer(value: &Value) -> i64 {
-    match value {
-        Value::Integer(n) => *n,
-        other => panic!("expected an integer cell, got {other:?}"),
-    }
 }
 
 #[tokio::test]
@@ -245,32 +233,9 @@ async fn materialize_reserved_catalog_schemas_are_marked_as_the_engines_own() {
 
     // Selected by schema here even though the backend classifies them through
     // `mz_schemas.id`, so the test names the objects independently of the rule
-    // under test — a rule that quietly stopped matching would fail this rather
-    // than select nothing and pass.
-    let reserved: Vec<&TableMeta> = tables
-        .iter()
-        .filter(|t| {
-            // The fixtures are tables named `mz_*` inside `public`, never
-            // schemas, so matching the schema name cannot catch them.
-            t.schema.as_deref().is_some_and(|s| s.starts_with("mz_"))
-        })
-        .collect();
-    assert!(
-        reserved.len() > 100,
-        "expected Materialize's catalog schemas to be populated, got {}",
-        reserved.len()
-    );
-    for table in &reserved {
-        assert_eq!(table.internal, Some(Internal::System), "{table:?}");
-    }
-
-    // ...and the user's own schema is untouched by the rule.
-    for table in tables
-        .iter()
-        .filter(|t| t.schema.as_deref() == Some("public"))
-    {
-        assert_eq!(table.internal, None, "{table:?}");
-    }
+    // under test. The fixtures are tables named `mz_*` inside `public`, never
+    // schemas, so matching the schema name cannot catch them.
+    assert_schema_is_internal(&tables, |schema| schema.starts_with("mz_"), 100);
 
     pool.close().await;
 }

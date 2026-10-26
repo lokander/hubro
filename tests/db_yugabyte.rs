@@ -124,13 +124,18 @@
 
 mod common;
 
+use common::pg_family::{
+    assert_pages_sorts_and_filters, assert_rows_edit_through_key,
+    assert_script_ddl_escapes_rollback, find, integer, DdlEscape, Expected, KeyedEdits,
+    ReadingsKey, SensorFixture,
+};
+
 use hubro::db::Reading;
 use std::sync::OnceLock;
 
 use hubro::db::{
-    apply_staged, detect_row_identity, run_script, split_statements, Capabilities, DbPool,
-    DdlObject, DdlSource, Filter, Internal, PageRequest, PgFlavor, Restriction, Rollback, RowCount,
-    RowIdentity, RowLocator, SortDir, StagedChange, TableKind, TableMeta, Value,
+    detect_row_identity, run_script, split_statements, DbPool, DdlObject, DdlSource, Filter,
+    Internal, PageRequest, PgFlavor, Restriction, RowCount, SortDir, TableKind, Value,
 };
 use tokio::sync::Mutex;
 
@@ -159,40 +164,15 @@ fn ddl_lock() -> &'static Mutex<()> {
 /// A parent/child pair with a composite primary key, a foreign key and a
 /// secondary index. Suffixed per test so each test owns its objects.
 async fn fresh_fixture(pool: &DbPool, suffix: &str) -> (String, String) {
-    let readings = format!("yb_readings_{suffix}");
-    let sensors = format!("yb_sensors_{suffix}");
-    let guard = ddl_lock().lock().await;
-    for sql in [
-        format!("DROP TABLE IF EXISTS {readings} CASCADE"),
-        format!("DROP TABLE IF EXISTS {sensors} CASCADE"),
-        format!("CREATE TABLE {sensors} (id int PRIMARY KEY, name text NOT NULL)"),
-        format!(
-            "CREATE TABLE {readings} (
-                id          int NOT NULL,
-                sensor_id   int NOT NULL REFERENCES {sensors}(id),
-                temperature double precision,
-                note        text,
-                PRIMARY KEY (id, sensor_id)
-            )"
-        ),
-        format!("CREATE INDEX {readings}_by_temp ON {readings} (temperature)"),
-    ] {
-        pool.query_unbounded(&sql).await.unwrap();
+    // Schema changes run under the lock; the rows load outside it, being
+    // ordinary writes that Yugabyte runs concurrently without trouble.
+    SensorFixture {
+        prefix: "yb_",
+        key: ReadingsKey::IdAndSensor,
+        ddl_lock: Some(ddl_lock()),
     }
-    drop(guard);
-
-    // Data loads outside the lock: these are ordinary writes, and Yugabyte has
-    // no trouble running them concurrently.
-    for sql in [
-        format!("INSERT INTO {sensors} (id, name) VALUES (1, 'alpha'), (2, 'beta')"),
-        format!(
-            "INSERT INTO {readings} (id, sensor_id, temperature)
-             SELECT g, s.id, g * 1.5 FROM generate_series(1, 8) g CROSS JOIN {sensors} s"
-        ),
-    ] {
-        pool.query_unbounded(&sql).await.unwrap();
-    }
-    (readings, sensors)
+    .create(pool, suffix)
+    .await
 }
 
 /// Runs schema changes that aren't part of [`fresh_fixture`], under the lock.
@@ -200,20 +180,6 @@ async fn with_ddl(pool: &DbPool, statements: &[String]) {
     let _guard = ddl_lock().lock().await;
     for sql in statements {
         pool.query_unbounded(sql).await.unwrap();
-    }
-}
-
-fn find<'a>(tables: &'a [TableMeta], name: &str) -> &'a TableMeta {
-    tables
-        .iter()
-        .find(|t| t.name == name && t.schema.as_deref() == Some("public"))
-        .unwrap_or_else(|| panic!("{name} missing from introspection"))
-}
-
-fn integer(value: &Value) -> i64 {
-    match value {
-        Value::Integer(n) => *n,
-        other => panic!("expected an integer cell, got {other:?}"),
     }
 }
 
@@ -310,28 +276,11 @@ async fn yugabyte_pages_sorts_and_filters() {
         filter: Some(Filter::equals("sensor_id", "2")),
         extra_key_column: None,
     };
-    assert_eq!(
-        pool.count_rows(Reading::UNMARKED, &request).await.unwrap(),
-        8
-    );
-
-    let page = pool.fetch_page(Reading::UNMARKED, &request).await.unwrap();
-    assert_eq!(page.rows.len(), 3);
-    let ids: Vec<i64> = page.rows.iter().map(|row| integer(&row[0])).collect();
+    let (page, next) = assert_pages_sorts_and_filters(&pool, &request, Expected::Exactly(8)).await;
     // Rows are distributed by hash, so the storage order is arbitrary; an
     // ORDER BY has to impose the ordering rather than reflect it.
+    let ids: Vec<i64> = page.rows.iter().map(|row| integer(&row[0])).collect();
     assert_eq!(ids, [8, 7, 6]);
-
-    let next = pool
-        .fetch_page(
-            Reading::UNMARKED,
-            &PageRequest {
-                offset: 3,
-                ..request
-            },
-        )
-        .await
-        .unwrap();
     assert_eq!(integer(&next.rows[0][0]), 5);
 
     pool.close().await;
@@ -344,63 +293,20 @@ async fn yugabyte_rows_edit_through_the_composite_key() {
     let (readings, _) = fresh_fixture(&pool, "edit").await;
 
     let tables = pool.introspect().await.unwrap();
-    let table = find(&tables, &readings);
-    let identity = detect_row_identity(table, pool.dialect()).expect("composite pk");
-    assert_eq!(
-        identity,
-        RowIdentity::PrimaryKey {
-            columns: vec!["id".into(), "sensor_id".into()]
-        }
-    );
-
-    let access = pool.backend_access(table);
-    assert!(access.can_mutate());
-
-    let counts = apply_staged(
+    assert_rows_edit_through_key(
         &pool,
-        &access,
-        table,
-        &identity,
-        &[StagedChange::Update {
-            locator: RowLocator {
-                identity_values: vec![Value::Integer(1), Value::Integer(1)],
-            },
-            column: "note".into(),
-            value: Value::Text("checked".into()),
-        }],
+        find(&tables, &readings),
+        &["id", "sensor_id"],
+        KeyedEdits {
+            update: vec![Value::Integer(1), Value::Integer(1)],
+            insert: (
+                &["id", "sensor_id", "temperature"],
+                vec![Value::Integer(99), Value::Integer(1), Value::Real(9.5)],
+            ),
+            delete: vec![Value::Integer(99), Value::Integer(1)],
+        },
     )
-    .await
-    .unwrap();
-    assert_eq!(counts.updated_rows, 1);
-
-    let counts = apply_staged(
-        &pool,
-        &access,
-        table,
-        &identity,
-        &[StagedChange::Insert {
-            columns: vec!["id".into(), "sensor_id".into(), "temperature".into()],
-            values: vec![Value::Integer(99), Value::Integer(1), Value::Real(9.5)],
-        }],
-    )
-    .await
-    .unwrap();
-    assert_eq!(counts.inserted_rows, 1);
-
-    let counts = apply_staged(
-        &pool,
-        &access,
-        table,
-        &identity,
-        &[StagedChange::Delete {
-            locator: RowLocator {
-                identity_values: vec![Value::Integer(99), Value::Integer(1)],
-            },
-        }],
-    )
-    .await
-    .unwrap();
-    assert_eq!(counts.deleted_rows, 1);
+    .await;
 
     pool.close().await;
 }
@@ -575,81 +481,22 @@ async fn yugabyte_script_dml_rolls_back_but_its_ddl_does_not() {
     let Some(url) = test_url() else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
 
-    // The declaration that drives it, pinned separately from the behaviour: a
-    // rollback here covers DML and nothing else, so `transactional_ddl` is the
-    // one flag that differs from a full-featured engine. Declaring
-    // `transactions: false` instead would be the worse lie — the DML half
-    // below demonstrably works.
-    assert_eq!(
-        pool.backend_capabilities(),
-        Capabilities {
-            transactional_ddl: false,
-            ..Capabilities::FULL
-        }
-    );
-
     // The same gap CockroachDB has, reached differently: Yugabyte commits each
     // schema change as it executes rather than auto-committing the transaction
     // around it. Pinned here as well as there because it is what makes this a
     // *capability* rather than one engine's quirk — the warning that DDL
     // escaped a rollback narrows what hubro claims, and must not simply declare
     // `transactions: false`, since the DML half below demonstrably still works.
-    with_ddl(
+    assert_script_ddl_escapes_rollback(
         &pool,
-        &[
-            "DROP TABLE IF EXISTS yb_script_ddl CASCADE".to_string(),
-            "DROP TABLE IF EXISTS yb_script_dml CASCADE".to_string(),
-            "CREATE TABLE yb_script_dml (id int PRIMARY KEY)".to_string(),
-        ],
-    )
-    .await;
-
-    let guard = ddl_lock().lock().await;
-    let sql = "INSERT INTO yb_script_dml VALUES (1); \
-               CREATE TABLE yb_script_ddl (id int PRIMARY KEY); \
-               SELECT * FROM missing_relation";
-    let statements = split_statements(sql, pool.dialect());
-    let error = run_script(&pool, pool.backend_capabilities(), &statements, |_| {})
-        .await
-        .expect_err("the final statement names no relation");
-    assert_eq!(
-        error.rollback,
-        Rollback::ExceptSchemaChanges,
-        "the rollback covered the DML but not the schema change, and hubro must say so"
-    );
-    drop(guard);
-
-    let survivors = pool
-        .query_unbounded(
-            "SELECT count(*) FROM information_schema.tables \
-             WHERE table_name = 'yb_script_ddl'",
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        integer(&survivors.rows[0][0]),
-        1,
-        "known gap: the schema change is committed as it executes"
-    );
-
-    // ...while the write in the same script really is undone. This is the half
-    // that keeps `transactions: true` honest.
-    let rows = pool
-        .query_unbounded("SELECT count(*) FROM yb_script_dml")
-        .await
-        .unwrap();
-    assert_eq!(
-        integer(&rows.rows[0][0]),
-        0,
-        "DML must still roll back with the batch"
-    );
-
-    with_ddl(
-        &pool,
-        &[
-            "DROP TABLE IF EXISTS yb_script_ddl CASCADE".to_string(),
-            "DROP TABLE yb_script_dml CASCADE".to_string(),
-        ],
+        DdlEscape {
+            prefix: "yb_",
+            ddl_lock: Some(ddl_lock()),
+            // ...while the write in the same script really is undone. This is
+            // the half that keeps `transactions: true` honest.
+            rows_left: (0, "DML must still roll back with the batch"),
+            table_left: "known gap: the schema change is committed as it executes",
+        },
     )
     .await;
     pool.close().await;

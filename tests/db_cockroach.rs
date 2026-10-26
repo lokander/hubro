@@ -94,12 +94,17 @@
 
 mod common;
 
+use common::pg_family::{
+    assert_pages_sorts_and_filters, assert_rows_edit_through_key, assert_schema_is_internal,
+    assert_script_ddl_escapes_rollback, find, integer, DdlEscape, Expected, KeyedEdits,
+    ReadingsKey, SensorFixture,
+};
+
 use hubro::db::Reading;
 use hubro::db::{
-    apply_staged, detect_row_identity, run_script, split_statements, Capabilities, DbPool, Filter,
-    Internal, KeyTextPinned, OpenTransaction, PageRequest, PgFlavor, Restriction, Rollback,
-    RowIdentity, RowLocator, ScriptDone, SortDir, StagedChange, StatementOutcome, TableKind,
-    TableMeta, Value, MISSING_ROW,
+    detect_row_identity, run_script, split_statements, DbPool, Filter, KeyTextPinned,
+    OpenTransaction, PageRequest, PgFlavor, Restriction, Rollback, RowIdentity, ScriptDone,
+    SortDir, StatementOutcome, TableKind, Value, MISSING_ROW,
 };
 
 fn test_url() -> Option<String> {
@@ -110,45 +115,13 @@ fn test_url() -> Option<String> {
 /// index. Suffixed per test so the tests in this binary can run concurrently
 /// against one database without fighting over one fixture.
 async fn fresh_fixture(pool: &DbPool, suffix: &str) -> (String, String) {
-    let readings = format!("readings_{suffix}");
-    let sensors = format!("sensors_{suffix}");
-    for sql in [
-        format!("DROP TABLE IF EXISTS {readings} CASCADE"),
-        format!("DROP TABLE IF EXISTS {sensors} CASCADE"),
-        format!("CREATE TABLE {sensors} (id int PRIMARY KEY, name text NOT NULL)"),
-        format!("INSERT INTO {sensors} (id, name) VALUES (1, 'alpha'), (2, 'beta')"),
-        format!(
-            "CREATE TABLE {readings} (
-                id          int NOT NULL,
-                sensor_id   int NOT NULL REFERENCES {sensors}(id),
-                temperature double precision,
-                note        text,
-                PRIMARY KEY (id, sensor_id)
-            )"
-        ),
-        format!("CREATE INDEX {readings}_by_temp ON {readings} (temperature)"),
-        format!(
-            "INSERT INTO {readings} (id, sensor_id, temperature)
-             SELECT g, s.id, g * 1.5 FROM generate_series(1, 8) g CROSS JOIN {sensors} s"
-        ),
-    ] {
-        pool.query_unbounded(&sql).await.unwrap();
+    SensorFixture {
+        prefix: "",
+        key: ReadingsKey::IdAndSensor,
+        ddl_lock: None,
     }
-    (readings, sensors)
-}
-
-fn find<'a>(tables: &'a [TableMeta], name: &str) -> &'a TableMeta {
-    tables
-        .iter()
-        .find(|t| t.name == name && t.schema.as_deref() == Some("public"))
-        .unwrap_or_else(|| panic!("{name} missing from introspection"))
-}
-
-fn integer(value: &Value) -> i64 {
-    match value {
-        Value::Integer(n) => *n,
-        other => panic!("expected an integer cell, got {other:?}"),
-    }
+    .create(pool, suffix)
+    .await
 }
 
 #[tokio::test]
@@ -232,22 +205,12 @@ async fn cockroach_reserved_catalog_schemas_are_marked_as_the_engines_own() {
     // `table_type`, which is the point: the test names the objects
     // independently of the rule under test, so a rule that quietly stopped
     // matching would fail this rather than select nothing and pass.
-    let reserved: Vec<&TableMeta> = tables
-        .iter()
-        .filter(|t| {
-            matches!(
-                t.schema.as_deref(),
-                Some("crdb_internal") | Some("pg_extension")
-            )
-        })
-        .collect();
-    assert!(
-        reserved.len() > 50,
-        "expected Cockroach's catalog schemas to be populated, got {}",
-        reserved.len()
+    let reserved = assert_schema_is_internal(
+        &tables,
+        |schema| matches!(schema, "crdb_internal" | "pg_extension"),
+        50,
     );
     for table in &reserved {
-        assert_eq!(table.internal, Some(Internal::System), "{table:?}");
         // A `SYSTEM VIEW` is a view: nothing about being the engine's own
         // catalog makes its rows addressable, and reading it as a table would
         // offer editing on objects that mostly cannot even be read.
@@ -257,14 +220,6 @@ async fn cockroach_reserved_catalog_schemas_are_marked_as_the_engines_own() {
             None,
             "{table:?}"
         );
-    }
-
-    // ...and the user's own schema is untouched by the rule.
-    for table in tables
-        .iter()
-        .filter(|t| t.schema.as_deref() == Some("public"))
-    {
-        assert_eq!(table.internal, None, "{table:?}");
     }
 
     pool.close().await;
@@ -285,27 +240,9 @@ async fn cockroach_pages_sorts_and_filters() {
         filter: Some(Filter::equals("sensor_id", "2")),
         extra_key_column: None,
     };
-    assert_eq!(
-        pool.count_rows(Reading::UNMARKED, &request).await.unwrap(),
-        8
-    );
-
-    let page = pool.fetch_page(Reading::UNMARKED, &request).await.unwrap();
-    assert_eq!(page.rows.len(), 3);
+    let (page, next) = assert_pages_sorts_and_filters(&pool, &request, Expected::Exactly(8)).await;
     let ids: Vec<i64> = page.rows.iter().map(|row| integer(&row[0])).collect();
     assert_eq!(ids, [8, 7, 6], "rows should come back highest id first");
-
-    // Offsets keep walking the same ordering.
-    let next = pool
-        .fetch_page(
-            Reading::UNMARKED,
-            &PageRequest {
-                offset: 3,
-                ..request
-            },
-        )
-        .await
-        .unwrap();
     assert_eq!(integer(&next.rows[0][0]), 5);
 
     pool.close().await;
@@ -318,64 +255,20 @@ async fn cockroach_rows_edit_through_the_composite_key() {
     let (readings, _) = fresh_fixture(&pool, "edit").await;
 
     let tables = pool.introspect().await.unwrap();
-    let table = find(&tables, &readings);
-    let identity = detect_row_identity(table, pool.dialect()).expect("composite pk");
-    assert_eq!(
-        identity,
-        RowIdentity::PrimaryKey {
-            columns: vec!["id".into(), "sensor_id".into()]
-        }
-    );
-
-    let access = pool.backend_access(table);
-    assert!(access.can_mutate());
-    let key = || RowLocator {
-        identity_values: vec![Value::Integer(1), Value::Integer(1)],
-    };
-
-    let counts = apply_staged(
+    assert_rows_edit_through_key(
         &pool,
-        &access,
-        table,
-        &identity,
-        &[StagedChange::Update {
-            locator: key(),
-            column: "note".into(),
-            value: Value::Text("checked".into()),
-        }],
+        find(&tables, &readings),
+        &["id", "sensor_id"],
+        KeyedEdits {
+            update: vec![Value::Integer(1), Value::Integer(1)],
+            insert: (
+                &["id", "sensor_id", "temperature"],
+                vec![Value::Integer(99), Value::Integer(1), Value::Real(9.5)],
+            ),
+            delete: vec![Value::Integer(99), Value::Integer(1)],
+        },
     )
-    .await
-    .unwrap();
-    assert_eq!(counts.updated_rows, 1);
-
-    let counts = apply_staged(
-        &pool,
-        &access,
-        table,
-        &identity,
-        &[StagedChange::Insert {
-            columns: vec!["id".into(), "sensor_id".into(), "temperature".into()],
-            values: vec![Value::Integer(99), Value::Integer(1), Value::Real(9.5)],
-        }],
-    )
-    .await
-    .unwrap();
-    assert_eq!(counts.inserted_rows, 1);
-
-    let counts = apply_staged(
-        &pool,
-        &access,
-        table,
-        &identity,
-        &[StagedChange::Delete {
-            locator: RowLocator {
-                identity_values: vec![Value::Integer(99), Value::Integer(1)],
-            },
-        }],
-    )
-    .await
-    .unwrap();
-    assert_eq!(counts.deleted_rows, 1);
+    .await;
 
     pool.close().await;
 }
@@ -483,19 +376,6 @@ async fn cockroach_script_dml_rolls_back_but_its_ddl_does_not() {
     let Some(url) = test_url() else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
 
-    // The declaration that drives it, pinned separately from the behaviour: a
-    // rollback here covers DML and nothing else, so `transactional_ddl` is the
-    // one flag that differs from a full-featured engine. Declaring
-    // `transactions: false` instead would be the worse lie — the DML half
-    // below demonstrably works.
-    assert_eq!(
-        pool.backend_capabilities(),
-        Capabilities {
-            transactional_ddl: false,
-            ..Capabilities::FULL
-        }
-    );
-
     // The engine behaviour, pinned so it stays deliberate. Cockroach's
     // `autocommit_before_ddl` defaults to on: it commits the open transaction
     // before each DDL statement, announcing it only as a NOTICE. A failing
@@ -516,63 +396,24 @@ async fn cockroach_script_dml_rolls_back_but_its_ddl_does_not() {
     // default therefore stands; if this test ever starts failing because the
     // CREATE TABLE *did* roll back, that trade has been revisited (or
     // Cockroach changed its default) and the header above needs updating.
-    pool.query_unbounded("DROP TABLE IF EXISTS crdb_script_ddl CASCADE")
-        .await
-        .unwrap();
-    pool.query_unbounded("DROP TABLE IF EXISTS crdb_script_dml CASCADE")
-        .await
-        .unwrap();
-    pool.query_unbounded("CREATE TABLE crdb_script_dml (id int PRIMARY KEY)")
-        .await
-        .unwrap();
-
-    let sql = "INSERT INTO crdb_script_dml VALUES (1); \
-               CREATE TABLE crdb_script_ddl (id int PRIMARY KEY); \
-               SELECT * FROM missing_relation";
-    let statements = split_statements(sql, pool.dialect());
-    let error = run_script(&pool, pool.backend_capabilities(), &statements, |_| {})
-        .await
-        .expect_err("the final statement names no relation");
-    assert_eq!(
-        error.rollback,
-        Rollback::ExceptSchemaChanges,
-        "the rollback was real but did not reach the schema change, and hubro must say so"
-    );
-
-    // The auto-commit fires *before* the DDL, so it also commits everything
-    // staged ahead of it: this INSERT is not itself a schema change and still
-    // survives. That is the sharp edge — the escape isn't limited to the DDL
-    // statement, it takes every write before it along.
-    let rows = pool
-        .query_unbounded("SELECT count(*) FROM crdb_script_dml")
-        .await
-        .unwrap();
-    assert_eq!(
-        integer(&rows.rows[0][0]),
-        1,
-        "known gap: the commit before the DDL takes the preceding INSERT with it"
-    );
-
-    // ...as does the schema change itself.
-    let survivors = pool
-        .query_unbounded(
-            "SELECT count(*) FROM information_schema.tables \
-             WHERE table_name = 'crdb_script_ddl'",
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        integer(&survivors.rows[0][0]),
-        1,
-        "known gap: Cockroach auto-commits DDL out of the transaction"
-    );
-
-    pool.query_unbounded("DROP TABLE IF EXISTS crdb_script_ddl CASCADE")
-        .await
-        .unwrap();
-    pool.query_unbounded("DROP TABLE crdb_script_dml CASCADE")
-        .await
-        .unwrap();
+    assert_script_ddl_escapes_rollback(
+        &pool,
+        DdlEscape {
+            prefix: "crdb_",
+            ddl_lock: None,
+            // The auto-commit fires *before* the DDL, so it also commits
+            // everything staged ahead of it: the INSERT is not itself a
+            // schema change and still survives. That is the sharp edge — the
+            // escape isn't limited to the DDL statement, it takes every write
+            // before it along.
+            rows_left: (
+                1,
+                "known gap: the commit before the DDL takes the preceding INSERT with it",
+            ),
+            table_left: "known gap: Cockroach auto-commits DDL out of the transaction",
+        },
+    )
+    .await;
     pool.close().await;
 }
 

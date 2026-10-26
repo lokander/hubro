@@ -35,6 +35,10 @@
 
 mod common;
 
+use common::pg_family::{
+    assert_pages_sorts_and_filters, assert_rows_edit_through_key, find, Expected, KeyedEdits,
+};
+
 use hubro::db::Reading;
 use std::collections::HashMap;
 
@@ -42,8 +46,7 @@ use tokio::sync::Mutex;
 
 use hubro::db::{
     apply_staged, build_fk_filter, detect_row_identity, DbPool, Dialect, ExportFormat, Filter,
-    Internal, PageRequest, RowIdentity, RowLocator, SortDir, StagedChange, TableKind, TableMeta,
-    Value,
+    Internal, PageRequest, RowLocator, SortDir, StagedChange, TableKind, TableMeta, Value,
 };
 
 fn test_url() -> Option<String> {
@@ -99,13 +102,6 @@ async fn fresh_cluster(pool: &DbPool, suffix: &str) -> (String, String, String) 
         pool.query_unbounded(&sql).await.unwrap();
     }
     (orders, countries, notes)
-}
-
-fn find<'a>(tables: &'a [TableMeta], name: &str) -> &'a TableMeta {
-    tables
-        .iter()
-        .find(|t| t.name == name && t.schema.as_deref() == Some("public"))
-        .unwrap_or_else(|| panic!("{name} missing from introspection"))
 }
 
 #[tokio::test]
@@ -208,7 +204,8 @@ async fn distributed_table_pages_sorts_and_filters_across_shards() {
     let (orders, _, _) = fresh_cluster(&pool, "page").await;
 
     // A filter that matches rows on many shards: Citus has to fan the query
-    // out and merge, and the ordering has to survive the merge.
+    // out and merge, the ordering has to survive the merge, and the next page
+    // has to continue it rather than restart per shard.
     let request = PageRequest {
         schema: Some("public".into()),
         table: orders.clone(),
@@ -218,40 +215,7 @@ async fn distributed_table_pages_sorts_and_filters_across_shards() {
         filter: Some(Filter::equals("country", "no")),
         extra_key_column: None,
     };
-    let total = pool.count_rows(Reading::UNMARKED, &request).await.unwrap();
-    assert!(total > 50, "expected a spread of rows, got {total}");
-
-    let page = pool.fetch_page(Reading::UNMARKED, &request).await.unwrap();
-    assert_eq!(page.rows.len(), 5);
-    let ids: Vec<i64> = page
-        .rows
-        .iter()
-        .map(|row| match &row[0] {
-            Value::Integer(n) => *n,
-            other => panic!("expected an id, got {other:?}"),
-        })
-        .collect();
-    let mut sorted = ids.clone();
-    sorted.sort_by(|a, b| b.cmp(a));
-    assert_eq!(ids, sorted, "rows should come back in descending id order");
-
-    // The next page continues the same ordering rather than restarting per
-    // shard, which is the thing a fan-out merge could plausibly get wrong.
-    let next = pool
-        .fetch_page(
-            Reading::UNMARKED,
-            &PageRequest {
-                offset: 5,
-                ..request
-            },
-        )
-        .await
-        .unwrap();
-    let next_first = match &next.rows[0][0] {
-        Value::Integer(n) => *n,
-        other => panic!("expected an id, got {other:?}"),
-    };
-    assert!(next_first < ids[4]);
+    assert_pages_sorts_and_filters(&pool, &request, Expected::MoreThan(50)).await;
 }
 
 #[tokio::test]
@@ -261,69 +225,28 @@ async fn distributed_rows_edit_through_the_distribution_key() {
     let (orders, _, _) = fresh_cluster(&pool, "edit").await;
 
     let tables = pool.introspect().await.unwrap();
-    let table = find(&tables, &orders);
-    let identity = detect_row_identity(table, pool.dialect()).expect("pk");
     // Citus requires the distribution column in the WHERE clause of an
     // UPDATE/DELETE. Here the PK *is* the distribution column, so the locator
     // hubro builds from row identity already satisfies that — no Citus-aware
     // code needed on the write path.
-    assert_eq!(
-        identity,
-        RowIdentity::PrimaryKey {
-            columns: vec!["id".into()]
-        }
-    );
-
-    let access = pool.backend_access(table);
-    let counts = apply_staged(
+    assert_rows_edit_through_key(
         &pool,
-        &access,
-        table,
-        &identity,
-        &[StagedChange::Update {
-            locator: RowLocator {
-                identity_values: vec![Value::Integer(7)],
-            },
-            column: "note".into(),
-            value: Value::Text("checked".into()),
-        }],
+        find(&tables, &orders),
+        &["id"],
+        KeyedEdits {
+            update: vec![Value::Integer(7)],
+            insert: (
+                &["id", "country", "total"],
+                vec![
+                    Value::Integer(9001),
+                    Value::Text("no".into()),
+                    Value::Text("12.50".into()),
+                ],
+            ),
+            delete: vec![Value::Integer(9001)],
+        },
     )
-    .await
-    .unwrap();
-    assert_eq!(counts.updated_rows, 1);
-
-    let counts = apply_staged(
-        &pool,
-        &access,
-        table,
-        &identity,
-        &[StagedChange::Insert {
-            columns: vec!["id".into(), "country".into(), "total".into()],
-            values: vec![
-                Value::Integer(9001),
-                Value::Text("no".into()),
-                Value::Text("12.50".into()),
-            ],
-        }],
-    )
-    .await
-    .unwrap();
-    assert_eq!(counts.inserted_rows, 1);
-
-    let counts = apply_staged(
-        &pool,
-        &access,
-        table,
-        &identity,
-        &[StagedChange::Delete {
-            locator: RowLocator {
-                identity_values: vec![Value::Integer(9001)],
-            },
-        }],
-    )
-    .await
-    .unwrap();
-    assert_eq!(counts.deleted_rows, 1);
+    .await;
 }
 
 #[tokio::test]

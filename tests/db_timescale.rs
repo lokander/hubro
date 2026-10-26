@@ -18,10 +18,15 @@
 
 mod common;
 
+use common::pg_family::{
+    assert_pages_sorts_and_filters, assert_rows_edit_through_key, find, text, Expected, KeyedEdits,
+    ReadingsKey, SensorFixture,
+};
+
 use hubro::db::Reading;
 use hubro::db::{
-    apply_staged, detect_row_identity, DbPool, Filter, Internal, PageRequest, Restriction,
-    RowIdentity, RowLocator, SortDir, StagedChange, TableKind, TableMeta, Value,
+    detect_row_identity, DbPool, Filter, Internal, PageRequest, Restriction, SortDir, TableKind,
+    TableMeta, Value,
 };
 
 fn test_url() -> Option<String> {
@@ -33,51 +38,13 @@ fn test_url() -> Option<String> {
 /// several chunks. Suffixed per test so the tests in this binary can run
 /// concurrently without fighting over one fixture.
 async fn fresh_hypertable(pool: &DbPool, suffix: &str) -> (String, String) {
-    let readings = format!("readings_{suffix}");
-    let sensors = format!("sensors_{suffix}");
-    for sql in [
-        format!("DROP TABLE IF EXISTS {readings} CASCADE"),
-        format!("DROP TABLE IF EXISTS {sensors} CASCADE"),
-        format!("CREATE TABLE {sensors} (id int PRIMARY KEY, name text NOT NULL)"),
-        format!("INSERT INTO {sensors} (id, name) VALUES (1, 'alpha'), (2, 'beta')"),
-        format!(
-            "CREATE TABLE {readings} (
-                time        timestamptz NOT NULL,
-                sensor_id   int NOT NULL REFERENCES {sensors}(id),
-                temperature double precision,
-                note        text,
-                PRIMARY KEY (time, sensor_id)
-            )"
-        ),
-        format!("SELECT create_hypertable('{readings}', by_range('time', INTERVAL '1 day'))"),
-        format!(
-            "INSERT INTO {readings} (time, sensor_id, temperature)
-             SELECT ts, s.id, extract(epoch from ts) / 1e9
-             FROM generate_series(
-                 '2026-01-01'::timestamptz, '2026-01-05'::timestamptz, INTERVAL '6 hours'
-             ) ts
-             CROSS JOIN {sensors} s"
-        ),
-    ] {
-        pool.query_unbounded(&sql).await.unwrap();
+    SensorFixture {
+        prefix: "",
+        key: ReadingsKey::TimeHypertable,
+        ddl_lock: None,
     }
-    (readings, sensors)
-}
-
-/// The rendered text of a cell. Timestamps arrive as text in a fixed ISO-ish
-/// layout, so comparing the strings compares the instants.
-fn text(value: &Value) -> &str {
-    match value {
-        Value::Text(text) => text,
-        other => panic!("expected a text cell, got {other:?}"),
-    }
-}
-
-fn find<'a>(tables: &'a [TableMeta], name: &str) -> &'a TableMeta {
-    tables
-        .iter()
-        .find(|t| t.name == name && t.schema.as_deref() == Some("public"))
-        .unwrap_or_else(|| panic!("{name} missing from introspection"))
+    .create(pool, suffix)
+    .await
 }
 
 #[tokio::test]
@@ -206,7 +173,8 @@ async fn timescale_hypertable_pages_sorts_and_filters_across_chunks() {
     let (readings, _) = fresh_hypertable(&pool, "page").await;
 
     // 17 timestamps × 2 sensors, so a filtered count has to reach across
-    // every chunk rather than stopping at the first.
+    // every chunk rather than stopping at the first, and the next page has to
+    // keep walking the same ordering rather than restarting per chunk.
     let request = PageRequest {
         schema: Some("public".into()),
         table: readings.clone(),
@@ -216,25 +184,7 @@ async fn timescale_hypertable_pages_sorts_and_filters_across_chunks() {
         filter: Some(Filter::equals("sensor_id", "2")),
         extra_key_column: None,
     };
-    assert_eq!(
-        pool.count_rows(Reading::UNMARKED, &request).await.unwrap(),
-        17
-    );
-
-    let page = pool.fetch_page(Reading::UNMARKED, &request).await.unwrap();
-    assert_eq!(page.rows.len(), 3);
-    let times: Vec<&str> = page.rows.iter().map(|row| text(&row[0])).collect();
-    let mut sorted = times.clone();
-    sorted.sort_by(|a, b| b.cmp(a));
-    assert_eq!(times, sorted, "rows should come back newest first");
-
-    // Offsets keep walking the same ordering rather than restarting per chunk.
-    let next = PageRequest {
-        offset: 3,
-        ..request
-    };
-    let next = pool.fetch_page(Reading::UNMARKED, &next).await.unwrap();
-    assert!(text(&next.rows[0][0]) < times[2]);
+    assert_pages_sorts_and_filters(&pool, &request, Expected::Exactly(17)).await;
 }
 
 #[tokio::test]
@@ -244,76 +194,27 @@ async fn timescale_hypertable_rows_edit_through_the_composite_key() {
     let (readings, _) = fresh_hypertable(&pool, "edit").await;
 
     let tables = pool.introspect().await.unwrap();
-    let table = find(&tables, &readings);
-    let identity = detect_row_identity(table, pool.dialect()).expect("composite pk");
-    assert_eq!(
-        identity,
-        RowIdentity::PrimaryKey {
-            columns: vec!["time".into(), "sensor_id".into()]
-        }
-    );
-
-    let access = pool.backend_access(table);
-    let key = || RowLocator {
-        identity_values: vec![
-            Value::Text("2026-01-01 00:00:00+00".into()),
-            Value::Integer(1),
-        ],
-    };
-
-    let counts = apply_staged(
+    // The insert lands outside every existing chunk's range, which makes
+    // Timescale create a new chunk behind the scenes; the backend should
+    // neither know nor care.
+    let far_future = || Value::Text("2027-06-01 12:00:00+00".into());
+    assert_rows_edit_through_key(
         &pool,
-        &access,
-        table,
-        &identity,
-        &[StagedChange::Update {
-            locator: key(),
-            column: "note".into(),
-            value: Value::Text("checked".into()),
-        }],
-    )
-    .await
-    .unwrap();
-    assert_eq!(counts.updated_rows, 1);
-
-    // An insert outside every existing chunk's range makes Timescale create a
-    // new chunk behind the scenes; the backend should neither know nor care.
-    let far_future = RowLocator {
-        identity_values: vec![
-            Value::Text("2027-06-01 12:00:00+00".into()),
-            Value::Integer(1),
-        ],
-    };
-    let counts = apply_staged(
-        &pool,
-        &access,
-        table,
-        &identity,
-        &[StagedChange::Insert {
-            columns: vec!["time".into(), "sensor_id".into(), "temperature".into()],
-            values: vec![
-                Value::Text("2027-06-01 12:00:00+00".into()),
+        find(&tables, &readings),
+        &["time", "sensor_id"],
+        KeyedEdits {
+            update: vec![
+                Value::Text("2026-01-01 00:00:00+00".into()),
                 Value::Integer(1),
-                Value::Real(9.5),
             ],
-        }],
+            insert: (
+                &["time", "sensor_id", "temperature"],
+                vec![far_future(), Value::Integer(1), Value::Real(9.5)],
+            ),
+            delete: vec![far_future(), Value::Integer(1)],
+        },
     )
-    .await
-    .unwrap();
-    assert_eq!(counts.inserted_rows, 1);
-
-    let counts = apply_staged(
-        &pool,
-        &access,
-        table,
-        &identity,
-        &[StagedChange::Delete {
-            locator: far_future,
-        }],
-    )
-    .await
-    .unwrap();
-    assert_eq!(counts.deleted_rows, 1);
+    .await;
 }
 
 #[tokio::test]
