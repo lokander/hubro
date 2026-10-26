@@ -250,9 +250,12 @@ async fn materialize_refuses_keys_so_no_table_is_editable() {
     // both ways of declaring a key, so *no* table here can ever have one.
     // Asserted as a contrast rather than by the engine's wording: the same
     // table without the key is accepted, so the key is what was refused.
-    pool.query_unbounded("DROP TABLE IF EXISTS mz_keyless_probe")
-        .await
-        .unwrap();
+    for sql in [
+        "DROP TABLE IF EXISTS mz_keyless_probe",
+        "DROP TABLE IF EXISTS mz_keyed_probe",
+    ] {
+        pool.query_unbounded(sql).await.unwrap();
+    }
     pool.query_unbounded("CREATE TABLE mz_keyless_probe (id int)")
         .await
         .unwrap_or_else(|e| panic!("the same table without a key must be accepted: {e}"));
