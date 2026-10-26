@@ -1765,10 +1765,9 @@ mod tests {
     ///   it is what lets a pool or connection run a bare `&str`.
     fn reaches_driver(code: &str) -> Vec<(usize, String)> {
         let mut found = Vec::new();
-        let sqlx_allowed = |name: &str| SQLX_ALLOWED.contains(&name);
-        let roots: [(&str, &dyn Fn(&str) -> bool); 2] =
-            [("sqlx", &sqlx_allowed), ("sqlx_common", &common_allowed)];
-        for (root, allowed) in roots {
+        let sqlx_allowed: fn(&str) -> bool = |name| SQLX_ALLOWED.contains(&name);
+        let common: fn(&str) -> bool = common_allowed;
+        for (root, allowed) in [("sqlx", sqlx_allowed), ("sqlx_common", common)] {
             for at in ident_at(code, root) {
                 let rest = &code[at + root.len()..];
                 let Some(rest) = rest.strip_prefix("::") else {
