@@ -119,6 +119,8 @@
 //! `table_type = 'SINK'`, the server's own classification, so any engine that
 //! reports one inherits the gate without a flavor check.
 
+mod common;
+
 use hubro::db::Reading;
 use hubro::db::{
     apply_staged, detect_row_identity, run_script, split_statements, Capabilities, DbPool, Filter,
@@ -127,13 +129,7 @@ use hubro::db::{
 };
 
 fn test_url() -> Option<String> {
-    match std::env::var("HUBRO_RISINGWAVE_TEST_URL") {
-        Ok(url) => Some(url),
-        Err(_) => {
-            eprintln!("skipping risingwave test: HUBRO_RISINGWAVE_TEST_URL not set");
-            None
-        }
-    }
+    common::engine_url("HUBRO_RISINGWAVE_TEST_URL")
 }
 
 /// A keyed table plus a materialized view over it. Suffixed per test so the

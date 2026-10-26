@@ -34,50 +34,43 @@ async fn test_url() -> Option<String> {
     common::mssql_test_url().await
 }
 
-/// Whether an error is SQL Server picking this session as a deadlock victim
-/// (error 1205). Under cargo's parallel test execution, sibling tests' DDL and
-/// catalog reads occasionally deadlock; the server explicitly says "rerun the
-/// transaction", so [`run_all`] and [`introspect_table`] retry these a few
-/// times. Detection is on the 1205 message text and nothing else, so any real
-/// failure still fails fast.
-fn is_deadlock_victim(err: &DbError) -> bool {
-    err.to_string().contains("deadlock victim")
-}
-
-/// Bounded retry for the transient deadlocks above: up to three re-attempts
-/// with a short growing backoff.
-async fn retry_deadlocks<T, F, Fut>(mut op: F) -> Result<T, DbError>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, DbError>>,
-{
-    let mut attempt = 0u32;
-    loop {
-        match op().await {
-            Err(e) if is_deadlock_victim(&e) && attempt < 3 => {
-                attempt += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(50 * u64::from(attempt))).await;
-            }
-            other => return other,
-        }
-    }
-}
+/// Keeps introspection and fixture DDL from overlapping inside this binary.
+///
+/// Cargo runs one test binary at a time but the tests inside it in parallel,
+/// all in the one database [`common::mssql_test_url`] made for this process.
+/// That database keeps *other* binaries out of the catalog, not this binary's
+/// own tests: measured with nothing but this suite running, 25 runs saw 28
+/// deadlock-victim kills (1205), every one of them `introspect()`'s catalog
+/// joins losing to a sibling test's `CREATE`/`DROP`. Neither side is what a
+/// test here is about, so they take turns: introspection takes the write
+/// half, fixture DDL the read half, and DDL still runs beside other DDL.
+///
+/// This replaced a bounded retry on 1205. The retry made those kills pass
+/// silently, and would have done the same for a kill from anywhere else —
+/// another binary back in a shared database, say — so a 1205 now fails the
+/// test that met it.
+static CATALOG: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
 /// Runs each statement on its own (CREATE VIEW must be alone in its batch, so
 /// fixtures are built statement by statement, like the Postgres suite does),
-/// retrying deadlock-victim kills. Fixture DDL and drops route through here.
+/// each under [`CATALOG`]'s shared half. Fixture DDL and drops route through
+/// here.
 async fn run_all(pool: &DbPool, statements: &[&str]) {
     for sql in statements {
-        retry_deadlocks(|| pool.query(sql))
+        let _ddl = CATALOG.read().await;
+        pool.query(sql)
             .await
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }
 
-/// The introspected metadata for one `dbo` table, retrying deadlock-victim
-/// kills (the catalog joins can deadlock with sibling tests' DDL).
+/// The introspected metadata for one `dbo` table, read under [`CATALOG`]'s
+/// exclusive half so no sibling test's DDL runs beside the catalog joins.
 async fn introspect_table(pool: &DbPool, name: &str) -> TableMeta {
-    let tables = retry_deadlocks(|| pool.introspect()).await.unwrap();
+    let tables = {
+        let _catalog = CATALOG.write().await;
+        pool.introspect().await.unwrap()
+    };
     tables
         .iter()
         .find(|t| t.schema.as_deref() == Some("dbo") && t.name == name)
@@ -797,7 +790,8 @@ async fn sqlserver_staged_row_count_mismatch_rolls_the_batch_back() {
 /// how [`run_all`] sends its statements, `CREATE TRIGGER` fails with error
 /// 156; [`DbPool::execute`] sends it as a plain batch instead.
 async fn create_trigger(pool: &DbPool, sql: &str) {
-    retry_deadlocks(|| pool.execute(sql))
+    let _ddl = CATALOG.read().await;
+    pool.execute(sql)
         .await
         .unwrap_or_else(|e| panic!("{sql}: {e}"));
 }

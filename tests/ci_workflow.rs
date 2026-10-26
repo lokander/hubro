@@ -32,7 +32,7 @@
 //! when its variable is unset. The Linux leg starts a Postgres, and
 //! `HUBRO_REQUIRE_TEST_URLS` turns a lost `HUBRO_PG_TEST_URL` into a failure.
 //! That is checked at run time rather than here, by
-//! `ci_linux_runs_the_postgres_suites` in `tests/common/mod.rs`: reading
+//! `ci_linux_runs_the_postgres_suites` in `tests/engine_urls.rs`: reading
 //! ci.yml's text could only pin that an `echo` line exists, not that its
 //! value reaches `cargo test`.
 

@@ -553,17 +553,67 @@ pub async fn pg_test_url() -> Option<String> {
         .clone()
 }
 
+/// The variables of the engines whose suites share the one database their URL
+/// names, read through [`engine_url`].
+///
+/// Each is a single-suite engine today, so nothing runs two binaries against
+/// it at once and a database per process has not been needed. Postgres and SQL
+/// Server are deliberately absent: their URLs come from [`pg_test_url`] and
+/// [`mssql_test_url`], because a dozen suites share each of those servers.
+pub const SHARED_DATABASE_URLS: &[&str] = &[
+    "HUBRO_TIMESCALE_TEST_URL",
+    "HUBRO_CITUS_TEST_URL",
+    "HUBRO_CRDB_TEST_URL",
+    "HUBRO_YUGABYTE_TEST_URL",
+    "HUBRO_MATERIALIZE_TEST_URL",
+    "HUBRO_RISINGWAVE_TEST_URL",
+];
+
+/// The URL in `var`, one of [`SHARED_DATABASE_URLS`], or `None` when it is
+/// unset — which is how that engine's tests skip, unless
+/// [`REQUIRE_TEST_URLS`] lists it, when they fail instead.
+///
+/// Panics on any other name. The Postgres and SQL Server variables are refused
+/// by name because reading them here is the bypass this exists to close: it
+/// hands back the shared database, where every other suite's identically
+/// named fixtures live. An unknown name is refused because a typo would
+/// otherwise skip and pass.
+pub fn engine_url(var: &str) -> Option<String> {
+    assert!(
+        SHARED_DATABASE_URLS.contains(&var),
+        "{var} is not read through engine_url: Postgres and SQL Server use \
+         common::pg_test_url / common::mssql_test_url, and every other engine is \
+         one of {SHARED_DATABASE_URLS:?}"
+    );
+    match std::env::var(var) {
+        Ok(url) => Some(url),
+        Err(_) if is_required(var) => panic!(
+            "{var} is not set, but {REQUIRE_TEST_URLS} says this run needs it — \
+             every one of this engine's tests would skip and pass"
+        ),
+        Err(_) => {
+            eprintln!("skipping: {var} not set");
+            None
+        }
+    }
+}
+
 /// Which server a per-process database is being built on. The two differ in
 /// how they are opened, how identifiers are quoted, and — the awkward one —
 /// how the sweep below can tell a database's age.
 #[derive(Clone, Copy)]
-enum Engine {
+pub enum Engine {
     Postgres,
     SqlServer,
 }
 
 impl Engine {
-    fn env(self) -> &'static str {
+    /// Whether this engine's variable is set at all.
+    pub fn is_set(self) -> bool {
+        std::env::var(self.env()).is_ok()
+    }
+
+    pub fn env(self) -> &'static str {
         match self {
             Engine::Postgres => "HUBRO_PG_TEST_URL",
             Engine::SqlServer => "HUBRO_MSSQL_TEST_URL",
@@ -654,39 +704,36 @@ const TEST_DB_PREFIX: &str = "hubro_test_";
 /// way to `cargo test` (a renamed step, a typo) fails the build instead of
 /// quietly skipping ~70 tests.
 ///
-/// Honoured only by the per-process lookups below, which is to say for
-/// Postgres and SQL Server: the other engines read their variables in their
-/// own files. `a_required_url_names_an_engine_that_honours_it` refuses any
-/// other name, so the list cannot ask for a check nothing performs.
-const REQUIRE_TEST_URLS: &str = "HUBRO_REQUIRE_TEST_URLS";
+/// Honoured by every URL lookup in this module — the per-process ones for
+/// Postgres and SQL Server, and [`engine_url`] for the rest — which are the
+/// only places a suite may read its URL from (`tests/engine_urls.rs` pins
+/// that). `a_required_url_names_an_engine_that_honours_it` refuses any other
+/// name, so the list cannot ask for a check nothing performs.
+pub const REQUIRE_TEST_URLS: &str = "HUBRO_REQUIRE_TEST_URLS";
 
-fn required_test_urls() -> Vec<&'static str> {
-    let listed = std::env::var(REQUIRE_TEST_URLS).unwrap_or_default();
-    [Engine::Postgres, Engine::SqlServer]
-        .into_iter()
-        .map(Engine::env)
-        .filter(|name| {
-            listed
-                .split(|c: char| c == ',' || c.is_whitespace())
-                .any(|listed| listed == *name)
-        })
+/// The names [`REQUIRE_TEST_URLS`] lists.
+pub fn required_test_urls() -> Vec<String> {
+    std::env::var(REQUIRE_TEST_URLS)
+        .unwrap_or_default()
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
         .collect()
 }
 
-#[test]
-fn a_required_url_names_an_engine_that_honours_it() {
-    let honoured = [Engine::Postgres, Engine::SqlServer].map(Engine::env);
-    let listed = std::env::var(REQUIRE_TEST_URLS).unwrap_or_default();
-    for name in listed
-        .split(|c: char| c == ',' || c.is_whitespace())
-        .filter(|name| !name.is_empty())
-    {
-        assert!(
-            honoured.contains(&name),
-            "{REQUIRE_TEST_URLS} lists {name}, which only {honoured:?} honour — \
-             requiring it would check nothing"
-        );
-    }
+/// Whether [`REQUIRE_TEST_URLS`] lists `var`.
+pub fn is_required(var: &str) -> bool {
+    required_test_urls().iter().any(|listed| listed == var)
+}
+
+/// Every variable [`REQUIRE_TEST_URLS`] may name: the two the per-process
+/// lookups read, and the ones [`engine_url`] reads.
+pub fn honoured_test_urls() -> Vec<&'static str> {
+    [Engine::Postgres, Engine::SqlServer]
+        .map(Engine::env)
+        .into_iter()
+        .chain(SHARED_DATABASE_URLS.iter().copied())
+        .collect()
 }
 
 /// The Postgres major version this run's server must be, e.g.
@@ -699,12 +746,17 @@ fn a_required_url_names_an_engine_that_honours_it() {
 /// line, and a pass pointed at the wrong one still goes green — just without
 /// the half it was added for. Each pass therefore declares its version, and
 /// [`per_process_database`] refuses a server that disagrees.
-const PG_TEST_MAJOR: &str = "HUBRO_PG_TEST_MAJOR";
+pub const PG_TEST_MAJOR: &str = "HUBRO_PG_TEST_MAJOR";
+
+/// What [`PG_TEST_MAJOR`] is set to, if anything.
+pub fn pg_test_major() -> Option<String> {
+    std::env::var(PG_TEST_MAJOR).ok()
+}
 
 /// Why a server reporting `server_version_num` is not the `declared` major
 /// version, or `None` when it is. A free function over the two strings so the
 /// comparison is tested without a server.
-fn pg_major_mismatch(declared: &str, server_version_num: &str) -> Option<String> {
+pub fn pg_major_mismatch(declared: &str, server_version_num: &str) -> Option<String> {
     let Ok(declared_major) = declared.trim().parse::<u32>() else {
         return Some(format!(
             "{PG_TEST_MAJOR}={declared:?} is not a major version number"
@@ -718,52 +770,6 @@ fn pg_major_mismatch(declared: &str, server_version_num: &str) -> Option<String>
              server reports server_version_num {server_version_num}"
         )),
     }
-}
-
-#[test]
-fn a_declared_pg_major_must_match_the_server() {
-    assert_eq!(pg_major_mismatch("17", "170006"), None);
-    assert_eq!(pg_major_mismatch("18", "180000"), None);
-    assert_eq!(pg_major_mismatch(" 18\n", "180001"), None);
-    assert!(pg_major_mismatch("18", "170006").is_some());
-    assert!(pg_major_mismatch("17", "180000").is_some());
-    // Not "1": a prefix comparison would let 17 pass as 1.
-    assert!(pg_major_mismatch("1", "170006").is_some());
-    assert!(pg_major_mismatch("eighteen", "180000").is_some());
-    assert!(pg_major_mismatch("18", "").is_some());
-}
-
-#[test]
-fn ci_linux_runs_the_postgres_suites() {
-    // CI's Linux leg starts a Postgres for the suites (ci.yml), and this is
-    // what notices if the URL stops reaching `cargo test` — the step's output
-    // not written to $GITHUB_ENV, its `if:` flipped, the step moved below
-    // Test, the requirement's name misspelled. Every one of those leaves the
-    // Postgres tests skipping and CI green, and every one leaves an `echo`
-    // line in ci.yml for a source-reading test to find, which is why this
-    // asks the running process instead. Inert everywhere else: `RUNNER_OS`
-    // and `GITHUB_ACTIONS` are set by the Actions runner, and a developer
-    // running without Postgres should still skip.
-    let set_to = |name: &str, value: &str| std::env::var(name).is_ok_and(|v| v == value);
-    if !(set_to("GITHUB_ACTIONS", "true") && set_to("RUNNER_OS", "Linux")) {
-        return;
-    }
-    assert!(
-        std::env::var(Engine::Postgres.env()).is_ok(),
-        "CI's Linux leg has no {}, so every Postgres suite skips",
-        Engine::Postgres.env()
-    );
-    assert!(
-        required_test_urls().contains(&Engine::Postgres.env()),
-        "CI's Linux leg does not list {} in {REQUIRE_TEST_URLS}, so losing it \
-         would skip the Postgres suites and pass",
-        Engine::Postgres.env()
-    );
-    assert!(
-        std::env::var(PG_TEST_MAJOR).is_ok(),
-        "CI's Linux leg does not set {PG_TEST_MAJOR}, so a Postgres pass could \
-         reach the wrong server version and still pass"
-    );
 }
 
 /// Builds this process a database of its own and returns the URL naming it.
@@ -804,7 +810,7 @@ async fn per_process_database(engine: Engine) -> Option<String> {
     let base = match std::env::var(engine.env()) {
         Ok(url) => url,
         Err(_) => {
-            if required_test_urls().contains(&engine.env()) {
+            if is_required(engine.env()) {
                 panic!(
                     "{} is not set, but {REQUIRE_TEST_URLS} says this run needs it — \
                      every one of this engine's tests would skip and pass",
@@ -819,7 +825,7 @@ async fn per_process_database(engine: Engine) -> Option<String> {
         .open(&base)
         .await
         .unwrap_or_else(|e| panic!("{} must be connectable: {e}", engine.env()));
-    if let (Engine::Postgres, Ok(declared)) = (engine, std::env::var(PG_TEST_MAJOR)) {
+    if let (Engine::Postgres, Some(declared)) = (engine, pg_test_major()) {
         let reported = admin
             .query("SELECT current_setting('server_version_num')")
             .await
@@ -894,74 +900,6 @@ pub fn with_database(url: &str, database: &str) -> String {
         None => before_query,
     };
     format!("{scheme}://{authority}/{database}{query}")
-}
-
-#[test]
-fn a_rewritten_url_keeps_everything_but_the_database() {
-    // The credentials, port and parameters all have to survive, or the suites
-    // silently reconnect to the wrong place — or not at all.
-    assert_eq!(
-        with_database(
-            "mssql://sa:Str0ng%21Passw0rd@localhost:14333/master?encrypt=on&trustServerCertificate=true",
-            "hubro_test_1_2"
-        ),
-        "mssql://sa:Str0ng%21Passw0rd@localhost:14333/hubro_test_1_2?encrypt=on&trustServerCertificate=true"
-    );
-    // Percent-encoded userinfo passes through untouched. The database is
-    // located as the first `/` after the scheme, which is correct precisely
-    // because userinfo may not contain a bare `/` — a password that does has
-    // to be encoded, and would not survive sqlx or tiberius either. This case
-    // is here because the naive reading of "the first slash" looks wrong until
-    // you check that.
-    assert_eq!(
-        with_database("postgres://u:a%2Fb@h:5432/demo", "db"),
-        "postgres://u:a%2Fb@h:5432/db"
-    );
-    assert_eq!(
-        with_database(
-            "postgres://tester:testpass@localhost:5433/demo",
-            "hubro_test_1_2"
-        ),
-        "postgres://tester:testpass@localhost:5433/hubro_test_1_2"
-    );
-    // No path at all, and — the case the first version of this test claimed
-    // to cover and didn't — no path *with* a query, where the database was
-    // being appended inside the last parameter value.
-    assert_eq!(
-        with_database("postgres://u@h:5432", "db"),
-        "postgres://u@h:5432/db"
-    );
-    assert_eq!(
-        with_database(
-            "mssql://sa:p@h:14333?encrypt=on&trustServerCertificate=true",
-            "db"
-        ),
-        "mssql://sa:p@h:14333/db?encrypt=on&trustServerCertificate=true"
-    );
-    // An IPv6 literal host keeps its brackets and colons.
-    assert_eq!(
-        with_database("postgres://u@[::1]:5432/demo", "db"),
-        "postgres://u@[::1]:5432/db"
-    );
-    // A `/` inside a query value is not the start of a path. `sslrootcert`
-    // and friends are stock sqlx parameters holding absolute paths, and
-    // reading that slash as the path both misplaced the database *and*
-    // truncated the query.
-    assert_eq!(
-        with_database("postgres://u:p@h:5432?sslrootcert=/etc/ssl/root.crt", "db"),
-        "postgres://u:p@h:5432/db?sslrootcert=/etc/ssl/root.crt"
-    );
-    assert_eq!(
-        with_database(
-            "postgres://u:p@h:5432/demo?sslrootcert=/etc/ssl/root.crt",
-            "db"
-        ),
-        "postgres://u:p@h:5432/db?sslrootcert=/etc/ssl/root.crt"
-    );
-    assert_eq!(
-        with_database("postgres://u@h:5432/?sslmode=disable", "db"),
-        "postgres://u@h:5432/db?sslmode=disable"
-    );
 }
 
 // ---------------------------------------------------------------------------

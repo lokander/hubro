@@ -673,16 +673,6 @@ async fn serialized(engine: &'static str) -> tokio::sync::OwnedMutexGuard<()> {
     lock.lock_owned().await
 }
 
-fn url(var: &str) -> Option<String> {
-    match std::env::var(var) {
-        Ok(url) => Some(url),
-        Err(_) => {
-            eprintln!("skipping schema-edit test: {var} not set");
-            None
-        }
-    }
-}
-
 /// Opens `url` as Postgres, seeds the fixture, and runs the sequence.
 async fn postgres_report(url: &str, name: &str, flavor: Flavor) -> Report {
     let pool = DbPool::open_postgres(url).await.unwrap();
@@ -707,7 +697,7 @@ async fn postgres_applies_every_operation() {
 #[tokio::test]
 async fn timescale_applies_every_operation() {
     let _engine = serialized("HUBRO_TIMESCALE_TEST_URL").await;
-    let Some(url) = url("HUBRO_TIMESCALE_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_TIMESCALE_TEST_URL") else {
         return;
     };
     assert_all_applied(
@@ -719,7 +709,7 @@ async fn timescale_applies_every_operation() {
 #[tokio::test]
 async fn citus_applies_every_operation() {
     let _engine = serialized("HUBRO_CITUS_TEST_URL").await;
-    let Some(url) = url("HUBRO_CITUS_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_CITUS_TEST_URL") else {
         return;
     };
     assert_all_applied(
@@ -731,7 +721,7 @@ async fn citus_applies_every_operation() {
 #[tokio::test]
 async fn cockroach_applies_every_operation() {
     let _engine = serialized("HUBRO_CRDB_TEST_URL").await;
-    let Some(url) = url("HUBRO_CRDB_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_CRDB_TEST_URL") else {
         return;
     };
     assert_all_applied(
@@ -743,7 +733,7 @@ async fn cockroach_applies_every_operation() {
 #[tokio::test]
 async fn yugabyte_applies_every_operation() {
     let _engine = serialized("HUBRO_YUGABYTE_TEST_URL").await;
-    let Some(url) = url("HUBRO_YUGABYTE_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_YUGABYTE_TEST_URL") else {
         return;
     };
     assert_all_applied(
@@ -859,7 +849,7 @@ async fn postgres_an_index_built_for_a_constraint_is_not_offered_for_drop() {
 #[tokio::test]
 async fn timescale_an_index_built_for_a_constraint_is_not_offered_for_drop() {
     let _engine = serialized("HUBRO_TIMESCALE_TEST_URL").await;
-    let Some(url) = url("HUBRO_TIMESCALE_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_TIMESCALE_TEST_URL") else {
         return;
     };
     assert_postgres_constraint_sweep(&url, "ci_ts", "TimescaleDB").await;
@@ -868,7 +858,7 @@ async fn timescale_an_index_built_for_a_constraint_is_not_offered_for_drop() {
 #[tokio::test]
 async fn citus_an_index_built_for_a_constraint_is_not_offered_for_drop() {
     let _engine = serialized("HUBRO_CITUS_TEST_URL").await;
-    let Some(url) = url("HUBRO_CITUS_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_CITUS_TEST_URL") else {
         return;
     };
     assert_postgres_constraint_sweep(&url, "ci_citus", "Citus").await;
@@ -877,7 +867,7 @@ async fn citus_an_index_built_for_a_constraint_is_not_offered_for_drop() {
 #[tokio::test]
 async fn yugabyte_an_index_built_for_a_constraint_is_not_offered_for_drop() {
     let _engine = serialized("HUBRO_YUGABYTE_TEST_URL").await;
-    let Some(url) = url("HUBRO_YUGABYTE_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_YUGABYTE_TEST_URL") else {
         return;
     };
     // No EXCLUDE: "EXCLUDE constraint not supported yet".
@@ -907,7 +897,7 @@ async fn yugabyte_an_index_built_for_a_constraint_is_not_offered_for_drop() {
 #[tokio::test]
 async fn cockroach_offers_a_unique_constraints_index_and_the_engine_refuses_it() {
     let _engine = serialized("HUBRO_CRDB_TEST_URL").await;
-    let Some(url) = url("HUBRO_CRDB_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_CRDB_TEST_URL") else {
         return;
     };
     let pool = DbPool::open_postgres(&url).await.unwrap();
@@ -960,7 +950,7 @@ async fn sqlserver_an_index_built_for_a_constraint_is_not_offered_for_drop() {
 #[tokio::test]
 async fn materialize_applies_what_its_ddl_supports() {
     let _engine = serialized("HUBRO_MATERIALIZE_TEST_URL").await;
-    let Some(url) = url("HUBRO_MATERIALIZE_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_MATERIALIZE_TEST_URL") else {
         return;
     };
     let report = postgres_report(
@@ -986,7 +976,7 @@ async fn materialize_applies_what_its_ddl_supports() {
 #[tokio::test]
 async fn risingwave_applies_what_its_ddl_supports() {
     let _engine = serialized("HUBRO_RISINGWAVE_TEST_URL").await;
-    let Some(url) = url("HUBRO_RISINGWAVE_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_RISINGWAVE_TEST_URL") else {
         return;
     };
     let report = postgres_report(

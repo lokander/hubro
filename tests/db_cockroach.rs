@@ -103,13 +103,7 @@ use hubro::db::{
 };
 
 fn test_url() -> Option<String> {
-    match std::env::var("HUBRO_CRDB_TEST_URL") {
-        Ok(url) => Some(url),
-        Err(_) => {
-            eprintln!("skipping cockroachdb test: HUBRO_CRDB_TEST_URL not set");
-            None
-        }
-    }
+    common::engine_url("HUBRO_CRDB_TEST_URL")
 }
 
 /// A parent/child pair with a real primary key, a foreign key and a secondary
