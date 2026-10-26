@@ -2054,7 +2054,24 @@ enum PkSource {
 /// answer where the views' is not: RisingWave's `key_column_usage` reports a
 /// key column's *table* position as its `ordinal_position`, so a key declared
 /// `PRIMARY KEY (c, a)` over columns `(a, b, c)` came back `a` = 1, `c` = 3,
-/// where `conkey` says `c` first, then `a`.
+/// where `conkey` says `c` first, then `a`. A materialized view's key had the
+/// same fault and now reads in key order too, which changes only what is
+/// shown: a view gets no row identity.
+///
+/// **What it costs: the key is no longer hidden by privilege.** The views
+/// list a table's key only where `has_table_privilege(…, 'INSERT, UPDATE,
+/// DELETE')` holds, so a `SELECT`-only user saw no key on RisingWave (as on
+/// PostgreSQL, measured: a `SELECT`-only role sees none through the views
+/// there either). `pg_constraint` shows it to everyone. On RisingWave that
+/// gives no edit controls: every table there is refused for want of
+/// transactions ([`UNGUARDED_WRITES`](super::caps::UNGUARDED_WRITES)) whatever
+/// its key, so such a user's tables now say that instead of "no row identity",
+/// and keyed reads (a long cell re-fetched by its row's key) work for them.
+/// Filtering by privilege again was measured: `has_table_privilege` by oid or
+/// by name raises on a dropped table just the same (36 and 34 of 500 reads),
+/// and reading the privilege out of `rw_relations.acl` held up (0 of 500, and
+/// no key for a `SELECT`-only user) but reimplements the engine's privilege
+/// rules in SQL and drew RisingWave's "plan is too deep" warning on its own.
 ///
 /// By flavor, because no catalog fact says a view raises: the flavor picks
 /// which catalog to ask, and the answer still comes from the catalog. Only
@@ -3612,6 +3629,52 @@ fn format_interval(iv: &PgInterval) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Which catalog the column query asks for keys, for every flavor, and
+    /// what each form of the query reads. The engine tests that measure the
+    /// reason (`tests/db_risingwave.rs`) run only where RisingWave does; this
+    /// runs everywhere, so sending RisingWave back to the views fails CI.
+    #[test]
+    fn only_risingwave_reads_its_keys_from_pg_constraint() {
+        use super::{column_query, pk_source, ColumnQuery, PgFlavor, PkSource};
+        // Exhaustive: a new flavor fails to compile here until it is listed.
+        let listed = |flavor: PgFlavor| match flavor {
+            PgFlavor::Postgres
+            | PgFlavor::CockroachDB
+            | PgFlavor::Yugabyte
+            | PgFlavor::Materialize
+            | PgFlavor::RisingWave => flavor,
+        };
+        for (flavor, source) in [
+            (PgFlavor::Postgres, PkSource::InformationSchema),
+            (PgFlavor::CockroachDB, PkSource::InformationSchema),
+            (PgFlavor::Yugabyte, PkSource::InformationSchema),
+            (PgFlavor::Materialize, PkSource::InformationSchema),
+            (PgFlavor::RisingWave, PkSource::PgConstraint),
+        ] {
+            assert_eq!(pk_source(listed(flavor)), source, "{flavor:?}");
+        }
+        for shape in [ColumnQuery::Rich, ColumnQuery::Portable] {
+            let catalog = column_query(shape, PkSource::PgConstraint);
+            assert!(
+                catalog.contains("FROM pg_constraint con")
+                    && catalog.contains("unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)")
+                    && catalog.contains("k.ord AS ordinal_position"),
+                "{shape:?}: {catalog}"
+            );
+            assert!(
+                !catalog.contains("table_constraints") && !catalog.contains("key_column_usage"),
+                "{shape:?}: the pg_constraint form still reads a view that raises: {catalog}"
+            );
+            let views = column_query(shape, PkSource::InformationSchema);
+            assert!(
+                views.contains("information_schema.table_constraints")
+                    && views.contains("information_schema.key_column_usage")
+                    && !views.contains("conkey"),
+                "{shape:?}: {views}"
+            );
+        }
+    }
+
     /// The extension query's rows as markings: an extension beats a
     /// partition on the same object whichever row comes first, a schema-wide
     /// row marks the schema, and which extensions are installed is read from
