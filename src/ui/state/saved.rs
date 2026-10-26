@@ -85,21 +85,47 @@ fn forget_collapsed(collapsed: &mut Vec<String>, name: &str) {
     collapsed.retain(|folded| folded != name);
 }
 
+/// What a saved-list edit hands back, read for whether it changed the list
+/// and so has to be persisted ([`AppState::mutate_saved`]).
+trait SavedChange {
+    fn changed(&self) -> bool;
+}
+
+/// `true` when the edit changed the list.
+impl SavedChange for bool {
+    fn changed(&self) -> bool {
+        *self
+    }
+}
+
+/// `Ok` when the edit was made; an `Err` was refused and changed nothing.
+impl<T, E> SavedChange for Result<T, E> {
+    fn changed(&self) -> bool {
+        self.is_ok()
+    }
+}
+
+/// `Some` when the edit removed something.
+impl<T> SavedChange for Option<T> {
+    fn changed(&self) -> bool {
+        self.is_some()
+    }
+}
+
 impl AppState {
     /// Adds a database file to the saved list (deduped by path) and
     /// persists the list.
-    pub fn add_saved(mut self, path: PathBuf) {
+    pub fn add_saved(self, path: PathBuf) {
         let path = canonical(&path);
-        let added = self.saved.write().add(SavedConnection::Sqlite {
-            name: tab_title(&path),
-            path,
-            protection: WriteProtection::Open,
-            color: None,
-            group: None,
+        self.mutate_saved(|saved| {
+            saved.add(SavedConnection::Sqlite {
+                name: tab_title(&path),
+                path,
+                protection: WriteProtection::Open,
+                color: None,
+                group: None,
+            })
         });
-        if added {
-            self.persist_saved();
-        }
     }
 
     /// Marks a saved connection's write protection and accent colour,
@@ -124,14 +150,9 @@ impl AppState {
         protection: WriteProtection,
         color: Option<ConnectionColor>,
     ) {
-        let changed = {
-            let mut saved = self.saved.write();
-            saved.set_marking(locator, protection, color)
-        };
-        if !changed {
+        if !self.mutate_saved(|saved| saved.set_marking(locator, protection, color)) {
             return;
         }
-        self.persist_saved();
         let open_locator = self
             .saved
             .read()
@@ -147,23 +168,16 @@ impl AppState {
     /// Creates a connection group and persists the list. The error
     /// is handed back for the connections screen to show next to the field
     /// the name was typed into.
-    pub fn create_saved_group(mut self, name: &str) -> Result<String, GroupError> {
-        // Scoped so the write borrow is released before `persist_saved`
-        // takes a read one.
-        let created = { self.saved.write().create_group(name) };
-        if created.is_ok() {
-            self.persist_saved();
-        }
-        created
+    pub fn create_saved_group(self, name: &str) -> Result<String, GroupError> {
+        self.mutate_saved(|saved| saved.create_group(name))
     }
 
     /// Renames a group, carrying its members and its collapsed state with it.
     pub fn rename_saved_group(mut self, old: &str, new: &str) -> Result<String, GroupError> {
-        let renamed = { self.saved.write().rename_group(old, new) };
+        let renamed = self.mutate_saved(|saved| saved.rename_group(old, new));
         let Ok(new_name) = renamed else {
             return renamed;
         };
-        self.persist_saved();
         if new_name != old && collapsed_needs_rename(&self.collapsed_groups.peek(), old) {
             rename_collapsed(&mut self.collapsed_groups.write(), old, &new_name);
         }
@@ -173,22 +187,17 @@ impl AppState {
     /// Removes a group; its connections become ungrouped rather than being
     /// removed with it.
     pub fn remove_saved_group(mut self, name: &str) {
-        let removed = { self.saved.write().remove_group(name) };
-        if !removed {
+        if !self.mutate_saved(|saved| saved.remove_group(name)) {
             return;
         }
-        self.persist_saved();
         if self.collapsed_groups.peek().iter().any(|g| g == name) {
             forget_collapsed(&mut self.collapsed_groups.write(), name);
         }
     }
 
     /// Moves a group one step up or down the display order.
-    pub fn move_saved_group(mut self, name: &str, up: bool) {
-        let moved = { self.saved.write().move_group(name, up) };
-        if moved {
-            self.persist_saved();
-        }
+    pub fn move_saved_group(self, name: &str, up: bool) {
+        self.mutate_saved(|saved| saved.move_group(name, up));
     }
 
     /// Files a saved connection under a group, or ungroups it with
@@ -198,11 +207,8 @@ impl AppState {
     /// Nothing about an *open* tab depends on the group — unlike the marking,
     /// which has to reach the live connection — so there is no counterpart
     /// here to [`Self::set_saved_marking`]'s re-marking step.
-    pub fn assign_saved_group(mut self, locator: &str, group: Option<&str>) {
-        let changed = { self.saved.write().assign_group(locator, group) };
-        if changed {
-            self.persist_saved();
-        }
+    pub fn assign_saved_group(self, locator: &str, group: Option<&str>) {
+        self.mutate_saved(|saved| saved.assign_group(locator, group));
     }
 
     /// Folds or unfolds a group in the connections list. Persisted with the
@@ -269,10 +275,7 @@ impl AppState {
                 self.update_saved(edit.old_locator, connection);
             }
             None => {
-                let added = self.saved.write().add(connection);
-                if added {
-                    self.persist_saved();
-                }
+                self.mutate_saved(|saved| saved.add(connection));
             }
         }
         // Best-effort, like forgetting a moved locator's token: nothing was
@@ -298,10 +301,7 @@ impl AppState {
     /// never carried ([`carried_secret_keys`]).
     pub fn update_saved(mut self, old_locator: String, connection: SavedConnection) {
         let new_locator = connection.locator().to_string();
-        let updated = self.saved.write().update(&old_locator, connection);
-        if updated {
-            self.persist_saved();
-        }
+        self.mutate_saved(|saved| saved.update(&old_locator, connection));
         if new_locator != old_locator {
             // Synchronously, and before the spawn: session memory is what the
             // *next* connect reads first, and the next connect can begin as
@@ -351,8 +351,7 @@ impl AppState {
     /// to reconnect with, which is the intended reading of a deletion rather
     /// than an oversight.
     pub fn remove_saved(mut self, locator: &str) {
-        let removed = self.saved.write().remove(locator);
-        if let Some(entry) = removed {
+        if let Some(entry) = self.mutate_saved(|saved| saved.remove(locator)) {
             // The in-memory stores are keyed by locator whatever the backend
             // is, and clearing them is not I/O, so it happens for every entry
             // and before the keyring work is spawned.
@@ -376,8 +375,22 @@ impl AppState {
                     let _ = self.finish_entra_sign_out(&url, signed_out).await;
                 });
             }
+        }
+    }
+
+    /// Applies `edit` to the saved list and persists the list when the edit
+    /// says it changed something ([`SavedChange`]), handing back what the
+    /// edit returned. The one mutate-then-persist step every saved-list
+    /// edit goes through, so none can change the list and forget to write it.
+    ///
+    /// The write borrow ends with `edit`, before [`Self::persist_saved`]
+    /// takes its read one.
+    fn mutate_saved<R: SavedChange>(mut self, edit: impl FnOnce(&mut SavedList) -> R) -> R {
+        let result = edit(&mut self.saved.write());
+        if result.changed() {
             self.persist_saved();
         }
+        result
     }
 
     fn persist_saved(mut self) {
@@ -438,6 +451,39 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_saved_list_edit_is_written_exactly_when_it_changed_the_list() {
+        // `mutate_saved` reads each edit's own answer — a `bool`, a `Result`,
+        // an `Option` — for whether to write. Each kind is driven both ways
+        // against the test state's own file: a write recreates the deleted
+        // file, and an edit that changed nothing leaves it gone.
+        fn empty() -> Element {
+            rsx! {}
+        }
+        let dom = dioxus::core::VirtualDom::new(empty);
+        let state = crate::ui::test_dom::provide_state(&dom);
+        let file = dom.in_runtime(|| state.paths.peek().connections.clone().unwrap());
+        let written = |edit: &dyn Fn()| {
+            let _ = std::fs::remove_file(&file);
+            dom.in_runtime(edit);
+            file.exists()
+        };
+        assert!(written(&|| {
+            state.create_saved_group("Prod").unwrap();
+        }));
+        assert!(!written(&|| {
+            state.create_saved_group("Prod").unwrap_err();
+        }));
+        assert!(written(&|| state.add_saved(PathBuf::from("/tmp/a.db"))));
+        let locator = dom.in_runtime(|| state.saved.peek().entries()[0].locator());
+        assert!(written(&|| state.assign_saved_group(&locator, Some("Prod"))));
+        assert!(!written(
+            &|| state.assign_saved_group(&locator, Some("Prod"))
+        ));
+        assert!(!written(&|| state.remove_saved("/nowhere.db")));
+        assert!(written(&|| state.remove_saved(&locator)));
+    }
 
     fn v(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()

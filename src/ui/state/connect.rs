@@ -400,11 +400,8 @@ impl AppState {
                 self.session_passwords
                     .write()
                     .insert(entra_secret_key(url), refresh);
-                self.connect_error.set(Some(
-                    "connected, but the sign-in could not be stored in the system \
-                     keyring — it is remembered for this session only"
-                        .to_string(),
-                ));
+                self.connect_error
+                    .set(Some(keyring_store_failed("the sign-in")));
             }
             RefreshKeyringOutcome::RemovalRefused => {
                 self.connect_error.set(Some(
@@ -703,11 +700,8 @@ impl AppState {
                     let store =
                         crate::secrets::store_password_async(url.clone(), password.clone()).await;
                     if store.is_err() {
-                        self.connect_error.set(Some(
-                            "connected, but the password could not be stored in the system \
-                             keyring — it is remembered for this session only"
-                                .to_string(),
-                        ));
+                        self.connect_error
+                            .set(Some(keyring_store_failed("the password")));
                     }
                 }
                 StoredPassword::Delete => {
@@ -877,11 +871,8 @@ impl AppState {
             .await
             .is_err()
         {
-            self.connect_error.set(Some(
-                "connected, but the SSH key passphrase could not be stored in the system \
-                 keyring — it is remembered for this session only"
-                    .to_string(),
-            ));
+            self.connect_error
+                .set(Some(keyring_store_failed("the SSH key passphrase")));
         }
     }
 

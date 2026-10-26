@@ -604,6 +604,17 @@ pub(super) fn stored_copy(in_session: bool, found: bool) -> StoredCopy {
     }
 }
 
+/// The notice for a connect whose secret — `what`, such as "the password" —
+/// the keyring refused to store. The secret is kept for the session instead,
+/// so the connect itself stands. One wording for every secret, so the notices
+/// cannot drift apart as they once had.
+pub(super) fn keyring_store_failed(what: &str) -> String {
+    format!(
+        "connected, but {what} could not be stored in the system keyring — it is \
+         remembered for this session only"
+    )
+}
+
 /// What a password connect that just succeeded does to the keyring entry for
 /// its locator. See [`stored_password_after_connect`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -646,6 +657,35 @@ pub(super) fn stored_password_after_connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_refused_keyring_store_is_worded_alike() {
+        assert_eq!(
+            keyring_store_failed("the password"),
+            "connected, but the password could not be stored in the system keyring — it \
+             is remembered for this session only"
+        );
+        // Every such notice is built here: no shipped code spells the wording
+        // out itself, and each kind of secret has its call.
+        let mut calls = Vec::new();
+        for (file, source) in super::super::source_reading::all_sources() {
+            let code = crate::source_scan::code_outside_test_modules(&source);
+            assert!(
+                file == "ui/state/secrets_policy.rs"
+                    || !code.contains("could not be stored in the system keyring"),
+                "src/{file} words a refused keyring store itself"
+            );
+            for (at, _) in code.match_indices("keyring_store_failed(\"") {
+                let what = &code[at + "keyring_store_failed(\"".len()..];
+                calls.push(what[..what.find('"').unwrap()].to_string());
+            }
+        }
+        calls.sort();
+        assert_eq!(
+            calls,
+            ["the SSH key passphrase", "the password", "the sign-in"]
+        );
+    }
 
     #[test]
     fn a_silent_sign_in_keeps_its_token_where_the_user_put_it() {
