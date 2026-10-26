@@ -689,6 +689,107 @@ fn format_numeric(n: &tiberius::numeric::Numeric) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The SQL Server catalog reads are the ones whose deadlock victim is
+    /// retried, so the wire is pinned end to end, read through
+    /// `source_scan` (comments and test modules out):
+    ///
+    /// - each of the five catalog functions reads only through
+    ///   `catalog_query_with`, never plain `query_with`;
+    /// - nothing else in shipped code calls `catalog_query_with` — a script's
+    ///   or a write's 1205 must stay an ordinary error;
+    /// - `fetch_ddl` passes a transient failure of the table extras through
+    ///   ahead of the arm that degrades every other failure, or the retry
+    ///   would never see it.
+    #[test]
+    fn only_the_catalog_reads_retry_a_deadlock_and_ddl_passes_it_through() {
+        use crate::source_scan::{block_end, code_outside_test_modules, names_ident, rust_files};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |file: &str| {
+            code_outside_test_modules(&std::fs::read_to_string(root.join(file)).unwrap())
+        };
+        // `file`'s code with the body of `fn name` cut out, and that body.
+        let cut = |code: &str, name: &str| -> (String, String) {
+            let start = code
+                .find(&format!("fn {name}("))
+                .unwrap_or_else(|| panic!("no fn {name}"));
+            let end = start + block_end(&code[start..]).expect("the function closes");
+            (
+                format!("{}{}", &code[..start], &code[end..]),
+                code[start..end].to_string(),
+            )
+        };
+        let mut bodies = Vec::new();
+        let mut rest = std::collections::HashMap::new();
+        for (file, functions) in [
+            (
+                "src/db/sqlserver/mod.rs",
+                &["introspect", "fetch_table_stats"][..],
+            ),
+            (
+                "src/db/sqlserver/ddl.rs",
+                &["fetch_ddl", "table_ddl_extras", "index_ddl"][..],
+            ),
+        ] {
+            let mut code = read(file);
+            for name in functions {
+                let (left, body) = cut(&code, name);
+                code = left;
+                bodies.push((*name, body));
+            }
+            rest.insert(file, code);
+        }
+        for (name, body) in &bodies {
+            assert!(
+                body.contains("catalog_query_with("),
+                "fn {name} no longer reads the catalog through catalog_query_with"
+            );
+            assert!(
+                !names_ident(body, "query_with"),
+                "fn {name} reads the catalog through plain query_with, so its deadlock is not retried"
+            );
+        }
+        // Outside those bodies, the definition and the import are the only
+        // other places it may be named.
+        let (pool_rest, _) = cut(&read("src/db/sqlserver/pool.rs"), "catalog_query_with");
+        let ddl_rest = rest["src/db/sqlserver/ddl.rs"]
+            .replace("use super::pool::{catalog_query_with, MssqlPool};", "");
+        for file in rust_files(&root.join("src")) {
+            let relative = file
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let code = match relative.as_str() {
+                "src/db/sqlserver/pool.rs" => pool_rest.clone(),
+                "src/db/sqlserver/ddl.rs" => ddl_rest.clone(),
+                "src/db/sqlserver/mod.rs" => rest["src/db/sqlserver/mod.rs"].clone(),
+                _ => code_outside_test_modules(&std::fs::read_to_string(&file).unwrap()),
+            };
+            assert!(
+                !names_ident(&code, "catalog_query_with"),
+                "{relative}: calls catalog_query_with outside the catalog reads, so its 1205 would be retried"
+            );
+        }
+        // The degrade arm comes after the transient pass-through.
+        let fetch_ddl: String = bodies
+            .iter()
+            .find(|(name, _)| *name == "fetch_ddl")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .collect();
+        let pass = fetch_ddl
+            .find("Err(err)iferr.is_transient()=>returnErr(err),")
+            .expect("fetch_ddl passes a transient table-extras failure through");
+        let degrade = fetch_ddl
+            .find("Err(err)=>{")
+            .expect("fetch_ddl degrades other table-extras failures");
+        assert!(
+            pass < degrade,
+            "the degrade arm swallows a deadlock before it can be retried"
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -60,7 +60,13 @@ pub async fn fetch_ddl(
 
     let extras = match table_ddl_extras(pool, table, &params).await {
         Ok(extras) => extras,
-        // A failed catalog read degrades to the metadata-only rebuild rather
+        // A deadlock victim is passed through, not degraded: the caller's one
+        // retry (`registry::retry_transient`) runs the whole fetch again. So a
+        // *second* deadlock now shows as an error rather than as the degraded
+        // rebuild below — the price of not handing back the worse output for
+        // a failure that running it again usually cures.
+        Err(err) if err.is_transient() => return Err(err),
+        // Any other failed catalog read degrades to the metadata-only rebuild rather
         // than failing the action outright. The standing caveats are extended,
         // never replaced: the worse output must not claim to reproduce more
         // than the good one.
