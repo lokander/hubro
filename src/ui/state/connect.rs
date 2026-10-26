@@ -29,6 +29,101 @@ pub(super) struct EntraSignIn {
     redeemed_at: Option<u64>,
 }
 
+/// Where an Entra sign-in may get its token from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EntraOpener {
+    /// Without anyone at the browser: a managed identity, or a kept refresh
+    /// token redeemed. A sign-in that needs the browser parks the card instead
+    /// ([`refuse_browser`]).
+    Silent,
+    /// From the sign-in card: the user asked for the browser.
+    Browser,
+}
+
+/// Whether a sign-in that just succeeded keeps its refresh token in the
+/// keyring: the answer `finish_entra_connect` acts on.
+///
+/// From the card ([`EntraOpener::Browser`]), `card_answer` is the box the
+/// user ticked or cleared just now, and it decides, whatever an earlier
+/// sign-in was told. A silent sign-in showed no card, so there is no fresh
+/// answer: the one given when the user signed in stands, which is where the
+/// redeemed token was kept ([`redeemed_refresh_remembered`]). Mixed up either
+/// way, a cleared box stores a sign-in the user declined, or a remembered one
+/// is deleted at its next renewal.
+fn sign_in_remembered(
+    opener: EntraOpener,
+    card_answer: bool,
+    source: Option<RefreshSource>,
+) -> bool {
+    match opener {
+        EntraOpener::Browser => card_answer,
+        EntraOpener::Silent => redeemed_refresh_remembered(source),
+    }
+}
+
+impl EntraOpener {
+    fn open(self) -> fn(&str) -> Result<(), azure::AzureError> {
+        match self {
+            EntraOpener::Silent => refuse_browser,
+            EntraOpener::Browser => open_browser,
+        }
+    }
+}
+
+/// Where a server connect's credential comes from — the one thing the
+/// connect flows differ in. [`AppState::connect_with`] runs the part they
+/// share (the reservation, the tunnel, the TLS host) once, and then the
+/// credential's own branch.
+///
+/// Each variant carries the user's "remember" answer, if there is one, in the
+/// form its branch acts on — so the answer cannot be read off a different
+/// variant's field by mistake.
+pub(super) enum CredentialSource {
+    /// A saved password connection's own: session memory, then the keyring,
+    /// then nothing (a trust-auth server connects; a refusal raises the
+    /// password prompt). Nobody has been asked anything, so there is no answer.
+    Remembered,
+    /// A password just supplied — by the prompt, the form, or the command
+    /// line — and the answer to "remember": `None` when nobody was asked, as
+    /// for a command-line password ([`stored_password_after_connect`]).
+    Typed {
+        password: String,
+        remember: Option<bool>,
+    },
+    /// An Entra sign-in. `card` is the sign-in card this connect parks or
+    /// completes, and its `remember` the answer: given on the card for a
+    /// [`EntraOpener::Browser`] sign-in, decided from where the token was
+    /// kept for a [`EntraOpener::Silent`] one.
+    Entra {
+        card: EntraPrompt,
+        opener: EntraOpener,
+    },
+}
+
+impl CredentialSource {
+    /// The auth mode a connect with this credential opens its tunnel for and
+    /// saves.
+    fn auth(&self) -> ServerAuth {
+        match self {
+            CredentialSource::Remembered | CredentialSource::Typed { .. } => ServerAuth::Password,
+            CredentialSource::Entra { card, .. } => ServerAuth::Entra(card.entra.clone()),
+        }
+    }
+}
+
+/// A server connect past the part every credential shares
+/// ([`AppState::connect_with`]): the reserved locator and what it is saved
+/// as, and the tunnel and TLS host the credential's branch connects through.
+struct ServerConnect {
+    backend: ServerBackend,
+    url: String,
+    name: String,
+    tunnel: Option<TunnelConfig>,
+    connect_url: String,
+    tls_host: Option<String>,
+    live_tunnel: Option<Tunnel>,
+}
+
 /// The opener a *silent* acquisition passes: it refuses to open a browser, so
 /// an interactive sign-in with no usable refresh token errors here and the
 /// flow can park the sign-in card instead of popping a window unasked.
@@ -156,19 +251,105 @@ impl AppState {
     /// back to a password prompt on authentication failure (so trust-auth
     /// servers connect silently).
     pub async fn connect_server(
-        mut self,
+        self,
         backend: ServerBackend,
         url: String,
         name: String,
         tunnel: Option<TunnelConfig>,
         auth: ServerAuth,
     ) {
+        let source = match auth {
+            ServerAuth::Password => CredentialSource::Remembered,
+            ServerAuth::Entra(entra) => CredentialSource::Entra {
+                card: EntraPrompt {
+                    url: url.clone(),
+                    name: name.clone(),
+                    tunnel: tunnel.clone(),
+                    entra,
+                    backend: backend.kind,
+                    // Decided by the silent attempt, either way it goes.
+                    remember: true,
+                    // Likewise: the attempt finds out where its token was.
+                    stored: StoredCopy::Unknown,
+                },
+                opener: EntraOpener::Silent,
+            },
+        };
+        self.connect_with(backend, url, name, tunnel, source).await;
+    }
+
+    /// Completes the password prompt: connects with the entered password
+    /// (through the tunnel when one is configured). On success the password
+    /// always lives in session memory, and [`stored_password_after_connect`]
+    /// decides the keyring: stored when `remember` is ticked (silently staying
+    /// session-only when no keyring is available), a different stored one
+    /// deleted when it is not, and nothing touched when nobody was asked.
+    pub async fn connect_server_with_password(
+        self,
+        backend: ServerBackend,
+        url: String,
+        name: String,
+        password: String,
+        remember: Option<bool>,
+        tunnel: Option<TunnelConfig>,
+    ) {
+        let source = CredentialSource::Typed { password, remember };
+        self.connect_with(backend, url, name, tunnel, source).await;
+    }
+
+    /// Resumes an interactive Entra connect from the sign-in card: opens the
+    /// browser, waits for the redirect, and connects with the acquired token.
+    pub async fn connect_server_with_entra_signin(
+        self,
+        backend: ServerBackend,
+        prompt: EntraPrompt,
+    ) {
+        let (url, name, tunnel) = (
+            prompt.url.clone(),
+            prompt.name.clone(),
+            prompt.tunnel.clone(),
+        );
+        let source = CredentialSource::Entra {
+            card: prompt,
+            opener: EntraOpener::Browser,
+        };
+        self.connect_with(backend, url, name, tunnel, source).await;
+    }
+
+    /// The one server connect: what every credential shares — the
+    /// reservation, the tunnel, the TLS host — and then the credential's own
+    /// branch ([`CredentialSource`]).
+    ///
+    /// A connect whose locator is already open (or reserved) runs nothing, so
+    /// the save at its end never fires; an edit still has to land, so it saves
+    /// here — `save_server_if_open` no-ops unless the locator is genuinely
+    /// open. The sign-in card does not: it completes a connect that has
+    /// already been through this once.
+    async fn connect_with(
+        mut self,
+        backend: ServerBackend,
+        url: String,
+        name: String,
+        tunnel: Option<TunnelConfig>,
+        source: CredentialSource,
+    ) {
         self.connect_error.set(None);
+        let browser_sign_in = matches!(
+            source,
+            CredentialSource::Entra {
+                opener: EntraOpener::Browser,
+                ..
+            }
+        );
+        if browser_sign_in {
+            // The card is being answered.
+            self.entra_prompt.set(None);
+        }
+        let auth = source.auth();
         if self.focus_or_reserve(&url) {
-            // Already open (or reserved): no connect runs, so the save below
-            // never fires. An edit still has to land — save_server_if_open
-            // no-ops unless the locator is genuinely open.
-            self.save_server_if_open(backend, &url, &name, tunnel.clone(), auth.clone());
+            if !browser_sign_in {
+                self.save_server_if_open(backend, &url, &name, tunnel, auth);
+            }
             return;
         }
         let Some((connect_url, live_tunnel)) =
@@ -177,25 +358,39 @@ impl AppState {
             return; // failure already surfaced (error or passphrase/host-key prompt)
         };
         let tls_host = backend.tls_host(&url, tunnel.is_some());
-        match auth {
-            ServerAuth::Entra(entra) => {
-                let pending = EntraPrompt {
-                    url,
-                    name,
-                    tunnel,
-                    entra,
-                    backend: backend.kind,
-                    // Decided by the silent attempt below, either way it goes.
-                    remember: true,
-                    // Likewise: the attempt finds out where its token was.
-                    stored: StoredCopy::Unknown,
-                };
-                self.connect_server_entra(backend, pending, connect_url, tls_host, live_tunnel)
-                    .await;
-                return;
+        let connect = ServerConnect {
+            backend,
+            url,
+            name,
+            tunnel,
+            connect_url,
+            tls_host,
+            live_tunnel,
+        };
+        match source {
+            CredentialSource::Remembered => self.connect_remembered_password(connect).await,
+            CredentialSource::Typed { password, remember } => {
+                self.connect_typed_password(connect, password, remember)
+                    .await
             }
-            ServerAuth::Password => {}
+            CredentialSource::Entra { card, opener } => {
+                self.connect_entra(connect, card, opener).await
+            }
         }
+    }
+
+    /// The password branch of [`Self::connect_with`] for a saved connection:
+    /// the remembered password, or none, and the prompt on a refusal.
+    async fn connect_remembered_password(mut self, connect: ServerConnect) {
+        let ServerConnect {
+            backend,
+            url,
+            name,
+            tunnel,
+            connect_url,
+            tls_host,
+            live_tunnel,
+        } = connect;
         // Session memory first, then the OS keyring. The keyring call runs
         // off-thread (a locked wallet can block on a user dialog) and only
         // after the session read guard is dropped; errors mean "no keyring"
@@ -475,34 +670,44 @@ impl AppState {
         });
     }
 
-    /// The Entra branch of the connect: try to acquire a token silently — a
-    /// managed identity always can; interactive only via a cached refresh token
-    /// (the browser opener errors, so a missing/expired refresh falls through to
-    /// the sign-in card rather than opening a window here). The tunnel is
-    /// already open; on a silent success we connect, otherwise park the sign-in.
-    async fn connect_server_entra(
+    /// The Entra branch of [`Self::connect_with`]: acquire a token through
+    /// `opener`, then connect with it.
+    ///
+    /// A [`EntraOpener::Silent`] sign-in — a managed identity always can;
+    /// interactive only through a kept refresh token — parks the sign-in card
+    /// when an interactive one needs the browser after all. A
+    /// [`EntraOpener::Browser`] sign-in comes from that card, and re-raises it
+    /// when the sign-in fails, so the user can retry in place.
+    async fn connect_entra(
         mut self,
-        backend: ServerBackend,
-        mut pending: EntraPrompt,
-        connect_url: String,
-        tls_host: Option<String>,
-        live_tunnel: Option<Tunnel>,
+        connect: ServerConnect,
+        mut card: EntraPrompt,
+        opener: EntraOpener,
     ) {
-        self.set_step(&pending.url, ConnectStep::SigningIn);
+        let ServerConnect {
+            backend,
+            connect_url,
+            tls_host,
+            live_tunnel,
+            ..
+        } = connect;
+        if opener == EntraOpener::Silent {
+            self.set_step(&card.url, ConnectStep::SigningIn);
+        }
         let (token, source, stored) = self
             .acquire_entra(
-                &pending.entra,
+                &card.entra,
                 backend.entra_resource,
-                &pending.url,
-                refuse_browser,
+                &card.url,
+                opener.open(),
             )
             .await;
         match token {
             Ok(token) => {
-                pending.remember = redeemed_refresh_remembered(source);
+                card.remember = sign_in_remembered(opener, card.remember, source);
                 self.finish_entra_connect(
                     backend,
-                    pending,
+                    card,
                     &connect_url,
                     tls_host,
                     token,
@@ -510,18 +715,30 @@ impl AppState {
                 )
                 .await;
             }
-            // Interactive with no usable refresh token: park behind the sign-in
-            // card. Drop the tunnel; the sign-in retry re-opens it.
-            Err(_) if matches!(pending.entra, EntraAuth::Interactive { .. }) => {
-                self.release_connect(&pending.url);
+            // Silent and interactive with no usable refresh token: park behind
+            // the sign-in card. Drop the tunnel; the sign-in retry re-opens it.
+            Err(_)
+                if opener == EntraOpener::Silent
+                    && matches!(card.entra, EntraAuth::Interactive { .. }) =>
+            {
+                self.release_connect(&card.url);
                 drop(live_tunnel);
-                pending.remember = card_offers_remember(source);
-                pending.stored = stored;
-                self.entra_prompt.set(Some(pending));
+                card.remember = card_offers_remember(source);
+                card.stored = stored;
+                self.entra_prompt.set(Some(card));
             }
             Err(err) => {
                 drop(live_tunnel);
-                self.fail_connect(&pending.url, err.to_string());
+                self.fail_connect(&card.url, err.to_string());
+                if opener == EntraOpener::Browser {
+                    // Re-raise the card so the user can retry the sign-in in
+                    // place. It carries the answer they gave, so a failed
+                    // sign-in does not re-tick a box they cleared — and what
+                    // this attempt learned about a remembered sign-in, which
+                    // it may have just deleted as refused.
+                    card.stored = stored;
+                    self.entra_prompt.set(Some(card));
+                }
             }
         }
     }
@@ -580,99 +797,23 @@ impl AppState {
         }
     }
 
-    /// Resumes an interactive Entra connect from the sign-in card: opens the
-    /// browser, waits for the redirect, and connects with the acquired token.
-    pub async fn connect_server_with_entra_signin(
+    /// The branch of [`Self::connect_with`] for a password just supplied
+    /// ([`CredentialSource::Typed`]).
+    async fn connect_typed_password(
         mut self,
-        backend: ServerBackend,
-        mut prompt: EntraPrompt,
-    ) {
-        self.connect_error.set(None);
-        self.entra_prompt.set(None);
-        if self.focus_or_reserve(&prompt.url) {
-            return;
-        }
-        let Some((connect_url, live_tunnel)) = self
-            .open_tunnel(
-                &prompt.url,
-                &prompt.name,
-                &prompt.tunnel,
-                &ServerAuth::Entra(prompt.entra.clone()),
-                backend,
-            )
-            .await
-        else {
-            return;
-        };
-        let tls_host = backend.tls_host(&prompt.url, prompt.tunnel.is_some());
-        let (token, _, stored) = self
-            .acquire_entra(
-                &prompt.entra,
-                backend.entra_resource,
-                &prompt.url,
-                open_browser,
-            )
-            .await;
-        match token {
-            Ok(token) => {
-                // `prompt.remember` is the card's answer, given just now: it
-                // decides, whatever an earlier sign-in was told.
-                self.finish_entra_connect(
-                    backend,
-                    prompt,
-                    &connect_url,
-                    tls_host,
-                    token,
-                    live_tunnel,
-                )
-                .await;
-            }
-            Err(err) => {
-                drop(live_tunnel);
-                self.fail_connect(&prompt.url, err.to_string());
-                // Re-raise the card so the user can retry the sign-in in
-                // place. It carries the answer they gave, so a failed sign-in
-                // does not re-tick a box they cleared — and what this attempt
-                // learned about a remembered sign-in, which it may have just
-                // deleted as refused.
-                prompt.stored = stored;
-                self.entra_prompt.set(Some(prompt));
-            }
-        }
-    }
-
-    /// Completes the password prompt: connects with the entered password
-    /// (through the tunnel when one is configured). On success the password
-    /// always lives in session memory, and [`stored_password_after_connect`]
-    /// decides the keyring: stored when `remember` is ticked (silently staying
-    /// session-only when no keyring is available), a different stored one
-    /// deleted when it is not, and nothing touched when nobody was asked.
-    pub async fn connect_server_with_password(
-        mut self,
-        backend: ServerBackend,
-        url: String,
-        name: String,
+        connect: ServerConnect,
         password: String,
         remember: Option<bool>,
-        tunnel: Option<TunnelConfig>,
     ) {
-        self.connect_error.set(None);
-        // The prompt replaces the reservation made by connect_server, so
-        // re-reserve here.
-        if self.focus_or_reserve(&url) {
-            // Already open (or reserved): no connect runs, so the save
-            // below never fires. An edit still has to land —
-            // save_server_if_open no-ops unless the locator is genuinely open.
-            self.save_server_if_open(backend, &url, &name, tunnel.clone(), ServerAuth::Password);
-            return;
-        }
-        let Some((connect_url, live_tunnel)) = self
-            .open_tunnel(&url, &name, &tunnel, &ServerAuth::Password, backend)
-            .await
-        else {
-            return;
-        };
-        let tls_host = backend.tls_host(&url, tunnel.is_some());
+        let ServerConnect {
+            backend,
+            url,
+            name,
+            tunnel,
+            connect_url,
+            tls_host,
+            live_tunnel,
+        } = connect;
         let result = backend
             .open(
                 &connect_url,
@@ -1641,6 +1782,41 @@ mod tests {
     }
 
     #[test]
+    fn a_sign_in_keeps_its_token_by_the_answer_its_opener_has() {
+        // From the card, the box decides, whatever the token's history: a
+        // cleared box after a remembered sign-in deletes it, a ticked one
+        // after a session-only one stores it.
+        for source in [
+            None,
+            Some(RefreshSource::Session),
+            Some(RefreshSource::Keyring),
+        ] {
+            for answer in [false, true] {
+                assert_eq!(
+                    sign_in_remembered(EntraOpener::Browser, answer, source),
+                    answer,
+                    "the card's answer {answer} is overridden after {source:?}"
+                );
+            }
+        }
+        // Silently, there is no fresh answer: where the redeemed token was
+        // kept stands, whatever the placeholder the saved connect built.
+        for answer in [false, true] {
+            assert!(sign_in_remembered(
+                EntraOpener::Silent,
+                answer,
+                Some(RefreshSource::Keyring)
+            ));
+            assert!(!sign_in_remembered(
+                EntraOpener::Silent,
+                answer,
+                Some(RefreshSource::Session)
+            ));
+            assert!(!sign_in_remembered(EntraOpener::Silent, answer, None));
+        }
+    }
+
+    #[test]
     fn the_remember_answer_is_not_inverted_at_any_hop_of_its_wire() {
         // One `!` anywhere on this wire inverts a decision about a secret
         // while moving no call, leaving every gate, label and ordering
@@ -1703,6 +1879,14 @@ mod tests {
                 "the password connect",
                 method_body(source, "pub async fn connect_server_with_password("),
             ),
+            (
+                "connect_with",
+                method_body(source, "async fn connect_with("),
+            ),
+            (
+                "the typed-password branch",
+                method_body(source, "async fn connect_typed_password("),
+            ),
             ("open_tunnel", open_tunnel_body()),
             ("update_saved", method_body(source, "pub fn update_saved(")),
             (
@@ -1717,6 +1901,41 @@ mod tests {
                 None,
                 "a verdict about a secret is negated in {hop}, which inverts \
                  the decision without moving a call: {code}"
+            );
+        }
+
+        // The database password's answer travels as written from the
+        // prompt's or form's call into `CredentialSource::Typed`, through
+        // `connect_with`'s dispatch, to the decision; a saved connect has no
+        // answer to carry.
+        for (signature, binding) in [
+            (
+                "pub async fn connect_server_with_password(",
+                "let source = CredentialSource::Typed { password, remember };",
+            ),
+            (
+                "async fn connect_with(",
+                "CredentialSource::Typed { password, remember } => { \
+                 self.connect_typed_password(connect, password, remember) .await }",
+            ),
+            (
+                "async fn connect_with(",
+                "CredentialSource::Remembered => self.connect_remembered_password(connect).await,",
+            ),
+            (
+                "pub async fn connect_server(",
+                "ServerAuth::Password => CredentialSource::Remembered,",
+            ),
+            (
+                "async fn connect_typed_password(",
+                "match stored_password_after_connect(remember, in_keyring.as_deref(), &password) {",
+            ),
+        ] {
+            let body = collapsed(&code_of(&method_body(source, signature)));
+            assert!(
+                body.contains(binding),
+                "`{binding}` is gone, so the password's answer reaches the keyring \
+                 rewritten, or from somewhere else: {body}"
             );
         }
 
@@ -1949,11 +2168,14 @@ mod tests {
     fn the_entra_remember_answer_is_not_inverted_at_any_hop_of_its_wire() {
         // The refresh token is functionally a password, and reaches the
         // keyring on the same kind of answer. The wire, in order: the card's
-        // checkbox → its sign-in → `connect_server_with_entra_signin` →
-        // `finish_entra_connect` → `keep_entra_refresh` → `place_entra_refresh`
-        // → the keyring write or delete. A silent sign-in joins at
-        // `connect_server_entra`, whose answer is where the redeemed token was
-        // kept; `acquire_entra` and the restore gate read that, and the former
+        // checkbox → its sign-in → `connect_server_with_entra_signin`, which
+        // hands the card over as `CredentialSource::Entra` with the browser
+        // opener → `connect_with`, which dispatches it untouched →
+        // `connect_entra` → `finish_entra_connect` → `keep_entra_refresh` →
+        // `place_entra_refresh` → the keyring write or delete. A silent
+        // sign-in joins at `connect_server`, with the silent opener, and its
+        // answer is where the redeemed token was kept (`sign_in_remembered`);
+        // `acquire_entra` and the restore gate read that, and the former
         // forgets a refused token. A `!` anywhere on it inverts a decision
         // about a credential while moving no call — see
         // `the_remember_answer_is_not_inverted_at_any_hop_of_its_wire` for
@@ -1973,6 +2195,7 @@ mod tests {
             "refresh_rejected",
             "redeemed_refresh_remembered",
             "card_offers_remember",
+            "sign_in_remembered",
             "has_refresh",
         ];
         let source = &connect_code();
@@ -1981,7 +2204,9 @@ mod tests {
             "fn EntraSignInCard(",
         );
         let signin = method_body(source, "pub async fn connect_server_with_entra_signin(");
-        let silent = method_body(source, "async fn connect_server_entra(");
+        let saved = method_body(source, "pub async fn connect_server(");
+        let dispatch = method_body(source, "async fn connect_with(");
+        let entra = method_body(source, "async fn connect_entra(");
         let finish = method_body(source, "async fn finish_entra_connect(");
         let acquire = method_body(source, "async fn acquire_entra(");
         let keep = method_body(source, "async fn keep_entra_refresh(");
@@ -1995,7 +2220,9 @@ mod tests {
         let hops = [
             ("the card", &card),
             ("the sign-in", &signin),
-            ("the silent connect", &silent),
+            ("the saved connect", &saved),
+            ("connect_with", &dispatch),
+            ("connect_entra", &entra),
             ("finish_entra_connect", &finish),
             ("acquire_entra", &acquire),
             ("keep_entra_refresh", &keep),
@@ -2041,36 +2268,71 @@ mod tests {
                  other than the user or its policy: {body}"
             );
         }
-        // A failed sign-in re-raises the card with the answer it was given;
-        // rewriting it on the way re-ticks a box the user cleared.
-        assert!(
-            !collapsed(&code_of(&signin)).contains("prompt.remember ="),
-            "the sign-in rewrites the card's answer: {signin}"
+        // The card travels to `connect_entra` as given: the sign-in hands it
+        // over with the browser opener, a saved connect builds its own with
+        // the silent one, and `connect_with` passes either on untouched.
+        let handed = [
+            (
+                &signin,
+                "let source = CredentialSource::Entra { card: prompt, opener: EntraOpener::Browser, };",
+            ),
+            (&saved, "opener: EntraOpener::Silent,"),
+            (
+                &dispatch,
+                "CredentialSource::Entra { card, opener } => { self.connect_entra(connect, card, opener).await }",
+            ),
+        ];
+        for (body, binding) in handed {
+            assert!(
+                collapsed(&code_of(body)).contains(binding),
+                "`{binding}` is gone: the card reaches the sign-in by some other \
+                 route, or with the other opener: {body}"
+            );
+        }
+        for (hop, body) in [("the sign-in", &signin), ("connect_with", &dispatch)] {
+            assert!(
+                !collapsed(&code_of(body)).contains(".remember ="),
+                "{hop} rewrites the card's answer on its way: {body}"
+            );
+        }
+        // `connect_entra` sets the answer twice, each from its policy: what a
+        // sign-in that succeeded keeps (`sign_in_remembered`, which leaves the
+        // card's own answer standing for a browser sign-in), and what the card
+        // parked after a failed silent attempt offers. A failed browser
+        // sign-in re-raises the card with the answer it was given; rewriting
+        // it there re-ticks a box the user cleared.
+        let entra_code = collapsed(&code_of(&entra));
+        assert_eq!(
+            entra_code.matches("card.remember =").count(),
+            2,
+            "connect_entra sets the card's answer somewhere new: {entra_code}"
         );
-        // The answer travels in the prompt. The silent connect sets it in
-        // each arm from its own policy — what to keep on success, what to
-        // offer on failure — and `finish_entra_connect` takes it out as
-        // written, a line at a time for CRLF checkouts.
-        let succeeded = collapsed(&code_of(&method_body(&silent, "Ok(token) => {")));
+        let succeeded = collapsed(&code_of(&method_body(&entra, "Ok(token) => {")));
         assert!(
-            succeeded.contains("pending.remember = redeemed_refresh_remembered(source);"),
-            "a silent sign-in keeps its token somewhere other than where the \
-             user put it: {succeeded}"
+            succeeded
+                .contains("card.remember = sign_in_remembered(opener, card.remember, source);"),
+            "a sign-in keeps its token somewhere other than where the user put \
+             it: {succeeded}"
         );
         // Sliced by hand: the arm's pattern has braces of its own.
-        let parked_from = silent
+        let parked_from = entra
             .find("EntraAuth::Interactive { .. }) =>")
             .expect("the silent connect still parks interactive sign-ins");
         let parked_to = parked_from
-            + silent[parked_from..]
+            + entra[parked_from..]
                 .find("Err(err) =>")
                 .expect("the parking arm is followed by the failure arm");
-        let parked = collapsed(&code_of(&silent[parked_from..parked_to]));
+        let parked = collapsed(&code_of(&entra[parked_from..parked_to]));
         assert!(
-            parked.contains("pending.remember = card_offers_remember(source);"),
+            parked.contains("card.remember = card_offers_remember(source);"),
             "the card parked after a failed silent attempt offers something \
              other than its policy — a ticked box after a \"don't remember\" \
              this run turns a transient error into a keyring write: {parked}"
+        );
+        assert!(
+            entra_code.contains("Err(_) if opener == EntraOpener::Silent && matches!(card.entra, EntraAuth::Interactive { .. }) =>"),
+            "the card is parked after something other than a failed silent \
+             interactive attempt: {entra_code}"
         );
         assert!(
             finish.lines().any(|line| line.trim() == "remember,"),
@@ -2236,9 +2498,15 @@ mod tests {
         // database-password prompt has no policy behind it at all — nothing
         // parks that choice — so its default is a literal, and a literal can
         // be flipped without moving a call or failing any policy test.
-        let body = method_body(&connect_code(), "pub async fn connect_server(");
+        // Read off the prompt it raises, not the whole connect: the Entra
+        // card a saved connect builds carries a `remember: true` of its own.
+        let body = collapsed(&code_of(&method_body(
+            &connect_code(),
+            "async fn connect_remembered_password(",
+        )));
         assert!(
-            body.contains("remember: true"),
+            body.contains("kind: PromptKind::DbPassword,")
+                && body.contains("auth: ServerAuth::Password, remember: true, stored, }));"),
             "the password prompt no longer offers to remember by default, so \
              every saved connection quietly starts re-asking: {body}"
         );
@@ -2667,7 +2935,7 @@ mod tests {
         //    are both `url`, which nothing in the method rebinds: read under
         //    another key (the SSH passphrase's, say) and a refusal of that
         //    secret would forget the database password.
-        let connect = method_body(&source, "pub async fn connect_server(");
+        let connect = method_body(&source, "async fn connect_remembered_password(");
         let mut from = 0;
         for step in [
             "let mut session_password = self.session_passwords.read().get(&url).cloned();",
@@ -2790,7 +3058,7 @@ mod tests {
         //     and the password that connected — each as written, in order, and
         //     inside the success gate. The decision itself is executed by
         //     `a_stored_password_survives_until_a_different_one_connects`.
-        let with_password = method_body(&source, "pub async fn connect_server_with_password(");
+        let with_password = method_body(&source, "async fn connect_typed_password(");
         let success = method_body(&with_password, "if result.is_ok() {");
         let mut from = 0;
         for step in [
@@ -2962,13 +3230,14 @@ mod tests {
             ),
             ("async fn acquire_entra(", "(signed_in, source, stored)"),
             (
-                "async fn connect_server_entra(",
-                "pending.remember = card_offers_remember(source); pending.stored = stored; \
-                 self.entra_prompt.set(Some(pending));",
+                "async fn connect_entra(",
+                "card.remember = card_offers_remember(source); card.stored = stored; \
+                 self.entra_prompt.set(Some(card));",
             ),
             (
-                "pub async fn connect_server_with_entra_signin(",
-                "prompt.stored = stored; self.entra_prompt.set(Some(prompt));",
+                "async fn connect_entra(",
+                "if opener == EntraOpener::Browser { card.stored = stored; \
+                 self.entra_prompt.set(Some(card)); }",
             ),
         ] {
             let body = collapsed(&code_only(&method_body(source, signature)));
@@ -2996,7 +3265,7 @@ mod tests {
             ("secrets.rs", "delete_in", 1, API),
             (
                 "ui/state/connect.rs",
-                "connect_server_with_password",
+                "connect_typed_password",
                 1,
                 "user-answered: `StoredPassword::Delete`, an unticked box once a different \
                  password connects. Warned by `remember_hint` on the password prompt and \
