@@ -1292,7 +1292,11 @@ async fn sqlite_a_batch_split_into_statements_counts_every_row_it_undid() {
     )
     .await
     .unwrap_err();
-    assert!(err.message.contains("UNIQUE"), "{}", err.message);
+    // The server's refusal of the third row, by hubro's half of the report:
+    // a statement that failed (not a value hubro could not coerce, which
+    // would name its line). SQLite's own words follow the prefix.
+    assert_eq!(err.line, None, "{err:?}");
+    assert!(err.message.starts_with("query failed: "), "{}", err.message);
     assert_eq!(err.undone_rows, 2);
     assert_eq!(
         pool.count_table_rows(Reading::UNMARKED, table)
