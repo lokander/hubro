@@ -2899,27 +2899,10 @@ mod tests {
         // The slice must actually contain the fields, or the assertion above
         // passes by matching nothing at all — every one of them, counted off
         // the struct definition, so a field built anywhere else is noticed.
-        let fields = source
-            .lines()
-            .skip_while(|line| *line != "pub struct AppState {")
-            .skip(1)
-            .take_while(|line| *line != "}")
-            .filter(|line| {
-                // Top-level `name: Type` lines only: not doc comments, not the
-                // continuation lines of a wrapped type.
-                let Some(line) = line.strip_prefix("    ") else {
-                    return false;
-                };
-                let line = line.strip_prefix("pub ").unwrap_or(line);
-                line.split_once(':').is_some_and(|(name, _)| {
-                    !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_')
-                })
-            })
-            .count();
-        assert!(
-            fields > 40,
-            "the AppState definition was not found: {fields} fields"
-        );
+        // Read by the field scan `tabs` uses, which takes every field shape
+        // — a digit in the name, a `pub(crate)` — and refuses a line it
+        // cannot read rather than skipping it.
+        let fields = super::tabs::tests::all_fields().len();
         assert_eq!(
             ctor.matches("Signal::new_in_scope(").count(),
             fields,
