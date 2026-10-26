@@ -2018,6 +2018,58 @@ enum ColumnQuery {
     Portable,
 }
 
+/// Where the column query reads primary-key positions from — see
+/// [`pk_source`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PkSource {
+    /// `information_schema.table_constraints` joined to `key_column_usage`:
+    /// the standard's own answer, and what every engine but RisingWave is
+    /// asked.
+    InformationSchema,
+    /// `pg_constraint.conkey`, one row per key column in key order, joined to
+    /// `pg_attribute` for its name.
+    PgConstraint,
+}
+
+/// Which catalog the column query asks for primary-key positions on `flavor`.
+///
+/// **RisingWave is asked `pg_constraint`, because its `information_schema`
+/// cannot be read while a table is being dropped.** Its `table_constraints`
+/// and `key_column_usage` views filter tables through
+/// `has_table_privilege(conrelid, …)`, and that call *raises* — `XX000`,
+/// "Invalid parameter oid: Table N not found" — for a table dropped after the
+/// view's join found it. One such row fails the whole statement, and with it
+/// introspection. Measured on RisingWave 3.1 with one session creating and
+/// dropping a keyed table in a loop: 19 of 300 reads of `table_constraints`
+/// failed, 22 of 300 of `key_column_usage`, and 0 of 500 of the
+/// `pg_constraint` form; `information_schema.columns` and `tables` do not call
+/// it and never failed. So a user browsing a RisingWave database while anyone
+/// drops a table could lose the schema tree, and the test suite, whose tests
+/// drop their fixtures while others introspect, failed now and then.
+/// PostgreSQL itself is untouched by this: its `has_table_privilege` answers
+/// NULL for an oid that has gone, and 3,000 reads of `table_constraints`
+/// against 3,000 create/drop pairs failed none.
+///
+/// Measured on the same server, the `pg_constraint` form is also the right
+/// answer where the views' is not: RisingWave's `key_column_usage` reports a
+/// key column's *table* position as its `ordinal_position`, so a key declared
+/// `PRIMARY KEY (c, a)` over columns `(a, b, c)` came back `a` = 1, `c` = 3,
+/// where `conkey` says `c` first, then `a`.
+///
+/// By flavor, because no catalog fact says a view raises: the flavor picks
+/// which catalog to ask, and the answer still comes from the catalog. Only
+/// RisingWave: the other engines answer the views without raising, and moving
+/// them would change what they report — the standard views show a key only on
+/// a table the user holds a privilege on — for no failure seen.
+fn pk_source(flavor: PgFlavor) -> PkSource {
+    match flavor {
+        PgFlavor::RisingWave => PkSource::PgConstraint,
+        PgFlavor::Postgres | PgFlavor::CockroachDB | PgFlavor::Yugabyte | PgFlavor::Materialize => {
+            PkSource::InformationSchema
+        }
+    }
+}
+
 /// Columns for every relation, with primary-key positions resolved in SQL.
 ///
 /// Identity and generated columns carry a NULL `column_default` even though
@@ -2038,7 +2090,7 @@ enum ColumnQuery {
 /// wire type, so the mismatch failed the *whole* introspection. Pinning the
 /// width costs nothing on Postgres and makes the decode independent of what any
 /// engine chose.
-fn column_query(shape: ColumnQuery) -> String {
+fn column_query(shape: ColumnQuery, pk: PkSource) -> String {
     // The three spans that differ. The portable shape must select the same
     // column names in the same order, so only the expressions change.
     let (generated, type_detail, type_join) = match shape {
@@ -2058,6 +2110,30 @@ fn column_query(shape: ColumnQuery) -> String {
             "",
         ),
     };
+    // The key columns as (table_schema, table_name, column_name,
+    // ordinal_position), the position being the column's place in the key.
+    let keys = match pk {
+        PkSource::InformationSchema => {
+            "SELECT kcu.table_schema, kcu.table_name, kcu.column_name, kcu.ordinal_position \
+             FROM information_schema.table_constraints tc \
+             JOIN information_schema.key_column_usage kcu \
+               ON kcu.constraint_name = tc.constraint_name \
+              AND kcu.constraint_schema = tc.constraint_schema \
+              AND kcu.table_schema = tc.table_schema \
+              AND kcu.table_name = tc.table_name \
+             WHERE tc.constraint_type = 'PRIMARY KEY'"
+        }
+        PkSource::PgConstraint => {
+            "SELECT n.nspname AS table_schema, t.relname AS table_name, \
+                    a.attname AS column_name, k.ord AS ordinal_position \
+             FROM pg_constraint con \
+             JOIN pg_class t ON t.oid = con.conrelid \
+             JOIN pg_namespace n ON n.oid = t.relnamespace \
+             CROSS JOIN unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) \
+             JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
+             WHERE con.contype = 'p'"
+        }
+    };
     format!(
         "SELECT c.table_schema, c.table_name, c.column_name, c.data_type, \
                 c.is_nullable, c.column_default, \
@@ -2067,16 +2143,7 @@ fn column_query(shape: ColumnQuery) -> String {
                 {type_detail} \
          FROM information_schema.columns c \
          {type_join} \
-         LEFT JOIN ( \
-             SELECT kcu.table_schema, kcu.table_name, kcu.column_name, kcu.ordinal_position \
-             FROM information_schema.table_constraints tc \
-             JOIN information_schema.key_column_usage kcu \
-               ON kcu.constraint_name = tc.constraint_name \
-              AND kcu.constraint_schema = tc.constraint_schema \
-              AND kcu.table_schema = tc.table_schema \
-              AND kcu.table_name = tc.table_name \
-             WHERE tc.constraint_type = 'PRIMARY KEY' \
-         ) pk ON pk.table_schema = c.table_schema \
+         LEFT JOIN ( {keys} ) pk ON pk.table_schema = c.table_schema \
              AND pk.table_name = c.table_name \
              AND pk.column_name = c.column_name \
          WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema') \
@@ -2187,7 +2254,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     // Asked once, before anything depends on the answer.
     let shape = catalog_shape(pool).await;
 
-    let column_rows = sqlx::query(&column_query(shape.column_query))
+    let column_rows = sqlx::query(&column_query(shape.column_query, pk_source(conn.flavor())))
         .fetch_all(pool)
         .await
         .map_err(catalog_error)?;
