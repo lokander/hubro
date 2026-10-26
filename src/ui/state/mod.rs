@@ -1087,6 +1087,11 @@ pub struct AppState {
     /// A neutral outcome to report on the connections screen — that a
     /// sign-out went through. Errors go in [`Self::connect_error`].
     pub connect_notice: Signal<Option<String>>,
+    /// Per locator, the Entra sign-outs this run: whether one's keyring
+    /// deletion is still running, and how many there have been, which a
+    /// connect under way compares before keeping a token
+    /// ([`connect::EntraSignOut`]).
+    pub entra_sign_outs: Signal<HashMap<String, connect::EntraSignOut>>,
     /// Secrets entered this session: Postgres passwords keyed by stored URL,
     /// SSH key passphrases keyed by [`connect::ssh_secret_key`]. Never
     /// persisted here — the OS keyring handles "remember".
@@ -1475,6 +1480,7 @@ impl AppState {
             connect_requests: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             connect_error: Signal::new_in_scope(load_error, ScopeId::ROOT),
             connect_notice: Signal::new_in_scope(None, ScopeId::ROOT),
+            entra_sign_outs: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             session_passwords: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             password_prompt: Signal::new_in_scope(None, ScopeId::ROOT),
             host_key_prompt: Signal::new_in_scope(None, ScopeId::ROOT),

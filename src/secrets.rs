@@ -51,6 +51,12 @@ fn disabled() -> bool {
     std::env::var_os("HUBRO_DISABLE_KEYRING").is_some_and(|v| v == "1")
 }
 
+/// Whether the keyring is switched off ([`disabled`]), so every call fails
+/// by design rather than because a real keyring is locked or broken.
+pub fn keyring_disabled() -> bool {
+    disabled()
+}
+
 /// Entries are cached per URL. Real backends don't need this, but the
 /// `mock` backend used in tests ([`new_entry`]) stores state inside the Entry
 /// instance, so repeated lookups must reuse the same one.
