@@ -308,15 +308,18 @@ async fn materialize_refuses_keys_so_no_table_is_editable() {
 
     // Browsing is untouched, which is the half that has to keep working.
     let page = pool
-        .fetch_page(&PageRequest {
-            schema: Some("public".into()),
-            table: readings.clone(),
-            limit: 3,
-            offset: 0,
-            sort: Some(("id".into(), SortDir::Asc)),
-            filter: None,
-            extra_key_column: None,
-        })
+        .fetch_page(
+            Capabilities::FULL,
+            &PageRequest {
+                schema: Some("public".into()),
+                table: readings.clone(),
+                limit: 3,
+                offset: 0,
+                sort: Some(("id".into(), SortDir::Asc)),
+                filter: None,
+                extra_key_column: None,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(page.rows.len(), 3);
@@ -395,8 +398,11 @@ async fn materialize_views_and_matviews_browse_but_refuse_writes() {
         filter: Some(Filter::equals("sensor_id", "2")),
         extra_key_column: None,
     };
-    assert_eq!(pool.count_rows(&request).await.unwrap(), 1);
-    let page = pool.fetch_page(&request).await.unwrap();
+    assert_eq!(
+        pool.count_rows(Capabilities::FULL, &request).await.unwrap(),
+        1
+    );
+    let page = pool.fetch_page(Capabilities::FULL, &request).await.unwrap();
     assert_eq!(page.rows.len(), 1);
     assert_eq!(integer(&page.rows[0][0]), 2);
 
@@ -511,7 +517,7 @@ async fn materialize_reports_no_statistics_rather_than_a_row_of_zeroes() {
     }
 
     assert_eq!(
-        pool.count_table_rows(find(&tables, &readings))
+        pool.count_table_rows(Capabilities::FULL, find(&tables, &readings))
             .await
             .unwrap(),
         5

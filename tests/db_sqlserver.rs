@@ -485,13 +485,16 @@ async fn sqlserver_paging_sorting_filtering_and_values_work() {
         sort: Some(("name".into(), SortDir::Asc)),
         ..page_request("fruits_page")
     };
-    assert_eq!(pool.count_rows(&request).await.unwrap(), 4);
-    let page = pool.fetch_page(&request).await.unwrap();
+    assert_eq!(
+        pool.count_rows(Capabilities::FULL, &request).await.unwrap(),
+        4
+    );
+    let page = pool.fetch_page(Capabilities::FULL, &request).await.unwrap();
     assert_eq!(page.rows.len(), 2);
     assert_eq!(page.rows[0][1], Value::Text("a_c".into()));
     assert_eq!(page.rows[1][1], Value::Text("apple".into()));
     request.offset = 2;
-    let page = pool.fetch_page(&request).await.unwrap();
+    let page = pool.fetch_page(Capabilities::FULL, &request).await.unwrap();
     assert_eq!(page.rows[0][1], Value::Text("avocado".into()));
     assert_eq!(page.rows[1][1], Value::Text("banana".into()));
 
@@ -502,28 +505,42 @@ async fn sqlserver_paging_sorting_filtering_and_values_work() {
         offset: 1,
         ..page_request("fruits_page")
     };
-    assert_eq!(pool.fetch_page(&unsorted).await.unwrap().rows.len(), 2);
+    assert_eq!(
+        pool.fetch_page(Capabilities::FULL, &unsorted)
+            .await
+            .unwrap()
+            .rows
+            .len(),
+        2
+    );
     let all = page_request("fruits_page");
-    assert_eq!(pool.fetch_page(&all).await.unwrap().rows.len(), 4);
+    assert_eq!(
+        pool.fetch_page(Capabilities::FULL, &all)
+            .await
+            .unwrap()
+            .rows
+            .len(),
+        4
+    );
 
     // Contains filter with an underscore matches literally, not as a wildcard.
     let mut request = page_request("fruits_page");
     request.filter = Some(Filter::contains("name", "a_"));
-    let filtered = pool.fetch_page(&request).await.unwrap();
+    let filtered = pool.fetch_page(Capabilities::FULL, &request).await.unwrap();
     assert_eq!(filtered.rows.len(), 1);
     assert_eq!(filtered.rows[0][1], Value::Text("a_c".into()));
 
     // Equals filter on a numeric column via the nvarchar cast; int, nvarchar,
     // float, varbinary, and NULL all decode.
     request.filter = Some(Filter::equals("id", "1"));
-    let by_id = pool.fetch_page(&request).await.unwrap();
+    let by_id = pool.fetch_page(Capabilities::FULL, &request).await.unwrap();
     assert_eq!(by_id.rows.len(), 1);
     assert_eq!(by_id.rows[0][0], Value::Integer(1));
     assert_eq!(by_id.rows[0][1], Value::Text("apple".into()));
     assert_eq!(by_id.rows[0][2], Value::Real(1.5));
     assert_eq!(by_id.rows[0][3], Value::Blob(vec![1, 2]));
     request.filter = Some(Filter::equals("id", "2"));
-    let with_nulls = pool.fetch_page(&request).await.unwrap();
+    let with_nulls = pool.fetch_page(Capabilities::FULL, &request).await.unwrap();
     assert_eq!(with_nulls.rows[0][2], Value::Null);
     assert_eq!(with_nulls.rows[0][3], Value::Null);
 
@@ -1589,7 +1606,7 @@ async fn sqlserver_every_read_path_keeps_only_the_first_result_set() {
 
     let mut csv = Vec::new();
     let written = pool
-        .export(sql, &[], ExportFormat::Csv, &mut csv)
+        .export(Capabilities::FULL, sql, &[], ExportFormat::Csv, &mut csv)
         .await
         .unwrap();
     assert_eq!(written, 2);
@@ -1623,7 +1640,7 @@ async fn sqlserver_export_streams_csv_and_json() {
     // CSV: quoted-when-needed fields, \x… blobs, empty NULLs.
     let mut csv = Vec::new();
     let written = pool
-        .export(sql, &[], ExportFormat::Csv, &mut csv)
+        .export(Capabilities::FULL, sql, &[], ExportFormat::Csv, &mut csv)
         .await
         .unwrap();
     assert_eq!(written, 2);
@@ -1635,7 +1652,7 @@ async fn sqlserver_export_streams_csv_and_json() {
     // JSON: one object per row, real JSON nulls and numbers.
     let mut json = Vec::new();
     let written = pool
-        .export(sql, &[], ExportFormat::Json, &mut json)
+        .export(Capabilities::FULL, sql, &[], ExportFormat::Json, &mut json)
         .await
         .unwrap();
     assert_eq!(written, 2);
@@ -1650,16 +1667,28 @@ async fn sqlserver_export_streams_csv_and_json() {
     let empty_sql = "SELECT id, name FROM dbo.export_rows WHERE id = 0";
     let mut csv = Vec::new();
     assert_eq!(
-        pool.export(empty_sql, &[], ExportFormat::Csv, &mut csv)
-            .await
-            .unwrap(),
+        pool.export(
+            Capabilities::FULL,
+            empty_sql,
+            &[],
+            ExportFormat::Csv,
+            &mut csv
+        )
+        .await
+        .unwrap(),
         0
     );
     assert_eq!(String::from_utf8(csv).unwrap(), "id,name\n");
     let mut json = Vec::new();
-    pool.export(empty_sql, &[], ExportFormat::Json, &mut json)
-        .await
-        .unwrap();
+    pool.export(
+        Capabilities::FULL,
+        empty_sql,
+        &[],
+        ExportFormat::Json,
+        &mut json,
+    )
+    .await
+    .unwrap();
     assert_eq!(String::from_utf8(json).unwrap(), "[]\n");
 
     run_all(&pool, &["DROP TABLE dbo.export_rows"]).await;
@@ -1696,7 +1725,7 @@ async fn sqlserver_bounded_page_previews_large_text_and_binary() {
     };
 
     let page = pool
-        .fetch_page_bounded(&request, &docs.columns, &["id"])
+        .fetch_page_bounded(Capabilities::FULL, &request, &docs.columns, &["id"])
         .await
         .unwrap();
     assert_eq!(page.result.columns.len(), 4, "length columns stripped");
@@ -1723,7 +1752,7 @@ async fn sqlserver_bounded_page_previews_large_text_and_binary() {
         identity_values: vec![Value::Integer(1)],
     };
     let cell = pool
-        .fetch_cell(&docs, &identity, &locator, "big_text")
+        .fetch_cell(Capabilities::FULL, &docs, &identity, &locator, "big_text")
         .await
         .unwrap();
     assert_eq!(cell.full_len, 50_000);
@@ -1734,7 +1763,7 @@ async fn sqlserver_bounded_page_previews_large_text_and_binary() {
         panic!("expected full text");
     }
     let cell = pool
-        .fetch_cell(&docs, &identity, &locator, "payload")
+        .fetch_cell(Capabilities::FULL, &docs, &identity, &locator, "payload")
         .await
         .unwrap();
     assert_eq!(cell.full_len, 40_000);
@@ -1747,7 +1776,7 @@ async fn sqlserver_bounded_page_previews_large_text_and_binary() {
     // Deleted underneath the grid: an error, never a NULL value.
     run_all(&pool, &["DELETE FROM dbo.bounded_docs WHERE id = 1"]).await;
     match pool
-        .fetch_cell(&docs, &identity, &locator, "big_text")
+        .fetch_cell(Capabilities::FULL, &docs, &identity, &locator, "big_text")
         .await
     {
         Err(DbError::Query(message)) => assert_eq!(message, MISSING_ROW),
@@ -1788,7 +1817,12 @@ async fn sqlserver_trailing_spaces_still_count_toward_the_preview_length() {
 
     let padded = introspect_table(&pool, "padded_text").await;
     let page = pool
-        .fetch_page_bounded(&page_request("padded_text"), &padded.columns, &["id"])
+        .fetch_page_bounded(
+            Capabilities::FULL,
+            &page_request("padded_text"),
+            &padded.columns,
+            &["id"],
+        )
         .await
         .unwrap();
     // The probe must see all the characters, not the `body` count `LEN` reports.
@@ -1805,7 +1839,7 @@ async fn sqlserver_trailing_spaces_still_count_toward_the_preview_length() {
         identity_values: vec![Value::Integer(1)],
     };
     let cell = pool
-        .fetch_cell(&padded, &identity, &locator, "v")
+        .fetch_cell(Capabilities::FULL, &padded, &identity, &locator, "v")
         .await
         .unwrap();
     assert_eq!(cell.full_len, total);
@@ -1852,7 +1886,7 @@ async fn sqlserver_sql_variant_cells_browse_and_fetch_safely() {
         ..page_request("variant_probe")
     };
     let page = pool
-        .fetch_page_bounded(&request, &probe.columns, &["id"])
+        .fetch_page_bounded(Capabilities::FULL, &request, &probe.columns, &["id"])
         .await
         .unwrap();
     assert_eq!(page.result.rows[0][1], Value::Text("42".into()));
@@ -1865,7 +1899,7 @@ async fn sqlserver_sql_variant_cells_browse_and_fetch_safely() {
         identity_values: vec![Value::Integer(1)],
     };
     let cell = pool
-        .fetch_cell(&probe, &identity, &locator, "v")
+        .fetch_cell(Capabilities::FULL, &probe, &identity, &locator, "v")
         .await
         .unwrap();
     assert_eq!(cell.value, Value::Text("42".into()));
@@ -1912,7 +1946,12 @@ async fn sqlserver_table_stats_come_from_the_partition_counters() {
         "reserved pages must be reported: {:?}",
         stats.bytes
     );
-    assert_eq!(pool.count_table_rows(&meta).await.unwrap(), 3);
+    assert_eq!(
+        pool.count_table_rows(Capabilities::FULL, &meta)
+            .await
+            .unwrap(),
+        3
+    );
 
     // A plain view owns no partitions, so both sums are over zero rows and
     // come back absent rather than as zeroes.
@@ -1932,9 +1971,12 @@ async fn sqlserver_table_stats_come_from_the_partition_counters() {
         "a non-indexed view has no partitions to report: {view:?}"
     );
     assert_eq!(
-        pool.count_table_rows(&introspect_table(&pool, "stats_view").await)
-            .await
-            .unwrap(),
+        pool.count_table_rows(
+            Capabilities::FULL,
+            &introspect_table(&pool, "stats_view").await
+        )
+        .await
+        .unwrap(),
         3
     );
 
@@ -1998,7 +2040,12 @@ async fn sqlserver_an_empty_table_reports_zero_rows_not_nothing() {
         "a maintained counter reading zero is a measurement, not an absence"
     );
     assert!(!stats.is_empty());
-    assert_eq!(pool.count_table_rows(&meta).await.unwrap(), 0);
+    assert_eq!(
+        pool.count_table_rows(Capabilities::FULL, &meta)
+            .await
+            .unwrap(),
+        0
+    );
 
     run_all(&pool, &["DROP TABLE dbo.stats_empty"]).await;
     pool.close().await;
@@ -2318,13 +2365,16 @@ async fn sqlserver_an_alias_of_sql_variant_is_refused_as_a_key_too() {
     };
     let request = page_request("alias_variant_keys");
     let page = pool
-        .fetch_page_bounded(&request, &keys.columns, &["k"])
+        .fetch_page_bounded(Capabilities::FULL, &request, &keys.columns, &["k"])
         .await
         .unwrap();
     let locator = RowLocator {
         identity_values: vec![page.result.rows[0][0].clone()],
     };
-    match pool.fetch_cell(&keys, &forced, &locator, "body").await {
+    match pool
+        .fetch_cell(Capabilities::FULL, &keys, &forced, &locator, "body")
+        .await
+    {
         Err(DbError::Query(message)) => assert_eq!(message, MISSING_ROW),
         other => panic!("the int variant's key finds no row, so nothing loads: {other:?}"),
     }

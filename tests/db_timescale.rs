@@ -16,6 +16,7 @@
 //! The rest of the Postgres suite also passes against this container — point
 //! `HUBRO_PG_TEST_URL` at it to re-run it there.
 
+use hubro::db::Capabilities;
 use hubro::db::{
     apply_staged, detect_row_identity, DbPool, Filter, Internal, PageRequest, Restriction,
     RowIdentity, RowLocator, SortDir, StagedChange, TableKind, TableMeta, Value,
@@ -219,9 +220,12 @@ async fn timescale_hypertable_pages_sorts_and_filters_across_chunks() {
         filter: Some(Filter::equals("sensor_id", "2")),
         extra_key_column: None,
     };
-    assert_eq!(pool.count_rows(&request).await.unwrap(), 17);
+    assert_eq!(
+        pool.count_rows(Capabilities::FULL, &request).await.unwrap(),
+        17
+    );
 
-    let page = pool.fetch_page(&request).await.unwrap();
+    let page = pool.fetch_page(Capabilities::FULL, &request).await.unwrap();
     assert_eq!(page.rows.len(), 3);
     let times: Vec<&str> = page.rows.iter().map(|row| text(&row[0])).collect();
     let mut sorted = times.clone();
@@ -233,7 +237,7 @@ async fn timescale_hypertable_pages_sorts_and_filters_across_chunks() {
         offset: 3,
         ..request
     };
-    let next = pool.fetch_page(&next).await.unwrap();
+    let next = pool.fetch_page(Capabilities::FULL, &next).await.unwrap();
     assert!(text(&next.rows[0][0]) < times[2]);
 }
 
@@ -351,15 +355,18 @@ async fn timescale_continuous_aggregate_is_a_readable_read_only_view() {
     assert!(!pool.backend_access(view).can_mutate());
 
     let page = pool
-        .fetch_page(&PageRequest {
-            schema: Some("public".into()),
-            table: agg.clone(),
-            limit: 10,
-            offset: 0,
-            sort: Some(("bucket".into(), SortDir::Asc)),
-            filter: None,
-            extra_key_column: None,
-        })
+        .fetch_page(
+            Capabilities::FULL,
+            &PageRequest {
+                schema: Some("public".into()),
+                table: agg.clone(),
+                limit: 10,
+                offset: 0,
+                sort: Some(("bucket".into(), SortDir::Asc)),
+                filter: None,
+                extra_key_column: None,
+            },
+        )
         .await
         .unwrap();
     assert!(!page.rows.is_empty(), "the aggregate should have rows");
@@ -412,15 +419,18 @@ async fn timescale_hypertable_without_a_primary_key_refuses_editing() {
 
     // Still browsable, which is the half that has to keep working.
     let page = pool
-        .fetch_page(&PageRequest {
-            schema: Some("public".into()),
-            table: "readings_nokey".into(),
-            limit: 5,
-            offset: 0,
-            sort: Some(("time".into(), SortDir::Asc)),
-            filter: None,
-            extra_key_column: None,
-        })
+        .fetch_page(
+            Capabilities::FULL,
+            &PageRequest {
+                schema: Some("public".into()),
+                table: "readings_nokey".into(),
+                limit: 5,
+                offset: 0,
+                sort: Some(("time".into(), SortDir::Asc)),
+                filter: None,
+                extra_key_column: None,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(page.rows.len(), 5);

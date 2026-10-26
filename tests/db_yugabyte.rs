@@ -313,9 +313,12 @@ async fn yugabyte_pages_sorts_and_filters() {
         filter: Some(Filter::equals("sensor_id", "2")),
         extra_key_column: None,
     };
-    assert_eq!(pool.count_rows(&request).await.unwrap(), 8);
+    assert_eq!(
+        pool.count_rows(Capabilities::FULL, &request).await.unwrap(),
+        8
+    );
 
-    let page = pool.fetch_page(&request).await.unwrap();
+    let page = pool.fetch_page(Capabilities::FULL, &request).await.unwrap();
     assert_eq!(page.rows.len(), 3);
     let ids: Vec<i64> = page.rows.iter().map(|row| integer(&row[0])).collect();
     // Rows are distributed by hash, so the storage order is arbitrary; an
@@ -323,10 +326,13 @@ async fn yugabyte_pages_sorts_and_filters() {
     assert_eq!(ids, [8, 7, 6]);
 
     let next = pool
-        .fetch_page(&PageRequest {
-            offset: 3,
-            ..request
-        })
+        .fetch_page(
+            Capabilities::FULL,
+            &PageRequest {
+                offset: 3,
+                ..request
+            },
+        )
         .await
         .unwrap();
     assert_eq!(integer(&next.rows[0][0]), 5);
@@ -435,15 +441,18 @@ async fn yugabyte_table_without_a_key_is_read_only_like_postgres() {
     assert_eq!(access.restriction, Some(Restriction::NoRowIdentity));
 
     let page = pool
-        .fetch_page(&PageRequest {
-            schema: Some("public".into()),
-            table: "yb_nokey".into(),
-            limit: 5,
-            offset: 0,
-            sort: Some(("a".into(), SortDir::Asc)),
-            filter: None,
-            extra_key_column: None,
-        })
+        .fetch_page(
+            Capabilities::FULL,
+            &PageRequest {
+                schema: Some("public".into()),
+                table: "yb_nokey".into(),
+                limit: 5,
+                offset: 0,
+                sort: Some(("a".into(), SortDir::Asc)),
+                filter: None,
+                extra_key_column: None,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(page.rows.len(), 2, "still browsable");
@@ -489,15 +498,18 @@ async fn yugabyte_materialized_view_browses_but_refuses_writes() {
     assert_eq!(access.restriction, Some(Restriction::MaterializedView));
 
     let page = pool
-        .fetch_page(&PageRequest {
-            schema: Some("public".into()),
-            table: view.clone(),
-            limit: 10,
-            offset: 0,
-            sort: Some(("sensor_id".into(), SortDir::Asc)),
-            filter: None,
-            extra_key_column: None,
-        })
+        .fetch_page(
+            Capabilities::FULL,
+            &PageRequest {
+                schema: Some("public".into()),
+                table: view.clone(),
+                limit: 10,
+                offset: 0,
+                sort: Some(("sensor_id".into(), SortDir::Asc)),
+                filter: None,
+                extra_key_column: None,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(page.rows.len(), 2, "the matview should have rows");
@@ -827,7 +839,12 @@ async fn yugabyte_row_estimate_arrives_but_its_size_accounting_lags() {
     );
 
     // And the exact count is unaffected by any of it.
-    assert_eq!(pool.count_table_rows(&meta).await.unwrap(), 16);
+    assert_eq!(
+        pool.count_table_rows(Capabilities::FULL, &meta)
+            .await
+            .unwrap(),
+        16
+    );
 
     let _guard = ddl_lock().lock().await;
     pool.query(&format!("DROP TABLE IF EXISTS {readings} CASCADE"))

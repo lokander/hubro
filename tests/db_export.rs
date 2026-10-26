@@ -6,6 +6,7 @@
 mod common;
 
 use common::FixtureDb;
+use hubro::db::Capabilities;
 use hubro::db::{DbPool, ExportFormat, Filter, PageRequest, SortDir, Value};
 
 /// Streams an export into an in-memory buffer, returning (bytes, row_count).
@@ -17,7 +18,7 @@ async fn export_to_string(
 ) -> (String, u64) {
     let mut buf = Vec::new();
     let rows = pool
-        .export(sql, params, format, &mut buf)
+        .export(Capabilities::FULL, sql, params, format, &mut buf)
         .await
         .expect("export succeeds");
     (String::from_utf8(buf).expect("export is valid UTF-8"), rows)

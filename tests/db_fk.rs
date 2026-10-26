@@ -7,6 +7,7 @@
 
 mod common;
 
+use hubro::db::Capabilities;
 use std::collections::HashMap;
 
 use common::FixtureDb;
@@ -93,7 +94,7 @@ async fn child_row(pool: &DbPool, id: i64) -> HashMap<String, Value> {
         filter: None,
         extra_key_column: None,
     };
-    let page = pool.fetch_page(&req).await.unwrap();
+    let page = pool.fetch_page(Capabilities::FULL, &req).await.unwrap();
     let idx = page
         .columns
         .iter()
@@ -140,8 +141,8 @@ async fn jump(
         extra_key_column: None,
     };
     let (page, count) = (
-        pool.fetch_page(&req).await.unwrap(),
-        pool.count_rows(&req).await.unwrap(),
+        pool.fetch_page(Capabilities::FULL, &req).await.unwrap(),
+        pool.count_rows(Capabilities::FULL, &req).await.unwrap(),
     );
     // The jump must select exactly the referenced row(s).
     assert_eq!(count, page.rows.len() as u64);

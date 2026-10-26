@@ -18,6 +18,7 @@
 
 mod common;
 
+use hubro::db::Capabilities;
 use std::io::BufReader;
 
 use common::FixtureDb;
@@ -266,7 +267,12 @@ async fn sqlite_a_bad_row_rolls_back_every_row_already_inserted() {
 
     // ...and the table is exactly what it was.
     assert_eq!(snapshot(&pool, people, "id").await, before);
-    assert_eq!(pool.count_table_rows(people).await.unwrap(), 1);
+    assert_eq!(
+        pool.count_table_rows(Capabilities::FULL, people)
+            .await
+            .unwrap(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -448,7 +454,12 @@ async fn sqlite_a_read_only_marking_refuses_the_import_before_reading_the_file()
 
     assert!(err.message.contains("marked"), "{}", err.message);
     assert_eq!(err.undone_rows, 0);
-    assert_eq!(pool.count_table_rows(people).await.unwrap(), 0);
+    assert_eq!(
+        pool.count_table_rows(Capabilities::FULL, people)
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -485,7 +496,13 @@ async fn sqlite_import_round_trips_the_export_of_the_same_table() {
     let (sql, params) = request.export_sql(Dialect::Sqlite);
     let mut buffer: Vec<u8> = Vec::new();
     let exported = pool
-        .export(&sql, &params, hubro::db::ExportFormat::Csv, &mut buffer)
+        .export(
+            Capabilities::FULL,
+            &sql,
+            &params,
+            hubro::db::ExportFormat::Csv,
+            &mut buffer,
+        )
         .await
         .unwrap();
     let text = String::from_utf8(buffer).unwrap();
@@ -624,7 +641,12 @@ async fn postgres_a_bad_row_rolls_back_every_row_already_inserted() {
         err.undone_rows
     );
     assert_eq!(snapshot(&pool, table, "id").await, before);
-    assert_eq!(pool.count_table_rows(table).await.unwrap(), 1);
+    assert_eq!(
+        pool.count_table_rows(Capabilities::FULL, table)
+            .await
+            .unwrap(),
+        1
+    );
 
     pool.execute("DROP TABLE import_rollback").await.unwrap();
     pool.close().await;
@@ -664,7 +686,9 @@ async fn postgres_a_server_side_failure_also_rolls_the_whole_import_back() {
             err.message
         );
         assert_eq!(
-            pool.count_table_rows(table).await.unwrap(),
+            pool.count_table_rows(Capabilities::FULL, table)
+                .await
+                .unwrap(),
             1,
             "{mode:?}: nothing may survive a server-side rejection"
         );
@@ -711,7 +735,12 @@ async fn postgres_skip_mode_reports_lines_and_commits_the_rest() {
         report.skipped.iter().map(|s| s.line).collect::<Vec<_>>(),
         vec![3, 4]
     );
-    assert_eq!(pool.count_table_rows(table).await.unwrap(), 2);
+    assert_eq!(
+        pool.count_table_rows(Capabilities::FULL, table)
+            .await
+            .unwrap(),
+        2
+    );
 
     pool.execute("DROP TABLE import_skip").await.unwrap();
     pool.close().await;
@@ -761,7 +790,12 @@ async fn mssql_csv_import_lands_rows_and_rolls_a_bad_file_back() {
     .await
     .unwrap();
     assert_eq!(report.inserted_rows, 1200);
-    assert_eq!(pool.count_table_rows(table).await.unwrap(), 1201);
+    assert_eq!(
+        pool.count_table_rows(Capabilities::FULL, table)
+            .await
+            .unwrap(),
+        1201
+    );
 
     // ...then a bad one, which must leave those 1201 rows exactly as they are.
     let before = snapshot(&pool, table, "id").await;
@@ -788,7 +822,12 @@ async fn mssql_csv_import_lands_rows_and_rolls_a_bad_file_back() {
         err.undone_rows
     );
     assert_eq!(snapshot(&pool, table, "id").await, before);
-    assert_eq!(pool.count_table_rows(table).await.unwrap(), 1201);
+    assert_eq!(
+        pool.count_table_rows(Capabilities::FULL, table)
+            .await
+            .unwrap(),
+        1201
+    );
 
     pool.execute("DROP TABLE dbo.import_rows").await.unwrap();
     pool.close().await;
@@ -831,7 +870,12 @@ async fn mssql_skip_mode_reports_lines_and_commits_the_rest() {
         report.skipped.iter().map(|s| s.line).collect::<Vec<_>>(),
         vec![3, 4]
     );
-    assert_eq!(pool.count_table_rows(table).await.unwrap(), 2);
+    assert_eq!(
+        pool.count_table_rows(Capabilities::FULL, table)
+            .await
+            .unwrap(),
+        2
+    );
 
     pool.execute("DROP TABLE dbo.import_skip").await.unwrap();
     pool.close().await;
@@ -866,7 +910,12 @@ async fn mssql_import_counts_its_own_rows_not_the_triggers() {
     .await
     .expect("the trigger's rows are not the import's");
     assert_eq!(report.inserted_rows, 3);
-    assert_eq!(pool.count_table_rows(table).await.unwrap(), 3);
+    assert_eq!(
+        pool.count_table_rows(Capabilities::FULL, table)
+            .await
+            .unwrap(),
+        3
+    );
     // The trigger ran, so its rows were in the response the guard read.
     let audit = pool
         .query("SELECT COUNT(*) FROM dbo.import_audit")
@@ -914,7 +963,12 @@ async fn mssql_an_instead_of_insert_trigger_refuses_the_import() {
         err.message
     );
     assert_eq!(err.undone_rows, 0);
-    assert_eq!(pool.count_table_rows(table).await.unwrap(), 0);
+    assert_eq!(
+        pool.count_table_rows(Capabilities::FULL, table)
+            .await
+            .unwrap(),
+        0
+    );
 
     pool.execute("DROP TABLE dbo.import_instead").await.unwrap();
     pool.close().await;
@@ -970,7 +1024,12 @@ async fn postgres_a_partially_applied_batch_is_rolled_back_and_counted() {
     // The two rows the trigger let through were applied and then undone —
     // reporting 0 here would under-count the one case the guard fires in.
     assert_eq!(err.undone_rows, 2);
-    assert_eq!(pool.count_table_rows(table).await.unwrap(), 0);
+    assert_eq!(
+        pool.count_table_rows(Capabilities::FULL, table)
+            .await
+            .unwrap(),
+        0
+    );
 
     pool.execute("DROP TABLE import_partial").await.unwrap();
     pool.execute("DROP FUNCTION import_drop_odd()")
@@ -1236,7 +1295,12 @@ async fn sqlite_a_batch_split_into_statements_counts_every_row_it_undid() {
     .unwrap_err();
     assert!(err.message.contains("UNIQUE"), "{}", err.message);
     assert_eq!(err.undone_rows, 2);
-    assert_eq!(pool.count_table_rows(table).await.unwrap(), 1);
+    assert_eq!(
+        pool.count_table_rows(Capabilities::FULL, table)
+            .await
+            .unwrap(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -1276,7 +1340,12 @@ async fn sqlite_a_short_statement_in_a_split_batch_counts_every_row_it_undid() {
         err.message
     );
     assert_eq!(err.undone_rows, 3);
-    assert_eq!(pool.count_table_rows(table).await.unwrap(), 0);
+    assert_eq!(
+        pool.count_table_rows(Capabilities::FULL, table)
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -1452,7 +1521,10 @@ async fn mssql_import_a_committing_trigger_kept_is_not_reported_undone() {
     )
     .await
     .unwrap_err();
-    let kept = pool.count_table_rows(table).await.unwrap();
+    let kept = pool
+        .count_table_rows(Capabilities::FULL, table)
+        .await
+        .unwrap();
     assert_eq!(
         kept, 1200,
         "the trigger's COMMIT kept every row sent: {err}"

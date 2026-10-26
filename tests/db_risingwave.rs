@@ -450,8 +450,11 @@ async fn risingwave_pages_sorts_and_filters_over_a_materialized_view() {
         filter: Some(Filter::equals("sensor_id", "1")),
         extra_key_column: None,
     };
-    assert_eq!(pool.count_rows(&request).await.unwrap(), 3);
-    let page = pool.fetch_page(&request).await.unwrap();
+    assert_eq!(
+        pool.count_rows(Capabilities::FULL, &request).await.unwrap(),
+        3
+    );
+    let page = pool.fetch_page(Capabilities::FULL, &request).await.unwrap();
     let ids: Vec<i64> = page.rows.iter().map(|row| integer(&row[0])).collect();
     assert_eq!(ids, [3, 2]);
 
@@ -466,7 +469,10 @@ async fn risingwave_pages_sorts_and_filters_over_a_materialized_view() {
         filter: Some(Filter::equals("sensor_id", "2")),
         extra_key_column: None,
     };
-    let mv_page = pool.fetch_page(&mv_request).await.unwrap();
+    let mv_page = pool
+        .fetch_page(Capabilities::FULL, &mv_request)
+        .await
+        .unwrap();
     assert_eq!(mv_page.rows.len(), 1);
     assert_eq!(integer(&mv_page.rows[0][0]), 2);
 
@@ -617,13 +623,13 @@ async fn risingwave_has_no_pg_class_statistics_so_none_are_invented() {
     // Counting still works on both, which is what makes the empty estimate
     // tolerable rather than a dead end.
     assert_eq!(
-        pool.count_table_rows(find(&tables, &readings))
+        pool.count_table_rows(Capabilities::FULL, find(&tables, &readings))
             .await
             .unwrap(),
         5
     );
     assert_eq!(
-        pool.count_table_rows(find(&tables, &matview))
+        pool.count_table_rows(Capabilities::FULL, find(&tables, &matview))
             .await
             .unwrap(),
         2
@@ -694,7 +700,7 @@ async fn risingwave_long_cells_load_through_every_key_type() {
             extra_key_column: None,
         };
         let page = pool
-            .fetch_page_bounded(&request, &table.columns, &["k"])
+            .fetch_page_bounded(Capabilities::FULL, &request, &table.columns, &["k"])
             .await
             .unwrap();
         assert_eq!(page.result.rows.len(), literals.len(), "{slug}");
@@ -702,7 +708,10 @@ async fn risingwave_long_cells_load_through_every_key_type() {
             let locator = RowLocator {
                 identity_values: vec![row[0].clone()],
             };
-            match pool.fetch_cell(table, &identity, &locator, "body").await {
+            match pool
+                .fetch_cell(Capabilities::FULL, table, &identity, &locator, "body")
+                .await
+            {
                 Ok(cell) if cell.full_len > 5000 => {}
                 Ok(cell) => failures.push(format!("{slug} {:?}: got {:?}", row[0], cell.value)),
                 Err(e) => failures.push(format!("{slug} {:?}: {e}", row[0])),

@@ -721,8 +721,53 @@ pub async fn query_with(
     sql: &str,
     params: &[Value],
 ) -> Result<QueryResult, DbError> {
-    let stream = bind_params(sqlx::query(sql), params).fetch(pool);
+    query_with_on(pool, sql, params).await
+}
+
+/// [`query_with`] on any executor — the pool, or the read-only transaction a
+/// marked connection's browsing runs in ([`read_only_query_with`]).
+async fn query_with_on<'c, E>(
+    executor: E,
+    sql: &str,
+    params: &[Value],
+) -> Result<QueryResult, DbError>
+where
+    E: sqlx::Executor<'c, Database = sqlx::Postgres>,
+{
+    let stream = bind_params(sqlx::query(sql), params).fetch(executor);
     sqlx_common::collect_all(stream, decode_value, |e| query_error(e, sql)).await
+}
+
+/// [`query_with`] for a connection the user marked read-only: the statement
+/// runs in a read-only transaction of its own ([`begin_read_only`]), always
+/// rolled back, so the engine refuses whatever the object being browsed does
+/// as a write — a view over `nextval()`, or over a function that inserts.
+///
+/// Returns the read's outcome and the rollback's separately, for the caller
+/// to combine the way a marked script's statements are
+/// (`registry::read_only_outcome`). The connection goes back to the pool: a
+/// browse runs only SQL hubro built, so nothing a script could leave on a
+/// session is left by one, and a reconnect per page would cost far more than
+/// the transaction does. What a browsed object's functions leave on the
+/// session outside the transaction (a session-level advisory lock) stays,
+/// as it does on any connection — the class
+/// [`WriteProtection::ReadOnly`](super::caps::WriteProtection::ReadOnly)
+/// names.
+pub async fn read_only_query_with(
+    pg: &PgConn,
+    sql: &str,
+    params: &[Value],
+) -> (Result<QueryResult, DbError>, Result<(), DbError>) {
+    let mut conn = match pg.pool().acquire().await {
+        Ok(conn) => conn,
+        Err(e) => return (Err(query_error(e, sql)), Ok(())),
+    };
+    let mut tx = match begin_read_only(&mut conn, pg.read_only_begin()).await {
+        Ok(tx) => tx,
+        Err(e) => return (Err(e), Ok(())),
+    };
+    let result = query_with_on(&mut *tx, sql, params).await;
+    (result, end_read_only(tx).await)
 }
 
 /// Streams `sql` one row at a time (`fetch`, not `fetch_all`), decoding and
@@ -1607,7 +1652,20 @@ pub async fn export(
     format: ExportFormat,
     out: &mut impl Write,
 ) -> Result<u64, DbError> {
-    let stream = bind_params(sqlx::query(sql), params).fetch(pool);
+    let mut conn = pool.acquire().await.map_err(|e| query_error(e, sql))?;
+    export_on(&mut conn, sql, params, format, out).await
+}
+
+/// [`export`] on one connection — a pooled one, or the read-only transaction
+/// a marked connection's export runs in ([`read_only_export`]).
+async fn export_on(
+    conn: &mut sqlx::postgres::PgConnection,
+    sql: &str,
+    params: &[Value],
+    format: ExportFormat,
+    out: &mut impl Write,
+) -> Result<u64, DbError> {
+    let stream = bind_params(sqlx::query(sql), params).fetch(&mut *conn);
     if let Some(rows) =
         sqlx_common::export_stream(stream, format, out, decode_value, |e| query_error(e, sql))
             .await?
@@ -1617,11 +1675,34 @@ pub async fn export(
     // No rows streamed, so no row carried the column names: describe the
     // statement instead. This one propagates its failure — an export whose
     // header cannot be determined is an empty file that says nothing.
-    let columns = sqlx_common::describe_columns(pool, sql)
+    let columns = sqlx_common::describe_columns(&mut *conn, sql)
         .await
         .map_err(|e| query_error(e, sql))?;
     sqlx_common::export_empty(format, columns, out)?;
     Ok(0)
+}
+
+/// [`export`] for a connection the user marked read-only, in a read-only
+/// transaction that is always rolled back — see [`read_only_query_with`],
+/// whose shape and reasons this shares. The describe that recovers an empty
+/// export's header runs inside the same transaction.
+pub async fn read_only_export(
+    pg: &PgConn,
+    sql: &str,
+    params: &[Value],
+    format: ExportFormat,
+    out: &mut impl Write,
+) -> (Result<u64, DbError>, Result<(), DbError>) {
+    let mut conn = match pg.pool().acquire().await {
+        Ok(conn) => conn,
+        Err(e) => return (Err(query_error(e, sql)), Ok(())),
+    };
+    let mut tx = match begin_read_only(&mut conn, pg.read_only_begin()).await {
+        Ok(tx) => tx,
+        Err(e) => return (Err(e), Ok(())),
+    };
+    let result = export_on(&mut tx, sql, params, format, out).await;
+    (result, end_read_only(tx).await)
 }
 
 /// Executes a statement without decoding rows, returning the driver's

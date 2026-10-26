@@ -258,6 +258,17 @@ pub enum WriteProtection {
     /// ([`ReadOnlyRun`](super::registry::ReadOnlyRun)): a read-only SQLite
     /// open, or a read-only transaction per statement on Postgres.
     ///
+    /// **Browsing is under the engine's refusal too.** The grid's page and
+    /// count, a cell fetch, a table's exact count and a grid export run SQL
+    /// hubro built, but what they read can write — a view over `nextval()`, a
+    /// row-security policy calling a function that inserts — so on Postgres
+    /// each runs in the same always-rolled-back read-only transaction
+    /// ([`DbPool::fetch_page`](super::registry::DbPool::fetch_page)), and
+    /// the read fails with the engine's refusal instead. SQLite's reads cannot
+    /// write at all (no sequences, and hubro registers no function and loads no
+    /// extension). Introspection, DDL and statistics read only the catalog
+    /// and run no user-defined code.
+    ///
     /// **SQL Server has only the first layer**: T-SQL has no read-only session
     /// or transaction mode, so a write the classification misses —
     /// `SELECT NEXT VALUE FOR s`, a procedure called from a function — runs
