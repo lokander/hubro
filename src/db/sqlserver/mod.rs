@@ -89,10 +89,20 @@ pub fn build_mssql_url(
 /// Indexed views map to plain `View` too — unlike a Postgres materialized
 /// view they are transparently maintained (never stale, no REFRESH), so the
 /// matview-specific handling doesn't apply; `MaterializedView` stays PG-only.
-pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
-    let map_err = |e: DbError| DbError::Introspect(e.message().to_string());
+/// A failed catalog read as introspection reports it: a deadlock victim stays
+/// [`DbError::Transient`] for `registry::retry_transient` to run once more
+/// (`pool::catalog_query_with`); anything else is an introspection failure.
+fn introspect_error(err: DbError) -> DbError {
+    match err {
+        DbError::Transient(_) => err,
+        other => DbError::Introspect(other.message().to_string()),
+    }
+}
 
-    let table_rows = query_with(
+pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
+    let map_err = introspect_error;
+
+    let table_rows = pool::catalog_query_with(
         pool,
         "SELECT s.name, o.name, o.type, \
                 CASE WHEN o.type = 'U' AND EXISTS ( \
@@ -120,7 +130,7 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
     // the conventional readable form (`nvarchar(50)`, `decimal(10,2)`) by
     // [`format_mssql_type`]; default definitions are unwrapped from SQL
     // Server's parenthesis armor by [`strip_default_parens`].
-    let column_rows = query_with(
+    let column_rows = pool::catalog_query_with(
         pool,
         "SELECT s.name, o.name, c.name, t.name, \
                 c.max_length, c.precision, c.scale, \
@@ -154,7 +164,7 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
     // Filtered indexes (has_filter) map to `partial` — a filtered unique
     // index only guarantees uniqueness among matching rows, so row identity
     // must never rely on one (same contract as a Postgres partial index).
-    let index_rows = query_with(
+    let index_rows = pool::catalog_query_with(
         pool,
         "SELECT s.name, o.name, i.name, i.is_unique, i.has_filter, col.name, \
                 i.is_primary_key, i.is_unique_constraint \
@@ -181,7 +191,7 @@ pub async fn introspect(pool: &MssqlPool) -> Result<Vec<TableMeta>, DbError> {
     // Deliberately no `is_ms_shipped` filter here: an FK whose parent table
     // isn't in the user-table list fails the `table_index` lookup below and is
     // dropped anyway.
-    let fk_rows = query_with(
+    let fk_rows = pool::catalog_query_with(
         pool,
         "SELECT s.name, o.name, fk.name, rs.name, ro.name, pc.name, rc.name \
          FROM sys.foreign_keys fk \
@@ -370,7 +380,7 @@ pub async fn fetch_table_stats(pool: &MssqlPool, table: &TableMeta) -> Result<Ta
     // spliced — and quoted, since it is otherwise parsed as an identifier
     // path and a schema or table containing a dot would resolve elsewhere.
     let qualified = qualified(table.schema.as_deref(), &table.name);
-    let result = query_with(
+    let result = pool::catalog_query_with(
         pool,
         "SELECT SUM(CASE WHEN ps.index_id IN (0, 1) THEN ps.row_count ELSE 0 END), \
                 SUM(ps.reserved_page_count) * CAST(8192 AS bigint) \
@@ -379,7 +389,7 @@ pub async fn fetch_table_stats(pool: &MssqlPool, table: &TableMeta) -> Result<Ta
         &[Value::Text(qualified)],
     )
     .await
-    .map_err(|e| DbError::Introspect(e.message().to_string()))?;
+    .map_err(introspect_error)?;
     let Some(row) = result.rows.first() else {
         return Ok(TableStats::default());
     };
