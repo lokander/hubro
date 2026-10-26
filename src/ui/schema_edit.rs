@@ -360,7 +360,7 @@ pub fn SchemaEditDialog(
                     }
                 }
                 TextArea {
-                    class: "mb-2 h-24 w-full resize-y rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 p-2 font-mono text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-1 focus:ring-sky-500",
+                    class: "mb-2 h-24 w-full resize-y font-mono {INPUT}",
                     "spellcheck": "false",
                     text: "{sql()}",
                     oninput: move |evt: FormEvent| edited.set(Some(evt.value())),

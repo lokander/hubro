@@ -708,12 +708,12 @@ pub fn grid_export_line(
 ) -> Option<(String, Tone, bool)> {
     let status = statuses.get(&(id, ExportPane::Grid))?;
     let finished = *status != ExportStatus::Running;
-    let (text, class) = status.line();
+    let (text, tone) = status.line();
     match tables.get(&id) {
         Some(source) if source != shown => {
-            Some((format!("{}: {text}", source.label()), class, finished))
+            Some((format!("{}: {text}", source.label()), tone, finished))
         }
-        _ => Some((text, class, finished)),
+        _ => Some((text, tone, finished)),
     }
 }
 
