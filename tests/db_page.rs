@@ -4,6 +4,7 @@
 mod common;
 
 use common::FixtureDb;
+use hubro::db::Capabilities;
 use hubro::db::{Filter, PageRequest, SortDir, Value};
 
 fn request(table: &str) -> PageRequest {
@@ -42,11 +43,11 @@ async fn first_page_is_full_and_last_page_is_partial() {
     let pool = fixture.open().await;
 
     let mut req = sorted("numbers", "n", SortDir::Asc);
-    let first = pool.fetch_page(&req).await.unwrap();
+    let first = pool.fetch_page(Capabilities::FULL, &req).await.unwrap();
     assert_eq!(n_values(&first.rows), (1..=10).collect::<Vec<_>>());
 
     req.offset = 20;
-    let last = pool.fetch_page(&req).await.unwrap();
+    let last = pool.fetch_page(Capabilities::FULL, &req).await.unwrap();
     assert_eq!(n_values(&last.rows), [21, 22, 23, 24, 25]);
 
     pool.close().await;
@@ -62,7 +63,7 @@ async fn offset_beyond_the_end_yields_an_empty_page() {
         offset: 100,
         ..request("numbers")
     };
-    let page = pool.fetch_page(&req).await.unwrap();
+    let page = pool.fetch_page(Capabilities::FULL, &req).await.unwrap();
     assert!(page.rows.is_empty());
 
     pool.close().await;
@@ -79,7 +80,7 @@ async fn count_rows_ignores_limit_and_offset() {
         offset: 100,
         ..request("numbers")
     };
-    assert_eq!(pool.count_rows(&req).await.unwrap(), 25);
+    assert_eq!(pool.count_rows(Capabilities::FULL, &req).await.unwrap(), 25);
 
     pool.close().await;
 }
@@ -90,7 +91,7 @@ async fn sort_desc_reverses_the_order() {
     let pool = fixture.open().await;
 
     let req = sorted("numbers", "n", SortDir::Desc);
-    let page = pool.fetch_page(&req).await.unwrap();
+    let page = pool.fetch_page(Capabilities::FULL, &req).await.unwrap();
     assert_eq!(n_values(&page.rows), (16..=25).rev().collect::<Vec<_>>());
 
     pool.close().await;
@@ -103,7 +104,10 @@ async fn sort_places_nulls_first_ascending_and_last_descending() {
     let pool = fixture.open().await;
 
     let asc = pool
-        .fetch_page(&sorted("numbers", "score", SortDir::Asc))
+        .fetch_page(
+            Capabilities::FULL,
+            &sorted("numbers", "score", SortDir::Asc),
+        )
         .await
         .unwrap();
     // SQLite treats NULL as smaller than every value: NULLs lead ascending.
@@ -115,7 +119,10 @@ async fn sort_places_nulls_first_ascending_and_last_descending() {
         limit: 25,
         ..sorted("numbers", "score", SortDir::Desc)
     };
-    let desc = pool.fetch_page(&desc_req).await.unwrap();
+    let desc = pool
+        .fetch_page(Capabilities::FULL, &desc_req)
+        .await
+        .unwrap();
     assert_eq!(desc.rows[0][2], Value::Real(12.0));
     assert!(desc.rows[20..].iter().all(|row| row[2] == Value::Null));
 
@@ -142,14 +149,14 @@ async fn contains_filter_treats_percent_and_underscore_literally() {
 
     // '%' in the needle must not act as a wildcard...
     req.filter = Some(Filter::contains("body", "%"));
-    let percent = pool.fetch_page(&req).await.unwrap();
+    let percent = pool.fetch_page(Capabilities::FULL, &req).await.unwrap();
     assert_eq!(percent.rows.len(), 1);
     assert_eq!(percent.rows[0][1], Value::Text("100% done".into()));
-    assert_eq!(pool.count_rows(&req).await.unwrap(), 1);
+    assert_eq!(pool.count_rows(Capabilities::FULL, &req).await.unwrap(), 1);
 
     // ...and '_' must not match any single character ('axb' stays out).
     req.filter = Some(Filter::contains("body", "a_b"));
-    let underscore = pool.fetch_page(&req).await.unwrap();
+    let underscore = pool.fetch_page(Capabilities::FULL, &req).await.unwrap();
     assert_eq!(underscore.rows.len(), 1);
     assert_eq!(underscore.rows[0][1], Value::Text("a_b".into()));
 
@@ -182,9 +189,9 @@ async fn equals_filter_with_text_value_matches_numeric_column_via_affinity() {
         filter: Some(Filter::equals("n", "7")),
         ..request("numbers")
     };
-    let page = pool.fetch_page(&req).await.unwrap();
+    let page = pool.fetch_page(Capabilities::FULL, &req).await.unwrap();
     assert_eq!(n_values(&page.rows), [7]);
-    assert_eq!(pool.count_rows(&req).await.unwrap(), 1);
+    assert_eq!(pool.count_rows(Capabilities::FULL, &req).await.unwrap(), 1);
 
     pool.close().await;
 }
@@ -204,14 +211,14 @@ async fn filter_sort_and_paging_combine() {
         filter: Some(Filter::contains("label", "row 1")),
         ..request("numbers")
     };
-    assert_eq!(pool.count_rows(&req).await.unwrap(), 10);
+    assert_eq!(pool.count_rows(Capabilities::FULL, &req).await.unwrap(), 10);
 
     // Descending 19..10, offset 8 into the match set: the partial last page.
-    let page = pool.fetch_page(&req).await.unwrap();
+    let page = pool.fetch_page(Capabilities::FULL, &req).await.unwrap();
     assert_eq!(n_values(&page.rows), [11, 10]);
 
     req.offset = 0;
-    let first = pool.fetch_page(&req).await.unwrap();
+    let first = pool.fetch_page(Capabilities::FULL, &req).await.unwrap();
     assert_eq!(n_values(&first.rows), [19, 18, 17]);
 
     pool.close().await;
@@ -233,8 +240,8 @@ async fn paging_works_on_tables_and_columns_with_weird_names() {
         filter: Some(Filter::contains("col name", "row")),
         extra_key_column: None,
     };
-    assert_eq!(pool.count_rows(&req).await.unwrap(), 3);
-    let page = pool.fetch_page(&req).await.unwrap();
+    assert_eq!(pool.count_rows(Capabilities::FULL, &req).await.unwrap(), 3);
+    let page = pool.fetch_page(Capabilities::FULL, &req).await.unwrap();
     let names: Vec<&str> = page.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["col name", "übercol", "select"]);
     assert_eq!(page.rows[0][0], Value::Text("другой row".into()));
@@ -246,7 +253,7 @@ async fn paging_works_on_tables_and_columns_with_weird_names() {
         filter: Some(Filter::equals("group", "g1")),
         ..request("order")
     };
-    let page = pool.fetch_page(&req).await.unwrap();
+    let page = pool.fetch_page(Capabilities::FULL, &req).await.unwrap();
     assert_eq!(page.rows.len(), 1);
     assert_eq!(page.rows[0][0], Value::Integer(1));
 
@@ -259,8 +266,8 @@ async fn views_page_like_tables() {
     let pool = fixture.open().await;
 
     let req = sorted("artist_overview", "album_count", SortDir::Desc);
-    assert_eq!(pool.count_rows(&req).await.unwrap(), 3);
-    let page = pool.fetch_page(&req).await.unwrap();
+    assert_eq!(pool.count_rows(Capabilities::FULL, &req).await.unwrap(), 3);
+    let page = pool.fetch_page(Capabilities::FULL, &req).await.unwrap();
     assert_eq!(page.rows.len(), 3);
     // Ana has two albums, Bo one, Cleo none.
     assert_eq!(page.rows[0][1], Value::Text("Ana".into()));
@@ -277,7 +284,7 @@ async fn fetched_page_round_trips_all_storage_classes() {
     let pool = fixture.open().await;
 
     let page = pool
-        .fetch_page(&sorted("artists", "id", SortDir::Asc))
+        .fetch_page(Capabilities::FULL, &sorted("artists", "id", SortDir::Asc))
         .await
         .unwrap();
     assert_eq!(

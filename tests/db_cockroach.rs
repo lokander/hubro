@@ -290,19 +290,25 @@ async fn cockroach_pages_sorts_and_filters() {
         filter: Some(Filter::equals("sensor_id", "2")),
         extra_key_column: None,
     };
-    assert_eq!(pool.count_rows(&request).await.unwrap(), 8);
+    assert_eq!(
+        pool.count_rows(Capabilities::FULL, &request).await.unwrap(),
+        8
+    );
 
-    let page = pool.fetch_page(&request).await.unwrap();
+    let page = pool.fetch_page(Capabilities::FULL, &request).await.unwrap();
     assert_eq!(page.rows.len(), 3);
     let ids: Vec<i64> = page.rows.iter().map(|row| integer(&row[0])).collect();
     assert_eq!(ids, [8, 7, 6], "rows should come back highest id first");
 
     // Offsets keep walking the same ordering.
     let next = pool
-        .fetch_page(&PageRequest {
-            offset: 3,
-            ..request
-        })
+        .fetch_page(
+            Capabilities::FULL,
+            &PageRequest {
+                offset: 3,
+                ..request
+            },
+        )
         .await
         .unwrap();
     assert_eq!(integer(&next.rows[0][0]), 5);
@@ -453,15 +459,18 @@ async fn cockroach_view_is_readable_but_never_editable() {
     assert_eq!(access.restriction, Some(Restriction::View));
 
     let page = pool
-        .fetch_page(&PageRequest {
-            schema: Some("public".into()),
-            table: view.clone(),
-            limit: 10,
-            offset: 0,
-            sort: Some(("id".into(), SortDir::Asc)),
-            filter: None,
-            extra_key_column: None,
-        })
+        .fetch_page(
+            Capabilities::FULL,
+            &PageRequest {
+                schema: Some("public".into()),
+                table: view.clone(),
+                limit: 10,
+                offset: 0,
+                sort: Some(("id".into(), SortDir::Asc)),
+                filter: None,
+                extra_key_column: None,
+            },
+        )
         .await
         .unwrap();
     assert!(!page.rows.is_empty(), "the view should have rows");
@@ -772,7 +781,12 @@ async fn cockroach_keeps_no_statistics_this_can_read_so_the_pane_stays_empty() {
 
     // The exact count is the number this engine *can* give, and the reason
     // the action exists separately from the estimate.
-    assert_eq!(pool.count_table_rows(meta).await.unwrap(), 16);
+    assert_eq!(
+        pool.count_table_rows(Capabilities::FULL, meta)
+            .await
+            .unwrap(),
+        16
+    );
 
     pool.query(&format!("DROP TABLE IF EXISTS {readings} CASCADE"))
         .await

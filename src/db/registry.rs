@@ -957,7 +957,7 @@ impl DbPool {
 
     /// Runs a free-form read query, buffered. A zero-row result still carries
     /// its column headers — this is a user-facing result set, unlike
-    /// the projection-built reads behind [`Self::query_with`].
+    /// the projection-built reads behind [`Self::browse_with`].
     pub async fn query(&self, sql: &str) -> Result<QueryResult, DbError> {
         match self {
             DbPool::Sqlite(pool) => sqlite::query(pool, sql).await,
@@ -1131,19 +1131,63 @@ impl DbPool {
         }
     }
 
-    async fn query_with(&self, sql: &str, params: &[Value]) -> Result<QueryResult, DbError> {
+    /// Runs one of the reads hubro builds for browsing — a page, a count, a
+    /// cell — on a connection with these effective capabilities.
+    ///
+    /// **Where the engine has a read-only mode, a connection that may not
+    /// write browses in it** ([`engine_enforces_read_only`], the predicate a
+    /// marked connection's scripts are routed by). The SQL is hubro's, but
+    /// what it reads need not be: a view over `nextval()`, a view or
+    /// row-security policy calling a function that writes, fires on every
+    /// read of it. Measured on PostgreSQL 17, one page of a three-row view
+    /// over `nextval()` advanced its sequence by three (the sort reads every
+    /// row), and its `COUNT(*)` by three more.
+    ///
+    /// - **Postgres-wire**: the statement runs in a read-only transaction of
+    ///   its own, always rolled back ([`postgres::read_only_query_with`]) —
+    ///   the same `BEGIN` a marked script's statements get, so CockroachDB's
+    ///   `autocommit_before_ddl` and Materialize's DDL-accepting read-only
+    ///   transaction are covered the same way. The read then fails with the
+    ///   engine's refusal (`cannot execute nextval() in a read-only
+    ///   transaction`) rather than doing the write. It costs two round trips
+    ///   (`BEGIN`, `ROLLBACK`), on marked connections only.
+    /// - **SQLite**: the pool, unchanged. A `SELECT` there cannot write —
+    ///   SQLite has no sequences, and its functions write nothing unless an
+    ///   application registers one that does or loads an extension, and hubro
+    ///   does neither (`a_sqlite_read_cannot_load_an_extension` pins that
+    ///   `load_extension` is refused). A read-only open per page would buy
+    ///   nothing.
+    /// - **SQL Server**: the pool, unchanged — no read-only mode exists
+    ///   ([`engine_has_read_only_mode`]), as for its scripts.
+    async fn browse_with(
+        &self,
+        caps: Capabilities,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<QueryResult, DbError> {
         match self {
             DbPool::Sqlite(pool) => sqlite::query_with(pool, sql, params).await,
+            DbPool::Postgres(pg) if engine_enforces_read_only(caps) => {
+                let (result, ended) = postgres::read_only_query_with(pg, sql, params).await;
+                read_only_outcome(result, ended)
+            }
             DbPool::Postgres(pg) => postgres::query_with(pg.pool(), sql, params).await,
             DbPool::SqlServer(pool) => sqlserver::query_with(pool, sql, params).await,
         }
     }
 
-    /// One page of a table, honoring the request's sort and filter.
-    pub async fn fetch_page(&self, request: &PageRequest) -> Result<QueryResult, DbError> {
+    /// One page of a table, honoring the request's sort and filter. `caps`
+    /// are the connection's effective capabilities
+    /// ([`Connection::capabilities`]), which decide whether the read runs
+    /// where the engine refuses writes — see [`Self::browse_with`].
+    pub async fn fetch_page(
+        &self,
+        caps: Capabilities,
+        request: &PageRequest,
+    ) -> Result<QueryResult, DbError> {
         refuse_paged_read(self.backend_capabilities())?;
         let (sql, params) = request.select_sql(self.dialect());
-        self.query_with(&sql, &params).await
+        self.browse_with(caps, &sql, &params).await
     }
 
     /// One page of a table with **bounded previews** of large columns (long
@@ -1153,9 +1197,10 @@ impl DbPool {
     /// foreign-key columns, whose truncation would misaddress rows or
     /// misdirect a foreign-key jump. The returned [`Page`] carries per-cell
     /// truncation metadata; the full value of a truncated cell is loaded on
-    /// demand via [`Self::fetch_cell`].
+    /// demand via [`Self::fetch_cell`]. `caps` as for [`Self::fetch_page`].
     pub async fn fetch_page_bounded(
         &self,
+        caps: Capabilities,
         request: &PageRequest,
         columns: &[ColumnMeta],
         no_preview: &[&str],
@@ -1163,7 +1208,7 @@ impl DbPool {
         refuse_paged_read(self.backend_capabilities())?;
         let (sql, params, plan) =
             request.select_bounded_sql(self.dialect(), columns, no_preview, PREVIEW_BYTES);
-        let raw = self.query_with(&sql, &params).await?;
+        let raw = self.browse_with(caps, &sql, &params).await?;
         Ok(plan.assemble(raw, PREVIEW_BYTES))
     }
 
@@ -1218,8 +1263,11 @@ impl DbPool {
     /// A locator that matches no row is a [`DbError::Query`] carrying
     /// [`MISSING_ROW`], not a NULL value: every consumer shows, edits or
     /// copies what this returns, so an empty value would read as data.
+    ///
+    /// `caps` as for [`Self::fetch_page`].
     pub async fn fetch_cell(
         &self,
+        caps: Capabilities,
         table: &TableMeta,
         identity: &RowIdentity,
         locator: &RowLocator,
@@ -1245,7 +1293,7 @@ impl DbPool {
             &where_clause,
             FETCH_CELL_MAX_BYTES,
         );
-        let result = self.query_with(&sql, &params).await?;
+        let result = self.browse_with(caps, &sql, &params).await?;
         let Some(row) = result.rows.into_iter().next() else {
             // No row matched: deleted underneath the grid, or a key the
             // server cannot be asked for again. Either way it is a failure,
@@ -1266,9 +1314,14 @@ impl DbPool {
     }
 
     /// Total row count for the request's table and filter (paging ignored).
-    pub async fn count_rows(&self, request: &PageRequest) -> Result<u64, DbError> {
+    /// `caps` as for [`Self::fetch_page`].
+    pub async fn count_rows(
+        &self,
+        caps: Capabilities,
+        request: &PageRequest,
+    ) -> Result<u64, DbError> {
         let (sql, params) = request.count_sql(self.dialect());
-        self.count_query(&sql, &params).await
+        self.count_query(caps, &sql, &params).await
     }
 
     /// Exactly how many rows `table` holds, by running `COUNT(*)`.
@@ -1282,17 +1335,28 @@ impl DbPool {
     /// Unfiltered by construction: the grid's own count runs through
     /// [`Self::count_rows`] with the page's filter, and the two must not be
     /// confused for each other.
-    pub async fn count_table_rows(&self, table: &TableMeta) -> Result<u64, DbError> {
+    ///
+    /// `caps` as for [`Self::fetch_page`]: counting a view runs it.
+    pub async fn count_table_rows(
+        &self,
+        caps: Capabilities,
+        table: &TableMeta,
+    ) -> Result<u64, DbError> {
         let sql = format!(
             "SELECT COUNT(*) FROM {}",
             super::sql::qualified(table.schema.as_deref(), &table.name)
         );
-        self.count_query(&sql, &[]).await
+        self.count_query(caps, &sql, &[]).await
     }
 
     /// Runs a single-value `COUNT(*)` query and decodes it.
-    async fn count_query(&self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
-        let result = self.query_with(sql, params).await?;
+    async fn count_query(
+        &self,
+        caps: Capabilities,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<u64, DbError> {
+        let result = self.browse_with(caps, sql, params).await?;
         match result.rows.first().and_then(|r| r.first()) {
             Some(Value::Integer(n)) => Ok(*n as u64),
             other => Err(DbError::Query(format!(
@@ -1326,8 +1390,13 @@ impl DbPool {
     /// Streams the rows of `sql` (with bound `params`) to `out` in `format`,
     /// pulling one row at a time so the export never buffers the full result.
     /// Returns the number of data rows written. See [`export`](super::export).
+    ///
+    /// `caps` as for [`Self::fetch_page`]: on a connection that may not write,
+    /// a Postgres-wire export streams inside a read-only transaction, always
+    /// rolled back ([`postgres::read_only_export`]).
     pub async fn export(
         &self,
+        caps: Capabilities,
         sql: &str,
         params: &[Value],
         format: ExportFormat,
@@ -1335,6 +1404,11 @@ impl DbPool {
     ) -> Result<u64, DbError> {
         match self {
             DbPool::Sqlite(pool) => sqlite::export(pool, sql, params, format, out).await,
+            DbPool::Postgres(pg) if engine_enforces_read_only(caps) => {
+                let (result, ended) =
+                    postgres::read_only_export(pg, sql, params, format, out).await;
+                read_only_outcome(result, ended)
+            }
             DbPool::Postgres(pg) => postgres::export(pg.pool(), sql, params, format, out).await,
             DbPool::SqlServer(pool) => sqlserver::export(pool, sql, params, format, out).await,
         }

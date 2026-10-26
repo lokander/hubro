@@ -21,14 +21,24 @@
 //! sequence through it. If that test ever fails, SQL Server gained a
 //! backstop and the documentation saying it has none is wrong.
 //!
+//! **Browsing is held to the same claim.** The grid's page, its count, a cell
+//! fetch, a table's exact count and an export run SQL hubro built, but what
+//! that SQL reads can write: a view over `setval()` (or over a function that
+//! inserts) fires on every read of it. On a marked Postgres-wire connection
+//! each of those reads runs in the same always-rolled-back read-only
+//! transaction, so the engine refuses the write; `browsing_*` below pins it
+//! per engine, with the same three checks, and that browsing an ordinary
+//! table still works there — Materialize and RisingWave included.
+//!
 //! Every test skips unless its engine's `HUBRO_*_TEST_URL` is set — see
 //! `tests/CLAUDE.md`.
 
 mod common;
 
 use hubro::db::{
-    run_script, script_refusal, ConnectionRegistry, DbError, DbPool, Dialect, PgFlavor, RestOfRead,
-    StatementOutcome, Value, WriteProtection,
+    run_script, script_refusal, Capabilities, ConnectionRegistry, DbError, DbPool, Dialect,
+    ExportFormat, PageRequest, PgFlavor, RestOfRead, RowIdentity, RowLocator, StatementOutcome,
+    TableMeta, Value, WriteProtection,
 };
 
 fn url(var: &str) -> Option<String> {
@@ -569,5 +579,305 @@ async fn a_marked_yugabyte_connection_does_not_read_a_capped_read_to_its_end() {
     };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     assert_a_capped_read_is_not_read_to_its_end(&pool).await;
+    pool.close().await;
+}
+
+/// One of the reads the grid and the schema pane make on a table — each one
+/// a separate path through `DbPool`, so each is checked on its own.
+#[derive(Debug, Clone, Copy)]
+enum Browse {
+    Page,
+    Count,
+    TableCount,
+    Cell,
+    Export,
+}
+
+const BROWSES: [Browse; 5] = [
+    Browse::Page,
+    Browse::Count,
+    Browse::TableCount,
+    Browse::Cell,
+    Browse::Export,
+];
+
+/// Runs one browse of `table` with these effective capabilities. The cell
+/// fetch addresses the row by an `id` column of value 1, which every object
+/// these tests browse has — a view has no key of its own, and the path under
+/// test is the read, not the addressing.
+async fn browse(
+    pool: &DbPool,
+    caps: Capabilities,
+    table: &TableMeta,
+    how: Browse,
+) -> Result<String, DbError> {
+    let request = PageRequest {
+        schema: table.schema.clone(),
+        table: table.name.clone(),
+        limit: 100,
+        offset: 0,
+        sort: None,
+        filter: None,
+        extra_key_column: None,
+    };
+    match how {
+        Browse::Page => pool
+            .fetch_page_bounded(caps, &request, &table.columns, &["id"])
+            .await
+            .map(|page| format!("{:?}", page.result.rows)),
+        Browse::Count => pool.count_rows(caps, &request).await.map(|n| n.to_string()),
+        Browse::TableCount => pool
+            .count_table_rows(caps, table)
+            .await
+            .map(|n| n.to_string()),
+        Browse::Cell => {
+            let identity = RowIdentity::PrimaryKey {
+                columns: vec!["id".into()],
+            };
+            let locator = RowLocator {
+                identity_values: vec![Value::Integer(1)],
+            };
+            let column = &table
+                .columns
+                .iter()
+                .find(|c| c.name != "id")
+                .expect("a column besides id")
+                .name;
+            pool.fetch_cell(caps, table, &identity, &locator, column)
+                .await
+                .map(|cell| format!("{:?}", cell.value))
+        }
+        Browse::Export => {
+            let (sql, params) = request.select_sql(pool.dialect());
+            let mut out = Vec::new();
+            pool.export(caps, &sql, &params, ExportFormat::Csv, &mut out)
+                .await
+                .map(|_| String::from_utf8(out).unwrap())
+        }
+    }
+}
+
+async fn object_named(pool: &DbPool, name: &str) -> TableMeta {
+    pool.introspect()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == name)
+        .unwrap_or_else(|| panic!("introspection did not list {name}"))
+}
+
+/// Browsing a view that writes when read, on one engine with sequences: the
+/// marked read is refused by the engine and the sequence does not move, and
+/// the same read unmarked does move it — so the refusal is what stopped it.
+async fn assert_browsing_does_not_write(var: &str, pool: &DbPool) {
+    let s = format!("hubro_ro_browse_seq_{}", std::process::id());
+    let v = format!("hubro_ro_browse_view_{}", std::process::id());
+    let _ = pool.execute(&format!("DROP VIEW IF EXISTS {v}")).await;
+    let _ = pool.execute(&format!("DROP SEQUENCE IF EXISTS {s}")).await;
+    pool.execute(&format!("CREATE SEQUENCE {s}")).await.unwrap();
+    // `setval` rather than `nextval`, for YugabyteDB — see `invisible_writes`.
+    // Except on CockroachDB, whose stored view loses `setval`'s second
+    // argument (measured: "unknown signature: setval(oid)" on every read of
+    // it), and which reports one `nextval` exactly.
+    let write = match pool.pg_flavor() {
+        Some(PgFlavor::CockroachDB) => format!("nextval('{s}')"),
+        _ => format!("setval('{s}', 3001)"),
+    };
+    pool.execute(&format!("CREATE VIEW {v} AS SELECT 1 AS id, {write} AS n"))
+        .await
+        .unwrap();
+    let view = object_named(pool, &v).await;
+    let full = pool.backend_capabilities();
+    let marked = WriteProtection::ReadOnly.apply(full);
+    // Each browse starts from here, and the view moves the sequence off it.
+    let reset = Value::Integer(1);
+
+    let mut wrote = Vec::new();
+    for how in BROWSES {
+        // Unmarked first: whether this browse writes at all is the engine's
+        // business — CockroachDB plans `COUNT(*)` over the view without
+        // calling `nextval` — and a browse that does not write has nothing
+        // to refuse.
+        pool.query(&format!("SELECT setval('{s}', 1)"))
+            .await
+            .unwrap();
+        browse(pool, full, &view, how)
+            .await
+            .unwrap_or_else(|e| panic!("{var}: {how:?} failed unmarked: {e:?}"));
+        let writes = last_value(pool, &s).await != reset;
+
+        pool.query(&format!("SELECT setval('{s}', 1)"))
+            .await
+            .unwrap();
+        let marked_read = browse(pool, marked, &view, how).await;
+        assert_eq!(
+            last_value(pool, &s).await,
+            reset,
+            "{var}: {how:?} moved the sequence on a read-only connection"
+        );
+        if writes {
+            let refused =
+                marked_read.expect_err(&format!("{var}: {how:?} of a writing view ran marked"));
+            // The engine's own refusal, not any failure: a view the engine
+            // cannot run at all would pass a looser check.
+            assert!(
+                refused.to_string().contains("read-only transaction"),
+                "{var}: {how:?} must be refused as a write in a read-only transaction: \
+                 {refused:?}"
+            );
+            wrote.push(how);
+        } else {
+            marked_read.unwrap_or_else(|e| {
+                panic!("{var}: {how:?} writes nothing, yet failed marked: {e:?}")
+            });
+        }
+    }
+    eprintln!("{var}: writes when browsed unmarked: {wrote:?}");
+    // The page is the browse every engine runs the view for; without it,
+    // nothing above was refused and the test would prove nothing.
+    assert!(
+        wrote.iter().any(|how| matches!(how, Browse::Page)),
+        "{var}: browsing the view did not write even unmarked: {wrote:?}"
+    );
+
+    pool.execute(&format!("DROP VIEW {v}")).await.unwrap();
+    pool.execute(&format!("DROP SEQUENCE {s}")).await.unwrap();
+}
+
+/// Browsing an ordinary table on a marked connection reads what the same
+/// browse reads unmarked, on every Postgres-wire engine — the read-only
+/// transaction must not cost a working grid anywhere.
+async fn assert_marked_browsing_reads(var: &str, pool: &DbPool) {
+    let t = format!("hubro_ro_browse_t_{}", std::process::id());
+    let _ = pool.execute(&format!("DROP TABLE IF EXISTS {t}")).await;
+    pool.execute(&format!("CREATE TABLE {t} (id int, body text)"))
+        .await
+        .unwrap();
+    pool.execute(&format!(
+        "INSERT INTO {t} VALUES (1, 'one'), (2, 'two'), (3, 'three')"
+    ))
+    .await
+    .unwrap();
+    if pool.pg_flavor() == Some(PgFlavor::RisingWave) {
+        // RisingWave makes a write visible to reads only once flushed.
+        pool.execute("FLUSH").await.unwrap();
+    }
+    let table = object_named(pool, &t).await;
+    let full = pool.backend_capabilities();
+    let marked = WriteProtection::ReadOnly.apply(full);
+    for how in BROWSES {
+        let unmarked = browse(pool, full, &table, how)
+            .await
+            .unwrap_or_else(|e| panic!("{var}: {how:?} failed unmarked: {e:?}"));
+        let read = browse(pool, marked, &table, how)
+            .await
+            .unwrap_or_else(|e| panic!("{var}: {how:?} failed on a marked connection: {e:?}"));
+        // Page and export rows come back in no promised order.
+        let sorted = |text: &str| {
+            let mut chars: Vec<char> = text.chars().collect();
+            chars.sort_unstable();
+            chars
+        };
+        assert_eq!(sorted(&read), sorted(&unmarked), "{var}: {how:?}");
+    }
+    pool.execute(&format!("DROP TABLE {t}")).await.unwrap();
+}
+
+#[tokio::test]
+async fn browsing_a_writing_view_on_a_marked_postgres_connection_is_refused() {
+    let Some(url) = common::pg_test_url().await else {
+        return;
+    };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    assert_browsing_does_not_write("HUBRO_PG_TEST_URL", &pool).await;
+    assert_marked_browsing_reads("HUBRO_PG_TEST_URL", &pool).await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn browsing_a_writing_view_on_a_marked_timescale_connection_is_refused() {
+    let Some(url) = url("HUBRO_TIMESCALE_TEST_URL") else {
+        return;
+    };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    assert_browsing_does_not_write("HUBRO_TIMESCALE_TEST_URL", &pool).await;
+    assert_marked_browsing_reads("HUBRO_TIMESCALE_TEST_URL", &pool).await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn browsing_a_writing_view_on_a_marked_citus_connection_is_refused() {
+    let Some(url) = url("HUBRO_CITUS_TEST_URL") else {
+        return;
+    };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    assert_browsing_does_not_write("HUBRO_CITUS_TEST_URL", &pool).await;
+    assert_marked_browsing_reads("HUBRO_CITUS_TEST_URL", &pool).await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn browsing_a_writing_view_on_a_marked_cockroach_connection_is_refused() {
+    let Some(url) = url("HUBRO_CRDB_TEST_URL") else {
+        return;
+    };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    assert_browsing_does_not_write("HUBRO_CRDB_TEST_URL", &pool).await;
+    assert_marked_browsing_reads("HUBRO_CRDB_TEST_URL", &pool).await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn browsing_a_writing_view_on_a_marked_yugabyte_connection_is_refused() {
+    let Some(url) = url("HUBRO_YUGABYTE_TEST_URL") else {
+        return;
+    };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    assert_browsing_does_not_write("HUBRO_YUGABYTE_TEST_URL", &pool).await;
+    assert_marked_browsing_reads("HUBRO_YUGABYTE_TEST_URL", &pool).await;
+    pool.close().await;
+}
+
+/// Materialize and RisingWave have no sequences and no function a view can
+/// write through, so there is nothing to refuse — only that browsing inside
+/// their read-only transactions still works.
+#[tokio::test]
+async fn browsing_on_a_marked_materialize_connection_still_reads() {
+    let Some(url) = url("HUBRO_MATERIALIZE_TEST_URL") else {
+        return;
+    };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    assert_marked_browsing_reads("HUBRO_MATERIALIZE_TEST_URL", &pool).await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn browsing_on_a_marked_risingwave_connection_still_reads() {
+    let Some(url) = url("HUBRO_RISINGWAVE_TEST_URL") else {
+        return;
+    };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    assert_marked_browsing_reads("HUBRO_RISINGWAVE_TEST_URL", &pool).await;
+    pool.close().await;
+}
+
+/// Why SQLite browsing needs no read-only open: a `SELECT` there writes only
+/// through a function an application registered or an extension it loaded,
+/// and hubro registers none and lets no statement load one. If this fails,
+/// `DbPool::browse_with`'s SQLite arm has lost its reason.
+#[tokio::test]
+async fn a_sqlite_read_cannot_load_an_extension() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.db");
+    std::fs::File::create(&path).unwrap();
+    let pool = DbPool::open_sqlite(&path).await.unwrap();
+    let refused = pool
+        .query("SELECT load_extension('hubro_no_such_extension')")
+        .await
+        .expect_err("load_extension ran");
+    assert!(
+        refused.to_string().contains("not authorized"),
+        "refused for some other reason than being disabled: {refused}"
+    );
     pool.close().await;
 }

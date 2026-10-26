@@ -617,8 +617,14 @@ impl AppState {
     ) {
         let slot = (id, ExportPane::Grid);
         self.grid_export_tables.write().insert(id, table);
-        let pool = self.registry.read().get(id).map(|c| c.pool.clone());
-        let Some(pool) = pool else {
+        // With the effective capabilities, which decide whether the export
+        // runs where the engine refuses writes — see `DbPool::export`.
+        let pool = self
+            .registry
+            .read()
+            .get(id)
+            .map(|c| (c.pool.clone(), c.capabilities()));
+        let Some((pool, caps)) = pool else {
             self.begin_export(slot);
             self.export_status
                 .write()
@@ -641,7 +647,7 @@ impl AppState {
                         let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
                         let mut writer = std::io::BufWriter::new(file);
                         let rows = pool
-                            .export(&sql, &params, format, &mut writer)
+                            .export(caps, &sql, &params, format, &mut writer)
                             .await
                             .map_err(|e| e.to_string())?;
                         writer.flush().map_err(|e| e.to_string())?;

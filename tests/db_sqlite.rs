@@ -614,7 +614,10 @@ async fn sqlite_reports_rows_only_after_analyze_and_never_reports_a_size() {
         "an un-analyzed database knows nothing: {before:?}"
     );
 
-    let exact = pool.count_table_rows(&artists).await.unwrap();
+    let exact = pool
+        .count_table_rows(Capabilities::FULL, &artists)
+        .await
+        .unwrap();
     assert!(exact > 0, "the fixture seeds artists");
 
     pool.query("ANALYZE").await.unwrap();
@@ -640,7 +643,7 @@ async fn sqlite_reports_rows_only_after_analyze_and_never_reports_a_size() {
     // Quoted and keyword identifiers go through the same qualifier as
     // everything else.
     assert_eq!(
-        pool.count_table_rows(table(&tables, "we\"ird table"))
+        pool.count_table_rows(Capabilities::FULL, table(&tables, "we\"ird table"))
             .await
             .unwrap(),
         3
@@ -733,7 +736,7 @@ async fn sql_text_holding_a_nul_is_refused_at_every_entry_point() {
     assert_eq!(
         within(
             "export",
-            pool.export(read, &[], ExportFormat::Csv, &mut out)
+            pool.export(Capabilities::FULL, read, &[], ExportFormat::Csv, &mut out)
         )
         .await,
         Err(nul_refused())
@@ -797,24 +800,28 @@ async fn a_table_whose_catalog_name_holds_a_nul_is_refused_not_hung() {
         extra_key_column: None,
     };
     assert_eq!(
-        within("fetch_page", pool.fetch_page(&request)).await,
+        within("fetch_page", pool.fetch_page(Capabilities::FULL, &request)).await,
         Err(nul_refused())
     );
     assert_eq!(
         within(
             "fetch_page_bounded",
-            pool.fetch_page_bounded(&request, &crafted.columns, &["id"])
+            pool.fetch_page_bounded(Capabilities::FULL, &request, &crafted.columns, &["id"])
         )
         .await
         .err(),
         Some(nul_refused())
     );
     assert_eq!(
-        within("count_rows", pool.count_rows(&request)).await,
+        within("count_rows", pool.count_rows(Capabilities::FULL, &request)).await,
         Err(nul_refused())
     );
     assert_eq!(
-        within("count_table_rows", pool.count_table_rows(&crafted)).await,
+        within(
+            "count_table_rows",
+            pool.count_table_rows(Capabilities::FULL, &crafted)
+        )
+        .await,
         Err(nul_refused())
     );
     let (sql, params) = request.export_sql(pool.dialect());
@@ -822,7 +829,13 @@ async fn a_table_whose_catalog_name_holds_a_nul_is_refused_not_hung() {
     assert_eq!(
         within(
             "export",
-            pool.export(&sql, &params, ExportFormat::Json, &mut out)
+            pool.export(
+                Capabilities::FULL,
+                &sql,
+                &params,
+                ExportFormat::Json,
+                &mut out
+            )
         )
         .await,
         Err(nul_refused())

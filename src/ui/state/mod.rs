@@ -1997,9 +1997,13 @@ impl AppState {
         locator: RowLocator,
         column: String,
     ) -> Result<CellFetch, String> {
-        let pool = self.registry.read().get(id).map(|c| c.pool.clone());
+        let pool = self
+            .registry
+            .read()
+            .get(id)
+            .map(|c| (c.pool.clone(), c.capabilities()));
         let meta = self.table_meta(id, &table);
-        let (Some(pool), Some(meta)) = (pool, meta) else {
+        let (Some((pool, caps)), Some(meta)) = (pool, meta) else {
             return Err("connection or schema no longer available".into());
         };
         // A read path: it only needs the row to be addressable, so it asks
@@ -2009,7 +2013,9 @@ impl AppState {
         let Some(identity) = pool.backend_row_identity(&meta) else {
             return Err("this table has no usable row identity".into());
         };
-        pool.fetch_cell(&meta, &identity, &locator, &column)
+        // The effective capabilities decide whether the fetch runs where the
+        // engine refuses writes — see `DbPool::fetch_page`.
+        pool.fetch_cell(caps, &meta, &identity, &locator, &column)
             .await
             .map_err(|e| e.to_string())
     }
@@ -2063,12 +2069,16 @@ impl AppState {
     /// Only ever from an explicit "count exactly" action — see
     /// [`DbPool::count_table_rows`], which is where the reason lives.
     pub async fn count_table_rows(self, id: ConnectionId, table: TableRef) -> Result<u64, String> {
-        let pool = self.registry.read().get(id).map(|c| c.pool.clone());
+        let pool = self
+            .registry
+            .read()
+            .get(id)
+            .map(|c| (c.pool.clone(), c.capabilities()));
         let meta = self.table_meta(id, &table);
-        let (Some(pool), Some(meta)) = (pool, meta) else {
+        let (Some((pool, caps)), Some(meta)) = (pool, meta) else {
             return Err("connection or schema no longer available".into());
         };
-        pool.count_table_rows(&meta)
+        pool.count_table_rows(caps, &meta)
             .await
             .map_err(|e| e.to_string())
     }
@@ -2224,6 +2234,170 @@ pub fn tab_title(path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::db::Dialect;
+
+    /// The app state's own reads of a table — the exact count and the grid
+    /// export — take the connection's *effective* capabilities from the
+    /// registry when they run, so on a marked Postgres connection a view that
+    /// writes when read is refused by the engine; and unmarked through
+    /// `set_protection`, the same reads run and write, which is what makes
+    /// the refusal mean something. The grid's page and count take theirs the
+    /// same way, in a component no test mounts.
+    #[tokio::test]
+    async fn a_marked_connections_count_and_export_run_where_the_engine_refuses_writes() {
+        use crate::db::{ExportFormat, Value, WriteProtection};
+        use std::future::Future as _;
+        let Ok(url) = std::env::var("HUBRO_PG_TEST_URL") else {
+            eprintln!("skipping: HUBRO_PG_TEST_URL not set");
+            return;
+        };
+        let pool = DbPool::open_postgres(&url).await.unwrap();
+        let s = format!("hubro_state_ro_seq_{}", std::process::id());
+        let v = format!("hubro_state_ro_view_{}", std::process::id());
+        let _ = pool.execute(&format!("DROP VIEW IF EXISTS {v}")).await;
+        let _ = pool.execute(&format!("DROP SEQUENCE IF EXISTS {s}")).await;
+        pool.execute(&format!("CREATE SEQUENCE {s}")).await.unwrap();
+        pool.execute(&format!(
+            "CREATE VIEW {v} AS SELECT 1 AS id, setval('{s}', 3001) AS n"
+        ))
+        .await
+        .unwrap();
+        let meta = pool
+            .introspect()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.name == v)
+            .expect("the view is listed");
+        let table = TableRef {
+            schema: meta.schema.clone(),
+            name: v.clone(),
+        };
+        let last_value = || {
+            let pool = pool.clone();
+            let s = s.clone();
+            async move {
+                pool.query(&format!("SELECT last_value FROM {s}"))
+                    .await
+                    .unwrap()
+                    .rows[0][0]
+                    .clone()
+            }
+        };
+        let reset = || {
+            let pool = pool.clone();
+            let s = s.clone();
+            async move {
+                pool.query(&format!("SELECT setval('{s}', 1)"))
+                    .await
+                    .unwrap();
+            }
+        };
+
+        let mut dom = dioxus::core::VirtualDom::new(|| rsx! {});
+        let state = crate::ui::test_dom::provide_state(&dom);
+        let id = dom.in_runtime(|| {
+            let mut registry = state.registry;
+            let id = registry
+                .write()
+                .insert("pg", pool.clone(), WriteProtection::ReadOnly);
+            let mut schemas = state.schemas;
+            schemas
+                .write()
+                .insert(id, SchemaLoad::Ready(vec![meta.clone()]));
+            id
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (sql, params) = crate::db::PageRequest {
+            schema: meta.schema.clone(),
+            table: v.clone(),
+            limit: 100,
+            offset: 0,
+            sort: None,
+            filter: None,
+            extra_key_column: None,
+        }
+        .select_sql(Dialect::Postgres);
+
+        for (protection, marked) in [
+            (WriteProtection::ReadOnly, true),
+            (WriteProtection::Open, false),
+        ] {
+            dom.in_runtime(|| {
+                let mut registry = state.registry;
+                registry.write().set_protection(id, protection);
+            });
+
+            reset().await;
+            let mut count =
+                std::pin::pin!(dom.in_runtime(|| state.count_table_rows(id, table.clone())));
+            let counted =
+                std::future::poll_fn(|cx| dom.in_runtime(|| count.as_mut().poll(cx))).await;
+            match (&counted, marked) {
+                (Err(e), true) => assert!(e.contains("read-only transaction"), "{e}"),
+                (Ok(_), false) => {}
+                _ => panic!("{protection:?}: the exact count gave {counted:?}"),
+            }
+            assert_eq!(
+                last_value().await == Value::Integer(1),
+                marked,
+                "{protection:?}: the exact count's write"
+            );
+
+            reset().await;
+            let path = dir.path().join(format!("{protection:?}.csv"));
+            dom.in_runtime(|| {
+                state.export_query(
+                    id,
+                    table.clone(),
+                    sql.clone(),
+                    params.clone(),
+                    ExportFormat::Csv,
+                    path.clone(),
+                )
+            });
+            let finished = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let status = dom.in_runtime(|| {
+                        state
+                            .export_status
+                            .peek()
+                            .get(&(id, ExportPane::Grid))
+                            .cloned()
+                    });
+                    match status {
+                        Some(ExportStatus::Done { .. }) | Some(ExportStatus::Failed(_)) => {
+                            break status
+                        }
+                        _ => {
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_millis(50),
+                                dom.wait_for_work(),
+                            )
+                            .await;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("the export never finished");
+            match (&finished, marked) {
+                (Some(ExportStatus::Failed(e)), true) => {
+                    assert!(e.contains("read-only transaction"), "{e}")
+                }
+                (Some(ExportStatus::Done { rows: 1 }), false) => {}
+                _ => panic!("{protection:?}: the export ended {finished:?}"),
+            }
+            assert_eq!(
+                last_value().await == Value::Integer(1),
+                marked,
+                "{protection:?}: the export's write"
+            );
+        }
+
+        pool.execute(&format!("DROP VIEW {v}")).await.unwrap();
+        pool.execute(&format!("DROP SEQUENCE {s}")).await.unwrap();
+        pool.close().await;
+    }
 
     #[test]
     fn the_settings_notice_is_raised_once_a_session() {

@@ -185,9 +185,9 @@ fn protection_hint(protection: WriteProtection, backend: BackendKind) -> &'stati
         // The read-only transaction covers this connection only; a function
         // that writes over a connection of its own is beyond it.
         WriteProtection::ReadOnly if backend == BackendKind::Postgres => {
-            "Writes are refused, including from the SQL editor, where the database itself \
-             refuses them too — except through a function that opens a connection of its \
-             own, such as dblink or Citus's run_command_on_*."
+            "Writes are refused, including from the SQL editor and from browsing a view that \
+             writes, where the database itself refuses them too — except through a function \
+             that opens a connection of its own, such as dblink or Citus's run_command_on_*."
         }
         WriteProtection::ReadOnly => {
             "Writes are refused, including from the SQL editor, where the database itself \

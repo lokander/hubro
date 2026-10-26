@@ -8,6 +8,7 @@
 // only a subset of it, so unused-item lints would fire spuriously.
 #![allow(dead_code)]
 
+use hubro::db::Capabilities;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -1007,7 +1008,7 @@ pub async fn row_addressing_failures(pool: &DbPool, table: &hubro::db::TableMeta
         extra_key_column: None,
     };
     let page = pool
-        .fetch_page_bounded(&request, &table.columns, &keys)
+        .fetch_page_bounded(Capabilities::FULL, &request, &table.columns, &keys)
         .await
         .unwrap_or_else(|e| panic!("{}: page fetch failed: {e}", table.name));
     let column = |name: &str| {
@@ -1037,7 +1038,10 @@ pub async fn row_addressing_failures(pool: &DbPool, table: &hubro::db::TableMeta
         let (Value::Text(prefix), Some(preview)) = (&row[body_at], previews[body_at]) else {
             panic!("{label}: body must be a previewed text cell");
         };
-        match pool.fetch_cell(table, &identity, &locator, "body").await {
+        match pool
+            .fetch_cell(Capabilities::FULL, table, &identity, &locator, "body")
+            .await
+        {
             Ok(cell) => match &cell.value {
                 Value::Text(full)
                     if full.chars().count() as u64 == preview.full_len
@@ -1066,7 +1070,7 @@ pub async fn row_addressing_failures(pool: &DbPool, table: &hubro::db::TableMeta
         }
     }
     let after = pool
-        .fetch_page_bounded(&request, &table.columns, &keys)
+        .fetch_page_bounded(Capabilities::FULL, &request, &table.columns, &keys)
         .await
         .unwrap_or_else(|e| panic!("{}: page re-read failed: {e}", table.name));
     let tag_at = after
@@ -1135,7 +1139,7 @@ pub async fn fk_jump_failures(
     };
     let fk_columns: Vec<&str> = fk.columns.iter().map(String::as_str).collect();
     let page = pool
-        .fetch_page_bounded(&source, &child.columns, &fk_columns)
+        .fetch_page_bounded(Capabilities::FULL, &source, &child.columns, &fk_columns)
         .await
         .unwrap_or_else(|e| panic!("{}: page fetch failed: {e}", child.name));
     assert!(!page.result.rows.is_empty(), "{}: no rows", child.name);
@@ -1188,7 +1192,7 @@ pub async fn fk_jump_failures(
             extra_key_column: None,
         };
         match pool
-            .fetch_page_bounded(&request, &parent.columns, &keys)
+            .fetch_page_bounded(Capabilities::FULL, &request, &parent.columns, &keys)
             .await
         {
             Ok(landed) => {
@@ -1208,7 +1212,7 @@ pub async fn fk_jump_failures(
             }
             Err(e) => failures.push(format!("{label}: the page failed: {e}")),
         }
-        match pool.count_rows(&request).await {
+        match pool.count_rows(Capabilities::FULL, &request).await {
             Ok(1) => {}
             Ok(n) => failures.push(format!("{label}: the count was {n}")),
             Err(e) => failures.push(format!("{label}: the count failed: {e}")),
@@ -1483,7 +1487,7 @@ pub async fn contains_filter_mismatches(
             filter: Some(Filter::contains("v", *needle)),
             extra_key_column: None,
         };
-        let got: Vec<i64> = match pool.fetch_page(&request).await {
+        let got: Vec<i64> = match pool.fetch_page(Capabilities::FULL, &request).await {
             Ok(page) => page
                 .rows
                 .iter()

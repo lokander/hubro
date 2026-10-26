@@ -35,6 +35,7 @@
 
 mod common;
 
+use hubro::db::Capabilities;
 use std::collections::HashMap;
 
 use tokio::sync::Mutex;
@@ -223,10 +224,10 @@ async fn distributed_table_pages_sorts_and_filters_across_shards() {
         filter: Some(Filter::equals("country", "no")),
         extra_key_column: None,
     };
-    let total = pool.count_rows(&request).await.unwrap();
+    let total = pool.count_rows(Capabilities::FULL, &request).await.unwrap();
     assert!(total > 50, "expected a spread of rows, got {total}");
 
-    let page = pool.fetch_page(&request).await.unwrap();
+    let page = pool.fetch_page(Capabilities::FULL, &request).await.unwrap();
     assert_eq!(page.rows.len(), 5);
     let ids: Vec<i64> = page
         .rows
@@ -243,10 +244,13 @@ async fn distributed_table_pages_sorts_and_filters_across_shards() {
     // The next page continues the same ordering rather than restarting per
     // shard, which is the thing a fan-out merge could plausibly get wrong.
     let next = pool
-        .fetch_page(&PageRequest {
-            offset: 5,
-            ..request
-        })
+        .fetch_page(
+            Capabilities::FULL,
+            &PageRequest {
+                offset: 5,
+                ..request
+            },
+        )
         .await
         .unwrap();
     let next_first = match &next.rows[0][0] {
@@ -375,15 +379,18 @@ async fn changing_the_distribution_column_is_refused_with_citus_own_message() {
 
     // And the row is untouched — the failed statement took nothing with it.
     let page = pool
-        .fetch_page(&PageRequest {
-            schema: Some("public".into()),
-            table: orders.clone(),
-            limit: 1,
-            offset: 0,
-            sort: None,
-            filter: Some(Filter::equals("id", "11")),
-            extra_key_column: None,
-        })
+        .fetch_page(
+            Capabilities::FULL,
+            &PageRequest {
+                schema: Some("public".into()),
+                table: orders.clone(),
+                limit: 1,
+                offset: 0,
+                sort: None,
+                filter: Some(Filter::equals("id", "11")),
+                extra_key_column: None,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(page.rows.len(), 1, "the original row should still be there");
@@ -449,15 +456,18 @@ async fn fk_navigation_crosses_from_distributed_to_reference() {
         .expect("a filter pinning the referenced row");
 
     let page = pool
-        .fetch_page(&PageRequest {
-            schema: Some("public".into()),
-            table: countries.clone(),
-            limit: 10,
-            offset: 0,
-            sort: None,
-            filter: Some(filter),
-            extra_key_column: None,
-        })
+        .fetch_page(
+            Capabilities::FULL,
+            &PageRequest {
+                schema: Some("public".into()),
+                table: countries.clone(),
+                limit: 10,
+                offset: 0,
+                sort: None,
+                filter: Some(filter),
+                extra_key_column: None,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(page.rows.len(), 1);
@@ -581,6 +591,7 @@ async fn scripts_and_exports_span_distributed_and_reference_tables() {
     let mut csv = Vec::new();
     let exported = pool
         .export(
+            Capabilities::FULL,
             &format!("SELECT id, country, total FROM {orders} WHERE country = $1 ORDER BY id"),
             &[Value::Text("no".into())],
             ExportFormat::Csv,
