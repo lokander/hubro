@@ -227,7 +227,9 @@ async fn fetch_cell_reports_a_missing_row_as_an_error_not_null() {
         .unwrap();
     assert_eq!(stored_null.value, Value::Null);
 
-    pool.query("DELETE FROM docs WHERE id = 1").await.unwrap();
+    pool.query_unbounded("DELETE FROM docs WHERE id = 1")
+        .await
+        .unwrap();
     for id in [1, 999] {
         match pool
             .fetch_cell(Reading::UNMARKED, docs, &identity, &at(id), "big_text")

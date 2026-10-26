@@ -108,7 +108,7 @@ async fn sqlite_script_rolls_back_the_whole_batch_on_error() {
     // Atomic wrapping: the whole batch rolled back, so even the CREATE TABLE
     // is gone — the table never came into existence.
     let tables = pool
-        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 't'")
+        .query_unbounded("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 't'")
         .await
         .unwrap();
     assert!(
@@ -135,7 +135,10 @@ async fn sqlite_script_commits_every_statement_on_success() {
     outcome.unwrap();
 
     // All statements committed: the rows are there after the run.
-    let rows = pool.query("SELECT a FROM t ORDER BY a").await.unwrap();
+    let rows = pool
+        .query_unbounded("SELECT a FROM t ORDER BY a")
+        .await
+        .unwrap();
     assert_eq!(
         rows.rows,
         vec![
@@ -173,7 +176,10 @@ async fn sqlite_script_with_vacuum_runs_sequentially_and_keeps_prior_effects() {
     );
 
     // The insert persisted (no wrapping transaction to undo it).
-    let rows = pool.query("SELECT a FROM t ORDER BY a").await.unwrap();
+    let rows = pool
+        .query_unbounded("SELECT a FROM t ORDER BY a")
+        .await
+        .unwrap();
     assert_eq!(
         rows.rows,
         vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
@@ -261,7 +267,10 @@ async fn postgres_errors_carry_line_and_column_positions() {
     let pool = DbPool::open_postgres(&url).await.unwrap();
 
     // The undefined column starts at line 2, column 3.
-    let err = pool.query("SELECT\n  bad_column").await.unwrap_err();
+    let err = pool
+        .query_unbounded("SELECT\n  bad_column")
+        .await
+        .unwrap_err();
     let message = err.to_string();
     assert!(
         message.contains("bad_column") && message.contains("(line 2, column 3)"),
@@ -315,7 +324,7 @@ async fn postgres_script_rolls_back_the_whole_batch_on_error() {
     // Atomic wrapping: the whole batch rolled back, so the CREATE TABLE is
     // undone and the relation does not exist.
     let count = pool
-        .query(
+        .query_unbounded(
             "SELECT count(*)::int FROM information_schema.tables \
              WHERE table_name = 'script_seq'",
         )
@@ -348,7 +357,7 @@ async fn postgres_script_commits_every_statement_on_success() {
     outcome.unwrap();
 
     let rows = pool
-        .query("SELECT a FROM script_ok ORDER BY a")
+        .query_unbounded("SELECT a FROM script_ok ORDER BY a")
         .await
         .unwrap();
     assert_eq!(
@@ -396,7 +405,7 @@ async fn postgres_script_with_vacuum_runs_sequentially_and_keeps_prior_effects()
     );
 
     let rows = pool
-        .query("SELECT a FROM script_vac ORDER BY a")
+        .query_unbounded("SELECT a FROM script_vac ORDER BY a")
         .await
         .unwrap();
     assert_eq!(
@@ -451,7 +460,7 @@ async fn sqlite_script_creates_a_trigger_with_a_multi_statement_body() {
     assert_eq!(err.statement_index, 1);
     assert_eq!(err.rollback, Rollback::Full);
     let triggers = pool
-        .query("SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name")
+        .query_unbounded("SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name")
         .await
         .unwrap();
     assert_eq!(triggers.rows, vec![vec![Value::Text("bump".into())]]);
@@ -511,7 +520,7 @@ async fn assert_hidden_writes_are_refused(pool: &DbPool, table: &str, scripts: &
         let statements = split_statements(script, pool.dialect());
         let full = pool.backend_capabilities();
         let _ = run_script(pool, full, &statements, |_| {}).await;
-        let rows = pool.query(&count).await.unwrap();
+        let rows = pool.query_unbounded(&count).await.unwrap();
         assert_eq!(
             rows.rows,
             vec![vec![Value::Integer(0)]],
@@ -529,7 +538,7 @@ async fn assert_hidden_writes_are_refused(pool: &DbPool, table: &str, scripts: &
             ),
             Ok(_) => panic!("{script:?} ran on a read-only connection, split as {statements:?}"),
         }
-        let rows = pool.query(&count).await.unwrap();
+        let rows = pool.query_unbounded(&count).await.unwrap();
         assert_eq!(rows.rows, vec![vec![Value::Integer(1)]], "{script:?}");
     }
 }
@@ -651,7 +660,10 @@ async fn sqlite_tcl_variables_never_reach_a_later_statement() {
         let statements = split_statements(script, pool.dialect());
         let outcome = run_script(&pool, pool.backend_capabilities(), &statements, |_| {}).await;
         assert!(outcome.is_err(), "{script:?} should fail before running");
-        let rows = pool.query("SELECT COUNT(*) FROM t").await.unwrap();
+        let rows = pool
+            .query_unbounded("SELECT COUNT(*) FROM t")
+            .await
+            .unwrap();
         assert_eq!(rows.rows, vec![vec![Value::Integer(1)]], "{script:?}");
     }
     pool.close().await;
@@ -694,7 +706,7 @@ const SQLITE_SLOW: &str = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x +
                            WHERE x < 300000) SELECT count(*) FROM c";
 
 async fn count(pool: &DbPool, sql: &str) -> Value {
-    pool.query(sql).await.unwrap().rows[0][0].clone()
+    pool.query_unbounded(sql).await.unwrap().rows[0][0].clone()
 }
 
 /// Every pooled connection can take a guarded write and commit it: none is
@@ -812,7 +824,9 @@ async fn sqlite_script_failing_inside_its_transaction_rolls_it_back() {
 /// connections answers; a connection inside an aborted transaction fails.
 async fn pg_open_transactions(pool: &DbPool) -> Vec<String> {
     let reads: Vec<_> = (0..4)
-        .map(|_| pool.query("SELECT pg_current_xact_id_if_assigned()::text, pg_sleep(0.2)"))
+        .map(|_| {
+            pool.query_unbounded("SELECT pg_current_xact_id_if_assigned()::text, pg_sleep(0.2)")
+        })
         .collect();
     futures_util::future::join_all(reads)
         .await

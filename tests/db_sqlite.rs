@@ -308,7 +308,7 @@ async fn a_view_refuses_staged_writes_with_the_stated_reason() {
 
     // Nothing was sent, so the underlying data is untouched.
     let rows = pool
-        .query("SELECT name FROM artist_overview WHERE id = 1")
+        .query_unbounded("SELECT name FROM artist_overview WHERE id = 1")
         .await
         .unwrap();
     assert_eq!(rows.rows[0][0], Value::Text("Ana".into()));
@@ -494,7 +494,7 @@ async fn query_decodes_all_storage_classes() {
     let pool = fixture.open().await;
 
     let result = pool
-        .query("SELECT id, name, rating, cover, notes FROM artists ORDER BY id")
+        .query_unbounded("SELECT id, name, rating, cover, notes FROM artists ORDER BY id")
         .await
         .unwrap();
     let column_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
@@ -530,7 +530,7 @@ async fn query_with_no_rows_yields_empty_result_with_its_headers() {
     // even for zero rows). The sqlx backends have no row to read the names
     // off, so they fall back to describing the statement.
     let empty = pool
-        .query("SELECT artist_id, title FROM albums WHERE 0")
+        .query_unbounded("SELECT artist_id, title FROM albums WHERE 0")
         .await
         .unwrap();
     assert!(empty.rows.is_empty());
@@ -580,7 +580,10 @@ async fn query_against_missing_table_is_a_query_error() {
     let fixture = FixtureDb::full().await;
     let pool = fixture.open().await;
 
-    let err = pool.query("SELECT * FROM missing_table").await.unwrap_err();
+    let err = pool
+        .query_unbounded("SELECT * FROM missing_table")
+        .await
+        .unwrap_err();
     assert!(matches!(err, DbError::Query(_)));
 
     pool.close().await;
@@ -593,7 +596,7 @@ async fn custom_schema_helper_builds_a_usable_database() {
             .await;
     let pool = fixture.open().await;
 
-    let result = pool.query("SELECT sum(x) FROM t").await.unwrap();
+    let result = pool.query_unbounded("SELECT sum(x) FROM t").await.unwrap();
     assert_eq!(result.rows[0][0], Value::Integer(6));
 
     pool.close().await;
@@ -621,7 +624,7 @@ async fn sqlite_reports_rows_only_after_analyze_and_never_reports_a_size() {
         .unwrap();
     assert!(exact > 0, "the fixture seeds artists");
 
-    pool.query("ANALYZE").await.unwrap();
+    pool.query_unbounded("ANALYZE").await.unwrap();
     let after = pool.fetch_table_stats(&artists).await.unwrap();
     assert_eq!(
         after.rows,
@@ -670,7 +673,7 @@ async fn sqlite_explains_a_query_as_raw_output() {
         sql,
         "EXPLAIN QUERY PLAN SELECT * FROM artists WHERE name = 'x'"
     );
-    let result = pool.query(&sql).await.unwrap();
+    let result = pool.query_unbounded(&sql).await.unwrap();
     let PlanDisplay::Raw(text) = PlanDisplay::from_result(support.structured, &result) else {
         panic!("only postgres produces a parsed tree");
     };
@@ -682,11 +685,17 @@ async fn sqlite_explains_a_query_as_raw_output() {
     // And the statement was explained, not run: EXPLAIN QUERY PLAN of a
     // DELETE reports the plan and leaves the rows alone. hubro never adds
     // ANALYZE, and SQLite's EXPLAIN has no such option to add.
-    let before = pool.query("SELECT count(*) FROM artists").await.unwrap();
-    pool.query(&explain_statement("DELETE FROM artists", support))
+    let before = pool
+        .query_unbounded("SELECT count(*) FROM artists")
         .await
         .unwrap();
-    let after = pool.query("SELECT count(*) FROM artists").await.unwrap();
+    pool.query_unbounded(&explain_statement("DELETE FROM artists", support))
+        .await
+        .unwrap();
+    let after = pool
+        .query_unbounded("SELECT count(*) FROM artists")
+        .await
+        .unwrap();
     assert_eq!(before.rows, after.rows);
 
     pool.close().await;
@@ -720,7 +729,10 @@ async fn sql_text_holding_a_nul_is_refused_at_every_entry_point() {
     let read = "SELECT * FROM t;\0";
     let write = "DELETE FROM t;\0";
 
-    assert_eq!(within("query", pool.query(read)).await, Err(nul_refused()));
+    assert_eq!(
+        within("query", pool.query_unbounded(read)).await,
+        Err(nul_refused())
+    );
     assert_eq!(
         within("execute", pool.execute(write)).await,
         Err(nul_refused())
@@ -762,7 +774,7 @@ async fn sql_text_holding_a_nul_is_refused_at_every_entry_point() {
 
     // Nothing ran, and the pool is whole: a hung statement would also have
     // kept its connection.
-    let rows = within("count", pool.query("SELECT count(*) FROM t")).await;
+    let rows = within("count", pool.query_unbounded("SELECT count(*) FROM t")).await;
     assert_eq!(rows.unwrap().rows, vec![vec![Value::Integer(1)]]);
     pool.close().await;
 }
@@ -863,7 +875,7 @@ async fn a_table_whose_catalog_name_holds_a_nul_is_refused_not_hung() {
     assert_eq!(err.message, nul_refused().to_string(), "{err}");
 
     // The row is still there, read under the name SQLite knows.
-    let rows = within("count", pool.query("SELECT count(*) FROM t")).await;
+    let rows = within("count", pool.query_unbounded("SELECT count(*) FROM t")).await;
     assert_eq!(rows.unwrap().rows, vec![vec![Value::Integer(1)]]);
     pool.close().await;
 }
@@ -975,7 +987,7 @@ async fn assigns_an_id(pool: &DbPool, table: &str, insert: &str) -> bool {
         return false;
     }
     let rows = pool
-        .query(&format!("SELECT typeof(id) FROM {table} WHERE x = 'probe'"))
+        .query_unbounded(&format!("SELECT typeof(id) FROM {table} WHERE x = 'probe'"))
         .await
         .unwrap()
         .rows;

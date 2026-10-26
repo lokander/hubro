@@ -17,7 +17,7 @@
 //! "User-facing" is the whole scope of that describe: the capped reads a
 //! script's statements run through ([`DbPool::query_capped`] and
 //! [`ScriptTx::query_capped`](registry::ScriptTx::query_capped)), which hand
-//! their result straight to the SQL editor, and [`DbPool::query`], which only
+//! their result straight to the SQL editor, and [`DbPool::query_unbounded`], which only
 //! the tests use. The internal reads (page fetch,
 //! cell fetch, DDL catalog queries) build their own projection and so already
 //! know their columns, so paying a round trip to recover headers nobody reads

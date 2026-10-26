@@ -143,7 +143,10 @@ async fn postgres_connects_end_to_end_through_the_tunnel() {
     let pool = DbPool::open_postgres(&url)
         .await
         .expect("postgres should connect through the tunnel");
-    let result = pool.query("SELECT 1").await.expect("query through tunnel");
+    let result = pool
+        .query_unbounded("SELECT 1")
+        .await
+        .expect("query through tunnel");
     assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
     pool.close().await;
 }
@@ -177,7 +180,10 @@ async fn sqlserver_connects_end_to_end_through_the_tunnel() {
     let pool = DbPool::open_mssql_with(&full, &MssqlAuth::Password, Some(&tls_host))
         .await
         .expect("sql server should connect through the tunnel");
-    let result = pool.query("SELECT 1").await.expect("query through tunnel");
+    let result = pool
+        .query_unbounded("SELECT 1")
+        .await
+        .expect("query through tunnel");
     assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
     pool.close().await;
 }
@@ -321,7 +327,7 @@ async fn a_session_that_ends_under_the_tunnel_is_reported_and_fails_fast() {
     let pool = DbPool::open_postgres(&url)
         .await
         .expect("pg through tunnel");
-    pool.query("SELECT 1").await.expect("query");
+    pool.query_unbounded("SELECT 1").await.expect("query");
     let ended = tunnel.session_ended();
     tokio::pin!(ended);
     assert!(
@@ -341,9 +347,12 @@ async fn a_session_that_ends_under_the_tunnel_is_reported_and_fails_fast() {
     // And the connection over it fails at once rather than after a timeout:
     // the forward keeps accepting and closes what it cannot open, where a
     // closed port would have had sqlx retry for its 30s acquire timeout.
-    let failed = tokio::time::timeout(std::time::Duration::from_secs(5), pool.query("SELECT 1"))
-        .await
-        .expect("a query over a dead session must fail promptly");
+    let failed = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        pool.query_unbounded("SELECT 1"),
+    )
+    .await
+    .expect("a query over a dead session must fail promptly");
     assert!(failed.is_err(), "{failed:?}");
     pool.close().await;
 }
@@ -365,7 +374,7 @@ async fn tunnel_works_on_a_multi_thread_runtime() {
     let pool = DbPool::open_postgres(&url)
         .await
         .expect("pg through tunnel");
-    pool.query("SELECT 1").await.expect("query");
+    pool.query_unbounded("SELECT 1").await.expect("query");
     pool.close().await;
 }
 

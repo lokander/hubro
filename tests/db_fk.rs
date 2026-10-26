@@ -226,7 +226,7 @@ async fn postgres_fk_jump_selects_the_referenced_rows() {
     };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     for sql in postgres_setup() {
-        pool.query(sql).await.unwrap();
+        pool.query_unbounded(sql).await.unwrap();
     }
     assert_fk_navigation(&pool).await;
     pool.close().await;

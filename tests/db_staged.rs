@@ -94,7 +94,7 @@ async fn sqlite_multi_change_batch_applies_atomically() {
     assert_eq!(counts.deleted_rows, 1);
 
     let check = pool
-        .query("SELECT artist_id, seq, title FROM albums ORDER BY artist_id, seq")
+        .query_unbounded("SELECT artist_id, seq, title FROM albums ORDER BY artist_id, seq")
         .await
         .unwrap();
     let titles: Vec<&Value> = check.rows.iter().map(|r| &r[2]).collect();
@@ -140,7 +140,7 @@ async fn sqlite_multi_column_edits_on_one_row_apply_as_one_row_update() {
     assert_eq!(counts.updated_rows, 1, "grouped into one row update");
 
     let check = pool
-        .query("SELECT name, rating, notes FROM artists WHERE id = 1")
+        .query_unbounded("SELECT name, rating, notes FROM artists WHERE id = 1")
         .await
         .unwrap();
     assert_eq!(check.rows[0][0], Value::Text("Ana B".into()));
@@ -203,11 +203,16 @@ async fn sqlite_failure_mid_batch_rolls_everything_back_and_names_the_change() {
 
     // Nothing landed — not even the valid first update or the insert.
     let check = pool
-        .query("SELECT COUNT(*) FROM albums WHERE title IN ('should not stick', 'also not')")
+        .query_unbounded(
+            "SELECT COUNT(*) FROM albums WHERE title IN ('should not stick', 'also not')",
+        )
         .await
         .unwrap();
     assert_eq!(check.rows[0][0], Value::Integer(0));
-    let count = pool.query("SELECT COUNT(*) FROM albums").await.unwrap();
+    let count = pool
+        .query_unbounded("SELECT COUNT(*) FROM albums")
+        .await
+        .unwrap();
     assert_eq!(count.rows[0][0], Value::Integer(3));
 
     pool.close().await;
@@ -250,7 +255,7 @@ async fn sqlite_sql_error_mid_batch_rolls_back_and_names_the_change() {
     assert_eq!(err.change_index, Some(1));
 
     let check = pool
-        .query("SELECT title FROM albums WHERE artist_id = 1 AND seq = 1")
+        .query_unbounded("SELECT title FROM albums WHERE artist_id = 1 AND seq = 1")
         .await
         .unwrap();
     assert_eq!(check.rows[0][0], Value::Text("First".into()));
@@ -317,7 +322,7 @@ async fn sqlite_rowid_identity_table_edits_end_to_end() {
     assert_eq!(counts.updated_rows, 1);
 
     let check = pool
-        .query("SELECT body FROM notes ORDER BY rowid")
+        .query_unbounded("SELECT body FROM notes ORDER BY rowid")
         .await
         .unwrap();
     let bodies: Vec<&Value> = check.rows.iter().map(|r| &r[0]).collect();
@@ -351,7 +356,7 @@ async fn pg_fixture(pool: &DbPool, schema: &str) {
                 (1, 'one', 10), (2, 'two', 20), (3, 'three', 30)"
         ),
     ] {
-        pool.query(sql).await.unwrap();
+        pool.query_unbounded(sql).await.unwrap();
     }
 }
 
@@ -389,7 +394,7 @@ async fn postgres_multi_change_batch_applies_atomically() {
     assert_eq!(counts.deleted_rows, 1);
 
     let check = pool
-        .query("SELECT id, label, quantity FROM staged_batch.items ORDER BY id")
+        .query_unbounded("SELECT id, label, quantity FROM staged_batch.items ORDER BY id")
         .await
         .unwrap();
     assert_eq!(check.rows.len(), 3);
@@ -441,7 +446,7 @@ async fn postgres_failure_mid_batch_rolls_everything_back_and_names_the_change()
     );
 
     let check = pool
-        .query("SELECT label FROM staged_rollback.items WHERE id = 1")
+        .query_unbounded("SELECT label FROM staged_rollback.items WHERE id = 1")
         .await
         .unwrap();
     assert_eq!(check.rows[0][0], Value::Text("one".into()));
@@ -486,7 +491,7 @@ async fn sqlite_bool_checkbox_stages_integers_end_to_end() {
     .unwrap();
 
     let check = pool
-        .query("SELECT ok FROM flags ORDER BY id")
+        .query_unbounded("SELECT ok FROM flags ORDER BY id")
         .await
         .unwrap();
     assert_eq!(check.rows[0][0], Value::Integer(1));
@@ -518,7 +523,7 @@ async fn postgres_staged_text_values_coerce_to_column_types() {
         "INSERT INTO staged_casts.typed VALUES
             (1, false, '2000-01-01 00:00:00', '{}', 0, 0)",
     ] {
-        pool.query(sql).await.unwrap();
+        pool.query_unbounded(sql).await.unwrap();
     }
     let tables = pool.introspect().await.unwrap();
     let typed = find(&tables, Some("staged_casts"), "typed").clone();
@@ -555,7 +560,9 @@ async fn postgres_staged_text_values_coerce_to_column_types() {
     assert_eq!(counts.updated_rows, 1);
 
     let check = pool
-        .query("SELECT flag, at, doc, amount, quantity FROM staged_casts.typed WHERE id = 1")
+        .query_unbounded(
+            "SELECT flag, at, doc, amount, quantity FROM staged_casts.typed WHERE id = 1",
+        )
         .await
         .unwrap();
     assert_eq!(check.rows[0][0], Value::Text("true".into()));
@@ -608,7 +615,7 @@ async fn postgres_char_n_columns_round_trip_without_truncating() {
         )",
         "INSERT INTO staged_charn.items VALUES ('abc', 'one', 'aaa'), ('ab', 'short', 'bbb')",
     ] {
-        pool.query(sql).await.unwrap();
+        pool.query_unbounded(sql).await.unwrap();
     }
     let tables = pool.introspect().await.unwrap();
     let items = find(&tables, Some("staged_charn"), "items").clone();
@@ -644,7 +651,7 @@ async fn postgres_char_n_columns_round_trip_without_truncating() {
     assert_eq!(counts.updated_rows, 1);
 
     let check = pool
-        .query("SELECT label, tag FROM staged_charn.items WHERE code = 'abc'")
+        .query_unbounded("SELECT label, tag FROM staged_charn.items WHERE code = 'abc'")
         .await
         .unwrap();
     assert_eq!(check.rows[0][0], Value::Text("two".into()));
@@ -667,7 +674,7 @@ async fn postgres_char_n_columns_round_trip_without_truncating() {
     .unwrap();
     assert_eq!(counts.updated_rows, 1);
     let check = pool
-        .query("SELECT label FROM staged_charn.items WHERE code = 'ab'")
+        .query_unbounded("SELECT label FROM staged_charn.items WHERE code = 'ab'")
         .await
         .unwrap();
     assert_eq!(check.rows[0][0], Value::Text("found".into()));
@@ -701,7 +708,7 @@ async fn postgres_bit_n_edits_save_and_a_wrong_length_still_rolls_back() {
         )",
         "INSERT INTO staged_bitn.items VALUES (1, B'101')",
     ] {
-        pool.query(sql).await.unwrap();
+        pool.query_unbounded(sql).await.unwrap();
     }
     let tables = pool.introspect().await.unwrap();
     let items = find(&tables, Some("staged_bitn"), "items").clone();
@@ -724,7 +731,7 @@ async fn postgres_bit_n_edits_save_and_a_wrong_length_still_rolls_back() {
     .expect("a bit(n) column must be writable");
 
     let check = pool
-        .query("SELECT mask::text FROM staged_bitn.items WHERE id = 1")
+        .query_unbounded("SELECT mask::text FROM staged_bitn.items WHERE id = 1")
         .await
         .unwrap();
     assert_eq!(check.rows[0][0], Value::Text("110".into()));
@@ -749,7 +756,7 @@ async fn postgres_bit_n_edits_save_and_a_wrong_length_still_rolls_back() {
     assert_eq!(err.change_index, Some(0), "the edit itself is named");
 
     let check = pool
-        .query("SELECT mask::text FROM staged_bitn.items WHERE id = 1")
+        .query_unbounded("SELECT mask::text FROM staged_bitn.items WHERE id = 1")
         .await
         .unwrap();
     assert_eq!(
@@ -776,7 +783,7 @@ async fn postgres_staged_text_insert_coerces_to_column_types() {
             doc jsonb
         )",
     ] {
-        pool.query(sql).await.unwrap();
+        pool.query_unbounded(sql).await.unwrap();
     }
     let tables = pool.introspect().await.unwrap();
     let typed = find(&tables, Some("staged_cast_insert"), "typed").clone();
@@ -802,7 +809,7 @@ async fn postgres_staged_text_insert_coerces_to_column_types() {
     assert_eq!(counts.inserted_rows, 1);
 
     let check = pool
-        .query("SELECT id, flag, doc FROM staged_cast_insert.typed")
+        .query_unbounded("SELECT id, flag, doc FROM staged_cast_insert.typed")
         .await
         .unwrap();
     assert_eq!(check.rows[0][0], Value::Integer(7));
@@ -845,7 +852,7 @@ async fn postgres_set_null_on_integer_column_works_via_literal_null() {
     assert_eq!(counts.updated_rows, 1);
 
     let check = pool
-        .query("SELECT label, quantity FROM staged_null.items WHERE id = 1")
+        .query_unbounded("SELECT label, quantity FROM staged_null.items WHERE id = 1")
         .await
         .unwrap();
     assert_eq!(check.rows[0][0], Value::Text("emptied".into()));
@@ -903,7 +910,7 @@ async fn sqlite_staged_insert_leaves_defaults_to_the_database() {
 
     // The database assigned id (rowid alias) and the qty default.
     let check = pool
-        .query("SELECT id, label, qty, note FROM items")
+        .query_unbounded("SELECT id, label, qty, note FROM items")
         .await
         .unwrap();
     assert_eq!(check.rows.len(), 1);
@@ -914,7 +921,7 @@ async fn sqlite_staged_insert_leaves_defaults_to_the_database() {
 
     // A second, fully defaultable table: an all-default phantom row goes
     // through INSERT … DEFAULT VALUES.
-    pool.query("CREATE TABLE logs (id INTEGER PRIMARY KEY, note TEXT DEFAULT 'x')")
+    pool.query_unbounded("CREATE TABLE logs (id INTEGER PRIMARY KEY, note TEXT DEFAULT 'x')")
         .await
         .unwrap();
     let tables = pool.introspect().await.unwrap();
@@ -939,7 +946,10 @@ async fn sqlite_staged_insert_leaves_defaults_to_the_database() {
     )
     .await
     .unwrap();
-    let check = pool.query("SELECT id, note FROM logs").await.unwrap();
+    let check = pool
+        .query_unbounded("SELECT id, note FROM logs")
+        .await
+        .unwrap();
     assert_eq!(check.rows[0][0], Value::Integer(1));
     assert_eq!(check.rows[0][1], Value::Text("x".into()));
 
@@ -971,7 +981,7 @@ async fn postgres_staged_insert_gets_serial_and_identity_values() {
             note text
         )",
     ] {
-        pool.query(sql).await.unwrap();
+        pool.query_unbounded(sql).await.unwrap();
     }
     let tables = pool.introspect().await.unwrap();
     let items = find(&tables, Some("staged_insert_defaults"), "items").clone();
@@ -1024,7 +1034,7 @@ async fn postgres_staged_insert_gets_serial_and_identity_values() {
     assert_eq!(counts.inserted_rows, 1);
 
     let check = pool
-        .query(
+        .query_unbounded(
             "SELECT id, seq, by_default, label, qty, doubled, note \
              FROM staged_insert_defaults.items",
         )
@@ -1085,7 +1095,7 @@ async fn sqlite_staged_multi_delete_with_edit_applies_exact_counts() {
     assert_eq!(counts.inserted_rows, 0);
 
     let check = pool
-        .query("SELECT id, name FROM contacts ORDER BY id")
+        .query_unbounded("SELECT id, name FROM contacts ORDER BY id")
         .await
         .unwrap();
     assert_eq!(check.rows.len(), 2);
@@ -1109,7 +1119,7 @@ async fn a_read_only_marking_refuses_a_staged_write_and_leaves_the_row_untouched
     let identity = detect_row_identity(&albums, Dialect::Sqlite).unwrap();
 
     let before = pool
-        .query("SELECT title FROM albums WHERE artist_id = 1 AND seq = 1")
+        .query_unbounded("SELECT title FROM albums WHERE artist_id = 1 AND seq = 1")
         .await
         .unwrap();
 
@@ -1139,7 +1149,7 @@ async fn a_read_only_marking_refuses_a_staged_write_and_leaves_the_row_untouched
     );
 
     let after = pool
-        .query("SELECT title FROM albums WHERE artist_id = 1 AND seq = 1")
+        .query_unbounded("SELECT title FROM albums WHERE artist_id = 1 AND seq = 1")
         .await
         .unwrap();
     assert_eq!(before.rows, after.rows, "nothing may have been written");
@@ -1162,7 +1172,10 @@ async fn a_read_only_marking_refuses_a_delete_from_the_sql_editor() {
         "nothing ran, so nothing was rolled back"
     );
 
-    let count = pool.query("SELECT COUNT(*) FROM albums").await.unwrap();
+    let count = pool
+        .query_unbounded("SELECT COUNT(*) FROM albums")
+        .await
+        .unwrap();
     assert_ne!(
         count.rows[0][0],
         Value::Integer(0),

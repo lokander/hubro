@@ -2260,12 +2260,7 @@ mod tests {
     /// Whether `code` names the identifier `Reading` anywhere — a path, an
     /// import, an alias (`use … Reading as R` names it too).
     fn names_reading(code: &str) -> bool {
-        let ident = |c: char| c.is_alphanumeric() || c == '_';
-        code.match_indices("Reading").any(|(at, word)| {
-            let before = code[..at].chars().next_back();
-            let after = code[at + word.len()..].chars().next();
-            !before.is_some_and(ident) && !after.is_some_and(ident)
-        })
+        crate::source_scan::names_ident(code, "Reading")
     }
 
     #[test]
@@ -2295,19 +2290,8 @@ mod tests {
     fn no_ui_code_builds_its_own_reading() {
         let code_of =
             |text: &str| -> String { code_outside_test_modules(text).split_whitespace().collect() };
-        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for entry in std::fs::read_dir(dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    rust_files(&path, out);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    out.push(path);
-                }
-            }
-        }
         let ui = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui");
-        let mut files = Vec::new();
-        rust_files(&ui, &mut files);
+        let files = crate::source_scan::rust_files(&ui);
         assert!(
             files.len() > 20,
             "found only {} files under src/ui",
@@ -2415,7 +2399,7 @@ mod tests {
             let s = s.clone();
             async move {
                 admin
-                    .query(&format!("SELECT last_value FROM {s}"))
+                    .query_unbounded(&format!("SELECT last_value FROM {s}"))
                     .await
                     .unwrap()
                     .rows[0][0]
@@ -2445,7 +2429,7 @@ mod tests {
                 registry.write().set_protection(id, protection);
             });
             admin
-                .query(&format!("SELECT setval('{s}', 1)"))
+                .query_unbounded(&format!("SELECT setval('{s}', 1)"))
                 .await
                 .unwrap();
             let locator = RowLocator {
@@ -2518,7 +2502,7 @@ mod tests {
             let pool = pool.clone();
             let s = s.clone();
             async move {
-                pool.query(&format!("SELECT last_value FROM {s}"))
+                pool.query_unbounded(&format!("SELECT last_value FROM {s}"))
                     .await
                     .unwrap()
                     .rows[0][0]
@@ -2529,7 +2513,7 @@ mod tests {
             let pool = pool.clone();
             let s = s.clone();
             async move {
-                pool.query(&format!("SELECT setval('{s}', 1)"))
+                pool.query_unbounded(&format!("SELECT setval('{s}', 1)"))
                     .await
                     .unwrap();
             }

@@ -301,8 +301,10 @@ async fn budget_postgres_parity() {
     let pool = DbPool::open_postgres(&url).await.unwrap();
 
     const PG_ROWS: i64 = 100_000;
-    pool.query("DROP TABLE IF EXISTS perf_wide").await.unwrap();
-    pool.query(
+    pool.query_unbounded("DROP TABLE IF EXISTS perf_wide")
+        .await
+        .unwrap();
+    pool.query_unbounded(
         "CREATE TABLE perf_wide (
             id bigint PRIMARY KEY,
             label text NOT NULL,
@@ -311,7 +313,7 @@ async fn budget_postgres_parity() {
     )
     .await
     .unwrap();
-    pool.query(&format!(
+    pool.query_unbounded(&format!(
         "INSERT INTO perf_wide (id, label, amount)
          SELECT g, 'row ' || g, g * 0.5 FROM generate_series(1, {PG_ROWS}) AS g"
     ))
@@ -349,6 +351,8 @@ async fn budget_postgres_parity() {
     .await;
     println!("pg_page_nav_deep p50={:?} p95={:?}", nav.p50(), nav.p95());
 
-    pool.query("DROP TABLE IF EXISTS perf_wide").await.unwrap();
+    pool.query_unbounded("DROP TABLE IF EXISTS perf_wide")
+        .await
+        .unwrap();
     pool.close().await;
 }

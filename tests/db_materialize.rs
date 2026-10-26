@@ -130,7 +130,7 @@ async fn fresh_fixture(pool: &DbPool, suffix: &str) -> (String, String, String) 
              SELECT sensor_id, avg(temperature) AS avg_temp FROM {readings} GROUP BY sensor_id"
         ),
     ] {
-        pool.query(&sql).await.unwrap();
+        pool.query_unbounded(&sql).await.unwrap();
     }
     (readings, view, matview)
 }
@@ -284,7 +284,7 @@ async fn materialize_refuses_keys_so_no_table_is_editable() {
     // Not a property of this fixture but of the engine: Materialize rejects
     // both ways of declaring a key, so *no* table here can ever have one.
     let refused = pool
-        .query("CREATE TABLE mz_keyed_probe (id int PRIMARY KEY)")
+        .query_unbounded("CREATE TABLE mz_keyed_probe (id int PRIMARY KEY)")
         .await
         .expect_err("Materialize does not support primary keys");
     assert!(
@@ -417,10 +417,10 @@ async fn materialize_is_a_fully_capable_connection_despite_editing_nothing() {
     assert_eq!(pool.backend_capabilities(), Capabilities::FULL);
 
     let table = "mz_caps_probe";
-    pool.query(&format!("DROP TABLE IF EXISTS {table}"))
+    pool.query_unbounded(&format!("DROP TABLE IF EXISTS {table}"))
         .await
         .unwrap();
-    pool.query(&format!("CREATE TABLE {table} (id int, note text)"))
+    pool.query_unbounded(&format!("CREATE TABLE {table} (id int, note text)"))
         .await
         .unwrap();
 
@@ -444,7 +444,9 @@ async fn materialize_is_a_fully_capable_connection_despite_editing_nothing() {
         1
     );
 
-    pool.query(&format!("DROP TABLE {table}")).await.unwrap();
+    pool.query_unbounded(&format!("DROP TABLE {table}"))
+        .await
+        .unwrap();
     pool.close().await;
 }
 
@@ -460,7 +462,7 @@ async fn materialize_rolls_back_a_transaction_including_its_ddl() {
     // per-engine capability rather than something assumed of Postgres-wire
     // engines generally.
     let table = "mz_tx_probe";
-    pool.query(&format!("DROP TABLE IF EXISTS {table}"))
+    pool.query_unbounded(&format!("DROP TABLE IF EXISTS {table}"))
         .await
         .unwrap();
 
@@ -471,7 +473,7 @@ async fn materialize_rolls_back_a_transaction_including_its_ddl() {
     let _ = tx.rollback().await;
 
     let survivors = pool
-        .query(&format!(
+        .query_unbounded(&format!(
             "SELECT count(*) FROM information_schema.tables WHERE table_name = '{table}'"
         ))
         .await
@@ -525,7 +527,7 @@ async fn materialize_reports_no_statistics_rather_than_a_row_of_zeroes() {
         format!("DROP VIEW IF EXISTS {view}"),
         format!("DROP TABLE IF EXISTS {readings}"),
     ] {
-        pool.query(&sql).await.unwrap();
+        pool.query_unbounded(&sql).await.unwrap();
     }
     pool.close().await;
 }
@@ -582,7 +584,7 @@ async fn materialize_write_only_transaction_left_open_is_rolled_back_and_said_to
         async move { hubro::db::run_script(pool, caps, &statements, |_| {}).await }
     };
     let rows = || async {
-        pool.query("SELECT count(*) FROM write_only")
+        pool.query_unbounded("SELECT count(*) FROM write_only")
             .await
             .unwrap()
             .rows[0][0]

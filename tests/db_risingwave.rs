@@ -161,7 +161,7 @@ async fn fresh_fixture(pool: &DbPool, suffix: &str) -> (String, String) {
              SELECT sensor_id, avg(temperature) AS avg_temp FROM {readings} GROUP BY sensor_id"
         ),
     ] {
-        pool.query(&sql).await.unwrap();
+        pool.query_unbounded(&sql).await.unwrap();
     }
     (readings, matview)
 }
@@ -197,13 +197,13 @@ async fn risingwave_is_not_mistaken_for_stock_postgres() {
 /// through a barrier, so a read issued immediately after a write can miss it.
 async fn settle(pool: &DbPool, sql: &str, expected: i64) {
     for _ in 0..40 {
-        let rows = pool.query(sql).await.unwrap();
+        let rows = pool.query_unbounded(sql).await.unwrap();
         if integer(&rows.rows[0][0]) == expected {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-    let rows = pool.query(sql).await.unwrap();
+    let rows = pool.query_unbounded(sql).await.unwrap();
     panic!(
         "never settled: {sql} gave {:?}, expected {expected}",
         rows.rows[0][0]
@@ -251,10 +251,10 @@ async fn risingwave_writes_are_not_visible_to_an_immediate_read() {
     // the barrier is a timing detail, and a test that required the row to be
     // absent would be a test that fails on a slow enough machine.
     let table = "rw_visibility_probe";
-    pool.query(&format!("DROP TABLE IF EXISTS {table}"))
+    pool.query_unbounded(&format!("DROP TABLE IF EXISTS {table}"))
         .await
         .unwrap();
-    pool.query(&format!("CREATE TABLE {table} (id int, PRIMARY KEY (id))"))
+    pool.query_unbounded(&format!("CREATE TABLE {table} (id int, PRIMARY KEY (id))"))
         .await
         .unwrap();
     pool.execute(&format!("INSERT INTO {table} VALUES (1)"))
@@ -263,7 +263,9 @@ async fn risingwave_writes_are_not_visible_to_an_immediate_read() {
 
     settle(&pool, &format!("SELECT count(*) FROM {table}"), 1).await;
 
-    pool.query(&format!("DROP TABLE {table}")).await.unwrap();
+    pool.query_unbounded(&format!("DROP TABLE {table}"))
+        .await
+        .unwrap();
     pool.close().await;
 }
 
@@ -349,7 +351,7 @@ async fn risingwave_keyed_table_is_refused_for_editing_with_the_reason() {
 
     // Nothing was written.
     let rows = pool
-        .query(&format!(
+        .query_unbounded(&format!(
             "SELECT note FROM {readings} WHERE id = 1 AND sensor_id = 1"
         ))
         .await
@@ -370,10 +372,10 @@ async fn risingwave_scripts_run_sequentially_instead_of_claiming_atomicity() {
     // the truth on this engine, and saying it is the point — the alternative
     // is a rollback message that means nothing.
     let table = "rw_script_probe";
-    pool.query(&format!("DROP TABLE IF EXISTS {table}"))
+    pool.query_unbounded(&format!("DROP TABLE IF EXISTS {table}"))
         .await
         .unwrap();
-    pool.query(&format!("CREATE TABLE {table} (id int, PRIMARY KEY (id))"))
+    pool.query_unbounded(&format!("CREATE TABLE {table} (id int, PRIMARY KEY (id))"))
         .await
         .unwrap();
 
@@ -395,7 +397,9 @@ async fn risingwave_scripts_run_sequentially_instead_of_claiming_atomicity() {
     // visible (see the header).
     settle(&pool, &format!("SELECT count(*) FROM {table}"), 1).await;
 
-    pool.query(&format!("DROP TABLE {table}")).await.unwrap();
+    pool.query_unbounded(&format!("DROP TABLE {table}"))
+        .await
+        .unwrap();
     pool.close().await;
 }
 
@@ -531,7 +535,7 @@ async fn risingwave_source_and_sink_are_read_only_and_say_which_they_are() {
          WITH (connector = 'datagen', datagen.rows.per.second = '1') \
          FORMAT PLAIN ENCODE JSON",
     ] {
-        pool.query(sql).await.unwrap();
+        pool.query_unbounded(sql).await.unwrap();
     }
 
     let tables = pool.introspect().await.unwrap();
@@ -579,7 +583,7 @@ async fn risingwave_source_and_sink_are_read_only_and_say_which_they_are() {
     // And the claim is true of the engine, not just of hubro's model: the read
     // the gate suppresses is one RisingWave itself refuses.
     let attempted = pool
-        .query("SELECT * FROM rw_edge_sink LIMIT 1")
+        .query_unbounded("SELECT * FROM rw_edge_sink LIMIT 1")
         .await
         .expect_err("a sink stores no rows");
     assert!(
@@ -592,7 +596,7 @@ async fn risingwave_source_and_sink_are_read_only_and_say_which_they_are() {
         "DROP SOURCE rw_edge_source",
         "DROP TABLE rw_edge_base",
     ] {
-        pool.query(sql).await.unwrap();
+        pool.query_unbounded(sql).await.unwrap();
     }
     pool.close().await;
 }
@@ -632,10 +636,10 @@ async fn risingwave_has_no_pg_class_statistics_so_none_are_invented() {
         2
     );
 
-    pool.query(&format!("DROP MATERIALIZED VIEW IF EXISTS {matview}"))
+    pool.query_unbounded(&format!("DROP MATERIALIZED VIEW IF EXISTS {matview}"))
         .await
         .unwrap();
-    pool.query(&format!("DROP TABLE IF EXISTS {readings}"))
+    pool.query_unbounded(&format!("DROP TABLE IF EXISTS {readings}"))
         .await
         .unwrap();
     pool.close().await;
@@ -676,7 +680,7 @@ async fn risingwave_long_cells_load_through_every_key_type() {
             format!("INSERT INTO rw_addr_{slug} VALUES {}", rows.join(", ")),
             "FLUSH".to_string(),
         ] {
-            pool.query(&sql)
+            pool.query_unbounded(&sql)
                 .await
                 .unwrap_or_else(|e| panic!("{slug}: {sql}: {e}"));
         }
@@ -718,7 +722,7 @@ async fn risingwave_long_cells_load_through_every_key_type() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 
     for (slug, _, _) in key_types {
-        pool.query(&format!("DROP TABLE rw_addr_{slug}"))
+        pool.query_unbounded(&format!("DROP TABLE rw_addr_{slug}"))
             .await
             .unwrap();
     }

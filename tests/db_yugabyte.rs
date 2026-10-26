@@ -177,7 +177,7 @@ async fn fresh_fixture(pool: &DbPool, suffix: &str) -> (String, String) {
         ),
         format!("CREATE INDEX {readings}_by_temp ON {readings} (temperature)"),
     ] {
-        pool.query(&sql).await.unwrap();
+        pool.query_unbounded(&sql).await.unwrap();
     }
     drop(guard);
 
@@ -190,7 +190,7 @@ async fn fresh_fixture(pool: &DbPool, suffix: &str) -> (String, String) {
              SELECT g, s.id, g * 1.5 FROM generate_series(1, 8) g CROSS JOIN {sensors} s"
         ),
     ] {
-        pool.query(&sql).await.unwrap();
+        pool.query_unbounded(&sql).await.unwrap();
     }
     (readings, sensors)
 }
@@ -199,7 +199,7 @@ async fn fresh_fixture(pool: &DbPool, suffix: &str) -> (String, String) {
 async fn with_ddl(pool: &DbPool, statements: &[String]) {
     let _guard = ddl_lock().lock().await;
     for sql in statements {
-        pool.query(sql).await.unwrap();
+        pool.query_unbounded(sql).await.unwrap();
     }
 }
 
@@ -423,7 +423,7 @@ async fn yugabyte_table_without_a_key_is_read_only_like_postgres() {
         ],
     )
     .await;
-    pool.query("INSERT INTO yb_nokey (a, b) VALUES (1, 'one'), (2, 'two')")
+    pool.query_unbounded("INSERT INTO yb_nokey (a, b) VALUES (1, 'one'), (2, 'two')")
         .await
         .unwrap();
 
@@ -620,7 +620,7 @@ async fn yugabyte_script_dml_rolls_back_but_its_ddl_does_not() {
     drop(guard);
 
     let survivors = pool
-        .query(
+        .query_unbounded(
             "SELECT count(*) FROM information_schema.tables \
              WHERE table_name = 'yb_script_ddl'",
         )
@@ -635,7 +635,7 @@ async fn yugabyte_script_dml_rolls_back_but_its_ddl_does_not() {
     // ...while the write in the same script really is undone. This is the half
     // that keeps `transactions: true` honest.
     let rows = pool
-        .query("SELECT count(*) FROM yb_script_dml")
+        .query_unbounded("SELECT count(*) FROM yb_script_dml")
         .await
         .unwrap();
     assert_eq!(
@@ -736,8 +736,8 @@ async fn yugabyte_refuses_concurrent_ddl_without_corrupting_anything() {
     // document.
     let guard = ddl_lock().lock().await;
     let (a, b) = tokio::join!(
-        pool.query("CREATE TABLE yb_race_a (id int PRIMARY KEY)"),
-        pool.query("CREATE TABLE yb_race_b (id int PRIMARY KEY)"),
+        pool.query_unbounded("CREATE TABLE yb_race_a (id int PRIMARY KEY)"),
+        pool.query_unbounded("CREATE TABLE yb_race_b (id int PRIMARY KEY)"),
     );
     drop(guard);
 
@@ -844,10 +844,10 @@ async fn yugabyte_row_estimate_arrives_but_its_size_accounting_lags() {
     );
 
     let _guard = ddl_lock().lock().await;
-    pool.query(&format!("DROP TABLE IF EXISTS {readings} CASCADE"))
+    pool.query_unbounded(&format!("DROP TABLE IF EXISTS {readings} CASCADE"))
         .await
         .unwrap();
-    pool.query(&format!("DROP TABLE IF EXISTS {sensors} CASCADE"))
+    pool.query_unbounded(&format!("DROP TABLE IF EXISTS {sensors} CASCADE"))
         .await
         .unwrap();
     pool.close().await;
@@ -928,7 +928,7 @@ async fn a_capped_read_that_writes_keeps_its_writes_though_yugabyte_cannot_say_i
         let mut kept = Value::Null;
         for _ in 0..300 {
             kept = pool
-                .query("SELECT count(*) FROM yb_capped_side")
+                .query_unbounded("SELECT count(*) FROM yb_capped_side")
                 .await
                 .unwrap()
                 .rows[0][0]

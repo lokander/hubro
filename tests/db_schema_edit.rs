@@ -109,7 +109,7 @@ fn qualified(meta: &TableMeta) -> String {
 async fn row_count(pool: &DbPool, meta: &TableMeta) -> i64 {
     let sql = format!("SELECT COUNT(*) FROM {}", qualified(meta));
     let result = pool
-        .query(&sql)
+        .query_unbounded(&sql)
         .await
         .unwrap_or_else(|e| panic!("counting rows failed: {e}\n{sql}"));
     match result.rows.first().and_then(|row| row.first()) {
@@ -640,9 +640,11 @@ async fn a_read_only_connection_is_offered_nothing_on_any_dialect() {
 /// name first. Returns the table name, which is suffixed per engine so two
 /// suites pointed at one server cannot collide.
 async fn seed(pool: &DbPool, name: &str, flavor: Flavor) {
-    let _ = pool.query(&format!("DROP TABLE IF EXISTS {name}")).await;
+    let _ = pool
+        .query_unbounded(&format!("DROP TABLE IF EXISTS {name}"))
+        .await;
     for statement in split_statements(&fixture_sql(name, flavor), pool.dialect()) {
-        pool.query(&statement)
+        pool.query_unbounded(&statement)
             .await
             .unwrap_or_else(|e| panic!("seeding {name} failed: {e}\n{statement}"));
     }
@@ -801,7 +803,7 @@ async fn sqlserver_renames_through_sp_rename() {
     assert!(find(&tables, "se_renamed").is_some());
     assert!(find(&tables, "se_rename").is_none());
 
-    let _ = pool.query("DROP TABLE se_renamed").await;
+    let _ = pool.query_unbounded("DROP TABLE se_renamed").await;
     pool.close().await;
 }
 
@@ -1017,11 +1019,11 @@ async fn sqlserver_add_column_ignores_the_session_null_default() {
         return;
     };
     let pool = DbPool::open_mssql(&url).await.unwrap();
-    let _ = pool.query("DROP TABLE se_nulls").await;
+    let _ = pool.query_unbounded("DROP TABLE se_nulls").await;
 
     // The setting is not inert: it reaches CREATE TABLE, where a bare column
     // does come out NOT NULL.
-    pool.query(
+    pool.query_unbounded(
         "SET ANSI_NULL_DFLT_ON OFF; SET ANSI_NULL_DFLT_OFF ON; \
          CREATE TABLE se_nulls (id int, name varchar(40) NOT NULL);",
     )
@@ -1049,7 +1051,7 @@ async fn sqlserver_add_column_ignores_the_session_null_default() {
             },
         ),
     ] {
-        pool.query(&format!(
+        pool.query_unbounded(&format!(
             "SET ANSI_NULL_DFLT_ON OFF; SET ANSI_NULL_DFLT_OFF ON; {statement}"
         ))
         .await
@@ -1065,6 +1067,6 @@ async fn sqlserver_add_column_ignores_the_session_null_default() {
         assert!(column.nullable, "{name} came out NOT NULL");
     }
 
-    let _ = pool.query("DROP TABLE se_nulls").await;
+    let _ = pool.query_unbounded("DROP TABLE se_nulls").await;
     pool.close().await;
 }

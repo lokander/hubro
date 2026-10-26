@@ -154,10 +154,10 @@ async fn pg_url() -> Option<String> {
 }
 
 async fn pg_fixture(pool: &DbPool, table: &str) {
-    pool.query(&format!("DROP TABLE IF EXISTS {table}"))
+    pool.query_unbounded(&format!("DROP TABLE IF EXISTS {table}"))
         .await
         .unwrap();
-    pool.query(&format!(
+    pool.query_unbounded(&format!(
         "CREATE TABLE {table} (
             id serial PRIMARY KEY,
             name text,
@@ -167,7 +167,7 @@ async fn pg_fixture(pool: &DbPool, table: &str) {
     ))
     .await
     .unwrap();
-    pool.query(&format!(
+    pool.query_unbounded(&format!(
         "INSERT INTO {table} (name, weight, data) VALUES
             ('apple', 1.5, '\\x0102'),
             ('banana', NULL, NULL),

@@ -838,7 +838,7 @@ async fn per_process_database(engine: Engine) -> Option<String> {
         .unwrap_or_else(|e| panic!("{} must be connectable: {e}", engine.env()));
     if let (Engine::Postgres, Some(declared)) = (engine, pg_test_major()) {
         let reported = admin
-            .query("SELECT current_setting('server_version_num')")
+            .query_unbounded("SELECT current_setting('server_version_num')")
             .await
             .unwrap_or_else(|e| panic!("could not read server_version_num: {e}"));
         let reported = reported
@@ -857,12 +857,12 @@ async fn per_process_database(engine: Engine) -> Option<String> {
     // individually, because a database still in use makes `DROP DATABASE` fail
     // — and in one batch that failure would abort the rest of the sweep, so
     // the tidying would stop working exactly when there is something to tidy.
-    match admin.query(&engine.stale_query()).await {
+    match admin.query_unbounded(&engine.stale_query()).await {
         Ok(stale) => {
             for row in &stale.rows {
                 if let Some(hubro::db::Value::Text(name)) = row.first() {
                     let _ = admin
-                        .query(&format!("DROP DATABASE {}", engine.quote(name)))
+                        .query_unbounded(&format!("DROP DATABASE {}", engine.quote(name)))
                         .await;
                 }
             }
@@ -882,7 +882,7 @@ async fn per_process_database(engine: Engine) -> Option<String> {
         .unwrap_or(0);
     let name = format!("{TEST_DB_PREFIX}{}_{secs}", std::process::id());
     admin
-        .query(&format!("CREATE DATABASE {}", engine.quote(&name)))
+        .query_unbounded(&format!("CREATE DATABASE {}", engine.quote(&name)))
         .await
         .unwrap_or_else(|e| panic!("could not create the test database {name}: {e}"));
     admin.close().await;
@@ -1217,10 +1217,10 @@ pub async fn real_round_trip_failures(
     use hubro::db::{apply_staged, detect_row_identity, StagedChange, Value};
     let (src, dst) = (format!("{prefix}_src"), format!("{prefix}_dst"));
     for table in [&src, &dst] {
-        pool.query(&format!("DROP TABLE IF EXISTS {table}"))
+        pool.query_unbounded(&format!("DROP TABLE IF EXISTS {table}"))
             .await
             .unwrap();
-        pool.query(&format!("CREATE TABLE {table} (k int PRIMARY KEY, r real)"))
+        pool.query_unbounded(&format!("CREATE TABLE {table} (k int PRIMARY KEY, r real)"))
             .await
             .unwrap();
     }
@@ -1229,12 +1229,12 @@ pub async fn real_round_trip_failures(
         .enumerate()
         .map(|(k, (literal, _))| format!("({k}, {literal})"))
         .collect();
-    pool.query(&format!("INSERT INTO {src} VALUES {}", rows.join(", ")))
+    pool.query_unbounded(&format!("INSERT INTO {src} VALUES {}", rows.join(", ")))
         .await
         .unwrap();
 
     let read = pool
-        .query(&format!("SELECT k, r FROM {src} ORDER BY k"))
+        .query_unbounded(&format!("SELECT k, r FROM {src} ORDER BY k"))
         .await
         .unwrap();
     let mut failures = Vec::new();
@@ -1257,7 +1257,7 @@ pub async fn real_round_trip_failures(
         }
     }
     let same = pool
-        .query(&format!(
+        .query_unbounded(&format!(
             "SELECT s.k FROM {src} s JOIN {dst} d ON d.k = s.k AND d.r = s.r ORDER BY s.k"
         ))
         .await
@@ -1304,15 +1304,15 @@ pub async fn non_finite_edit_failures(
 ) -> Vec<String> {
     use hubro::db::{apply_staged, detect_row_identity, RowLocator, StagedChange, Value};
     use hubro::ui::editing::{editor_kind, parse_input};
-    pool.query(&format!("DROP TABLE IF EXISTS {prefix}"))
+    pool.query_unbounded(&format!("DROP TABLE IF EXISTS {prefix}"))
         .await
         .unwrap();
-    pool.query(&format!(
+    pool.query_unbounded(&format!(
         "CREATE TABLE {prefix} (k int PRIMARY KEY, n numeric, d double precision, r real)"
     ))
     .await
     .unwrap();
-    pool.query(&format!(
+    pool.query_unbounded(&format!(
         "INSERT INTO {prefix} VALUES (1, 'NaN', 'NaN', 'NaN'), (2, 0, 0, 0), (3, 1e400, 0, 0)"
     ))
     .await
@@ -1321,11 +1321,11 @@ pub async fn non_finite_edit_failures(
     let identity = detect_row_identity(table, pool.dialect()).expect("a keyed table");
     let access = pool.backend_access(table);
     let shown = pool
-        .query(&format!("SELECT n, d, r FROM {prefix} WHERE k = 1"))
+        .query_unbounded(&format!("SELECT n, d, r FROM {prefix} WHERE k = 1"))
         .await
         .unwrap();
     let huge = pool
-        .query(&format!("SELECT n FROM {prefix} WHERE k = 3"))
+        .query_unbounded(&format!("SELECT n FROM {prefix} WHERE k = 3"))
         .await
         .unwrap()
         .rows[0][0]
@@ -1370,7 +1370,7 @@ pub async fn non_finite_edit_failures(
         // prints a decimal typed as `1e400` as `1E+400`. Both engines count
         // NaN equal to NaN, as they must for a NaN key to be found at all.
         let held = pool
-            .query(&format!(
+            .query_unbounded(&format!(
                 "SELECT {column}::text, {column} = '{stored}' FROM {prefix} WHERE k = {k}"
             ))
             .await
@@ -1490,7 +1490,7 @@ pub fn like_hostile_rows(prefix: &str) -> String {
 /// that same one, which is how a script whose statements each took a pooled
 /// connection could look as if they shared a session.
 pub async fn open_several_connections(pool: &DbPool, slow_sql: &str) {
-    let reads: Vec<_> = (0..4).map(|_| pool.query(slow_sql)).collect();
+    let reads: Vec<_> = (0..4).map(|_| pool.query_unbounded(slow_sql)).collect();
     for read in futures_util::future::join_all(reads).await {
         read.expect("the read that opens a pooled connection");
     }
