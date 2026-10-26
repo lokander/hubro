@@ -746,7 +746,12 @@ async fn a_capped_read_that_writes_keeps_its_writes_though_yugabyte_cannot_say_i
     }
     let read = "SELECT yb_capped_bump(g) FROM generate_series(1, 20000) g";
     let mut expected = 0;
-    for script in [read.to_string(), format!("{read}; SELECT 1")] {
+    // As the last statement the rest is read after the run, so its outcome
+    // is not claimed; before another statement it is read in the run.
+    for (script, rest) in [
+        (read.to_string(), hubro::db::RestOfRead::Unconfirmed),
+        (format!("{read}; SELECT 1"), hubro::db::RestOfRead::Ran),
+    ] {
         let statements = split_statements(&script, pool.dialect());
         let mut results = Vec::new();
         run_script(&pool, pool.backend_capabilities(), &statements, |r| {
@@ -755,7 +760,7 @@ async fn a_capped_read_that_writes_keeps_its_writes_though_yugabyte_cannot_say_i
         .await
         .unwrap_or_else(|e| panic!("{script}: {e:?}"));
         assert!(results[0].truncated, "{script}");
-        assert_eq!(results[0].rest, hubro::db::RestOfRead::Ran, "{script}");
+        assert_eq!(results[0].rest, rest, "{script}");
         expected += 20_000;
         // The last read is read in the background before its transaction
         // commits.
@@ -779,5 +784,81 @@ async fn a_capped_read_that_writes_keeps_its_writes_though_yugabyte_cannot_say_i
         .await
         .unwrap();
     pool.execute("DROP TABLE yb_capped_side").await.unwrap();
+    pool.close().await;
+}
+
+/// A last read the row cap cut short, whose rest fails after the run has
+/// ended, is not reported as having run: its function inserts a row per call
+/// and divides by zero at call 15,000, past the cap. The rest is read in the
+/// background, the error reaches only that read, and the statement's rows are
+/// all undone — measured, 0 of them kept while the run reported the rest
+/// `Ran`. Now the run says `Unconfirmed`, and the rows are still gone, which is
+/// what that word warns of.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_capped_read_failing_after_the_run_is_not_claimed_to_have_run() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    {
+        let _ddl = ddl_lock().lock().await;
+        for statement in [
+            "DROP FUNCTION IF EXISTS yb_capped_fail(integer)",
+            "DROP TABLE IF EXISTS yb_capped_fail_side",
+            "CREATE TABLE yb_capped_fail_side (a integer)",
+            "CREATE FUNCTION yb_capped_fail(i integer) RETURNS text LANGUAGE sql \
+             AS 'INSERT INTO yb_capped_fail_side VALUES (i / (i - 15000)) \
+                 RETURNING repeat(''x'', 2000)'",
+        ] {
+            pool.execute(statement).await.unwrap();
+        }
+    }
+    let statements = split_statements(
+        "SELECT yb_capped_fail(g) FROM generate_series(1, 20000) g",
+        pool.dialect(),
+    );
+    let mut results = Vec::new();
+    let outcome = run_script(&pool, pool.backend_capabilities(), &statements, |r| {
+        results.push((r.truncated, r.rest))
+    })
+    .await;
+    assert_eq!(outcome, Ok(hubro::db::ScriptDone::default()));
+    assert_eq!(results, [(true, hubro::db::RestOfRead::Unconfirmed)]);
+    // The background read meets the error and the statement is undone. Its
+    // rows are uncommitted until then, so the count is read only once no
+    // session is running the statement any more.
+    let mut running = Value::Null;
+    for _ in 0..300 {
+        running = pool
+            .query_unbounded(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE query LIKE 'SELECT yb_capped_fail(g)%' AND pid <> pg_backend_pid()",
+            )
+            .await
+            .unwrap()
+            .rows[0][0]
+            .clone();
+        if running == Value::Integer(0) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(running, Value::Integer(0), "the rest never finished");
+    let kept = pool
+        .query_unbounded("SELECT count(*) FROM yb_capped_fail_side")
+        .await
+        .unwrap()
+        .rows[0][0]
+        .clone();
+    assert_eq!(
+        kept,
+        Value::Integer(0),
+        "the failed statement's rows were kept"
+    );
+    let _ddl = ddl_lock().lock().await;
+    pool.execute("DROP FUNCTION yb_capped_fail(integer)")
+        .await
+        .unwrap();
+    pool.execute("DROP TABLE yb_capped_fail_side")
+        .await
+        .unwrap();
     pool.close().await;
 }
