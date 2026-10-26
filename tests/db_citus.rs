@@ -47,13 +47,7 @@ use hubro::db::{
 };
 
 fn test_url() -> Option<String> {
-    match std::env::var("HUBRO_CITUS_TEST_URL") {
-        Ok(url) => Some(url),
-        Err(_) => {
-            eprintln!("skipping citus test: HUBRO_CITUS_TEST_URL not set");
-            None
-        }
-    }
+    common::engine_url("HUBRO_CITUS_TEST_URL")
 }
 
 /// Serializes fixture DDL across the tests in this binary.

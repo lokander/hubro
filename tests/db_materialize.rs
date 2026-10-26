@@ -93,6 +93,8 @@
 //! outcome inverted: the connection is fully capable and every *object*
 //! narrows, rather than the connection being clamped shut.
 
+mod common;
+
 use hubro::db::Reading;
 use hubro::db::{
     detect_row_identity, Capabilities, DbPool, Filter, Generated, Internal, KeyTextPinned,
@@ -100,13 +102,7 @@ use hubro::db::{
 };
 
 fn test_url() -> Option<String> {
-    match std::env::var("HUBRO_MATERIALIZE_TEST_URL") {
-        Ok(url) => Some(url),
-        Err(_) => {
-            eprintln!("skipping materialize test: HUBRO_MATERIALIZE_TEST_URL not set");
-            None
-        }
-    }
+    common::engine_url("HUBRO_MATERIALIZE_TEST_URL")
 }
 
 /// A table plus a view and a materialized view over it. Suffixed per test so

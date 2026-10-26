@@ -16,6 +16,8 @@
 //! The rest of the Postgres suite also passes against this container — point
 //! `HUBRO_PG_TEST_URL` at it to re-run it there.
 
+mod common;
+
 use hubro::db::Reading;
 use hubro::db::{
     apply_staged, detect_row_identity, DbPool, Filter, Internal, PageRequest, Restriction,
@@ -23,13 +25,7 @@ use hubro::db::{
 };
 
 fn test_url() -> Option<String> {
-    match std::env::var("HUBRO_TIMESCALE_TEST_URL") {
-        Ok(url) => Some(url),
-        Err(_) => {
-            eprintln!("skipping timescale test: HUBRO_TIMESCALE_TEST_URL not set");
-            None
-        }
-    }
+    common::engine_url("HUBRO_TIMESCALE_TEST_URL")
 }
 
 /// A hypertable with a composite `(time, sensor_id)` primary key, a foreign

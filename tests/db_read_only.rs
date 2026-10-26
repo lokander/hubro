@@ -41,16 +41,6 @@ use hubro::db::{
     StatementOutcome, TableMeta, Value, WriteProtection,
 };
 
-fn url(var: &str) -> Option<String> {
-    match std::env::var(var) {
-        Ok(url) => Some(url),
-        Err(_) => {
-            eprintln!("skipping read-only test: {var} not set");
-            None
-        }
-    }
-}
-
 fn stmts(sql: &[&str]) -> Vec<String> {
     sql.iter().map(|s| s.to_string()).collect()
 }
@@ -202,7 +192,7 @@ async fn postgres_refuses_writes_the_gate_cannot_see() {
 
 #[tokio::test]
 async fn timescale_refuses_writes_the_gate_cannot_see() {
-    let Some(url) = url("HUBRO_TIMESCALE_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_TIMESCALE_TEST_URL") else {
         return;
     };
     let pool = DbPool::open_postgres(&url).await.unwrap();
@@ -212,7 +202,7 @@ async fn timescale_refuses_writes_the_gate_cannot_see() {
 
 #[tokio::test]
 async fn citus_refuses_writes_the_gate_cannot_see() {
-    let Some(url) = url("HUBRO_CITUS_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_CITUS_TEST_URL") else {
         return;
     };
     let pool = DbPool::open_postgres(&url).await.unwrap();
@@ -222,7 +212,7 @@ async fn citus_refuses_writes_the_gate_cannot_see() {
 
 #[tokio::test]
 async fn cockroach_refuses_writes_the_gate_cannot_see() {
-    let Some(url) = url("HUBRO_CRDB_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_CRDB_TEST_URL") else {
         return;
     };
     let pool = DbPool::open_postgres(&url).await.unwrap();
@@ -238,7 +228,7 @@ static YUGABYTE_DDL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
 async fn yugabyte_refuses_writes_the_gate_cannot_see() {
-    let Some(url) = url("HUBRO_YUGABYTE_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_YUGABYTE_TEST_URL") else {
         return;
     };
     let _ddl = YUGABYTE_DDL.lock().await;
@@ -457,7 +447,7 @@ async fn a_marked_connection_recovers_from_a_statement_that_kills_it() {
 /// the documentation saying it does not is out of date.
 #[tokio::test]
 async fn citus_writes_through_run_command_on_coordinator_despite_the_marking() {
-    let Some(url) = url("HUBRO_CITUS_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_CITUS_TEST_URL") else {
         return;
     };
     let pool = DbPool::open_postgres(&url).await.unwrap();
@@ -571,7 +561,7 @@ async fn a_marked_postgres_connection_does_not_read_a_capped_read_to_its_end() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_marked_cockroach_connection_does_not_read_a_capped_read_to_its_end() {
-    let Some(url) = url("HUBRO_CRDB_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_CRDB_TEST_URL") else {
         return;
     };
     let pool = DbPool::open_postgres(&url).await.unwrap();
@@ -581,7 +571,7 @@ async fn a_marked_cockroach_connection_does_not_read_a_capped_read_to_its_end() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_marked_yugabyte_connection_does_not_read_a_capped_read_to_its_end() {
-    let Some(url) = url("HUBRO_YUGABYTE_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_YUGABYTE_TEST_URL") else {
         return;
     };
     let pool = DbPool::open_postgres(&url).await.unwrap();

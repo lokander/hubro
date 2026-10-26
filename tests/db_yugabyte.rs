@@ -122,6 +122,8 @@
 //! so "0 B" beside sixteen rows never reaches the screen. It is only the shared
 //! suite that has to guard its size assertions, and only those.
 
+mod common;
+
 use hubro::db::Reading;
 use std::sync::OnceLock;
 
@@ -133,13 +135,7 @@ use hubro::db::{
 use tokio::sync::Mutex;
 
 fn test_url() -> Option<String> {
-    match std::env::var("HUBRO_YUGABYTE_TEST_URL") {
-        Ok(url) => Some(url),
-        Err(_) => {
-            eprintln!("skipping yugabyte test: HUBRO_YUGABYTE_TEST_URL not set");
-            None
-        }
-    }
+    common::engine_url("HUBRO_YUGABYTE_TEST_URL")
 }
 
 /// Serialises schema changes across the tests in this binary.

@@ -31,16 +31,6 @@ use std::time::Duration;
 use common::{script_outcome, FixtureDb};
 use hubro::db::{run_script, split_statements, Capabilities, DbPool, Value, WriteProtection};
 
-fn url(var: &str) -> Option<String> {
-    match std::env::var(var) {
-        Ok(url) => Some(url),
-        Err(_) => {
-            eprintln!("skipping session-state test: {var} not set");
-            None
-        }
-    }
-}
-
 async fn run(pool: &DbPool, caps: Capabilities, sql: &str) -> String {
     let statements = split_statements(sql, pool.dialect());
     let outcome = run_script(pool, caps, &statements, |_| {}).await;
@@ -210,7 +200,7 @@ async fn postgres_script_session_state_stays_in_its_run() {
 
 #[tokio::test]
 async fn timescale_script_session_state_stays_in_its_run() {
-    let Some(url) = url("HUBRO_TIMESCALE_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_TIMESCALE_TEST_URL") else {
         return;
     };
     let engine = PgEngine {
@@ -223,7 +213,7 @@ async fn timescale_script_session_state_stays_in_its_run() {
 
 #[tokio::test]
 async fn citus_script_session_state_stays_in_its_run() {
-    let Some(url) = url("HUBRO_CITUS_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_CITUS_TEST_URL") else {
         return;
     };
     let engine = PgEngine {
@@ -236,7 +226,7 @@ async fn citus_script_session_state_stays_in_its_run() {
 
 #[tokio::test]
 async fn cockroach_script_session_state_stays_in_its_run() {
-    let Some(url) = url("HUBRO_CRDB_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_CRDB_TEST_URL") else {
         return;
     };
     let engine = PgEngine {
@@ -249,7 +239,7 @@ async fn cockroach_script_session_state_stays_in_its_run() {
 
 #[tokio::test]
 async fn yugabyte_script_session_state_stays_in_its_run() {
-    let Some(url) = url("HUBRO_YUGABYTE_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_YUGABYTE_TEST_URL") else {
         return;
     };
     let engine = PgEngine {
@@ -262,7 +252,7 @@ async fn yugabyte_script_session_state_stays_in_its_run() {
 
 #[tokio::test]
 async fn materialize_script_session_state_stays_in_its_run() {
-    let Some(url) = url("HUBRO_MATERIALIZE_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_MATERIALIZE_TEST_URL") else {
         return;
     };
     let engine = PgEngine {
@@ -275,7 +265,7 @@ async fn materialize_script_session_state_stays_in_its_run() {
 
 #[tokio::test]
 async fn risingwave_script_session_state_stays_in_its_run() {
-    let Some(url) = url("HUBRO_RISINGWAVE_TEST_URL") else {
+    let Some(url) = common::engine_url("HUBRO_RISINGWAVE_TEST_URL") else {
         return;
     };
     let engine = PgEngine {

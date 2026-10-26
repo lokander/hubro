@@ -68,20 +68,25 @@ fn ssh_env() -> Option<SshTestEnv> {
         eprintln!("skipping ssh tunnel test: HUBRO_SSH_TEST not set");
         return None;
     }
-    let var =
-        |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.to_string());
+    let or = |read: Result<String, std::env::VarError>, default: &str| {
+        read.unwrap_or_else(|_| default.to_string())
+    };
     Some(SshTestEnv {
-        host: var("HUBRO_SSH_TEST_HOST", "127.0.0.1"),
-        port: var("HUBRO_SSH_TEST_PORT", "2222").parse().unwrap(),
-        user: var("HUBRO_SSH_TEST_USER", "tunnel"),
+        host: or(std::env::var("HUBRO_SSH_TEST_HOST"), "127.0.0.1"),
+        port: or(std::env::var("HUBRO_SSH_TEST_PORT"), "2222")
+            .parse()
+            .unwrap(),
+        user: or(std::env::var("HUBRO_SSH_TEST_USER"), "tunnel"),
         key: PathBuf::from(
             std::env::var("HUBRO_SSH_TEST_KEY").expect("HUBRO_SSH_TEST_KEY must be set"),
         ),
         encrypted_key: PathBuf::from(
             std::env::var("HUBRO_SSH_TEST_ENC_KEY").expect("HUBRO_SSH_TEST_ENC_KEY must be set"),
         ),
-        db_host: var("HUBRO_SSH_TEST_DB_HOST", "hubro-pg-test"),
-        db_port: var("HUBRO_SSH_TEST_DB_PORT", "5432").parse().unwrap(),
+        db_host: or(std::env::var("HUBRO_SSH_TEST_DB_HOST"), "hubro-pg-test"),
+        db_port: or(std::env::var("HUBRO_SSH_TEST_DB_PORT"), "5432")
+            .parse()
+            .unwrap(),
     })
 }
 
