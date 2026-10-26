@@ -1107,21 +1107,16 @@ pub(super) fn ConnectionsScreen() -> Element {
                     on_dismiss_error: move |_| state.connect_error.set(None),
                     match kind {
                         ConnectForm::Postgres => rsx! {
-                            PostgresForm { on_done: move |_| open_form.set(None) }
+                            ServerForm { spec: ServerSpec::Postgres, on_done: move |_| open_form.set(None) }
                         },
                         ConnectForm::SqlServer => rsx! {
-                            SqlServerForm { on_done: move |_| open_form.set(None) }
+                            ServerForm { spec: ServerSpec::SqlServer, on_done: move |_| open_form.set(None) }
                         },
                         // Only server connections reach here; the Edit action
                         // isn't offered on SQLite entries.
-                        ConnectForm::Edit(saved) if matches!(*saved, SavedConnection::SqlServer { .. }) => rsx! {
-                            SqlServerForm {
-                                edit: (*saved).clone(),
-                                on_done: move |_| open_form.set(None),
-                            }
-                        },
                         ConnectForm::Edit(saved) => rsx! {
-                            PostgresForm {
+                            ServerForm {
+                                spec: ServerSpec::editing(&saved),
                                 edit: (*saved).clone(),
                                 on_done: move |_| open_form.set(None),
                             }
@@ -1339,7 +1334,7 @@ fn form_remember_hint(
     }
 }
 
-/// The locator the Postgres form's fields build: what its submit connects,
+/// The locator [`ServerForm`]'s fields build for Postgres: what its submit connects,
 /// saves, and keys the keyring under.
 fn postgres_form_url(
     use_url: bool,
@@ -1357,7 +1352,7 @@ fn postgres_form_url(
     }
 }
 
-/// The locator the SQL Server form's fields build — the encrypt option and
+/// The locator [`ServerForm`]'s fields build for SQL Server — the encrypt option and
 /// the trust-server-certificate flag are SQL Server's alone. What its submit
 /// connects, saves, and keys the keyring under.
 #[allow(clippy::too_many_arguments)]
@@ -1523,16 +1518,19 @@ fn entra_remember_hint(stored: super::state::StoredCopy) -> Option<&'static str>
     }
 }
 
-/// The signals every connection form holds, handed to [`submit_server_form`]
-/// so one pipeline can read the fields at submit time (signals are `Copy`).
-///
-/// Deliberately only the *shared* fields: each form keeps its own option
-/// signals (`sslmode` vs `encrypt` + trust-server-certificate) and folds them
-/// into the URL it passes in, which is the one genuinely per-backend step of
-/// the submit.
+/// The signals a [`ServerForm`] holds, handed to [`submit_server_form`] so
+/// one pipeline can read the fields at submit time (signals are `Copy`).
 #[derive(Clone, Copy)]
 struct ServerFormState {
     name: Signal<String>,
+    host: Signal<String>,
+    port: Signal<String>,
+    database: Signal<String>,
+    user: Signal<String>,
+    /// `sslmode` for Postgres, `encrypt` for SQL Server.
+    option: Signal<String>,
+    /// Read only where the spec offers the checkbox.
+    trust_cert: Signal<bool>,
     /// Never prefilled; empty means "keep whatever the keyring holds".
     password: Signal<String>,
     remember: Signal<bool>,
@@ -1551,17 +1549,37 @@ struct ServerFormState {
     form_error: Signal<Option<String>>,
 }
 
-/// The submit pipeline both connection forms run: validate the
+impl ServerFormState {
+    /// The fields the URL is built from, for the hint and the submit alike.
+    /// Read during render, this subscribes the form to each of them, so the
+    /// hint follows the typing; read from the submit's handler, no reactive
+    /// scope is running and it subscribes nothing.
+    fn fields(self) -> ServerFields {
+        ServerFields {
+            use_url: (self.use_url)(),
+            pasted: (self.pasted_url)(),
+            host: (self.host)(),
+            port: (self.port)(),
+            database: (self.database)(),
+            user: (self.user)(),
+            option: (self.option)(),
+            trust_cert: (self.trust_cert)(),
+        }
+    }
+}
+
+/// The submit pipeline of [`ServerForm`], for both engines: validate the
 /// tunnel fields, take the SSH passphrase and any password embedded in a
 /// pasted URL, settle the display name and auth mode, register the pending
 /// edit, carry a moved secret across, then dispatch the connect and close only
 /// if it worked.
 ///
-/// `built` is the URL the calling form's own fields produced — `Ok` or the
-/// error to show. It is computed by the caller because that is the step the
-/// two forms genuinely differ in (which `build_*`/`normalize_*` applies, and
-/// SQL Server's trust-server-certificate flag); building it is side-effect
-/// free, so a tunnel-field error still surfaces first, as before.
+/// `built` is the URL the form's fields produced — `Ok` or the error to
+/// show. It is computed by the caller, with [`ServerSpec::form_url`], because
+/// that is the one step the engines genuinely differ in (which
+/// `build_*`/`normalize_*` applies, and SQL Server's trust-server-certificate
+/// flag), and the form's hint builds it the same way; building it is
+/// side-effect free, so a tunnel-field error still surfaces first.
 ///
 /// `old_locator` is set when editing a saved entry: the locator to replace,
 /// which the edit may move.
@@ -1821,28 +1839,187 @@ fn display_name_for(entered: &str, url: &str) -> String {
     }
 }
 
-/// Add-Postgres panel: individual fields or a pasted URL, plus an optional
-/// SSH tunnel.
+/// Which server engine a [`ServerForm`] is for, and everything about the
+/// form that differs by engine: the heading, the placeholders, the one option
+/// select's choices and default, whether it offers to trust the server's
+/// certificate, the submit's accent, and the URL its fields build.
+///
+/// Data rather than a slot for a per-engine element: the options it renders
+/// are the ones [`ServerSpec::form_url`] reads, through the same
+/// [`ServerFields`], so the URL the hint describes and the URL the submit
+/// connects cannot be built from different fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerSpec {
+    Postgres,
+    SqlServer,
+}
+
+impl ServerSpec {
+    /// The form for editing `saved`. Only server connections are edited in a
+    /// form; SQLite is offered no Edit action.
+    fn editing(saved: &SavedConnection) -> Self {
+        match saved {
+            SavedConnection::SqlServer { .. } => ServerSpec::SqlServer,
+            _ => ServerSpec::Postgres,
+        }
+    }
+
+    fn kind(self) -> BackendKind {
+        match self {
+            ServerSpec::Postgres => BackendKind::Postgres,
+            ServerSpec::SqlServer => BackendKind::SqlServer,
+        }
+    }
+
+    fn backend(self) -> ServerBackend {
+        match self {
+            ServerSpec::Postgres => ServerBackend::POSTGRES,
+            ServerSpec::SqlServer => ServerBackend::SQL_SERVER,
+        }
+    }
+
+    fn url_placeholder(self) -> &'static str {
+        match self {
+            ServerSpec::Postgres => "postgres://user@host:5432/database?sslmode=require",
+            ServerSpec::SqlServer => "mssql://user@host:1433/database?encrypt=on",
+        }
+    }
+
+    fn port_placeholder(self) -> &'static str {
+        match self {
+            ServerSpec::Postgres => "5432",
+            ServerSpec::SqlServer => "1433",
+        }
+    }
+
+    /// The option select's values and labels: Postgres's `sslmode`, and SQL
+    /// Server's `encrypt`, matching the URL params the backend accepts.
+    fn options(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            ServerSpec::Postgres => &[
+                ("prefer", "sslmode: prefer"),
+                ("require", "sslmode: require"),
+                ("disable", "sslmode: disable"),
+            ],
+            ServerSpec::SqlServer => &[
+                ("on", "encrypt: on"),
+                ("off", "encrypt: off (login only)"),
+                ("plaintext", "encrypt: plaintext"),
+            ],
+        }
+    }
+
+    /// The option an added connection starts with, and an edited one whose
+    /// URL names none.
+    fn default_option(self) -> &'static str {
+        match self {
+            ServerSpec::Postgres => "prefer",
+            ServerSpec::SqlServer => "on",
+        }
+    }
+
+    /// Whether the form offers to accept the server's TLS certificate without
+    /// CA validation — SQL Server's, for dev servers with self-signed certs
+    /// (e.g. the stock Docker image).
+    fn offers_trust_cert(self) -> bool {
+        matches!(self, ServerSpec::SqlServer)
+    }
+
+    /// The submit button's fill, the engine's accent.
+    fn submit_fill(self) -> &'static str {
+        match self {
+            ServerSpec::Postgres => "bg-cyan-700 hover:bg-cyan-600",
+            ServerSpec::SqlServer => "bg-red-800 hover:bg-red-700",
+        }
+    }
+
+    /// The SSH auth radios' group name, distinct per engine.
+    fn radio_group(self) -> &'static str {
+        match self {
+            ServerSpec::Postgres => "pg-ssh-auth",
+            ServerSpec::SqlServer => "mssql-ssh-auth",
+        }
+    }
+
+    /// The locator `fields` build: what the submit connects, saves, and keys
+    /// the keyring under.
+    fn form_url(self, fields: &ServerFields) -> Result<String, crate::db::DbError> {
+        let ServerFields {
+            use_url,
+            pasted,
+            host,
+            port,
+            database,
+            user,
+            option,
+            trust_cert,
+        } = fields;
+        match self {
+            ServerSpec::Postgres => {
+                postgres_form_url(*use_url, pasted, host, port, database, user, option)
+            }
+            ServerSpec::SqlServer => sqlserver_form_url(
+                *use_url,
+                pasted,
+                host,
+                port,
+                database,
+                user,
+                option,
+                *trust_cert,
+            ),
+        }
+    }
+}
+
+/// What a [`ServerForm`]'s URL is built from, read off its signals in one
+/// place ([`ServerFormState::fields`]) for both the hint and the submit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerFields {
+    use_url: bool,
+    pasted: String,
+    host: String,
+    port: String,
+    database: String,
+    user: String,
+    /// `sslmode` for Postgres, `encrypt` for SQL Server.
+    option: String,
+    trust_cert: bool,
+}
+
+/// The add and edit form for a server connection, Postgres or SQL Server:
+/// individual fields or a pasted URL, the engine's option select (and SQL
+/// Server's trust-certificate box), the Auth dropdown, an optional SSH tunnel,
+/// and the "remember" box. Everything that differs by engine is [`ServerSpec`]
+/// data; the submit is [`submit_server_form`].
 #[component]
-fn PostgresForm(
+fn ServerForm(
+    spec: ServerSpec,
     /// The saved entry being edited; `None` is the add flow. Its
     /// locator is the key to replace on save — the edit may move it.
     edit: Option<SavedConnection>,
     on_done: EventHandler<()>,
 ) -> Element {
     let state = use_context::<AppState>();
-    let prefill = edit.clone().map(EditPrefill::from_saved);
-    let seed = prefill.clone().unwrap_or_default();
+    let seed = edit
+        .clone()
+        .map(EditPrefill::from_saved)
+        .unwrap_or_default();
     let old_locator = edit.as_ref().map(|e| e.locator().to_string());
     let hint_old_locator = old_locator.clone();
     let editing = edit.is_some();
-    let mut host = use_signal(|| seed.host.clone());
-    let mut port = use_signal(|| seed.port.clone());
-    let mut database = use_signal(|| seed.database.clone());
-    let mut user = use_signal(|| seed.user.clone());
-    let mut sslmode = use_signal(|| seed.option.clone().unwrap_or_else(|| "prefer".to_string()));
     let form = ServerFormState {
         name: use_signal(|| seed.name.clone()),
+        host: use_signal(|| seed.host.clone()),
+        port: use_signal(|| seed.port.clone()),
+        database: use_signal(|| seed.database.clone()),
+        user: use_signal(|| seed.user.clone()),
+        option: use_signal(|| {
+            seed.option
+                .clone()
+                .unwrap_or_else(|| spec.default_option().to_string())
+        }),
+        trust_cert: use_signal(|| seed.trust_cert),
         // Never prefilled: the stored secret isn't shown, and an empty field
         // on save means "keep the existing keyring entry".
         password: use_signal(String::new),
@@ -1866,6 +2043,12 @@ fn PostgresForm(
     };
     let ServerFormState {
         mut name,
+        mut host,
+        mut port,
+        mut database,
+        mut user,
+        option: mut engine_option,
+        mut trust_cert,
         mut password,
         mut remember,
         mut use_url,
@@ -1884,23 +2067,14 @@ fn PostgresForm(
     } = form;
 
     let submit = move || {
-        // The URL is this form's own step; everything else is the shared
-        // pipeline.
-        let built = postgres_form_url(
-            *use_url.peek(),
-            &pasted_url.peek(),
-            &host.peek(),
-            &port.peek(),
-            &database.peek(),
-            &user.peek(),
-            &sslmode.peek(),
-        );
+        // The URL is the spec's step; everything else is the shared pipeline.
+        let built = spec.form_url(&form.fields());
         // Cloned per attempt: the submit takes ownership, and `submit` has to
         // stay FnMut.
         submit_server_form(
             state,
             on_done,
-            ServerBackend::POSTGRES,
+            spec.backend(),
             form,
             old_locator.clone(),
             built,
@@ -1909,16 +2083,7 @@ fn PostgresForm(
 
     // Read at render, so the line follows the fields as they are typed — on
     // the same URL builder and the same password decision as the submit.
-    let hint_url = postgres_form_url(
-        use_url(),
-        &pasted_url(),
-        &host(),
-        &port(),
-        &database(),
-        &user(),
-        &sslmode(),
-    )
-    .ok();
+    let hint_url = spec.form_url(&form.fields()).ok();
     let remember_note = form_remember_hint(
         editing,
         &form_password(
@@ -1930,13 +2095,14 @@ fn PostgresForm(
         hint_url.as_deref(),
         state.saved.read().entries(),
     );
+    let label = spec.kind().label();
     rsx! {
         // Opaque, and a step above the page's slate-950: this renders over the
         // modal backdrop, and at 80% the connections list showed through it.
         div { class: "w-full max-w-xl rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 p-4",
             div { class: "mb-3 flex items-center justify-between",
                 span { class: "text-sm font-medium text-slate-900 dark:text-slate-200",
-                    if editing { "Edit a {BackendKind::Postgres.label()} connection" } else { "Add a {BackendKind::Postgres.label()} connection" }
+                    if editing { "Edit a {label} connection" } else { "Add a {label} connection" }
                 }
                 button {
                     class: "text-xs text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
@@ -1957,7 +2123,7 @@ fn PostgresForm(
                 if use_url() {
                     TextInput {
                         class: FORM_INPUT,
-                        placeholder: "postgres://user@host:5432/database?sslmode=require",
+                        placeholder: spec.url_placeholder(),
                         text: "{pasted_url}",
                         oninput: move |evt: FormEvent| pasted_url.set(evt.value()),
                     }
@@ -1971,7 +2137,7 @@ fn PostgresForm(
                         }
                         TextInput {
                             class: "{FORM_INPUT} flex-1",
-                            placeholder: "5432",
+                            placeholder: spec.port_placeholder(),
                             text: "{port}",
                             oninput: move |evt: FormEvent| port.set(evt.value()),
                         }
@@ -1993,10 +2159,25 @@ fn PostgresForm(
                     div { class: "flex gap-2",
                         select {
                             class: FORM_SELECT,
-                            onchange: move |evt| sslmode.set(evt.value()),
-                            option { value: "prefer", selected: *sslmode.read() == "prefer", "sslmode: prefer" }
-                            option { value: "require", selected: *sslmode.read() == "require", "sslmode: require" }
-                            option { value: "disable", selected: *sslmode.read() == "disable", "sslmode: disable" }
+                            onchange: move |evt| engine_option.set(evt.value()),
+                            for (value , text) in spec.options().iter().copied() {
+                                option {
+                                    key: "{value}",
+                                    value: "{value}",
+                                    selected: *engine_option.read() == value,
+                                    "{text}"
+                                }
+                            }
+                        }
+                    }
+                    if spec.offers_trust_cert() {
+                        label { class: "flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
+                            input {
+                                r#type: "checkbox",
+                                checked: trust_cert(),
+                                onchange: move |evt| trust_cert.set(evt.checked()),
+                            }
+                            "Trust the server certificate (self-signed / dev servers)"
                         }
                     }
                 }
@@ -2020,7 +2201,7 @@ fn PostgresForm(
                     ssh_use_key,
                     ssh_key_path,
                     ssh_passphrase,
-                    radio_group: "pg-ssh-auth",
+                    radio_group: spec.radio_group().to_string(),
                 }
                 // Only meaningful for password auth — Entra asks on its
                 // sign-in card.
@@ -2044,262 +2225,7 @@ fn PostgresForm(
                         "Cancel"
                     }
                     button {
-                        class: "{BTN_PRIMARY} bg-cyan-700 hover:bg-cyan-600",
-                        onclick: move |_| submit(),
-                        if editing { "Save & connect" } else { "Connect & save" }
-                    }
-                }
-                if let Some(err) = form_error() {
-                    p { class: "text-sm text-red-600 dark:text-red-400", "{err}" }
-                }
-            }
-        }
-    }
-}
-
-/// Add-SQL-Server panel: individual fields or a pasted `mssql://`
-/// URL, plus the Auth dropdown (password / Entra ID) and optional SSH tunnel.
-/// Deliberately close to [`PostgresForm`] but kept separate —
-/// the two share the field styling, the auth/tunnel fieldsets
-/// ([`AuthModeFields`] / [`SshTunnelFields`] and their validation helpers),
-/// and the display-name fallback, while the option sets (encrypt vs sslmode,
-/// trust-server-cert) differ enough that one shared form wasn't worth it.
-#[component]
-fn SqlServerForm(
-    /// The saved entry being edited; `None` is the add flow.
-    edit: Option<SavedConnection>,
-    on_done: EventHandler<()>,
-) -> Element {
-    let state = use_context::<AppState>();
-    let seed = edit
-        .clone()
-        .map(EditPrefill::from_saved)
-        .unwrap_or_default();
-    let old_locator = edit.as_ref().map(|e| e.locator().to_string());
-    let hint_old_locator = old_locator.clone();
-    let editing = edit.is_some();
-    let mut host = use_signal(|| seed.host.clone());
-    let mut port = use_signal(|| seed.port.clone());
-    let mut database = use_signal(|| seed.database.clone());
-    let mut user = use_signal(|| seed.user.clone());
-    // Matches the URL params the backend accepts: encrypt=on|off|plaintext.
-    let mut encrypt = use_signal(|| seed.option.clone().unwrap_or_else(|| "on".to_string()));
-    // Accept the server's TLS certificate without CA validation — needed for
-    // dev servers with self-signed certs (e.g. the stock Docker image).
-    let mut trust_cert = use_signal(|| seed.trust_cert);
-    let form = ServerFormState {
-        name: use_signal(|| seed.name.clone()),
-        // Never prefilled: an empty field on save keeps the keyring entry.
-        password: use_signal(String::new),
-        remember: use_signal(|| true),
-        use_url: use_signal(|| false),
-        pasted_url: use_signal(String::new),
-        // Authentication: "password" (default), "entra-interactive", or
-        // "entra-mi".
-        auth_mode: use_signal(|| seed.auth_mode.clone()),
-        entra_tenant: use_signal(|| seed.entra_tenant.clone()),
-        entra_client_id: use_signal(|| seed.entra_client_id.clone()),
-        use_tunnel: use_signal(|| seed.tunnel.is_some()),
-        ssh_host: use_signal(|| seed.ssh_host.clone()),
-        ssh_port: use_signal(|| seed.ssh_port.clone()),
-        ssh_user: use_signal(|| seed.ssh_user.clone()),
-        // false = ssh-agent (the default), true = key file.
-        ssh_use_key: use_signal(|| seed.ssh_use_key),
-        ssh_key_path: use_signal(|| seed.ssh_key_path.clone()),
-        ssh_passphrase: use_signal(String::new),
-        form_error: use_signal(|| Option::<String>::None),
-    };
-    let ServerFormState {
-        mut name,
-        mut password,
-        mut remember,
-        mut use_url,
-        mut pasted_url,
-        auth_mode,
-        entra_tenant,
-        entra_client_id,
-        use_tunnel,
-        ssh_host,
-        ssh_port,
-        ssh_user,
-        ssh_use_key,
-        ssh_key_path,
-        ssh_passphrase,
-        form_error,
-    } = form;
-
-    let submit = move || {
-        // The URL is this form's own step — the encrypt option and the
-        // trust-server-certificate flag are SQL Server's alone; everything
-        // else is the shared pipeline.
-        let built = sqlserver_form_url(
-            *use_url.peek(),
-            &pasted_url.peek(),
-            &host.peek(),
-            &port.peek(),
-            &database.peek(),
-            &user.peek(),
-            &encrypt.peek(),
-            *trust_cert.peek(),
-        );
-        // Cloned per attempt: the submit takes ownership, and `submit` has to
-        // stay FnMut.
-        submit_server_form(
-            state,
-            on_done,
-            ServerBackend::SQL_SERVER,
-            form,
-            old_locator.clone(),
-            built,
-        );
-    };
-
-    // Read at render, so the line follows the fields as they are typed — on
-    // the same URL builder and the same password decision as the submit.
-    let hint_url = sqlserver_form_url(
-        use_url(),
-        &pasted_url(),
-        &host(),
-        &port(),
-        &database(),
-        &user(),
-        &encrypt(),
-        trust_cert(),
-    )
-    .ok();
-    let remember_note = form_remember_hint(
-        editing,
-        &form_password(
-            &password(),
-            embedded_url_password(use_url(), &pasted_url()),
-            hint_old_locator.as_deref(),
-            hint_url.as_deref().unwrap_or_default(),
-        ),
-        hint_url.as_deref(),
-        state.saved.read().entries(),
-    );
-    rsx! {
-        // Opaque over the modal backdrop, matching the Postgres form.
-        div { class: "w-full max-w-xl rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 p-4",
-            div { class: "mb-3 flex items-center justify-between",
-                span { class: "text-sm font-medium text-slate-900 dark:text-slate-200",
-                    if editing { "Edit a {BackendKind::SqlServer.label()} connection" } else { "Add a {BackendKind::SqlServer.label()} connection" }
-                }
-                button {
-                    class: "text-xs text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100",
-                    onclick: move |_| {
-                        let flip = !*use_url.read();
-                        use_url.set(flip);
-                    },
-                    if use_url() { "Use individual fields" } else { "Paste a URL instead" }
-                }
-            }
-            div { class: "flex flex-col gap-2",
-                TextInput {
-                    class: FORM_INPUT,
-                    placeholder: "display name (optional)",
-                    text: "{name}",
-                    oninput: move |evt: FormEvent| name.set(evt.value()),
-                }
-                if use_url() {
-                    TextInput {
-                        class: FORM_INPUT,
-                        placeholder: "mssql://user@host:1433/database?encrypt=on",
-                        text: "{pasted_url}",
-                        oninput: move |evt: FormEvent| pasted_url.set(evt.value()),
-                    }
-                } else {
-                    div { class: "flex gap-2",
-                        TextInput {
-                            class: "{FORM_INPUT} flex-[3]",
-                            placeholder: "host",
-                            text: "{host}",
-                            oninput: move |evt: FormEvent| host.set(evt.value()),
-                        }
-                        TextInput {
-                            class: "{FORM_INPUT} flex-1",
-                            placeholder: "1433",
-                            text: "{port}",
-                            oninput: move |evt: FormEvent| port.set(evt.value()),
-                        }
-                    }
-                    div { class: "flex gap-2",
-                        TextInput {
-                            class: FORM_INPUT,
-                            placeholder: "database",
-                            text: "{database}",
-                            oninput: move |evt: FormEvent| database.set(evt.value()),
-                        }
-                        TextInput {
-                            class: FORM_INPUT,
-                            placeholder: "user",
-                            text: "{user}",
-                            oninput: move |evt: FormEvent| user.set(evt.value()),
-                        }
-                    }
-                    div { class: "flex gap-2",
-                        select {
-                            class: FORM_SELECT,
-                            onchange: move |evt| encrypt.set(evt.value()),
-                            option { value: "on", selected: *encrypt.read() == "on", "encrypt: on" }
-                            option { value: "off", selected: *encrypt.read() == "off", "encrypt: off (login only)" }
-                            option { value: "plaintext", selected: *encrypt.read() == "plaintext", "encrypt: plaintext" }
-                        }
-                    }
-                    label { class: "flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
-                        input {
-                            r#type: "checkbox",
-                            checked: trust_cert(),
-                            onchange: move |evt| trust_cert.set(evt.checked()),
-                        }
-                        "Trust the server certificate (self-signed / dev servers)"
-                    }
-                }
-                // Authentication mode. Entra uses the user field as
-                // the principal and a token instead of a password.
-                AuthModeFields { auth_mode, entra_tenant, entra_client_id }
-                if auth_mode() == "password" {
-                    TextInput {
-                        r#type: "password",
-                        class: FORM_INPUT,
-                        placeholder: if editing { "password (unchanged if left empty)" } else { "password" },
-                        text: "{password}",
-                        oninput: move |evt: FormEvent| password.set(evt.value()),
-                    }
-                }
-                SshTunnelFields {
-                    use_tunnel,
-                    ssh_host,
-                    ssh_port,
-                    ssh_user,
-                    ssh_use_key,
-                    ssh_key_path,
-                    ssh_passphrase,
-                    radio_group: "mssql-ssh-auth",
-                }
-                // Only meaningful for password auth — Entra asks on its
-                // sign-in card.
-                if asks_remember(&auth_mode()) {
-                    label { class: "flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400",
-                        input {
-                            r#type: "checkbox",
-                            checked: remember(),
-                            onchange: move |evt| remember.set(evt.checked()),
-                        }
-                        "Remember in the system keyring (falls back to this session only)"
-                    }
-                    if let Some(hint) = remember_note {
-                        p { class: "text-xs text-amber-700 dark:text-amber-400", "{hint}" }
-                    }
-                }
-                div { class: "flex justify-end gap-2",
-                    button {
-                        class: BTN_CANCEL,
-                        onclick: move |_| on_done.call(()),
-                        "Cancel"
-                    }
-                    button {
-                        class: "{BTN_PRIMARY} bg-red-800 hover:bg-red-700",
+                        class: "{BTN_PRIMARY} {spec.submit_fill()}",
                         onclick: move |_| submit(),
                         if editing { "Save & connect" } else { "Connect & save" }
                     }
@@ -2578,19 +2504,10 @@ mod tests {
         // where an inversion compiles and no executed test sees it: the card
         // handed `StoredCopy::Absent` instead of what the prompt carries, a
         // form handed `false` instead of `editing`, or a form's hint built
-        // from fields its submit does not use. Comment-stripped and
-        // whitespace-collapsed, so prose cannot satisfy it and rustfmt cannot
-        // trip it.
-        let source = include_str!("connections.rs");
-        let body_of = |signature: &str| {
-            let lines: Vec<&str> = source
-                .lines()
-                .skip_while(|line| line.trim() != signature)
-                .take_while(|line| line.trim_end() != "}")
-                .collect();
-            assert!(!lines.is_empty(), "no `{signature}`");
-            code_without_prose(&lines.join("\n"))
-        };
+        // from fields its submit does not use. Read as code alone
+        // ([`crate::source_scan::code_only`]), so prose cannot satisfy it and
+        // rustfmt cannot trip it.
+        let body_of = shipped_code_of;
         for (signature, pins) in [
             (
                 "fn PasswordPromptCard(prompt: super::state::PasswordPrompt) -> Element {",
@@ -2613,25 +2530,19 @@ mod tests {
              hint_url.as_deref().unwrap_or_default(), ), hint_url.as_deref(), \
              state.saved.read().entries(), );",
         ];
-        for (form, builder_at_render, builder_at_submit) in [
-            (
-                "fn PostgresForm(",
-                "let hint_url = postgres_form_url( use_url(), &pasted_url(), &host(), &port(), \
-                 &database(), &user(), &sslmode(), ) .ok();",
-                "let built = postgres_form_url( *use_url.peek(), &pasted_url.peek(), \
-                 &host.peek(), &port.peek(), &database.peek(), &user.peek(), \
-                 &sslmode.peek(), );",
-            ),
-            (
-                "fn SqlServerForm(",
-                "let hint_url = sqlserver_form_url( use_url(), &pasted_url(), &host(), &port(), \
-                 &database(), &user(), &encrypt(), trust_cert(), ) .ok();",
-                "let built = sqlserver_form_url( *use_url.peek(), &pasted_url.peek(), \
-                 &host.peek(), &port.peek(), &database.peek(), &user.peek(), \
-                 &encrypt.peek(), *trust_cert.peek(), );",
-            ),
-        ] {
+        // One form serves both engines, so the hint and the submit build their
+        // URL with the same call — the spec's builder over the one reader of
+        // the fields — and each builds it exactly once.
+        {
+            let form = "fn ServerForm(";
+            let builder_at_render = "let hint_url = spec.form_url(&form.fields()).ok();";
+            let builder_at_submit = "let built = spec.form_url(&form.fields());";
             let body = body_of(form);
+            assert_eq!(
+                body.matches("form_url(").count(),
+                2,
+                "{form}: the URL is built somewhere besides the hint and the submit: {body}"
+            );
             for pin in shared
                 .iter()
                 .copied()
@@ -2657,14 +2568,7 @@ mod tests {
         }
         // The submit acts on the same decision, and on nothing else: the
         // password it hands on is `form_password`'s verdict, read once.
-        let submit = {
-            let lines: Vec<&str> = source
-                .lines()
-                .skip_while(|line| !line.starts_with("fn submit_server_form("))
-                .take_while(|line| line.trim_end() != "}")
-                .collect();
-            code_without_prose(&lines.join("\n"))
-        };
+        let submit = body_of("fn submit_server_form(");
         for pin in [
             "let handed = form_password( &form.password.peek(), embedded_password, \
              old_locator.as_deref(), &url, );",
@@ -2787,33 +2691,132 @@ mod tests {
         assert!(!asks_remember("entra-mi"));
     }
 
-    /// `code` with comment lines dropped, string-literal contents removed and
-    /// whitespace collapsed: what a pin about code should read.
-    fn code_without_prose(code: &str) -> String {
-        let code: String = code
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut out = String::new();
-        let (mut in_string, mut escaped) = (false, false);
-        for ch in code.chars() {
-            if in_string {
-                match (escaped, ch) {
-                    (true, _) => escaped = false,
-                    (false, '\\') => escaped = true,
-                    (false, '"') => {
-                        in_string = false;
-                        out.push(ch);
-                    }
-                    _ => {}
-                }
-            } else {
-                in_string = ch == '"';
-                out.push(ch);
-            }
+    /// The shipped code of the item `signature` opens in this file, through
+    /// the brace that closes it, as code alone: comments dropped, literals
+    /// emptied, whitespace collapsed ([`crate::source_scan::code_only`]).
+    /// Read from the shipped file, so a test naming the signature in a string
+    /// is never found in its place.
+    fn shipped_code_of(signature: &str) -> String {
+        let shipped = crate::source_scan::shipped(include_str!("connections.rs"));
+        let mut found = shipped.match_indices(signature);
+        let (at, _) = found
+            .next()
+            .unwrap_or_else(|| panic!("no `{signature}` in connections.rs"));
+        assert!(
+            found.next().is_none(),
+            "`{signature}` occurs more than once; pin a longer signature"
+        );
+        let len = crate::source_scan::block_end(&shipped[at..])
+            .unwrap_or_else(|| panic!("unbalanced braces after `{signature}`"));
+        crate::source_scan::code_only(&shipped[at..at + len])
+    }
+
+    #[test]
+    fn each_engine_builds_its_own_url_from_the_shared_fields() {
+        let fields = |option: &str, trust_cert: bool| ServerFields {
+            use_url: false,
+            pasted: String::new(),
+            host: "db".to_string(),
+            port: String::new(),
+            database: "app".to_string(),
+            user: "u".to_string(),
+            option: option.to_string(),
+            trust_cert,
+        };
+        let pg = ServerSpec::Postgres
+            .form_url(&fields("require", false))
+            .unwrap();
+        assert_eq!(
+            pg,
+            postgres_form_url(false, "", "db", "", "app", "u", "require").unwrap()
+        );
+        // Postgres offers no trust box, so its tick (always unset from a
+        // Postgres prefill) cannot reach the URL either way.
+        assert!(!ServerSpec::Postgres.offers_trust_cert());
+        assert_eq!(
+            ServerSpec::Postgres
+                .form_url(&fields("require", true))
+                .unwrap(),
+            pg
+        );
+        let ms = ServerSpec::SqlServer
+            .form_url(&fields("off", true))
+            .unwrap();
+        assert_eq!(
+            ms,
+            sqlserver_form_url(false, "", "db", "", "app", "u", "off", true).unwrap()
+        );
+        assert!(ms.contains("trustServerCertificate=true"), "{ms}");
+        assert!(!ServerSpec::SqlServer
+            .form_url(&fields("off", false))
+            .unwrap()
+            .contains("trustServerCertificate"));
+        // A pasted URL goes through the engine's own normalizer.
+        let pasted = ServerFields {
+            use_url: true,
+            pasted: "mssql://sa@H:1433/master".to_string(),
+            ..fields("on", false)
+        };
+        assert_eq!(
+            ServerSpec::SqlServer.form_url(&pasted).unwrap(),
+            crate::db::normalize_mssql_url("mssql://sa@H:1433/master").unwrap()
+        );
+        for spec in [ServerSpec::Postgres, ServerSpec::SqlServer] {
+            assert_eq!(spec.backend().kind, spec.kind(), "{spec:?}");
+            assert!(
+                spec.options()
+                    .iter()
+                    .any(|(value, _)| *value == spec.default_option()),
+                "{spec:?}: the default option is not one the select offers"
+            );
         }
-        out.split_whitespace().collect::<Vec<_>>().join(" ")
+        assert_ne!(
+            ServerSpec::Postgres.radio_group(),
+            ServerSpec::SqlServer.radio_group()
+        );
+    }
+
+    #[test]
+    fn an_edit_opens_the_form_for_the_saved_engine() {
+        let server = |kind: BackendKind| {
+            let (name, url, tunnel, auth, protection, color, group) = (
+                "x".to_string(),
+                "u".to_string(),
+                None,
+                ServerAuth::Password,
+                Default::default(),
+                None,
+                None,
+            );
+            match kind {
+                BackendKind::SqlServer => SavedConnection::SqlServer {
+                    name,
+                    url,
+                    tunnel,
+                    auth,
+                    protection,
+                    color,
+                    group,
+                },
+                _ => SavedConnection::Postgres {
+                    name,
+                    url,
+                    tunnel,
+                    auth,
+                    protection,
+                    color,
+                    group,
+                },
+            }
+        };
+        assert_eq!(
+            ServerSpec::editing(&server(BackendKind::SqlServer)),
+            ServerSpec::SqlServer
+        );
+        assert_eq!(
+            ServerSpec::editing(&server(BackendKind::Postgres)),
+            ServerSpec::Postgres
+        );
     }
 
     #[test]
@@ -2822,52 +2825,33 @@ mod tests {
         // shown. That is only an answer if the box *is* shown there: a render
         // gate turned round hides it under password auth, and its default tick
         // then stores the password and the passphrase unasked — with every
-        // other test green. So each form renders it once, inside that gate.
-        let source = include_str!("connections.rs");
-        for form in ["fn PostgresForm(", "fn SqlServerForm("] {
-            let body: Vec<&str> = source
-                .lines()
-                .skip_while(|line| line.trim() != form)
-                .take_while(|line| line.trim_end() != "}")
-                .collect();
-            let code = code_without_prose(&body.join("\n"));
-            let gate = "if asks_remember(&auth_mode()) { label {";
-            assert_eq!(
-                code.matches(gate).count(),
-                1,
-                "{form}: the box's gate: {code}"
-            );
-            assert_eq!(
-                code.matches("remember()").count(),
-                1,
-                "{form}: the box is read somewhere besides its own `checked:`: {code}"
-            );
-            // The gate's block, by brace matching, holds the box.
-            let at = code.find(gate).unwrap() + gate.len() - "label {".len();
-            let mut depth = 0usize;
-            let mut end = code.len();
-            for (offset, ch) in code[at..].char_indices() {
-                match ch {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth = depth.saturating_sub(1);
-                        if depth == 0 {
-                            end = at + offset;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            assert!(
-                code[at..end].contains("checked: remember(),"),
-                "{form}: the box is rendered outside the gate its answer is read \
-                 under: {code}"
-            );
-        }
-        // And the submit's producer is the only read of the forms' box.
-        let shipped = crate::source_scan::shipped(source);
-        let shipped = code_without_prose(&shipped);
+        // other test green. So the one form both engines use renders it once,
+        // inside that gate.
+        let form = "fn ServerForm(";
+        let code = shipped_code_of(form);
+        let gate = "if asks_remember(&auth_mode()) { label {";
+        assert_eq!(
+            code.matches(gate).count(),
+            1,
+            "{form}: the box's gate: {code}"
+        );
+        assert_eq!(
+            code.matches("remember()").count(),
+            1,
+            "{form}: the box is read somewhere besides its own `checked:`: {code}"
+        );
+        // The gate's block, by brace matching, holds the box.
+        let at = code.find(gate).unwrap();
+        let end = at + crate::source_scan::block_end(&code[at..]).expect("the gate's block closes");
+        assert!(
+            code[at..end].contains("checked: remember(),"),
+            "{form}: the box is rendered outside the gate its answer is read \
+             under: {code}"
+        );
+        // And the submit's producer is the only read of the form's box.
+        let shipped = crate::source_scan::code_only(&crate::source_scan::shipped(include_str!(
+            "connections.rs"
+        )));
         assert_eq!(shipped.matches("form.remember").count(), 1, "{shipped}");
         assert!(shipped.contains(
             "let remember_choice = asks_remember(&form.auth_mode.peek()).then(|| *form.remember.peek());"
@@ -3062,7 +3046,7 @@ mod tests {
 }
 
 /// Builds the tunnel config from the SSH form fields — `Ok(None)` when the
-/// toggle is off. Shared by the Postgres and SQL Server forms; errors are
+/// toggle is off. Shared by both engines' forms; errors are
 /// user-facing form errors, raised before any connect attempt.
 fn tunnel_from_form(
     use_tunnel: bool,
@@ -3153,8 +3137,8 @@ fn entra_principal_missing(url: &str) -> bool {
 }
 
 /// The Auth dropdown (password / Entra interactive / Entra managed identity)
-/// plus the Entra fields it reveals — shared by the Postgres and SQL Server
-/// forms, which hand their own signals in (signals are `Copy`).
+/// plus the Entra fields it reveals, in [`ServerForm`], which hands its
+/// signals in (signals are `Copy`).
 #[component]
 fn AuthModeFields(
     auth_mode: Signal<String>,
@@ -3199,9 +3183,9 @@ fn AuthModeFields(
     }
 }
 
-/// The "Connect through an SSH tunnel" toggle and its fieldset — shared by the
-/// Postgres and SQL Server forms. `radio_group` keeps the two forms' auth
-/// radios in separate groups.
+/// The "Connect through an SSH tunnel" toggle and its fieldset, in
+/// [`ServerForm`]. `radio_group` names the auth radios' group, one per
+/// engine ([`ServerSpec::radio_group`]).
 #[component]
 fn SshTunnelFields(
     use_tunnel: Signal<bool>,
@@ -3285,7 +3269,7 @@ fn SshTunnelFields(
 }
 
 /// Fallback display name for a server connection URL: "database @ host".
-/// Scheme-agnostic, so the Postgres and SQL Server forms share it.
+/// Scheme-agnostic, so both engines' forms share it.
 fn default_server_name(url: &str) -> String {
     match url::Url::parse(url) {
         Ok(parsed) => {

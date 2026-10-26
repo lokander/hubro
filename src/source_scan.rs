@@ -267,6 +267,34 @@ pub(crate) fn string_literals(text: &str) -> Vec<String> {
     literals
 }
 
+/// `text` as code alone, for a pin that should match code and nothing else:
+/// comments dropped, each literal emptied to a bare pair of quotes, and every
+/// run of whitespace one space. So a comment or a string cannot satisfy the
+/// pin, and rustfmt wrapping a line does not break it.
+pub(crate) fn code_only(text: &str) -> String {
+    let classes = classify(text);
+    let mut out = String::with_capacity(text.len());
+    let mut in_literal = false;
+    for (at, c) in text.char_indices() {
+        match classes[at] {
+            Class::Code => {
+                in_literal = false;
+                out.push(c);
+            }
+            Class::Comment => {
+                in_literal = false;
+                out.push(' ');
+            }
+            Class::Literal if !in_literal => {
+                in_literal = true;
+                out.push_str(if c == '\'' { "''" } else { "\"\"" });
+            }
+            Class::Literal => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// The code of a Rust file outside its test modules, comments removed.
 pub(crate) fn code_outside_test_modules(text: &str) -> String {
     without_comments(&shipped(text))
@@ -304,6 +332,15 @@ pub(crate) fn names_ident(code: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_alone_keeps_no_comment_and_no_literal_text() {
+        let code = "let a = f(x); // f(y)\n/* f(z) */ let b = \"f(w) } {\";\nlet c = '}';\n";
+        assert_eq!(code_only(code), "let a = f(x); let b = \"\"; let c = '';");
+        // Wrapped by rustfmt or not, the same code.
+        assert_eq!(code_only("g(\n    a,\n    b,\n)"), "g( a, b, )");
+        assert_eq!(code_only("g( a, b, )"), "g( a, b, )");
+    }
 
     #[test]
     fn an_identifier_is_named_only_on_its_own_boundaries() {
