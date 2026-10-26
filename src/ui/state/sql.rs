@@ -495,10 +495,11 @@ impl AppState {
             .map(|(_, locator)| locator.clone())
     }
 
-    /// Saves editor text under a name, scoped to this connection or
-    /// global ([`SaveScope`]). Best-effort and off the UI path like the history writes; the
-    /// outcome — including a failure — lands in [`Self::saved_status`], and a
-    /// success bumps [`Self::saved_nonce`] so open panels re-query.
+    /// Saves editor text under a name, scoped to this connection or global
+    /// ([`SaveScope`]). Best-effort and off the UI path like the history
+    /// writes; the outcome — including a failure — lands in
+    /// [`Self::saved_status`], and a success bumps [`Self::saved_nonce`] so
+    /// open panels re-query.
     ///
     /// A successful save also titles the buffer it came from, so the query
     /// tab stops reading "Query 2" the moment it has a name.
