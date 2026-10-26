@@ -1045,11 +1045,36 @@ pub async fn finish_script_conn_with_read(
 /// is gone — so it holds one of the runtime's worker threads until it is
 /// done. Not the thread the run is polled on: a `tokio::spawn`ed task runs on
 /// the worker pool, and the SQL tab's run on the UI thread.
-pub(super) fn drain_then_close(mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>) {
+///
+/// What the rest met is sent on the returned [`PendingRest`] once it has been
+/// read ([`late_rest`]), so whoever shows the run can say so; the run does not
+/// wait for it.
+pub(super) fn drain_then_close(
+    mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
+) -> super::value::PendingRest {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let _ = sqlx::Connection::ping(&mut *conn).await;
+        let ping = sqlx::Connection::ping(&mut *conn).await;
         let _ = conn.close().await;
+        // Nobody may be listening any more (a plain `run_script`); that is
+        // theirs to decide.
+        let _ = sender.send(late_rest(ping));
     });
+    super::value::PendingRest(receiver)
+}
+
+/// How the rest of a read ended, from the ping that read it to its end
+/// ([`drain_then_close`]). The server's own error ended the statement, and
+/// undid it with its writes. Any other error — the connection lost, a
+/// protocol failure — leaves unknown whether the statement had finished by
+/// then. Over plain data so a test can execute it.
+pub(super) fn late_rest(ping: Result<(), sqlx::Error>) -> super::value::LateRest {
+    use super::value::LateRest;
+    match ping {
+        Ok(()) => LateRest::Finished,
+        Err(sqlx::Error::Database(error)) => LateRest::Failed(error.to_string()),
+        Err(_) => LateRest::Unknown,
+    }
 }
 
 /// Opens the read-only transaction one statement of a read-only script runs
@@ -3631,6 +3656,62 @@ fn format_interval(iv: &PgInterval) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// How the rest of a read reports, from the ping that read it after the
+    /// run: the server's error ended the statement (and undid it); any other
+    /// error leaves the outcome unknown.
+    #[test]
+    fn a_rest_read_after_the_run_ends_as_its_read_says() {
+        use super::late_rest;
+        use crate::db::LateRest;
+        #[derive(Debug)]
+        struct ServerSaid;
+        impl std::fmt::Display for ServerSaid {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("division by zero")
+            }
+        }
+        impl std::error::Error for ServerSaid {}
+        impl sqlx::error::DatabaseError for ServerSaid {
+            fn message(&self) -> &str {
+                "division by zero"
+            }
+            fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+            fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+            fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+                self
+            }
+            fn kind(&self) -> sqlx::error::ErrorKind {
+                sqlx::error::ErrorKind::Other
+            }
+        }
+        assert_eq!(late_rest(Ok(())), LateRest::Finished);
+        assert_eq!(
+            late_rest(Err(sqlx::Error::Database(Box::new(ServerSaid)))),
+            LateRest::Failed("division by zero".into())
+        );
+        for lost in [
+            sqlx::Error::Io(std::io::Error::other("connection reset")),
+            sqlx::Error::PoolClosed,
+            sqlx::Error::Protocol("unexpected message".into()),
+        ] {
+            assert_eq!(late_rest(Err(lost)), LateRest::Unknown);
+        }
+    }
+
+    /// A background read dropped before it reported is unknown, not pending
+    /// for ever.
+    #[tokio::test]
+    async fn a_rest_whose_read_is_dropped_unreported_is_unknown() {
+        use crate::db::{LateRest, PendingRest};
+        let (sender, receiver) = tokio::sync::oneshot::channel::<LateRest>();
+        drop(sender);
+        assert_eq!(PendingRest(receiver).outcome().await, LateRest::Unknown);
+    }
+
     /// Which catalog the column query asks for keys, for every flavor, and
     /// what each form of the query reads. The engine tests that measure the
     /// reason (`tests/db_risingwave.rs`) run only where RisingWave does; this

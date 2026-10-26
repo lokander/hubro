@@ -22,7 +22,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::db::{
-    needs_confirmation, plan_reached_cell_cap, ConnectionId, Dialect, ExportFormat,
+    needs_confirmation, plan_reached_cell_cap, ConnectionId, Dialect, ExportFormat, LateRest,
     OpenTransaction, PlanDisplay, PlanNode, PlanTree, RestOfRead, Rollback, RowsAffected,
     StatementOutcome, TableMeta, Value, EXPENSIVE_SHARE, MARKED_READ_ONLY, MAX_QUERY_ROWS, NO_DDL,
     NO_EXPLAIN, NO_MUTATE, NO_QUERY, PLAN_CELL_CAP,

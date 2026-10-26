@@ -635,12 +635,16 @@ impl ScriptConn {
         sql: &str,
         max_rows: u64,
         cell_cap: usize,
-    ) -> (Result<Capped, DbError>, Result<bool, DbError>) {
+    ) -> (
+        Result<Capped, DbError>,
+        Result<bool, DbError>,
+        Option<super::value::PendingRest>,
+    ) {
         if let HeldConn::Sqlite(conn) = &mut self.held {
             let read = sqlite::query_capped_conn(conn, sql, max_rows, cell_cap)
                 .await
                 .map(Capped::from);
-            return (read, self.end().await);
+            return (read, self.end().await, None);
         }
         let finished = match &mut self.held {
             HeldConn::Postgres { conn, pg, session } => {
@@ -652,17 +656,20 @@ impl ScriptConn {
             }
             HeldConn::Sqlite(_) => unreachable!("handled above"),
         };
-        match (self.held, finished.after) {
+        let pending = match (self.held, finished.after) {
             (HeldConn::Postgres { conn, .. }, AfterRead::DrainClose) => {
-                postgres::drain_then_close(conn);
+                Some(postgres::drain_then_close(conn))
             }
-            (held, _) => ScriptConn { held }.close().await,
-        }
+            (held, _) => {
+                ScriptConn { held }.close().await;
+                None
+            }
+        };
         let read = finished.read.map(|capped| Capped {
             rest: rest_after(finished.after, capped.rest),
             ..capped
         });
-        (read, finished.ended)
+        (read, finished.ended, pending)
     }
 }
 

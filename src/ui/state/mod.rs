@@ -66,13 +66,13 @@ use crate::config::{
 use crate::db::{
     apply_staged, build_fk_filter, explain_statement, fk_target_columns, mssql_url_target,
     mssql_url_via_local_port, mssql_url_with_password, needs_confirmation, open_source, run_import,
-    run_script, script_refusal, split_statements, statement_preview, url_target,
-    url_via_local_port, url_with_password, write_result, Capabilities, CellFetch, Connection,
-    ConnectionId, ConnectionRegistry, DbError, DbPool, Ddl, DdlObject, Encoding, ExportFormat,
-    Filter, ForeignKeyMeta, ImportOptions, ImportReport, KeyRules, MssqlAuth, OpenTransaction,
-    Rollback, RowLocator, SchemaOp, ScriptDone, ScriptError, SourceFormat, StagedChange,
-    StatementOutcome, StatementResult, TableAccess, TableMeta, TableStats, Value, WriteProtection,
-    NOTHING_TO_RUN,
+    run_script, run_script_watching_rest, script_refusal, split_statements, statement_preview,
+    url_target, url_via_local_port, url_with_password, write_result, Capabilities, CellFetch,
+    Connection, ConnectionId, ConnectionRegistry, DbError, DbPool, Ddl, DdlObject, Encoding,
+    ExportFormat, Filter, ForeignKeyMeta, ImportOptions, ImportReport, KeyRules, MssqlAuth,
+    OpenTransaction, Rollback, RowLocator, SchemaOp, ScriptDone, ScriptError, SourceFormat,
+    StagedChange, StatementOutcome, StatementResult, TableAccess, TableMeta, TableStats, Value,
+    WriteProtection, NOTHING_TO_RUN,
 };
 use crate::history::{HistoryStore, SaveOutcome};
 use crate::tunnel::{HostKeyInfo, Tunnel, TunnelAuth, TunnelConfig, TunnelError};
@@ -617,6 +617,13 @@ pub struct SqlRun {
     /// alternates between running a statement and explaining it, and what is
     /// on screen belongs to whichever was asked for last.
     pub explain: bool,
+    /// How the rest of a read reported [`RestOfRead::Unconfirmed`] ended,
+    /// with the index of that statement in [`Self::statements`] — set once
+    /// the background read has ended, after the run has
+    /// ([`AppState::execute_script`]). `None` while it is still being read.
+    ///
+    /// [`RestOfRead::Unconfirmed`]: crate::db::RestOfRead::Unconfirmed
+    pub late_rest: Option<(usize, crate::db::LateRest)>,
 }
 
 /// Which pane an export belongs to. Statuses are keyed per connection AND
