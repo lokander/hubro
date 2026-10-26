@@ -102,10 +102,11 @@ impl ServerAuth {
     /// and a password connection never signs in at all.
     ///
     /// Two decisions read this, so they cannot disagree: whether a saved
-    /// connection offers "Sign out", and whether an edit forgets the token the
-    /// connection kept before it. An edit away from interactive sign-in that
-    /// kept the token would leave a sign-in no "Sign out" could reach, and an
-    /// edit back would then redeem it silently.
+    /// connection offers "Sign out", and whether saving it — an edit, or a
+    /// connect through another form — signs it out because it can no longer
+    /// keep one. A save away from interactive sign-in that kept the token
+    /// would leave a sign-in no "Sign out" could reach, and a save back would
+    /// then redeem it silently.
     pub fn keeps_entra_sign_in(&self) -> bool {
         matches!(self, ServerAuth::Entra(EntraAuth::Interactive { .. }))
     }
