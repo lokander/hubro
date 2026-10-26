@@ -575,6 +575,91 @@ async fn risingwave_source_and_sink_are_read_only_and_say_which_they_are() {
     pool.close().await;
 }
 
+/// A composite key comes back in the order it was declared, not the order its
+/// columns sit in the table. RisingWave's own `key_column_usage` reports a key
+/// column's table position as its `ordinal_position` (here `a` = 1, `c` = 3),
+/// so this holds only because hubro reads the key from `pg_constraint` on this
+/// engine (`postgres::pk_source`) — the same choice that keeps introspection
+/// alive through a concurrent drop, below.
+#[tokio::test]
+async fn risingwave_reports_a_composite_key_in_its_declared_order() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let table = "rw_key_order";
+    pool.query_unbounded(&format!("DROP TABLE IF EXISTS {table}"))
+        .await
+        .unwrap();
+    pool.query_unbounded(&format!(
+        "CREATE TABLE {table} (a int, b varchar, c int, PRIMARY KEY (c, a))"
+    ))
+    .await
+    .unwrap();
+    let tables = pool.introspect().await.unwrap();
+    let positions: Vec<(&str, Option<u32>)> = find(&tables, table)
+        .columns
+        .iter()
+        .map(|c| (c.name.as_str(), c.primary_key_position))
+        .collect();
+    assert_eq!(positions, [("a", Some(2)), ("b", None), ("c", Some(1))]);
+    pool.query_unbounded(&format!("DROP TABLE {table}"))
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+/// Introspection survives a table being dropped while it reads. Another
+/// session creates and drops a keyed table `CHURN_CYCLES` times, and
+/// introspection runs back to back until it is done. Through RisingWave's
+/// `information_schema` constraint views (see `postgres::pk_source`), runs
+/// like this failed one introspection in every four drops or so — 2 of 28
+/// over eight — so thirty drops make a regression all but certain to show.
+#[tokio::test]
+async fn risingwave_introspection_survives_tables_dropped_mid_read() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let churn_pool = DbPool::open_postgres(&url).await.unwrap();
+    const CHURN_CYCLES: u32 = 30;
+    let churn = tokio::spawn({
+        async move {
+            for cycle in 0..CHURN_CYCLES {
+                let table = format!("rw_churn_{cycle}");
+                churn_pool
+                    .query_unbounded(&format!("DROP TABLE IF EXISTS {table}"))
+                    .await
+                    .unwrap();
+                churn_pool
+                    .query_unbounded(&format!("CREATE TABLE {table} (id int PRIMARY KEY, v int)"))
+                    .await
+                    .unwrap();
+                churn_pool
+                    .query_unbounded(&format!("DROP TABLE {table}"))
+                    .await
+                    .unwrap();
+            }
+            churn_pool.close().await;
+        }
+    });
+    let (mut runs, mut failures) = (0, Vec::new());
+    while !churn.is_finished() {
+        runs += 1;
+        if let Err(err) = pool.introspect().await {
+            failures.push(err.to_string());
+        }
+    }
+    churn.await.unwrap();
+    assert!(
+        runs >= CHURN_CYCLES,
+        "only {runs} introspections ran while the tables came and went"
+    );
+    assert!(
+        failures.is_empty(),
+        "{} of {runs} introspections failed while {CHURN_CYCLES} tables came and went: {:?}",
+        failures.len(),
+        failures.first()
+    );
+    pool.close().await;
+}
+
 #[tokio::test]
 async fn risingwave_has_no_pg_class_statistics_so_none_are_invented() {
     let Some(url) = test_url() else { return };
