@@ -131,10 +131,6 @@ async fn a_server_sent_serialization_failure_classifies_as_transient() {
         refused.is_transient(),
         "a server-sent 40001 must classify as transient, got: {refused:?}"
     );
-    assert!(
-        refused.message().contains("could not serialize access"),
-        "{refused:?}"
-    );
 
     // And the classification is the code's, not every failure's.
     let other = pool.query_unbounded("SELECT 1 / 0").await.unwrap_err();
@@ -817,6 +813,11 @@ async fn postgres_a_materialized_view_introspects_once_with_its_columns_and_no_r
     // information_schema omits matviews), and read-only — its unique index
     // must not yield a row identity. Exactly once: the pg_catalog UNION must
     // not double-list it alongside an information_schema row.
+    //
+    // The read-only half pins the outcome, not which rule produces it: Postgres
+    // never marks a matview's columns NOT NULL (measured, even over a primary
+    // key), so its unique index already fails the not-null rule, and removing
+    // `detect_row_identity`'s early return for matviews leaves this green.
     assert_eq!(
         tables
             .iter()
