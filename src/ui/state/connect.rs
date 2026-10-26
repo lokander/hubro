@@ -3356,7 +3356,7 @@ mod tests {
                 1,
                 "user-answered: `StoredPassword::Delete`, an unticked box once a different \
                  password connects. Warned by `remember_hint` on the password prompt and \
-                 `form_remember_hint` on both connection forms",
+                 `form_remember_hint` on the connection form",
             ),
             (
                 "ui/state/secrets_policy.rs",
