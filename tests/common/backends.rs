@@ -53,8 +53,10 @@ pub async fn assert_query_capped(pool: &DbPool, queries: &CappedQueries) {
 
     let (result, _) = pool.query_capped(queries.huge_cell, &[], 10).await.unwrap();
     match &result.rows[0][0] {
+        // Capped, but not to nothing: a query that returned a short cell
+        // would otherwise pass.
         Value::Text(t) => assert!(
-            t.len() <= QUERY_CELL_CAP,
+            t.len() <= QUERY_CELL_CAP && t.len() > QUERY_CELL_CAP / 2,
             "cell should be capped to {QUERY_CELL_CAP}, got {}",
             t.len()
         ),

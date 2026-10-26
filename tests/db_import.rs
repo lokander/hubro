@@ -292,6 +292,13 @@ async fn sqlite_a_bad_row_rolls_back_every_row_already_inserted() {
         900,
     )
     .await;
+    // The one row the table started with.
+    assert_eq!(
+        pool.count_table_rows(Reading::UNMARKED, people)
+            .await
+            .unwrap(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -642,6 +649,13 @@ async fn postgres_a_bad_row_rolls_back_every_row_already_inserted() {
         1000,
     )
     .await;
+    // The one row the table started with.
+    assert_eq!(
+        pool.count_table_rows(Reading::UNMARKED, table)
+            .await
+            .unwrap(),
+        1
+    );
 
     pool.execute("DROP TABLE import_rollback").await.unwrap();
     pool.close().await;
