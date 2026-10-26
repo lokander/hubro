@@ -730,8 +730,12 @@ async fn yugabyte_reports_a_transaction_only_when_a_script_leaves_one_open() {
 async fn a_capped_read_that_writes_keeps_its_writes_though_yugabyte_cannot_say_it_wrote() {
     let Some(url) = test_url() else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
+    // Held across the run, not only the setup: the statement calls a
+    // function, which reads the catalog, and a sibling's DDL meanwhile fails
+    // it with MISMATCHED_SCHEMA — a transient error hubro reports as such,
+    // and noise here.
+    let _ddl = ddl_lock().lock().await;
     {
-        let _ddl = ddl_lock().lock().await;
         for statement in [
             "DROP FUNCTION IF EXISTS yb_capped_bump(integer)",
             "DROP TABLE IF EXISTS yb_capped_side",
@@ -779,7 +783,6 @@ async fn a_capped_read_that_writes_keeps_its_writes_though_yugabyte_cannot_say_i
         }
         assert_eq!(kept, Value::Integer(expected), "{script}: writes lost");
     }
-    let _ddl = ddl_lock().lock().await;
     pool.execute("DROP FUNCTION yb_capped_bump(integer)")
         .await
         .unwrap();
@@ -798,8 +801,12 @@ async fn a_capped_read_that_writes_keeps_its_writes_though_yugabyte_cannot_say_i
 async fn a_capped_read_failing_after_the_run_is_not_claimed_to_have_run() {
     let Some(url) = test_url() else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
+    // Held across the run, not only the setup: the statement calls a
+    // function, which reads the catalog, and a sibling's DDL meanwhile fails
+    // it with MISMATCHED_SCHEMA — a transient error hubro reports as such,
+    // and noise here.
+    let _ddl = ddl_lock().lock().await;
     {
-        let _ddl = ddl_lock().lock().await;
         for statement in [
             "DROP FUNCTION IF EXISTS yb_capped_fail(integer)",
             "DROP TABLE IF EXISTS yb_capped_fail_side",
@@ -853,7 +860,6 @@ async fn a_capped_read_failing_after_the_run_is_not_claimed_to_have_run() {
         Value::Integer(0),
         "the failed statement's rows were kept"
     );
-    let _ddl = ddl_lock().lock().await;
     pool.execute("DROP FUNCTION yb_capped_fail(integer)")
         .await
         .unwrap();
