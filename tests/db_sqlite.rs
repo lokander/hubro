@@ -2,6 +2,8 @@
 
 mod common;
 
+use common::backends::{assert_empty_result_keeps_headers, assert_no_result_set_is_no_columns};
+
 use common::FixtureDb;
 use hubro::db::Reading;
 use hubro::db::{
@@ -529,23 +531,12 @@ async fn query_with_no_rows_yields_empty_result_with_its_headers() {
     // the SQL Server backend has always done (TDS sends result-set metadata
     // even for zero rows). The sqlx backends have no row to read the names
     // off, so they fall back to describing the statement.
-    let empty = pool
-        .query_unbounded("SELECT artist_id, title FROM albums WHERE 0")
-        .await
-        .unwrap();
-    assert!(empty.rows.is_empty());
-    let names: Vec<&str> = empty.columns.iter().map(|c| c.name.as_str()).collect();
-    assert_eq!(names, ["artist_id", "title"]);
-
-    // Same contract on the capped/streaming path the SQL editor uses.
-    let (empty, truncated) = pool
-        .query_capped("SELECT artist_id, title FROM albums WHERE 0", &[], 100)
-        .await
-        .unwrap();
-    assert!(empty.rows.is_empty());
-    assert!(!truncated);
-    let names: Vec<&str> = empty.columns.iter().map(|c| c.name.as_str()).collect();
-    assert_eq!(names, ["artist_id", "title"]);
+    assert_empty_result_keeps_headers(
+        &pool,
+        "SELECT artist_id, title FROM albums WHERE 0",
+        &["artist_id", "title"],
+    )
+    .await;
 
     pool.close().await;
 }
@@ -564,13 +555,7 @@ async fn statements_without_a_result_set_report_no_columns() {
     pool.execute("CREATE TABLE headerless (x INTEGER)")
         .await
         .unwrap();
-    let (result, truncated) = pool
-        .query_capped("DROP TABLE headerless", &[], 100)
-        .await
-        .unwrap();
-    assert!(result.rows.is_empty());
-    assert!(result.columns.is_empty());
-    assert!(!truncated);
+    assert_no_result_set_is_no_columns(&pool, "DROP TABLE headerless").await;
 
     pool.close().await;
 }
@@ -804,13 +789,8 @@ async fn a_table_whose_catalog_name_holds_a_nul_is_refused_not_hung() {
     assert_eq!(columns, ["id", "v"]);
 
     let request = PageRequest {
-        schema: None,
-        table: crafted.name.clone(),
         limit: 10,
-        offset: 0,
-        sort: None,
-        filter: None,
-        extra_key_column: None,
+        ..common::page(crafted.name.clone())
     };
     assert_eq!(
         within("fetch_page", pool.fetch_page(Reading::UNMARKED, &request)).await,

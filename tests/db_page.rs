@@ -9,13 +9,8 @@ use hubro::db::{Filter, PageRequest, SortDir, Value};
 
 fn request(table: &str) -> PageRequest {
     PageRequest {
-        schema: None,
-        table: table.into(),
         limit: 10,
-        offset: 0,
-        sort: None,
-        filter: None,
-        extra_key_column: None,
+        ..common::page(table)
     }
 }
 
@@ -226,13 +221,10 @@ async fn paging_works_on_tables_and_columns_with_weird_names() {
     // Table name with an embedded double quote and a space; sort on a column
     // with a space, filter on it too, and read a unicode-named column.
     let req = PageRequest {
-        schema: None,
-        table: "we\"ird table".into(),
         limit: 10,
-        offset: 0,
         sort: Some(("col name".into(), SortDir::Desc)),
         filter: Some(Filter::contains("col name", "row")),
-        extra_key_column: None,
+        ..common::page("we\"ird table")
     };
     assert_eq!(pool.count_rows(Reading::UNMARKED, &req).await.unwrap(), 3);
     let page = pool.fetch_page(Reading::UNMARKED, &req).await.unwrap();

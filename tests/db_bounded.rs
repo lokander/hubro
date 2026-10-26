@@ -5,22 +5,22 @@
 
 mod common;
 
+use common::backends::{
+    assert_a_deleted_rows_cell_does_not_load, assert_bounded_page_previews,
+    assert_large_cells_load_in_full, assert_query_capped, CappedQueries,
+};
+
 use common::FixtureDb;
 use hubro::db::Reading;
 use hubro::db::{
     detect_row_identity, DbError, Generated, PageRequest, RowLocator, TableMeta, Value,
-    MISSING_ROW, PREVIEW_BYTES, QUERY_CELL_CAP,
+    PREVIEW_BYTES,
 };
 
 fn request(table: &str) -> PageRequest {
     PageRequest {
-        schema: None,
-        table: table.into(),
-        limit: 100,
-        offset: 0,
         sort: Some(("id".into(), hubro::db::SortDir::Asc)),
-        filter: None,
-        extra_key_column: None,
+        ..common::page(table)
     }
 }
 
@@ -59,44 +59,15 @@ async fn fetch_page_bounded_previews_large_columns_and_stays_small() {
     let tables = pool.introspect().await.unwrap();
     let docs = tables.iter().find(|t| t.name == "docs").unwrap();
 
-    let page = pool
-        .fetch_page_bounded(Reading::UNMARKED, &request("docs"), &docs.columns, &["id"])
-        .await
-        .unwrap();
-
-    // The trailing length helper columns are stripped: 4 visible columns.
-    assert_eq!(page.result.columns.len(), 4);
+    let page = assert_bounded_page_previews(&pool, docs, &request("docs")).await;
     assert_eq!(page.result.rows.len(), 3);
 
-    // Row 1's big_text is a bounded preview, flagged with the real length.
-    let big_text = &page.result.rows[0][2];
-    if let Value::Text(t) = big_text {
-        assert!(
-            t.chars().count() <= PREVIEW_BYTES,
-            "preview length {} exceeds cap",
-            t.chars().count()
-        );
-    } else {
-        panic!("expected a text preview, got {big_text:?}");
-    }
-    let text_preview = page.previews[0][2].expect("big_text is truncated");
-    assert_eq!(text_preview.full_len, 50_000);
-    assert!(!text_preview.binary);
-
-    // Row 1's blob is previewed too: the grid only shows its (real) size.
-    let blob_preview = page.previews[0][3].expect("blob is truncated");
-    assert_eq!(blob_preview.full_len, 40_000);
-    assert!(blob_preview.binary);
+    // Row 1's blob prefix is bounded too: the grid only shows its (real) size.
     if let Value::Blob(b) = &page.result.rows[0][3] {
         assert!(b.len() <= PREVIEW_BYTES + 1, "blob prefix bounded");
     } else {
         panic!("expected a blob preview");
     }
-
-    // Small columns and short values are never previewed.
-    assert!(page.previews[0][1].is_none(), "short small_note");
-    assert!(page.previews[1][2].is_none(), "short big_text");
-    assert!(page.previews[0][0].is_none(), "scalar id");
     // NULLs carry no preview.
     assert!(page.previews[2][2].is_none());
 
@@ -168,22 +139,7 @@ async fn fetch_cell_loads_the_full_value() {
     let pool = fixture.open().await;
     let tables = pool.introspect().await.unwrap();
     let docs = tables.iter().find(|t| t.name == "docs").unwrap();
-    let identity = detect_row_identity(docs, pool.dialect()).unwrap();
-
-    let locator = RowLocator {
-        identity_values: vec![Value::Integer(1)],
-    };
-    let fetched = pool
-        .fetch_cell(Reading::UNMARKED, docs, &identity, &locator, "big_text")
-        .await
-        .unwrap();
-    assert_eq!(fetched.full_len, 50_000);
-    assert!(!fetched.capped);
-    if let Value::Text(t) = &fetched.value {
-        assert_eq!(t.chars().count(), 50_000, "the full value, not a preview");
-    } else {
-        panic!("expected full text");
-    }
+    assert_large_cells_load_in_full(&pool, docs).await;
 
     // Safety anchor for edit correctness: the grid's page value for
     // this cell is a PREVIEW, strictly shorter than the full value — so the
@@ -231,73 +187,27 @@ async fn fetch_cell_reports_a_missing_row_as_an_error_not_null() {
         .await
         .unwrap();
     for id in [1, 999] {
-        match pool
-            .fetch_cell(Reading::UNMARKED, docs, &identity, &at(id), "big_text")
-            .await
-        {
-            Err(DbError::Query(message)) => assert_eq!(message, MISSING_ROW),
-            other => panic!("row {id} is gone, so its cell must not load: {other:?}"),
-        }
+        assert_a_deleted_rows_cell_does_not_load(&pool, docs, id).await;
     }
 
     pool.close().await;
 }
 
 #[tokio::test]
-async fn query_capped_stops_at_max_rows_and_flags_truncation() {
+async fn query_capped_stops_at_max_rows_and_bounds_huge_cells() {
     let fixture = FixtureDb::numbers(50).await;
     let pool = fixture.open().await;
-
-    // More rows than the cap: exactly `max_rows` retained, flagged truncated.
-    let (result, truncated) = pool
-        .query_capped("SELECT n FROM numbers ORDER BY n", &[], 10)
-        .await
-        .unwrap();
-    assert_eq!(result.rows.len(), 10);
-    assert!(truncated);
-    assert_eq!(result.rows[0][0], Value::Integer(1));
-    assert_eq!(result.rows[9][0], Value::Integer(10));
-
-    // Exactly `max_rows` rows exist: full result, NOT flagged.
-    let (result, truncated) = pool
-        .query_capped("SELECT n FROM numbers ORDER BY n LIMIT 10", &[], 10)
-        .await
-        .unwrap();
-    assert_eq!(result.rows.len(), 10);
-    assert!(!truncated);
-
-    // Fewer rows than the cap: everything, not flagged.
-    let (result, truncated) = pool
-        .query_capped("SELECT n FROM numbers WHERE n <= 5", &[], 100)
-        .await
-        .unwrap();
-    assert_eq!(result.rows.len(), 5);
-    assert!(!truncated);
-
-    pool.close().await;
-}
-
-#[tokio::test]
-async fn query_capped_bounds_huge_cells() {
-    let big = "Z".repeat(200_000);
-    let sql = format!("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('{big}');");
-    let fixture = FixtureDb::with_sql(&sql).await;
-    let pool = fixture.open().await;
-
-    let (result, _truncated) = pool
-        .query_capped("SELECT v FROM t", &[], 100)
-        .await
-        .unwrap();
-    if let Value::Text(t) = &result.rows[0][0] {
-        assert!(
-            t.len() <= QUERY_CELL_CAP,
-            "cell should be capped to {QUERY_CELL_CAP}, got {}",
-            t.len()
-        );
-    } else {
-        panic!("expected text");
-    }
-
+    assert_query_capped(
+        &pool,
+        &CappedQueries {
+            one_to_25: "SELECT n FROM numbers WHERE n <= 25 ORDER BY n",
+            exactly_ten: "SELECT n FROM numbers ORDER BY n LIMIT 10",
+            five: "SELECT n FROM numbers WHERE n <= 5",
+            // hex() of 100 000 zero bytes is 200 000 characters of text.
+            huge_cell: "SELECT hex(zeroblob(100000))",
+        },
+    )
+    .await;
     pool.close().await;
 }
 

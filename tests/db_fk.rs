@@ -85,15 +85,7 @@ fn row_map(result: &QueryResult, row: &[Value]) -> HashMap<String, Value> {
 
 /// The child row whose `id` column equals `id`, as a column → value map.
 async fn child_row(pool: &DbPool, id: i64) -> HashMap<String, Value> {
-    let req = PageRequest {
-        schema: None,
-        table: "child".into(),
-        limit: 100,
-        offset: 0,
-        sort: None,
-        filter: None,
-        extra_key_column: None,
-    };
+    let req = common::page("child");
     let page = pool.fetch_page(Reading::UNMARKED, &req).await.unwrap();
     let idx = page
         .columns
@@ -133,12 +125,8 @@ async fn jump(
         .expect("a fully-populated FK builds a jump filter");
     let req = PageRequest {
         schema: target.schema.clone(),
-        table: target.name.clone(),
-        limit: 100,
-        offset: 0,
-        sort: None,
         filter: Some(filter),
-        extra_key_column: None,
+        ..common::page(target.name.clone())
     };
     let (page, count) = (
         pool.fetch_page(Reading::UNMARKED, &req).await.unwrap(),

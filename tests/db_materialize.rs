@@ -274,12 +274,9 @@ async fn materialize_refuses_keys_so_no_table_is_editable() {
             Reading::UNMARKED,
             &PageRequest {
                 schema: Some("public".into()),
-                table: readings.clone(),
                 limit: 3,
-                offset: 0,
                 sort: Some(("id".into(), SortDir::Asc)),
-                filter: None,
-                extra_key_column: None,
+                ..common::page(readings.clone())
             },
         )
         .await
@@ -353,12 +350,10 @@ async fn materialize_views_and_matviews_browse_but_refuse_writes() {
     // mostly are.
     let request = PageRequest {
         schema: Some("public".into()),
-        table: matview.clone(),
         limit: 1,
-        offset: 0,
         sort: Some(("sensor_id".into(), SortDir::Asc)),
         filter: Some(Filter::equals("sensor_id", "2")),
-        extra_key_column: None,
+        ..common::page(matview.clone())
     };
     assert_eq!(
         pool.count_rows(Reading::UNMARKED, &request).await.unwrap(),

@@ -189,6 +189,49 @@ fn csv_with_a_bad_row(rows: usize, bad_at: usize) -> String {
     text
 }
 
+/// An import of `text` that fails at `line` on a value its target cannot
+/// take, after at least `undone_at_least` rows of it were already inserted,
+/// reports that line and undoes every one of them, leaving `table` exactly
+/// as it was. Its message names the column and the value.
+async fn assert_a_bad_file_rolls_back(
+    pool: &DbPool,
+    table: &TableMeta,
+    mapping: Vec<ColumnBinding>,
+    text: &str,
+    line: u64,
+    undone_at_least: u64,
+) {
+    let before = snapshot(pool, table, "id").await;
+    let rows_before = pool
+        .count_table_rows(Reading::UNMARKED, table)
+        .await
+        .unwrap();
+    let err = import(
+        pool,
+        table,
+        &options(mapping, ErrorMode::Abort),
+        csv(text).as_mut(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.line, Some(line), "the header is line 1");
+    assert!(err.message.contains("weight"), "{}", err.message);
+    assert!(err.message.contains("not-a-number"), "{}", err.message);
+    assert!(
+        err.undone_rows >= undone_at_least,
+        "rows must really have been inserted before the rollback, got {}",
+        err.undone_rows
+    );
+    // ...and the table is exactly what it was.
+    assert_eq!(snapshot(pool, table, "id").await, before);
+    assert_eq!(
+        pool.count_table_rows(Reading::UNMARKED, table)
+            .await
+            .unwrap(),
+        rows_before
+    );
+}
+
 #[tokio::test]
 async fn sqlite_csv_import_lands_every_row_in_one_transaction() {
     let fixture = FixtureDb::with_sql("").await;
@@ -237,42 +280,18 @@ async fn sqlite_a_bad_row_rolls_back_every_row_already_inserted() {
         .unwrap();
     let tables = pool.introspect().await.unwrap();
     let people = find(&tables, "people");
-    let before = snapshot(&pool, people, "id").await;
-
     // 1200 rows against a 300-row batch (900 parameter ceiling / 3 columns):
     // the bad row is in the last batch, so three batches have already been
     // sent and committed-to-the-transaction when it fails.
-    let text = csv_with_a_bad_row(1200, 1150);
-    let err = import(
+    assert_a_bad_file_rolls_back(
         &pool,
         people,
-        &options(
-            vec![bind(0, "id"), bind(1, "name"), bind(2, "weight")],
-            ErrorMode::Abort,
-        ),
-        csv(text.as_str()).as_mut(),
+        vec![bind(0, "id"), bind(1, "name"), bind(2, "weight")],
+        &csv_with_a_bad_row(1200, 1150),
+        1151,
+        900,
     )
-    .await
-    .unwrap_err();
-
-    // The failure names the line and the column, and reports what it undid.
-    assert_eq!(err.line, Some(1151), "the header is line 1");
-    assert!(err.message.contains("weight"), "{}", err.message);
-    assert!(err.message.contains("not-a-number"), "{}", err.message);
-    assert!(
-        err.undone_rows >= 900,
-        "the import must actually have inserted rows before undoing them, got {}",
-        err.undone_rows
-    );
-
-    // ...and the table is exactly what it was.
-    assert_eq!(snapshot(&pool, people, "id").await, before);
-    assert_eq!(
-        pool.count_table_rows(Reading::UNMARKED, people)
-            .await
-            .unwrap(),
-        1
-    );
+    .await;
 }
 
 #[tokio::test]
@@ -485,13 +504,8 @@ async fn sqlite_import_round_trips_the_export_of_the_same_table() {
     let copy = find(&tables, "artists_copy");
 
     let request = PageRequest {
-        schema: None,
-        table: "artists".to_string(),
         limit: 0,
-        offset: 0,
-        sort: None,
-        filter: None,
-        extra_key_column: None,
+        ..common::page("artists".to_string())
     };
     let (sql, params) = request.export_sql(Dialect::Sqlite);
     let mut buffer: Vec<u8> = Vec::new();
@@ -617,36 +631,17 @@ async fn postgres_a_bad_row_rolls_back_every_row_already_inserted() {
         .unwrap();
     let tables = pool.introspect().await.unwrap();
     let table = find(&tables, "import_rollback");
-    let before = snapshot(&pool, table, "id").await;
-
     // 60000 parameters / 3 columns is capped at 500 rows per batch, so 1200
     // rows is three batches: the failure has two full batches behind it.
-    let text = csv_with_a_bad_row(1200, 1150);
-    let err = import(
+    assert_a_bad_file_rolls_back(
         &pool,
         table,
-        &options(
-            vec![bind(0, "id"), bind(1, "name"), bind(2, "weight")],
-            ErrorMode::Abort,
-        ),
-        csv(text.as_str()).as_mut(),
+        vec![bind(0, "id"), bind(1, "name"), bind(2, "weight")],
+        &csv_with_a_bad_row(1200, 1150),
+        1151,
+        1000,
     )
-    .await
-    .unwrap_err();
-
-    assert_eq!(err.line, Some(1151));
-    assert!(
-        err.undone_rows >= 1000,
-        "rows must really have been inserted before the rollback, got {}",
-        err.undone_rows
-    );
-    assert_eq!(snapshot(&pool, table, "id").await, before);
-    assert_eq!(
-        pool.count_table_rows(Reading::UNMARKED, table)
-            .await
-            .unwrap(),
-        1
-    );
+    .await;
 
     pool.execute("DROP TABLE import_rollback").await.unwrap();
     pool.close().await;
@@ -798,7 +793,6 @@ async fn mssql_csv_import_lands_rows_and_rolls_a_bad_file_back() {
     );
 
     // ...then a bad one, which must leave those 1201 rows exactly as they are.
-    let before = snapshot(&pool, table, "id").await;
     let mut bad = String::from("id,name,weight,active\n");
     for i in 2001..=3200 {
         if i == 3150 {
@@ -807,21 +801,7 @@ async fn mssql_csv_import_lands_rows_and_rolls_a_bad_file_back() {
             bad.push_str(&format!("{i},row{i},{i}.5,1\n"));
         }
     }
-    let err = import(
-        &pool,
-        table,
-        &options(mapping, ErrorMode::Abort),
-        csv(bad.as_str()).as_mut(),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(err.line, Some(1151));
-    assert!(
-        err.undone_rows >= 1000,
-        "rows must really have been inserted before the rollback, got {}",
-        err.undone_rows
-    );
-    assert_eq!(snapshot(&pool, table, "id").await, before);
+    assert_a_bad_file_rolls_back(&pool, table, mapping, &bad, 1151, 1000).await;
     assert_eq!(
         pool.count_table_rows(Reading::UNMARKED, table)
             .await
