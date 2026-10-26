@@ -2107,7 +2107,7 @@ fn pk_source(flavor: PgFlavor) -> PkSource {
 /// wire type, so the mismatch failed the *whole* introspection. Pinning the
 /// width costs nothing on Postgres and makes the decode independent of what any
 /// engine chose.
-fn column_query(shape: ColumnQuery, pk: PkSource) -> String {
+fn column_query(shape: ColumnQuery, flavor: PgFlavor) -> String {
     // The three spans that differ. The portable shape must select the same
     // column names in the same order, so only the expressions change.
     let (generated, type_detail, type_join) = match shape {
@@ -2129,7 +2129,7 @@ fn column_query(shape: ColumnQuery, pk: PkSource) -> String {
     };
     // The key columns as (table_schema, table_name, column_name,
     // ordinal_position), the position being the column's place in the key.
-    let keys = match pk {
+    let keys = match pk_source(flavor) {
         PkSource::InformationSchema => {
             "SELECT kcu.table_schema, kcu.table_name, kcu.column_name, kcu.ordinal_position \
              FROM information_schema.table_constraints tc \
@@ -2271,7 +2271,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     // Asked once, before anything depends on the answer.
     let shape = catalog_shape(pool).await;
 
-    let column_rows = sqlx::query(&column_query(shape.column_query, pk_source(conn.flavor())))
+    let column_rows = sqlx::query(&column_query(shape.column_query, conn.flavor()))
         .fetch_all(pool)
         .await
         .map_err(catalog_error)?;
@@ -3636,43 +3636,66 @@ mod tests {
     #[test]
     fn only_risingwave_reads_its_keys_from_pg_constraint() {
         use super::{column_query, pk_source, ColumnQuery, PgFlavor, PkSource};
-        // Exhaustive: a new flavor fails to compile here until it is listed.
-        let listed = |flavor: PgFlavor| match flavor {
+        // The source each flavor must read, by an exhaustive match: a new
+        // flavor fails to compile here until it states its own.
+        let expected = |flavor: PgFlavor| match flavor {
+            PgFlavor::RisingWave => PkSource::PgConstraint,
             PgFlavor::Postgres
             | PgFlavor::CockroachDB
             | PgFlavor::Yugabyte
-            | PgFlavor::Materialize
-            | PgFlavor::RisingWave => flavor,
+            | PgFlavor::Materialize => PkSource::InformationSchema,
         };
-        for (flavor, source) in [
-            (PgFlavor::Postgres, PkSource::InformationSchema),
-            (PgFlavor::CockroachDB, PkSource::InformationSchema),
-            (PgFlavor::Yugabyte, PkSource::InformationSchema),
-            (PgFlavor::Materialize, PkSource::InformationSchema),
-            (PgFlavor::RisingWave, PkSource::PgConstraint),
+        for flavor in [
+            PgFlavor::Postgres,
+            PgFlavor::CockroachDB,
+            PgFlavor::Yugabyte,
+            PgFlavor::Materialize,
+            PgFlavor::RisingWave,
         ] {
-            assert_eq!(pk_source(listed(flavor)), source, "{flavor:?}");
+            assert_eq!(pk_source(flavor), expected(flavor), "{flavor:?}");
+            // The whole path, flavor to SQL: what the query sent for this
+            // flavor actually reads.
+            for shape in [ColumnQuery::Rich, ColumnQuery::Portable] {
+                let sql = column_query(shape, flavor);
+                match expected(flavor) {
+                    PkSource::PgConstraint => {
+                        assert!(
+                            sql.contains("FROM pg_constraint con")
+                                && sql.contains(
+                                    "unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)"
+                                )
+                                && sql.contains("k.ord AS ordinal_position"),
+                            "{flavor:?} {shape:?}: {sql}"
+                        );
+                        assert!(
+                            !sql.contains("table_constraints") && !sql.contains("key_column_usage"),
+                            "{flavor:?} {shape:?}: still reads a view that raises: {sql}"
+                        );
+                    }
+                    PkSource::InformationSchema => assert!(
+                        sql.contains("information_schema.table_constraints")
+                            && sql.contains("information_schema.key_column_usage")
+                            && !sql.contains("conkey"),
+                        "{flavor:?} {shape:?}: {sql}"
+                    ),
+                }
+            }
         }
-        for shape in [ColumnQuery::Rich, ColumnQuery::Portable] {
-            let catalog = column_query(shape, PkSource::PgConstraint);
-            assert!(
-                catalog.contains("FROM pg_constraint con")
-                    && catalog.contains("unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)")
-                    && catalog.contains("k.ord AS ordinal_position"),
-                "{shape:?}: {catalog}"
-            );
-            assert!(
-                !catalog.contains("table_constraints") && !catalog.contains("key_column_usage"),
-                "{shape:?}: the pg_constraint form still reads a view that raises: {catalog}"
-            );
-            let views = column_query(shape, PkSource::InformationSchema);
-            assert!(
-                views.contains("information_schema.table_constraints")
-                    && views.contains("information_schema.key_column_usage")
-                    && !views.contains("conkey"),
-                "{shape:?}: {views}"
-            );
-        }
+        // And introspection hands the query the connection's own flavor: the
+        // one call, as written (whitespace collapsed, comments and tests out).
+        let shipped: String = crate::source_scan::code_only(&crate::source_scan::shipped(
+            include_str!("postgres.rs"),
+        ));
+        let calls: Vec<&str> = shipped
+            .match_indices("column_query(")
+            .map(|(at, _)| &shipped[at..at + shipped[at..].find(')').unwrap() + 1])
+            .filter(|call| !call.contains(": ColumnQuery"))
+            .collect();
+        assert_eq!(
+            calls,
+            ["column_query(shape.column_query, conn.flavor()"],
+            "introspection asks the column query for another flavor than its own"
+        );
     }
 
     /// The extension query's rows as markings: an extension beats a
