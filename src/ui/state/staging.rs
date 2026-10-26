@@ -329,15 +329,12 @@ impl AppState {
             stage.changes()
         };
         self.nav_guard.set(None);
-        let pool = self.registry.read().get(id).map(|c| c.pool.clone());
-        let meta = self.table_meta(id, table);
-        let (Some(pool), Some(meta)) = (pool, meta) else {
-            self.fail_save(
-                id,
-                &table_key,
-                "connection or schema no longer available".into(),
-            );
-            return;
+        let (pool, meta) = match self.pool_and_meta(id, table, |c| c.pool.clone()) {
+            Ok(found) => found,
+            Err(gone) => {
+                self.fail_save(id, &table_key, gone);
+                return;
+            }
         };
         // The same resolution the grid gated its editors on (the backend's
         // capabilities plus the user's write-protection marking); if a stage

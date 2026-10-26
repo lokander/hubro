@@ -1379,6 +1379,10 @@ pub(crate) fn fk_jump_target<'a>(
     fk_target_columns(fk, target, rules).map(|_| target)
 }
 
+/// What an on-demand load of one table says when its tab has closed or its
+/// table has left the schema ([`AppState::pool_and_meta`]).
+const CONNECTION_OR_SCHEMA_GONE: &str = "connection or schema no longer available";
+
 /// Finds one table's metadata in a loaded schema — the single
 /// `(schema, name)` match behind every "which table is this?" lookup in the
 /// app.
@@ -2016,11 +2020,7 @@ impl AppState {
         locator: RowLocator,
         column: String,
     ) -> Result<CellFetch, String> {
-        let pool = self.registry.read().get(id).map(|c| c.browse());
-        let meta = self.table_meta(id, &table);
-        let (Some((pool, reading)), Some(meta)) = (pool, meta) else {
-            return Err("connection or schema no longer available".into());
-        };
+        let ((pool, reading), meta) = self.pool_and_meta(id, &table, Connection::browse)?;
         // A read path: it only needs the row to be addressable, so it asks
         // for the identity alone rather than a full access it has no business
         // reading a write capability off — a read-only connection, whether by
@@ -2046,11 +2046,7 @@ impl AppState {
         table: TableRef,
         object: DdlObject,
     ) -> Result<Ddl, String> {
-        let pool = self.registry.read().get(id).map(|c| c.pool.clone());
-        let meta = self.table_meta(id, &table);
-        let (Some(pool), Some(meta)) = (pool, meta) else {
-            return Err("connection or schema no longer available".into());
-        };
+        let (pool, meta) = self.pool_and_meta(id, &table, |c| c.pool.clone())?;
         pool.fetch_ddl(&meta, &object)
             .await
             .map_err(|e| e.to_string())
@@ -2069,11 +2065,7 @@ impl AppState {
         id: ConnectionId,
         table: TableRef,
     ) -> Result<TableStats, String> {
-        let pool = self.registry.read().get(id).map(|c| c.pool.clone());
-        let meta = self.table_meta(id, &table);
-        let (Some(pool), Some(meta)) = (pool, meta) else {
-            return Err("connection or schema no longer available".into());
-        };
+        let (pool, meta) = self.pool_and_meta(id, &table, |c| c.pool.clone())?;
         pool.fetch_table_stats(&meta)
             .await
             .map_err(|e| e.to_string())
@@ -2084,14 +2076,33 @@ impl AppState {
     /// Only ever from an explicit "count exactly" action — see
     /// [`DbPool::count_table_rows`], which is where the reason lives.
     pub async fn count_table_rows(self, id: ConnectionId, table: TableRef) -> Result<u64, String> {
-        let pool = self.registry.read().get(id).map(|c| c.browse());
-        let meta = self.table_meta(id, &table);
-        let (Some((pool, reading)), Some(meta)) = (pool, meta) else {
-            return Err("connection or schema no longer available".into());
-        };
+        let ((pool, reading), meta) = self.pool_and_meta(id, &table, Connection::browse)?;
         pool.count_table_rows(reading, &meta)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// What every on-demand load of one table starts from: the connection's
+    /// pool, as `take` picks it off the open [`Connection`] —
+    /// [`Connection::browse`] for a read that runs under the connection's
+    /// marking, the bare pool for one that does not — and the table's
+    /// metadata ([`Self::table_meta`]). Both are cloned out of their signals,
+    /// so no borrow spans the caller's await.
+    ///
+    /// The error is the one message every such load reports when the tab has
+    /// closed or a schema refresh has dropped the table from under it.
+    pub(super) fn pool_and_meta<T>(
+        &self,
+        id: ConnectionId,
+        table: &TableRef,
+        take: impl FnOnce(&Connection) -> T,
+    ) -> Result<(T, TableMeta), String> {
+        let pool = self.registry.read().get(id).map(take);
+        let meta = self.table_meta(id, table);
+        match (pool, meta) {
+            (Some(pool), Some(meta)) => Ok((pool, meta)),
+            _ => Err(CONNECTION_OR_SCHEMA_GONE.to_string()),
+        }
     }
 
     /// One table's metadata from the loaded schema, cloned out of the signal.
@@ -2261,6 +2272,84 @@ mod tests {
     /// import, an alias (`use … Reading as R` names it too).
     fn names_reading(code: &str) -> bool {
         crate::source_scan::names_ident(code, "Reading")
+    }
+
+    #[tokio::test]
+    async fn an_on_demand_load_gets_both_the_connection_and_the_table_or_an_error() {
+        use dioxus::core::VirtualDom;
+
+        use crate::ui::test_dom::provide_state;
+
+        fn empty() -> Element {
+            rsx! {}
+        }
+        let dom = VirtualDom::new(empty);
+        let state = provide_state(&dom);
+        let table = TableRef {
+            schema: None,
+            name: "t".to_string(),
+        };
+        let meta = TableMeta {
+            schema: None,
+            name: "t".to_string(),
+            kind: crate::db::TableKind::Table,
+            columns: vec![],
+            indexes: vec![],
+            foreign_keys: vec![],
+            restriction: None,
+            internal: None,
+            kind_label: None,
+        };
+        let lazy =
+            || DbPool::Sqlite(sqlx::sqlite::SqlitePool::connect_lazy("sqlite::memory:").unwrap());
+        dom.in_runtime(|| {
+            let mut state = state;
+            let id = state
+                .registry
+                .write()
+                .insert("t.db", lazy(), WriteProtection::Open);
+            let gone = Some(CONNECTION_OR_SCHEMA_GONE);
+            // An open connection whose schema has not loaded.
+            assert_eq!(
+                state.pool_and_meta(id, &table, |_| ()).err().as_deref(),
+                gone
+            );
+            state
+                .schemas
+                .write()
+                .insert(id, SchemaLoad::Ready(vec![meta.clone()]));
+            // Both: what `take` picked off this connection, and this table.
+            let (taken, found) = state
+                .pool_and_meta(id, &table, |connection| connection.id)
+                .expect("the connection and the table are both there");
+            assert_eq!((taken, found.name.as_str()), (id, "t"));
+            // A table the schema does not hold.
+            let missing = TableRef {
+                schema: None,
+                name: "u".to_string(),
+            };
+            assert_eq!(
+                state.pool_and_meta(id, &missing, |_| ()).err().as_deref(),
+                gone
+            );
+            // A schema whose connection is not open here: the second id a
+            // registry hands out, where this one has handed out only the first.
+            let mut other = ConnectionRegistry::default();
+            other.insert("u.db", lazy(), WriteProtection::Open);
+            let elsewhere = other.insert("v.db", lazy(), WriteProtection::Open);
+            assert_ne!(elsewhere, id);
+            state
+                .schemas
+                .write()
+                .insert(elsewhere, SchemaLoad::Ready(vec![meta.clone()]));
+            assert_eq!(
+                state
+                    .pool_and_meta(elsewhere, &table, |_| ())
+                    .err()
+                    .as_deref(),
+                gone
+            );
+        });
     }
 
     #[test]
