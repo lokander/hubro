@@ -177,12 +177,10 @@ async fn timescale_hypertable_pages_sorts_and_filters_across_chunks() {
     // keep walking the same ordering rather than restarting per chunk.
     let request = PageRequest {
         schema: Some("public".into()),
-        table: readings.clone(),
         limit: 3,
-        offset: 0,
         sort: Some(("time".into(), SortDir::Desc)),
         filter: Some(Filter::equals("sensor_id", "2")),
-        extra_key_column: None,
+        ..common::page(readings.clone())
     };
     assert_pages_sorts_and_filters(&pool, &request, Expected::Exactly(17)).await;
 }
@@ -256,12 +254,9 @@ async fn timescale_continuous_aggregate_is_a_readable_read_only_view() {
             Reading::UNMARKED,
             &PageRequest {
                 schema: Some("public".into()),
-                table: agg.clone(),
                 limit: 10,
-                offset: 0,
                 sort: Some(("bucket".into(), SortDir::Asc)),
-                filter: None,
-                extra_key_column: None,
+                ..common::page(agg.clone())
             },
         )
         .await
@@ -322,12 +317,9 @@ async fn timescale_hypertable_without_a_primary_key_refuses_editing() {
             Reading::UNMARKED,
             &PageRequest {
                 schema: Some("public".into()),
-                table: "readings_nokey".into(),
                 limit: 5,
-                offset: 0,
                 sort: Some(("time".into(), SortDir::Asc)),
-                filter: None,
-                extra_key_column: None,
+                ..common::page("readings_nokey")
             },
         )
         .await

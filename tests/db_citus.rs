@@ -208,12 +208,10 @@ async fn distributed_table_pages_sorts_and_filters_across_shards() {
     // has to continue it rather than restart per shard.
     let request = PageRequest {
         schema: Some("public".into()),
-        table: orders.clone(),
         limit: 5,
-        offset: 0,
         sort: Some(("id".into(), SortDir::Desc)),
         filter: Some(Filter::equals("country", "no")),
-        extra_key_column: None,
+        ..common::page(orders.clone())
     };
     assert_pages_sorts_and_filters(&pool, &request, Expected::MoreThan(50)).await;
 }
@@ -300,12 +298,9 @@ async fn changing_the_distribution_column_is_refused_with_citus_own_message() {
             Reading::UNMARKED,
             &PageRequest {
                 schema: Some("public".into()),
-                table: orders.clone(),
                 limit: 1,
-                offset: 0,
-                sort: None,
                 filter: Some(Filter::equals("id", "11")),
-                extra_key_column: None,
+                ..common::page(orders.clone())
             },
         )
         .await
@@ -377,12 +372,9 @@ async fn fk_navigation_crosses_from_distributed_to_reference() {
             Reading::UNMARKED,
             &PageRequest {
                 schema: Some("public".into()),
-                table: countries.clone(),
                 limit: 10,
-                offset: 0,
-                sort: None,
                 filter: Some(filter),
-                extra_key_column: None,
+                ..common::page(countries.clone())
             },
         )
         .await

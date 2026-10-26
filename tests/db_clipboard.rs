@@ -69,6 +69,28 @@ async fn paste_inserts(pool: &DbPool, dialect: Dialect, table: &str, rows: &[Vec
     }
 }
 
+/// The rows of `src`, which every backend fills with the same five rows, come
+/// back byte-identical in `dst` after their generated INSERTs run there
+/// unedited. Returns the source rows, for the checks only one backend makes.
+///
+/// `note` holds the pair that must never collapse: a NULL (row 1) and an
+/// empty string (row 2), and the source is checked to really hold them.
+async fn assert_inserts_round_trip(
+    pool: &DbPool,
+    dialect: Dialect,
+    src: &str,
+    dst: &str,
+) -> Vec<Vec<Value>> {
+    let source = read_rows(pool, src).await;
+    assert_eq!(source.len(), 5);
+    assert_eq!(source[0][2], Value::Null);
+    assert_eq!(source[1][2], Value::Text(String::new()));
+
+    paste_inserts(pool, dialect, dst, &source).await;
+    assert_eq!(read_rows(pool, dst).await, source);
+    source
+}
+
 #[tokio::test]
 async fn sqlite_generated_inserts_round_trip() {
     // `note` holds the pair that must never collapse: a NULL and an empty
@@ -89,14 +111,7 @@ async fn sqlite_generated_inserts_round_trip() {
     .await;
     let pool = fixture.open().await;
 
-    let source = read_rows(&pool, "src").await;
-    assert_eq!(source.len(), 5);
-    // The fixture really does hold a NULL and an empty string in `note`.
-    assert_eq!(source[0][2], Value::Null);
-    assert_eq!(source[1][2], Value::Text(String::new()));
-
-    paste_inserts(&pool, Dialect::Sqlite, "dst", &source).await;
-    assert_eq!(read_rows(&pool, "dst").await, source);
+    assert_inserts_round_trip(&pool, Dialect::Sqlite, "src", "dst").await;
 }
 
 #[tokio::test]
@@ -133,10 +148,7 @@ async fn postgres_generated_inserts_round_trip() {
     .await
     .unwrap();
 
-    let source = read_rows(&pool, "clip_src").await;
-    assert_eq!(source.len(), 5);
-    assert_eq!(source[0][2], Value::Null);
-    assert_eq!(source[1][2], Value::Text(String::new()));
+    let source = assert_inserts_round_trip(&pool, Dialect::Postgres, "clip_src", "clip_dst").await;
     // A backslash must survive as one character: the generated literal relies
     // on `standard_conforming_strings`, so a doubled backslash here would mean
     // the rendering is wrong for every escape.
@@ -144,9 +156,6 @@ async fn postgres_generated_inserts_round_trip() {
         source[1][1],
         Value::Text("back\\slash; and -- comment".into())
     );
-
-    paste_inserts(&pool, Dialect::Postgres, "clip_dst", &source).await;
-    assert_eq!(read_rows(&pool, "clip_dst").await, source);
 
     for table in ["clip_src", "clip_dst"] {
         pool.execute(&format!("DROP TABLE {table}")).await.unwrap();
@@ -244,16 +253,10 @@ async fn sqlserver_generated_inserts_round_trip() {
     .await
     .unwrap();
 
-    let source = read_rows(&pool, "clip_src").await;
-    assert_eq!(source.len(), 5);
-    assert_eq!(source[0][2], Value::Null);
-    assert_eq!(source[1][2], Value::Text(String::new()));
-    assert_eq!(source[3][1], Value::Text("héllo 世界".into()));
-
-    paste_inserts(&pool, Dialect::SqlServer, "clip_dst", &source).await;
     // Without the `N` prefix on the generated literals, row 4's name comes
-    // back as "h?llo ??" here — valid SQL, silently wrong data.
-    assert_eq!(read_rows(&pool, "clip_dst").await, source);
+    // back as "h?llo ??" — valid SQL, silently wrong data.
+    let source = assert_inserts_round_trip(&pool, Dialect::SqlServer, "clip_src", "clip_dst").await;
+    assert_eq!(source[3][1], Value::Text("héllo 世界".into()));
 
     for table in ["clip_src", "clip_dst"] {
         pool.execute(&format!("DROP TABLE dbo.{table}"))

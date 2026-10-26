@@ -15,14 +15,20 @@
 
 mod common;
 
+use common::backends::{
+    assert_a_deleted_rows_cell_does_not_load, assert_bounded_page_previews,
+    assert_empty_result_keeps_headers, assert_large_cells_load_in_full,
+    assert_no_result_set_is_no_columns, assert_query_capped, CappedQueries,
+};
+
 use hubro::db::Reading;
 use hubro::db::{
     apply_staged, detect_row_identity, explain_statement, needs_confirmation,
     plan_reached_cell_cap, run_script, script_refusal, url_with_password, Capabilities, DbError,
     DbPool, Dialect, Filter, Internal, KeyTextPinned, PageRequest, PgFlavor, PlanDisplay,
     Restriction, Rollback, RowCount, RowLocator, SortDir, StagedChange, StatementOutcome,
-    TableKind, TableMeta, TypeDetail, TypeRef, Value, WriteProtection, INSTEAD_RULE, MISSING_ROW,
-    PREVIEW_BYTES, QUERY_CELL_CAP,
+    TableKind, TableMeta, TypeDetail, TypeRef, Value, WriteProtection, INSTEAD_RULE,
+    QUERY_CELL_CAP,
 };
 
 async fn test_url() -> Option<String> {
@@ -214,13 +220,9 @@ async fn postgres_paging_sorting_filtering_and_values_work() {
     fresh_fixture(&pool, "fruits_page").await;
 
     let mut request = PageRequest {
-        schema: None,
-        table: "fruits_page".into(),
         limit: 2,
-        offset: 0,
         sort: Some(("name".into(), SortDir::Asc)),
-        filter: None,
-        extra_key_column: None,
+        ..common::page("fruits_page")
     };
     assert_eq!(
         pool.count_rows(Reading::UNMARKED, &request).await.unwrap(),
@@ -794,12 +796,8 @@ async fn postgres_multi_schema_introspection_has_parity_metadata() {
     // Browsing the matview's data works through the normal paged read path.
     let mv_request = PageRequest {
         schema: Some("warehouse".into()),
-        table: "stock_mv".into(),
         limit: 10,
-        offset: 0,
-        sort: None,
-        filter: None,
-        extra_key_column: None,
+        ..common::page("stock_mv")
     };
     assert_eq!(
         pool.count_rows(Reading::UNMARKED, &mv_request)
@@ -816,12 +814,8 @@ async fn postgres_multi_schema_introspection_has_parity_metadata() {
     // Schema-qualified paging works end to end.
     let request = PageRequest {
         schema: Some("warehouse".into()),
-        table: "stock".into(),
         limit: 10,
-        offset: 0,
-        sort: None,
-        filter: None,
-        extra_key_column: None,
+        ..common::page("stock")
     };
     assert_eq!(
         pool.count_rows(Reading::UNMARKED, &request).await.unwrap(),
@@ -946,62 +940,17 @@ async fn postgres_bounded_page_previews_large_text_and_bytea() {
         .clone();
     let request = PageRequest {
         schema: docs.schema.clone(),
-        table: "bounded_docs".into(),
-        limit: 100,
-        offset: 0,
         sort: Some(("id".into(), SortDir::Asc)),
-        filter: None,
-        extra_key_column: None,
+        ..common::page("bounded_docs")
     };
 
-    let page = pool
-        .fetch_page_bounded(Reading::UNMARKED, &request, &docs.columns, &["id"])
-        .await
-        .unwrap();
-    assert_eq!(page.result.columns.len(), 4, "length columns stripped");
-    // big_text previewed with the real length; bytea previewed as size.
-    let text_preview = page.previews[0][2].expect("big_text truncated");
-    assert_eq!(text_preview.full_len, 50_000);
-    assert!(!text_preview.binary);
-    if let Value::Text(t) = &page.result.rows[0][2] {
-        assert!(t.chars().count() <= PREVIEW_BYTES);
-    } else {
-        panic!("expected text preview");
-    }
-    let blob_preview = page.previews[0][3].expect("bytea truncated");
-    assert_eq!(blob_preview.full_len, 40_000);
-    assert!(blob_preview.binary);
-    // Short values are complete.
-    assert!(page.previews[1][2].is_none());
-    assert!(page.previews[0][1].is_none());
-
-    // fetch_cell returns the full text.
-    let identity = detect_row_identity(&docs, pool.dialect()).unwrap();
-    let locator = RowLocator {
-        identity_values: vec![Value::Integer(1)],
-    };
-    let cell = pool
-        .fetch_cell(Reading::UNMARKED, &docs, &identity, &locator, "big_text")
-        .await
-        .unwrap();
-    assert_eq!(cell.full_len, 50_000);
-    assert!(!cell.capped);
-    if let Value::Text(t) = &cell.value {
-        assert_eq!(t.chars().count(), 50_000);
-    } else {
-        panic!("expected full text");
-    }
+    assert_bounded_page_previews(&pool, &docs, &request).await;
+    assert_large_cells_load_in_full(&pool, &docs).await;
     // Deleted underneath the grid: an error, never a NULL value.
     pool.query_unbounded("DELETE FROM bounded_docs WHERE id = 1")
         .await
         .unwrap();
-    match pool
-        .fetch_cell(Reading::UNMARKED, &docs, &identity, &locator, "big_text")
-        .await
-    {
-        Err(DbError::Query(message)) => assert_eq!(message, MISSING_ROW),
-        other => panic!("a deleted row's cell must not load: {other:?}"),
-    }
+    assert_a_deleted_rows_cell_does_not_load(&pool, &docs, 1).await;
 
     pool.query_unbounded("DROP TABLE IF EXISTS bounded_docs")
         .await
@@ -1013,38 +962,16 @@ async fn postgres_bounded_page_previews_large_text_and_bytea() {
 async fn postgres_query_capped_stops_and_bounds_cells() {
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
-
-    // Row cap: 25 rows exist, ask for 10.
-    let (result, truncated) = pool
-        .query_capped(
-            "SELECT g FROM generate_series(1, 25) AS g ORDER BY g",
-            &[],
-            10,
-        )
-        .await
-        .unwrap();
-    assert_eq!(result.rows.len(), 10);
-    assert!(truncated);
-
-    // Under the cap: no truncation.
-    let (result, truncated) = pool
-        .query_capped("SELECT g FROM generate_series(1, 5) AS g", &[], 100)
-        .await
-        .unwrap();
-    assert_eq!(result.rows.len(), 5);
-    assert!(!truncated);
-
-    // Huge cell capped.
-    let (result, _t) = pool
-        .query_capped("SELECT repeat('Z', 200000) AS v", &[], 10)
-        .await
-        .unwrap();
-    if let Value::Text(t) = &result.rows[0][0] {
-        assert!(t.len() <= QUERY_CELL_CAP, "cell capped, got {}", t.len());
-    } else {
-        panic!("expected text");
-    }
-
+    assert_query_capped(
+        &pool,
+        &CappedQueries {
+            one_to_25: "SELECT g FROM generate_series(1, 25) AS g ORDER BY g",
+            exactly_ten: "SELECT g FROM generate_series(1, 10) AS g",
+            five: "SELECT g FROM generate_series(1, 5) AS g",
+            huge_cell: "SELECT repeat('Z', 200000) AS v",
+        },
+    )
+    .await;
     pool.close().await;
 }
 
@@ -1055,18 +982,12 @@ async fn postgres_empty_results_keep_their_column_headers() {
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     fresh_fixture(&pool, "fruits_empty").await;
-
-    let sql = "SELECT id, name FROM fruits_empty WHERE false";
-    let empty = pool.query_unbounded(sql).await.unwrap();
-    assert!(empty.rows.is_empty());
-    let names: Vec<&str> = empty.columns.iter().map(|c| c.name.as_str()).collect();
-    assert_eq!(names, ["id", "name"]);
-
-    let (empty, truncated) = pool.query_capped(sql, &[], 100).await.unwrap();
-    assert!(empty.rows.is_empty());
-    assert!(!truncated);
-    let names: Vec<&str> = empty.columns.iter().map(|c| c.name.as_str()).collect();
-    assert_eq!(names, ["id", "name"]);
+    assert_empty_result_keeps_headers(
+        &pool,
+        "SELECT id, name FROM fruits_empty WHERE false",
+        &["id", "name"],
+    )
+    .await;
 
     // A statement with no result set has no header to recover, and must not
     // become an error because of it.
@@ -1076,12 +997,7 @@ async fn postgres_empty_results_keep_their_column_headers() {
     pool.execute("CREATE TABLE pg_headerless (x integer)")
         .await
         .unwrap();
-    let (result, _) = pool
-        .query_capped("DROP TABLE pg_headerless", &[], 100)
-        .await
-        .unwrap();
-    assert!(result.rows.is_empty());
-    assert!(result.columns.is_empty());
+    assert_no_result_set_is_no_columns(&pool, "DROP TABLE pg_headerless").await;
 
     pool.close().await;
 }
@@ -2346,12 +2262,9 @@ async fn postgres_a_key_read_as_text_still_sorts_by_its_type() {
         .unwrap();
     let sorted = |column: &str| PageRequest {
         schema: table.schema.clone(),
-        table: table.name.clone(),
         limit: 10,
-        offset: 0,
         sort: Some((column.into(), SortDir::Asc)),
-        filter: None,
-        extra_key_column: None,
+        ..common::page(table.name.clone())
     };
     let page = pool
         .fetch_page_bounded(Reading::UNMARKED, &sorted("k"), &table.columns, &["k"])
@@ -2396,12 +2309,8 @@ async fn saves_by_text_key_land_on_their_rows(
     let access = pool.backend_access(&meta);
     let request = PageRequest {
         schema: meta.schema.clone(),
-        table: meta.name.clone(),
         limit: 10,
-        offset: 0,
-        sort: None,
-        filter: None,
-        extra_key_column: None,
+        ..common::page(meta.name.clone())
     };
     let tags = || async {
         let read = pool

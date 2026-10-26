@@ -283,13 +283,9 @@ async fn sqlite_rowid_identity_table_edits_end_to_end() {
     // Fetch a page exactly as the grid does for rowid tables: the key
     // column is prepended to the row and hidden from display.
     let request = PageRequest {
-        schema: None,
-        table: "notes".into(),
         limit: 10,
-        offset: 0,
-        sort: None,
-        filter: None,
         extra_key_column: Some(column.clone()),
+        ..common::page("notes")
     };
     let page = pool.fetch_page(Reading::UNMARKED, &request).await.unwrap();
     assert_eq!(page.columns[0].name, "rowid");

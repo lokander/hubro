@@ -434,12 +434,10 @@ async fn risingwave_pages_sorts_and_filters_over_a_materialized_view() {
     // writes are refused, since browsing is most of what it will be used for.
     let request = PageRequest {
         schema: Some("public".into()),
-        table: readings.clone(),
         limit: 2,
-        offset: 0,
         sort: Some(("id".into(), SortDir::Desc)),
         filter: Some(Filter::equals("sensor_id", "1")),
-        extra_key_column: None,
+        ..common::page(readings.clone())
     };
     let (page, next) = assert_pages_sorts_and_filters(&pool, &request, Expected::Exactly(3)).await;
     let ids: Vec<i64> = page.rows.iter().map(|row| integer(&row[0])).collect();
@@ -450,12 +448,10 @@ async fn risingwave_pages_sorts_and_filters_over_a_materialized_view() {
     // most objects on a streaming engine are.
     let mv_request = PageRequest {
         schema: Some("public".into()),
-        table: matview.clone(),
         limit: 10,
-        offset: 0,
         sort: Some(("sensor_id".into(), SortDir::Asc)),
         filter: Some(Filter::equals("sensor_id", "2")),
-        extra_key_column: None,
+        ..common::page(matview.clone())
     };
     let mv_page = pool
         .fetch_page(Reading::UNMARKED, &mv_request)
@@ -661,12 +657,7 @@ async fn risingwave_long_cells_load_through_every_key_type() {
         let identity = detect_row_identity(table, pool.dialect()).expect("a keyed table");
         let request = PageRequest {
             schema: table.schema.clone(),
-            table: table.name.clone(),
-            limit: 100,
-            offset: 0,
-            sort: None,
-            filter: None,
-            extra_key_column: None,
+            ..common::page(table.name.clone())
         };
         let page = pool
             .fetch_page_bounded(Reading::UNMARKED, &request, &table.columns, &["k"])

@@ -269,12 +269,10 @@ async fn yugabyte_pages_sorts_and_filters() {
 
     let request = PageRequest {
         schema: Some("public".into()),
-        table: readings.clone(),
         limit: 3,
-        offset: 0,
         sort: Some(("id".into(), SortDir::Desc)),
         filter: Some(Filter::equals("sensor_id", "2")),
-        extra_key_column: None,
+        ..common::page(readings.clone())
     };
     let (page, next) = assert_pages_sorts_and_filters(&pool, &request, Expected::Exactly(8)).await;
     // Rows are distributed by hash, so the storage order is arbitrary; an
@@ -348,12 +346,9 @@ async fn yugabyte_table_without_a_key_is_read_only_like_postgres() {
             Reading::UNMARKED,
             &PageRequest {
                 schema: Some("public".into()),
-                table: "yb_nokey".into(),
                 limit: 5,
-                offset: 0,
                 sort: Some(("a".into(), SortDir::Asc)),
-                filter: None,
-                extra_key_column: None,
+                ..common::page("yb_nokey")
             },
         )
         .await
@@ -405,12 +400,9 @@ async fn yugabyte_materialized_view_browses_but_refuses_writes() {
             Reading::UNMARKED,
             &PageRequest {
                 schema: Some("public".into()),
-                table: view.clone(),
                 limit: 10,
-                offset: 0,
                 sort: Some(("sensor_id".into(), SortDir::Asc)),
-                filter: None,
-                extra_key_column: None,
+                ..common::page(view.clone())
             },
         )
         .await

@@ -611,12 +611,7 @@ async fn browse(
     let reading = Reading::of(caps);
     let request = PageRequest {
         schema: table.schema.clone(),
-        table: table.name.clone(),
-        limit: 100,
-        offset: 0,
-        sort: None,
-        filter: None,
-        extra_key_column: None,
+        ..common::page(table.name.clone())
     };
     match how {
         Browse::Page => pool

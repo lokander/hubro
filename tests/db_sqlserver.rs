@@ -21,13 +21,19 @@
 
 mod common;
 
+use common::backends::{
+    assert_a_deleted_rows_cell_does_not_load, assert_bounded_page_previews,
+    assert_empty_result_keeps_headers, assert_large_cells_load_in_full,
+    assert_no_result_set_is_no_columns, assert_query_capped, CappedQueries,
+};
+
 use hubro::db::Reading;
 use hubro::db::{
     apply_staged, detect_row_identity, mssql_url_with_password, run_script, split_statements,
     Capabilities, CheckedStatement, DbError, DbPool, Dialect, ExportFormat, Filter, Generated,
     OpenTransaction, PageRequest, RestOfRead, Restriction, Rollback, RowCount, RowIdentity,
     RowLocator, RowsAffected, ScriptDone, SortDir, StagedChange, StatementOutcome, TableKind,
-    TableMeta, TypeDetail, Value, INSTEAD_OF_TRIGGER, MISSING_ROW, PREVIEW_BYTES, QUERY_CELL_CAP,
+    TableMeta, TypeDetail, Value, INSTEAD_OF_TRIGGER, MISSING_ROW, PREVIEW_BYTES,
 };
 
 /// Keeps introspection apart from everything else this binary sends.
@@ -116,12 +122,7 @@ async fn introspect_table(turn: &mut Turn, pool: &DbPool, name: &str) -> TableMe
 fn page_request(table: &str) -> PageRequest {
     PageRequest {
         schema: Some("dbo".into()),
-        table: table.into(),
-        limit: 100,
-        offset: 0,
-        sort: None,
-        filter: None,
-        extra_key_column: None,
+        ..common::page(table)
     }
 }
 
@@ -1578,46 +1579,18 @@ async fn sqlserver_query_capped_stops_and_bounds_cells() {
         return;
     };
     let pool = DbPool::open_mssql(&url).await.unwrap();
-
-    // Row cap: 25 rows exist, ask for 10.
-    let (result, truncated) = pool
-        .query_capped(
-            "SELECT TOP (25) ROW_NUMBER() OVER (ORDER BY object_id) AS g FROM sys.all_objects",
-            &[],
-            10,
-        )
-        .await
-        .unwrap();
-    assert_eq!(result.rows.len(), 10);
-    assert!(truncated);
-
-    // Under the cap: no truncation.
-    let (result, truncated) = pool
-        .query_capped(
-            "SELECT TOP (5) ROW_NUMBER() OVER (ORDER BY object_id) AS g FROM sys.all_objects",
-            &[],
-            100,
-        )
-        .await
-        .unwrap();
-    assert_eq!(result.rows.len(), 5);
-    assert!(!truncated);
-
-    // Huge cell capped.
-    let (result, _t) = pool
-        .query_capped(
-            "SELECT REPLICATE(CAST(N'Z' AS nvarchar(max)), 200000) AS v",
-            &[],
-            10,
-        )
-        .await
-        .unwrap();
-    if let Value::Text(t) = &result.rows[0][0] {
-        assert!(t.len() <= QUERY_CELL_CAP, "cell capped, got {}", t.len());
-    } else {
-        panic!("expected text");
-    }
-
+    assert_query_capped(
+        &pool,
+        &CappedQueries {
+            one_to_25: "SELECT TOP (25) ROW_NUMBER() OVER (ORDER BY object_id) AS g \
+                        FROM sys.all_objects ORDER BY g",
+            exactly_ten: "SELECT TOP (10) ROW_NUMBER() OVER (ORDER BY object_id) AS g \
+                          FROM sys.all_objects",
+            five: "SELECT TOP (5) ROW_NUMBER() OVER (ORDER BY object_id) AS g FROM sys.all_objects",
+            huge_cell: "SELECT REPLICATE(CAST(N'Z' AS nvarchar(max)), 200000) AS v",
+        },
+    )
+    .await;
     pool.close().await;
 }
 
@@ -1639,20 +1612,16 @@ async fn sqlserver_empty_results_keep_their_column_headers() {
         ],
     )
     .await;
+    assert_empty_result_keeps_headers(
+        &pool,
+        "SELECT id, name FROM dbo.empty_headers WHERE 1 = 0",
+        &["id", "name"],
+    )
+    .await;
 
-    let sql = "SELECT id, name FROM dbo.empty_headers WHERE 1 = 0";
-    let empty = pool.query_unbounded(sql).await.unwrap();
-    assert!(empty.rows.is_empty());
-    let names: Vec<&str> = empty.columns.iter().map(|c| c.name.as_str()).collect();
-    assert_eq!(names, ["id", "name"]);
-
-    let (empty, truncated) = pool.query_capped(sql, &[], 100).await.unwrap();
-    assert!(empty.rows.is_empty());
-    assert!(!truncated);
-    let names: Vec<&str> = empty.columns.iter().map(|c| c.name.as_str()).collect();
-    assert_eq!(names, ["id", "name"]);
-
-    run_all(&pool, &["DROP TABLE IF EXISTS dbo.empty_headers"]).await;
+    // A statement with no result set has no header to recover, and must not
+    // become an error because of it.
+    assert_no_result_set_is_no_columns(&pool, "DROP TABLE dbo.empty_headers").await;
     pool.close().await;
 }
 
@@ -1807,64 +1776,11 @@ async fn sqlserver_bounded_page_previews_large_text_and_binary() {
         ..page_request("bounded_docs")
     };
 
-    let page = pool
-        .fetch_page_bounded(Reading::UNMARKED, &request, &docs.columns, &["id"])
-        .await
-        .unwrap();
-    assert_eq!(page.result.columns.len(), 4, "length columns stripped");
-    // big_text previewed with the real length; varbinary previewed as size.
-    let text_preview = page.previews[0][2].expect("big_text truncated");
-    assert_eq!(text_preview.full_len, 50_000);
-    assert!(!text_preview.binary);
-    if let Value::Text(t) = &page.result.rows[0][2] {
-        assert!(t.chars().count() <= PREVIEW_BYTES);
-    } else {
-        panic!("expected text preview");
-    }
-    let blob_preview = page.previews[0][3].expect("payload truncated");
-    assert_eq!(blob_preview.full_len, 40_000);
-    assert!(blob_preview.binary);
-    // Short values are complete.
-    assert!(page.previews[0][1].is_none());
-    assert!(page.previews[1][2].is_none());
-    assert!(page.previews[1][3].is_none());
-
-    // fetch_cell returns the full text and the full blob.
-    let identity = detect_row_identity(&docs, pool.dialect()).unwrap();
-    let locator = RowLocator {
-        identity_values: vec![Value::Integer(1)],
-    };
-    let cell = pool
-        .fetch_cell(Reading::UNMARKED, &docs, &identity, &locator, "big_text")
-        .await
-        .unwrap();
-    assert_eq!(cell.full_len, 50_000);
-    assert!(!cell.capped);
-    if let Value::Text(t) = &cell.value {
-        assert_eq!(t.chars().count(), 50_000);
-    } else {
-        panic!("expected full text");
-    }
-    let cell = pool
-        .fetch_cell(Reading::UNMARKED, &docs, &identity, &locator, "payload")
-        .await
-        .unwrap();
-    assert_eq!(cell.full_len, 40_000);
-    assert!(!cell.capped);
-    if let Value::Blob(b) = &cell.value {
-        assert_eq!(b.len(), 40_000);
-    } else {
-        panic!("expected full blob");
-    }
+    assert_bounded_page_previews(&pool, &docs, &request).await;
+    assert_large_cells_load_in_full(&pool, &docs).await;
     // Deleted underneath the grid: an error, never a NULL value.
     run_all(&pool, &["DELETE FROM dbo.bounded_docs WHERE id = 1"]).await;
-    match pool
-        .fetch_cell(Reading::UNMARKED, &docs, &identity, &locator, "big_text")
-        .await
-    {
-        Err(DbError::Query(message)) => assert_eq!(message, MISSING_ROW),
-        other => panic!("a deleted row's cell must not load: {other:?}"),
-    }
+    assert_a_deleted_rows_cell_does_not_load(&pool, &docs, 1).await;
 
     run_all(&pool, &["DROP TABLE dbo.bounded_docs"]).await;
     pool.close().await;

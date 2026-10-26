@@ -94,13 +94,10 @@ async fn sqlite_export_respects_filter_and_sort_via_page_request() {
     // The same query the grid would build for the current view: a `contains`
     // filter on name plus a descending sort, and no paging.
     let request = PageRequest {
-        schema: None,
-        table: "items".into(),
         limit: 0,
-        offset: 0,
         sort: Some(("id".into(), SortDir::Desc)),
         filter: Some(Filter::contains("name", "a")),
-        extra_key_column: None,
+        ..common::page("items")
     };
     let (sql, params) = request.export_sql(pool.dialect());
     let (csv, rows) = export_to_string(&pool, &sql, &params, ExportFormat::Csv).await;
@@ -226,12 +223,10 @@ async fn postgres_export_respects_filter_and_sort() {
 
     let request = PageRequest {
         schema: Some("public".into()),
-        table: "export_filtered".into(),
         limit: 0,
-        offset: 0,
         sort: Some(("id".into(), SortDir::Desc)),
         filter: Some(Filter::equals("name", "banana")),
-        extra_key_column: None,
+        ..common::page("export_filtered")
     };
     let (sql, params) = request.export_sql(pool.dialect());
     let (csv, rows) = export_to_string(&pool, &sql, &params, ExportFormat::Csv).await;

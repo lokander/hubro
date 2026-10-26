@@ -31,18 +31,6 @@ use common::{budgets, perf_scale, FixtureDb, Timings};
 use hubro::db::Reading;
 use hubro::db::{DbPool, PageRequest, Value, PREVIEW_BYTES};
 
-fn request(table: &str) -> PageRequest {
-    PageRequest {
-        schema: None,
-        table: table.into(),
-        limit: 100,
-        offset: 0,
-        sort: None,
-        filter: None,
-        extra_key_column: None,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Fast generator sanity checks (run in ordinary `cargo test`)
 // ---------------------------------------------------------------------------
@@ -53,13 +41,13 @@ async fn wide_generator_builds_a_queryable_table() {
     let pool = fixture.open().await;
 
     let count = pool
-        .count_rows(Reading::UNMARKED, &request("wide"))
+        .count_rows(Reading::UNMARKED, &common::page("wide"))
         .await
         .unwrap();
     assert_eq!(count, 200);
 
     let page = pool
-        .fetch_page(Reading::UNMARKED, &request("wide"))
+        .fetch_page(Reading::UNMARKED, &common::page("wide"))
         .await
         .unwrap();
     assert_eq!(page.rows.len(), 100);
@@ -74,7 +62,7 @@ async fn big_values_generator_stores_multi_kb_payloads() {
     let pool = fixture.open().await;
 
     let page = pool
-        .fetch_page(Reading::UNMARKED, &request("big_values"))
+        .fetch_page(Reading::UNMARKED, &common::page("big_values"))
         .await
         .unwrap();
     assert_eq!(page.rows.len(), 3);
@@ -126,7 +114,7 @@ async fn budget_wide_table_operations() {
     .report_and_assert(budgets::CONNECTION_OPEN);
 
     let pool = fixture.open().await;
-    let base = request("wide");
+    let base = common::page("wide");
 
     // Time to first rows: count + first page, as the grid does on table open.
     Timings::measure("time_to_first_rows", ITERS, || {
@@ -202,7 +190,7 @@ async fn budget_big_value_page() {
     let fixture =
         FixtureDb::big_values_cached(perf_scale::BIG_VALUE_ROWS, perf_scale::BIG_VALUE_BYTES).await;
     let pool = fixture.open().await;
-    let req = request("big_values");
+    let req = common::page("big_values");
 
     Timings::measure("big_value_page", ITERS, || {
         let pool = &pool;
@@ -235,7 +223,7 @@ async fn budget_big_value_page_bounded() {
         .unwrap()
         .columns
         .clone();
-    let req = request("big_values");
+    let req = common::page("big_values");
 
     // Memory bound: every large cell is capped at PREVIEW_BYTES, so the whole
     // decoded page is a few KB — not rows × 4 MB.
@@ -320,7 +308,7 @@ async fn budget_postgres_parity() {
     .await
     .unwrap();
 
-    let base = request("perf_wide");
+    let base = common::page("perf_wide");
     // Reported for parity; not asserted (server hardware varies).
     let ttfr = Timings::measure("pg_time_to_first_rows", ITERS, || {
         let pool = &pool;

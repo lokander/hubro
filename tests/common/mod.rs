@@ -8,7 +8,24 @@
 // only a subset of it, so unused-item lints would fire spuriously.
 #![allow(dead_code)]
 
+pub mod backends;
 pub mod pg_family;
+
+/// A page of `table`: the first 100 rows, unsorted, unfiltered, in the
+/// connection's default schema. Callers name only what differs, as
+/// `PageRequest { limit: 3, ..common::page(table) }`, so the request a test
+/// means is the part it spells out.
+pub fn page(table: impl Into<String>) -> hubro::db::PageRequest {
+    hubro::db::PageRequest {
+        schema: None,
+        table: table.into(),
+        limit: 100,
+        offset: 0,
+        sort: None,
+        filter: None,
+        extra_key_column: None,
+    }
+}
 
 use hubro::db::Reading;
 use std::fmt::Write as _;
@@ -951,12 +968,8 @@ pub async fn row_addressing_failures(pool: &DbPool, table: &hubro::db::TableMeta
     let keys = identity.key_columns();
     let request = PageRequest {
         schema: table.schema.clone(),
-        table: table.name.clone(),
         limit: 1000,
-        offset: 0,
-        sort: None,
-        filter: None,
-        extra_key_column: None,
+        ..crate::common::page(table.name.clone())
     };
     let page = pool
         .fetch_page_bounded(Reading::UNMARKED, &request, &table.columns, &keys)
@@ -1081,12 +1094,8 @@ pub async fn fk_jump_failures(
         .unwrap_or_else(|| panic!("{}: no foreign key", child.name));
     let source = PageRequest {
         schema: child.schema.clone(),
-        table: child.name.clone(),
         limit: 1000,
-        offset: 0,
-        sort: None,
-        filter: None,
-        extra_key_column: None,
+        ..crate::common::page(child.name.clone())
     };
     let fk_columns: Vec<&str> = fk.columns.iter().map(String::as_str).collect();
     let page = pool
@@ -1135,12 +1144,9 @@ pub async fn fk_jump_failures(
         };
         let request = PageRequest {
             schema: parent.schema.clone(),
-            table: parent.name.clone(),
             limit: 1000,
-            offset: 0,
-            sort: None,
             filter: Some(filter),
-            extra_key_column: None,
+            ..crate::common::page(parent.name.clone())
         };
         match pool
             .fetch_page_bounded(Reading::UNMARKED, &request, &parent.columns, &keys)
@@ -1439,12 +1445,10 @@ pub async fn contains_filter_mismatches(
     for needle in LIKE_HOSTILE_NEEDLES {
         let request = PageRequest {
             schema: schema.map(str::to_string),
-            table: table.to_string(),
             limit: 1000,
-            offset: 0,
             sort: Some(("id".into(), hubro::db::SortDir::Asc)),
             filter: Some(Filter::contains("v", *needle)),
-            extra_key_column: None,
+            ..crate::common::page(table.to_string())
         };
         let got: Vec<i64> = match pool.fetch_page(Reading::UNMARKED, &request).await {
             Ok(page) => page
