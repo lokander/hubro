@@ -1532,12 +1532,16 @@ mod fixtures {
 
     /// The top-level item of the grid's shipped code — across every file
     /// under `src/ui/grid`, so a pin follows its code when it moves between
-    /// them — whose first line contains `start`, through the line closing
-    /// it. Comments are dropped and each line's whitespace collapsed, lines
-    /// joined by single spaces: a comment cannot satisfy an assertion and a
-    /// rustfmt reflow cannot fail one.
+    /// them — whose first line contains `start` and is not indented, through
+    /// the line closing it. Comments are dropped and each line's whitespace
+    /// collapsed, lines joined by single spaces: a comment cannot satisfy an
+    /// assertion and a rustfmt reflow cannot fail one.
     ///
-    /// Exactly one item may match, so a pin cannot quietly read a namesake.
+    /// The first line must start at column 0, because the cut ends at the
+    /// first line that is a bare `}`: from an indented line (a method, a
+    /// nested item, a call) that is the end of whatever encloses it. And every
+    /// matching line in every file counts, so exactly one may match — a pin
+    /// cannot quietly read a namesake, in another file or the same one.
     pub(in crate::ui::grid) fn grid_item(start: &str) -> String {
         use crate::source_scan::{rust_files, shipped, without_comments};
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/grid");
@@ -1547,21 +1551,24 @@ mod fixtures {
         for file in files {
             let code = without_comments(&shipped(&std::fs::read_to_string(&file).unwrap()));
             let lines: Vec<&str> = code.lines().collect();
-            let Some(at) = lines.iter().position(|line| line.contains(start)) else {
-                continue;
-            };
-            let end = lines[at..]
+            let starts = lines
                 .iter()
-                .position(|line| *line == "}")
-                .unwrap_or_else(|| panic!("{}: `{start}` never closes", file.display()));
-            found.push(
-                lines[at..=at + end]
+                .enumerate()
+                .filter(|(_, line)| line.contains(start) && !line.starts_with(char::is_whitespace));
+            for (at, _) in starts {
+                let end = lines[at..]
                     .iter()
-                    .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
-                    .filter(|line| !line.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            );
+                    .position(|line| *line == "}")
+                    .unwrap_or_else(|| panic!("{}: `{start}` never closes", file.display()));
+                found.push(
+                    lines[at..=at + end]
+                        .iter()
+                        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+                        .filter(|line| !line.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+            }
         }
         assert_eq!(found.len(), 1, "`{start}` starts {} items", found.len());
         found.remove(0)
@@ -1875,6 +1882,72 @@ mod tests {
         assert!(
             !picker.contains("spawn"),
             "the picker spawns a task: {picker}"
+        );
+    }
+
+    /// `grid_item` reads one top-level item or refuses: an indented start (a
+    /// method, whose cut would run to the end of its `impl`) matches nothing,
+    /// and a start on several lines is a namesake rather than a pin.
+    #[test]
+    fn grid_item_refuses_an_indented_or_repeated_start() {
+        for start in ["fn select_cell(", "#[component]"] {
+            assert!(
+                std::panic::catch_unwind(|| grid_item(start)).is_err(),
+                "`{start}` should not read as one item"
+            );
+        }
+        assert!(grid_item("fn use_grid_reset(").starts_with("fn use_grid_reset("));
+    }
+
+    /// `DataGrid`'s hooks, in the order they are called — which is the order
+    /// their effects are installed in, and so the order those effects first
+    /// run. The reset effect has to sit after the query it watches and before
+    /// the fetch: that is why the page is two hooks with
+    /// `use_grid_reset` between them, and nothing else would notice it moved.
+    /// Every `use_` call in the body, so a hook added, dropped or reordered
+    /// fails here and has to be placed on purpose.
+    #[test]
+    fn the_grid_calls_its_hooks_in_effect_order() {
+        let body = grid_item("pub fn DataGrid(");
+        let mut calls = Vec::new();
+        for (at, _) in body.match_indices("use_") {
+            if body[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            {
+                continue;
+            }
+            let name: String = body[at..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            let rest = &body[at + name.len()..];
+            if rest.starts_with('(') || rest.starts_with("::<") {
+                calls.push(name);
+            }
+        }
+        assert_eq!(
+            calls,
+            [
+                "use_context",
+                "use_grid_editors",
+                "use_grid_focus",
+                "use_signal",
+                "use_signal",
+                "use_row_window",
+                "use_signal",
+                "use_save_confirm",
+                "use_grid_query",
+                "use_grid_reset",
+                "use_grid_page",
+                "use_selection",
+                "use_visible_rows",
+                "use_editor_refocus",
+                "use_memo",
+                "use_signal",
+            ],
+            "DataGrid's hooks moved; their effects run in this order"
         );
     }
 
