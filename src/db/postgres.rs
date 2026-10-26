@@ -270,7 +270,8 @@ impl PgConn {
         self.pinned
     }
 
-    /// The statement [`run_read_only`] opens each transaction with — see
+    /// The statement a marked connection's reads open each transaction with
+    /// ([`ReadOnlyRun`](super::registry::ReadOnlyRun), and its browsing) — see
     /// [`read_only_begin`].
     pub fn read_only_begin(&self) -> &'static str {
         self.read_only_begin
@@ -911,7 +912,7 @@ fn refused_probe_rolled_back(flavor: PgFlavor, sqlstate: Option<&str>) -> bool {
 ///   any other statement's is.
 /// - Nothing is open on any other engine: a cut-short read is left
 ///   unfinished, and its rest read in the background before the connection
-///   closes ([`AfterRead::DrainClose`]) — closing at once would abort a write
+///   closes ([`AfterRead::DrainClose`](super::registry::AfterRead::DrainClose)) — closing at once would abort a write
 ///   the gate cannot see (`SELECT f()` for a function that writes), and
 ///   waiting for it would cost every capped read the rest of its result.
 pub async fn finish_script_conn_with_read(
@@ -1844,6 +1845,19 @@ fn is_transient(err: &sqlx::Error) -> bool {
     db_err.code().as_deref() == Some("40001")
 }
 
+/// The error a failed catalog read reports: [`DbError::Transient`] when the
+/// server called it retryable ([`is_transient`]), so the caller's one retry
+/// (`registry::retry_transient`) can act on it, and an introspection failure
+/// like any other otherwise. One mapping for every catalog read, so none can
+/// lose the retry by spelling it differently.
+fn catalog_error(err: sqlx::Error) -> DbError {
+    if is_transient(&err) {
+        DbError::Transient(err.to_string())
+    } else {
+        DbError::Introspect(err.to_string())
+    }
+}
+
 /// Maps a 1-based character position into 1-based line and column numbers.
 /// Returns `None` for positions outside the text (except one-past-the-end,
 /// which the server reports e.g. for input that stops too early).
@@ -2203,12 +2217,6 @@ where
 /// of table count.
 pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     let pool = conn.pool();
-    // A serialization failure keeps its own variant so the caller can retry
-    // it; anything else is an introspection failure like any other.
-    let map_err = |e: sqlx::Error| match is_transient(&e) {
-        true => DbError::Transient(e.to_string()),
-        false => DbError::Introspect(e.to_string()),
-    };
 
     // Objects that are the database's own bookkeeping rather than the user's
     // data, from the three sources Postgres has. All three are
@@ -2263,7 +2271,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     )
     .fetch_all(pool)
     .await
-    .map_err(map_err)?;
+    .map_err(catalog_error)?;
     // Schema-wide entries and per-object entries are kept apart so an object
     // rule can win over its schema's — the object is the more specific fact.
     let mut internal_schemas: HashMap<String, Internal> = HashMap::new();
@@ -2511,7 +2519,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     )
     .fetch_all(pool)
     .await
-    .map_err(map_err)?;
+    .map_err(catalog_error)?;
 
     // Tables whose writes a `DO INSTEAD` rule replaces (see [`INSTEAD_RULE`]).
     // Views are left out: every one carries an instead rule, `_RETURN`, and
@@ -2528,7 +2536,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     )
     .fetch_all(pool)
     .await
-    .map_err(map_err)?;
+    .map_err(catalog_error)?;
     let mut instead_rules = std::collections::HashSet::with_capacity(rule_rows.len());
     for row in &rule_rows {
         instead_rules.insert((
@@ -2566,7 +2574,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     let column_rows = sqlx::query(&column_query(shape.column_query))
         .fetch_all(pool)
         .await
-        .map_err(map_err)?;
+        .map_err(catalog_error)?;
 
     // Enum variants for every enum type in the database, keyed by type OID.
     // One query rather than per-column: enum types are few and a
@@ -2578,7 +2586,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     )
     .fetch_all(pool)
     .await
-    .map_err(map_err)?;
+    .map_err(catalog_error)?;
     let mut enum_variants: HashMap<i64, Vec<String>> = HashMap::new();
     for row in &enum_rows {
         let type_oid: i64 = get(row, "type_oid")?;
@@ -2610,7 +2618,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     ))
     .fetch_all(pool)
     .await
-    .map_err(map_err)?;
+    .map_err(catalog_error)?;
 
     // Foreign keys from pg_constraint; conkey/confkey arrays preserve the
     // multi-column ordering that information_schema loses.
@@ -2637,7 +2645,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     )
     .fetch_all(pool)
     .await
-    .map_err(map_err)?;
+    .map_err(catalog_error)?;
 
     // Group the batched rows per (schema, table).
     let mut tables: Vec<TableMeta> = Vec::with_capacity(table_rows.len());
@@ -2992,10 +3000,7 @@ async fn stats_shape(pool: &PgPool) -> Result<StatsShape, DbError> {
     )
     .fetch_one(pool)
     .await
-    .map_err(|e| match is_transient(&e) {
-        true => DbError::Transient(e.to_string()),
-        false => DbError::Introspect(e.to_string()),
-    })?;
+    .map_err(catalog_error)?;
     Ok(StatsShape {
         row_estimate: columns > 0,
         total_size: size_fn > 0,
@@ -3040,10 +3045,7 @@ pub async fn fetch_table_stats(pool: &PgPool, table: &TableMeta) -> Result<Table
         .bind(&table.name)
         .fetch_optional(pool)
         .await
-        .map_err(|e| match is_transient(&e) {
-            true => DbError::Transient(e.to_string()),
-            false => DbError::Introspect(e.to_string()),
-        })?;
+        .map_err(catalog_error)?;
     // No row at all means the relation is gone (dropped under a stale schema
     // tree), which is an absence like any other rather than an error.
     let Some((reltuples, bytes)) = row else {

@@ -611,8 +611,8 @@ impl ScriptConn {
     /// transaction is open is asked *before* it instead.
     ///
     /// That is only sound for a statement that can neither touch the
-    /// transaction nor write ([`final_read_may_close`]
-    /// (super::script::final_read_may_close)): a "read" is whatever its first
+    /// transaction nor write
+    /// ([`final_read_may_close`](super::script::final_read_may_close)): a "read" is whatever its first
     /// keyword says, and measured, CockroachDB's `SHOW COMMIT TIMESTAMP` and
     /// a SQL Server batch led by `SELECT` can commit or open a transaction,
     /// and a row-returning write is aborted by abandoning its rows. Any other
@@ -955,9 +955,17 @@ impl DbPool {
         TableAccess::resolve(self.backend_capabilities(), table, self.key_rules())
     }
 
-    /// Runs a free-form read query, buffered. A zero-row result still carries
-    /// its column headers — this is a user-facing result set, unlike
-    /// the projection-built reads behind [`Self::browse_with`].
+    /// Runs a free-form read query, buffered **whole**: no row cap, no cell
+    /// cap. A zero-row result still carries its column headers.
+    ///
+    /// **Not for the app.** No caller in `src/` outside tests uses it, and
+    /// none should: everything the app reads is bounded — the SQL editor's
+    /// statements go through [`run_script`](super::script::run_script)'s
+    /// capped reads ([`MAX_QUERY_ROWS`], [`QUERY_CELL_CAP`]), the grid
+    /// through [`Self::fetch_page_bounded`]. It stays `pub` solely for the
+    /// integration tests in `tests/`, which read back small fixtures through
+    /// it, as [`Self::backend_access`] does for unmarked writes; a use in
+    /// `src/` would be an unbounded read of whatever the statement returns.
     pub async fn query(&self, sql: &str) -> Result<QueryResult, DbError> {
         match self {
             DbPool::Sqlite(pool) => sqlite::query(pool, sql).await,
@@ -1562,7 +1570,8 @@ impl Connection {
     /// narrowed by the user's write protection.
     ///
     /// Every capability gate should read this rather than
-    /// [`DbPool::capabilities`], which reports only what the engine can do.
+    /// [`DbPool::backend_capabilities`], which reports only what the engine
+    /// can do.
     pub fn capabilities(&self) -> Capabilities {
         self.protection.apply(self.pool.backend_capabilities())
     }

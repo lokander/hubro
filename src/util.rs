@@ -61,8 +61,45 @@ pub fn human_count(n: u64) -> String {
     out
 }
 
+/// `byte` as two lowercase hex digits, as ASCII bytes — for a writer that
+/// takes bytes ([`push_hex`] is the one that takes a `String`).
+pub fn hex_digits(byte: u8) -> [u8; 2] {
+    const DIGITS: [u8; 16] = *b"0123456789abcdef";
+    [DIGITS[(byte >> 4) as usize], DIGITS[(byte & 0x0f) as usize]]
+}
+
+/// Appends `bytes` to `out` as lowercase hex, two digits a byte — the one
+/// hex spelling every blob rendering shares (export, the clipboard, SQL
+/// literals, the staged-edit key, the hex viewer).
+///
+/// By hand rather than through `write!(out, "{byte:02x}")`, which runs the
+/// formatting machinery per byte; the hex viewer formats up to 16k of them
+/// for one cell.
+pub fn push_hex(out: &mut String, bytes: &[u8]) {
+    out.reserve(bytes.len() * 2);
+    for &byte in bytes {
+        let [high, low] = hex_digits(byte);
+        out.push(high as char);
+        out.push(low as char);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hex_is_two_lowercase_digits_a_byte() {
+        let mut out = String::from("x");
+        super::push_hex(&mut out, &[0x00, 0x0f, 0xa0, 0xff, 0x5c]);
+        assert_eq!(out, "x000fa0ff5c");
+        // The same spelling `{:02x}` gives, for every byte.
+        for byte in 0..=255u8 {
+            let mut one = String::new();
+            super::push_hex(&mut one, &[byte]);
+            assert_eq!(one, format!("{byte:02x}"));
+            assert_eq!(super::hex_digits(byte), *format!("{byte:02x}").as_bytes());
+        }
+    }
+
     use super::*;
 
     #[test]

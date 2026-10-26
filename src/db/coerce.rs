@@ -390,6 +390,22 @@ pub(crate) fn coerce_field(
     coerce_text(column, dialect, class, &text)
 }
 
+/// What a column of this class cannot hold an empty value as — the noun
+/// [`coerce_text`]'s refusal names — or `None` for the classes where the
+/// empty string is a value: `Text`, and `BitString`, where it is a legal
+/// zero-length `bit varying` (see [`validate_bit_literal`]), so refusing it
+/// would take away something the column accepts.
+fn empty_value_noun(class: TypeClass) -> Option<&'static str> {
+    match class {
+        TypeClass::Integer | TypeClass::Float | TypeClass::Exact => Some("a number"),
+        TypeClass::Bool => Some("a true/false value"),
+        TypeClass::Json => Some("JSON"),
+        TypeClass::DateTime => Some("a date or time"),
+        TypeClass::Binary => Some("binary data"),
+        TypeClass::Text | TypeClass::BitString => None,
+    }
+}
+
 /// [`coerce_field`]'s text arm: a CSV field, or a JSON string, against the
 /// column's class.
 fn coerce_text(
@@ -418,29 +434,14 @@ fn coerce_text(
     // rather than falling through to the numeric parser's — whose wording
     // ("use the ∅ NULL button") belongs to the cell editor and names a
     // button this dialog does not have.
-    // `BitString` joins Text in the exemption: the empty string is a legal
-    // zero-length `bit varying` value, so refusing it by name here would take
-    // away something the column accepts (see [`validate_bit_literal`]).
-    if text.trim().is_empty() && !matches!(class, TypeClass::Text | TypeClass::BitString) {
-        return Err(format!(
-            "column \"{}\": an empty value is not {} — choose \"{}\" if it should be NULL",
-            column.name,
-            match class {
-                TypeClass::Integer | TypeClass::Float | TypeClass::Exact => "a number",
-                TypeClass::Bool => "a true/false value",
-                TypeClass::Json => "JSON",
-                TypeClass::DateTime => "a date or time",
-                TypeClass::Binary => "binary data",
-                // Unreachable: the guard above exempts both of these, being
-                // the classes an empty value means something for. Named
-                // rather than folded into an arm they are not, so this does
-                // not read as a decision someone made.
-                TypeClass::Text | TypeClass::BitString => {
-                    unreachable!("Text and BitString are exempted above")
-                }
-            },
-            EmptyField::Null.label(),
-        ));
+    if text.trim().is_empty() {
+        if let Some(noun) = empty_value_noun(class) {
+            return Err(format!(
+                "column \"{}\": an empty value is not {noun} — choose \"{}\" if it should be NULL",
+                column.name,
+                EmptyField::Null.label(),
+            ));
+        }
     }
     match class {
         // Text, dates and everything unrecognized go to the server verbatim.

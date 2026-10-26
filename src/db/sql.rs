@@ -20,6 +20,45 @@ pub enum Dialect {
 }
 
 impl Dialect {
+    /// How this dialect caps a SELECT at `limit` rows, as the text that goes
+    /// right after `SELECT` and the text that ends the statement — the one
+    /// place either spelling lives.
+    ///
+    /// With no `offset`, the first `limit` rows: ` LIMIT n` on SQLite and
+    /// Postgres, `TOP n` on SQL Server, which puts the cap right after
+    /// `SELECT`. With an `offset`, a page: ` LIMIT n OFFSET m`, or on SQL
+    /// Server ` OFFSET m ROWS FETCH NEXT n ROWS ONLY`, which is valid only
+    /// after an `ORDER BY` — so when the statement has none (`has_order`
+    /// false), the tail supplies a synthetic ` ORDER BY (SELECT NULL)` first,
+    /// keeping the SQL valid without imposing an order.
+    pub(crate) fn row_cap(
+        self,
+        limit: u64,
+        offset: Option<u64>,
+        has_order: bool,
+    ) -> (String, String) {
+        match (self, offset) {
+            (Dialect::Sqlite | Dialect::Postgres, None) => {
+                (String::new(), format!(" LIMIT {limit}"))
+            }
+            (Dialect::Sqlite | Dialect::Postgres, Some(offset)) => {
+                (String::new(), format!(" LIMIT {limit} OFFSET {offset}"))
+            }
+            (Dialect::SqlServer, None) => (format!("TOP {limit} "), String::new()),
+            (Dialect::SqlServer, Some(offset)) => {
+                let order = if has_order {
+                    ""
+                } else {
+                    " ORDER BY (SELECT NULL)"
+                };
+                (
+                    String::new(),
+                    format!("{order} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"),
+                )
+            }
+        }
+    }
+
     /// The `n`th bound-parameter placeholder (1-based): SQLite placeholders
     /// are positional so every one renders as `?`; Postgres numbers them
     /// `$n`; SQL Server numbers them `@Pn` (the tiberius convention). Every
@@ -183,9 +222,8 @@ pub(crate) fn preview_exprs(
 
 /// Builds the single-row SELECT [`DbPool::fetch_cell`](super::DbPool::fetch_cell)
 /// runs: the bounded [`preview_exprs`] pair for `column` (capped at `cap`
-/// characters/bytes), the row-pinning `where_clause`, and a one-row limit — a
-/// ` LIMIT 1` tail on SQLite/Postgres, but `SELECT TOP 1 …` on SQL Server
-/// (T-SQL puts the row cap right after SELECT).
+/// characters/bytes), the row-pinning `where_clause`, and a one-row cap
+/// ([`Dialect::row_cap`]).
 pub(crate) fn cell_fetch_sql(
     dialect: Dialect,
     table: &TableMeta,
@@ -195,10 +233,7 @@ pub(crate) fn cell_fetch_sql(
     cap: usize,
 ) -> String {
     let (value_expr, length_expr) = preview_exprs(dialect, class, &quote_ident(column), cap as i64);
-    let (top, tail) = match dialect {
-        Dialect::Sqlite | Dialect::Postgres => ("", " LIMIT 1"),
-        Dialect::SqlServer => ("TOP 1 ", ""),
-    };
+    let (top, tail) = dialect.row_cap(1, None, false);
     format!(
         "SELECT {top}{value_expr}, {length_expr} FROM {}{where_clause}{tail}",
         qualified(table.schema.as_deref(), &table.name),
