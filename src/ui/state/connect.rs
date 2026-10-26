@@ -282,6 +282,78 @@ pub(super) fn place_entra_refresh(
     }
 }
 
+/// Signs a connection out: takes its kept refresh token out of session memory
+/// and returns the keyring half, which is I/O. Always a
+/// [`RefreshKeyring::Delete`] — the verdict a "don't remember" sign-in gets
+/// from [`place_entra_refresh`], minus the fresh token to keep for the session,
+/// because a sign-out leaves no token in either home.
+pub(super) fn sign_out_entra_refresh(
+    session: &mut HashMap<String, String>,
+    url: &str,
+) -> RefreshKeyring {
+    session.remove(&entra_secret_key(url));
+    RefreshKeyring::Delete
+}
+
+/// How executing a [`RefreshKeyring`] verdict went.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum RefreshKeyringOutcome {
+    /// Stored, or nothing remembered is left.
+    Applied,
+    /// The keyring refused to store this token; the caller decides where it
+    /// goes instead.
+    StoreRefused(String),
+    /// A remembered token was there and the keyring refused to delete it, so
+    /// it will go on signing the user in.
+    RemovalRefused,
+}
+
+/// Executes a [`RefreshKeyring`] verdict against the keyring entry for
+/// `url`'s refresh token. The one path both a sign-in's answer
+/// ([`AppState::keep_entra_refresh`]) and a sign-out
+/// ([`AppState::sign_out_entra`]) take to the keyring.
+///
+/// A delete always runs; the read before it only decides whether a failure is
+/// worth reporting, so a machine with no keyring at all — where nothing can
+/// have been remembered — is not told one failed.
+pub(super) async fn apply_refresh_keyring(
+    url: &str,
+    verdict: RefreshKeyring,
+) -> RefreshKeyringOutcome {
+    let key = entra_secret_key(url);
+    match verdict {
+        RefreshKeyring::Store(refresh) => {
+            match crate::secrets::store_password_async(key, refresh.clone()).await {
+                Ok(()) => RefreshKeyringOutcome::Applied,
+                Err(_) => RefreshKeyringOutcome::StoreRefused(refresh),
+            }
+        }
+        RefreshKeyring::Delete => {
+            let held = crate::secrets::get_password_async(key.clone()).await;
+            let deleted = crate::secrets::delete_password_async(key).await;
+            if matches!(held, Ok(Some(_))) && deleted.is_err() {
+                RefreshKeyringOutcome::RemovalRefused
+            } else {
+                RefreshKeyringOutcome::Applied
+            }
+        }
+    }
+}
+
+/// What the connections screen says once a sign-out has gone through. `open`
+/// is whether a tab on the connection is open, which the sign-out does not
+/// touch (see [`AppState::sign_out_entra`]).
+pub(super) fn sign_out_notice(name: &str, open: bool) -> String {
+    if open {
+        format!(
+            "Signed out of {name}. Its open tab stays connected; the next connect \
+             asks you to sign in again."
+        )
+    } else {
+        format!("Signed out of {name}. The next connect asks you to sign in again.")
+    }
+}
+
 /// Every key a connection's locator owns, in the keyring and in session
 /// memory alike: the database password (the bare locator), the SSH key
 /// passphrase, and the cached Entra refresh token.
@@ -1064,6 +1136,7 @@ impl AppState {
     /// never carried ([`carried_secret_keys`]).
     pub fn update_saved(mut self, old_locator: String, connection: SavedConnection) {
         let new_locator = connection.locator().to_string();
+        let signs_out = matches!(connection.auth(), Some(auth) if !auth.keeps_entra_sign_in());
         let updated = self.saved.write().update(&old_locator, connection);
         if updated {
             self.persist_saved();
@@ -1103,6 +1176,18 @@ impl AppState {
                 for (old, new, validated) in moves {
                     migrate_secret(old, new, validated).await;
                 }
+            });
+        }
+        // An edit away from interactive sign-in signs the connection out:
+        // left in place, the token is a sign-in that no "Sign out" offers to
+        // remove (the row offers one only to a connection that can keep one),
+        // and an edit back to interactive would redeem it without a card.
+        // Best-effort, like the forgetting above — nothing was asked of the
+        // user, so a refusal has nobody to tell.
+        if signs_out {
+            let verdict = sign_out_entra_refresh(&mut self.session_passwords.write(), &new_locator);
+            spawn_forever(async move {
+                let _ = apply_refresh_keyring(&new_locator, verdict).await;
             });
         }
     }
@@ -1432,11 +1517,11 @@ impl AppState {
     }
 
     /// Drops a connection's kept refresh token from session memory and the
-    /// keyring alike.
+    /// keyring alike, by the path a sign-out takes. Nobody asked for this one,
+    /// so a refused deletion is not reported.
     async fn forget_entra_refresh(mut self, url: &str) {
-        let key = entra_secret_key(url);
-        self.session_passwords.write().remove(&key);
-        let _ = crate::secrets::delete_password_async(key).await;
+        let verdict = sign_out_entra_refresh(&mut self.session_passwords.write(), url);
+        let _ = apply_refresh_keyring(url, verdict).await;
     }
 
     /// Keeps a sign-in's refresh token where `remember` says
@@ -1445,36 +1530,71 @@ impl AppState {
     async fn keep_entra_refresh(mut self, url: &str, refresh: String, remember: bool) {
         let placed =
             place_entra_refresh(&mut self.session_passwords.write(), url, refresh, remember);
-        match placed {
-            RefreshKeyring::Store(refresh) => {
-                let key = entra_secret_key(url);
-                let stored =
-                    crate::secrets::store_password_async(key.clone(), refresh.clone()).await;
-                if stored.is_err() {
-                    self.session_passwords.write().insert(key, refresh);
-                    self.connect_error.set(Some(
-                        "connected, but the sign-in could not be stored in the system \
-                         keyring — it is remembered for this session only"
-                            .to_string(),
-                    ));
-                }
+        match apply_refresh_keyring(url, placed).await {
+            RefreshKeyringOutcome::Applied => {}
+            RefreshKeyringOutcome::StoreRefused(refresh) => {
+                self.session_passwords
+                    .write()
+                    .insert(entra_secret_key(url), refresh);
+                self.connect_error.set(Some(
+                    "connected, but the sign-in could not be stored in the system \
+                     keyring — it is remembered for this session only"
+                        .to_string(),
+                ));
             }
-            // Always deleted; the read only decides whether a failure is
-            // worth saying, so a machine with no keyring at all — where
-            // nothing can have been remembered — is not told one failed.
-            RefreshKeyring::Delete => {
-                let key = entra_secret_key(url);
-                let held = crate::secrets::get_password_async(key.clone()).await;
-                let deleted = crate::secrets::delete_password_async(key).await;
-                if matches!(held, Ok(Some(_))) && deleted.is_err() {
-                    self.connect_error.set(Some(
-                        "connected, but an earlier remembered sign-in could not be removed \
-                         from the system keyring — it will still sign you in"
-                            .to_string(),
-                    ));
-                }
+            RefreshKeyringOutcome::RemovalRefused => {
+                self.connect_error.set(Some(
+                    "connected, but an earlier remembered sign-in could not be removed \
+                     from the system keyring — it will still sign you in"
+                        .to_string(),
+                ));
             }
         }
+    }
+
+    /// Signs `url`'s connection out of Entra: forgets the refresh token it
+    /// kept, in session memory and in the keyring, so its next connect shows
+    /// the sign-in card instead of redeeming the token silently.
+    ///
+    /// The session copy goes now, before anything is spawned, for the reason
+    /// [`Self::update_saved`] removes one synchronously: session memory is
+    /// what the next connect reads first. The keyring half is the same
+    /// [`RefreshKeyring::Delete`] a "don't remember" sign-in executes
+    /// ([`apply_refresh_keyring`]), spawned because it is I/O and detached
+    /// from the screen so that leaving it cannot cut a deletion short.
+    ///
+    /// An open tab on the connection keeps working: its pool holds the tokens
+    /// it renews with in memory and never writes them back, so the sign-out
+    /// takes effect at the next connect. The notice says so.
+    pub fn sign_out_entra(mut self, url: String, name: String) {
+        let verdict = sign_out_entra_refresh(&mut self.session_passwords.write(), &url);
+        self.connect_notice.set(None);
+        spawn_forever(async move {
+            match apply_refresh_keyring(&url, verdict).await {
+                RefreshKeyringOutcome::RemovalRefused => {
+                    self.connect_error.set(Some(format!(
+                        "{name} could not be signed out: the remembered sign-in could \
+                         not be removed from the system keyring, so it will still \
+                         sign you in"
+                    )));
+                }
+                // `StoreRefused` cannot come of a `Delete`; treated as done
+                // rather than unreachable, because it would mean nothing was
+                // left behind to say anything about.
+                RefreshKeyringOutcome::Applied | RefreshKeyringOutcome::StoreRefused(_) => {
+                    // A sign-in card already up for this connection read the
+                    // keyring before the sign-out; its warning about a
+                    // remembered sign-in is now about one that is gone.
+                    if let Some(prompt) = self.entra_prompt.write().as_mut() {
+                        if prompt.url == url {
+                            prompt.stored = StoredCopy::Absent;
+                        }
+                    }
+                    let open = self.open_locators.peek().iter().any(|(_, l)| *l == url);
+                    self.connect_notice.set(Some(sign_out_notice(&name, open)));
+                }
+            }
+        });
     }
 
     /// The Entra branch of the connect: try to acquire a token silently — a
@@ -2060,6 +2180,10 @@ impl AppState {
         if let Some(request) = self.connect_requests.write().get_mut(&key) {
             request.focus |= focus;
             return;
+        }
+        // "The next connect asks you to sign in" is answered by this one.
+        if self.connect_notice.peek().is_some() {
+            self.connect_notice.set(None);
         }
         let task = spawn_forever(async move {
             match backend {
@@ -3295,23 +3419,43 @@ mod tests {
             order.windows(2).all(|pair| pair[0] < pair[1]),
             "the lookup labels a token by the wrong home: {lookup}"
         );
-        // And forgetting a refused token clears both homes.
+        // And forgetting a refused token clears both homes, by the sign-out's
+        // path (`signing_out_leaves_no_sign_in_for_the_next_connect_to_redeem`
+        // executes it).
         let forgets = collapsed(&code_of(&forget));
         assert!(
-            forgets.contains("self.session_passwords.write().remove(&key);")
-                && forgets.contains("crate::secrets::delete_password_async(key)"),
+            forgets.contains(
+                "let verdict = sign_out_entra_refresh(&mut self.session_passwords.write(), url);"
+            ) && forgets.contains("apply_refresh_keyring(url, verdict).await;"),
             "a refused token survives in one of its homes: {forgets}"
+        );
+
+        // The verdict reaches the keyring as placed, with nothing in between
+        // to rewrite it.
+        assert!(
+            collapsed(&code_of(&keep)).contains("match apply_refresh_keyring(url, placed).await {"),
+            "keep_entra_refresh executes something other than the placed verdict: {keep}"
+        );
+        // A refused store falls back to the session copy of *this* token.
+        let refused = collapsed(&code_of(&method_body(
+            &keep,
+            "RefreshKeyringOutcome::StoreRefused(refresh) => {",
+        )));
+        assert!(
+            refused.contains(".insert(entra_secret_key(url), refresh);"),
+            "a sign-in the keyring refused is not kept for the session: {refused}"
         );
 
         // Each keyring call sits in the arm of the verdict that asks for it:
         // swapping them stores a declined sign-in and deletes a remembered one
         // while every binding above still reads correctly.
-        let store = method_body(&keep, "RefreshKeyring::Store(refresh) => {");
+        let apply = method_body(source, "async fn apply_refresh_keyring(");
+        let store = method_body(&apply, "RefreshKeyring::Store(refresh) => {");
         assert!(
             store.contains("store_password_async") && !store.contains("delete_password_async"),
             "{store}"
         );
-        let delete = method_body(&keep, "RefreshKeyring::Delete => {");
+        let delete = method_body(&apply, "RefreshKeyring::Delete => {");
         assert!(
             delete.contains("delete_password_async") && !delete.contains("store_password_async"),
             "{delete}"
@@ -3366,6 +3510,8 @@ mod tests {
             "async fn forget_entra_refresh(",
             "async fn keep_entra_refresh(",
             "pub fn update_saved(",
+            "fn sign_out_entra_refresh(",
+            "async fn apply_refresh_keyring(",
         ]
         .iter()
         .map(|signature| {
@@ -5093,6 +5239,27 @@ mod tests {
             ),
             (
                 "ui/state/connect.rs",
+                "apply_refresh_keyring",
+                1,
+                "the executor of a `RefreshKeyring` verdict; every caller is a delete, \
+                 classified here under its own name",
+            ),
+            (
+                "ui/state/connect.rs",
+                "sign_out_entra",
+                1,
+                "explicit: the user pressed the connection's \"Sign out\"",
+            ),
+            (
+                "ui/state/connect.rs",
+                "update_saved",
+                1,
+                "explicit: an edit away from interactive sign-in, which leaves the \
+                 connection nothing that redeems a kept sign-in and no \"Sign out\" to \
+                 remove one (`ServerAuth::keeps_entra_sign_in`)",
+            ),
+            (
+                "ui/state/connect.rs",
                 "keep_entra_refresh",
                 1,
                 "user-answered: `RefreshKeyring::Delete`, an unticked \"stay signed in\" box \
@@ -5150,10 +5317,14 @@ mod tests {
             // and a `use … as` rename all still name the original, so each
             // is counted where it appears — a `use` outside any function as
             // `<module>`, which no entry classifies.
+            // `apply_refresh_keyring` executes a delete for its callers, so a
+            // call to it is a delete site too: counted only at its definition,
+            // every caller would hide behind one entry.
             for ident in [
                 "delete_password",
                 "delete_password_async",
                 "delete_credential",
+                "apply_refresh_keyring",
             ] {
                 for (at, _) in code.match_indices(ident) {
                     let before = &code[..at];
@@ -5722,6 +5893,254 @@ mod tests {
             );
             crate::secrets::delete_password(&key).unwrap();
             crate::secrets::delete_password(&done).unwrap();
+        }
+    }
+
+    #[test]
+    fn only_a_connection_that_can_keep_a_sign_in_offers_to_sign_out() {
+        // The gate on the wire below, executed: an interactive sign-in is the
+        // only one that hands back a refresh token. Offered to a managed
+        // identity or a password connection, "Sign out" would claim to undo
+        // something that never happened.
+        for (auth, keeps) in [
+            (ServerAuth::Entra(EntraAuth::interactive_default()), true),
+            (
+                ServerAuth::Entra(EntraAuth::Interactive {
+                    tenant: "contoso.onmicrosoft.com".into(),
+                    client_id: Some("app".into()),
+                }),
+                true,
+            ),
+            (
+                ServerAuth::Entra(EntraAuth::ManagedIdentity { client_id: None }),
+                false,
+            ),
+            (ServerAuth::Password, false),
+        ] {
+            assert_eq!(auth.keeps_entra_sign_in(), keeps, "{auth:?}");
+        }
+        assert_eq!(
+            sign_out_notice("prod", false),
+            "Signed out of prod. The next connect asks you to sign in again."
+        );
+        assert!(
+            sign_out_notice("prod", true).contains("open tab stays connected"),
+            "a sign-out that leaves a tab connected says so"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)] // see the Postgres test above
+    #[tokio::test]
+    async fn signing_out_leaves_no_sign_in_for_the_next_connect_to_redeem() {
+        // The whole wire of "Sign out", one hop at a time: the row offers it
+        // behind `keeps_entra_sign_in` and hands it the row's own locator →
+        // `sign_out_entra` → `sign_out_entra_refresh` (session memory) →
+        // `apply_refresh_keyring` with `Delete` (the keyring) → the next
+        // connect's `cached_entra_refresh`, whose `None` is what makes it
+        // raise the sign-in card instead of redeeming silently. A sign-in
+        // card already up is told the remembered sign-in is gone. Executed
+        // from the method down; the row's two hops are read from its source.
+        use dioxus::core::{NoOpMutations, VirtualDom};
+
+        use crate::ui::test_dom::provide_state;
+
+        // The row: the button sits inside the gate and signs out the row it
+        // is on. Comment-stripped and whitespace-collapsed.
+        let row = collapsed(&code_of(&method_body(
+            include_str!("../connections.rs"),
+            "fn SavedConnectionRow(",
+        )));
+        let gate = "if row.auth.keeps_entra_sign_in() {";
+        let gated = row
+            .find(gate)
+            .unwrap_or_else(|| panic!("the row no longer gates its sign-out: {row}"));
+        let button = method_body(&row[gated..], gate);
+        assert!(
+            button.contains(
+                "let (locator, name) = (row.locator.clone(), row.name.clone()); \
+                 move |_| state.sign_out_entra(locator.clone(), name.clone())"
+            ),
+            "the sign-out button signs out something other than its row: {button}"
+        );
+        assert_eq!(
+            ident_count(&row, "sign_out_entra"),
+            1,
+            "a sign-out is offered outside the gate: {row}"
+        );
+
+        let _keyring = crate::secrets::tests::mock_keyring();
+        fn empty() -> Element {
+            rsx! {}
+        }
+        let mut dom = VirtualDom::new(empty);
+        let state = provide_state(&dom);
+        dom.rebuild_in_place();
+
+        // Two connections, each with a token in both homes (the one-place
+        // rule's accepted exception — and the hardest case: either copy
+        // alone would sign the user in). Only the first signs out.
+        const URL: &str = "postgres://u@sign-out:5432/a";
+        const OTHER: &str = "postgres://u@stays-signed-in:5432/a";
+        for url in [URL, OTHER] {
+            crate::secrets::store_password(&entra_secret_key(url), "kept").unwrap();
+        }
+        dom.in_runtime(|| {
+            let mut session = state.session_passwords;
+            for url in [URL, OTHER] {
+                session
+                    .write()
+                    .insert(entra_secret_key(url), "kept".to_string());
+            }
+            let mut prompt = state.entra_prompt;
+            prompt.set(Some(EntraPrompt {
+                url: URL.to_string(),
+                name: "prod".to_string(),
+                tunnel: None,
+                entra: EntraAuth::interactive_default(),
+                backend: BackendKind::Postgres,
+                remember: true,
+                stored: StoredCopy::Present,
+            }));
+            state.sign_out_entra(URL.to_string(), "prod".to_string());
+        });
+        // The session half is not spawned: a connect starting the moment
+        // the click returns must not find it.
+        assert_eq!(
+            dom.in_runtime(|| state
+                .session_passwords
+                .peek()
+                .get(&entra_secret_key(URL))
+                .cloned()),
+            None,
+            "the session copy outlives the click"
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while dom.in_runtime(|| {
+            state.connect_notice.peek().is_none() && state.connect_error.peek().is_none()
+        }) {
+            assert!(tokio::time::Instant::now() < deadline, "never signed out");
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(20), dom.wait_for_work())
+                .await;
+            dom.render_immediate(&mut NoOpMutations);
+        }
+
+        assert_eq!(dom.in_runtime(|| state.connect_error.peek().clone()), None);
+        assert_eq!(
+            dom.in_runtime(|| state.connect_notice.peek().clone())
+                .as_deref(),
+            Some(sign_out_notice("prod", false).as_str())
+        );
+        assert_eq!(
+            [
+                dom.in_runtime(|| state
+                    .session_passwords
+                    .peek()
+                    .get(&entra_secret_key(URL))
+                    .cloned()),
+                crate::secrets::get_password(&entra_secret_key(URL)).unwrap(),
+            ],
+            [None, None],
+            "a signed-out sign-in survives in one of its homes"
+        );
+        // The hop that decides the next connect: nothing to redeem, so the
+        // card is raised.
+        let next = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let slot = next.clone();
+        dom.in_runtime(|| {
+            spawn_forever(async move {
+                let found = state.cached_entra_refresh(URL).await;
+                *slot.lock().unwrap() = Some(found);
+            });
+        });
+        while next.lock().unwrap().is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the lookup never ran"
+            );
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(20), dom.wait_for_work())
+                .await;
+            dom.render_immediate(&mut NoOpMutations);
+        }
+        assert_eq!(
+            next.lock().unwrap().take(),
+            Some(None),
+            "the next connect still signs in silently"
+        );
+        assert_eq!(
+            dom.in_runtime(|| state.entra_prompt.peek().as_ref().map(|p| p.stored)),
+            Some(StoredCopy::Absent),
+            "the card still warns about the remembered sign-in just removed"
+        );
+        // Signing one connection out signs no other one out.
+        assert_eq!(
+            [
+                dom.in_runtime(|| state
+                    .session_passwords
+                    .peek()
+                    .get(&entra_secret_key(OTHER))
+                    .cloned()),
+                crate::secrets::get_password(&entra_secret_key(OTHER)).unwrap(),
+            ],
+            [Some("kept".to_string()), Some("kept".to_string())],
+            "another connection was signed out too"
+        );
+        crate::secrets::delete_password(&entra_secret_key(OTHER)).unwrap();
+    }
+
+    #[allow(clippy::await_holding_lock)] // see the Postgres test above
+    #[tokio::test]
+    async fn an_edit_away_from_interactive_sign_in_signs_the_connection_out() {
+        // Left behind, the token is a sign-in the row no longer offers to
+        // sign out of, which an edit back to interactive would redeem without
+        // a card. The other polarity — an edit that stays interactive keeps
+        // the token the confirming connect placed — is
+        // `an_edit_leaves_the_refresh_token_where_the_confirming_connect_put_it`.
+        use dioxus::core::{NoOpMutations, VirtualDom};
+
+        use crate::ui::test_dom::provide_state;
+
+        let _keyring = crate::secrets::tests::mock_keyring();
+        fn empty() -> Element {
+            rsx! {}
+        }
+        let mut dom = VirtualDom::new(empty);
+        let state = provide_state(&dom);
+        dom.rebuild_in_place();
+
+        for (case, auth) in [
+            ServerAuth::Password,
+            ServerAuth::Entra(EntraAuth::ManagedIdentity { client_id: None }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let url = format!("postgres://u@edit-away-{case}:5432/a");
+            let key = entra_secret_key(&url);
+            crate::secrets::store_password(&key, "kept").unwrap();
+            dom.in_runtime(|| {
+                let mut session = state.session_passwords;
+                session.write().insert(key.clone(), "kept".to_string());
+                let connection = ServerBackend::POSTGRES.saved("edited", &url, None, auth.clone());
+                state.update_saved(url.clone(), connection);
+            });
+            assert_eq!(
+                dom.in_runtime(|| state.session_passwords.peek().get(&key).cloned()),
+                None,
+                "{auth:?}: the session copy outlives the edit"
+            );
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while crate::secrets::get_password(&key).unwrap().is_some() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{auth:?}: an edit away from interactive sign-in left its \
+                     remembered sign-in in the keyring"
+                );
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(20), dom.wait_for_work())
+                        .await;
+                dom.render_immediate(&mut NoOpMutations);
+            }
         }
     }
 

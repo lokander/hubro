@@ -1084,6 +1084,9 @@ pub struct AppState {
     /// Error from the most recent connect/config operation, shown on the
     /// connections screen.
     pub connect_error: Signal<Option<String>>,
+    /// A neutral outcome to report on the connections screen — that a
+    /// sign-out went through. Errors go in [`Self::connect_error`].
+    pub connect_notice: Signal<Option<String>>,
     /// Secrets entered this session: Postgres passwords keyed by stored URL,
     /// SSH key passphrases keyed by [`connect::ssh_secret_key`]. Never
     /// persisted here — the OS keyring handles "remember".
@@ -1471,6 +1474,7 @@ impl AppState {
             connecting: Signal::new_in_scope(Vec::new(), ScopeId::ROOT),
             connect_requests: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             connect_error: Signal::new_in_scope(load_error, ScopeId::ROOT),
+            connect_notice: Signal::new_in_scope(None, ScopeId::ROOT),
             session_passwords: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             password_prompt: Signal::new_in_scope(None, ScopeId::ROOT),
             host_key_prompt: Signal::new_in_scope(None, ScopeId::ROOT),
