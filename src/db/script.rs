@@ -18,8 +18,8 @@ use std::ops::Range;
 use super::caps::{self, Capabilities};
 use super::error::DbError;
 use super::registry::{
-    engine_enforces_read_only, DbPool, ReadOnlyRun, RolledBack, MAX_QUERY_ROWS, PLAN_CELL_CAP,
-    QUERY_CELL_CAP,
+    engine_enforces_read_only, DbPool, ReadOnlyRun, RolledBack, ScriptConn, ScriptTx,
+    MAX_QUERY_ROWS, PLAN_CELL_CAP, QUERY_CELL_CAP,
 };
 use super::sql::Dialect;
 use super::value::QueryResult;
@@ -1722,17 +1722,7 @@ pub async fn run_script(
             // SQL Server: no read-only mode to run in, so the script runs as
             // any other does, behind the gate alone.
             Ok(None) => {}
-            Err(error) => {
-                return Err(ScriptError {
-                    statement_index: 0,
-                    preview: statements
-                        .first()
-                        .map(|s| statement_preview(s))
-                        .unwrap_or_default(),
-                    error,
-                    rollback: Rollback::None,
-                })
-            }
+            Err(error) => return Err(nothing_ran(statements, error)),
         }
     }
     if wrap_atomically(caps, pool.dialect(), statements) {
@@ -1848,69 +1838,217 @@ fn cell_cap(statement: &str, dialect: Dialect) -> usize {
     }
 }
 
-/// The autocommit path: each statement commits on its own, so a failure leaves
-/// earlier statements' effects in place ([`Rollback::None`]) — unless the
-/// script had opened a transaction of its own and was inside it, which
-/// [`ScriptConn::end`](super::registry::ScriptConn::end) rolls back ([`Rollback::OpenTransaction`]).
+/// The run's hold on its connection could not be had: nothing ran, so
+/// nothing rolled back, and the first statement carries the error.
+fn nothing_ran(statements: &[String], error: DbError) -> ScriptError {
+    ScriptError {
+        statement_index: 0,
+        preview: statements
+            .first()
+            .map(|s| statement_preview(s))
+            .unwrap_or_default(),
+        error,
+        rollback: Rollback::None,
+    }
+}
+
+/// One script run's hold on the server, as the statement loop
+/// ([`run_statements`]) drives it: a [`ScriptConn`] (sequential), a
+/// [`ReadOnlyRun`] (marked read-only) or a [`ScriptTx`] (atomic). The loop is
+/// the same for all three; what differs is in here, and in what each run
+/// makes of the loop's outcome afterwards ([`sequential_outcome`],
+/// [`read_only_outcome`], [`atomic_outcome`]).
+trait StatementExecutor: Sized {
+    /// How letting go of the hold went.
+    type Ended;
+
+    /// Runs a row-returning statement, capped.
+    async fn read(&mut self, sql: &str, max_rows: u64, cell_cap: usize) -> Result<Capped, DbError>;
+
+    /// Runs any other statement, returning its affected-row count.
+    async fn write(&mut self, sql: &str) -> Result<RowsAffected, DbError>;
+
+    /// Lets go of the hold once the statements are done. `failed` is whether
+    /// one of them failed — the atomic run rolls back then and commits
+    /// otherwise; the other two let go the same way either way.
+    async fn end(self, failed: bool) -> Self::Ended;
+
+    /// Runs the script's last statement, a read, and lets go of the hold with
+    /// it — so a hold that would otherwise wait for the rest of a cut-short
+    /// result can close instead. By default, the read and then [`Self::end`].
+    async fn finish_with_read(
+        mut self,
+        sql: &str,
+        max_rows: u64,
+        cell_cap: usize,
+    ) -> (Result<Capped, DbError>, Self::Ended) {
+        let read = self.read(sql, max_rows, cell_cap).await;
+        let ended = self.end(read.is_err()).await;
+        (read, ended)
+    }
+}
+
+/// The sequential run: every statement on the one connection the run holds,
+/// and letting go of it rolls back whatever transaction the script left open
+/// ([`ScriptConn::end`]), whether a statement failed or not.
+impl StatementExecutor for ScriptConn {
+    type Ended = Result<bool, DbError>;
+
+    async fn read(&mut self, sql: &str, max_rows: u64, cell_cap: usize) -> Result<Capped, DbError> {
+        self.query_capped_to(sql, max_rows, cell_cap).await
+    }
+
+    async fn write(&mut self, sql: &str) -> Result<RowsAffected, DbError> {
+        self.execute(sql).await
+    }
+
+    async fn end(self, _failed: bool) -> Result<bool, DbError> {
+        ScriptConn::end(self).await
+    }
+
+    async fn finish_with_read(
+        self,
+        sql: &str,
+        max_rows: u64,
+        cell_cap: usize,
+    ) -> (Result<Capped, DbError>, Result<bool, DbError>) {
+        ScriptConn::finish_with_read(self, sql, max_rows, cell_cap).await
+    }
+}
+
+/// The read-only run: letting go closes the connection, failed or not.
+impl StatementExecutor for ReadOnlyRun {
+    type Ended = ();
+
+    async fn read(&mut self, sql: &str, max_rows: u64, cell_cap: usize) -> Result<Capped, DbError> {
+        self.query_capped_to(sql, max_rows, cell_cap).await
+    }
+
+    async fn write(&mut self, sql: &str) -> Result<RowsAffected, DbError> {
+        self.execute(sql).await
+    }
+
+    async fn end(self, _failed: bool) {
+        self.close().await;
+    }
+
+    async fn finish_with_read(
+        self,
+        sql: &str,
+        max_rows: u64,
+        cell_cap: usize,
+    ) -> (Result<Capped, DbError>, ()) {
+        (
+            ReadOnlyRun::finish_with_read(self, sql, max_rows, cell_cap).await,
+            (),
+        )
+    }
+}
+
+/// How an atomic run let go of its transaction.
+#[derive(Debug)]
+enum TxEnded {
+    /// A statement failed, and the transaction was rolled back; what the
+    /// rollback found open.
+    RolledBack(RolledBack),
+    /// Every statement ran, and the transaction was committed — or the
+    /// commit failed, and what the rollback after it found.
+    Committed(Result<(), (DbError, RolledBack)>),
+}
+
+/// Whether an atomic run commits: only when no statement failed.
+fn tx_commits(failed: bool) -> bool {
+    !failed
+}
+
+/// The atomic run: the statements share one transaction, committed only if
+/// all of them ran ([`tx_commits`]). Its last read takes the default
+/// [`StatementExecutor::finish_with_read`]: read, then commit or roll back.
+impl StatementExecutor for ScriptTx<'_> {
+    type Ended = TxEnded;
+
+    async fn read(&mut self, sql: &str, max_rows: u64, cell_cap: usize) -> Result<Capped, DbError> {
+        self.query_capped_to(sql, max_rows, cell_cap).await
+    }
+
+    async fn write(&mut self, sql: &str) -> Result<RowsAffected, DbError> {
+        self.execute(sql).await
+    }
+
+    async fn end(self, failed: bool) -> TxEnded {
+        if tx_commits(failed) {
+            TxEnded::Committed(self.commit().await)
+        } else {
+            TxEnded::RolledBack(self.rollback().await)
+        }
+    }
+}
+
+/// How the statement loop runs one statement: what [`run_statements`] does
+/// with it, over plain data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// A read that is not the script's last.
+    Read,
+    /// The script's last statement, a read: run it and let go of the hold
+    /// together ([`StatementExecutor::finish_with_read`]).
+    FinishWithRead,
+    /// Anything that does not return rows.
+    Write,
+}
+
+fn step(reads: bool, is_last: bool) -> Step {
+    match (reads, is_last) {
+        (true, true) => Step::FinishWithRead,
+        (true, false) => Step::Read,
+        (false, _) => Step::Write,
+    }
+}
+
+/// The statement loop every script run goes through: each statement in
+/// order through `exec`, reporting each outcome to `on_result`, **stopping
+/// at the first failure** — nothing after a failed statement runs, in any
+/// mode — and then letting go of the hold, told whether a statement failed.
+/// Returns the failure (its index and error) and how letting go went.
 ///
-/// Every statement runs on the one connection the run holds: a script's own
-/// `BEGIN` and the statements after it must share a session, or the `BEGIN`
-/// opens a transaction nothing else runs in.
-async fn run_script_sequential(
-    pool: &DbPool,
-    caps: Capabilities,
+/// Reads stream through the row cap so a huge result never buffers in full;
+/// writes report an affected-row count.
+async fn run_statements<E: StatementExecutor>(
+    exec: E,
+    dialect: Dialect,
     statements: &[String],
     mut on_result: impl FnMut(StatementResult),
-) -> Result<ScriptDone, ScriptError> {
-    let conn = match pool.acquire_script_conn().await {
-        Ok(conn) => conn,
-        Err(error) => {
-            return Err(ScriptError {
-                statement_index: 0,
-                preview: statements
-                    .first()
-                    .map(|s| statement_preview(s))
-                    .unwrap_or_default(),
-                error,
-                rollback: Rollback::None,
-            })
-        }
-    };
+) -> (Option<(usize, DbError)>, E::Ended) {
     let last = statements.len().saturating_sub(1);
-    let mut conn = Some(conn);
-    // Set when the last statement ended the hold itself (a read: see
-    // `ScriptConn::finish_with_read`).
+    let mut exec = Some(exec);
+    // Set when the last statement let go of the hold itself.
     let mut ended = None;
     let mut failure = None;
     for (statement_index, statement) in statements.iter().enumerate() {
-        let Some(held) = conn.as_mut() else { break };
-        // Reads stream through the row cap so a huge result never buffers in
-        // full; writes report an affected-row count as before.
-        let reads = classify_statement(statement, pool.dialect()).returns_rows();
-        let outcome = if reads && statement_index == last {
-            let (read, end) = conn
-                .take()
+        let reads = classify_statement(statement, dialect).returns_rows();
+        let cap = cell_cap(statement, dialect);
+        let outcome = match step(reads, statement_index == last) {
+            Step::FinishWithRead => {
+                let (read, end) = exec
+                    .take()
+                    .expect("held until the last statement")
+                    .finish_with_read(statement, MAX_QUERY_ROWS, cap)
+                    .await;
+                ended = Some(end);
+                read.map(|capped| rows_outcome(dialect, capped))
+            }
+            Step::Read => exec
+                .as_mut()
                 .expect("held until the last statement")
-                .finish_with_read(
-                    statement,
-                    MAX_QUERY_ROWS,
-                    cell_cap(statement, pool.dialect()),
-                )
-                .await;
-            ended = Some(end);
-            read.map(|capped| rows_outcome(pool.dialect(), capped))
-        } else if reads {
-            held.query_capped_to(
-                statement,
-                MAX_QUERY_ROWS,
-                cell_cap(statement, pool.dialect()),
-            )
-            .await
-            .map(|capped| rows_outcome(pool.dialect(), capped))
-        } else {
-            held.execute(statement)
+                .read(statement, MAX_QUERY_ROWS, cap)
                 .await
-                .map(|affected| (StatementOutcome::Affected(affected), false, RestOfRead::Ran))
+                .map(|capped| rows_outcome(dialect, capped)),
+            Step::Write => exec
+                .as_mut()
+                .expect("held until the last statement")
+                .write(statement)
+                .await
+                .map(|affected| (StatementOutcome::Affected(affected), false, RestOfRead::Ran)),
         };
         match outcome {
             Ok((outcome, truncated, rest)) => on_result(StatementResult {
@@ -1925,14 +2063,36 @@ async fn run_script_sequential(
             }
         }
     }
+    let ended = match (ended, exec) {
+        (Some(ended), _) => ended,
+        (None, Some(exec)) => exec.end(failure.is_some()).await,
+        (None, None) => unreachable!("the hold is let go by the last statement or here"),
+    };
+    (failure, ended)
+}
+
+/// The autocommit path: each statement commits on its own, so a failure leaves
+/// earlier statements' effects in place ([`Rollback::None`]) — unless the
+/// script had opened a transaction of its own and was inside it, which
+/// [`ScriptConn::end`](super::registry::ScriptConn::end) rolls back ([`Rollback::OpenTransaction`]).
+///
+/// Every statement runs on the one connection the run holds: a script's own
+/// `BEGIN` and the statements after it must share a session, or the `BEGIN`
+/// opens a transaction nothing else runs in.
+async fn run_script_sequential(
+    pool: &DbPool,
+    caps: Capabilities,
+    statements: &[String],
+    on_result: impl FnMut(StatementResult),
+) -> Result<ScriptDone, ScriptError> {
+    let conn = match pool.acquire_script_conn().await {
+        Ok(conn) => conn,
+        Err(error) => return Err(nothing_ran(statements, error)),
+    };
+    let (failure, ended) = run_statements(conn, pool.dialect(), statements, on_result).await;
     let ran = match &failure {
         Some((statement_index, _)) => &statements[..=*statement_index],
         None => statements,
-    };
-    let ended = match (ended, conn) {
-        (Some(ended), _) => ended,
-        (None, Some(conn)) => conn.end().await,
-        (None, None) => unreachable!("the hold is ended by the last statement or here"),
     };
     sequential_outcome(caps, pool.dialect(), statements, ran, failure, ended)
 }
@@ -1997,58 +2157,31 @@ fn sequential_outcome(
 /// a write (see [`ReadOnlyRun`]). Never wrapped in a script-long transaction —
 /// a read-only script has nothing to roll back, and on Postgres every
 /// statement already runs in a transaction of its own — so a failure reports
-/// [`Rollback::None`], as the sequential path does.
+/// [`Rollback::None`], as the sequential path does ([`read_only_outcome`]).
 async fn run_script_read_only(
     run: ReadOnlyRun,
     dialect: Dialect,
     statements: &[String],
-    mut on_result: impl FnMut(StatementResult),
+    on_result: impl FnMut(StatementResult),
 ) -> Result<(), ScriptError> {
-    let mut outcome = Ok(());
-    let last = statements.len().saturating_sub(1);
-    let mut run = Some(run);
-    for (statement_index, statement) in statements.iter().enumerate() {
-        let Some(held) = run.as_mut() else { break };
-        let reads = classify_statement(statement, dialect).returns_rows();
-        let result = if reads && statement_index == last {
-            // Ends the run too, so that a cut-short read is closed rather
-            // than read to its end (see `ReadOnlyRun::finish_with_read`).
-            run.take()
-                .expect("held until the last statement")
-                .finish_with_read(statement, MAX_QUERY_ROWS, cell_cap(statement, dialect))
-                .await
-                .map(|capped| rows_outcome(dialect, capped))
-        } else if reads {
-            held.query_capped_to(statement, MAX_QUERY_ROWS, cell_cap(statement, dialect))
-                .await
-                .map(|capped| rows_outcome(dialect, capped))
-        } else {
-            held.execute(statement)
-                .await
-                .map(|affected| (StatementOutcome::Affected(affected), false, RestOfRead::Ran))
-        };
-        match result {
-            Ok((result, truncated, rest)) => on_result(StatementResult {
-                preview: statement_preview(statement),
-                outcome: result,
-                truncated,
-                rest,
-            }),
-            Err(error) => {
-                outcome = Err(ScriptError {
-                    statement_index,
-                    preview: statement_preview(statement),
-                    error,
-                    rollback: Rollback::None,
-                });
-                break;
-            }
-        }
+    let (failure, ()) = run_statements(run, dialect, statements, on_result).await;
+    read_only_outcome(statements, failure)
+}
+
+/// How a read-only run reports: a failed statement with nothing rolled back.
+fn read_only_outcome(
+    statements: &[String],
+    failure: Option<(usize, DbError)>,
+) -> Result<(), ScriptError> {
+    match failure {
+        None => Ok(()),
+        Some((statement_index, error)) => Err(ScriptError {
+            statement_index,
+            preview: statement_preview(&statements[statement_index]),
+            error,
+            rollback: Rollback::None,
+        }),
     }
-    if let Some(run) = run {
-        run.close().await;
-    }
-    outcome
 }
 
 /// The atomic path: all statements run in one transaction, committed only if
@@ -2061,76 +2194,50 @@ async fn run_script_atomic(
     pool: &DbPool,
     caps: Capabilities,
     statements: &[String],
-    mut on_result: impl FnMut(StatementResult),
+    on_result: impl FnMut(StatementResult),
 ) -> Result<(), ScriptError> {
-    let mut tx = match pool.begin_script_tx().await {
+    let tx = match pool.begin_script_tx().await {
         Ok(tx) => tx,
         // Opening the transaction failed: nothing ran, so nothing rolled back.
-        Err(error) => {
-            return Err(ScriptError {
-                statement_index: 0,
-                preview: statements
-                    .first()
-                    .map(|s| statement_preview(s))
-                    .unwrap_or_default(),
-                error,
-                rollback: Rollback::None,
-            })
-        }
+        Err(error) => return Err(nothing_ran(statements, error)),
     };
-    for (statement_index, statement) in statements.iter().enumerate() {
-        let outcome = if classify_statement(statement, pool.dialect()).returns_rows() {
-            tx.query_capped_to(
-                statement,
-                MAX_QUERY_ROWS,
-                cell_cap(statement, pool.dialect()),
-            )
-            .await
-            .map(|capped| rows_outcome(pool.dialect(), capped))
-        } else {
-            tx.execute(statement)
-                .await
-                .map(|affected| (StatementOutcome::Affected(affected), false, RestOfRead::Ran))
-        };
-        match outcome {
-            Ok((outcome, truncated, rest)) => on_result(StatementResult {
-                preview: statement_preview(statement),
-                outcome,
-                truncated,
-                rest,
-            }),
-            Err(error) => {
-                let found = tx.rollback().await;
-                return Err(ScriptError {
-                    statement_index,
-                    preview: statement_preview(statement),
-                    error,
-                    // Only what ran can have escaped the rollback — a schema
-                    // change later in the script never reached the server.
-                    rollback: atomic_rollback(
-                        caps,
-                        pool.dialect(),
-                        &statements[..=statement_index],
-                        found,
-                    ),
-                });
-            }
-        }
-    }
-    if let Err((error, found)) = tx.commit().await {
-        // The commit itself failed (e.g. a deferred-constraint violation), not
-        // any one statement — label it as such rather than blaming the last
-        // statement, which actually succeeded.
-        return Err(ScriptError {
+    let (failure, ended) = run_statements(tx, pool.dialect(), statements, on_result).await;
+    atomic_outcome(caps, pool.dialect(), statements, failure, ended)
+}
+
+/// How an atomic run reports, given how its statements went and how its
+/// transaction ended. Over plain data so a test can execute every case.
+///
+/// A failed statement: its error, with what the rollback covered judged over
+/// the statements up to and including it — a schema change later in the
+/// script never reached the server. A failed commit: not any one statement's
+/// failure, so it is labelled `COMMIT` rather than blaming the last statement,
+/// which ran, and every statement is in scope.
+fn atomic_outcome(
+    caps: Capabilities,
+    dialect: Dialect,
+    statements: &[String],
+    failure: Option<(usize, DbError)>,
+    ended: TxEnded,
+) -> Result<(), ScriptError> {
+    match (failure, ended) {
+        (None, TxEnded::Committed(Ok(()))) => Ok(()),
+        (None, TxEnded::Committed(Err((error, found)))) => Err(ScriptError {
             statement_index: statements.len().saturating_sub(1),
             preview: "COMMIT".to_string(),
             error,
-            // Every statement ran before the commit was attempted, so the
-            // whole script is in scope here.
-            rollback: atomic_rollback(caps, pool.dialect(), statements, found),
-        });
+            rollback: atomic_rollback(caps, dialect, statements, found),
+        }),
+        (Some((statement_index, error)), TxEnded::RolledBack(found)) => Err(ScriptError {
+            statement_index,
+            preview: statement_preview(&statements[statement_index]),
+            error,
+            rollback: atomic_rollback(caps, dialect, &statements[..=statement_index], found),
+        }),
+        (Some(_), TxEnded::Committed(_)) | (None, TxEnded::RolledBack(_)) => {
+            unreachable!("an atomic run commits exactly when no statement failed")
+        }
     }
-    Ok(())
 }
 
 /// What a failed atomic run reports its rollback covered, given what
@@ -5578,5 +5685,249 @@ mod read_only_backstop {
             pool.close().await;
         }
         assert!(failures.is_empty(), "{failures:#?}");
+    }
+}
+
+/// The statement loop every script run shares ([`run_statements`]) and the
+/// per-mode decisions around it, executed over a fake hold rather than read
+/// off the source: what runs after a failure, whether the hold is told a
+/// statement failed, which statement lets go of the hold, and what each mode
+/// reports.
+#[cfg(test)]
+mod statement_loop {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// A hold that logs what the loop asks of it and fails any statement
+    /// naming `FAIL`. Takes the default `finish_with_read`, as `ScriptTx`
+    /// does.
+    struct Fake(Rc<RefCell<Vec<String>>>);
+
+    impl StatementExecutor for Fake {
+        type Ended = bool;
+
+        async fn read(&mut self, sql: &str, _: u64, _: usize) -> Result<Capped, DbError> {
+            self.0.borrow_mut().push(format!("read {sql}"));
+            if sql.contains("FAIL") {
+                return Err(DbError::Query(sql.to_string()));
+            }
+            Ok(Capped::from((QueryResult::default(), false)))
+        }
+
+        async fn write(&mut self, sql: &str) -> Result<RowsAffected, DbError> {
+            self.0.borrow_mut().push(format!("write {sql}"));
+            if sql.contains("FAIL") {
+                return Err(DbError::Query(sql.to_string()));
+            }
+            Ok(RowsAffected::Exact(1))
+        }
+
+        /// Ended is the `failed` it was told.
+        async fn end(self, failed: bool) -> bool {
+            self.0.borrow_mut().push(format!("end failed={failed}"));
+            failed
+        }
+    }
+
+    /// [`Fake`] with a `finish_with_read` of its own, as `ScriptConn` and
+    /// `ReadOnlyRun` have.
+    struct Closing(Fake);
+
+    impl StatementExecutor for Closing {
+        type Ended = bool;
+
+        async fn read(&mut self, sql: &str, rows: u64, cap: usize) -> Result<Capped, DbError> {
+            self.0.read(sql, rows, cap).await
+        }
+
+        async fn write(&mut self, sql: &str) -> Result<RowsAffected, DbError> {
+            self.0.write(sql).await
+        }
+
+        async fn end(self, failed: bool) -> bool {
+            self.0.end(failed).await
+        }
+
+        async fn finish_with_read(
+            self,
+            sql: &str,
+            _: u64,
+            _: usize,
+        ) -> (Result<Capped, DbError>, bool) {
+            self.0 .0.borrow_mut().push(format!("finish {sql}"));
+            (Ok(Capped::from((QueryResult::default(), false))), false)
+        }
+    }
+
+    fn stmts(sql: &[&str]) -> Vec<String> {
+        sql.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Runs `sql` through the loop on a [`Fake`] (or a [`Closing`] one),
+    /// returning the failure's index, what `end` was told, the hold's log and
+    /// how many statements were reported.
+    async fn drive(sql: &[&str], closing: bool) -> (Option<usize>, bool, Vec<String>, usize) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut reported = 0;
+        let statements = stmts(sql);
+        let (failure, ended) = if closing {
+            run_statements(
+                Closing(Fake(log.clone())),
+                Dialect::Postgres,
+                &statements,
+                |_| reported += 1,
+            )
+            .await
+        } else {
+            run_statements(Fake(log.clone()), Dialect::Postgres, &statements, |_| {
+                reported += 1
+            })
+            .await
+        };
+        let log = log.borrow().clone();
+        (failure.map(|(at, _)| at), ended, log, reported)
+    }
+
+    #[tokio::test]
+    async fn nothing_runs_after_a_failed_statement_and_the_hold_is_told() {
+        for closing in [false, true] {
+            let (failed_at, ended, log, reported) = drive(
+                &[
+                    "INSERT INTO t VALUES (1)",
+                    "INSERT FAIL",
+                    "INSERT INTO t VALUES (3)",
+                ],
+                closing,
+            )
+            .await;
+            assert_eq!(failed_at, Some(1));
+            assert!(ended, "the hold was not told a statement failed");
+            assert_eq!(
+                log,
+                [
+                    "write INSERT INTO t VALUES (1)",
+                    "write INSERT FAIL",
+                    "end failed=true"
+                ],
+                "closing: {closing}"
+            );
+            assert_eq!(reported, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_clean_run_lets_go_of_the_hold_as_unfailed_once() {
+        let (failed_at, ended, log, reported) = drive(
+            &["INSERT INTO t VALUES (1)", "SELECT 1", "DELETE FROM t"],
+            false,
+        )
+        .await;
+        assert_eq!(failed_at, None);
+        assert!(!ended);
+        assert_eq!(
+            log,
+            [
+                "write INSERT INTO t VALUES (1)",
+                "read SELECT 1",
+                "write DELETE FROM t",
+                "end failed=false"
+            ]
+        );
+        assert_eq!(reported, 3);
+    }
+
+    /// Only the last statement, and only a read, lets go of the hold itself —
+    /// and then the hold is not let go of a second time.
+    #[tokio::test]
+    async fn only_a_final_read_lets_go_of_the_hold_with_it() {
+        let (_, _, log, reported) = drive(&["SELECT 1", "SELECT 2"], true).await;
+        assert_eq!(log, ["read SELECT 1", "finish SELECT 2"]);
+        assert_eq!(reported, 2);
+        // The default: the read, then the end, told whether the read failed.
+        let (_, _, log, _) = drive(&["SELECT 1", "SELECT 2"], false).await;
+        assert_eq!(log, ["read SELECT 1", "read SELECT 2", "end failed=false"]);
+        let (failed_at, ended, log, _) = drive(&["SELECT 1", "SELECT FAIL"], false).await;
+        assert_eq!(failed_at, Some(1));
+        assert!(ended);
+        assert_eq!(
+            log,
+            ["read SELECT 1", "read SELECT FAIL", "end failed=true"]
+        );
+        for (reads, is_last, expected) in [
+            (true, true, Step::FinishWithRead),
+            (true, false, Step::Read),
+            (false, true, Step::Write),
+            (false, false, Step::Write),
+        ] {
+            assert_eq!(
+                step(reads, is_last),
+                expected,
+                "reads {reads}, last {is_last}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_atomic_run_commits_only_when_no_statement_failed() {
+        assert!(tx_commits(false));
+        assert!(!tx_commits(true));
+    }
+
+    /// What an atomic run reports: a failed statement is judged over what ran
+    /// up to it, a failed commit over the whole script and labelled `COMMIT`.
+    #[test]
+    fn an_atomic_run_reports_a_failed_statement_and_a_failed_commit_apart() {
+        let escapes = Capabilities {
+            transactional_ddl: false,
+            ..Capabilities::FULL
+        };
+        let script = stmts(&[
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 2",
+            "CREATE TABLE u (a int)",
+        ]);
+        let failed = atomic_outcome(
+            escapes,
+            Dialect::Postgres,
+            &script,
+            Some((1, DbError::Query("boom".into()))),
+            TxEnded::RolledBack(RolledBack::Own),
+        )
+        .unwrap_err();
+        assert_eq!(failed.statement_index, 1);
+        assert_eq!(failed.preview, statement_preview(&script[1]));
+        assert_eq!(failed.rollback, Rollback::Full);
+        let commit = atomic_outcome(
+            escapes,
+            Dialect::Postgres,
+            &script,
+            None,
+            TxEnded::Committed(Err((DbError::Query("deferred".into()), RolledBack::Own))),
+        )
+        .unwrap_err();
+        assert_eq!(commit.statement_index, 2);
+        assert_eq!(commit.preview, "COMMIT");
+        assert_eq!(commit.rollback, Rollback::ExceptSchemaChanges);
+        assert_eq!(
+            atomic_outcome(
+                escapes,
+                Dialect::Postgres,
+                &script,
+                None,
+                TxEnded::Committed(Ok(()))
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_read_only_run_reports_its_failure_with_nothing_rolled_back() {
+        let script = stmts(&["SELECT 1", "INSERT INTO t VALUES (1)"]);
+        let failed =
+            read_only_outcome(&script, Some((1, DbError::Query("read-only".into())))).unwrap_err();
+        assert_eq!(failed.statement_index, 1);
+        assert_eq!(failed.rollback, Rollback::None);
+        assert_eq!(read_only_outcome(&script, None), Ok(()));
     }
 }
