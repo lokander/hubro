@@ -30,113 +30,18 @@ pub(super) fn connect_code() -> String {
 /// assertion against that span would then read the wrong code — failing with
 /// a message that blames a "missing" call.
 pub(super) fn method_body(source: &str, signature: &str) -> String {
-    let from = source
-        .find(signature)
+    let mut found = source.match_indices(signature);
+    let (from, _) = found
+        .next()
         .unwrap_or_else(|| panic!("no `{signature}` in the source read"));
-    let end = body_end(&source[from..])
+    assert!(
+        found.next().is_none(),
+        "`{signature}` occurs more than once in the source read, so which body \
+         this reads depends on order; pin a longer signature"
+    );
+    let end = crate::source_scan::block_end(&source[from..])
         .unwrap_or_else(|| panic!("unbalanced braces after `{signature}`"));
     source[from..from + end].to_string()
-}
-
-/// The byte length of `text` up to and including the brace that closes the
-/// first `{` in it that is code, or `None` when it never closes.
-fn body_end(text: &str) -> Option<usize> {
-    let chars: Vec<(usize, char)> = text.char_indices().collect();
-    let at = |i: usize| chars.get(i).map(|&(_, c)| c);
-    let is_ident = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
-    let mut depth = 0usize;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i].1;
-        match c {
-            '/' if at(i + 1) == Some('/') => {
-                while i < chars.len() && chars[i].1 != '\n' {
-                    i += 1;
-                }
-                continue;
-            }
-            '/' if at(i + 1) == Some('*') => {
-                // Block comments nest in Rust.
-                let mut nested = 0usize;
-                while i < chars.len() {
-                    if chars[i].1 == '/' && at(i + 1) == Some('*') {
-                        nested += 1;
-                        i += 2;
-                    } else if chars[i].1 == '*' && at(i + 1) == Some('/') {
-                        nested -= 1;
-                        i += 2;
-                        if nested == 0 {
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-                continue;
-            }
-            // A raw string: `r"…"`, `r#"…"#`, `br#"…"#` — but not the `r` that
-            // ends an identifier such as `for` or `ptr`.
-            'r' if !is_ident(i.checked_sub(1).and_then(at))
-                || (i >= 1
-                    && at(i - 1) == Some('b')
-                    && !is_ident(i.checked_sub(2).and_then(at))) =>
-            {
-                let mut j = i + 1;
-                while at(j) == Some('#') {
-                    j += 1;
-                }
-                if at(j) == Some('"') {
-                    let hashes = j - i - 1;
-                    j += 1;
-                    loop {
-                        match at(j) {
-                            None => return None,
-                            Some('"') if (1..=hashes).all(|k| at(j + k) == Some('#')) => {
-                                i = j + hashes + 1;
-                                break;
-                            }
-                            _ => j += 1,
-                        }
-                    }
-                    continue;
-                }
-            }
-            '"' => {
-                i += 1;
-                while i < chars.len() && chars[i].1 != '"' {
-                    if chars[i].1 == '\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-                i += 1;
-                continue;
-            }
-            // A char literal — `'{'`, `'"'`, `'\''` — rather than a lifetime.
-            '\'' if at(i + 1) == Some('\\') => {
-                let mut j = i + 3;
-                while at(j).is_some_and(|c| c != '\'') {
-                    j += 1;
-                }
-                i = j + 1;
-                continue;
-            }
-            '\'' if at(i + 2) == Some('\'') => {
-                i += 3;
-                continue;
-            }
-            '{' => depth += 1,
-            '}' if depth > 0 => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(chars[i].0 + 1);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
 }
 
 /// The code of a function with its comment lines removed — the prose
@@ -282,17 +187,10 @@ pub(super) fn code_only(source: &str) -> String {
         .join("\n")
 }
 
-/// `source` up to its test module (`#[cfg(test)]` followed by `mod`): the
-/// shipped code alone. A `#[cfg(test)]` on anything else — `cli.rs` has
-/// one on a `use` — does not end it. Line-based, so a CRLF checkout reads
-/// the same.
+/// `source` without its test modules ([`crate::source_scan::shipped`]): the
+/// shipped code alone, comments included.
 pub(super) fn shipped(source: &str) -> String {
-    let lines: Vec<&str> = source.lines().collect();
-    let end = lines
-        .windows(2)
-        .position(|w| w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod "))
-        .unwrap_or(lines.len());
-    lines[..end].join("\n")
+    crate::source_scan::shipped(source)
 }
 
 /// `code` with the contents of every `"…"` literal removed (escapes
@@ -396,42 +294,4 @@ pub(super) fn all_sources() -> Vec<(String, String)> {
         out.len()
     );
     out
-}
-
-#[test]
-fn a_brace_in_a_comment_or_a_literal_does_not_end_the_body() {
-    // Each of these, counted as code, ends the span early or runs it into the
-    // next function: an unbalanced brace in a doc comment, a line comment, a
-    // block comment, a format string, an escaped quote before one, a raw
-    // string and a char literal. A lifetime is not a char literal.
-    let source = r####"
-fn first<'a>(x: &'a str) -> &'a str {
-    /// a doc line with an open brace {
-    // and a line comment with a second open brace {
-    /* a block comment } /* nested { */ still } */
-    let s = format!("{{ {x} }} }}");
-    let q = "a quote \" then a brace }";
-    let raw = r#"a "raw" string } with a quote"#;
-    let c = '}';
-    let o = '{';
-    let e = '\'';
-    let bytes = br"}";
-    if x.is_empty() {
-        return x;
-    }
-    x
-}
-
-fn second() {}
-"####;
-    let body = method_body(source, "fn first<");
-    let last: Vec<&str> = body.lines().rev().take(2).collect();
-    assert_eq!(last, ["}", "    x"], "{body}");
-    assert!(!body.contains("fn second"), "{body}");
-    // An identifier ending in `r` is not a raw string's prefix.
-    let source = "fn f() { for r in v { let ptr = \"}\"; } }\nfn g() {}";
-    assert_eq!(
-        method_body(source, "fn f("),
-        "fn f() { for r in v { let ptr = \"}\"; } }"
-    );
 }

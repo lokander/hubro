@@ -844,18 +844,11 @@ mod tests {
         let mut safe = Vec::new();
         let mut keyed = 0;
         for (path, source) in ui_sources() {
-            // The code above the test module, cut by lines so a CRLF checkout
+            // The code outside the test modules, by lines so a CRLF checkout
             // reads the same (see tests/line_endings.rs).
-            let all: Vec<&str> = source.lines().collect();
-            let end = (0..all.len())
-                .find(|&i| {
-                    all[i].trim() == "#[cfg(test)]"
-                        && all.get(i + 1).is_some_and(|next| next.starts_with("mod "))
-                })
-                .unwrap_or(all.len());
-            let lines: Vec<&str> = all[..end]
-                .iter()
-                .copied()
+            let shipped = crate::source_scan::shipped(&source);
+            let lines: Vec<&str> = shipped
+                .lines()
                 .filter(|line| !line.trim_start().starts_with("//"))
                 .collect();
             let name = path.join("/");
@@ -1047,10 +1040,7 @@ mod tests {
 
         // And the one backdrop is marked, so a reclaim sees it open.
         let own = include_str!("notice.rs");
-        let (code, _tests) = own
-            .split_once("#[cfg(test)]")
-            .expect("notice.rs has a test module");
-        let lines = code_lines(code);
+        let lines = code_lines(&crate::source_scan::shipped(own));
         let overlay = lines
             .iter()
             .position(|line| line.starts_with("pub fn Overlay("))

@@ -842,8 +842,7 @@ mod tests {
     #[test]
     fn the_quit_confirmation_is_drawn_over_the_cheatsheet() {
         let source = include_str!("shell.rs");
-        let (code, _tests) = source.split_once("#[cfg(test)]").expect("a test module");
-        let lines = crate::ui::test_dom::code_lines(code);
+        let lines = crate::ui::test_dom::code_lines(&crate::source_scan::shipped(source));
         let shell = lines
             .iter()
             .position(|line| line.starts_with("pub fn Shell("))

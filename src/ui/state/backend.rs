@@ -53,7 +53,7 @@ pub(super) enum ServerCredential<'a> {
 /// server.
 ///
 /// Deliberately no `Debug`: both fields carry a secret.
-pub(super) struct ServerLogin {
+struct ServerLogin {
     /// The URL to dial, with the secret spliced in as its password when the
     /// engine takes it that way — which Postgres does for a password and an
     /// Entra token alike.
@@ -143,7 +143,7 @@ impl ServerBackend {
     /// Where `credential` goes for this engine: into the URL as its password,
     /// or to the driver as an AAD login. Pure — see [`ServerLogin`] for why
     /// this is a step of its own.
-    pub(super) fn login(
+    fn login(
         &self,
         connect_url: &str,
         credential: ServerCredential<'_>,

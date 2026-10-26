@@ -2886,11 +2886,7 @@ mod tests {
             );
         }
         // And the submit's producer is the only read of the forms' box.
-        let shipped: String = source
-            .lines()
-            .take_while(|line| line.trim() != "#[cfg(test)]")
-            .collect::<Vec<_>>()
-            .join("\n");
+        let shipped = crate::source_scan::shipped(source);
         let shipped = code_without_prose(&shipped);
         assert_eq!(shipped.matches("form.remember").count(), 1, "{shipped}");
         assert!(shipped.contains(

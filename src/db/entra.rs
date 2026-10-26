@@ -669,33 +669,10 @@ mod tests {
         out
     }
 
-    /// A file's shipped code: up to its test module, with comments removed —
-    /// whole comment lines, and a trailing `//` outside a string.
+    /// A file's shipped code, with comments removed
+    /// ([`crate::source_scan::code_outside_test_modules`]).
     fn shipped(source: &str) -> String {
-        let lines: Vec<&str> = source.lines().collect();
-        let end = lines
-            .windows(2)
-            .position(|w| w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod "))
-            .unwrap_or(lines.len());
-        lines[..end]
-            .iter()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .map(|line| {
-                let mut in_str = false;
-                let mut prev = ' ';
-                for (at, ch) in line.char_indices() {
-                    if ch == '"' && prev != '\\' {
-                        in_str = !in_str;
-                    }
-                    if !in_str && ch == '/' && prev == '/' {
-                        return &line[..at - 1];
-                    }
-                    prev = ch;
-                }
-                line
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        crate::source_scan::code_outside_test_modules(source)
     }
 
     /// Each read of a secret in `code` — `expose` as a whole identifier, but
