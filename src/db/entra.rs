@@ -627,7 +627,7 @@ mod tests {
             "tiberius: a login with one fixed token",
         ),
         (
-            "ui/state/connect.rs",
+            "ui/state/backend.rs",
             "login",
             1,
             "sqlx: the Postgres connect URL's password",

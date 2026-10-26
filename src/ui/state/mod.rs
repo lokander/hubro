@@ -6,12 +6,16 @@
 //! plain data types every part of the UI names. The procedural workflows that
 //! merely *drive* those signals live beside it:
 //!
-//! - [`connect`] — the saved list and the connect/auth/tunnel flows;
+//! - [`connect`] — the connect/auth/tunnel flows, over three files of their
+//!   own: [`secrets_policy`] (where each secret is kept, as free functions a
+//!   test can run), [`backend`] (the per-engine data the flows take) and
+//!   [`saved`] (the saved-connections list);
 //! - [`sql`] — running SQL, query history, and exports;
 //! - [`staging`] — staged edits and the save path;
-//! - [`session`] — snapshotting and restoring the open tabs.
+//! - [`session`] — snapshotting and restoring the open tabs;
+//! - [`import`] and [`schema_edit`] — importing a file, and editing a schema.
 //!
-//! `impl AppState` blocks live in all five files, so the split is invisible
+//! `impl AppState` blocks live across these files, so the split is invisible
 //! to callers: everything is still reached as `state::…`.
 //!
 //! The submodules open with `use super::*`. They hold nothing but
@@ -20,14 +24,19 @@
 //! their own — so they deliberately inherit this file's imports and types
 //! instead of restating thirty `use` lines four times.
 
+mod backend;
 mod connect;
 mod import;
+mod saved;
 mod schema_edit;
+mod secrets_policy;
 mod session;
+#[cfg(test)]
+mod source_reading;
 mod sql;
 mod staging;
 
-pub use connect::ServerBackend;
+pub use backend::ServerBackend;
 pub use import::{ImportRequest, ImportStatus};
 pub use schema_edit::{after_edit, SchemaEditRequest, SchemaEditStatus};
 
@@ -1090,10 +1099,10 @@ pub struct AppState {
     /// Per locator, the Entra sign-outs this run: whether one's keyring
     /// deletion is still running, and how many there have been, which a
     /// connect under way compares before keeping a token
-    /// ([`connect::EntraSignOut`]).
-    pub entra_sign_outs: Signal<HashMap<String, connect::EntraSignOut>>,
+    /// ([`secrets_policy::EntraSignOut`]).
+    pub entra_sign_outs: Signal<HashMap<String, secrets_policy::EntraSignOut>>,
     /// Secrets entered this session: Postgres passwords keyed by stored URL,
-    /// SSH key passphrases keyed by [`connect::ssh_secret_key`]. Never
+    /// SSH key passphrases keyed by [`secrets_policy::ssh_secret_key`]. Never
     /// persisted here — the OS keyring handles "remember".
     pub session_passwords: Signal<HashMap<String, String>>,
     /// When set, the connections screen asks for this connection's password

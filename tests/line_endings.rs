@@ -26,7 +26,7 @@
 /// `README.md` is deliberately absent even though `.gitattributes` names it:
 /// `tests/support_matrix.rs` reads it through `str::lines()`, which strips a
 /// trailing `\r`, so it does not care. Same for the three modules that read
-/// their own source — `ui/grid/stats.rs` counts markers, `connect.rs`'s
+/// their own source — `ui/grid/stats.rs` counts markers, `ui/state/source_reading.rs`'s
 /// `method_body` matches braces, and `connections.rs` slices its prompt card
 /// by lines; none compares a `\n`.
 ///
