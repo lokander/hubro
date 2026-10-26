@@ -294,7 +294,7 @@ impl AppState {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     /// Every `AppState` field keyed by connection that is not in
@@ -364,7 +364,7 @@ mod tests {
 
     /// Every `AppState` field and its type, as [`per_connection_fields`]
     /// reads them.
-    fn all_fields() -> Vec<(String, String)> {
+    pub(in crate::ui::state) fn all_fields() -> Vec<(String, String)> {
         let source = mod_rs_code();
         let body: Vec<&str> = source
             .lines()
