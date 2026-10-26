@@ -720,11 +720,38 @@ mod tests {
 
     #[test]
     fn views_are_never_addressable() {
-        // Even when introspection reports PK-ish columns (it doesn't today),
-        // a view must stay read-only.
-        let t = table(TableKind::View, vec![col("id", false, Some(1))], vec![]);
-        for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
-            assert_eq!(detect_row_identity(&t, dialect), None);
+        // Even when introspection reports a primary key or a usable unique
+        // index, a view or materialized view must stay read-only: the kind
+        // check is the only thing between them and an identity. Postgres
+        // never marks a matview's columns NOT NULL, so its suite cannot reach
+        // this, but Materialize infers matview nullability and CockroachDB and
+        // RisingWave matviews can carry keys and indexes.
+        let dialects = [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer];
+        // A new dialect fails to compile here until it is added above.
+        let _every_dialect = |d: Dialect| match d {
+            Dialect::Sqlite | Dialect::Postgres | Dialect::SqlServer => {}
+        };
+        let shapes = [
+            (vec![col("id", false, Some(1))], vec![]),
+            (
+                vec![col("id", false, None)],
+                vec![index("t_id_unique", true, &["id"])],
+            ),
+        ];
+        for (columns, indexes) in shapes {
+            for dialect in dialects {
+                // The control: the same shape as a table is addressable, so
+                // nothing but the kind refuses it below.
+                let as_table = table(TableKind::Table, columns.clone(), indexes.clone());
+                assert!(
+                    detect_row_identity(&as_table, dialect).is_some(),
+                    "{dialect:?}: {as_table:?}"
+                );
+                for kind in [TableKind::View, TableKind::MaterializedView] {
+                    let t = table(kind, columns.clone(), indexes.clone());
+                    assert_eq!(detect_row_identity(&t, dialect), None, "{dialect:?}: {t:?}");
+                }
+            }
         }
     }
 
