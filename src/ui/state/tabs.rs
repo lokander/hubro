@@ -521,6 +521,7 @@ pub(super) mod tests {
                 statements: Vec::new(),
                 status: RunStatus::Running,
                 explain: false,
+                late_rest: None,
             }
         }
         vec![

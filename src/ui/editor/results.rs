@@ -18,7 +18,7 @@ const MAX_RENDERED_ROWS: usize = 500;
 /// did could have lasted anyway (`RestOfRead::Stopped`) gets the plain line,
 /// and one read after the run (`RestOfRead::Unconfirmed`) says its outcome
 /// is not known.
-fn truncation_notice(rest: RestOfRead) -> String {
+fn truncation_notice(rest: RestOfRead, late: Option<&LateRest>) -> String {
     let notice = format!(
         "Result truncated — showing the first {MAX_QUERY_ROWS} rows to keep memory bounded. \
          Add a LIMIT or a WHERE clause to narrow it."
@@ -31,11 +31,25 @@ fn truncation_notice(rest: RestOfRead) -> String {
              statement did. Only a statement that had written no table rows is cancelled; \
              settings or notifications it made are undone too."
         ),
-        RestOfRead::Unconfirmed => format!(
-            "{notice} The rest of this result was read after the run ended, and its \
-             outcome isn't reported. If the statement wrote anything and the rest failed, \
-             its writes were undone."
-        ),
+        RestOfRead::Unconfirmed => match late {
+            None => format!(
+                "{notice} The rest of this result was read after the run ended, and its \
+                 outcome isn't reported. If the statement wrote anything and the rest failed, \
+                 its writes were undone."
+            ),
+            Some(LateRest::Finished) => format!(
+                "{notice} The rest of this result was read after the run ended and finished."
+            ),
+            Some(LateRest::Failed(error)) => format!(
+                "{notice} The rest of this result failed after the run ended: {error}. If the \
+                 statement wrote anything, its writes were undone."
+            ),
+            Some(LateRest::Unknown) => format!(
+                "{notice} The rest of this result was read after the run ended, and the \
+                 connection was lost before it reported, so its outcome is unknown. If the \
+                 statement wrote anything, its writes may have been undone."
+            ),
+        },
     }
 }
 
@@ -134,6 +148,11 @@ pub(super) fn RunResults(
                                 buffer: active,
                                 index: index + 1,
                                 result: statement.clone(),
+                                late: run
+                                    .late_rest
+                                    .as_ref()
+                                    .filter(|(at, _)| *at == index)
+                                    .map(|(_, late)| late.clone()),
                             }
                         }
                     }
@@ -378,6 +397,9 @@ fn StatementSection(
     buffer: u64,
     index: usize,
     result: SharedStatement,
+    /// How this statement's rest ended, when it was read after the run and
+    /// has ended since.
+    late: Option<LateRest>,
 ) -> Element {
     let state = use_context::<AppState>();
     let summary = outcome_summary(&result.outcome);
@@ -431,7 +453,7 @@ fn StatementSection(
                 div { class: "px-4 pt-2",
                     Banner {
                         kind: BannerKind::Warning,
-                        message: truncation_notice(result.rest),
+                        message: truncation_notice(result.rest, late.as_ref()),
                     }
                 }
             }
@@ -566,15 +588,15 @@ mod tests {
 
     #[test]
     fn a_read_stopped_at_the_row_cap_says_what_became_of_its_rest() {
-        let ran = truncation_notice(RestOfRead::Ran);
+        let ran = truncation_notice(RestOfRead::Ran, None);
         assert!(!ran.contains("rest"));
-        let stopped = truncation_notice(RestOfRead::Stopped);
+        let stopped = truncation_notice(RestOfRead::Stopped, None);
         assert!(stopped.starts_with(&ran));
         assert!(stopped.ends_with("The rest was not run."));
         // The xid rule's line, and only there: a marked connection's read and
         // SQL Server's discarded one were not cancelled on its grounds.
         assert!(!stopped.contains("table rows"));
-        let cancelled = truncation_notice(RestOfRead::CancelledUnwritten);
+        let cancelled = truncation_notice(RestOfRead::CancelledUnwritten, None);
         assert!(cancelled.starts_with(&ran));
         assert!(cancelled.contains("The rest was cancelled at the row cap"));
         // What a cancel costs, as the user decided it should be said: the
@@ -584,7 +606,7 @@ mod tests {
         assert!(cancelled.contains("settings or notifications it made are undone too"));
         // A rest read after the run says that its outcome is not known, and
         // what a failure would cost.
-        let unconfirmed = truncation_notice(RestOfRead::Unconfirmed);
+        let unconfirmed = truncation_notice(RestOfRead::Unconfirmed, None);
         assert!(unconfirmed.starts_with(&ran));
         // Shown on every capped last read on these engines, plain reads
         // included, and after the background read has finished: so it leads
@@ -597,6 +619,37 @@ mod tests {
         ));
         assert!(!unconfirmed.contains("still"));
         assert!(!unconfirmed.contains("everything the statement did"));
+        // Once the background read has ended, the notice says how: finished,
+        // or failed with the server's error and the writes undone, or not
+        // known when the connection was lost.
+        let finished = truncation_notice(RestOfRead::Unconfirmed, Some(&LateRest::Finished));
+        assert!(finished.starts_with(&ran));
+        assert!(finished
+            .ends_with("The rest of this result was read after the run ended and finished."));
+        assert!(!finished.contains("undone"));
+        let failed = truncation_notice(
+            RestOfRead::Unconfirmed,
+            Some(&LateRest::Failed("division by zero".into())),
+        );
+        assert!(failed.ends_with(
+            "The rest of this result failed after the run ended: division by zero. If the \
+             statement wrote anything, its writes were undone."
+        ));
+        let unknown = truncation_notice(RestOfRead::Unconfirmed, Some(&LateRest::Unknown));
+        assert!(unknown.contains("its outcome is unknown"));
+        assert!(unknown.contains("may have been undone"));
+        assert!(!unknown.contains("finished") && !unknown.contains("failed"));
+        // A late outcome speaks only for an unconfirmed rest.
+        for rest in [
+            RestOfRead::Ran,
+            RestOfRead::Stopped,
+            RestOfRead::CancelledUnwritten,
+        ] {
+            assert_eq!(
+                truncation_notice(rest, Some(&LateRest::Failed("x".into()))),
+                truncation_notice(rest, None)
+            );
+        }
     }
 
     /// Without a dialect the banner states no count at all, rather than one

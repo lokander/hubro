@@ -256,6 +256,7 @@ impl AppState {
                         preview: statement_preview(&statements[statement_index]),
                     },
                     explain,
+                    late_rest: None,
                 },
             );
             return;
@@ -382,6 +383,7 @@ impl AppState {
                 statements: Vec::new(),
                 status: RunStatus::Running,
                 explain,
+                late_rest: None,
             },
         );
         // spawn_forever: the run must survive pane/tab switches unmounting
@@ -389,16 +391,18 @@ impl AppState {
         // the pool is cloned out above and every write below is scoped.
         let task = spawn_forever(async move {
             let started = std::time::Instant::now();
-            let result = run_script(&pool, caps, &statements, |statement| {
-                // Peeked first, so a stale run's progress wakes no reader.
-                if self.sql_runs.peek().is_current(&(id, buffer), generation) {
-                    if let Some(run) = self.sql_runs.write().current_mut(&(id, buffer), generation)
-                    {
-                        run.statements.push(SharedStatement::new(statement));
+            let (result, pending) =
+                run_script_watching_rest(&pool, caps, &statements, |statement| {
+                    // Peeked first, so a stale run's progress wakes no reader.
+                    if self.sql_runs.peek().is_current(&(id, buffer), generation) {
+                        if let Some(run) =
+                            self.sql_runs.write().current_mut(&(id, buffer), generation)
+                        {
+                            run.statements.push(SharedStatement::new(statement));
+                        }
                     }
-                }
-            })
-            .await;
+                })
+                .await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
             // History is recorded even when a newer run made this one stale —
             // the script did execute. Cancelled runs never reach this point
@@ -416,8 +420,50 @@ impl AppState {
             if let Some(run) = self.sql_runs.write().status_mut(&(id, buffer)) {
                 run.status = status;
             }
+            // The last read's rest is still being read: say how it ended once
+            // it has. A task of its own, so the run is over now and its handle
+            // released; spawn_forever, so it outlives the editor.
+            if let Some(pending) = pending {
+                spawn_forever(async move {
+                    let outcome = pending.outcome().await;
+                    self.land_late_rest(id, buffer, generation, outcome);
+                });
+            }
         });
         self.sql_runs.write().attach((id, buffer), task);
+    }
+
+    /// Puts a late rest's outcome on the statement it belongs to, when the
+    /// run it came from is still the one in its query tab
+    /// ([`lands_late_rest`]).
+    fn land_late_rest(
+        mut self,
+        id: ConnectionId,
+        buffer: u64,
+        generation: u64,
+        outcome: crate::db::LateRest,
+    ) {
+        let current = self.sql_runs.peek().is_current(&(id, buffer), generation);
+        // The gate `tab_mut` uses: a closed tab's connection has left the
+        // registry (its `TabState` is made lazily, so its absence says nothing).
+        let tab_open = self.registry.peek().get(id).is_some();
+        let lands = self
+            .sql_runs
+            .peek()
+            .get(&(id, buffer))
+            .is_some_and(|run| lands_late_rest(current, tab_open, &run.status));
+        if !lands {
+            return;
+        }
+        if let Some(run) = self.sql_runs.write().status_mut(&(id, buffer)) {
+            let unconfirmed = run
+                .statements
+                .iter()
+                .rposition(|s| s.rest == crate::db::RestOfRead::Unconfirmed);
+            if let Some(index) = unconfirmed {
+                run.late_rest = Some((index, outcome));
+            }
+        }
     }
 
     /// Best-effort history write for a completed run: never blocks or fails
@@ -809,6 +855,15 @@ fn finished_run(
     }
 }
 
+/// Whether a late rest's outcome may land on the run in a query tab: only
+/// on the run it came from (`current`: no newer run has begun there, and the
+/// slot was not closed with its tab), while the connection's tab is open, and
+/// only on a run that finished — a cancelled or failed run left no
+/// unconfirmed rest to resolve. Over plain data so a test can execute it.
+fn lands_late_rest(current: bool, tab_open: bool, status: &RunStatus) -> bool {
+    current && tab_open && matches!(status, RunStatus::Done { .. })
+}
+
 fn export_temp_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".part");
@@ -950,6 +1005,72 @@ mod tests {
     }
 
     use crate::db::OpenTransaction;
+
+    /// The gate a late rest's outcome passes: the run it came from, still
+    /// current, in an open tab, and finished.
+    #[test]
+    fn a_late_rest_lands_only_on_the_finished_run_it_came_from() {
+        let done = RunStatus::Done {
+            elapsed_ms: 1,
+            rolled_back: None,
+            connection_closed: false,
+        };
+        assert!(lands_late_rest(true, true, &done));
+        assert!(
+            !lands_late_rest(false, true, &done),
+            "a newer run owns the tab"
+        );
+        assert!(!lands_late_rest(true, false, &done), "the tab was closed");
+        assert!(!lands_late_rest(true, true, &RunStatus::Cancelled));
+        assert!(!lands_late_rest(true, true, &RunStatus::Running));
+    }
+
+    /// Executed through the state: a late outcome lands on its run's
+    /// unconfirmed statement, and one from a run since replaced is dropped
+    /// rather than resolving the new run's notice.
+    #[tokio::test]
+    async fn a_late_rest_from_a_superseded_run_is_dropped() {
+        use crate::db::{LateRest, RestOfRead};
+        let (dom, mut state, id) = state_with_connection();
+        let unconfirmed = |preview: &str| {
+            SharedStatement::new(StatementResult {
+                preview: preview.into(),
+                outcome: StatementOutcome::Rows(crate::db::QueryResult::default()),
+                truncated: true,
+                rest: RestOfRead::Unconfirmed,
+            })
+        };
+        let finished = |statements: Vec<SharedStatement>| SqlRun {
+            statements,
+            status: RunStatus::Done {
+                elapsed_ms: 1,
+                rolled_back: None,
+                connection_closed: false,
+            },
+            explain: false,
+            late_rest: None,
+        };
+        dom.in_runtime(|| {
+            let first = state.claim_run_slot(id, 0, finished(vec![unconfirmed("SELECT f()")]));
+            state.land_late_rest(id, 0, first, LateRest::Finished);
+            assert_eq!(
+                state.sql_runs.peek()[&(id, 0)].late_rest,
+                Some((0, LateRest::Finished))
+            );
+            let second = state.claim_run_slot(id, 0, finished(vec![unconfirmed("SELECT g()")]));
+            state.land_late_rest(id, 0, first, LateRest::Failed("stale".into()));
+            assert_eq!(
+                state.sql_runs.peek()[&(id, 0)].late_rest,
+                None,
+                "a stale outcome landed"
+            );
+            state.land_late_rest(id, 0, second, LateRest::Failed("boom".into()));
+            assert_eq!(
+                state.sql_runs.peek()[&(id, 0)].late_rest,
+                Some((0, LateRest::Failed("boom".into())))
+            );
+        });
+    }
 
     /// The wire from what a run returned to what the editor shows and what
     /// history records — the rolled-back report must reach both.

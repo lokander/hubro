@@ -173,6 +173,36 @@ impl RestOfRead {
     }
 }
 
+/// How the rest of a read reported [`RestOfRead::Unconfirmed`] ended, once
+/// the background read of it has finished — the outcome the run could not
+/// wait for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LateRest {
+    /// Read to its end: the statement finished, and what it wrote stands.
+    Finished,
+    /// The server ended the statement with this error past the cap. The
+    /// statement was undone with it, its writes included.
+    Failed(String),
+    /// No answer came: the connection was lost while the rest was read, or
+    /// the read was dropped before it reported. Whether the statement
+    /// finished is not known.
+    Unknown,
+}
+
+/// The outcome of a rest read after the run ([`RestOfRead::Unconfirmed`]),
+/// to be awaited by whoever shows the run. Never makes the run itself wait.
+#[derive(Debug)]
+pub struct PendingRest(pub(crate) tokio::sync::oneshot::Receiver<LateRest>);
+
+impl PendingRest {
+    /// Waits for the background read to end. A read dropped without
+    /// reporting is [`LateRest::Unknown`], so this never waits forever on a
+    /// task that is gone.
+    pub async fn outcome(self) -> LateRest {
+        self.0.await.unwrap_or(LateRest::Unknown)
+    }
+}
+
 /// A bounded read: the rows kept, whether rows existed past the cap, and
 /// what became of the rest.
 #[derive(Debug)]

@@ -134,8 +134,8 @@ use hubro::db::Reading;
 use std::sync::OnceLock;
 
 use hubro::db::{
-    detect_row_identity, run_script, split_statements, DbPool, DdlObject, DdlSource, Filter,
-    Internal, PageRequest, PgFlavor, Restriction, RowCount, SortDir, TableKind, Value,
+    detect_row_identity, split_statements, DbPool, DdlObject, DdlSource, Filter, Internal,
+    PageRequest, PgFlavor, Restriction, RowCount, SortDir, TableKind, Value,
 };
 use tokio::sync::Mutex;
 
@@ -758,13 +758,29 @@ async fn a_capped_read_that_writes_keeps_its_writes_though_yugabyte_cannot_say_i
     ] {
         let statements = split_statements(&script, pool.dialect());
         let mut results = Vec::new();
-        run_script(&pool, pool.backend_capabilities(), &statements, |r| {
-            results.push(r)
-        })
-        .await
-        .unwrap_or_else(|e| panic!("{script}: {e:?}"));
+        let (outcome, pending) = hubro::db::run_script_watching_rest(
+            &pool,
+            pool.backend_capabilities(),
+            &statements,
+            |r| results.push(r),
+        )
+        .await;
+        outcome.unwrap_or_else(|e| panic!("{script}: {e:?}"));
         assert!(results[0].truncated, "{script}");
         assert_eq!(results[0].rest, rest, "{script}");
+        // Only a rest read after the run has an outcome still to come, and
+        // here it finishes.
+        match pending {
+            Some(pending) => {
+                assert_eq!(rest, hubro::db::RestOfRead::Unconfirmed, "{script}");
+                assert_eq!(
+                    pending.outcome().await,
+                    hubro::db::LateRest::Finished,
+                    "{script}"
+                );
+            }
+            None => assert_eq!(rest, hubro::db::RestOfRead::Ran, "{script}"),
+        }
         expected += 20_000;
         // The last read is read in the background before its transaction
         // commits.
@@ -823,12 +839,23 @@ async fn a_capped_read_failing_after_the_run_is_not_claimed_to_have_run() {
         pool.dialect(),
     );
     let mut results = Vec::new();
-    let outcome = run_script(&pool, pool.backend_capabilities(), &statements, |r| {
-        results.push((r.truncated, r.rest))
-    })
-    .await;
+    let (outcome, pending) =
+        hubro::db::run_script_watching_rest(&pool, pool.backend_capabilities(), &statements, |r| {
+            results.push((r.truncated, r.rest))
+        })
+        .await;
     assert_eq!(outcome, Ok(hubro::db::ScriptDone::default()));
     assert_eq!(results, [(true, hubro::db::RestOfRead::Unconfirmed)]);
+    // The run reported before the rest ended; the rest's outcome arrives
+    // after, and is the server's error.
+    let late = pending
+        .expect("the rest is read after the run")
+        .outcome()
+        .await;
+    assert!(
+        matches!(&late, hubro::db::LateRest::Failed(error) if error.contains("division by zero")),
+        "{late:?}"
+    );
     // The background read meets the error and the statement is undone. Its
     // rows are uncommitted until then, so the count is read only once no
     // session is running the statement any more. That moment is the end of

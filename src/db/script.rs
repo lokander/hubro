@@ -23,7 +23,7 @@ use super::registry::{
 };
 use super::sql::Dialect;
 use super::value::QueryResult;
-use super::value::{Capped, RestOfRead};
+use super::value::{Capped, PendingRest, RestOfRead};
 
 /// One lexed region of a SQL script. [`lex_regions`] is the single place
 /// that understands quote/comment/bracket/dollar-quote state — the statement
@@ -1709,26 +1709,44 @@ pub async fn run_script(
     statements: &[String],
     on_result: impl FnMut(StatementResult),
 ) -> Result<ScriptDone, ScriptError> {
+    run_script_watching_rest(pool, caps, statements, on_result)
+        .await
+        .0
+}
+
+/// [`run_script`], and the outcome of a last read whose rest is read after
+/// the run ([`RestOfRead::Unconfirmed`]) — `Some` exactly when that read's
+/// result says so. The run reports as soon as its statements have; the
+/// [`PendingRest`] resolves when the background read ends, so whoever shows
+/// the run can say how the rest went.
+pub async fn run_script_watching_rest(
+    pool: &DbPool,
+    caps: Capabilities,
+    statements: &[String],
+    on_result: impl FnMut(StatementResult),
+) -> (Result<ScriptDone, ScriptError>, Option<PendingRest>) {
     if let Some(refusal) = refuse_script(caps, statements, pool.dialect()) {
-        return Err(refusal);
+        return (Err(refusal), None);
     }
     if engine_enforces_read_only(caps) {
         match pool.begin_read_only_run().await {
             Ok(Some(run)) => {
-                return run_script_read_only(run, pool.dialect(), statements, on_result)
+                let outcome = run_script_read_only(run, pool.dialect(), statements, on_result)
                     .await
-                    .map(|()| ScriptDone::default())
+                    .map(|()| ScriptDone::default());
+                return (outcome, None);
             }
             // SQL Server: no read-only mode to run in, so the script runs as
             // any other does, behind the gate alone.
             Ok(None) => {}
-            Err(error) => return Err(nothing_ran(statements, error)),
+            Err(error) => return (Err(nothing_ran(statements, error)), None),
         }
     }
     if wrap_atomically(caps, pool.dialect(), statements) {
-        run_script_atomic(pool, caps, statements, on_result)
+        let outcome = run_script_atomic(pool, caps, statements, on_result)
             .await
-            .map(|()| ScriptDone::default())
+            .map(|()| ScriptDone::default());
+        (outcome, None)
     } else {
         run_script_sequential(pool, caps, statements, on_result).await
     }
@@ -1900,7 +1918,9 @@ trait StatementExecutor: Sized {
 /// and letting go of it rolls back whatever transaction the script left open
 /// ([`ScriptConn::end`]), whether a statement failed or not.
 impl StatementExecutor for ScriptConn {
-    type Ended = Result<bool, DbError>;
+    /// How ending the hold went, and the outcome of a rest read after the
+    /// run, if the last read left one.
+    type Ended = (Result<bool, DbError>, Option<PendingRest>);
     const ENDS_WITH_FINAL_READ: bool = true;
 
     async fn read(&mut self, sql: &str, max_rows: u64, cell_cap: usize) -> Result<Capped, DbError> {
@@ -1911,8 +1931,8 @@ impl StatementExecutor for ScriptConn {
         self.execute(sql).await
     }
 
-    async fn end(self, _failed: bool) -> Result<bool, DbError> {
-        ScriptConn::end(self).await
+    async fn end(self, _failed: bool) -> Self::Ended {
+        (ScriptConn::end(self).await, None)
     }
 
     async fn finish_with_read(
@@ -1920,8 +1940,10 @@ impl StatementExecutor for ScriptConn {
         sql: &str,
         max_rows: u64,
         cell_cap: usize,
-    ) -> (Result<Capped, DbError>, Result<bool, DbError>) {
-        ScriptConn::finish_with_read(self, sql, max_rows, cell_cap).await
+    ) -> (Result<Capped, DbError>, Self::Ended) {
+        let (read, ended, pending) =
+            ScriptConn::finish_with_read(self, sql, max_rows, cell_cap).await;
+        (read, (ended, pending))
     }
 }
 
@@ -2107,17 +2129,21 @@ async fn run_script_sequential(
     caps: Capabilities,
     statements: &[String],
     on_result: impl FnMut(StatementResult),
-) -> Result<ScriptDone, ScriptError> {
+) -> (Result<ScriptDone, ScriptError>, Option<PendingRest>) {
     let conn = match pool.acquire_script_conn().await {
         Ok(conn) => conn,
-        Err(error) => return Err(nothing_ran(statements, error)),
+        Err(error) => return (Err(nothing_ran(statements, error)), None),
     };
-    let (failure, ended) = run_statements(conn, pool.dialect(), statements, on_result).await;
+    let (failure, (ended, pending)) =
+        run_statements(conn, pool.dialect(), statements, on_result).await;
     let ran = match &failure {
         Some((statement_index, _)) => &statements[..=*statement_index],
         None => statements,
     };
-    sequential_outcome(caps, pool.dialect(), statements, ran, failure, ended)
+    (
+        sequential_outcome(caps, pool.dialect(), statements, ran, failure, ended),
+        pending,
+    )
 }
 
 /// How a sequential run reports, given how its statements went (`failure`)

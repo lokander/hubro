@@ -100,9 +100,10 @@ pub use schema_edit::{
     NOTHING_TO_RUN, NOT_A_TABLE, PRIMARY_KEY_INDEX, UNIQUE_CONSTRAINT_INDEX,
 };
 pub use script::{
-    classify_statement, needs_confirmation, run_script, script_refusal, split_statements,
-    statement_needs, statement_preview, OpenTransaction, Rollback, RowsAffected, ScriptDone,
-    ScriptError, StatementKind, StatementNeeds, StatementOutcome, StatementResult, NUL_IN_SCRIPT,
+    classify_statement, needs_confirmation, run_script, run_script_watching_rest, script_refusal,
+    split_statements, statement_needs, statement_preview, OpenTransaction, Rollback, RowsAffected,
+    ScriptDone, ScriptError, StatementKind, StatementNeeds, StatementOutcome, StatementResult,
+    NUL_IN_SCRIPT,
 };
 pub use sql::Dialect;
 pub use sqlite::{
@@ -116,4 +117,4 @@ pub use staged::{
     apply_staged, AppliedCounts, CheckedStatement, RowLocator, StagedChange, StagedError,
 };
 pub use stats::{RowCount, TableStats};
-pub use value::{ColumnInfo, QueryResult, RestOfRead, Value};
+pub use value::{ColumnInfo, LateRest, PendingRest, QueryResult, RestOfRead, Value};
