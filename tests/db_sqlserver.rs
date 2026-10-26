@@ -30,47 +30,70 @@ use hubro::db::{
     TableMeta, TypeDetail, Value, INSTEAD_OF_TRIGGER, MISSING_ROW, PREVIEW_BYTES, QUERY_CELL_CAP,
 };
 
-async fn test_url() -> Option<String> {
-    common::mssql_test_url().await
-}
-
-/// Keeps introspection and fixture DDL from overlapping inside this binary.
+/// Keeps introspection apart from everything else this binary sends.
 ///
 /// Cargo runs one test binary at a time but the tests inside it in parallel,
 /// all in the one database [`common::mssql_test_url`] made for this process.
 /// That database keeps *other* binaries out of the catalog, not this binary's
-/// own tests: measured with nothing but this suite running, 25 runs saw 28
-/// deadlock-victim kills (1205), every one of them `introspect()`'s catalog
+/// own tests. Measured with nothing but this suite running, 25 runs saw 28
+/// deadlock-victim kills (1205), and every one was `introspect()`'s catalog
 /// joins losing to a sibling test's `CREATE`/`DROP`. Neither side is what a
-/// test here is about, so they take turns: introspection takes the write
-/// half, fixture DDL the read half, and DDL still runs beside other DDL.
+/// test here is about, so they take turns.
 ///
-/// This replaced a bounded retry on 1205. The retry made those kills pass
-/// silently, and would have done the same for a kill from anywhere else —
-/// another binary back in a shared database, say — so a 1205 now fails the
+/// **Every test holds the shared half for its whole run**, and introspection
+/// alone takes the exclusive half. The shared half is not taken per DDL
+/// statement, because DDL reaches the server by too many roads to guard one at
+/// a time: fixtures, `run_script`, `apply_staged`, `execute`. A review found
+/// seven tests whose scripts created objects with no guard. Taking it once,
+/// inside the only function that hands out the URL ([`session`]), leaves no
+/// road unguarded. `tests/engine_urls.rs` pins that [`session`] is the only
+/// reader of the URL here and [`introspect_table`] the only caller of
+/// `introspect()`.
+///
+/// This replaced a bounded retry on 1205. The retry let those kills pass
+/// silently, and would have done the same for a kill from anywhere else
+/// (another binary back in a shared database, say), so a 1205 now fails the
 /// test that met it.
 static CATALOG: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
+/// A test's hold on [`CATALOG`]'s shared half, given up only while
+/// [`introspect_table`] takes the exclusive one.
+struct Turn(Option<tokio::sync::RwLockReadGuard<'static, ()>>);
+
+/// This test's URL, and its turn at the catalog. `None` when the server
+/// variable is unset, which is how every test here skips.
+///
+/// Hold the turn for the whole test (`let Some((url, _turn)) = …`, or
+/// `mut turn` to introspect). Binding it to `_` drops it at once, which is
+/// why the pin in `tests/engine_urls.rs` refuses that pattern.
+async fn session() -> Option<(String, Turn)> {
+    let url = common::mssql_test_url().await?;
+    Some((url, Turn(Some(CATALOG.read().await))))
+}
+
 /// Runs each statement on its own (CREATE VIEW must be alone in its batch, so
-/// fixtures are built statement by statement, like the Postgres suite does),
-/// each under [`CATALOG`]'s shared half. Fixture DDL and drops route through
-/// here.
+/// fixtures are built statement by statement, like the Postgres suite does).
+/// Fixture DDL and drops route through here.
 async fn run_all(pool: &DbPool, statements: &[&str]) {
     for sql in statements {
-        let _ddl = CATALOG.read().await;
         pool.query(sql)
             .await
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }
 
-/// The introspected metadata for one `dbo` table, read under [`CATALOG`]'s
-/// exclusive half so no sibling test's DDL runs beside the catalog joins.
-async fn introspect_table(pool: &DbPool, name: &str) -> TableMeta {
+/// The introspected metadata for one `dbo` table.
+///
+/// This test lets go of its shared turn and takes [`CATALOG`]'s exclusive
+/// half, so nothing else in this binary runs beside the catalog joins. Then
+/// it takes its turn back. It must let go first, or it would wait on itself.
+async fn introspect_table(turn: &mut Turn, pool: &DbPool, name: &str) -> TableMeta {
+    turn.0 = None;
     let tables = {
         let _catalog = CATALOG.write().await;
         pool.introspect().await.unwrap()
     };
+    turn.0 = Some(CATALOG.read().await);
     tables
         .iter()
         .find(|t| t.schema.as_deref() == Some("dbo") && t.name == name)
@@ -92,7 +115,9 @@ fn page_request(table: &str) -> PageRequest {
 
 #[tokio::test]
 async fn sqlserver_connects_and_validates_with_a_round_trip() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     // open_mssql itself validates with a SELECT 1 round-trip.
     let pool = DbPool::open_mssql(&url).await.unwrap();
     assert_eq!(pool.dialect(), Dialect::SqlServer);
@@ -107,7 +132,9 @@ async fn a_connection_the_server_killed_while_idle_is_not_handed_to_the_next_que
     // it sits idle. Measured before the pool checked idle connections: the
     // next query failed with an I/O error ("peer closed connection without
     // sending TLS close_notify"), and only the one after it worked.
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     let admin = DbPool::open_mssql(&url).await.unwrap();
     // open_mssql leaves exactly one idle connection; this query reuses it.
@@ -134,7 +161,9 @@ async fn a_connection_the_server_killed_while_idle_is_not_handed_to_the_next_que
 
 #[tokio::test]
 async fn sqlserver_bad_password_is_an_authentication_error() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let wrong = mssql_url_with_password(&url, "definitely-wrong-password").unwrap();
     let err = DbPool::open_mssql(&wrong)
         .await
@@ -172,7 +201,9 @@ async fn sqlserver_only_a_refused_password_is_a_credential_rejection() {
     // answers all of the database cases with error 4060, whose message ends
     // "The login failed." — the text that once classified them as a wrong
     // password.
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let admin = DbPool::open_mssql(&url).await.unwrap();
     // Server-level logins, so named per process: two binaries against one
     // server would otherwise drop each other's.
@@ -249,7 +280,9 @@ async fn sqlserver_only_a_refused_password_is_a_credential_rejection() {
 
 #[tokio::test]
 async fn sqlserver_introspection_covers_identity_computed_rowversion_and_defaults() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -268,7 +301,7 @@ async fn sqlserver_introspection_covers_identity_computed_rowversion_and_default
     )
     .await;
 
-    let widgets = introspect_table(&pool, "intro_widgets").await;
+    let widgets = introspect_table(&mut turn, &pool, "intro_widgets").await;
     assert_eq!(widgets.kind, TableKind::Table);
     let names: Vec<&str> = widgets.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(
@@ -318,7 +351,9 @@ async fn sqlserver_introspection_covers_identity_computed_rowversion_and_default
 
 #[tokio::test]
 async fn sqlserver_introspection_covers_indexes_fks_and_views() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -357,7 +392,7 @@ async fn sqlserver_introspection_covers_indexes_fks_and_views() {
     .await;
 
     // Composite PK in declaration order.
-    let parents = introspect_table(&pool, "intro_parents").await;
+    let parents = introspect_table(&mut turn, &pool, "intro_parents").await;
     let pk: Vec<&str> = parents
         .primary_key()
         .iter()
@@ -367,7 +402,7 @@ async fn sqlserver_introspection_covers_indexes_fks_and_views() {
 
     // Unique vs filtered-unique indexes: a filtered index maps to `partial`
     // and must never serve as a row identity.
-    let children = introspect_table(&pool, "intro_children").await;
+    let children = introspect_table(&mut turn, &pool, "intro_children").await;
     assert!(children
         .indexes
         .iter()
@@ -403,14 +438,14 @@ async fn sqlserver_introspection_covers_indexes_fks_and_views() {
     );
 
     // Views introspect with their own kind and columns, and are read-only.
-    let view = introspect_table(&pool, "intro_child_codes").await;
+    let view = introspect_table(&mut turn, &pool, "intro_child_codes").await;
     assert_eq!(view.kind, TableKind::View);
     let view_columns: Vec<&str> = view.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(view_columns, ["code"]);
     assert!(detect_row_identity(&view, Dialect::SqlServer).is_none());
 
     // A table whose only unique index is filtered has no safe row identity.
-    let filtered_only = introspect_table(&pool, "intro_filtered_only").await;
+    let filtered_only = introspect_table(&mut turn, &pool, "intro_filtered_only").await;
     assert!(
         detect_row_identity(&filtered_only, Dialect::SqlServer).is_none(),
         "a filtered unique index must not address rows"
@@ -452,7 +487,9 @@ async fn sqlserver_introspection_covers_indexes_fks_and_views() {
 
 #[tokio::test]
 async fn sqlserver_paging_sorting_filtering_and_values_work() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -544,7 +581,9 @@ async fn sqlserver_paging_sorting_filtering_and_values_work() {
 
 #[tokio::test]
 async fn sqlserver_rich_types_render_correctly() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -634,7 +673,9 @@ async fn sqlserver_rich_types_render_correctly() {
 
 #[tokio::test]
 async fn sqlserver_staged_edits_round_trip_and_identity_stays_server_assigned() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -650,7 +691,7 @@ async fn sqlserver_staged_edits_round_trip_and_identity_stays_server_assigned() 
     )
     .await;
 
-    let table = introspect_table(&pool, "staged_items").await;
+    let table = introspect_table(&mut turn, &pool, "staged_items").await;
     // The identity column is read-only in the editor…
     let id = table.columns.iter().find(|c| c.name == "id").unwrap();
     assert_eq!(id.generated, Generated::Always);
@@ -724,7 +765,9 @@ async fn sqlserver_staged_edits_round_trip_and_identity_stays_server_assigned() 
 
 #[tokio::test]
 async fn sqlserver_staged_row_count_mismatch_rolls_the_batch_back() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -739,7 +782,7 @@ async fn sqlserver_staged_row_count_mismatch_rolls_the_batch_back() {
     )
     .await;
 
-    let table = introspect_table(&pool, "staged_guard").await;
+    let table = introspect_table(&mut turn, &pool, "staged_guard").await;
     let identity = detect_row_identity(&table, Dialect::SqlServer).unwrap();
 
     // A valid edit followed by one addressing a vanished row: the mismatch
@@ -790,7 +833,6 @@ async fn sqlserver_staged_row_count_mismatch_rolls_the_batch_back() {
 /// how [`run_all`] sends its statements, `CREATE TRIGGER` fails with error
 /// 156; [`DbPool::execute`] sends it as a plain batch instead.
 async fn create_trigger(pool: &DbPool, sql: &str) {
-    let _ddl = CATALOG.read().await;
     pool.execute(sql)
         .await
         .unwrap_or_else(|e| panic!("{sql}: {e}"));
@@ -815,7 +857,9 @@ async fn sqlserver_guarded_writes_count_the_statement_not_its_triggers() {
     // every edit to it was refused. These triggers deliberately leave
     // NOCOUNT off, write more rows than the statement does, and fire a nested
     // trigger of their own: none of that may count against the guard.
-    let Some(url) = test_url().await else { return };
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -847,7 +891,7 @@ async fn sqlserver_guarded_writes_count_the_statement_not_its_triggers() {
     )
     .await;
 
-    let table = introspect_table(&pool, "trig_items").await;
+    let table = introspect_table(&mut turn, &pool, "trig_items").await;
     let identity = detect_row_identity(&table, Dialect::SqlServer).unwrap();
     let changes = vec![
         retitle(1, "renamed"),
@@ -943,7 +987,9 @@ async fn sqlserver_a_trigger_row_cannot_vouch_for_an_edit_that_matched_nothing()
     // audit row whether or not the statement matched anything, so an update
     // addressing a vanished row read as one affected row — exactly what the
     // guard expected — and was reported saved having changed nothing.
-    let Some(url) = test_url().await else { return };
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -963,7 +1009,7 @@ async fn sqlserver_a_trigger_row_cannot_vouch_for_an_edit_that_matched_nothing()
     )
     .await;
 
-    let table = introspect_table(&pool, "trig_vouch").await;
+    let table = introspect_table(&mut turn, &pool, "trig_vouch").await;
     let identity = detect_row_identity(&table, Dialect::SqlServer).unwrap();
     let err = apply_staged(
         &pool,
@@ -1005,7 +1051,9 @@ async fn sqlserver_a_script_cannot_turn_row_counts_off_for_later_writes() {
     // part of the module's body. (A run's connection is now discarded when
     // the run ends, so the pool probe below no longer lands on it; a SET
     // within the run is pinned by `sqlserver_script_temp_tables_last_the_run`.)
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -1105,7 +1153,9 @@ async fn sqlserver_an_instead_of_trigger_refuses_editing_before_anything_is_writ
     // reports for it is the rows the trigger *fired for*, whatever the trigger
     // wrote. One that writes nothing still reads as one row updated, so the
     // guard cannot check an edit to such a table and editing is refused.
-    let Some(url) = test_url().await else { return };
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -1124,7 +1174,7 @@ async fn sqlserver_an_instead_of_trigger_refuses_editing_before_anything_is_writ
     )
     .await;
 
-    let table = introspect_table(&pool, "trig_instead").await;
+    let table = introspect_table(&mut turn, &pool, "trig_instead").await;
     assert_eq!(table.restriction, Some(INSTEAD_OF_TRIGGER));
     let identity = detect_row_identity(&table, Dialect::SqlServer).unwrap();
     let access = pool.backend_access(&table);
@@ -1184,7 +1234,9 @@ async fn sqlserver_only_an_enabled_instead_of_trigger_on_a_table_restricts_it() 
     // beside the statement rather than in place of it, and a disabled
     // INSTEAD OF trigger does not fire (measured: four rows inserted, four
     // landed), so neither restricts. A view keeps the reason it already had.
-    let Some(url) = test_url().await else { return };
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     let names = [
         "io_insert",
@@ -1238,7 +1290,7 @@ async fn sqlserver_only_an_enabled_instead_of_trigger_on_a_table_restricts_it() 
         ("io_disabled", None),
         ("io_view", Some(Restriction::View)),
     ] {
-        let table = introspect_table(&pool, name).await;
+        let table = introspect_table(&mut turn, &pool, name).await;
         assert_eq!(pool.backend_access(&table).restriction, expected, "{name}");
     }
 
@@ -1251,7 +1303,9 @@ async fn sqlserver_only_an_enabled_instead_of_trigger_on_a_table_restricts_it() 
 
 #[tokio::test]
 async fn sqlserver_script_go_batches_split_and_execute() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(&pool, &["DROP TABLE IF EXISTS dbo.script_go_probe"]).await;
 
@@ -1300,7 +1354,9 @@ async fn sqlserver_script_go_batches_split_and_execute() {
 
 #[tokio::test]
 async fn sqlserver_script_errors_roll_the_whole_script_back() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(&pool, &["DROP TABLE IF EXISTS dbo.script_rb_probe"]).await;
 
@@ -1345,7 +1401,9 @@ async fn sqlserver_script_errors_roll_the_whole_script_back() {
 /// runs on the pool, several run in the script transaction.
 #[tokio::test]
 async fn sqlserver_script_creates_modules_that_must_lead_a_batch() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -1434,7 +1492,9 @@ async fn sqlserver_script_creates_modules_that_must_lead_a_batch() {
 /// block outside a module keeps its statements together too.
 #[tokio::test]
 async fn sqlserver_script_creates_a_procedure_with_a_multi_statement_body() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -1496,7 +1556,9 @@ async fn sqlserver_script_creates_a_procedure_with_a_multi_statement_body() {
 
 #[tokio::test]
 async fn sqlserver_query_capped_stops_and_bounds_cells() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
 
     // Row cap: 25 rows exist, ask for 10.
@@ -1547,7 +1609,9 @@ async fn sqlserver_query_capped_stops_and_bounds_cells() {
 /// here keeps the contract from drifting back apart.
 #[tokio::test]
 async fn sqlserver_empty_results_keep_their_column_headers() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -1579,7 +1643,9 @@ async fn sqlserver_every_read_path_keeps_only_the_first_result_set() {
     // The buffered, capped and export paths share one result loop, which
     // reads the first result set and stops at the second — one statement,
     // one result, as on the sqlx backends.
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     let sql = "SELECT 1 AS a UNION ALL SELECT 2; SELECT 3 AS b";
     let first = vec![vec![Value::Integer(1)], vec![Value::Integer(2)]];
@@ -1612,7 +1678,9 @@ async fn sqlserver_every_read_path_keeps_only_the_first_result_set() {
 
 #[tokio::test]
 async fn sqlserver_export_streams_csv_and_json() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -1692,7 +1760,9 @@ async fn sqlserver_export_streams_csv_and_json() {
 
 #[tokio::test]
 async fn sqlserver_bounded_page_previews_large_text_and_binary() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -1713,7 +1783,7 @@ async fn sqlserver_bounded_page_previews_large_text_and_binary() {
     )
     .await;
 
-    let docs = introspect_table(&pool, "bounded_docs").await;
+    let docs = introspect_table(&mut turn, &pool, "bounded_docs").await;
     let request = PageRequest {
         sort: Some(("id".into(), SortDir::Asc)),
         ..page_request("bounded_docs")
@@ -1791,7 +1861,9 @@ async fn sqlserver_trailing_spaces_still_count_toward_the_preview_length() {
     // to come back as a silent 2048-character prefix carrying no
     // `PreviewInfo` — which the grid then copies to the clipboard, and worse,
     // saves back over the real data on an inline edit.
-    let Some(url) = test_url().await else { return };
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     let body = PREVIEW_BYTES - 48;
     let padding = 1000;
@@ -1810,7 +1882,7 @@ async fn sqlserver_trailing_spaces_still_count_toward_the_preview_length() {
     )
     .await;
 
-    let padded = introspect_table(&pool, "padded_text").await;
+    let padded = introspect_table(&mut turn, &pool, "padded_text").await;
     let page = pool
         .fetch_page_bounded(
             Reading::UNMARKED,
@@ -1851,7 +1923,9 @@ async fn sqlserver_trailing_spaces_still_count_toward_the_preview_length() {
 
 #[tokio::test]
 async fn sqlserver_sql_variant_cells_browse_and_fetch_safely() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -1870,7 +1944,7 @@ async fn sqlserver_sql_variant_cells_browse_and_fetch_safely() {
     )
     .await;
 
-    let probe = introspect_table(&pool, "variant_probe").await;
+    let probe = introspect_table(&mut turn, &pool, "variant_probe").await;
     let v = probe.columns.iter().find(|c| c.name == "v").unwrap();
     assert_eq!(v.type_name, "sql_variant");
 
@@ -1907,7 +1981,9 @@ async fn sqlserver_sql_variant_cells_browse_and_fetch_safely() {
 
 #[tokio::test]
 async fn sqlserver_table_stats_come_from_the_partition_counters() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -1925,7 +2001,7 @@ async fn sqlserver_table_stats_come_from_the_partition_counters() {
     // sys.dm_db_partition_stats is maintained as rows are written, so unlike
     // Postgres there is nothing to ANALYZE first — but the number is still
     // documented as approximate, so it must still arrive labelled.
-    let meta = introspect_table(&pool, "stats_rows").await;
+    let meta = introspect_table(&mut turn, &pool, "stats_rows").await;
     // Summed over index_id 0/1 only: `ix_stats_rows_name` holds the same three
     // rows at index_id 2, so an unfiltered SUM would report six and this
     // assertion is what pins the filter.
@@ -1958,7 +2034,7 @@ async fn sqlserver_table_stats_come_from_the_partition_counters() {
     )
     .await;
     let view = pool
-        .fetch_table_stats(&introspect_table(&pool, "stats_view").await)
+        .fetch_table_stats(&introspect_table(&mut turn, &pool, "stats_view").await)
         .await
         .unwrap();
     assert!(
@@ -1968,7 +2044,7 @@ async fn sqlserver_table_stats_come_from_the_partition_counters() {
     assert_eq!(
         pool.count_table_rows(
             Reading::UNMARKED,
-            &introspect_table(&pool, "stats_view").await
+            &introspect_table(&mut turn, &pool, "stats_view").await
         )
         .await
         .unwrap(),
@@ -1987,7 +2063,7 @@ async fn sqlserver_table_stats_come_from_the_partition_counters() {
     )
     .await;
     let indexed = pool
-        .fetch_table_stats(&introspect_table(&pool, "stats_idx_view").await)
+        .fetch_table_stats(&introspect_table(&mut turn, &pool, "stats_idx_view").await)
         .await
         .unwrap();
     assert_eq!(
@@ -2011,7 +2087,9 @@ async fn sqlserver_table_stats_come_from_the_partition_counters() {
 
 #[tokio::test]
 async fn sqlserver_an_empty_table_reports_zero_rows_not_nothing() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -2027,7 +2105,7 @@ async fn sqlserver_an_empty_table_reports_zero_rows_not_nothing() {
     // table must describe itself the same way on both backends. Here there is
     // no ANALYZE to wait for — the partition counter is maintained — so an
     // empty table reads 0 from the moment it is created.
-    let meta = introspect_table(&pool, "stats_empty").await;
+    let meta = introspect_table(&mut turn, &pool, "stats_empty").await;
     let stats = pool.fetch_table_stats(&meta).await.unwrap();
     assert_eq!(
         stats.rows,
@@ -2048,7 +2126,9 @@ async fn sqlserver_an_empty_table_reports_zero_rows_not_nothing() {
 
 #[tokio::test]
 async fn sqlserver_offers_no_plan_view_rather_than_a_dangerous_one() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
 
     // T-SQL has no `EXPLAIN` statement. Its estimated plan comes
@@ -2216,12 +2296,14 @@ async fn sqlserver_every_key_type_reads_and_writes_the_same_row() {
     // through the staged writer. Both start from the same locator, so both
     // must find the same row for every key type the grid can hold — a float
     // key that saved but expanded to NULL was the bug this pins.
-    let Some(url) = test_url().await else { return };
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     let slugs = create_key_type_fixtures(&pool, "addr").await;
     let mut failures = Vec::new();
     for slug in &slugs {
-        let table = introspect_table(&pool, &format!("addr_{slug}")).await;
+        let table = introspect_table(&mut turn, &pool, &format!("addr_{slug}")).await;
         failures.extend(common::row_addressing_failures(&pool, &table).await);
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -2238,7 +2320,9 @@ async fn sqlserver_variant_keys_are_refused_rather_than_missed() {
     // variant compares unequal to a value of another type family, which is
     // the engine fact pinned first. So the key is refused: the table reads as
     // key-less, and a foreign key into it offers no jump.
-    let Some(url) = test_url().await else { return };
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -2282,8 +2366,8 @@ async fn sqlserver_variant_keys_are_refused_rather_than_missed() {
         "nor a date one"
     );
 
-    let keys = introspect_table(&pool, "variant_keys").await;
-    let refs = introspect_table(&pool, "variant_refs").await;
+    let keys = introspect_table(&mut turn, &pool, "variant_keys").await;
+    let refs = introspect_table(&mut turn, &pool, "variant_refs").await;
     // The primary key is passed over; the NOT NULL unique `alt` still
     // addresses the rows, which proves the refusal is per column rather than
     // per table.
@@ -2304,7 +2388,7 @@ async fn sqlserver_variant_keys_are_refused_rather_than_missed() {
         ],
     )
     .await;
-    let keys = introspect_table(&pool, "variant_keys").await;
+    let keys = introspect_table(&mut turn, &pool, "variant_keys").await;
     assert_eq!(detect_row_identity(&keys, Dialect::SqlServer), None);
     assert!(
         hubro::db::fk_target_columns(&refs.foreign_keys[0], &keys, Dialect::SqlServer).is_none(),
@@ -2325,7 +2409,9 @@ async fn sqlserver_an_alias_of_sql_variant_is_refused_as_a_key_too() {
     // `sql_variant` by name alone let `CREATE TYPE … FROM sql_variant` back
     // in: such a key missed its rows exactly as a plain variant did. The
     // system type behind the alias is introspected, and decides.
-    let Some(url) = test_url().await else { return };
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -2343,8 +2429,8 @@ async fn sqlserver_an_alias_of_sql_variant_is_refused_as_a_key_too() {
         ],
     )
     .await;
-    let keys = introspect_table(&pool, "alias_variant_keys").await;
-    let refs = introspect_table(&pool, "alias_variant_refs").await;
+    let keys = introspect_table(&mut turn, &pool, "alias_variant_keys").await;
+    let refs = introspect_table(&mut turn, &pool, "alias_variant_refs").await;
     let k = &keys.columns[0];
     assert_eq!(k.type_name, "hubro_variant_alias");
     assert_eq!(
@@ -2390,7 +2476,7 @@ async fn sqlserver_an_alias_of_sql_variant_is_refused_as_a_key_too() {
         ],
     )
     .await;
-    let ints = introspect_table(&pool, "alias_int_keys").await;
+    let ints = introspect_table(&mut turn, &pool, "alias_int_keys").await;
     assert_eq!(
         ints.columns[0].type_detail,
         TypeDetail::Alias { base: "int".into() }
@@ -2416,13 +2502,15 @@ async fn sqlserver_every_key_type_jumps_to_the_row_it_references() {
     // typed values. Compared as `nvarchar` text, a float (six significant
     // digits), a binary key (bound as the marker `<blob N>`) and every
     // date/time type and `money` jumped to an empty page.
-    let Some(url) = test_url().await else { return };
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     let slugs = create_key_type_fixtures(&pool, "jump").await;
     let mut failures = Vec::new();
     for slug in &slugs {
-        let parent = introspect_table(&pool, &format!("jump_{slug}")).await;
-        let child = introspect_table(&pool, &format!("jumpfk_{slug}")).await;
+        let parent = introspect_table(&mut turn, &pool, &format!("jump_{slug}")).await;
+        let child = introspect_table(&mut turn, &pool, &format!("jumpfk_{slug}")).await;
         failures.extend(common::fk_jump_failures(&pool, &child, &parent).await);
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -2440,7 +2528,9 @@ async fn sqlserver_key_types_re_address_under_a_british_login() {
     // row could not be re-addressed and a jump into it landed nowhere. The
     // fixtures are written by the usual login; the keys are read back and
     // used by a login whose default language is British.
-    let Some(url) = test_url().await else { return };
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     let slugs = create_key_type_fixtures(&pool, "brit").await;
     run_all(
@@ -2469,8 +2559,8 @@ async fn sqlserver_key_types_re_address_under_a_british_login() {
 
     let mut failures = Vec::new();
     for slug in &slugs {
-        let parent = introspect_table(&british, &format!("brit_{slug}")).await;
-        let child = introspect_table(&british, &format!("britfk_{slug}")).await;
+        let parent = introspect_table(&mut turn, &british, &format!("brit_{slug}")).await;
+        let child = introspect_table(&mut turn, &british, &format!("britfk_{slug}")).await;
         failures.extend(common::row_addressing_failures(&british, &parent).await);
         failures.extend(common::fk_jump_failures(&british, &child, &parent).await);
     }
@@ -2484,7 +2574,9 @@ async fn sqlserver_key_types_re_address_under_a_british_login() {
 async fn sqlserver_contains_filter_is_a_substring_search_whatever_the_needle_holds() {
     // T-SQL's `LIKE` reads `[…]` as a character class: unescaped, `[a]`
     // matched every value holding an `a`, and a lone `[` matched nothing.
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     let insert = format!(
         "INSERT INTO dbo.like_hostile VALUES {}",
@@ -2531,7 +2623,9 @@ async fn mssql_open_transactions(pool: &DbPool) -> Vec<Value> {
 
 #[tokio::test]
 async fn sqlserver_script_keeps_its_own_transaction_on_one_session() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -2584,7 +2678,9 @@ async fn sqlserver_script_keeps_its_own_transaction_on_one_session() {
 
 #[tokio::test]
 async fn sqlserver_script_left_inside_its_transaction_is_rolled_back_and_says_so() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -2653,7 +2749,9 @@ async fn sqlserver_script_left_inside_its_transaction_is_rolled_back_and_says_so
 
 #[tokio::test]
 async fn sqlserver_script_failing_inside_its_transaction_rolls_it_back() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -2695,7 +2793,9 @@ async fn sqlserver_cancelled_script_does_not_return_its_transaction_to_the_pool(
     // A run cancelled mid-statement never reaches its end, so its connection
     // must be discarded: returned, it went back at `@@TRANCOUNT = 1`, where
     // a later edit reported success and was lost with the connection.
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -2790,7 +2890,9 @@ async fn sqlserver_script_ending_in_a_capped_read_does_not_wait_for_the_rest() {
     // the row cap cut short, tiberius first drained the rest of the result —
     // measured, 1.55 s for 3M rows on localhost, where discarding the
     // connection took 100 ms. A one-statement SELECT is the commonest run.
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -2878,7 +2980,9 @@ async fn sqlserver_a_batch_led_by_select_that_ends_or_opens_a_transaction_is_rep
     // before such a batch: a COMMIT in it was reported as a rollback of rows
     // it had committed, and a BEGIN TRAN in it was reported clean while the
     // close discarded its INSERT.
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -2954,7 +3058,9 @@ fn capped_output_write(table: &str) -> String {
 async fn sqlserver_capped_row_returning_write_keeps_its_write() {
     // Discarding the connection after the row cap — what every capped read
     // on SQL Server did — aborted the write with the session.
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -3008,7 +3114,9 @@ async fn sqlserver_capped_row_returning_write_keeps_its_write() {
 /// value when written back.
 #[tokio::test]
 async fn sqlserver_a_real_reads_as_its_shortest_decimal_and_writes_back_unchanged() {
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     let failures = common::real_round_trip_failures(&pool, "real_trip").await;
     assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -3021,7 +3129,9 @@ async fn sqlserver_atomic_script_that_ends_hubros_transaction_is_not_reported_ro
     // script managing its own transaction and the script is wrapped in
     // hubro's. Measured before the fix: every case below was reported
     // `Rollback::Full` — "no changes were applied" — with rows in the table.
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -3136,7 +3246,9 @@ async fn sqlserver_edits_a_committing_trigger_kept_are_not_reported_unapplied() 
     // An AFTER trigger that commits ends hubro's transaction: measured, the
     // statement fails with 3609 and every change before it stands. Naming
     // the failing change is what makes the UI say "nothing was applied".
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -3228,7 +3340,9 @@ async fn sqlserver_a_script_count_says_when_it_may_hold_trigger_rows_or_is_missi
     // What each statement's result line is built from. A trigger's count
     // arrives as the same token as its statement's, so a sum of several is
     // reported as one; a statement that sent no count reports none, not 0.
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
@@ -3335,7 +3449,9 @@ async fn sqlserver_script_temp_tables_last_the_run() {
     // the call returned, and the next statement could not see it. Measured
     // before the fix: every script in the first group failed on its second
     // statement with "Invalid object name" (208).
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     let rows = |n: i64| format!("rows {:?}", vec![vec![Value::Integer(n)]]);
     let affected = |n: u64| format!("affected {n}");
@@ -3420,7 +3536,9 @@ async fn sqlserver_a_temp_table_batch_that_loses_the_transaction_stops_the_scrip
     // `sp_executesql`, 266 had stopped it at once with nothing kept.
     // A failed earlier run's trigger is dropped first, and the database is
     // this process's own, so a leftover reaches no other suite.
-    let Some(url) = test_url().await else { return };
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
     let pool = DbPool::open_mssql(&url).await.unwrap();
     run_all(
         &pool,
