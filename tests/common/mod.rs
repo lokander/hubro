@@ -8,6 +8,8 @@
 // only a subset of it, so unused-item lints would fire spuriously.
 #![allow(dead_code)]
 
+pub mod pg_family;
+
 use hubro::db::Reading;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};

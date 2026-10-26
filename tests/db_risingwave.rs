@@ -121,11 +121,15 @@
 
 mod common;
 
+use common::pg_family::{
+    assert_pages_sorts_and_filters, assert_schema_is_internal, find, integer, Expected,
+};
+
 use hubro::db::Reading;
 use hubro::db::{
     apply_staged, detect_row_identity, run_script, split_statements, Capabilities, DbPool, Filter,
-    Internal, PageRequest, PgFlavor, Restriction, Rollback, RowIdentity, RowLocator, SortDir,
-    StagedChange, TableKind, TableMeta, Value, NO_GUARDED_WRITE,
+    PageRequest, PgFlavor, Restriction, Rollback, RowIdentity, RowLocator, SortDir, StagedChange,
+    TableKind, Value, NO_GUARDED_WRITE,
 };
 
 fn test_url() -> Option<String> {
@@ -164,20 +168,6 @@ async fn fresh_fixture(pool: &DbPool, suffix: &str) -> (String, String) {
         pool.query_unbounded(&sql).await.unwrap();
     }
     (readings, matview)
-}
-
-fn find<'a>(tables: &'a [TableMeta], name: &str) -> &'a TableMeta {
-    tables
-        .iter()
-        .find(|t| t.name == name && t.schema.as_deref() == Some("public"))
-        .unwrap_or_else(|| panic!("{name} missing from introspection"))
-}
-
-fn integer(value: &Value) -> i64 {
-    match value {
-        Value::Integer(n) => *n,
-        other => panic!("expected an integer cell, got {other:?}"),
-    }
 }
 
 #[tokio::test]
@@ -451,13 +441,10 @@ async fn risingwave_pages_sorts_and_filters_over_a_materialized_view() {
         filter: Some(Filter::equals("sensor_id", "1")),
         extra_key_column: None,
     };
-    assert_eq!(
-        pool.count_rows(Reading::UNMARKED, &request).await.unwrap(),
-        3
-    );
-    let page = pool.fetch_page(Reading::UNMARKED, &request).await.unwrap();
+    let (page, next) = assert_pages_sorts_and_filters(&pool, &request, Expected::Exactly(3)).await;
     let ids: Vec<i64> = page.rows.iter().map(|row| integer(&row[0])).collect();
     assert_eq!(ids, [3, 2]);
+    assert_eq!(integer(&next.rows[0][0]), 1);
 
     // Then the materialized view, which is what the issue asked for and what
     // most objects on a streaming engine are.
@@ -493,26 +480,7 @@ async fn risingwave_own_catalog_is_marked_as_the_engines_own() {
     // under test. The previous version of this test asserted that *nothing*
     // was internal and passed for the wrong reason — it could not fail in
     // either state, and hid 74 unmarked objects.
-    let engine: Vec<&TableMeta> = tables
-        .iter()
-        .filter(|t| t.schema.as_deref() == Some("rw_catalog"))
-        .collect();
-    assert!(
-        engine.len() > 50,
-        "expected RisingWave's catalog to be populated, got {}",
-        engine.len()
-    );
-    for table in &engine {
-        assert_eq!(table.internal, Some(Internal::System), "{table:?}");
-    }
-
-    // ...and the user's own schema is untouched by the rule.
-    for table in tables
-        .iter()
-        .filter(|t| t.schema.as_deref() == Some("public"))
-    {
-        assert_eq!(table.internal, None, "{table:?}");
-    }
+    assert_schema_is_internal(&tables, |schema| schema == "rw_catalog", 50);
 
     pool.close().await;
 }
