@@ -2237,36 +2237,157 @@ mod tests {
     use super::*;
     use crate::db::Dialect;
 
+    /// The code of a Rust file outside its test modules, comments removed:
+    /// what `no_ui_code_builds_its_own_reading` reads. A `#[cfg(test)]` on a
+    /// `mod x { … }` drops exactly that block, brace-matched, and on a
+    /// `mod x;` declaration only that line; scanning goes on after both, so
+    /// code following a test module — or the `mod test_dom;` declaration in
+    /// `ui/mod.rs` — is still read. Braces inside string and character
+    /// literals are not counted.
+    fn code_outside_test_modules(text: &str) -> String {
+        // Comment-free code, line for line, with the braces inside string
+        // and character literals blanked so they are not counted. One pass
+        // over the whole text, because a string literal can span lines.
+        let chars: Vec<char> = text.chars().collect();
+        let mut code = String::new();
+        let mut i = 0;
+        while i < chars.len() {
+            let next = chars.get(i + 1).copied();
+            match chars[i] {
+                '/' if next == Some('/') => {
+                    while i < chars.len() && chars[i] != '\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                '/' if next == Some('*') => {
+                    i += 2;
+                    while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                        if chars[i] == '\n' {
+                            code.push('\n');
+                        }
+                        i += 1;
+                    }
+                    i += 2;
+                    continue;
+                }
+                '"' => {
+                    // Raw strings (`r#"…"#`) hold no `"` in this tree's UI
+                    // code that would end one early; ordinary escapes are
+                    // skipped.
+                    code.push('"');
+                    i += 1;
+                    while i < chars.len() && chars[i] != '"' {
+                        if chars[i] == '\\' {
+                            i += 1;
+                        }
+                        match chars.get(i) {
+                            Some('\n') => code.push('\n'),
+                            Some('{' | '}') => code.push('_'),
+                            Some(&c) => code.push(c),
+                            None => {}
+                        }
+                        i += 1;
+                    }
+                    code.push('"');
+                }
+                '\'' if chars.get(i + 2) == Some(&'\'') => {
+                    // A one-character literal such as '{'.
+                    code.push_str("'_'");
+                    i += 2;
+                }
+                c => code.push(c),
+            }
+            i += 1;
+        }
+        let lines: Vec<&str> = code.lines().collect();
+        let mut kept = String::new();
+        let mut i = 0;
+        while i < lines.len() {
+            if lines[i].trim() == "#[cfg(test)]" {
+                // Past any further attributes, to the item they are on.
+                let mut item = i + 1;
+                while item < lines.len()
+                    && (lines[item].trim().is_empty() || lines[item].trim().starts_with("#["))
+                {
+                    item += 1;
+                }
+                let head = lines.get(item).map(|l| l.trim()).unwrap_or("");
+                let is_mod =
+                    head.starts_with("mod ") || (head.starts_with("pub") && head.contains(" mod "));
+                if is_mod && head.ends_with(';') {
+                    i = item + 1;
+                    continue;
+                }
+                if is_mod {
+                    let mut depth = 0i32;
+                    let mut opened = false;
+                    let mut at = item;
+                    while at < lines.len() {
+                        for c in lines[at].chars() {
+                            match c {
+                                '{' => {
+                                    depth += 1;
+                                    opened = true;
+                                }
+                                '}' => depth -= 1,
+                                _ => {}
+                            }
+                        }
+                        at += 1;
+                        if opened && depth <= 0 {
+                            break;
+                        }
+                    }
+                    i = at;
+                    continue;
+                }
+            }
+            kept.push_str(lines[i]);
+            kept.push('\n');
+            i += 1;
+        }
+        kept
+    }
+
+    /// Whether `code` names the identifier `Reading` anywhere — a path, an
+    /// import, an alias (`use … Reading as R` names it too).
+    fn names_reading(code: &str) -> bool {
+        let ident = |c: char| c.is_alphanumeric() || c == '_';
+        code.match_indices("Reading").any(|(at, word)| {
+            let before = code[..at].chars().next_back();
+            let after = code[at + word.len()..].chars().next();
+            !before.is_some_and(ident) && !after.is_some_and(ident)
+        })
+    }
+
+    #[test]
+    fn the_reading_scan_reads_past_test_modules_and_nothing_else() {
+        let after_declaration =
+            "#[cfg(test)]\nmod test_dom;\n\nfn app() { let r = Reading::UNMARKED; }\n";
+        assert!(names_reading(&code_outside_test_modules(after_declaration)));
+        let after_module = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() { let s = \"}\"; let c = '{'; Reading::UNMARKED; }\n}\n\nfn later() { let x = crate::db::Reading::of(caps); }\n";
+        assert!(names_reading(&code_outside_test_modules(after_module)));
+        let inside_only = "fn a() {}\n#[cfg(test)]\n#[allow(unused)]\nmod tests {\n    use crate::db::Reading;\n    fn t() { if x { Reading::UNMARKED; } }\n}\nfn b() {}\n";
+        assert!(!names_reading(&code_outside_test_modules(inside_only)));
+        let commented = "// Reading::UNMARKED\nfn a() {} /* Reading */ /// Reading\n";
+        assert!(!names_reading(&code_outside_test_modules(commented)));
+        assert!(names_reading("use crate::db::{Reading as R};"));
+        assert!(!names_reading("let reading = c.browse(); ReadingsTable"));
+    }
+
     /// Every `Reading` the UI hands a browse comes from `Connection::browse`,
     /// which takes it from the connection's marking: no non-test code under
-    /// `src/ui` names `Reading::` (its other constructors, for code that has
-    /// no connection), and the grid's page and count both ask `browse`.
-    /// Comments are stripped first, so a doc mentioning either proves
-    /// nothing, and all whitespace is removed before matching, so a rustfmt
-    /// rewrap is not a failure.
+    /// `src/ui` names the type at all (its other constructors are for code
+    /// that has no connection; an import or alias of it would be the way
+    /// round this check), and the grid's page and count both ask `browse`.
+    /// Read through [`code_outside_test_modules`], with all whitespace
+    /// removed before matching the grid's calls, so a rustfmt rewrap is not
+    /// a failure.
     #[test]
     fn no_ui_code_builds_its_own_reading() {
-        fn code_of(text: &str) -> String {
-            let mut code = String::new();
-            let mut lines = text.lines().peekable();
-            while let Some(line) = lines.next() {
-                let opens_test_module = line.trim() == "#[cfg(test)]"
-                    && lines
-                        .peek()
-                        .is_some_and(|next| next.trim_start().starts_with("mod "));
-                if opens_test_module {
-                    // The rest is a test module, which may build any reading.
-                    break;
-                }
-                let line = match line.find("//") {
-                    Some(at) => &line[..at],
-                    None => line,
-                };
-                code.push_str(line);
-                code.push(' ');
-            }
-            code.split_whitespace().collect()
-        }
+        let code_of =
+            |text: &str| -> String { code_outside_test_modules(text).split_whitespace().collect() };
         fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
@@ -2285,10 +2406,25 @@ mod tests {
             "found only {} files under src/ui",
             files.len()
         );
-        for file in &files {
-            let code = code_of(&std::fs::read_to_string(file).unwrap());
+        // The scan reads the code that follows a test module, not only what
+        // precedes it: the two places that once ended it early.
+        for (file, after) in [
+            ("../mod.rs", "fn App("),
+            ("../connections.rs", "fn auth_from_form("),
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/ui/state")
+                .join(file);
+            let code = code_outside_test_modules(&std::fs::read_to_string(path).unwrap());
             assert!(
-                !code.contains("Reading::"),
+                code.contains(after),
+                "{file}: the scan stopped before {after}"
+            );
+        }
+        for file in &files {
+            let code = code_outside_test_modules(&std::fs::read_to_string(file).unwrap());
+            assert!(
+                !names_reading(&code),
                 "{}: builds a Reading of its own instead of asking Connection::browse",
                 file.display()
             );
