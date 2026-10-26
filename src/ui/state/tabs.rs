@@ -213,6 +213,21 @@ impl<K: Eq + std::hash::Hash + Clone, S, T> Slot<K, S, T> {
     }
 }
 
+/// [`Slot::finish`] on a slot held in a signal, writing only when the run
+/// still owns its key. A stale run's finish touches nothing, so it wakes none
+/// of the slot's readers — as before the slots were one type, when the
+/// generation was read before anything was written.
+pub(super) fn finish_in<K, S>(mut slot: Signal<Slot<K, S>>, key: &K, generation: u64) -> bool
+where
+    K: Eq + std::hash::Hash + Clone + 'static,
+    S: 'static,
+{
+    if !slot.peek().is_current(key, generation) {
+        return false;
+    }
+    slot.write().finish(key, generation)
+}
+
 impl AppState {
     /// Connection `id`'s [`TabState`], read through `f` — `None` when the tab
     /// is not open. Subscribes the caller to every tab's state; see
@@ -334,7 +349,22 @@ mod tests {
     /// The `AppState` fields whose type names a connection id, with their
     /// types: one entry per field, continuation lines of a wrapped type
     /// joined on.
+    ///
+    /// A field starts on a line indented exactly one level; a deeper line, or
+    /// one closing a wrapped type's brackets, continues the field above. A
+    /// line that starts a field but does not read as `name: type` fails the
+    /// scan rather than being folded into its neighbour, where a per-connection
+    /// type would hide inside an innocent one's.
     fn per_connection_fields() -> Vec<(String, String)> {
+        all_fields()
+            .into_iter()
+            .filter(|(_, ty)| ty.contains("ConnectionId") || ty.contains("ConnectionRegistry"))
+            .collect()
+    }
+
+    /// Every `AppState` field and its type, as [`per_connection_fields`]
+    /// reads them.
+    fn all_fields() -> Vec<(String, String)> {
         let source = mod_rs_code();
         let body: Vec<&str> = source
             .lines()
@@ -344,28 +374,24 @@ mod tests {
             .collect();
         let mut fields: Vec<(String, String)> = Vec::new();
         for line in body {
+            if line.trim().is_empty() || line.trim_start().starts_with("#[") {
+                continue;
+            }
             let Some(rest) = line.strip_prefix("    ") else {
-                continue;
+                panic!("a line of AppState outside its body's indentation: `{line}`");
             };
-            if rest.trim().is_empty() {
+            let continues =
+                rest.starts_with(char::is_whitespace) || rest.starts_with(['>', ')', ']', '}']);
+            if continues {
+                let last = fields
+                    .last_mut()
+                    .unwrap_or_else(|| panic!("`{line}` continues no field"));
+                last.1.push_str(rest.trim());
                 continue;
             }
-            let starts_field = !rest.starts_with(' ');
-            let rest = rest.strip_prefix("pub ").unwrap_or(rest);
-            match rest.split_once(':') {
-                Some((name, ty))
-                    if starts_field
-                        && !name.is_empty()
-                        && name.chars().all(|c| c.is_ascii_lowercase() || c == '_') =>
-                {
-                    fields.push((name.to_string(), ty.trim().to_string()));
-                }
-                _ => {
-                    if let Some(last) = fields.last_mut() {
-                        last.1.push_str(rest.trim());
-                    }
-                }
-            }
+            fields.push(parse_field(rest).unwrap_or_else(|| {
+                panic!("`{line}` starts an AppState field but does not read as `name: type`")
+            }));
         }
         assert!(
             fields.len() > 30,
@@ -373,9 +399,45 @@ mod tests {
             fields.len()
         );
         fields
-            .into_iter()
-            .filter(|(_, ty)| ty.contains("ConnectionId") || ty.contains("ConnectionRegistry"))
-            .collect()
+    }
+
+    /// `rest` as `[visibility] name: type`, the name any Rust identifier.
+    fn parse_field(rest: &str) -> Option<(String, String)> {
+        let rest = match rest.strip_prefix("pub") {
+            Some(after) if after.starts_with('(') => after[after.find(')')? + 1..].trim_start(),
+            Some(after) if after.starts_with(' ') => after.trim_start(),
+            _ => rest,
+        };
+        let (name, ty) = rest.split_once(':')?;
+        let mut chars = name.chars();
+        let first = chars.next()?;
+        let identifier = (first.is_alphabetic() || first == '_')
+            && chars.all(|c| c.is_alphanumeric() || c == '_');
+        (identifier && !ty.trim().is_empty()).then(|| (name.to_string(), ty.trim().to_string()))
+    }
+
+    #[test]
+    fn the_field_scan_reads_every_field_shape_and_refuses_what_it_cannot() {
+        assert_eq!(
+            parse_field("pub cache2: Signal<HashMap<ConnectionId, u8>>,"),
+            Some(("cache2".into(), "Signal<HashMap<ConnectionId, u8>>,".into()))
+        );
+        assert_eq!(
+            parse_field("pub(crate) tabs_2: Signal<u8>,").map(|f| f.0),
+            Some("tabs_2".into())
+        );
+        assert_eq!(
+            parse_field("pub(in crate::ui) x: Signal<u8>,").map(|f| f.0),
+            Some("x".into())
+        );
+        assert_eq!(parse_field("plain: u8,").map(|f| f.0), Some("plain".into()));
+        assert_eq!(parse_field("HashMap<ConnectionId, u8>>,"), None);
+        assert_eq!(parse_field("pub 2bad: u8,"), None);
+        // The real struct: every field read, the scan's own anchor included.
+        let names: Vec<String> = all_fields().into_iter().map(|f| f.0).collect();
+        for field in ["registry", "tabs", "sql_runs", "paths"] {
+            assert!(names.iter().any(|name| name == field), "{field}: {names:?}");
+        }
     }
 
     /// The body of `close_connection`, comments removed.
@@ -397,7 +459,13 @@ mod tests {
     /// Closing a tab drops all of its per-connection state: what is in
     /// `tabs` by construction, and everything else because this fails until
     /// a new per-connection field either moves into [`TabState`] or names its
-    /// reason in [`OUTSIDE_TABS`] and is torn down in `close_connection`.
+    /// reason in [`OUTSIDE_TABS`] and is torn down in `close_connection`
+    /// (and filled and checked by
+    /// `closing_a_tab_drops_its_state_and_a_late_write_cannot_restore_it`).
+    ///
+    /// It reads field types **as written**: a field is per-connection when its
+    /// type names `ConnectionId` or `ConnectionRegistry`. A type alias, or a
+    /// struct of its own that carries an id inside, evades it.
     #[test]
     fn every_per_connection_field_is_in_tabs_or_says_why_not() {
         let fields = per_connection_fields();
@@ -437,16 +505,179 @@ mod tests {
         }
     }
 
-    /// Through the real `close_connection`: one connection's state in
-    /// `tabs` and in every slot goes with its tab, the other's stays, and a
-    /// write arriving after the close — a background task finishing late —
-    /// does not bring the closed tab's entry back.
+    /// How the close test fills one per-connection field outside `tabs` for
+    /// a connection, and asks whether it still holds anything for it.
+    type Probe = (
+        &'static str,
+        fn(AppState, ConnectionId),
+        fn(AppState, ConnectionId) -> bool,
+    );
+
+    /// One probe per [`OUTSIDE_TABS`] entry; the close test fails when the
+    /// two lists differ, so a new entry cannot skip its runtime check.
+    fn outside_tabs_probes() -> Vec<Probe> {
+        fn run() -> SqlRun {
+            SqlRun {
+                statements: Vec::new(),
+                status: RunStatus::Running,
+                explain: false,
+            }
+        }
+        vec![
+            // Filled by the test itself: the connection must be open first.
+            (
+                "registry",
+                |_, _| {},
+                |state, id| state.registry.peek().get(id).is_some(),
+            ),
+            (
+                "open_locators",
+                |state, id| {
+                    let mut open = state.open_locators;
+                    open.write().push((id, format!("{id:?}")));
+                },
+                |state, id| {
+                    state
+                        .open_locators
+                        .peek()
+                        .iter()
+                        .any(|(open, _)| *open == id)
+                },
+            ),
+            (
+                "schemas",
+                |state, id| {
+                    let mut schemas = state.schemas;
+                    schemas.write().insert(id, SchemaLoad::Loading);
+                },
+                |state, id| state.schemas.peek().contains_key(&id),
+            ),
+            (
+                "tab_ui",
+                |state, id| {
+                    let mut tab_ui = state.tab_ui;
+                    tab_ui.write().insert(id, TabUi::default());
+                },
+                |state, id| state.tab_ui.peek().contains_key(&id),
+            ),
+            (
+                "staged",
+                |state, id| {
+                    let mut staged = state.staged;
+                    staged.write().insert(id, HashMap::new());
+                },
+                |state, id| state.staged.peek().contains_key(&id),
+            ),
+            (
+                "grid_refresh",
+                |state, id| {
+                    let mut refresh = state.grid_refresh;
+                    refresh.write().insert((id, "t".into()), 1);
+                },
+                |state, id| {
+                    state
+                        .grid_refresh
+                        .peek()
+                        .keys()
+                        .any(|(conn, _)| *conn == id)
+                },
+            ),
+            (
+                "sql_runs",
+                |state, id| {
+                    let mut runs = state.sql_runs;
+                    let _ = runs.write().begin((id, 1), run());
+                },
+                |state, id| {
+                    !state
+                        .sql_runs
+                        .peek()
+                        .holds_nothing_for(|(conn, _)| *conn == id)
+                },
+            ),
+            (
+                "pending_sql",
+                |state, id| {
+                    let mut pending = state.pending_sql;
+                    pending.write().insert(
+                        (id, 1),
+                        PendingSql {
+                            script: "DELETE FROM t".into(),
+                            statements: vec!["DELETE FROM t".into()],
+                            explain: false,
+                        },
+                    );
+                },
+                |state, id| state.pending_sql.peek().keys().any(|(conn, _)| *conn == id),
+            ),
+            (
+                "export_status",
+                |state, id| {
+                    let mut exports = state.export_status;
+                    let _ = exports
+                        .write()
+                        .begin((id, ExportPane::Grid), ExportStatus::Running);
+                },
+                |state, id| {
+                    !state
+                        .export_status
+                        .peek()
+                        .holds_nothing_for(|(conn, _)| *conn == id)
+                },
+            ),
+            (
+                "import_status",
+                |state, id| {
+                    let mut imports = state.import_status;
+                    let _ = imports
+                        .write()
+                        .begin(id, ImportStatus::Running { table: "t".into() });
+                },
+                |state, id| {
+                    !state
+                        .import_status
+                        .peek()
+                        .holds_nothing_for(|conn| *conn == id)
+                },
+            ),
+            (
+                "schema_edits",
+                |state, id| {
+                    let mut edits = state.schema_edits;
+                    let _ = edits
+                        .write()
+                        .begin(id, SchemaEditStatus::Running { label: "x".into() });
+                },
+                |state, id| {
+                    !state
+                        .schema_edits
+                        .peek()
+                        .holds_nothing_for(|conn| *conn == id)
+                },
+            ),
+        ]
+    }
+
+    /// Through the real `close_connection`, for two open connections: every
+    /// per-connection field — `tabs`, and each one [`OUTSIDE_TABS`] keeps out
+    /// of it — is filled for both, the closed one's is gone afterwards and the
+    /// other's kept. A write arriving after the close — a background task
+    /// finishing late — does not bring the closed tab's entry back.
     #[tokio::test]
     async fn closing_a_tab_drops_its_state_and_a_late_write_cannot_restore_it() {
         use dioxus::core::VirtualDom;
 
         use crate::ui::notice::Gesture;
         use crate::ui::test_dom::provide_state;
+
+        let probes = outside_tabs_probes();
+        let probed: Vec<&str> = probes.iter().map(|(name, ..)| *name).collect();
+        let listed: Vec<&str> = OUTSIDE_TABS.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            probed, listed,
+            "every field kept out of TabState needs a probe here, so its teardown \
+             is executed and not only named"
+        );
 
         let dom = VirtualDom::new(|| rsx! {});
         let state = provide_state(&dom);
@@ -474,23 +705,10 @@ mod tests {
                         filter: None,
                     });
                 });
-                let run = SqlRun {
-                    statements: Vec::new(),
-                    status: RunStatus::Running,
-                    explain: false,
-                };
-                let (mut runs, mut exports) = (state.sql_runs, state.export_status);
-                let (mut imports, mut edits) = (state.import_status, state.schema_edits);
-                let _ = runs.write().begin((id, 1), run);
-                let _ = exports
-                    .write()
-                    .begin((id, ExportPane::Grid), ExportStatus::Running);
-                let _ = imports
-                    .write()
-                    .begin(id, ImportStatus::Running { table: "t".into() });
-                let _ = edits
-                    .write()
-                    .begin(id, SchemaEditStatus::Running { label: "x".into() });
+                for (name, fill, holds) in &probes {
+                    fill(state, id);
+                    assert!(holds(state, id), "{name} was not filled");
+                }
             }
 
             state.close_connection(closed, Gesture::CLICK);
@@ -499,30 +717,80 @@ mod tests {
             assert!(!tabs.contains_key(&closed));
             assert!(tabs.contains_key(&kept));
             drop(tabs);
-            assert!(state
-                .sql_runs
-                .peek()
-                .holds_nothing_for(|(conn, _)| *conn == closed));
-            assert!(state
-                .export_status
-                .peek()
-                .holds_nothing_for(|(conn, _)| *conn == closed));
-            assert!(state
-                .import_status
-                .peek()
-                .holds_nothing_for(|conn| *conn == closed));
-            assert!(state
-                .schema_edits
-                .peek()
-                .holds_nothing_for(|conn| *conn == closed));
-            assert!(state.sql_runs.peek().contains_key(&(kept, 1)));
-            assert!(state.import_status.peek().contains_key(&kept));
+            for (name, _, holds) in &probes {
+                assert!(
+                    !holds(state, closed),
+                    "{name} still holds the closed tab's state"
+                );
+                assert!(holds(state, kept), "{name} lost the other tab's state");
+            }
             assert!(state.lost_tunnel(kept).is_some());
 
             // What a saved-query write finishing after the close does.
             assert_eq!(state.tab_mut(closed, |tab| tab.saved_status = None), None);
             assert!(!state.tabs.peek().contains_key(&closed));
         });
+    }
+
+    /// Every `tabs.<write method>` in `code`, spaces around the dot allowed:
+    /// `tabs` as a whole identifier, then `write`, `with_mut`, `set`,
+    /// `write_unchecked` or `take`, as whole identifiers.
+    fn tabs_writes(code: &str) -> Vec<String> {
+        let ident = |c: char| c.is_alphanumeric() || c == '_';
+        let mut found = Vec::new();
+        for (at, _) in code.match_indices("tabs") {
+            if code[..at].chars().next_back().is_some_and(ident) {
+                continue;
+            }
+            let rest = code[at + 4..].trim_start();
+            let Some(rest) = rest.strip_prefix('.') else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            let method: String = rest.chars().take_while(|&c| ident(c)).collect();
+            if ["write", "with_mut", "set", "write_unchecked", "take"].contains(&method.as_str()) {
+                found.push(format!("tabs.{method}"));
+            }
+        }
+        found
+    }
+
+    /// Writes to `tabs` go through [`AppState::tab_mut`], whose registry gate
+    /// is what keeps a late task from recreating a closed tab's entry, or
+    /// through `close_connection`, which removes the entry. Any other write
+    /// would skip the gate. Read from every shipped source file; a write
+    /// through a signal copied out under another name evades it.
+    #[test]
+    fn only_tab_mut_and_close_connection_write_tabs() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut allowed = 0;
+        for file in crate::source_scan::rust_files(&root) {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let mut code =
+                crate::source_scan::without_comments(&crate::source_scan::shipped(&text));
+            for signature in ["pub fn tab_mut<", "pub fn close_connection("] {
+                if let Some(start) = code.find(signature) {
+                    let end = start
+                        + crate::source_scan::block_end(&code[start..]).expect("the fn closes");
+                    allowed += tabs_writes(&code[start..end]).len();
+                    code.replace_range(start..end, "");
+                }
+            }
+            let found = tabs_writes(&code);
+            assert!(
+                found.is_empty(),
+                "{} writes `tabs` outside tab_mut and close_connection: {found:?}",
+                file.display()
+            );
+        }
+        assert_eq!(
+            allowed, 2,
+            "the scan no longer sees the two writes it allows"
+        );
+        assert_eq!(
+            tabs_writes("state.tabs .write(); self.tabs.peek(); my_tabs.write(); tabs.setter();"),
+            ["tabs.write"]
+        );
     }
 
     #[test]
