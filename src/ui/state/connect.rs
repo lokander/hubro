@@ -1952,7 +1952,7 @@ mod tests {
             "checked",
         ];
         let source = &connect_code();
-        let card = &shipped(include_str!("../connections.rs"));
+        let card = &crate::ui::connections::test_support::module_code();
         let form = method_body(card, "fn submit_server_form(");
         let hops = [
             ("the card", method_body(card, "fn PasswordPromptCard(")),
@@ -2313,7 +2313,7 @@ mod tests {
         ];
         let source = &connect_code();
         let card = method_body(
-            &shipped(include_str!("../connections.rs")),
+            &crate::ui::connections::test_support::module_code(),
             "fn EntraSignInCard(",
         );
         let signin = method_body(source, "pub async fn connect_server_with_entra_signin(");
@@ -4024,7 +4024,7 @@ mod tests {
         // The row: the button sits inside the gate and signs out the row it
         // is on. Comment-stripped and whitespace-collapsed.
         let row = collapsed(&code_only(&method_body(
-            &shipped(include_str!("../connections.rs")),
+            &crate::ui::connections::test_support::module_code(),
             "fn SavedConnectionRow(",
         )));
         let gate = "if row.auth.keeps_entra_sign_in() {";
