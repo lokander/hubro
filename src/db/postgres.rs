@@ -1037,7 +1037,9 @@ pub async fn finish_script_conn_with_read(
 /// every pending response has been read. The connection keeps its pool slot
 /// until it is closed, as it did while the pool read it. A failure in the
 /// rest is not reported — the statement's own transaction ends with it, as it
-/// always did here.
+/// always did here — which is why such a read reports its rest
+/// [`RestOfRead::Unconfirmed`] (`registry::rest_after`) rather than claiming
+/// it ran.
 ///
 /// Unlike every other rest, this one is read by sqlx in one poll — the stream
 /// is gone — so it holds one of the runtime's worker threads until it is

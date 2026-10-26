@@ -15,7 +15,9 @@ const MAX_RENDERED_ROWS: usize = 500;
 /// it looks only for table writes — a session setting or a notification the
 /// statement made is undone without one (measured,
 /// `postgres::knows_whether_written`). A statement stopped where nothing it
-/// did could have lasted anyway (`RestOfRead::Stopped`) gets the plain line.
+/// did could have lasted anyway (`RestOfRead::Stopped`) gets the plain line,
+/// and one still being read after the run (`RestOfRead::Unconfirmed`) says
+/// its outcome is not known.
 fn truncation_notice(rest: RestOfRead) -> String {
     let notice = format!(
         "Result truncated — showing the first {MAX_QUERY_ROWS} rows to keep memory bounded. \
@@ -28,6 +30,11 @@ fn truncation_notice(rest: RestOfRead) -> String {
             "{notice} The rest was cancelled at the row cap, which undid everything the \
              statement did. Only a statement that had written no table rows is cancelled; \
              settings or notifications it made are undone too."
+        ),
+        RestOfRead::Unconfirmed => format!(
+            "{notice} The rest is still being read after the run ended, and its outcome \
+             is not reported: if it fails, everything the statement did is undone, \
+             including any rows it wrote."
         ),
     }
 }
@@ -575,6 +582,12 @@ mod tests {
         assert!(cancelled.contains("undid everything the statement did"));
         assert!(cancelled.contains("Only a statement that had written no table rows"));
         assert!(cancelled.contains("settings or notifications it made are undone too"));
+        // A rest read after the run says that its outcome is not known, and
+        // what a failure would cost.
+        let unconfirmed = truncation_notice(RestOfRead::Unconfirmed);
+        assert!(unconfirmed.starts_with(&ran));
+        assert!(unconfirmed.contains("its outcome is not reported"));
+        assert!(unconfirmed.contains("everything the statement did is undone"));
     }
 
     /// Without a dialect the banner states no count at all, rather than one

@@ -658,7 +658,24 @@ impl ScriptConn {
             }
             (held, _) => ScriptConn { held }.close().await,
         }
-        (finished.read, finished.ended)
+        let read = finished.read.map(|capped| Capped {
+            rest: rest_after(finished.after, capped.rest),
+            ..capped
+        });
+        (read, finished.ended)
+    }
+}
+
+/// What a script's last read reports of its rest, given what is left to do
+/// with its connection. A rest read in the background
+/// ([`AfterRead::DrainClose`]) is [`RestOfRead::Unconfirmed`] whatever the
+/// read said: the run ends before the rest does, and nothing the rest meets —
+/// an error past the cap that undoes the statement's writes — is reported.
+/// Over plain data, so a test can execute the claim.
+pub(super) fn rest_after(after: AfterRead, rest: RestOfRead) -> RestOfRead {
+    match after {
+        AfterRead::DrainClose => RestOfRead::Unconfirmed,
+        AfterRead::Close => rest,
     }
 }
 
@@ -1684,6 +1701,29 @@ impl ConnectionRegistry {
 
 #[cfg(test)]
 mod tests {
+    /// A last read whose rest is read in the background never claims its
+    /// rest ran: whatever the read reported, the run ends first. Any other
+    /// end keeps what the read said.
+    #[test]
+    fn a_rest_read_after_the_run_claims_nothing() {
+        use super::{rest_after, AfterRead, RestOfRead};
+        for rest in [
+            RestOfRead::Ran,
+            RestOfRead::Stopped,
+            RestOfRead::CancelledUnwritten,
+            RestOfRead::Unconfirmed,
+        ] {
+            assert_eq!(
+                rest_after(AfterRead::DrainClose, rest),
+                RestOfRead::Unconfirmed
+            );
+            assert_eq!(rest_after(AfterRead::Close, rest), rest);
+        }
+        assert!(!RestOfRead::Unconfirmed.stopped());
+        assert!(!RestOfRead::Ran.stopped());
+        assert!(RestOfRead::Stopped.stopped() && RestOfRead::CancelledUnwritten.stopped());
+    }
+
     /// [`DbPool::query_unbounded`] reads a whole result with no cap, so the
     /// app must not reach it: outside test modules, nothing in `src/` names
     /// it but its own definition. Read through
