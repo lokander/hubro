@@ -561,6 +561,48 @@ pub(in crate::ui) mod test_support {
             "found only {} files in the connections module",
             files.len()
         );
+        // Only what the compiler builds may answer a pin: every file read is
+        // declared `mod <stem>;` here, and every declaration has its file. A
+        // stray copy left on disk — a correctly wired `PasswordPromptCard`
+        // sorted ahead of the compiled one, say — would otherwise satisfy the
+        // pins while the card that ships is inverted.
+        let root =
+            crate::source_scan::shipped(&std::fs::read_to_string(dir.join("mod.rs")).unwrap());
+        let declared: Vec<String> = root
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let line = line.strip_prefix("pub(super) ").unwrap_or(line);
+                line.strip_prefix("mod ")?
+                    .strip_suffix(';')
+                    .map(str::to_string)
+            })
+            .collect();
+        let mut stems = Vec::new();
+        for file in &files {
+            assert_eq!(
+                file.parent(),
+                Some(dir.as_path()),
+                "{}: a file below the module's directory is not read as one of its own",
+                file.display()
+            );
+            let stem = file.file_stem().unwrap().to_string_lossy().into_owned();
+            if stem != "mod" {
+                assert!(
+                    declared.contains(&stem),
+                    "{}: on disk but not declared `mod {stem};` in connections/mod.rs, \
+                     so the compiler never builds it",
+                    file.display()
+                );
+                stems.push(stem);
+            }
+        }
+        for module in &declared {
+            assert!(
+                stems.contains(module),
+                "`mod {module};` has no file in src/ui/connections"
+            );
+        }
         files
             .iter()
             .map(|file| crate::source_scan::shipped(&std::fs::read_to_string(file).unwrap()))

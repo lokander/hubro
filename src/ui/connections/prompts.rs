@@ -281,7 +281,7 @@ fn entra_remember_hint(stored: crate::ui::state::StoredCopy) -> Option<&'static 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::connections::test_support::module_code;
+    use crate::ui::connections::test_support::shipped_code_of;
 
     #[test]
     fn the_prompt_warns_that_unticking_removes_a_stored_password_only_when_it_can() {
@@ -335,26 +335,14 @@ mod tests {
         //
         // A component needs a Dioxus runtime to render, so the seed is checked
         // at its source: the card is a function, and the initialiser is one
-        // line of it.
-        // Read a line at a time rather than by byte offsets into literals
-        // containing `\n`: a `"\n}\n"` search for the end of the function
-        // would fail on a CRLF checkout — the trap that once turned Windows
-        // CI red, and that `tests/line_endings.rs` keeps this file clear of.
-        // Read from every file of the module, so the card is found wherever
-        // it lives.
-        let source = module_code();
-        let card: Vec<&str> = source
-            .lines()
-            .skip_while(|line| !line.contains("fn PasswordPromptCard("))
-            .take_while(|line| line.trim_end() != "}")
-            .collect();
+        // line of it. Read as code alone, the card found exactly once in the
+        // module and cut at its own closing brace ([`shipped_code_of`]), then
+        // split at `rsx!` into the setup and what renders.
+        let card = shipped_code_of("fn PasswordPromptCard(");
         let renders_at = card
-            .iter()
-            .position(|line| line.contains("rsx!"))
+            .find("rsx!")
             .expect("the card must still exist and render");
-        let (setup, rendered) = card.split_at(renders_at);
-        let body = setup.join("\n");
-        let rendered = rendered.join("\n");
+        let (body, rendered) = card.split_at(renders_at);
         assert!(
             !body.contains("use_signal(|| true)")
                 && !body.contains("use_signal(|| Remember::Keyring)"),
