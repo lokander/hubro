@@ -66,7 +66,7 @@ use crate::db::{
 use crate::ui::classes::{BTN_GHOST, INPUT, SELECT};
 use crate::util::human_bytes;
 
-use super::editing::{editor_kind, CellEditor, EditNav, EditorKind};
+use super::editing::{editor_kind, CellEditor, EditNav, EditorFrame, EditorKind};
 use super::import::ImportDialog;
 use super::js::{
     focus_by_id_next_frame, focus_on_mount, reclaim_focus_by_id_next_frame, write_clipboard,
@@ -75,6 +75,7 @@ use super::notice::{
     a_held_key_is_not_a_press, Armed, Banner, BannerKind, DelayedLoading, EmptyState, Gesture,
     Overlay, OverlayAlign,
 };
+use super::offer::Offer;
 use super::pick_export_path;
 use super::schema::display_type;
 use super::selection::Selection;
@@ -347,7 +348,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
         id,
         table: table.clone(),
         meta: meta.clone(),
-        dialect: dialect.unwrap_or(Dialect::Sqlite),
+        dialect,
         editing,
     };
     let pending_inserts: Vec<PendingInsert> = stage
@@ -370,9 +371,8 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                 id,
                 table: table.clone(),
                 dialect,
-                can_read,
-                can_import: table_meta.is_some(),
-                import_refused: import_refused.clone(),
+                export: export_offer(can_read),
+                import: import_offer(table_meta.is_some(), import_refused.clone()),
                 import_file,
                 detail_open,
                 meta: meta.clone(),
@@ -440,7 +440,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                         detail: detail(),
                         on_pending_insert: focused_cell().is_some_and(|(row, _)| row >= grid_nav.read().rows.len()),
                         width: detail_width,
-                        dialect: dialect.unwrap_or(Dialect::Sqlite),
+                        dialect,
                         read_only_notice: read_only_notice.map(str::to_string),
                         editors,
                         on_step: move |step: RowStep| focus.step_row(grid_nav, step),
@@ -666,18 +666,11 @@ fn GridToolbar(
     /// `None` until the connection reports one; gates the INSERT copy format
     /// and the export buttons, which both need to know the dialect.
     dialect: Option<Dialect>,
-    /// Whether this object has rows to read. False hides the export
-    /// affordances: an export is the same query the grid is refusing, so
-    /// offering it would hand back the failure the gate just prevented.
-    can_read: bool,
-    /// Whether an import can be offered at all: false until the schema has
-    /// loaded, since the dialog maps fields onto the table's columns and has
-    /// none to show without it.
-    can_import: bool,
-    /// Why an import is refused, when it is — the same sentence the
-    /// disabled Save button shows. `Some` leaves the button visible but
-    /// disabled and explained, rather than silently absent.
-    import_refused: Option<String>,
+    /// The export buttons (see [`export_offer`]). They also need the
+    /// dialect, so they show only once that is known too.
+    export: Offer,
+    /// The Import button (see [`import_offer`]).
+    import: Offer<String>,
     /// The file picked for import, if any: set by this toolbar's picker and
     /// consumed by [`DataGrid`], which owns the dialog.
     import_file: Signal<Option<std::path::PathBuf>>,
@@ -908,7 +901,7 @@ fn GridToolbar(
                     }
                 }
             }
-            if let Some(export_dialect) = dialect.filter(|_| can_read) {
+            if let (Some(export_dialect), true) = (dialect, export.is_shown()) {
                 button {
                     class: BTN_GHOST,
                     title: "Export the current view (filter + sort, all rows) to CSV",
@@ -928,12 +921,12 @@ fn GridToolbar(
                     "Export JSON"
                 }
             }
-            if can_import {
+            if import.is_shown() {
                 button {
                     class: "{BTN_GHOST} disabled:opacity-50 disabled:hover:bg-transparent",
-                    disabled: import_refused.is_some(),
-                    title: match import_refused.as_deref() {
-                        Some(reason) => reason.to_string(),
+                    disabled: import.refusal().is_some(),
+                    title: match import.refusal() {
+                        Some(reason) => reason.clone(),
                         None => "Import a CSV or JSON file into this table".to_string(),
                     },
                     onclick: {
@@ -965,6 +958,30 @@ fn GridToolbar(
             }
         }
         }
+    }
+}
+
+/// The toolbar's export buttons: hidden for an object with no rows to read,
+/// since an export is the same query the grid is refusing — offering it would
+/// hand back the failure the gate just prevented.
+fn export_offer(can_read: bool) -> Offer {
+    if can_read {
+        Offer::Offered
+    } else {
+        Offer::Hidden
+    }
+}
+
+/// The toolbar's Import button: hidden until the schema has loaded (the
+/// dialog maps fields onto the table's columns and has none to show without
+/// it), then shown — disabled with the reason when the table refuses writes,
+/// the same sentence the disabled Save button shows, rather than silently
+/// absent.
+fn import_offer(schema_loaded: bool, refusal: Option<String>) -> Offer<String> {
+    if schema_loaded {
+        Offer::shown(refusal)
+    } else {
+        Offer::Hidden
     }
 }
 
@@ -1582,6 +1599,22 @@ mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
+
+    /// Export is absent for an object with no rows; Import is absent until
+    /// the schema is known, then shown — refused with the table's reason, or
+    /// offered.
+    #[test]
+    fn the_toolbar_offers_export_and_import_by_the_tables_access() {
+        assert_eq!(export_offer(true), Offer::Offered);
+        assert_eq!(export_offer(false), Offer::Hidden);
+        assert_eq!(import_offer(false, None), Offer::Hidden);
+        assert_eq!(import_offer(false, Some("read-only".into())), Offer::Hidden);
+        assert_eq!(
+            import_offer(true, Some("read-only".into())),
+            Offer::Disabled("read-only".to_string())
+        );
+        assert_eq!(import_offer(true, None), Offer::Offered);
+    }
 
     #[test]
     fn an_open_editor_is_matched_on_row_as_well_as_column() {

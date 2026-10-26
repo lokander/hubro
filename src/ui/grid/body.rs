@@ -354,7 +354,7 @@ pub(super) fn GridBody(
                                         // outside the rectangle — so only rows whose span changed re-render.
                                         selected_cols: selection().and_then(|sel| sel.columns_in(index)),
                                         on_select_cell,
-                                        select_enabled,
+                                        ticks: TickColumn::for_selectable(select_enabled),
                                         selected,
                                         on_fk_jump: {
                                             let origin = row_table.clone();
@@ -388,7 +388,7 @@ pub(super) fn GridBody(
                                         ctx: ctx.clone(),
                                         insert,
                                         headers: headers.clone(),
-                                        lead_cell: select_enabled,
+                                        ticks: TickColumn::for_selectable(select_enabled),
                                     }
                                 }
                             }

@@ -64,12 +64,10 @@ fn buffer_label(buffer: &SqlBuffer, index: usize) -> String {
 #[component]
 pub fn SqlEditor(id: ConnectionId) -> Element {
     let state = use_context::<AppState>();
-    let dialect = state
-        .registry
-        .read()
-        .get(id)
-        .map(|c| c.pool.dialect())
-        .unwrap_or(Dialect::Sqlite);
+    // `None` once the connection is gone (the tab is closing). The editor is
+    // then not mounted at all: its grammar and completions are the dialect's,
+    // and it would only hand Ctrl+Enter to a connection that is not there.
+    let dialect: Option<Dialect> = state.registry.read().get(id).map(|c| c.pool.dialect());
     // Whether this connection can produce a plan at all, and whether that
     // plan will be structured. `None` disables the Explain button
     // rather than hiding it: "SQL Server has no EXPLAIN" is worth saying once
@@ -185,7 +183,13 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
             // The query tabs. Opening a saved query adds one here instead of
             // replacing what is in the editor.
             QueryTabs { id, active }
-            EditorSurface { id, dialect }
+            if let Some(dialect) = dialect {
+                EditorSurface { id, dialect }
+            } else {
+                p { class: "border-b border-slate-300 dark:border-slate-700 px-4 py-3 text-sm text-slate-500",
+                    "This connection is closing, so its SQL editor is not available."
+                }
+            }
             RunResults { id, active, dialect, structured_plans }
         }
         match panel() {

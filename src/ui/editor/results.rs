@@ -47,9 +47,10 @@ pub(super) fn RunResults(
     id: ConnectionId,
     /// The buffer whose results these are.
     active: u64,
-    /// The connection's dialect (SQLite when the registry has none), which
-    /// decides which pending statements need confirming.
-    dialect: Dialect,
+    /// The connection's dialect, which decides which pending statements need
+    /// confirming. `None` once the connection is gone: see
+    /// [`writes_to_confirm`].
+    dialect: Option<Dialect>,
     /// Whether this connection's plans parse into a tree.
     structured_plans: bool,
 ) -> Element {
@@ -61,13 +62,11 @@ pub(super) fn RunResults(
     // Filtered to the active buffer: one connection still runs one script at
     // a time, but its results belong to the buffer that ran them.
     let run = state.sql_runs.read().get(&(id, active)).cloned();
-    let pending_writes = state.pending_sql.read().get(&(id, active)).map(|pending| {
-        pending
-            .statements
-            .iter()
-            .filter(|s| needs_confirmation(s, dialect))
-            .count()
-    });
+    let pending_writes = state
+        .pending_sql
+        .read()
+        .get(&(id, active))
+        .and_then(|pending| writes_to_confirm(&pending.statements, dialect));
     // Under Confirm the banner names the connection: the whole
     // point of the state is to make you read *which* database you are about
     // to change, which "Run anyway?" alone never made you do.
@@ -152,6 +151,23 @@ pub(super) fn RunResults(
             }
         }
     }
+}
+
+/// How many of a pending script's statements the confirmation banner counts
+/// as writes — `None`, so no banner, without a dialect to judge them by.
+///
+/// The count is a claim ("this script contains 2 write statements"), and
+/// which statements need confirming is the dialect's call: guessing one
+/// would state a number about another engine. A connection without a dialect
+/// is closing, so there is nothing left to run the script against either.
+pub(super) fn writes_to_confirm(statements: &[String], dialect: Option<Dialect>) -> Option<usize> {
+    let dialect = dialect?;
+    Some(
+        statements
+            .iter()
+            .filter(|s| needs_confirmation(s, dialect))
+            .count(),
+    )
 }
 
 /// The script-level footer: running indicator, total elapsed time (shown
@@ -559,6 +575,19 @@ mod tests {
         assert!(cancelled.contains("undid everything the statement did"));
         assert!(cancelled.contains("Only a statement that had written no table rows"));
         assert!(cancelled.contains("settings or notifications it made are undone too"));
+    }
+
+    /// Without a dialect the banner states no count at all, rather than one
+    /// judged by a guessed engine; with one, the dialect's rule decides.
+    #[test]
+    fn a_pending_script_is_counted_only_by_a_known_dialect() {
+        let script = ["select 1".to_string(), "delete from t".to_string()];
+        assert_eq!(writes_to_confirm(&script, None), None);
+        assert_eq!(writes_to_confirm(&script, Some(Dialect::Sqlite)), Some(1));
+        assert_eq!(
+            writes_to_confirm(&script[..1], Some(Dialect::Postgres)),
+            Some(0)
+        );
     }
 
     #[test]

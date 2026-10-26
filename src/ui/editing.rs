@@ -167,6 +167,46 @@ pub fn editor_kind(type_name: &str, detail: &TypeDetail, dialect: Option<Dialect
     }
 }
 
+/// Why an editor without a dialect stages nothing. The dialect decides how a
+/// value is staged — a boolean is `TRUE` on PostgreSQL and `1` elsewhere, a
+/// number's range is the engine's — and the only way to be without one is a
+/// connection that is closing or gone, so there is nothing right to guess.
+pub const NO_DIALECT: &str =
+    "This value can't be edited: the connection is closing, so hubro no longer knows its SQL dialect.";
+
+/// What an editor stages for its input: the checkbox state for a boolean, the
+/// parsed text for everything else — or the refusal, without a dialect to
+/// stage it for. Both of the editor's commit paths (a commit and the unmount
+/// that stands in for one) go through here, so neither can stage a value
+/// written for a dialect it guessed.
+pub fn staged_value(
+    kind: &EditorKind,
+    dialect: Option<Dialect>,
+    checked: bool,
+    text: &str,
+) -> Result<Value, String> {
+    let Some(dialect) = dialect else {
+        return Err(NO_DIALECT.to_string());
+    };
+    if *kind == EditorKind::Bool {
+        Ok(bool_value(dialect, checked))
+    } else {
+        parse_input(kind, dialect, text)
+    }
+}
+
+/// How a [`CellEditor`] is framed: as the active cell of a table row, or as a
+/// block in a form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EditorFrame {
+    /// A `td`, for the grid, where the editor stands in a row of cells.
+    #[default]
+    TableCell,
+    /// A plain `div`, for the row detail panel: a stray table cell there
+    /// would drag in an anonymous table box around it.
+    Block,
+}
+
 /// Parses committed editor text into the [`Value`] to stage, per kind.
 /// `Err` is the human-readable validation message shown inline; nothing is
 /// staged then.
@@ -322,7 +362,10 @@ pub enum EditNav {
 #[component]
 pub fn CellEditor(
     kind: ReadSignal<EditorKind>,
-    dialect: Dialect,
+    /// What the value is staged for. `None` only while the connection is
+    /// closing: the editor then refuses rather than guess (see
+    /// [`NO_DIALECT`]).
+    dialect: Option<Dialect>,
     nullable: bool,
     initial: Value,
     /// Uncommitted text restored from a previous mount whose row was
@@ -339,12 +382,9 @@ pub fn CellEditor(
     /// Revert-to-database-default action. Existing rows have no default to
     /// revert to, so the grid only wires this for pending-insert cells.
     on_default: Option<EventHandler<()>>,
-    /// Wrap the editor in a plain `div` instead of a `td`. The grid mounts it
-    /// as the active cell of a `<table>` row; the row detail panel
-    /// mounts the same editor in a vertical form, where a stray table cell
-    /// would drag in an anonymous table box around it.
+    /// A `td` in the grid, a block in the row detail panel's form.
     #[props(default)]
-    block: bool,
+    frame: EditorFrame,
 ) -> Element {
     let has_draft = draft.is_some();
     let initial_for_text = initial.clone();
@@ -374,12 +414,8 @@ pub fn CellEditor(
         if *finished.peek() || !*modified.peek() {
             return;
         }
-        let parsed = if *kind.peek() == EditorKind::Bool {
-            Ok(bool_value(dialect, *checked.peek()))
-        } else {
-            let raw = text.peek().clone();
-            parse_input(&kind.peek(), dialect, &raw)
-        };
+        let raw = text.peek().clone();
+        let parsed = staged_value(&kind.peek(), dialect, *checked.peek(), &raw);
         match parsed {
             Ok(value) => on_commit.call((Some(value), EditNav::Stay)),
             Err(_) => {
@@ -402,11 +438,7 @@ pub fn CellEditor(
             }
             return;
         }
-        let parsed = if *kind.read() == EditorKind::Bool {
-            Ok(bool_value(dialect, checked()))
-        } else {
-            parse_input(&kind.read(), dialect, &text())
-        };
+        let parsed = staged_value(&kind.read(), dialect, checked(), &text());
         match parsed {
             Ok(value) => {
                 finished.set(true);
@@ -584,18 +616,32 @@ pub fn CellEditor(
             div { class: "mt-0.5 max-w-md text-xs text-red-600 dark:text-red-400", "{message}" }
         }
     };
-    // One editor, two wrappers (see `block`): the amber framing is the same
+    // Without a dialect nothing could be staged (see `staged_value`), so the
+    // editor says so instead of offering input it would only refuse.
+    let body = match dialect {
+        Some(_) => body,
+        None => rsx! {
+            div { class: "flex items-center gap-2",
+                span { class: "text-xs text-red-600 dark:text-red-400", "{NO_DIALECT}" }
+                button {
+                    class: "shrink-0 rounded border border-slate-400 dark:border-slate-600 px-2 py-0.5 text-xs",
+                    onclick: move |_| on_cancel.call(()),
+                    "Close"
+                }
+            }
+        },
+    };
+    // One editor, two wrappers (see `frame`): the amber framing is the same
     // either way, so a staged edit reads identically in the grid and in the
     // row detail panel.
-    let frame = "bg-amber-100 dark:bg-amber-900/30 px-1 py-0.5 align-top";
-    if block {
-        rsx! {
-            div { class: "{frame} rounded", {body} }
-        }
-    } else {
-        rsx! {
-            td { class: frame, {body} }
-        }
+    let amber = "bg-amber-100 dark:bg-amber-900/30 px-1 py-0.5 align-top";
+    match frame {
+        EditorFrame::Block => rsx! {
+            div { class: "{amber} rounded", {body} }
+        },
+        EditorFrame::TableCell => rsx! {
+            td { class: amber, {body} }
+        },
     }
 }
 
@@ -603,6 +649,43 @@ pub fn CellEditor(
 mod tests {
     use super::*;
     use crate::db::TypeRef;
+
+    /// Without a dialect the editor stages nothing, on either of its commit
+    /// paths: a boolean would otherwise be staged as SQLite's `1`, the wrong
+    /// literal for PostgreSQL. With one, the dialect's own value.
+    #[test]
+    fn nothing_is_staged_without_a_dialect() {
+        for (kind, checked, text) in [
+            (EditorKind::Bool, true, ""),
+            (EditorKind::Text, false, "hello"),
+            (
+                EditorKind::Numeric {
+                    kind: NumericKind::Integer,
+                },
+                false,
+                "12",
+            ),
+        ] {
+            assert_eq!(
+                staged_value(&kind, None, checked, text),
+                Err(NO_DIALECT.to_string()),
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            staged_value(&EditorKind::Bool, Some(Dialect::Postgres), true, ""),
+            Ok(bool_value(Dialect::Postgres, true))
+        );
+        assert_ne!(
+            bool_value(Dialect::Postgres, true),
+            bool_value(Dialect::Sqlite, true),
+            "the guess this refuses would have been wrong"
+        );
+        assert_eq!(
+            staged_value(&EditorKind::Text, Some(Dialect::Sqlite), false, "hello"),
+            Ok(Value::Text("hello".into()))
+        );
+    }
 
     /// Type-name-only derivation (no enum/array detail), which is what the
     /// name-matching rules below exercise.
