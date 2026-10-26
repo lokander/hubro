@@ -2696,19 +2696,16 @@ mod tests {
         // the one that hands the answer on — runs for whatever
         // `auth_from_form` maps to `Password`, so the two must agree for
         // every mode the selector offers.
-        // The selector's option values, read off its `select`.
-        // The selector offers every mode, and nothing else.
+        //
+        // The selector offers every mode in `ALL` and nothing else; that
+        // `ALL` lists every mode is
+        // `auth_mode_all_lists_every_mode_once_in_declaration_order`'s.
         let selector = shipped_code_of("fn AuthModeFields(");
         assert!(
             selector.contains("for mode in AuthMode::ALL { option { value: mode.as_str(),"),
             "{selector}"
         );
         for mode in AuthMode::ALL {
-            assert_eq!(
-                mode.as_str().parse(),
-                Ok(mode),
-                "{mode:?} does not read back"
-            );
             assert_eq!(
                 asks_remember(mode),
                 matches!(auth_from_form(mode, "tenant", ""), Ok(ServerAuth::Password)),
@@ -2717,7 +2714,6 @@ mod tests {
         }
         assert!(asks_remember(AuthMode::Password));
         assert!(!asks_remember(AuthMode::EntraManagedIdentity));
-        assert!("Password".parse::<AuthMode>().is_err());
     }
 
     /// The shipped code of the item `signature` opens in this file, through
@@ -3224,9 +3220,8 @@ fn tunnel_from_form(
     }))
 }
 
-/// Builds the auth mode from the form's Auth selector ("password",
-/// "entra-interactive", or "entra-mi") and Entra fields — the validation
-/// shared by both server forms.
+/// Builds the saved [`ServerAuth`] from the form's [`AuthMode`] and its Entra
+/// fields — the validation shared by both server forms.
 fn auth_from_form(mode: AuthMode, tenant: &str, client_id: &str) -> Result<ServerAuth, String> {
     use crate::azure::EntraAuth;
     let client = client_id.trim().to_string();

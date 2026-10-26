@@ -717,10 +717,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_filter_operator_reads_back_from_its_name() {
-        for op in FilterOp::ALL {
-            assert_eq!(op.as_str().parse(), Ok(op), "{op:?}");
+    fn filter_op_all_lists_every_operator_once_in_declaration_order() {
+        // Exhaustive, with no wildcard arm: a new operator does not compile
+        // until it is given its place here, beside which `ALL` must list it.
+        fn place(op: FilterOp) -> usize {
+            match op {
+                FilterOp::Contains => 0,
+                FilterOp::Equals => 1,
+            }
         }
+        let places: Vec<usize> = FilterOp::ALL.iter().map(|op| place(*op)).collect();
+        assert_eq!(
+            places,
+            (0..FilterOp::ALL.len()).collect::<Vec<_>>(),
+            "ALL is out of order, or lists an operator twice"
+        );
+        // And in declaration order, so a variant declared between two listed
+        // ones cannot be left out.
+        for (index, op) in FilterOp::ALL.iter().enumerate() {
+            assert_eq!(*op as usize, index, "{op:?}");
+        }
+    }
+
+    #[test]
+    fn a_filter_operator_reads_back_from_its_name() {
+        // The names themselves, as written: `FromStr` goes through `ALL` and
+        // `as_str`, so reading every name back proves only that they differ.
+        let names: Vec<&str> = FilterOp::ALL.iter().map(|op| op.as_str()).collect();
+        assert_eq!(names, ["contains", "equals"]);
         assert_eq!("equals".parse(), Ok(FilterOp::Equals));
         assert_eq!("contains".parse(), Ok(FilterOp::Contains));
         assert!("Equals".parse::<FilterOp>().is_err());

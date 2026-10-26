@@ -114,10 +114,9 @@ pub(super) fn forget_failed_ssh_passphrase(
 /// ones the user deliberately declined to save.
 ///
 /// A declined choice is recorded as [`Remember::SessionOnly`] rather than by
-/// removing the entry,
-/// because "answered no" and "never asked" are different states and the
-/// difference is user-visible: only the second may offer a ticked box on the
-/// next prompt. They were the same state while this was a set, which quietly
+/// removing the entry, because "answered no" and "never asked" are different
+/// states and the difference is user-visible: only the second may offer a
+/// ticked box on the next prompt. They were the same state while this was a set, which quietly
 /// unticked the re-prompt for a passphrase typed into the connection form.
 ///
 /// That form parks its answer here too. It used to stash the passphrase
@@ -541,9 +540,8 @@ pub(super) fn carry_session_secrets(session: &mut HashMap<String, String>, old: 
 /// writes back to the keyring the very passphrase the deletion removed.
 ///
 /// The answer is *removed* rather than set to [`Remember::SessionOnly`],
-/// because those are
-/// different states here too: a recreated connection has never been asked, so
-/// its first prompt must come up ticked like any other
+/// because those are different states here too: a recreated connection has
+/// never been asked, so its first prompt must come up ticked like any other
 /// ([`withdraw_ssh_remember`] is what tells them apart).
 pub(super) fn forget_connection_secrets(
     session: &mut HashMap<String, String>,

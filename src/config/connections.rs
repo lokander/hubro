@@ -1204,6 +1204,36 @@ impl SavedList {
 mod tests {
     use super::*;
 
+    #[test]
+    fn auth_mode_all_lists_every_mode_once_in_declaration_order() {
+        // Exhaustive, with no wildcard arm: a new mode does not compile until
+        // it is given its place here, beside which `ALL` must list it.
+        fn place(mode: AuthMode) -> usize {
+            match mode {
+                AuthMode::Password => 0,
+                AuthMode::EntraInteractive => 1,
+                AuthMode::EntraManagedIdentity => 2,
+            }
+        }
+        let places: Vec<usize> = AuthMode::ALL.iter().map(|mode| place(*mode)).collect();
+        assert_eq!(
+            places,
+            (0..AuthMode::ALL.len()).collect::<Vec<_>>(),
+            "ALL is out of order, or lists a mode twice"
+        );
+        // And in declaration order, so a variant declared between two listed
+        // ones cannot be left out.
+        for (index, mode) in AuthMode::ALL.iter().enumerate() {
+            assert_eq!(*mode as usize, index, "{mode:?}");
+        }
+        // The option values as written: `FromStr` goes through `ALL` and
+        // `as_str`, so reading every value back proves only that they differ.
+        let values: Vec<&str> = AuthMode::ALL.iter().map(|mode| mode.as_str()).collect();
+        assert_eq!(values, ["password", "entra-interactive", "entra-mi"]);
+        assert_eq!("entra-mi".parse(), Ok(AuthMode::EntraManagedIdentity));
+        assert!("Password".parse::<AuthMode>().is_err());
+    }
+
     fn saved(name: &str, path: &str) -> SavedConnection {
         SavedConnection::Sqlite {
             name: name.into(),
