@@ -2339,20 +2339,15 @@ mod tests {
             files.len()
         );
         // The scan reads the code that follows a test module, not only what
-        // precedes it: the two places that once ended it early.
-        for (file, after) in [
-            ("../mod.rs", "fn App("),
-            ("../connections.rs", "fn auth_from_form("),
-        ] {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src/ui/state")
-                .join(file);
-            let code = code_outside_test_modules(&std::fs::read_to_string(path).unwrap());
-            assert!(
-                code.contains(after),
-                "{file}: the scan stopped before {after}"
-            );
-        }
+        // precedes it: the place that once ended it early. (The other one,
+        // `connections.rs`, became a module whose files each end in their
+        // tests, so nothing there follows one any more.)
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/mod.rs");
+        let code = code_outside_test_modules(&std::fs::read_to_string(path).unwrap());
+        assert!(
+            code.contains("fn App("),
+            "ui/mod.rs: the scan stopped before fn App("
+        );
         for file in &files {
             let code = code_outside_test_modules(&std::fs::read_to_string(file).unwrap());
             assert!(

@@ -399,7 +399,11 @@ pub(crate) mod tests {
             .collect();
         let mut allowed: Vec<(&str, &str)> = Vec::new();
         allowed.extend(in_config.iter().map(|line| ("config/mod.rs", *line)));
-        allowed.extend(in_form.iter().map(|line| ("ui/connections.rs", *line)));
+        allowed.extend(
+            in_form
+                .iter()
+                .map(|line| ("ui/connections/tunnel.rs", *line)),
+        );
         allowed.extend(quoted.iter().map(|line| ("config/mod.rs", line.as_str())));
         let found = words_named_in(&root.join("src"), PLATFORM_DIR_WORDS, &allowed);
         assert!(

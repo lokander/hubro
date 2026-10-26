@@ -925,7 +925,7 @@ mod tests {
         // (file, where the modal starts, dismiss_on_backdrop)
         let modals: [(&[&str], &str, bool); 7] = [
             // Holding a half-typed connection.
-            (&["connections.rs"], "fn ConnectFormModal(", false),
+            (&["connections", "mod.rs"], "fn ConnectFormModal(", false),
             // Holding a column mapping and import options.
             (&["import.rs"], "pub fn ImportDialog(", false),
             // Holding a drafted change, maybe a hand-edited statement.
