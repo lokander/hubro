@@ -13,7 +13,9 @@
 //! - [`sql`] — running SQL, query history, and exports;
 //! - [`staging`] — staged edits and the save path;
 //! - [`session`] — snapshotting and restoring the open tabs;
-//! - [`import`] and [`schema_edit`] — importing a file, and editing a schema.
+//! - [`import`] and [`schema_edit`] — importing a file, and editing a schema;
+//! - [`tabs`] — the per-connection [`TabState`] a tab's close drops whole,
+//!   and the [`Slot`] every background operation's outcome goes through.
 //!
 //! `impl AppState` blocks live across these files, so the split is invisible
 //! to callers: everything is still reached as `state::…`.
@@ -35,10 +37,12 @@ mod session;
 mod source_reading;
 mod sql;
 mod staging;
+mod tabs;
 
 pub use backend::ServerBackend;
 pub use import::{ImportRequest, ImportStatus};
 pub use schema_edit::{after_edit, SchemaEditRequest, SchemaEditStatus};
+pub use tabs::{Slot, TabState};
 
 use std::collections::HashMap;
 #[cfg(test)]
@@ -655,11 +659,11 @@ pub struct SqlExportSource {
 /// instead.
 pub fn sql_export_status(
     statuses: &HashMap<(ConnectionId, ExportPane), ExportStatus>,
-    sources: &HashMap<ConnectionId, SqlExportSource>,
+    source: Option<&SqlExportSource>,
     id: ConnectionId,
     statement: &SharedStatement,
 ) -> Option<ExportStatus> {
-    let source = sources.get(&id)?;
+    let source = source?;
     if !statement.is(&source.statement) {
         return None;
     }
@@ -677,12 +681,12 @@ pub fn sql_export_status(
 /// the run in the tab the export was started from.
 pub fn orphaned_sql_export_status(
     statuses: &HashMap<(ConnectionId, ExportPane), ExportStatus>,
-    sources: &HashMap<ConnectionId, SqlExportSource>,
+    source: Option<&SqlExportSource>,
     id: ConnectionId,
     buffer: u64,
     shown: &[SharedStatement],
 ) -> Option<ExportStatus> {
-    let source = sources.get(&id)?;
+    let source = source?;
     if source.buffer != buffer || shown.iter().any(|s| s.is(&source.statement)) {
         return None;
     }
@@ -702,14 +706,14 @@ pub fn orphaned_sql_export_status(
 /// dismissed: it stays until then rather than following every table.
 pub fn grid_export_line(
     statuses: &HashMap<(ConnectionId, ExportPane), ExportStatus>,
-    tables: &HashMap<ConnectionId, TableRef>,
+    table: Option<&TableRef>,
     id: ConnectionId,
     shown: &TableRef,
 ) -> Option<(String, Tone, bool)> {
     let status = statuses.get(&(id, ExportPane::Grid))?;
     let finished = *status != ExportStatus::Running;
     let (text, tone) = status.line();
-    match tables.get(&id) {
+    match table {
         Some(source) if source != shown => {
             Some((format!("{}: {text}", source.label()), tone, finished))
         }
@@ -728,13 +732,11 @@ pub fn grid_export_line(
 /// So is one from another query tab, whose results this run does not touch.
 pub fn run_retires_sql_export(
     statuses: &HashMap<(ConnectionId, ExportPane), ExportStatus>,
-    sources: &HashMap<ConnectionId, SqlExportSource>,
+    source: Option<&SqlExportSource>,
     id: ConnectionId,
     buffer: u64,
 ) -> bool {
-    sources
-        .get(&id)
-        .is_some_and(|source| source.buffer == buffer)
+    source.is_some_and(|source| source.buffer == buffer)
         && !matches!(
             statuses.get(&(id, ExportPane::Sql)),
             Some(ExportStatus::Running)
@@ -1110,14 +1112,6 @@ pub struct AppState {
     /// the close is vetoed and a discard-and-quit confirmation is shown.
     /// Cleared on cancel or once the user discards and quits.
     pub confirm_quit: Signal<bool>,
-    /// Live SSH tunnels, one per tunneled open connection. Removing an entry
-    /// drops the [`Tunnel`], which shuts the forward down.
-    pub tunnels: Signal<HashMap<ConnectionId, Tunnel>>,
-    /// Open connections whose SSH session has ended under them, with what to
-    /// tell the user. Nothing can reach the database through such a tunnel any
-    /// more, but the pool cannot know that, so without this the tab would go
-    /// on looking connected while every query failed with a driver error.
-    pub lost_tunnels: Signal<HashMap<ConnectionId, String>>,
     /// Session tabs whose restore connect is still in flight, keyed by
     /// locator. Cleared when the connect ends, however it ends.
     pub restoring: Signal<HashMap<String, RestoredTab>>,
@@ -1152,6 +1146,10 @@ pub struct AppState {
     pub schemas: Signal<HashMap<ConnectionId, SchemaLoad>>,
     /// Sidebar/grid UI state per open connection.
     pub tab_ui: Signal<HashMap<ConnectionId, TabUi>>,
+    /// Per-connection bookkeeping written at the rate of a user's gestures,
+    /// dropped with the tab in one `remove` ([`TabState`]). Writes go through
+    /// [`Self::tab_mut`], which refuses a connection that is not open.
+    pub tabs: Signal<HashMap<ConnectionId, TabState>>,
     /// Staged (unsaved) edits per connection, keyed by [`TableRef::key`].
     /// The grid's editors push changes in via [`Self::stage_cell_edit`], the
     /// `stage_insert_*` family, and [`Self::stage_deletes`];
@@ -1180,38 +1178,15 @@ pub struct AppState {
     /// [`Self::any_dirty`] + [`Self::confirm_quit`], which raises a
     /// discard-and-quit confirmation rather than losing the edits silently.
     pub nav_guard: Signal<Option<PendingNav>>,
-    /// Latest free-form SQL result per query tab.
-    pub sql_runs: Signal<HashMap<(ConnectionId, u64), SqlRun>>,
+    /// Latest free-form SQL result per query tab, with the stale-run guard
+    /// and the in-flight run's handle ([`Slot`]). The handle is kept so the
+    /// Cancel button can abort the run — and so closing the query tab or the
+    /// connection cancels it, since a run nothing can reach still burns a
+    /// core and pins a pool connection.
+    pub sql_runs: Signal<Slot<(ConnectionId, u64), SqlRun>>,
     /// Scripts containing writes, held here until the user confirms (or
     /// dismisses) the write-confirmation banner, per query tab.
     pub pending_sql: Signal<HashMap<(ConnectionId, u64), PendingSql>>,
-    /// Staged saves waiting on the write-protection confirmation, one per
-    /// table, each holding the exact change list the prompt named.
-    ///
-    /// Only populated for connections marked [`WriteProtection::Confirm`];
-    /// an unmarked connection saves straight through as before. The staged
-    /// changes themselves stay in [`Self::staged`] — this holds only a copy,
-    /// so dismissing loses nothing, and the copy is what makes a confirmation
-    /// stale once the stage moves on (see `take_pending_save`). Armed, so a
-    /// press straight after the one that parked it does not confirm it.
-    pub pending_saves: Signal<HashMap<(ConnectionId, String), ParkedSave>>,
-    /// Per-connection accent colour, seeded from the saved entry at
-    /// connect time.
-    ///
-    /// Kept beside the registry rather than inside it because a colour warns
-    /// and never enforces: nothing in `db/` should be able to read it and act
-    /// on it. Its enforcing counterpart, [`WriteProtection`], lives on
-    /// [`Connection`] for the opposite reason.
-    pub connection_colors: Signal<HashMap<ConnectionId, ConnectionColor>>,
-    /// Handle of the in-flight run per query tab, kept so the Cancel button
-    /// can abort it. Entries are removed when a run completes — and cancelled
-    /// when the query tab or the connection closes, since a run nothing can
-    /// reach still burns a core and pins a pool connection.
-    pub sql_tasks: Signal<HashMap<(ConnectionId, u64), Task>>,
-    /// Stale-run guard: each started run gets the next generation number,
-    /// and a completing task only writes its result while its generation is
-    /// still current.
-    pub sql_generations: Signal<HashMap<(ConnectionId, u64), u64>>,
     /// Persisted query-history store, opened in the background at startup.
     /// `None` while opening or when opening failed (see
     /// [`Self::history_error`]) — history is best-effort and the app works
@@ -1233,10 +1208,6 @@ pub struct AppState {
     /// running a script must not make every open panel refetch a list that
     /// cannot have changed.
     pub saved_nonce: Signal<u64>,
-    /// Outcome of the most recent saved-query write, per connection. Keyed
-    /// like [`Self::export_status`]: one connection's "Saved" line
-    /// has no business appearing in another connection's panel.
-    pub saved_status: Signal<HashMap<ConnectionId, SavedStatus>>,
     /// The persisted theme choice (System / Light / Dark). The toggle cycles
     /// it; [`Self::set_theme`] persists it to settings.toml.
     pub theme: Signal<Theme>,
@@ -1263,54 +1234,25 @@ pub struct AppState {
     /// after the form has closed.
     pub pending_edit: Signal<Option<PendingEdit>>,
     /// Latest export progress per connection and pane. Written from the
-    /// `spawn_forever` export task.
-    pub export_status: Signal<HashMap<(ConnectionId, ExportPane), ExportStatus>>,
-    /// The result each connection's latest SQL-pane export was taken from,
-    /// so only that result's section shows the status
-    /// ([`sql_export_status`]).
-    pub sql_export_sources: Signal<HashMap<ConnectionId, SqlExportSource>>,
-    /// The table each connection's latest grid export was taken from, so
-    /// the line names it under any other table ([`grid_export_line`]).
-    pub grid_export_tables: Signal<HashMap<ConnectionId, TableRef>>,
-    /// Monotonic id per export slot; a finishing task only records its
-    /// outcome while it is still the slot's latest export, so a slow export
-    /// can't overwrite the status of one started after it.
-    pub export_generations: Signal<HashMap<(ConnectionId, ExportPane), u64>>,
-    /// Pending foreign-key focus per connection: a target table plus
-    /// the filter to seed. Set by [`Self::navigate_fk`] / [`Self::navigate_back`]
-    /// right before the target grid is selected; the grid consumes the entry
-    /// matching its table (on mount, or live for a same-table jump) and clears
-    /// it. At most one is pending per connection.
-    pub pending_focus: Signal<HashMap<ConnectionId, FocusTarget>>,
-    /// Back stack per connection: the views left behind by forward
-    /// foreign-key jumps, most recent last. [`Self::navigate_back`] pops one;
-    /// a manual table selection clears the stack.
-    pub nav_history: Signal<HashMap<ConnectionId, Vec<FocusTarget>>>,
+    /// `spawn_forever` export task; its [`Slot`] generation means a slow
+    /// export can't overwrite the status of one started after it. No handle
+    /// is kept: an export only writes a file, and closing the tab has never
+    /// stopped one.
+    pub export_status: Signal<Slot<(ConnectionId, ExportPane), ExportStatus>>,
     /// Latest import progress per connection. Written from the
     /// `spawn_forever` import task. Keyed per connection only — an
     /// import is always started from the grid, so there is no second pane to
-    /// tell apart.
-    pub import_status: Signal<HashMap<ConnectionId, ImportStatus>>,
-    /// Monotonic id per connection's import, so a slow import cannot record
-    /// its outcome over one started after it — the same guard the export
-    /// statuses carry.
-    pub import_generations: Signal<HashMap<ConnectionId, u64>>,
-    /// The in-flight import's task per connection, so closing the connection
-    /// can cancel it rather than leaving it to commit into a pool that is
-    /// being torn down. Held for the same reason [`Self::sql_tasks`] is.
-    pub import_tasks: Signal<HashMap<ConnectionId, Task>>,
+    /// tell apart. The [`Slot`] keeps the in-flight import's handle, so
+    /// closing the connection can cancel it rather than leaving it to commit
+    /// into a pool that is being torn down.
+    pub import_status: Signal<Slot<ConnectionId, ImportStatus>>,
     /// Latest schema-edit progress per connection. Written from the
     /// `spawn_forever` task in [`schema_edit`]. Per connection rather than per
     /// table: one dialog is open at a time, and the line it leaves behind
-    /// belongs to the tab.
-    pub schema_edits: Signal<HashMap<ConnectionId, SchemaEditStatus>>,
-    /// Monotonic id per connection's schema edit — the same staleness guard
-    /// the import and export statuses carry.
-    pub schema_edit_generations: Signal<HashMap<ConnectionId, u64>>,
-    /// The in-flight schema edit's task per connection, so closing the
-    /// connection drops it rather than leaving a statement running against a
-    /// pool being torn down.
-    pub schema_edit_tasks: Signal<HashMap<ConnectionId, Task>>,
+    /// belongs to the tab. The [`Slot`] keeps the in-flight edit's handle, so
+    /// closing the connection drops it rather than leaving a statement
+    /// running against a pool being torn down.
+    pub schema_edits: Signal<Slot<ConnectionId, SchemaEditStatus>>,
     /// Whether the keyboard-shortcut cheatsheet overlay is showing.
     /// App-global (one overlay for the whole window), toggled by `?` and
     /// dismissed by Escape / a backdrop click / `?` again.
@@ -1491,28 +1433,22 @@ impl AppState {
             host_key_prompt: Signal::new_in_scope(None, ScopeId::ROOT),
             entra_prompt: Signal::new_in_scope(None, ScopeId::ROOT),
             confirm_quit: Signal::new_in_scope(false, ScopeId::ROOT),
-            tunnels: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
-            lost_tunnels: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             restoring: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             ssh_remember: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             schemas: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             tab_ui: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            tabs: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             staged: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             grid_refresh: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             nav_guard: Signal::new_in_scope(None, ScopeId::ROOT),
-            sql_runs: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            sql_runs: Signal::new_in_scope(Slot::default(), ScopeId::ROOT),
             pending_sql: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
-            pending_saves: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
-            connection_colors: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
-            sql_tasks: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
-            sql_generations: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             history: Signal::new_in_scope(None, ScopeId::ROOT),
             history_error: Signal::new_in_scope(None, ScopeId::ROOT),
             history_record_error: Signal::new_in_scope(None, ScopeId::ROOT),
             history_nonce: Signal::new_in_scope(0, ScopeId::ROOT),
             history_recording: Signal::new_in_scope(true, ScopeId::ROOT),
             saved_nonce: Signal::new_in_scope(0, ScopeId::ROOT),
-            saved_status: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
             theme: Signal::new_in_scope(theme, ScopeId::ROOT),
             // `false`: assume a light system default until the startup
             // detection task below resolves the real one. An explicit
@@ -1528,18 +1464,9 @@ impl AppState {
             // chances to disagree about what the last session was.
             collapsed_groups: Signal::new_in_scope(Vec::new(), ScopeId::ROOT),
             pending_edit: Signal::new_in_scope(None, ScopeId::ROOT),
-            export_status: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
-            sql_export_sources: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
-            grid_export_tables: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
-            export_generations: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
-            import_status: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
-            import_generations: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
-            import_tasks: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
-            schema_edits: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
-            schema_edit_generations: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
-            schema_edit_tasks: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
-            pending_focus: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
-            nav_history: Signal::new_in_scope(HashMap::new(), ScopeId::ROOT),
+            export_status: Signal::new_in_scope(Slot::default(), ScopeId::ROOT),
+            import_status: Signal::new_in_scope(Slot::default(), ScopeId::ROOT),
+            schema_edits: Signal::new_in_scope(Slot::default(), ScopeId::ROOT),
             show_cheatsheet: Signal::new_in_scope(false, ScopeId::ROOT),
             paths: Signal::new_in_scope(paths, ScopeId::ROOT),
         }
@@ -1631,7 +1558,7 @@ impl AppState {
 
     /// This connection's accent colour, if the user set one.
     pub fn connection_color(&self, id: ConnectionId) -> Option<ConnectionColor> {
-        self.connection_colors.read().get(&id).copied()
+        self.tab(id, |tab| tab.color).flatten()
     }
 
     /// Introspects (or re-introspects) one connection's schema in the
@@ -1902,9 +1829,18 @@ impl AppState {
         }
         self.nav_guard.set(None);
         self.tab_ui.write().entry(id).or_default().selected_table = Some(table.clone());
-        if clear_fk_nav {
-            self.nav_history.write().remove(&id);
-            self.pending_focus.write().remove(&id);
+        // Checked before writing: every manual table selection lands here,
+        // and a write to `tabs` wakes every reader of any tab's state.
+        let fk_nav = self
+            .tab_peek(id, |tab| {
+                !tab.nav_history.is_empty() || tab.pending_focus.is_some()
+            })
+            .unwrap_or(false);
+        if clear_fk_nav && fk_nav {
+            self.tab_mut(id, |tab| {
+                tab.nav_history.clear();
+                tab.pending_focus = None;
+            });
         }
         true
     }
@@ -1912,10 +1848,8 @@ impl AppState {
     /// Whether this connection has anywhere to go Back to (a non-empty FK
     /// Back stack). Drives the grid's Back button visibility.
     pub fn can_go_back(&self, id: ConnectionId) -> bool {
-        self.nav_history
-            .read()
-            .get(&id)
-            .is_some_and(|stack| !stack.is_empty())
+        self.tab(id, |tab| !tab.nav_history.is_empty())
+            .unwrap_or(false)
     }
 
     /// Follows a foreign key from `origin` to the row it references:
@@ -1930,7 +1864,7 @@ impl AppState {
     /// with unsaved edits takes the usual second confirming click (a
     /// self-referencing FK only changes the filter, so it is never guarded).
     pub fn navigate_fk(
-        mut self,
+        self,
         id: ConnectionId,
         fk: &ForeignKeyMeta,
         source_row: &HashMap<String, Value>,
@@ -1949,22 +1883,12 @@ impl AppState {
             table: origin.clone(),
             filter: origin_filter,
         };
-        self.pending_focus.write().insert(id, focus);
-        if &target == origin {
-            // Self-referencing FK: the grid stays mounted and just refocuses
-            // its filter (consumed by its pending-focus effect). Record the
-            // origin so Back can restore the prior filter.
-            self.nav_history
-                .write()
-                .entry(id)
-                .or_default()
-                .push(origin_focus);
-        } else if self.switch_table(id, &target, false, gesture) {
-            self.nav_history
-                .write()
-                .entry(id)
-                .or_default()
-                .push(origin_focus);
+        self.tab_mut(id, |tab| tab.pending_focus = Some(focus));
+        // A self-referencing FK keeps the grid mounted and just refocuses
+        // its filter (consumed by its pending-focus effect); the origin is
+        // recorded either way, so Back can restore the prior filter.
+        if &target == origin || self.switch_table(id, &target, false, gesture) {
+            self.tab_mut(id, |tab| tab.nav_history.push(origin_focus));
         }
     }
 
@@ -1972,12 +1896,10 @@ impl AppState {
     /// restoring its table and filter. A no-op when the stack is empty. The
     /// entry is only popped once the return actually happens, so a staged-edit
     /// guard parking the switch keeps it for the confirming click.
-    pub fn navigate_back(mut self, id: ConnectionId, gesture: Gesture) {
+    pub fn navigate_back(self, id: ConnectionId, gesture: Gesture) {
         let target = self
-            .nav_history
-            .read()
-            .get(&id)
-            .and_then(|stack| stack.last().cloned());
+            .tab_peek(id, |tab| tab.nav_history.last().cloned())
+            .flatten();
         let Some(target) = target else {
             return;
         };
@@ -1987,15 +1909,13 @@ impl AppState {
             .get(&id)
             .and_then(|ui| ui.selected_table.clone());
         let dest = target.table.clone();
-        self.pending_focus.write().insert(id, target);
+        self.tab_mut(id, |tab| tab.pending_focus = Some(target));
         // Same-table restore only refocuses the filter (the grid's effect
         // consumes it); otherwise switch, honoring the unsaved-edits guard.
         let restored =
             current.as_ref() == Some(&dest) || self.switch_table(id, &dest, false, gesture);
         if restored {
-            if let Some(stack) = self.nav_history.write().get_mut(&id) {
-                stack.pop();
-            }
+            self.tab_mut(id, |tab| tab.nav_history.pop());
         }
     }
 
@@ -2141,67 +2061,37 @@ impl AppState {
             // component unmounts first.
             spawn_forever(async move { connection.pool.close().await });
         }
-        // Dropping the Tunnel signals its forward task to shut down.
-        self.tunnels.write().remove(&id);
-        self.lost_tunnels.write().remove(&id);
+        // Everything in TabState, at once. Dropping its Tunnel signals the
+        // forward task to shut down.
+        let tab = self.tabs.write().remove(&id);
+        drop(tab);
         self.open_locators
             .write()
             .retain(|(open_id, _)| *open_id != id);
         self.schemas.write().remove(&id);
         self.tab_ui.write().remove(&id);
-        self.sql_runs.write().retain(|(conn, _), _| *conn != id);
         self.pending_sql.write().retain(|(conn, _), _| *conn != id);
-        self.pending_saves
-            .write()
-            .retain(|(conn, _), _| *conn != id);
-        self.connection_colors.write().remove(&id);
-        self.saved_status.write().remove(&id);
-        self.export_status
-            .write()
-            .retain(|(conn, _), _| *conn != id);
-        self.sql_export_sources.write().remove(&id);
-        self.grid_export_tables.write().remove(&id);
-        self.export_generations
-            .write()
-            .retain(|(conn, _), _| *conn != id);
-        // Cancel an in-flight import before the pool is closed under it.
-        // Dropping the future drops its open transaction, so the rows it had
-        // written roll back — leaving it running would commit a partial file
-        // into a connection the user just closed, and its outcome would be
-        // dropped as stale, showing nothing.
-        if let Some(task) = self.import_tasks.write().remove(&id) {
-            task.cancel();
-        }
-        self.import_status.write().remove(&id);
-        self.import_generations.write().remove(&id);
-        // Same treatment for an in-flight schema edit: the statement is
-        // already at the server, but nothing here will be able to report what
-        // it did once the pool is gone.
-        if let Some(task) = self.schema_edit_tasks.write().remove(&id) {
-            task.cancel();
-        }
-        self.schema_edits.write().remove(&id);
-        self.schema_edit_generations.write().remove(&id);
-        self.pending_focus.write().remove(&id);
-        self.nav_history.write().remove(&id);
-        // Abort every query tab's in-flight run and drop the bookkeeping;
-        // bumping nothing is fine — removing the generation entries makes any
-        // still-alive task's generation stale.
-        let tasks: Vec<Task> = {
-            let mut sql_tasks = self.sql_tasks.write();
-            let ids: Vec<(ConnectionId, u64)> = sql_tasks
-                .keys()
-                .filter(|(conn, _)| *conn == id)
-                .copied()
-                .collect();
-            ids.iter().filter_map(|key| sql_tasks.remove(key)).collect()
-        };
+        // Every slot forgets the connection, which makes any run of it still
+        // alive stale; the ones still in flight are cancelled:
+        // - every query tab's run, which would otherwise go on burning a core
+        //   and pinning a pool connection with nothing able to stop it;
+        // - an import, before the pool is closed under it. Dropping the
+        //   future drops its open transaction, so the rows it had written
+        //   roll back — leaving it running would commit a partial file into a
+        //   connection the user just closed, and its outcome would be dropped
+        //   as stale, showing nothing;
+        // - a schema edit: the statement is already at the server, but
+        //   nothing here will be able to report what it did once the pool is
+        //   gone.
+        // Exports keep no handle; one still writing its file finishes, and
+        // its outcome is dropped as stale.
+        let mut tasks = self.sql_runs.write().close(|(conn, _)| *conn == id);
+        tasks.extend(self.export_status.write().close(|(conn, _)| *conn == id));
+        tasks.extend(self.import_status.write().close(|conn| *conn == id));
+        tasks.extend(self.schema_edits.write().close(|conn| *conn == id));
         for task in tasks {
             task.cancel();
         }
-        self.sql_generations
-            .write()
-            .retain(|(conn, _), _| *conn != id);
         if *self.active.read() == ActiveView::Connection(id) {
             self.active.set(ActiveView::Connections);
         }
@@ -3073,28 +2963,34 @@ mod tests {
         );
 
         assert_eq!(
-            sql_export_status(&statuses, &sources, id, &first),
+            sql_export_status(&statuses, sources.get(&id), id, &first),
             Some(done.clone())
         );
-        assert_eq!(sql_export_status(&statuses, &sources, id, &second), None);
-        // A clone of the exported result is the same result.
-        assert!(sql_export_status(&statuses, &sources, id, &first.clone()).is_some());
-        // Another connection never sees it, even with an equal-looking result.
-        assert_eq!(sql_export_status(&statuses, &sources, other, &first), None);
-        // A later run's results did not produce the file.
-        let rerun = rows_statement();
-        assert_eq!(sql_export_status(&statuses, &sources, id, &rerun), None);
-        // And with no recorded source nothing shows, whatever the status says.
         assert_eq!(
-            sql_export_status(&statuses, &HashMap::new(), id, &first),
+            sql_export_status(&statuses, sources.get(&id), id, &second),
             None
         );
+        // A clone of the exported result is the same result.
+        assert!(sql_export_status(&statuses, sources.get(&id), id, &first.clone()).is_some());
+        // Another connection never sees it, even with an equal-looking result.
+        assert_eq!(
+            sql_export_status(&statuses, sources.get(&other), other, &first),
+            None
+        );
+        // A later run's results did not produce the file.
+        let rerun = rows_statement();
+        assert_eq!(
+            sql_export_status(&statuses, sources.get(&id), id, &rerun),
+            None
+        );
+        // And with no recorded source nothing shows, whatever the status says.
+        assert_eq!(sql_export_status(&statuses, None, id, &first), None);
 
         // The run-level line is the other half: it shows exactly when the
         // exported result is not on screen in the tab it came from — a rerun
         // while the save dialog was open — so the outcome is never unshown.
         let orphaned = |buffer, shown: &[SharedStatement]| {
-            orphaned_sql_export_status(&statuses, &sources, id, buffer, shown)
+            orphaned_sql_export_status(&statuses, sources.get(&id), id, buffer, shown)
         };
         assert_eq!(orphaned(3, &[first.clone(), second.clone()]), None);
         assert_eq!(
@@ -3105,7 +3001,7 @@ mod tests {
         // Another query tab, or another connection, is not where it was asked.
         assert_eq!(orphaned(4, std::slice::from_ref(&rerun)), None);
         assert_eq!(
-            orphaned_sql_export_status(&statuses, &sources, other, 3, &[rerun]),
+            orphaned_sql_export_status(&statuses, sources.get(&other), other, 3, &[rerun]),
             None
         );
 
@@ -3121,19 +3017,34 @@ mod tests {
         let grid = HashMap::from([((id, ExportPane::Grid), ExportStatus::Done { rows: 7 })]);
         let tables = HashMap::from([(id, albums.clone())]);
         assert_eq!(
-            grid_export_line(&grid, &tables, id, &albums).unwrap().0,
+            grid_export_line(&grid, tables.get(&id), id, &albums)
+                .unwrap()
+                .0,
             "Exported 7 rows"
         );
         assert_eq!(
-            grid_export_line(&grid, &tables, id, &tracks).unwrap().0,
+            grid_export_line(&grid, tables.get(&id), id, &tracks)
+                .unwrap()
+                .0,
             "main.albums: Exported 7 rows"
         );
-        assert!(grid_export_line(&grid, &tables, id, &albums).unwrap().2);
+        assert!(
+            grid_export_line(&grid, tables.get(&id), id, &albums)
+                .unwrap()
+                .2
+        );
         let running = HashMap::from([((id, ExportPane::Grid), ExportStatus::Running)]);
-        assert!(!grid_export_line(&running, &tables, id, &albums).unwrap().2);
-        assert_eq!(grid_export_line(&grid, &tables, other, &albums), None);
+        assert!(
+            !grid_export_line(&running, tables.get(&id), id, &albums)
+                .unwrap()
+                .2
+        );
         assert_eq!(
-            grid_export_line(&HashMap::new(), &tables, id, &albums),
+            grid_export_line(&grid, tables.get(&other), other, &albums),
+            None
+        );
+        assert_eq!(
+            grid_export_line(&HashMap::new(), tables.get(&id), id, &albums),
             None
         );
 
@@ -3141,16 +3052,21 @@ mod tests {
         // it does not follow every later run around; another tab's run
         // leaves it, and so does any run while the export is still writing —
         // that outcome has not been shown anywhere yet.
-        assert!(run_retires_sql_export(&statuses, &sources, id, 3));
-        assert!(!run_retires_sql_export(&statuses, &sources, id, 4));
-        assert!(!run_retires_sql_export(&statuses, &sources, other, 3));
+        assert!(run_retires_sql_export(&statuses, sources.get(&id), id, 3));
+        assert!(!run_retires_sql_export(&statuses, sources.get(&id), id, 4));
+        assert!(!run_retires_sql_export(
+            &statuses,
+            sources.get(&other),
+            other,
+            3
+        ));
         let failed = HashMap::from([(
             (id, ExportPane::Sql),
             ExportStatus::Failed("disk full".into()),
         )]);
-        assert!(run_retires_sql_export(&failed, &sources, id, 3));
+        assert!(run_retires_sql_export(&failed, sources.get(&id), id, 3));
         let running = HashMap::from([((id, ExportPane::Sql), ExportStatus::Running)]);
-        assert!(!run_retires_sql_export(&running, &sources, id, 3));
+        assert!(!run_retires_sql_export(&running, sources.get(&id), id, 3));
     }
 
     #[test]

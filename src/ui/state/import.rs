@@ -167,18 +167,15 @@ impl AppState {
             .await;
             self.finish_import(id, generation, outcome, Some(table_key));
         });
-        self.import_tasks.write().insert(id, task);
+        self.import_status.write().attach(id, task);
     }
 
     /// Marks the connection's import slot Running and returns its generation.
+    ///
+    /// An import it supersedes is left to finish, unobserved: its handle is
+    /// dropped here, as it always has been, rather than cancelled.
     fn begin_import(mut self, id: ConnectionId, table: &str) -> u64 {
-        let generation = {
-            let mut generations = self.import_generations.write();
-            let entry = generations.entry(id).or_insert(0);
-            *entry += 1;
-            *entry
-        };
-        self.import_status.write().insert(
+        let (generation, _superseded) = self.import_status.write().begin(
             id,
             ImportStatus::Running {
                 table: table.to_string(),
@@ -199,11 +196,12 @@ impl AppState {
         outcome: Result<ImportReport, String>,
         table_key: Option<String>,
     ) {
-        let latest = self.import_generations.read().get(&id).copied();
-        if latest != Some(generation) {
+        // Releases the task handle too — nothing to cancel once the outcome
+        // is in, and a stale handle would let a later close "cancel" a task
+        // that has already committed.
+        if !self.import_status.write().finish(&id, generation) {
             return;
         }
-        self.release_import_task(id);
         let status = match outcome {
             Ok(report) => {
                 if let Some(key) = table_key {
@@ -213,14 +211,7 @@ impl AppState {
             }
             Err(err) => ImportStatus::Failed(err),
         };
-        self.import_status.write().insert(id, status);
-    }
-
-    /// Forgets a finished import's task handle — nothing to cancel once the
-    /// outcome is in, and a stale handle would let a later close "cancel" a
-    /// task that has already committed.
-    fn release_import_task(mut self, id: ConnectionId) {
-        self.import_tasks.write().remove(&id);
+        self.import_status.write().set(id, status);
     }
 
     /// Reports that a file picked for an import into `table` was dropped,
@@ -244,14 +235,14 @@ impl AppState {
         if !running {
             self.import_status
                 .write()
-                .insert(id, ImportStatus::Cancelled { table });
+                .set(id, ImportStatus::Cancelled { table });
         }
     }
 
     /// Clears the import line for one connection — the dialog's "dismiss"
     /// and what closing the dialog after a failure does.
     pub fn clear_import_status(mut self, id: ConnectionId) {
-        self.import_status.write().remove(&id);
+        self.import_status.write().clear(&id);
     }
 }
 
@@ -355,7 +346,7 @@ mod tests {
             let running = ImportStatus::Running {
                 table: "orders".into(),
             };
-            statuses.write().insert(id, running.clone());
+            statuses.write().set(id, running.clone());
             state.report_import_pick_dropped(id, "people".into());
             assert_eq!(state.import_status.peek().get(&id), Some(&running));
         });

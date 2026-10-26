@@ -710,7 +710,7 @@ fn GridToolbar(
     let can_back = state.can_go_back(id);
     let export_line = grid_export_line(
         &state.export_status.read(),
-        &state.grid_export_tables.read(),
+        state.grid_export_table(id).as_ref(),
         id,
         &table,
     );
@@ -1819,7 +1819,7 @@ mod tests {
                 table: "orders".into(),
             };
             let mut statuses = state.import_status;
-            statuses.write().insert(id, running.clone());
+            statuses.write().set(id, running.clone());
             deliver_import_pick(state, id, &people(), own, path.clone());
             assert_eq!(state.import_status.peek().get(&id), Some(&running));
         });

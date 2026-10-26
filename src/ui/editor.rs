@@ -531,7 +531,7 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
                         }
                         if let Some(status) = orphaned_sql_export_status(
                             &state.export_status.read(),
-                            &state.sql_export_sources.read(),
+                            state.sql_export_source(id).as_ref(),
                             id,
                             active,
                             &run.statements,
@@ -1018,7 +1018,7 @@ fn StatementSection(
         matches!(&result.outcome, StatementOutcome::Rows(rows) if !rows.rows.is_empty());
     let export_status: Option<ExportStatus> = sql_export_status(
         &state.export_status.read(),
-        &state.sql_export_sources.read(),
+        state.sql_export_source(id).as_ref(),
         id,
         &result,
     );

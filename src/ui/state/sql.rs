@@ -153,15 +153,13 @@ impl AppState {
     /// see [`Self::cancel_sql`].)
     pub fn close_sql_buffer(mut self, id: ConnectionId, buffer: u64) {
         self.tab_ui.write().entry(id).or_default().sql.close(buffer);
-        let task = self.sql_tasks.write().remove(&(id, buffer));
-        if let Some(task) = task {
+        // Closing the key makes any still-alive task for this buffer stale,
+        // so a completing run can't resurrect the closed tab's entry.
+        let tasks = self.sql_runs.write().close(|key| *key == (id, buffer));
+        for task in tasks {
             task.cancel();
         }
-        self.sql_runs.write().remove(&(id, buffer));
         self.pending_sql.write().remove(&(id, buffer));
-        // Removing the generation makes any still-alive task for this buffer
-        // stale, so a completing run can't resurrect the closed tab's entry.
-        self.sql_generations.write().remove(&(id, buffer));
     }
 
     /// Runs a free-form SQL script against one connection. Scripts where
@@ -247,9 +245,9 @@ impl AppState {
         if let Some((statement_index, reason)) = script_refusal(caps, &statements, dialect) {
             // Claim the run slot like a real run does: an in-flight script
             // must not push its results into the refusal or overwrite it.
-            self.claim_run_slot(id, buffer);
-            self.sql_runs.write().insert(
-                (id, buffer),
+            self.claim_run_slot(
+                id,
+                buffer,
                 SqlRun {
                     statements: Vec::new(),
                     status: RunStatus::Refused {
@@ -324,43 +322,38 @@ impl AppState {
     /// Either way each cancelled long-running statement keeps its server
     /// session busy until it finishes.
     pub fn cancel_sql(mut self, id: ConnectionId, buffer: u64) {
-        let task = self.sql_tasks.write().remove(&(id, buffer));
+        let task = self.sql_runs.write().take_task(&(id, buffer));
         let Some(task) = task else { return };
         task.cancel();
-        if let Some(run) = self.sql_runs.write().get_mut(&(id, buffer)) {
+        if let Some(run) = self.sql_runs.write().status_mut(&(id, buffer)) {
             if run.status == RunStatus::Running {
                 run.status = RunStatus::Cancelled;
             }
         }
     }
 
-    /// Takes ownership of one query tab's SQL run slot: cancels any
-    /// still-running task **of that tab** and bumps its generation, so a run
-    /// that completes later can tell it has been superseded and leaves the
-    /// new result alone. Returns the new generation.
+    /// Takes ownership of one query tab's SQL run slot with `run`: cancels
+    /// any still-running task **of that tab** and bumps its generation, so a
+    /// run that completes later can tell it has been superseded and leaves
+    /// the new result alone. Returns the new generation.
     ///
     /// Per buffer, so re-running in one query tab no longer cancels or
     /// discards a run another tab has going.
-    fn claim_run_slot(&mut self, id: ConnectionId, buffer: u64) -> u64 {
+    fn claim_run_slot(&mut self, id: ConnectionId, buffer: u64, run: SqlRun) -> u64 {
         // A new run replaces the results on screen, so a finished export of
         // one of them has been reported already and its line goes with them
         // (see `run_retires_sql_export`).
-        if run_retires_sql_export(
-            &self.export_status.peek(),
-            &self.sql_export_sources.peek(),
-            id,
-            buffer,
-        ) {
-            self.sql_export_sources.write().remove(&id);
+        let source = self
+            .tab_peek(id, |tab| tab.sql_export_source.clone())
+            .flatten();
+        if run_retires_sql_export(&self.export_status.peek(), source.as_ref(), id, buffer) {
+            self.tab_mut(id, |tab| tab.sql_export_source = None);
         }
-        let previous = self.sql_tasks.write().remove(&(id, buffer));
+        let (generation, previous) = self.sql_runs.write().begin((id, buffer), run);
         if let Some(previous) = previous {
             previous.cancel();
         }
-        let mut generations = self.sql_generations.write();
-        let entry = generations.entry((id, buffer)).or_insert(0);
-        *entry += 1;
-        *entry
+        generation
     }
 
     /// Executes a split script in the background: reads fetch rows, writes
@@ -382,9 +375,9 @@ impl AppState {
         else {
             return;
         };
-        let generation = self.claim_run_slot(id, buffer);
-        self.sql_runs.write().insert(
-            (id, buffer),
+        let generation = self.claim_run_slot(
+            id,
+            buffer,
             SqlRun {
                 statements: Vec::new(),
                 status: RunStatus::Running,
@@ -397,10 +390,8 @@ impl AppState {
         let task = spawn_forever(async move {
             let started = std::time::Instant::now();
             let result = run_script(&pool, caps, &statements, |statement| {
-                if self.sql_generation(id, buffer) == generation {
-                    if let Some(run) = self.sql_runs.write().get_mut(&(id, buffer)) {
-                        run.statements.push(SharedStatement::new(statement));
-                    }
+                if let Some(run) = self.sql_runs.write().current_mut(&(id, buffer), generation) {
+                    run.statements.push(SharedStatement::new(statement));
                 }
             })
             .await;
@@ -415,23 +406,15 @@ impl AppState {
                 self.record_history(id, script, success, error_text).await;
             });
             // Stale-run guard: a newer run (or a close) owns the slot now.
-            if self.sql_generation(id, buffer) != generation {
+            let mut runs = self.sql_runs.write();
+            if !runs.finish(&(id, buffer), generation) {
                 return;
             }
-            self.sql_tasks.write().remove(&(id, buffer));
-            if let Some(run) = self.sql_runs.write().get_mut(&(id, buffer)) {
+            if let Some(run) = runs.status_mut(&(id, buffer)) {
                 run.status = status;
             }
         });
-        self.sql_tasks.write().insert((id, buffer), task);
-    }
-
-    fn sql_generation(self, id: ConnectionId, buffer: u64) -> u64 {
-        self.sql_generations
-            .read()
-            .get(&(id, buffer))
-            .copied()
-            .unwrap_or(0)
+        self.sql_runs.write().attach((id, buffer), task);
     }
 
     /// Best-effort history write for a completed run: never blocks or fails
@@ -568,8 +551,8 @@ impl AppState {
     }
 
     /// Records the outcome of a saved-query write for one connection's panel.
-    fn set_saved_status(mut self, id: ConnectionId, status: SavedStatus) {
-        self.saved_status.write().insert(id, status);
+    fn set_saved_status(self, id: ConnectionId, status: SavedStatus) {
+        self.tab_mut(id, |tab| tab.saved_status = Some(status));
     }
 
     /// Names an existing buffer after the query just saved from it.
@@ -616,15 +599,15 @@ impl AppState {
         path: PathBuf,
     ) {
         let slot = (id, ExportPane::Grid);
-        self.grid_export_tables.write().insert(id, table);
+        self.tab_mut(id, |tab| tab.grid_export_table = Some(table));
         // With its `Reading`, which decides whether the export runs where the
         // engine refuses writes — see `DbPool::export`.
         let pool = self.registry.read().get(id).map(|c| c.browse());
         let Some((pool, reading)) = pool else {
-            self.begin_export(slot);
-            self.export_status
+            let _ = self
+                .export_status
                 .write()
-                .insert(slot, ExportStatus::Failed("connection closed".into()));
+                .begin(slot, ExportStatus::Failed("connection closed".into()));
             return;
         };
         let generation = self.begin_export(slot);
@@ -675,7 +658,7 @@ impl AppState {
     /// under that tab's run, if the result has been replaced by the time the
     /// export starts ([`orphaned_sql_export_status`]).
     pub fn export_result(
-        mut self,
+        self,
         id: ConnectionId,
         buffer: u64,
         statement: SharedStatement,
@@ -683,13 +666,12 @@ impl AppState {
         path: PathBuf,
     ) {
         let slot = (id, ExportPane::Sql);
-        self.sql_export_sources.write().insert(
-            id,
-            SqlExportSource {
+        self.tab_mut(id, |tab| {
+            tab.sql_export_source = Some(SqlExportSource {
                 buffer,
                 statement: statement.downgrade(),
-            },
-        );
+            })
+        });
         let generation = self.begin_export(slot);
         spawn_forever(async move {
             let tmp = export_temp_path(&path);
@@ -725,21 +707,16 @@ impl AppState {
     /// export offers none, so its outcome cannot be dismissed before it is
     /// known.
     pub fn clear_grid_export_status(mut self, id: ConnectionId) {
-        self.export_status.write().remove(&(id, ExportPane::Grid));
-        self.grid_export_tables.write().remove(&id);
+        self.export_status.write().clear(&(id, ExportPane::Grid));
+        self.tab_mut(id, |tab| tab.grid_export_table = None);
     }
 
     /// Marks a slot Running and returns the new export's generation.
     fn begin_export(mut self, slot: (ConnectionId, ExportPane)) -> u64 {
-        let generation = {
-            let mut generations = self.export_generations.write();
-            let entry = generations.entry(slot).or_insert(0);
-            *entry += 1;
-            *entry
-        };
-        self.export_status
+        let (generation, _no_task) = self
+            .export_status
             .write()
-            .insert(slot, ExportStatus::Running);
+            .begin(slot, ExportStatus::Running);
         generation
     }
 
@@ -751,15 +728,15 @@ impl AppState {
         generation: u64,
         outcome: Result<u64, String>,
     ) {
-        let latest = self.export_generations.read().get(&slot).copied();
-        if latest != Some(generation) {
+        let mut statuses = self.export_status.write();
+        if !statuses.finish(&slot, generation) {
             return;
         }
         let status = match outcome {
             Ok(rows) => ExportStatus::Done { rows },
             Err(err) => ExportStatus::Failed(err),
         };
-        self.export_status.write().insert(slot, status);
+        statuses.set(slot, status);
     }
 }
 
@@ -921,7 +898,7 @@ mod tests {
         let line = dom.in_runtime(|| {
             grid_export_line(
                 &state.export_status.peek(),
-                &state.grid_export_tables.peek(),
+                state.grid_export_table(id).as_ref(),
                 id,
                 &tracks,
             )
@@ -948,28 +925,21 @@ mod tests {
             rest: crate::db::RestOfRead::Ran,
         });
         dom.in_runtime(|| {
-            let (mut sources, mut statuses) = (state.sql_export_sources, state.export_status);
-            sources.write().insert(
-                id,
-                SqlExportSource {
+            state.tab_mut(id, |tab| {
+                tab.sql_export_source = Some(SqlExportSource {
                     buffer: 1,
                     statement: statement.downgrade(),
-                },
-            );
+                })
+            });
+            let mut statuses = state.export_status;
             statuses
                 .write()
-                .insert((id, ExportPane::Sql), ExportStatus::Done { rows: 1 });
+                .set((id, ExportPane::Sql), ExportStatus::Done { rows: 1 });
 
             state.run_sql(id, 2, "SELECT 1".into());
-            assert!(
-                state.sql_export_sources.peek().contains_key(&id),
-                "another tab's run"
-            );
+            assert!(state.sql_export_source(id).is_some(), "another tab's run");
             state.run_sql(id, 1, "SELECT 1".into());
-            assert!(
-                !state.sql_export_sources.peek().contains_key(&id),
-                "its own tab's run"
-            );
+            assert!(state.sql_export_source(id).is_none(), "its own tab's run");
         });
     }
 

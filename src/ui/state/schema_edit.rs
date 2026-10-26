@@ -162,19 +162,16 @@ impl AppState {
             let outcome = schema_edit_outcome(run_script(&pool, caps, &statements, |_| {}).await);
             self.finish_schema_edit(id, generation, outcome, &request);
         });
-        self.schema_edit_tasks.write().insert(id, task);
+        self.schema_edits.write().attach(id, task);
     }
 
     /// Marks the connection's schema-edit slot Running and returns its
     /// generation.
+    ///
+    /// An edit it supersedes is left to finish, unobserved: its handle is
+    /// dropped here, as it always has been, rather than cancelled.
     fn begin_schema_edit(mut self, id: ConnectionId, label: &str) -> u64 {
-        let generation = {
-            let mut generations = self.schema_edit_generations.write();
-            let entry = generations.entry(id).or_insert(0);
-            *entry += 1;
-            *entry
-        };
-        self.schema_edits.write().insert(
+        let (generation, _superseded) = self.schema_edits.write().begin(
             id,
             SchemaEditStatus::Running {
                 label: label.to_string(),
@@ -193,10 +190,9 @@ impl AppState {
         outcome: Result<(), String>,
         request: &SchemaEditRequest,
     ) {
-        if self.schema_edit_generations.read().get(&id).copied() != Some(generation) {
+        if !self.schema_edits.write().finish(&id, generation) {
             return;
         }
-        self.schema_edit_tasks.write().remove(&id);
         let status = match outcome {
             Ok(()) => {
                 self.apply_after_edit(id, request);
@@ -206,7 +202,7 @@ impl AppState {
             }
             Err(err) => SchemaEditStatus::Failed(err),
         };
-        self.schema_edits.write().insert(id, status);
+        self.schema_edits.write().set(id, status);
     }
 
     /// Re-reads the schema and repoints what the statement moved out from
@@ -245,7 +241,7 @@ impl AppState {
 
     /// Clears the schema-edit line for one connection — the pane's dismiss.
     pub fn clear_schema_edit_status(mut self, id: ConnectionId) {
-        self.schema_edits.write().remove(&id);
+        self.schema_edits.write().clear(&id);
     }
 
     /// This connection's schema-edit status, if any.

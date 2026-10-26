@@ -32,7 +32,7 @@ pub(super) fn SavedQueriesPanel(
     /// The buffer a save takes its text from — the one on screen.
     buffer: u64,
 ) -> Element {
-    let mut state = use_context::<AppState>();
+    let state = use_context::<AppState>();
     // The committed filter, set on Enter like the history panel's.
     let search = use_signal(String::new);
     let mut showing_form = use_signal(|| false);
@@ -40,7 +40,7 @@ pub(super) fn SavedQueriesPanel(
     let history_error = state.history_error.read().clone();
     // Per connection, like the export status: another connection's "Saved"
     // line has no business showing up in this panel.
-    let status = state.saved_status.read().get(&id).cloned();
+    let status = state.saved_status(id);
     // Empty buffers are not worth naming, and the store refuses them anyway;
     // saying so on the button beats a red line after the fact.
     let buffer_empty = state.sql_buffer_text(id, buffer).trim().is_empty();
@@ -71,7 +71,7 @@ pub(super) fn SavedQueriesPanel(
                             "Save what is in the editor under a name"
                         },
                         onclick: move |_| {
-                            state.saved_status.write().remove(&id);
+                            state.clear_saved_status(id);
                             showing_form.set(true);
                         },
                         "Save current query"

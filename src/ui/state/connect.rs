@@ -1368,12 +1368,10 @@ impl AppState {
                 // one place, so a new connect path cannot forget it.
                 let marking = self.saved_marking(&locator);
                 let id = self.registry.write().insert(name, pool, marking.0);
-                if let Some(color) = marking.1 {
-                    self.connection_colors.write().insert(id, color);
-                }
+                self.tab_mut(id, |tab| tab.color = marking.1);
                 if let Some(tunnel) = tunnel {
                     self.watch_tunnel(id, &tunnel);
-                    self.tunnels.write().insert(id, tunnel);
+                    self.tab_mut(id, |tab| tab.tunnel = Some(tunnel));
                 }
                 self.open_locators.write().push((id, locator));
                 if focus {
@@ -1417,13 +1415,11 @@ impl AppState {
         ended: impl std::future::Future<Output = ()> + 'static,
         message: String,
     ) {
-        let mut lost = self.lost_tunnels;
-        let registry = self.registry;
         spawn_forever(async move {
             ended.await;
-            if registry.peek().get(id).is_some() {
-                lost.write().insert(id, message);
-            }
+            // `tab_mut` drops the write for a connection no longer in the
+            // registry.
+            self.tab_mut(id, |tab| tab.lost_tunnel = Some(message));
         });
     }
 }
@@ -4497,7 +4493,17 @@ mod tests {
         drop(end_closed);
         drop(end_open);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while dom.in_runtime(|| state.lost_tunnels.peek().is_empty()) {
+        fn lost_tunnels(dom: &VirtualDom, state: AppState) -> HashMap<ConnectionId, String> {
+            dom.in_runtime(|| {
+                state
+                    .tabs
+                    .peek()
+                    .iter()
+                    .filter_map(|(id, tab)| Some((*id, tab.lost_tunnel.clone()?)))
+                    .collect()
+            })
+        }
+        while lost_tunnels(&dom, state).is_empty() {
             assert!(tokio::time::Instant::now() < deadline, "never flagged");
             let _ = tokio::time::timeout(std::time::Duration::from_millis(50), dom.wait_for_work())
                 .await;
@@ -4506,7 +4512,11 @@ mod tests {
         // One more round, so the closed tab's watch has had its chance too.
         let _ =
             tokio::time::timeout(std::time::Duration::from_millis(50), dom.wait_for_work()).await;
-        let lost = dom.in_runtime(|| state.lost_tunnels.peek().clone());
-        assert_eq!(lost, HashMap::from([(still_open, "a lost".to_string())]));
+        assert_eq!(
+            lost_tunnels(&dom, state),
+            HashMap::from([(still_open, "a lost".to_string())])
+        );
+        // And the closed tab has no state left to be flagged in.
+        assert!(dom.in_runtime(|| !state.tabs.peek().contains_key(&closed)));
     }
 }

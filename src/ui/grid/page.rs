@@ -223,27 +223,22 @@ pub(super) fn use_grid_query(id: ConnectionId, table: &TableRef) -> GridQuery {
     let seed_table = table.clone();
     let mut applied_filter = use_signal(move || {
         state
-            .pending_focus
-            .peek()
-            .get(&id)
+            .tab_peek(id, |tab| tab.pending_focus.clone())
+            .flatten()
             .filter(|focus| focus.table == seed_table)
-            .and_then(|focus| focus.filter.clone())
+            .and_then(|focus| focus.filter)
     });
     let focus_table = table.clone();
     use_effect(move || {
-        let mut state = state;
         let matched = state
-            .pending_focus
-            .read()
-            .get(&id)
-            .filter(|focus| focus.table == focus_table)
-            .cloned();
+            .pending_focus(id)
+            .filter(|focus| focus.table == focus_table);
         if let Some(focus) = matched {
             applied_filter.set(focus.filter);
             page.set(0);
             // Reading pending_focus above subscribes this effect; removing the
             // consumed entry re-runs it once (now no match) — no loop.
-            state.pending_focus.write().remove(&id);
+            state.clear_pending_focus(id);
         }
     });
 
