@@ -249,12 +249,13 @@ pub(super) fn entra_stored_copy(source: Option<RefreshSource>, rejected: bool) -
     }
 }
 
-/// A token an Entra sign-in acquired, with the sign-out generation the
-/// sign-in began at ([`kept_after_sign_in`]): the two travel together from
-/// the token's read to the decision to keep its refresh token.
-struct EntraSignIn {
+/// A token an Entra sign-in acquired and, when it was redeemed from storage,
+/// the sign-out generation it was read at ([`kept_after_sign_in`]): the two
+/// travel together from [`AppState::acquire_entra`] to the decision to keep
+/// its refresh token.
+pub(super) struct EntraSignIn {
     token: azure::AccessToken,
-    began: u64,
+    redeemed_at: Option<u64>,
 }
 
 /// What to do with the keyring entry for a sign-in's refresh token.
@@ -353,13 +354,19 @@ pub(super) fn keyring_sign_in_redeemable(
     sign_outs.get(url).is_none_or(|record| record.deleting == 0)
 }
 
-/// Whether a sign-in that began at sign-out generation `began` may keep the
-/// refresh token it got back, now that the connection is at `now`. Not if
-/// any sign-out came in between: the token was read, or redeemed, from a
-/// sign-in the user has since revoked, and keeping its rotated successor
-/// would undo the sign-out — in the keyring when the old one was remembered.
-pub(super) fn kept_after_sign_in(began: u64, now: u64) -> bool {
-    began == now
+/// Whether a sign-in may keep the refresh token it got back, now that the
+/// connection is at sign-out generation `now`.
+///
+/// `redeemed_at` is the generation a token *redeemed from storage* was read
+/// at, and `None` for a sign-in the user has just made in the browser. Only
+/// the first is revoked by a sign-out since: it is the old consent, and
+/// keeping its rotated successor would undo the sign-out — in the keyring when
+/// the old one was remembered. A fresh sign-in is fresh consent, kept where
+/// its card's answer says whatever was signed out before it — including the
+/// connect's own forgetting of a refused token, which the browser sign-in
+/// that follows it exists to replace.
+pub(super) fn kept_after_sign_in(redeemed_at: Option<u64>, now: u64) -> bool {
+    redeemed_at.is_none_or(|began| began == now)
 }
 
 /// Whether a write to the saved list leaves the entry under a locator unable
@@ -1602,10 +1609,12 @@ impl AppState {
         url: &str,
         open_browser: impl FnOnce(&str) -> Result<(), azure::AzureError>,
     ) -> (
-        Result<azure::AccessToken, azure::AzureError>,
+        Result<EntraSignIn, azure::AzureError>,
         Option<RefreshSource>,
         StoredCopy,
     ) {
+        // Before the token is read: a sign-out from here on revokes it.
+        let began = self.entra_sign_out_generation(url);
         let cached = self.cached_entra_refresh(url).await;
         let acquired = azure::acquire_token(
             entra,
@@ -1621,7 +1630,11 @@ impl AppState {
         }
         let source = cached.map(|(_, source)| source);
         let stored = entra_stored_copy(source, acquired.refresh_rejected);
-        (acquired.token, source, stored)
+        let redeemed_at = acquired.redeemed.then_some(began);
+        let signed_in = acquired
+            .token
+            .map(|token| EntraSignIn { token, redeemed_at });
+        (signed_in, source, stored)
     }
 
     /// Drops a connection's kept refresh token from session memory and the
@@ -1665,18 +1678,28 @@ impl AppState {
     /// ([`place_entra_refresh`]). A keyring that refuses the store leaves it
     /// for the session instead, and says so, as a refused password store does.
     ///
-    /// `began` is the sign-out generation the connect began at. A sign-out
-    /// since then means the token comes from a sign-in the user has revoked,
-    /// so it is kept nowhere — not in the keyring, and not for the session.
-    async fn keep_entra_refresh(mut self, url: &str, refresh: String, remember: bool, began: u64) {
-        if !kept_after_sign_in(began, self.entra_sign_out_generation(url)) {
+    /// `redeemed_at` is when a token redeemed from storage was read
+    /// ([`EntraSignIn`]). A sign-out since then means it comes from a sign-in
+    /// the user has revoked, so it is kept nowhere — not in the keyring, and
+    /// not for the session.
+    async fn keep_entra_refresh(
+        mut self,
+        url: &str,
+        refresh: String,
+        remember: bool,
+        redeemed_at: Option<u64>,
+    ) {
+        if !kept_after_sign_in(redeemed_at, self.entra_sign_out_generation(url)) {
             return;
         }
         let placed =
             place_entra_refresh(&mut self.session_passwords.write(), url, refresh, remember);
         match apply_refresh_keyring(url, placed).await {
-            // Unknown is not worth a word here: nobody asked for a deletion,
-            // and a keyring that cannot be reached has said so already.
+            // Not reported, as before this outcome had a name: an unticked
+            // box on a machine whose keyring cannot be reached is most often
+            // one with no keyring at all, and saying so after every such
+            // sign-in would be noise. A remembered sign-in that did survive
+            // shows itself as a silent sign-in, which "Sign out" can remove.
             RefreshKeyringOutcome::Applied | RefreshKeyringOutcome::Unreachable => {}
             RefreshKeyringOutcome::StoreRefused(refresh) => {
                 self.session_passwords
@@ -1731,9 +1754,9 @@ impl AppState {
                 }
                 RefreshKeyringOutcome::Unreachable => {
                     self.connect_error.set(Some(format!(
-                        "{name} is signed out for this session, but the system keyring \
-                         could not be reached: a sign-in remembered there will still \
-                         sign you in once it can be"
+                        "{name}: the system keyring could not be reached, so a sign-in \
+                         remembered there, if there is one, was not removed and will \
+                         still sign you in once the keyring is available"
                     )));
                 }
                 // `StoreRefused` cannot come of a `Delete`; treated as done
@@ -1774,8 +1797,6 @@ impl AppState {
         live_tunnel: Option<Tunnel>,
     ) {
         self.set_step(&pending.url, ConnectStep::SigningIn);
-        // Before the token is read: a sign-out from here on revokes it.
-        let began = self.entra_sign_out_generation(&pending.url);
         let (token, source, stored) = self
             .acquire_entra(
                 &pending.entra,
@@ -1792,7 +1813,7 @@ impl AppState {
                     pending,
                     &connect_url,
                     tls_host,
-                    EntraSignIn { token, began },
+                    token,
                     live_tunnel,
                 )
                 .await;
@@ -1831,7 +1852,7 @@ impl AppState {
         signed_in: EntraSignIn,
         live_tunnel: Option<Tunnel>,
     ) {
-        let EntraSignIn { token, began } = signed_in;
+        let EntraSignIn { token, redeemed_at } = signed_in;
         let EntraPrompt {
             url,
             name,
@@ -1860,7 +1881,7 @@ impl AppState {
             // Kept for silent renewals: in the keyring only on `remember`.
             // Exposed only to be kept where the user's answer says.
             if let Some(refresh) = token.refresh_token.map(|r| r.expose().to_string()) {
-                self.keep_entra_refresh(&url, refresh, remember, began)
+                self.keep_entra_refresh(&url, refresh, remember, redeemed_at)
                     .await;
             }
             self.save_server_if_open(backend, &url, &name, tunnel, ServerAuth::Entra(entra));
@@ -1892,8 +1913,6 @@ impl AppState {
             return;
         };
         let tls_host = backend.tls_host(&prompt.url, prompt.tunnel.is_some());
-        // Before the token is read: a sign-out from here on revokes it.
-        let began = self.entra_sign_out_generation(&prompt.url);
         let (token, _, stored) = self
             .acquire_entra(
                 &prompt.entra,
@@ -1911,7 +1930,7 @@ impl AppState {
                     prompt,
                     &connect_url,
                     tls_host,
-                    EntraSignIn { token, began },
+                    token,
                     live_tunnel,
                 )
                 .await;
@@ -3504,7 +3523,7 @@ mod tests {
             (&card, "checked: remember(),"),
             (
                 &finish,
-                "self.keep_entra_refresh(&url, refresh, remember, began)",
+                "self.keep_entra_refresh(&url, refresh, remember, redeemed_at)",
             ),
             (
                 &keep,
@@ -5355,10 +5374,7 @@ mod tests {
                 "async fn acquire_entra(",
                 "let stored = entra_stored_copy(source, acquired.refresh_rejected);",
             ),
-            (
-                "async fn acquire_entra(",
-                "(acquired.token, source, stored)",
-            ),
+            ("async fn acquire_entra(", "(signed_in, source, stored)"),
             (
                 "async fn connect_server_entra(",
                 "pending.remember = card_offers_remember(source); pending.stored = stored; \
@@ -6038,7 +6054,7 @@ mod tests {
             dom.in_runtime(|| {
                 spawn_forever(async move {
                     state
-                        .keep_entra_refresh(&task_url, "fresh".to_string(), remember, 0)
+                        .keep_entra_refresh(&task_url, "fresh".to_string(), remember, None)
                         .await;
                     // Marks the task done, whatever it decided.
                     crate::secrets::store_password(&format!("{task_key}-done"), "1").unwrap();
@@ -6138,10 +6154,18 @@ mod tests {
         end_entra_sign_out(&mut sign_outs, "a");
         assert!(keyring_sign_in_redeemable(&sign_outs, "a"));
         let now = entra_sign_out_generation(&sign_outs, "a");
-        assert!(!kept_after_sign_in(began, now));
-        assert!(kept_after_sign_in(now, now));
+        assert!(
+            !kept_after_sign_in(Some(began), now),
+            "a token redeemed before a sign-out outlives it"
+        );
+        assert!(kept_after_sign_in(Some(now), now));
+        assert!(
+            kept_after_sign_in(None, now),
+            "a sign-in the user just made in the browser is thrown away because \
+             something was signed out before it"
+        );
         assert!(kept_after_sign_in(
-            entra_sign_out_generation(&sign_outs, "b"),
+            Some(entra_sign_out_generation(&sign_outs, "b")),
             entra_sign_out_generation(&sign_outs, "b")
         ));
     }
@@ -6250,34 +6274,33 @@ mod tests {
             1,
             "a sign-out is offered outside the gate: {row}"
         );
-        // Both connect flows read the generation before the token, and the
-        // keep decides on it.
+        // The acquire reads the generation before the token, and marks only
+        // a token redeemed from storage as revocable by a later sign-out; the
+        // keep decides on what it was handed.
         let source = include_str!("connect.rs");
-        for flow in [
-            "async fn connect_server_entra(",
-            "pub async fn connect_server_with_entra_signin(",
-        ] {
-            let body = collapsed(&code_of(&method_body(source, flow)));
-            let read = body
-                .find("let began = self.entra_sign_out_generation(")
-                .unwrap_or_else(|| panic!("{flow} no longer records when it began: {body}"));
-            let acquired = body.find(".acquire_entra(").expect("the flow acquires");
-            assert!(
-                read < acquired,
-                "{flow} records its start after the read: {body}"
-            );
-            assert!(
-                body.contains("EntraSignIn { token, began }"),
-                "{flow}: {body}"
-            );
-        }
+        let acquire = collapsed(&code_of(&method_body(source, "async fn acquire_entra(")));
+        let read = acquire
+            .find("let began = self.entra_sign_out_generation(url);")
+            .unwrap_or_else(|| panic!("the acquire no longer records when it began: {acquire}"));
+        let cached = acquire
+            .find("self.cached_entra_refresh(url)")
+            .expect("the acquire reads the kept token");
+        assert!(
+            read < cached,
+            "the acquire records its start after the read: {acquire}"
+        );
+        assert!(
+            acquire.contains("let redeemed_at = acquired.redeemed.then_some(began);")
+                && acquire.contains(".map(|token| EntraSignIn { token, redeemed_at });"),
+            "the acquire marks something other than a redeemed token as revocable: {acquire}"
+        );
         assert!(
             collapsed(&code_of(&method_body(
                 source,
                 "async fn finish_entra_connect("
             )))
-            .contains("let EntraSignIn { token, began } = signed_in;"),
-            "finish_entra_connect keeps a token without knowing when its sign-in began"
+            .contains("let EntraSignIn { token, redeemed_at } = signed_in;"),
+            "finish_entra_connect keeps a token without knowing whether it was redeemed"
         );
 
         let _keyring = crate::secrets::tests::mock_keyring();
@@ -6385,7 +6408,7 @@ mod tests {
         dom.in_runtime(|| {
             spawn_forever(async move {
                 state
-                    .keep_entra_refresh(URL, "rotated".to_string(), true, began)
+                    .keep_entra_refresh(URL, "rotated".to_string(), true, Some(began))
                     .await;
                 *flag.lock().unwrap() = true;
             });
@@ -6457,6 +6480,68 @@ mod tests {
             "the card still warns about the remembered sign-in just removed"
         );
         crate::secrets::delete_password(&other_key).unwrap();
+    }
+
+    #[allow(clippy::await_holding_lock)] // see the Postgres test above
+    #[tokio::test]
+    async fn a_browser_sign_in_after_a_refused_token_is_kept_where_its_card_says() {
+        // The stale-token recovery path, executed hop by hop as
+        // `acquire_entra` runs it: the generation is read, the kept token is
+        // read, Entra refuses it for good so it is forgotten — through the
+        // sign-out path, which moves the generation — and the browser sign-in
+        // that follows succeeds with "Stay signed in" ticked. That sign-in is
+        // fresh consent: its token must reach the keyring, although a
+        // sign-out (the connect's own) came after the generation was read.
+        use dioxus::core::VirtualDom;
+
+        use crate::ui::test_dom::provide_state;
+
+        let _keyring = crate::secrets::tests::mock_keyring();
+        fn empty() -> Element {
+            rsx! {}
+        }
+        let mut dom = VirtualDom::new(empty);
+        let state = provide_state(&dom);
+        dom.rebuild_in_place();
+
+        const URL: &str = "postgres://u@stale-token:5432/a";
+        let key = entra_secret_key(URL);
+        crate::secrets::store_password(&key, "stale").unwrap();
+        let began = dom.in_runtime(|| state.entra_sign_out_generation(URL));
+        assert_eq!(
+            next_connect_finds(&mut dom, state, URL).await,
+            Some(("stale".to_string(), RefreshSource::Keyring))
+        );
+        let done = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let flag = done.clone();
+        dom.in_runtime(|| {
+            spawn_forever(async move {
+                // `if acquired.refresh_rejected { self.forget_entra_refresh(url) }`
+                state.forget_entra_refresh(URL).await;
+                // An interactive token: `acquired.redeemed` is false.
+                let redeemed_at = false.then_some(began);
+                state
+                    .keep_entra_refresh(URL, "fresh".to_string(), true, redeemed_at)
+                    .await;
+                *flag.lock().unwrap() = true;
+            });
+        });
+        settle_until(&mut dom, "the recovery never ran", |_| {
+            *done.lock().unwrap()
+        })
+        .await;
+        assert_ne!(
+            dom.in_runtime(|| state.entra_sign_out_generation(URL)),
+            began,
+            "the forgetting no longer counts as a sign-out, so this test no \
+             longer covers the case it was written for"
+        );
+        assert_eq!(
+            crate::secrets::get_password(&key).unwrap().as_deref(),
+            Some("fresh"),
+            "a ticked \"Stay signed in\" was thrown away after a refused token"
+        );
+        crate::secrets::delete_password(&key).unwrap();
     }
 
     #[allow(clippy::await_holding_lock)] // see the Postgres test above

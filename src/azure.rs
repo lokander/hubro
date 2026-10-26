@@ -178,6 +178,11 @@ pub struct Acquisition {
     /// should forget it. Reported even when the interactive fallback then
     /// succeeded, since that is a different token.
     pub refresh_rejected: bool,
+    /// `token` came from redeeming the cached refresh token, not from a
+    /// sign-in the user just made (or a managed identity). A caller that
+    /// revokes kept sign-ins tells the two apart by this: a redeemed token is
+    /// the old consent, an interactive one is fresh.
+    pub redeemed: bool,
 }
 
 /// Acquires an access token for `auth`, scoped to `resource` (the target
@@ -198,6 +203,7 @@ pub async fn acquire_token(
     let acquired = |token| Acquisition {
         token,
         refresh_rejected: false,
+        redeemed: false,
     };
     match auth {
         EntraAuth::ManagedIdentity { client_id } => {
@@ -214,7 +220,13 @@ pub async fn acquire_token(
             let mut refresh_rejected = false;
             if let Some(refresh) = cached_refresh {
                 match redeem_refresh_token(endpoints, tenant, client_id, resource, refresh).await {
-                    Ok(token) => return acquired(Ok(token)),
+                    Ok(token) => {
+                        return Acquisition {
+                            token: Ok(token),
+                            refresh_rejected: false,
+                            redeemed: true,
+                        }
+                    }
                     Err(err) => refresh_rejected = rejects_refresh(&err),
                 }
             }
@@ -230,6 +242,7 @@ pub async fn acquire_token(
             Acquisition {
                 token,
                 refresh_rejected,
+                redeemed: false,
             }
         }
     }

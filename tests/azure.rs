@@ -75,7 +75,7 @@ async fn interactive_flow_exchanges_the_code_for_a_token() {
         imds: "http://127.0.0.1:1".to_string(),
     };
 
-    let token = acquire_token(
+    let acquired = acquire_token(
         &EntraAuth::interactive_default(),
         OSSRDBMS_RESOURCE,
         None,
@@ -83,9 +83,13 @@ async fn interactive_flow_exchanges_the_code_for_a_token() {
         Duration::from_secs(5),
         fake_browser,
     )
-    .await
-    .token
-    .unwrap();
+    .await;
+    assert!(
+        !acquired.redeemed,
+        "a sign-in the user just made reads as an old one redeemed, so a \
+         sign-out racing it throws it away"
+    );
+    let token = acquired.token.unwrap();
 
     assert_eq!(token.secret.expose(), "ACCESS_TOKEN");
     assert_eq!(
@@ -117,6 +121,11 @@ async fn a_cached_refresh_token_is_redeemed_without_opening_a_browser() {
     )
     .await;
     assert!(!acquired.refresh_rejected);
+    assert!(
+        acquired.redeemed,
+        "a redeemed token reads as a fresh sign-in, so a sign-out cannot \
+         stop it being kept"
+    );
     let token = acquired.token.unwrap();
 
     assert_eq!(token.secret.expose(), "RENEWED");
