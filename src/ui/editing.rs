@@ -650,6 +650,41 @@ mod tests {
     use super::*;
     use crate::db::TypeRef;
 
+    /// And it offers no input to type into: an editor mounted without a
+    /// dialect draws the refusal where the checkbox would be.
+    #[test]
+    fn an_editor_without_a_dialect_draws_its_refusal_instead_of_an_input() {
+        use dioxus::core::VirtualDom;
+        #[allow(non_snake_case)]
+        fn Mounted(dialect: Option<Dialect>) -> Element {
+            rsx! {
+                CellEditor {
+                    kind: EditorKind::Bool,
+                    dialect,
+                    nullable: false,
+                    initial: Value::Integer(1),
+                    draft: None,
+                    on_commit: |_| {},
+                    on_cancel: |_| {},
+                    on_draft: None,
+                    on_default: None,
+                }
+            }
+        }
+        let shown = |dialect: Option<Dialect>| -> Vec<String> {
+            let mut dom = VirtualDom::new_with_props(Mounted, dialect);
+            let built = dom.rebuild_to_vec().edits;
+            crate::ui::test_dom::texts(&built)
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        };
+        assert!(shown(None).iter().any(|text| text == NO_DIALECT));
+        assert!(!shown(Some(Dialect::Postgres))
+            .iter()
+            .any(|text| text == NO_DIALECT));
+    }
+
     /// Without a dialect the editor stages nothing, on either of its commit
     /// paths: a boolean would otherwise be staged as SQLite's `1`, the wrong
     /// literal for PostgreSQL. With one, the dialect's own value.
