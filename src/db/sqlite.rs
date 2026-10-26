@@ -1706,18 +1706,14 @@ mod tests {
         assert_eq!(rows.rows, vec![vec![Value::Integer(1)]]);
     }
 
-    /// `source` up to its test module, with comment lines dropped. Line-based,
-    /// so a CRLF checkout reads the same.
-    fn shipped_code(source: &str) -> Vec<&str> {
-        let lines: Vec<&str> = source.lines().collect();
-        let end = lines
-            .windows(2)
-            .position(|w| w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod "))
-            .unwrap_or(lines.len());
-        lines[..end]
-            .iter()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .copied()
+    /// `source` outside its test modules, line by line, with comments removed
+    /// ([`crate::source_scan::code_outside_test_modules`]) and the lines that
+    /// leaves empty dropped.
+    fn shipped_code(source: &str) -> Vec<String> {
+        crate::source_scan::code_outside_test_modules(source)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_string)
             .collect()
     }
 

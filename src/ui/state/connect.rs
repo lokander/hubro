@@ -1695,7 +1695,7 @@ mod tests {
             "offered",
         ];
         let source = &connect_code();
-        let card = include_str!("../connections.rs");
+        let card = &shipped(include_str!("../connections.rs"));
         let form = method_body(card, "fn submit_server_form(");
         let hops = [
             ("the card", method_body(card, "fn PasswordPromptCard(")),
@@ -1800,11 +1800,7 @@ mod tests {
         let postgres = include_str!("../../db/postgres.rs");
         let mssql = include_str!("../../db/sqlserver/pool.rs");
         let registry = include_str!("../../db/registry.rs");
-        let provider = include_str!("../../db/entra.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("the shipped half")
-            .to_string();
+        let provider = shipped(include_str!("../../db/entra.rs"));
         let wire = [
             ("db/entra.rs", provider),
             ("entra_renewal", method_body(connect, "fn entra_renewal(")),
@@ -1989,7 +1985,10 @@ mod tests {
             "has_refresh",
         ];
         let source = &connect_code();
-        let card = method_body(include_str!("../connections.rs"), "fn EntraSignInCard(");
+        let card = method_body(
+            &shipped(include_str!("../connections.rs")),
+            "fn EntraSignInCard(",
+        );
         let signin = method_body(source, "pub async fn connect_server_with_entra_signin(");
         let silent = method_body(source, "async fn connect_server_entra(");
         let finish = method_body(source, "async fn finish_entra_connect(");
@@ -1997,7 +1996,10 @@ mod tests {
         let keep = method_body(source, "async fn keep_entra_refresh(");
         let cached = method_body(source, "async fn cached_entra_refresh(");
         let forget = method_body(source, "async fn forget_entra_refresh(");
-        let restore = method_body(include_str!("session.rs"), "async fn connects_silently(");
+        let restore = method_body(
+            &shipped(include_str!("session.rs")),
+            "async fn connects_silently(",
+        );
         let edit = method_body(source, "pub fn update_saved(");
         let hops = [
             ("the card", &card),
@@ -3087,18 +3089,10 @@ mod tests {
             ),
         ];
         let mut found: Vec<(String, String)> = Vec::new();
-        // `shipped` stops at `mod tests`; secrets.rs exports its test module
-        // (`pub(crate) mod tests`) for the mock keyring, so stop there too.
-        let without_tests = |text: &str| {
-            let lines: Vec<&str> = text.lines().collect();
-            let end = lines
-                .windows(2)
-                .position(|w| w[0].trim() == "#[cfg(test)]" && w[1].contains("mod tests"))
-                .unwrap_or(lines.len());
-            lines[..end].join("\n")
-        };
+        // `shipped` drops every test module, `pub(crate) mod tests` (secrets.rs
+        // exports its own, for the mock keyring) included.
         for (rel, text) in all_sources() {
-            let code = code_only(&shipped(&without_tests(&text)));
+            let code = code_only(&shipped(&text));
             // Every reference to a delete, not only calls: a fn pointer
             // (`let del = …delete_password_async;`), `.map(delete_password)`
             // and a `use … as` rename all still name the original, so each
@@ -3648,7 +3642,7 @@ mod tests {
         // The row: the button sits inside the gate and signs out the row it
         // is on. Comment-stripped and whitespace-collapsed.
         let row = collapsed(&code_only(&method_body(
-            include_str!("../connections.rs"),
+            &shipped(include_str!("../connections.rs")),
             "fn SavedConnectionRow(",
         )));
         let gate = "if row.auth.keeps_entra_sign_in() {";

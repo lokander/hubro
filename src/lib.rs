@@ -8,6 +8,8 @@ pub mod config;
 pub mod db;
 pub mod history;
 pub mod secrets;
+#[cfg(test)]
+pub(crate) mod source_scan;
 pub mod tunnel;
 pub mod ui;
 pub mod util;

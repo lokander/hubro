@@ -380,10 +380,7 @@ mod tests {
             }
         }
         let own = include_str!("js.rs");
-        let (code, _tests) = own
-            .split_once("#[cfg(test)]")
-            .expect("js.rs has a test module");
-        let lines = code_lines(code);
+        let lines = code_lines(&crate::source_scan::shipped(own));
         let start = lines
             .iter()
             .position(|line| line.starts_with("fn clipboard_js("))
