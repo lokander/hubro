@@ -5,7 +5,7 @@
 //! bookkeeping and child partitions marked internal.
 
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,8 +28,8 @@ use super::export::ExportFormat;
 use super::pg_wire;
 use super::rowkey::KeyTextPinned;
 use super::schema::{
-    ColumnMeta, ForeignKeyMeta, Generated, IndexConstraint, IndexMeta, Internal, TableKind,
-    TableMeta, TypeDetail, TypeRef,
+    push_index_row, table_index, ColumnMeta, ForeignKeyMeta, Generated, IndexConstraint, IndexMeta,
+    Internal, TableKind, TableMeta, TypeDetail, TypeRef,
 };
 use super::script::final_read_may_close;
 use super::sql::Dialect;
@@ -2140,337 +2140,26 @@ where
 
 /// Full multi-schema introspection: every user schema's tables and views
 /// with columns, primary keys, indexes (incl. unique), and foreign keys —
-/// parity with the SQLite metadata model. Six batched queries regardless
-/// of table count.
+/// parity with the SQLite metadata model. A fixed number of batched queries
+/// regardless of table count, in phases:
+///
+/// 1. [`internal_markings`]: what is the database's own rather than the
+///    user's, and which of the extensions that change introspection are
+///    installed ([`Installed`]);
+/// 2. [`kind_labels`]: Timescale's names for its kinds of object;
+/// 3. [`list_relations`]: the tables and views, each marked and labelled by
+///    the two phases before — which take nothing from it, and it nothing from
+///    them but their results;
+/// 4. the column, index and foreign-key reads, attached to the tables by
+///    [`attach_columns`], [`attach_indexes`] and [`attach_foreign_keys`].
+///
+/// Each phase is handed what it needs as a value, so none can read state a
+/// later phase changes.
 pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     let pool = conn.pool();
-
-    // Objects that are the database's own bookkeeping rather than the user's
-    // data, from the three sources Postgres has. All three are
-    // catalog facts, never name patterns — a user table genuinely called
-    // `spatial_ref_sys` is the user's.
-    //
-    //  1. Schemas an extension created. `pg_depend` records the namespace →
-    //     extension dependency, so this catches TimescaleDB's seven schemas,
-    //     PostGIS's `tiger`/`topology` and Citus's catalogs by construction.
-    //     A schema the *user* made has no such dependency even when an
-    //     extension puts objects in it — which is the distinction that
-    //     matters, since `public` holds PostGIS's functions and is still the
-    //     user's schema.
-    //  2. Individual objects an extension installs into an ordinary schema:
-    //     PostGIS's `spatial_ref_sys`, `pg_stat_statements`'s view. Same
-    //     catalog, keyed on `pg_class` instead of `pg_namespace`.
-    //  3. Child partitions of declaratively partitioned tables. Not an
-    //     extension matter at all, but a table partitioned by day floods the
-    //     tree exactly as Timescale's chunks do.
-    //
-    // The placeholder is `NULL::text` rather than the `name` that would match
-    // its sibling columns: `name` is a PostgreSQL-internal type, and an engine
-    // reimplementing the catalog need not have it — RisingWave does not, and
-    // failed to bind the cast at all, taking the whole introspection with it.
-    // Text unions with `name` on every engine that has both, and the
-    // value is decoded as a string either way.
-    //
-    // `deptype = 'e'` on the first two: that is the code for "member of the
-    // extension". The neighbouring `'x'` means the opposite — the object is
-    // *not* a member, it merely gets dropped with the extension — so counting
-    // it would attribute the user's own object to an extension.
-    let internal_rows = sqlx::query(
-        "SELECT n.nspname AS schema_name, NULL::text AS object_name, e.extname \
-         FROM pg_namespace n \
-         JOIN pg_depend d ON d.classid = 'pg_namespace'::regclass AND d.objid = n.oid \
-          AND d.deptype = 'e' \
-         JOIN pg_extension e ON e.oid = d.refobjid \
-          AND d.refclassid = 'pg_extension'::regclass \
-         UNION ALL \
-         SELECT n.nspname, c.relname, e.extname \
-         FROM pg_class c \
-         JOIN pg_namespace n ON n.oid = c.relnamespace \
-         JOIN pg_depend d ON d.classid = 'pg_class'::regclass AND d.objid = c.oid \
-          AND d.deptype = 'e' \
-         JOIN pg_extension e ON e.oid = d.refobjid \
-          AND d.refclassid = 'pg_extension'::regclass \
-         UNION ALL \
-         SELECT n.nspname, c.relname, NULL \
-         FROM pg_class c \
-         JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE c.relispartition",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(catalog_error)?;
-    // Schema-wide entries and per-object entries are kept apart so an object
-    // rule can win over its schema's — the object is the more specific fact.
-    let mut internal_schemas: HashMap<String, Internal> = HashMap::new();
-    let mut internal_objects: HashMap<(String, String), Internal> = HashMap::new();
-    for row in &internal_rows {
-        let schema: String = get(row, "schema_name")?;
-        let object: Option<String> = get(row, "object_name")?;
-        let extension: Option<String> = get(row, "extname")?;
-        let reason = match extension {
-            Some(extension) => Internal::Extension(extension),
-            None => Internal::Partition,
-        };
-        match object {
-            // An object can qualify twice — a partition an extension owns
-            // hits branches 2 and 3 — and the UNION has no defined row order,
-            // so name the winner rather than letting it be whichever row
-            // arrived last. Naming the extension is the more useful of the
-            // two, since "which extension" is the part the user can act on.
-            Some(object) => match internal_objects.entry((schema, object)) {
-                Entry::Occupied(mut slot) => {
-                    if matches!(reason, Internal::Extension(_)) {
-                        slot.insert(reason);
-                    }
-                }
-                Entry::Vacant(slot) => {
-                    slot.insert(reason);
-                }
-            },
-            None => {
-                internal_schemas.insert(schema, reason);
-            }
-        }
-    }
-
-    // Resolved before anything below mutates the maps these read.
-    let has_extension = |name: &str| {
-        internal_schemas
-            .values()
-            .chain(internal_objects.values())
-            .any(|reason| matches!(reason, Internal::Extension(ext) if ext == name))
-    };
-    let (has_citus, has_timescale) = (has_extension("citus"), has_extension("timescaledb"));
-
-    // Citus shard tables. Citus normally keeps these out of
-    // `pg_class` for client queries itself, so introspection never sees them
-    // and this finds nothing — but that hiding is a *setting*
-    // (`citus.show_shards_for_app_name_prefixes`), and with it widened a
-    // 26-table database reports 290, of which 264 are shards. They are not
-    // extension members and not partitions, so nothing else here catches
-    // them.
-    //
-    // `pg_dist_shard` is the catalog Citus itself uses, and `shard_name()` is
-    // Citus's own function for naming a row of it — asking beats reproducing
-    // the rule, which is not the plain `<table>_<shardid>` it looks like:
-    // Citus hashes and truncates once that would exceed NAMEDATALEN, so a
-    // 63-character table shards into `..._01ae35b2_102008`.
-    //
-    // Its answer is then resolved back to a real `pg_class` row rather than
-    // used as a name, because `shard_name()` qualifies anything outside
-    // `public` — a shard in a `sales` schema comes back as
-    // `sales.orders_102008`, which matches no `relname` anywhere. Resolving
-    // it yields the schema and the bare name the caller needs, and means no
-    // string is ever parsed.
-    //
-    // Two things that resolution has to be pinned against:
-    //
-    // `to_regclass` rather than a `::regclass` cast, because the cast *raises*
-    // on a name it cannot resolve, and a multi-node coordinator's
-    // `pg_dist_shard` lists shards living on workers with no local relation.
-    // The cast would error, the `if let Ok` below would swallow it, and
-    // nothing at all would be marked.
-    //
-    // `sc.relnamespace = c.relnamespace`, because `to_regclass` resolves
-    // through the search path: a user table named `decoy.pub_102008` with
-    // `decoy` ahead of `public` otherwise resolves *instead of* the real
-    // shard, and the user's own table is what gets hidden while the shard
-    // stays visible — backwards on both counts, and not gated behind the
-    // visibility setting, since name resolution goes through the catalog
-    // cache rather than the `pg_class` scan Citus filters. Shards always live
-    // in their table's schema, so pinning the namespace costs nothing.
-    //
-    // Residual, and benign: a `search_path` that excludes `public` leaves
-    // `public` shards unresolvable, so they go unmarked — the same place they
-    // would be if Citus were hiding them, which by default it is.
-    // Best-effort for the same reason as the Timescale labels below.
-    if has_citus {
-        let shards = sqlx::query(
-            "SELECT sn.nspname AS schema_name, sc.relname AS object_name \
-             FROM pg_dist_shard s \
-             JOIN pg_class c ON c.oid = s.logicalrelid \
-             JOIN pg_class sc \
-               ON sc.oid = pg_catalog.to_regclass( \
-                    pg_catalog.shard_name(s.logicalrelid, s.shardid)) \
-              AND sc.relnamespace = c.relnamespace \
-             JOIN pg_namespace sn ON sn.oid = sc.relnamespace",
-        )
-        .fetch_all(pool)
-        .await;
-        if let Ok(rows) = shards {
-            for [schema, object] in best_effort_names(&rows, ["schema_name", "object_name"]) {
-                // Same precedence as the branches above: naming the extension
-                // beats naming the shape, so a shard that is also a partition
-                // reports the extension rather than disagreeing with them.
-                internal_objects.insert((schema, object), Internal::Extension("citus".to_string()));
-            }
-        }
-    }
-
-    // Timescale's own vocabulary for objects that are otherwise ordinary
-    // tables and views, so a hypertable reads as one instead of
-    // looking like a table that mysteriously has chunks. Best-effort: these
-    // information views are stable across Timescale 2.x, but a badge is not
-    // worth failing a whole introspection over if a future version moves
-    // them, and the extension is absent on nearly every Postgres database.
-    let mut kind_labels: HashMap<(String, String), String> = HashMap::new();
-    if has_timescale {
-        let labelled = [
-            (
-                "SELECT hypertable_schema AS s, hypertable_name AS n \
-                 FROM timescaledb_information.hypertables",
-                "hypertable",
-            ),
-            (
-                "SELECT view_schema AS s, view_name AS n \
-                 FROM timescaledb_information.continuous_aggregates",
-                "continuous aggregate",
-            ),
-        ];
-        for (sql, label) in labelled {
-            let Ok(rows) = sqlx::query(sql).fetch_all(pool).await else {
-                continue;
-            };
-            for [schema, name] in best_effort_names(&rows, ["s", "n"]) {
-                kind_labels.insert((schema, name), label.to_string());
-            }
-        }
-    }
-
-    // Schemas Materialize reserves for its own catalog. It exposes
-    // five beyond the two excluded above — `mz_catalog`, `mz_internal`,
-    // `mz_introspection`, `mz_unsafe`, `mz_catalog_unstable` — holding 265
-    // objects between them, which would otherwise be the overwhelming majority
-    // of the schema tree.
-    //
-    // No cross-engine catalog fact reaches these. Unlike CockroachDB's they are
-    // reported as ordinary tables and views rather than `SYSTEM VIEW`, and the
-    // extension path above finds nothing: Materialize's `pg_depend` has rows,
-    // but none with `deptype = 'e'`, because it has no extensions — these
-    // schemas are the engine itself.
-    //
-    // Materialize does record it, in the one place only Materialize has.
-    // `mz_schemas.database_id` is null exactly for the schemas that belong to
-    // no database, which is what a system schema is; the `s`/`u` prefix on
-    // `mz_schemas.id` says the same thing, but it is an id encoding rather than
-    // a documented column contract and its representation has changed before.
-    //
-    // So this is the case `PgFlavor` exists for: knowing the engine is what
-    // tells us *which* catalog to ask, and the answer still comes from the
-    // catalog rather than from a list of names.
-    //
-    // Best-effort, like the Timescale and Citus queries above: a schema tree
-    // cluttered with Materialize's internals is worse than one without the
-    // badge, but neither is worth failing the whole introspection over.
-    if conn.flavor() == PgFlavor::Materialize {
-        if let Ok(rows) = sqlx::query("SELECT name FROM mz_schemas WHERE database_id IS NULL")
-            .fetch_all(pool)
-            .await
-        {
-            for [schema] in best_effort_names(&rows, ["name"]) {
-                internal_schemas.insert(schema, Internal::System);
-            }
-        }
-    }
-
-    // RisingWave's own catalog. `rw_catalog` holds 74 objects and is
-    // listed like any user schema, so without this it is most of the schema
-    // tree.
-    //
-    // Not reachable by catalog fact alone, and the near-miss is worth
-    // recording: 61 of the 74 report `table_type = 'SYSTEM TABLE'`, which the
-    // classification above now picks up and which no other engine emits
-    // outside `pg_catalog`. The remaining 13 are plain `VIEW`, indistinguishable
-    // from a user's own. So the schema is what identifies them.
-    //
-    // Matching the name is sound here on the same two grounds as
-    // `pg_catalog`: the connection has already identified itself as
-    // RisingWave, so no other server can reach this; and on RisingWave
-    // `rw_catalog` is reserved — `CREATE SCHEMA rw_catalog` is refused because
-    // it already exists — so no user schema can ever be caught by it.
-    if conn.flavor() == PgFlavor::RisingWave {
-        internal_schemas.insert("rw_catalog".to_string(), Internal::System);
-    }
-
-    // Tables and views across all non-system schemas. Materialized views
-    // (relkind 'm') are not in stock Postgres's information_schema, so they
-    // come from a pg_catalog UNION.
-    //
-    // "Not in information_schema" is a PostgreSQL choice, not a rule: Materialize
-    // lists its materialized views there *and* reports `relkind = 'm'`, so both
-    // halves of the UNION claim them and every such object arrived twice —
-    // once whole, once as a duplicate that later grouping left empty.
-    // The second half therefore takes only what the first did not, which is a
-    // no-op on any server that behaves like stock Postgres.
-    //
-    // Temporary tables are left out, and this is the one place that decides
-    // it: columns, indexes and foreign keys attach only to a table listed
-    // here. A temp table belongs to the session that made it, and hubro's
-    // sessions are a pool with no affinity — each query below, and every
-    // later browse, lands on whichever connection is idle. Measured against
-    // PostgreSQL 17 with a temp table made through the pool: listed by one
-    // introspection and not the next, listed with its columns but not its
-    // unique index (that query had already landed elsewhere), and, once the
-    // pool had grown, listed with no columns at all while every attempt to
-    // open it failed with "cannot access temporary tables of other sessions".
-    //
-    // One filter on this query is enough, because each engine that has temp
-    // tables at all either hides the ones it would otherwise get wrong or
-    // labels them. Measured with a temp table held open by a second session:
-    // PostgreSQL leaves other sessions' temp schemas out of
-    // `information_schema` entirely (they are still in `pg_class`), so the
-    // only temp table it can list is the introspecting connection's own —
-    // labelled `LOCAL TEMPORARY`. CockroachDB lists *every* session's temp
-    // tables, and labels each one the same way. Materialize lists no temp
-    // table or view at all, not even to the session that made it. Being the
-    // server's own classification, the label needs no schema-name pattern;
-    // the index and foreign-key queries' `pg\_%` filter excludes the same
-    // schemas, but cannot be applied here without also dropping
-    // CockroachDB's `pg_extension`, which is listed and marked internal.
-    let table_rows = sqlx::query(
-        "SELECT table_schema, table_name, table_type \
-         FROM information_schema.tables \
-         WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
-           AND table_type <> 'LOCAL TEMPORARY' \
-         UNION ALL \
-         SELECT n.nspname, c.relname, 'MATERIALIZED VIEW' \
-         FROM pg_class c \
-         JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE c.relkind = 'm' \
-           AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
-           AND NOT EXISTS ( \
-             SELECT 1 FROM information_schema.tables it \
-             WHERE it.table_schema = n.nspname AND it.table_name = c.relname \
-           ) \
-         ORDER BY table_schema, table_name",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(catalog_error)?;
-
-    // Tables whose writes a `DO INSTEAD` rule replaces (see [`INSTEAD_RULE`]).
-    // Views are left out: every one carries an instead rule, `_RETURN`, and
-    // is refused as a view already. Not best-effort like the extension
-    // queries above: a failure here would leave such a table editable, and
-    // every engine measured has `pg_rewrite` — CockroachDB, Materialize and
-    // RisingWave with no rules in it, since none of them can create one.
-    let rule_rows = sqlx::query(
-        "SELECT DISTINCT n.nspname AS table_schema, c.relname AS table_name \
-         FROM pg_rewrite r \
-         JOIN pg_class c ON c.oid = r.ev_class \
-         JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE r.is_instead AND c.relkind NOT IN ('v', 'm')",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(catalog_error)?;
-    let mut instead_rules = std::collections::HashSet::with_capacity(rule_rows.len());
-    for row in &rule_rows {
-        instead_rules.insert((
-            get::<String, _>(row, "table_schema")?,
-            get::<String, _>(row, "table_name")?,
-        ));
-    }
+    let (marks, installed) = internal_markings(conn).await?;
+    let labels = kind_labels(pool, installed).await;
+    let mut tables = list_relations(pool, &marks, &labels).await?;
 
     // Columns with PK positions resolved in SQL (LEFT JOIN on the pkey
     // constraint), one row per column. Identity and generated columns have a
@@ -2574,116 +2263,536 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
     .await
     .map_err(catalog_error)?;
 
-    // Group the batched rows per (schema, table).
-    let mut tables: Vec<TableMeta> = Vec::with_capacity(table_rows.len());
-    for row in &table_rows {
-        let table_type: String = get(row, "table_type")?;
-        let schema: String = get(row, "table_schema")?;
-        let name: String = get(row, "table_name")?;
-        let key = (schema.clone(), name.clone());
-        // `SYSTEM VIEW` is the engine's own catalog, in a schema it reserves
-        // beyond the two excluded above. CockroachDB reports 119 such
-        // objects — `crdb_internal` and `pg_extension` — and lists them here
-        // exactly as it lists the user's tables, so without this the schema
-        // tree is mostly Cockroach's bookkeeping, and most of it does not even
-        // open (`crdb_internal` refuses to be read at all without
-        // `allow_unsafe_internals`).
-        //
-        // Taken from `table_type` rather than from a list of schema names,
-        // which the catalog-facts-not-names rule for internal objects rules
-        // out: this is the server's own
-        // classification of the object, in a query already being run. Stock
-        // PostgreSQL never emits the value — it has nothing left to classify
-        // once `pg_catalog` and `information_schema` are excluded — so the
-        // rule needs no engine check and costs nothing to carry.
-        let system = matches!(table_type.as_str(), "SYSTEM VIEW" | "SYSTEM TABLE");
-        // A streaming engine's edges, on both Materialize and
-        // RisingWave. A source is continuously written by the engine
-        // from somewhere else — Kafka, Postgres replication, a load generator
-        // — so it is readable and never writable by hand, which is a view's
-        // contract rather than a table's. A sink is the mirror image: it
-        // *writes* to an external system and has no rows of its own at all.
-        let source = table_type == "SOURCE";
-        let sink = table_type == "SINK";
-        // The object's own rule first, then its schema's — most specific wins.
-        // Naming the extension beats naming the engine for the same reason it
-        // beats naming the shape above: it is the part the user can act on.
-        let internal = internal_objects
-            .get(&key)
-            .cloned()
-            .or_else(|| system.then_some(Internal::System))
-            .or_else(|| internal_schemas.get(&schema).cloned());
-        let kind_label = kind_labels.get(&key).cloned().or_else(|| {
-            // Materialize's own vocabulary for the object kind that has no
-            // Postgres equivalent, so a source reads as one instead of
-            // as a mysteriously unwritable view. Same treatment `hypertable`
-            // and `continuous aggregate` get on Timescale: the label
-            // refines the kind rather than replacing it.
-            if source {
-                Some("source".to_string())
-            } else if sink {
-                Some("sink".to_string())
-            } else {
-                None
-            }
-        });
-        tables.push(TableMeta {
-            schema: Some(schema),
-            name,
-            kind: match table_type.as_str() {
-                // A `SYSTEM VIEW` is a view, and saying so keeps it read-only
-                // by the ordinary route: nothing about being the engine's own
-                // catalog makes its rows addressable, and the alternative
-                // (falling through to `Table`) would offer editing on 119
-                // objects that mostly cannot even be read. A Materialize
-                // `SOURCE` is a view for the same reason — derived, readable,
-                // never written by the user.
-                "VIEW" | "SYSTEM VIEW" | "SOURCE" | "SINK" => TableKind::View,
-                "MATERIALIZED VIEW" => TableKind::MaterializedView,
-                _ => TableKind::Table,
-            },
-            columns: Vec::new(),
-            indexes: Vec::new(),
-            foreign_keys: Vec::new(),
-            // Per-object narrowing only where the driver knows something the
-            // resolver cannot derive. Kind and row identity carry the
-            // rest, so this is `None` for everything but a streaming engine's
-            // two edges and a table whose writes a `DO INSTEAD` rule
-            // replaces. A *source* resolves to a view and would otherwise be
-            // refused with "Views are read-only", a sentence that sends the
-            // reader looking for a view definition that does not exist; a
-            // *sink* has no rows at all, which nothing about its kind says.
-            restriction: if source {
-                Some(Restriction::Declared(STREAMING_SOURCE))
-            } else if sink {
-                // `NoRows`, not `Declared`: a sink stores nothing, so this one
-                // declaration has to stop it being *opened* as well as edited.
-                // Not gated on the flavor — `table_type = 'SINK'`
-                // is the server's own classification, so any engine reporting
-                // it inherits this.
-                Some(Restriction::NoRows(STREAMING_SINK))
-            } else if instead_rules.contains(&key) {
-                Some(INSTEAD_RULE)
-            } else {
-                None
-            },
-            internal,
-            kind_label,
-        });
+    let index = table_index(&tables);
+    attach_columns(&mut tables, &index, &column_rows, &enum_variants)?;
+    attach_indexes(&mut tables, &index, &index_rows, conn.flavor())?;
+    attach_foreign_keys(&mut tables, &index, &fk_rows)?;
+    Ok(tables)
+}
+
+/// What introspection marks as the database's own rather than the user's:
+/// per schema, and per object — an object's own marking wins over its
+/// schema's, the object being the more specific fact.
+#[derive(Debug, Default, PartialEq)]
+struct InternalMarks {
+    schemas: HashMap<String, Internal>,
+    objects: HashMap<(String, String), Internal>,
+}
+
+/// Which of the extensions that change what introspection asks are installed.
+/// Read once, from what the extension query found ([`fold_internal_rows`]),
+/// and handed on as a value: no marking added afterwards — a Citus shard, a
+/// Materialize schema — can change it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Installed {
+    citus: bool,
+    timescale: bool,
+}
+
+/// Phase 1 of [`introspect`]: the extension and partition markings from the
+/// catalog, then each engine's own additions to them — Citus's shards,
+/// Materialize's and RisingWave's reserved schemas. Returns the markings and
+/// which extensions are installed, the latter decided before any addition.
+async fn internal_markings(conn: &PgConn) -> Result<(InternalMarks, Installed), DbError> {
+    let pool = conn.pool();
+    // Objects that are the database's own bookkeeping rather than the user's
+    // data, from the three sources Postgres has. All three are
+    // catalog facts, never name patterns — a user table genuinely called
+    // `spatial_ref_sys` is the user's.
+    //
+    //  1. Schemas an extension created. `pg_depend` records the namespace →
+    //     extension dependency, so this catches TimescaleDB's seven schemas,
+    //     PostGIS's `tiger`/`topology` and Citus's catalogs by construction.
+    //     A schema the *user* made has no such dependency even when an
+    //     extension puts objects in it — which is the distinction that
+    //     matters, since `public` holds PostGIS's functions and is still the
+    //     user's schema.
+    //  2. Individual objects an extension installs into an ordinary schema:
+    //     PostGIS's `spatial_ref_sys`, `pg_stat_statements`'s view. Same
+    //     catalog, keyed on `pg_class` instead of `pg_namespace`.
+    //  3. Child partitions of declaratively partitioned tables. Not an
+    //     extension matter at all, but a table partitioned by day floods the
+    //     tree exactly as Timescale's chunks do.
+    //
+    // The placeholder is `NULL::text` rather than the `name` that would match
+    // its sibling columns: `name` is a PostgreSQL-internal type, and an engine
+    // reimplementing the catalog need not have it — RisingWave does not, and
+    // failed to bind the cast at all, taking the whole introspection with it.
+    // Text unions with `name` on every engine that has both, and the
+    // value is decoded as a string either way.
+    //
+    // `deptype = 'e'` on the first two: that is the code for "member of the
+    // extension". The neighbouring `'x'` means the opposite — the object is
+    // *not* a member, it merely gets dropped with the extension — so counting
+    // it would attribute the user's own object to an extension.
+    let internal_rows = sqlx::query(
+        "SELECT n.nspname AS schema_name, NULL::text AS object_name, e.extname \
+         FROM pg_namespace n \
+         JOIN pg_depend d ON d.classid = 'pg_namespace'::regclass AND d.objid = n.oid \
+          AND d.deptype = 'e' \
+         JOIN pg_extension e ON e.oid = d.refobjid \
+          AND d.refclassid = 'pg_extension'::regclass \
+         UNION ALL \
+         SELECT n.nspname, c.relname, e.extname \
+         FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         JOIN pg_depend d ON d.classid = 'pg_class'::regclass AND d.objid = c.oid \
+          AND d.deptype = 'e' \
+         JOIN pg_extension e ON e.oid = d.refobjid \
+          AND d.refclassid = 'pg_extension'::regclass \
+         UNION ALL \
+         SELECT n.nspname, c.relname, NULL \
+         FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relispartition",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(catalog_error)?;
+    let mut rows = Vec::with_capacity(internal_rows.len());
+    for row in &internal_rows {
+        rows.push((
+            get::<String, _>(row, "schema_name")?,
+            get::<Option<String>, _>(row, "object_name")?,
+            get::<Option<String>, _>(row, "extname")?,
+        ));
     }
-    // (schema, table) → index into `tables`, built once so grouping the
-    // column/index/FK rows below is a hash lookup per row instead of a linear
-    // scan over every table.
-    let mut table_index: HashMap<(String, String), usize> = HashMap::with_capacity(tables.len());
-    for (idx, table) in tables.iter().enumerate() {
-        if let Some(schema) = &table.schema {
-            table_index
-                .entry((schema.clone(), table.name.clone()))
-                .or_insert(idx);
+    let (mut marks, installed) = fold_internal_rows(rows);
+
+    // Citus shard tables. Citus normally keeps these out of
+    // `pg_class` for client queries itself, so introspection never sees them
+    // and this finds nothing — but that hiding is a *setting*
+    // (`citus.show_shards_for_app_name_prefixes`), and with it widened a
+    // 26-table database reports 290, of which 264 are shards. They are not
+    // extension members and not partitions, so nothing else here catches
+    // them.
+    //
+    // `pg_dist_shard` is the catalog Citus itself uses, and `shard_name()` is
+    // Citus's own function for naming a row of it — asking beats reproducing
+    // the rule, which is not the plain `<table>_<shardid>` it looks like:
+    // Citus hashes and truncates once that would exceed NAMEDATALEN, so a
+    // 63-character table shards into `..._01ae35b2_102008`.
+    //
+    // Its answer is then resolved back to a real `pg_class` row rather than
+    // used as a name, because `shard_name()` qualifies anything outside
+    // `public` — a shard in a `sales` schema comes back as
+    // `sales.orders_102008`, which matches no `relname` anywhere. Resolving
+    // it yields the schema and the bare name the caller needs, and means no
+    // string is ever parsed.
+    //
+    // Two things that resolution has to be pinned against:
+    //
+    // `to_regclass` rather than a `::regclass` cast, because the cast *raises*
+    // on a name it cannot resolve, and a multi-node coordinator's
+    // `pg_dist_shard` lists shards living on workers with no local relation.
+    // The cast would error, the `if let Ok` below would swallow it, and
+    // nothing at all would be marked.
+    //
+    // `sc.relnamespace = c.relnamespace`, because `to_regclass` resolves
+    // through the search path: a user table named `decoy.pub_102008` with
+    // `decoy` ahead of `public` otherwise resolves *instead of* the real
+    // shard, and the user's own table is what gets hidden while the shard
+    // stays visible — backwards on both counts, and not gated behind the
+    // visibility setting, since name resolution goes through the catalog
+    // cache rather than the `pg_class` scan Citus filters. Shards always live
+    // in their table's schema, so pinning the namespace costs nothing.
+    //
+    // Residual, and benign: a `search_path` that excludes `public` leaves
+    // `public` shards unresolvable, so they go unmarked — the same place they
+    // would be if Citus were hiding them, which by default it is.
+    // Best-effort for the same reason as the Timescale labels ([`kind_labels`]).
+    if installed.citus {
+        let shards = sqlx::query(
+            "SELECT sn.nspname AS schema_name, sc.relname AS object_name \
+             FROM pg_dist_shard s \
+             JOIN pg_class c ON c.oid = s.logicalrelid \
+             JOIN pg_class sc \
+               ON sc.oid = pg_catalog.to_regclass( \
+                    pg_catalog.shard_name(s.logicalrelid, s.shardid)) \
+              AND sc.relnamespace = c.relnamespace \
+             JOIN pg_namespace sn ON sn.oid = sc.relnamespace",
+        )
+        .fetch_all(pool)
+        .await;
+        if let Ok(rows) = shards {
+            for [schema, object] in best_effort_names(&rows, ["schema_name", "object_name"]) {
+                // Same precedence as the branches above: naming the extension
+                // beats naming the shape, so a shard that is also a partition
+                // reports the extension rather than disagreeing with them.
+                marks
+                    .objects
+                    .insert((schema, object), Internal::Extension("citus".to_string()));
+            }
         }
     }
 
-    for row in &column_rows {
+    // Schemas Materialize reserves for its own catalog. It exposes
+    // five beyond the two [`list_relations`] excludes — `mz_catalog`, `mz_internal`,
+    // `mz_introspection`, `mz_unsafe`, `mz_catalog_unstable` — holding 265
+    // objects between them, which would otherwise be the overwhelming majority
+    // of the schema tree.
+    //
+    // No cross-engine catalog fact reaches these. Unlike CockroachDB's they are
+    // reported as ordinary tables and views rather than `SYSTEM VIEW`, and the
+    // extension path above finds nothing: Materialize's `pg_depend` has rows,
+    // but none with `deptype = 'e'`, because it has no extensions — these
+    // schemas are the engine itself.
+    //
+    // Materialize does record it, in the one place only Materialize has.
+    // `mz_schemas.database_id` is null exactly for the schemas that belong to
+    // no database, which is what a system schema is; the `s`/`u` prefix on
+    // `mz_schemas.id` says the same thing, but it is an id encoding rather than
+    // a documented column contract and its representation has changed before.
+    //
+    // So this is the case `PgFlavor` exists for: knowing the engine is what
+    // tells us *which* catalog to ask, and the answer still comes from the
+    // catalog rather than from a list of names.
+    //
+    // Best-effort, like the Citus query above and the Timescale labels: a schema tree
+    // cluttered with Materialize's internals is worse than one without the
+    // badge, but neither is worth failing the whole introspection over.
+    if conn.flavor() == PgFlavor::Materialize {
+        if let Ok(rows) = sqlx::query("SELECT name FROM mz_schemas WHERE database_id IS NULL")
+            .fetch_all(pool)
+            .await
+        {
+            for [schema] in best_effort_names(&rows, ["name"]) {
+                marks.schemas.insert(schema, Internal::System);
+            }
+        }
+    }
+
+    // RisingWave's own catalog. `rw_catalog` holds 74 objects and is
+    // listed like any user schema, so without this it is most of the schema
+    // tree.
+    //
+    // Not reachable by catalog fact alone, and the near-miss is worth
+    // recording: 61 of the 74 report `table_type = 'SYSTEM TABLE'`, which the
+    // classification in [`relation_meta`] picks up and which no other engine emits
+    // outside `pg_catalog`. The remaining 13 are plain `VIEW`, indistinguishable
+    // from a user's own. So the schema is what identifies them.
+    //
+    // Matching the name is sound here on the same two grounds as
+    // `pg_catalog`: the connection has already identified itself as
+    // RisingWave, so no other server can reach this; and on RisingWave
+    // `rw_catalog` is reserved — `CREATE SCHEMA rw_catalog` is refused because
+    // it already exists — so no user schema can ever be caught by it.
+    if conn.flavor() == PgFlavor::RisingWave {
+        marks
+            .schemas
+            .insert("rw_catalog".to_string(), Internal::System);
+    }
+
+    Ok((marks, installed))
+}
+
+/// The extension query's rows — `(schema, object, extension)`, an object of
+/// `None` marking the whole schema and an extension of `None` a partition —
+/// as markings, and which extensions they show installed. Over plain data so
+/// a test can execute the precedence.
+fn fold_internal_rows(
+    rows: Vec<(String, Option<String>, Option<String>)>,
+) -> (InternalMarks, Installed) {
+    // Schema-wide entries and per-object entries are kept apart so an object
+    // rule can win over its schema's — the object is the more specific fact.
+    let mut internal_schemas: HashMap<String, Internal> = HashMap::new();
+    let mut internal_objects: HashMap<(String, String), Internal> = HashMap::new();
+    for (schema, object, extension) in rows {
+        let reason = match extension {
+            Some(extension) => Internal::Extension(extension),
+            None => Internal::Partition,
+        };
+        match object {
+            // An object can qualify twice — a partition an extension owns
+            // hits branches 2 and 3 — and the UNION has no defined row order,
+            // so name the winner rather than letting it be whichever row
+            // arrived last. Naming the extension is the more useful of the
+            // two, since "which extension" is the part the user can act on.
+            Some(object) => match internal_objects.entry((schema, object)) {
+                Entry::Occupied(mut slot) => {
+                    if matches!(reason, Internal::Extension(_)) {
+                        slot.insert(reason);
+                    }
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(reason);
+                }
+            },
+            None => {
+                internal_schemas.insert(schema, reason);
+            }
+        }
+    }
+
+    let marks = InternalMarks {
+        schemas: internal_schemas,
+        objects: internal_objects,
+    };
+    let has_extension = |name: &str| {
+        marks
+            .schemas
+            .values()
+            .chain(marks.objects.values())
+            .any(|reason| matches!(reason, Internal::Extension(ext) if ext == name))
+    };
+    let installed = Installed {
+        citus: has_extension("citus"),
+        timescale: has_extension("timescaledb"),
+    };
+    (marks, installed)
+}
+
+/// Phase 2 of [`introspect`]: Timescale's labels for its objects, keyed by
+/// (schema, name). Empty unless Timescale is installed.
+async fn kind_labels(pool: &PgPool, installed: Installed) -> HashMap<(String, String), String> {
+    // Timescale's own vocabulary for objects that are otherwise ordinary
+    // tables and views, so a hypertable reads as one instead of
+    // looking like a table that mysteriously has chunks. Best-effort: these
+    // information views are stable across Timescale 2.x, but a badge is not
+    // worth failing a whole introspection over if a future version moves
+    // them, and the extension is absent on nearly every Postgres database.
+    let mut kind_labels: HashMap<(String, String), String> = HashMap::new();
+    if installed.timescale {
+        let labelled = [
+            (
+                "SELECT hypertable_schema AS s, hypertable_name AS n \
+                 FROM timescaledb_information.hypertables",
+                "hypertable",
+            ),
+            (
+                "SELECT view_schema AS s, view_name AS n \
+                 FROM timescaledb_information.continuous_aggregates",
+                "continuous aggregate",
+            ),
+        ];
+        for (sql, label) in labelled {
+            let Ok(rows) = sqlx::query(sql).fetch_all(pool).await else {
+                continue;
+            };
+            for [schema, name] in best_effort_names(&rows, ["s", "n"]) {
+                kind_labels.insert((schema, name), label.to_string());
+            }
+        }
+    }
+
+    kind_labels
+}
+
+/// Phase 3 of [`introspect`]: every table and view, marked internal and
+/// labelled from the earlier phases' results, with no columns, indexes or
+/// foreign keys yet.
+async fn list_relations(
+    pool: &PgPool,
+    marks: &InternalMarks,
+    labels: &HashMap<(String, String), String>,
+) -> Result<Vec<TableMeta>, DbError> {
+    // Tables and views across all non-system schemas. Materialized views
+    // (relkind 'm') are not in stock Postgres's information_schema, so they
+    // come from a pg_catalog UNION.
+    //
+    // "Not in information_schema" is a PostgreSQL choice, not a rule: Materialize
+    // lists its materialized views there *and* reports `relkind = 'm'`, so both
+    // halves of the UNION claim them and every such object arrived twice —
+    // once whole, once as a duplicate that later grouping left empty.
+    // The second half therefore takes only what the first did not, which is a
+    // no-op on any server that behaves like stock Postgres.
+    //
+    // Temporary tables are left out, and this is the one place that decides
+    // it: columns, indexes and foreign keys attach only to a table listed
+    // here. A temp table belongs to the session that made it, and hubro's
+    // sessions are a pool with no affinity — each query below, and every
+    // later browse, lands on whichever connection is idle. Measured against
+    // PostgreSQL 17 with a temp table made through the pool: listed by one
+    // introspection and not the next, listed with its columns but not its
+    // unique index (that query had already landed elsewhere), and, once the
+    // pool had grown, listed with no columns at all while every attempt to
+    // open it failed with "cannot access temporary tables of other sessions".
+    //
+    // One filter on this query is enough, because each engine that has temp
+    // tables at all either hides the ones it would otherwise get wrong or
+    // labels them. Measured with a temp table held open by a second session:
+    // PostgreSQL leaves other sessions' temp schemas out of
+    // `information_schema` entirely (they are still in `pg_class`), so the
+    // only temp table it can list is the introspecting connection's own —
+    // labelled `LOCAL TEMPORARY`. CockroachDB lists *every* session's temp
+    // tables, and labels each one the same way. Materialize lists no temp
+    // table or view at all, not even to the session that made it. Being the
+    // server's own classification, the label needs no schema-name pattern;
+    // the index and foreign-key queries' `pg\_%` filter excludes the same
+    // schemas, but cannot be applied here without also dropping
+    // CockroachDB's `pg_extension`, which is listed and marked internal.
+    let table_rows = sqlx::query(
+        "SELECT table_schema, table_name, table_type \
+         FROM information_schema.tables \
+         WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
+           AND table_type <> 'LOCAL TEMPORARY' \
+         UNION ALL \
+         SELECT n.nspname, c.relname, 'MATERIALIZED VIEW' \
+         FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relkind = 'm' \
+           AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM information_schema.tables it \
+             WHERE it.table_schema = n.nspname AND it.table_name = c.relname \
+           ) \
+         ORDER BY table_schema, table_name",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(catalog_error)?;
+
+    // Tables whose writes a `DO INSTEAD` rule replaces (see [`INSTEAD_RULE`]).
+    // Views are left out: every one carries an instead rule, `_RETURN`, and
+    // is refused as a view already. Not best-effort like the extension
+    // queries above: a failure here would leave such a table editable, and
+    // every engine measured has `pg_rewrite` — CockroachDB, Materialize and
+    // RisingWave with no rules in it, since none of them can create one.
+    let rule_rows = sqlx::query(
+        "SELECT DISTINCT n.nspname AS table_schema, c.relname AS table_name \
+         FROM pg_rewrite r \
+         JOIN pg_class c ON c.oid = r.ev_class \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE r.is_instead AND c.relkind NOT IN ('v', 'm')",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(catalog_error)?;
+    let mut instead_rules = HashSet::with_capacity(rule_rows.len());
+    for row in &rule_rows {
+        instead_rules.insert((
+            get::<String, _>(row, "table_schema")?,
+            get::<String, _>(row, "table_name")?,
+        ));
+    }
+
+    let mut tables = Vec::with_capacity(table_rows.len());
+    for row in &table_rows {
+        tables.push(relation_meta(
+            get(row, "table_schema")?,
+            get(row, "table_name")?,
+            &get::<String, _>(row, "table_type")?,
+            marks,
+            labels,
+            &instead_rules,
+        ));
+    }
+    Ok(tables)
+}
+
+/// One listed relation as a [`TableMeta`] with nothing attached yet. Over
+/// plain data so a test can execute it.
+fn relation_meta(
+    schema: String,
+    name: String,
+    table_type: &str,
+    marks: &InternalMarks,
+    labels: &HashMap<(String, String), String>,
+    instead_rules: &HashSet<(String, String)>,
+) -> TableMeta {
+    let key = (schema.clone(), name.clone());
+    // `SYSTEM VIEW` is the engine's own catalog, in a schema it reserves
+    // beyond the two [`list_relations`] excludes. CockroachDB reports 119 such
+    // objects — `crdb_internal` and `pg_extension` — and lists them here
+    // exactly as it lists the user's tables, so without this the schema
+    // tree is mostly Cockroach's bookkeeping, and most of it does not even
+    // open (`crdb_internal` refuses to be read at all without
+    // `allow_unsafe_internals`).
+    //
+    // Taken from `table_type` rather than from a list of schema names,
+    // which the catalog-facts-not-names rule for internal objects rules
+    // out: this is the server's own
+    // classification of the object, in a query already being run. Stock
+    // PostgreSQL never emits the value — it has nothing left to classify
+    // once `pg_catalog` and `information_schema` are excluded — so the
+    // rule needs no engine check and costs nothing to carry.
+    let system = matches!(table_type, "SYSTEM VIEW" | "SYSTEM TABLE");
+    // A streaming engine's edges, on both Materialize and
+    // RisingWave. A source is continuously written by the engine
+    // from somewhere else — Kafka, Postgres replication, a load generator
+    // — so it is readable and never writable by hand, which is a view's
+    // contract rather than a table's. A sink is the mirror image: it
+    // *writes* to an external system and has no rows of its own at all.
+    let source = table_type == "SOURCE";
+    let sink = table_type == "SINK";
+    // The object's own rule first, then its schema's — most specific wins.
+    // Naming the extension beats naming the engine for the same reason it
+    // beats naming the shape in [`fold_internal_rows`]: it is the part the
+    // user can act on.
+    let internal = marks
+        .objects
+        .get(&key)
+        .cloned()
+        .or_else(|| system.then_some(Internal::System))
+        .or_else(|| marks.schemas.get(&schema).cloned());
+    let kind_label = labels.get(&key).cloned().or_else(|| {
+        // Materialize's own vocabulary for the object kind that has no
+        // Postgres equivalent, so a source reads as one instead of
+        // as a mysteriously unwritable view. Same treatment `hypertable`
+        // and `continuous aggregate` get on Timescale: the label
+        // refines the kind rather than replacing it.
+        if source {
+            Some("source".to_string())
+        } else if sink {
+            Some("sink".to_string())
+        } else {
+            None
+        }
+    });
+    TableMeta {
+        schema: Some(schema),
+        name,
+        kind: match table_type {
+            // A `SYSTEM VIEW` is a view, and saying so keeps it read-only
+            // by the ordinary route: nothing about being the engine's own
+            // catalog makes its rows addressable, and the alternative
+            // (falling through to `Table`) would offer editing on 119
+            // objects that mostly cannot even be read. A Materialize
+            // `SOURCE` is a view for the same reason — derived, readable,
+            // never written by the user.
+            "VIEW" | "SYSTEM VIEW" | "SOURCE" | "SINK" => TableKind::View,
+            "MATERIALIZED VIEW" => TableKind::MaterializedView,
+            _ => TableKind::Table,
+        },
+        columns: Vec::new(),
+        indexes: Vec::new(),
+        foreign_keys: Vec::new(),
+        // Per-object narrowing only where the driver knows something the
+        // resolver cannot derive. Kind and row identity carry the
+        // rest, so this is `None` for everything but a streaming engine's
+        // two edges and a table whose writes a `DO INSTEAD` rule
+        // replaces. A *source* resolves to a view and would otherwise be
+        // refused with "Views are read-only", a sentence that sends the
+        // reader looking for a view definition that does not exist; a
+        // *sink* has no rows at all, which nothing about its kind says.
+        restriction: if source {
+            Some(Restriction::Declared(STREAMING_SOURCE))
+        } else if sink {
+            // `NoRows`, not `Declared`: a sink stores nothing, so this one
+            // declaration has to stop it being *opened* as well as edited.
+            // Not gated on the flavor — `table_type = 'SINK'`
+            // is the server's own classification, so any engine reporting
+            // it inherits this.
+            Some(Restriction::NoRows(STREAMING_SINK))
+        } else if instead_rules.contains(&key) {
+            Some(INSTEAD_RULE)
+        } else {
+            None
+        },
+        internal,
+        kind_label,
+    }
+}
+
+/// Phase 4 of [`introspect`]: each column row onto its table, by
+/// [`table_index`]; a row whose table was not listed is dropped.
+fn attach_columns(
+    tables: &mut [TableMeta],
+    table_index: &HashMap<(String, String), usize>,
+    rows: &[PgRow],
+    enum_variants: &HashMap<i64, Vec<String>>,
+) -> Result<(), DbError> {
+    for row in rows {
         let schema: String = get(row, "table_schema")?;
         let table: String = get(row, "table_name")?;
         let Some(&idx) = table_index.get(&(schema, table)) else {
@@ -2741,7 +2850,18 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
         });
     }
 
-    for row in &index_rows {
+    Ok(())
+}
+
+/// Each index row onto its table, consecutive rows of one index becoming its
+/// columns in order ([`push_index_column`]).
+fn attach_indexes(
+    tables: &mut [TableMeta],
+    table_index: &HashMap<(String, String), usize>,
+    rows: &[PgRow],
+    flavor: PgFlavor,
+) -> Result<(), DbError> {
+    for row in rows {
         let schema: String = get(row, "table_schema")?;
         let table: String = get(row, "table_name")?;
         let Some(&idx) = table_index.get(&(schema, table)) else {
@@ -2753,20 +2873,29 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
         let unique: bool = get(row, "is_unique")?;
         let partial: bool = get(row, "is_partial")?;
         let contype: Option<String> = get(row, "constraint_type")?;
-        let indexes = &mut tables[idx].indexes;
-        match indexes.last_mut() {
-            Some(last) if last.name == index_name => last.columns.push(column),
-            _ => indexes.push(IndexMeta {
+        push_index_row(
+            &mut tables[idx].indexes,
+            IndexMeta {
                 name: index_name,
                 unique,
                 partial,
                 columns: vec![column],
-                constraint: pg_index_constraint(contype.as_deref(), conn.flavor()),
-            }),
-        }
+                constraint: pg_index_constraint(contype.as_deref(), flavor),
+            },
+        );
     }
 
-    for row in &fk_rows {
+    Ok(())
+}
+
+/// Each foreign-key row onto its table — one row per constraint, its columns
+/// already aggregated in key order.
+fn attach_foreign_keys(
+    tables: &mut [TableMeta],
+    table_index: &HashMap<(String, String), usize>,
+    rows: &[PgRow],
+) -> Result<(), DbError> {
+    for row in rows {
         let schema: String = get(row, "table_schema")?;
         let table: String = get(row, "table_name")?;
         let Some(&idx) = table_index.get(&(schema, table)) else {
@@ -2781,7 +2910,7 @@ pub async fn introspect(conn: &PgConn) -> Result<Vec<TableMeta>, DbError> {
         });
     }
 
-    Ok(tables)
+    Ok(())
 }
 
 /// DDL for one object.
@@ -3416,6 +3545,146 @@ fn format_interval(iv: &PgInterval) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The extension query's rows as markings: an extension beats a
+    /// partition on the same object whichever row comes first, a schema-wide
+    /// row marks the schema, and which extensions are installed is read from
+    /// those rows alone.
+    #[test]
+    fn extension_rows_mark_schemas_and_objects_and_say_what_is_installed() {
+        use super::{fold_internal_rows, Installed, Internal};
+        let row = |schema: &str, object: Option<&str>, extension: Option<&str>| {
+            (
+                schema.to_string(),
+                object.map(str::to_string),
+                extension.map(str::to_string),
+            )
+        };
+        let key = ("public".to_string(), "chunk".to_string());
+        for rows in [
+            vec![
+                row("public", Some("chunk"), None),
+                row("public", Some("chunk"), Some("timescaledb")),
+            ],
+            vec![
+                row("public", Some("chunk"), Some("timescaledb")),
+                row("public", Some("chunk"), None),
+            ],
+        ] {
+            let (marks, installed) = fold_internal_rows(rows);
+            assert_eq!(
+                marks.objects[&key],
+                Internal::Extension("timescaledb".into())
+            );
+            assert_eq!(
+                installed,
+                Installed {
+                    citus: false,
+                    timescale: true
+                }
+            );
+        }
+        let (marks, installed) = fold_internal_rows(vec![
+            row("citus", None, Some("citus")),
+            row("sales", Some("orders_1"), None),
+        ]);
+        assert_eq!(marks.schemas["citus"], Internal::Extension("citus".into()));
+        assert_eq!(
+            marks.objects[&("sales".to_string(), "orders_1".to_string())],
+            Internal::Partition
+        );
+        assert!(installed.citus && !installed.timescale);
+        let (_, installed) = fold_internal_rows(vec![row("p", Some("part"), None)]);
+        assert_eq!(installed, Installed::default());
+    }
+
+    /// One listed relation: its kind from the server's `table_type`, its
+    /// internal marking most specific first (object, then the engine's own
+    /// classification, then the schema), its label, and its restriction.
+    #[test]
+    fn a_relation_takes_its_kind_marking_label_and_restriction_from_the_phases() {
+        use super::{
+            relation_meta, InternalMarks, Restriction, TableKind, INSTEAD_RULE, STREAMING_SINK,
+            STREAMING_SOURCE,
+        };
+        use std::collections::{HashMap, HashSet};
+        let mut marks = InternalMarks::default();
+        marks
+            .schemas
+            .insert("ext".into(), Internal::Extension("postgis".into()));
+        marks
+            .objects
+            .insert(("ext".into(), "own".into()), Internal::Partition);
+        let mut labels = HashMap::new();
+        labels.insert(("s".into(), "hyper".into()), "hypertable".to_string());
+        labels.insert(("s".into(), "src".into()), "labelled".to_string());
+        let mut rules = HashSet::new();
+        rules.insert(("s".to_string(), "ruled".to_string()));
+        let meta = |schema: &str, name: &str, table_type: &str| {
+            relation_meta(
+                schema.into(),
+                name.into(),
+                table_type,
+                &marks,
+                &labels,
+                &rules,
+            )
+        };
+        use super::Internal;
+        assert_eq!(
+            meta("ext", "own", "SYSTEM VIEW").internal,
+            Some(Internal::Partition)
+        );
+        assert_eq!(
+            meta("s", "sys", "SYSTEM TABLE").internal,
+            Some(Internal::System)
+        );
+        assert_eq!(
+            meta("ext", "other", "SYSTEM VIEW").internal,
+            Some(Internal::System)
+        );
+        assert_eq!(
+            meta("ext", "other", "BASE TABLE").internal,
+            Some(Internal::Extension("postgis".into()))
+        );
+        assert_eq!(meta("s", "t", "BASE TABLE").internal, None);
+        for (table_type, kind) in [
+            ("BASE TABLE", TableKind::Table),
+            ("VIEW", TableKind::View),
+            ("SYSTEM VIEW", TableKind::View),
+            ("SOURCE", TableKind::View),
+            ("SINK", TableKind::View),
+            ("MATERIALIZED VIEW", TableKind::MaterializedView),
+        ] {
+            assert_eq!(meta("s", "t", table_type).kind, kind, "{table_type}");
+        }
+        assert_eq!(
+            meta("s", "hyper", "BASE TABLE").kind_label.as_deref(),
+            Some("hypertable")
+        );
+        assert_eq!(
+            meta("s", "src", "SOURCE").kind_label.as_deref(),
+            Some("labelled")
+        );
+        assert_eq!(
+            meta("s", "t", "SOURCE").kind_label.as_deref(),
+            Some("source")
+        );
+        assert_eq!(meta("s", "t", "SINK").kind_label.as_deref(), Some("sink"));
+        assert_eq!(
+            meta("s", "t", "SOURCE").restriction,
+            Some(Restriction::Declared(STREAMING_SOURCE))
+        );
+        assert_eq!(
+            meta("s", "t", "SINK").restriction,
+            Some(Restriction::NoRows(STREAMING_SINK))
+        );
+        assert_eq!(
+            meta("s", "ruled", "BASE TABLE").restriction,
+            Some(INSTEAD_RULE)
+        );
+        assert_eq!(meta("s", "t", "BASE TABLE").restriction, None);
+    }
+
     /// A marked browse whose `BEGIN` opens the transaction and then fails —
     /// CockroachDB's two-statement one, standing in for a `SET LOCAL` the
     /// server refuses — leaves no aborted transaction on a pooled

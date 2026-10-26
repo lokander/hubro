@@ -1,6 +1,8 @@
 //! Backend-neutral schema metadata. Captures primary keys, unique indexes,
 //! and foreign keys up front — editing and FK navigation depend on them.
 
+use std::collections::HashMap;
+
 use super::caps::Restriction;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,6 +263,34 @@ impl TableMeta {
     }
 }
 
+/// (schema, table) → position in `tables`, built once so a backend grouping
+/// its column, index and foreign-key catalog rows onto their tables does one
+/// hash lookup per row instead of scanning every table. The first of two
+/// same-named tables wins; a table without a schema (SQLite's) is left out.
+pub(super) fn table_index(tables: &[TableMeta]) -> HashMap<(String, String), usize> {
+    let mut index = HashMap::with_capacity(tables.len());
+    for (idx, table) in tables.iter().enumerate() {
+        if let Some(schema) = &table.schema {
+            index
+                .entry((schema.clone(), table.name.clone()))
+                .or_insert(idx);
+        }
+    }
+    index
+}
+
+/// Adds one catalog row of an index — the index with the one key column the
+/// row names — to `indexes`: as a further column of the last index when the
+/// row is that index's, or as a new index. A catalog lists an index's key
+/// columns in consecutive rows, in key order, so the last index is the only
+/// one a row can continue.
+pub(super) fn push_index_row(indexes: &mut Vec<IndexMeta>, row: IndexMeta) {
+    match indexes.last_mut() {
+        Some(last) if last.name == row.name => last.columns.extend(row.columns),
+        _ => indexes.push(row),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +326,58 @@ mod tests {
             .map(|c| c.name.as_str())
             .collect();
         assert_eq!(pk, ["c", "a"]);
+    }
+
+    #[test]
+    fn the_table_index_finds_each_table_by_schema_and_name_and_keeps_the_first() {
+        let table = |schema: Option<&str>, name: &str| TableMeta {
+            schema: schema.map(str::to_string),
+            name: name.to_string(),
+            kind: TableKind::Table,
+            columns: Vec::new(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            restriction: None,
+            internal: None,
+            kind_label: None,
+        };
+        let tables = [
+            table(Some("a"), "t"),
+            table(Some("b"), "t"),
+            table(Some("a"), "t"),
+            table(None, "u"),
+        ];
+        let index = table_index(&tables);
+        assert_eq!(index.len(), 2);
+        assert_eq!(index[&("a".to_string(), "t".to_string())], 0);
+        assert_eq!(index[&("b".to_string(), "t".to_string())], 1);
+    }
+
+    #[test]
+    fn consecutive_rows_of_one_index_become_its_columns_in_order() {
+        let row = |name: &str, column: &str| IndexMeta {
+            name: name.to_string(),
+            unique: true,
+            partial: false,
+            columns: vec![column.to_string()],
+            constraint: None,
+        };
+        let mut indexes = Vec::new();
+        for (name, column) in [("i", "a"), ("i", "b"), ("j", "c"), ("i", "d")] {
+            push_index_row(&mut indexes, row(name, column));
+        }
+        let shape: Vec<(&str, Vec<&str>)> = indexes
+            .iter()
+            .map(|i| {
+                (
+                    i.name.as_str(),
+                    i.columns.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [("i", vec!["a", "b"]), ("j", vec!["c"]), ("i", vec!["d"])]
+        );
     }
 }
