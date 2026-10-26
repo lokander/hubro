@@ -210,8 +210,8 @@ fn write_csv_value(value: &Value, out: &mut impl Write) -> io::Result<()> {
         // Byte-by-byte hex, same bytes as [`hex_literal`] without the String.
         Value::Blob(b) => {
             out.write_all(b"\\x")?;
-            for byte in b {
-                write!(out, "{byte:02x}")?;
+            for &byte in b {
+                out.write_all(&crate::util::hex_digits(byte))?;
             }
             Ok(())
         }
@@ -313,12 +313,8 @@ fn write_json_value(value: &Value, out: &mut impl Write) -> io::Result<()> {
 /// Postgres-style `\x…` hex rendering of a blob, shared by both formats — and
 /// by the clipboard ones — so a round-trip is unambiguous.
 pub(crate) fn hex_literal(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(2 + bytes.len() * 2);
-    s.push_str("\\x");
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(s, "{byte:02x}");
-    }
+    let mut s = String::from("\\x");
+    crate::util::push_hex(&mut s, bytes);
     s
 }
 

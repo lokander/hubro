@@ -70,9 +70,7 @@ impl RowLocator {
                 }
                 Value::Blob(b) => {
                     let _ = write!(out, "b{}:", b.len());
-                    for byte in b {
-                        let _ = write!(out, "{byte:02x}");
-                    }
+                    crate::util::push_hex(&mut out, b);
                     out.push(';');
                 }
             }
@@ -507,11 +505,8 @@ fn cast_text(value: &Value) -> String {
         Value::Integer(n) => n.to_string(),
         Value::Real(wide) => float_spelling(*wide),
         Value::Blob(bytes) => {
-            let mut hex = String::with_capacity(2 + bytes.len() * 2);
-            hex.push_str("\\x");
-            for byte in bytes {
-                let _ = write!(hex, "{byte:02x}");
-            }
+            let mut hex = String::from("\\x");
+            crate::util::push_hex(&mut hex, bytes);
             hex
         }
         // Rendered as the literal `NULL` before a bind is ever made.
@@ -589,7 +584,7 @@ pub(super) fn column_cast(column: &ColumnMeta, dialect: Dialect) -> Option<Strin
 ///
 /// Enum and array columns are the exception to "use `data_type` verbatim":
 /// they report `USER-DEFINED` and `ARRAY`, which name no type at all. For
-/// those the introspected [`TypeDetail`] supplies the real type name as its
+/// those the introspected [`TypeDetail`](super::schema::TypeDetail) supplies the real type name as its
 /// two identifier halves, each double-quoted here (`"public"."mood"`,
 /// `"pg_catalog"."_text"`). Quoted rather than lowercased because both are
 /// arbitrary identifiers — `CREATE TYPE "Mood"` is case-sensitive — and

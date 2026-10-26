@@ -14,9 +14,11 @@
 //! result set at all — a `DROP TABLE` routed through the query path —
 //! legitimately reports no columns.
 //!
-//! "User-facing" is the whole scope of that describe: [`DbPool::query`],
-//! [`DbPool::query_capped`] and [`ScriptTx::query_capped`] — the entry points
-//! that hand a result straight to the grid. The internal reads (page fetch,
+//! "User-facing" is the whole scope of that describe: the capped reads a
+//! script's statements run through ([`DbPool::query_capped`] and
+//! [`ScriptTx::query_capped`](registry::ScriptTx::query_capped)), which hand
+//! their result straight to the SQL editor, and [`DbPool::query`], which only
+//! the tests use. The internal reads (page fetch,
 //! cell fetch, DDL catalog queries) build their own projection and so already
 //! know their columns, so paying a round trip to recover headers nobody reads
 //! would be pure cost —

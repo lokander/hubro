@@ -336,10 +336,8 @@ fn text_literal(text: &str, dialect: Dialect) -> String {
 }
 
 fn blob_literal(bytes: &[u8], dialect: Dialect) -> String {
-    let mut hex = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(hex, "{byte:02x}");
-    }
+    let mut hex = String::new();
+    crate::util::push_hex(&mut hex, bytes);
     match dialect {
         Dialect::Sqlite => format!("X'{hex}'"),
         Dialect::Postgres => format!("'\\x{hex}'::bytea"),

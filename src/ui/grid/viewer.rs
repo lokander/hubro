@@ -137,18 +137,6 @@ pub(super) fn sniff_image(bytes: &[u8]) -> Option<ImageFormat> {
     None
 }
 
-/// Appends `byte` as two lowercase hex digits.
-///
-/// By hand rather than through `format!`, which would allocate a `String` per
-/// byte — 16k of them for a full dump, in a file whose whole point is bounding
-/// what one cell costs. The exact-output test on [`hex_dump`] is what keeps
-/// this honest.
-fn push_hex(out: &mut String, byte: u8) {
-    const DIGITS: [u8; 16] = *b"0123456789abcdef";
-    out.push(DIGITS[(byte >> 4) as usize] as char);
-    out.push(DIGITS[(byte & 0x0f) as usize] as char);
-}
-
 /// `hexdump -C` layout: an 8-digit offset, 16 bytes as hex split into two
 /// groups of eight, then the printable ASCII with everything else as `.`.
 ///
@@ -165,7 +153,7 @@ pub(super) fn hex_dump(bytes: &[u8]) -> String {
         for column in 0..HEX_COLUMNS {
             match chunk.get(column) {
                 Some(byte) => {
-                    push_hex(&mut out, *byte);
+                    crate::util::push_hex(&mut out, std::slice::from_ref(byte));
                     out.push(' ');
                 }
                 // A short last line keeps the ASCII gutter aligned.

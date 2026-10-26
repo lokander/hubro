@@ -468,29 +468,17 @@ impl PageRequest {
     }
 
     /// The paging tail shared by the paged selects, appended right after
-    /// [`Self::order_clause`]. SQLite and Postgres share the
-    /// ` LIMIT n OFFSET m` shape. SQL Server pages with
-    /// ` OFFSET n ROWS FETCH NEXT m ROWS ONLY`, which is only valid after an
-    /// ORDER BY — so when the request is unsorted (no order clause was
-    /// emitted) the tail supplies a synthetic ` ORDER BY (SELECT NULL)`
-    /// first, keeping the SQL valid without imposing an actual order.
+    /// [`Self::order_clause`] — a page of [`Dialect::row_cap`], which says
+    /// how each dialect spells it. Every paged shape caps at the tail, so
+    /// the head is always empty.
     fn limit_offset(&self, dialect: Dialect) -> String {
-        match dialect {
-            Dialect::Sqlite | Dialect::Postgres => {
-                format!(" LIMIT {} OFFSET {}", self.limit, self.offset)
-            }
-            Dialect::SqlServer => {
-                let order = if self.sort.is_some() {
-                    ""
-                } else {
-                    " ORDER BY (SELECT NULL)"
-                };
-                format!(
-                    "{order} OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
-                    self.offset, self.limit
-                )
-            }
-        }
+        let (head, tail) = dialect.row_cap(
+            u64::from(self.limit),
+            Some(self.offset),
+            self.sort.is_some(),
+        );
+        debug_assert!(head.is_empty(), "a page is capped at its tail");
+        tail
     }
 
     /// SELECT for this page that fetches a bounded preview of large columns
