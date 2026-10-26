@@ -9,6 +9,7 @@ use crate::db::{
     StatementOutcome, TableMeta, Value, EXPENSIVE_SHARE, MARKED_READ_ONLY, MAX_QUERY_ROWS, NO_DDL,
     NO_EXPLAIN, NO_MUTATE, NO_QUERY, PLAN_CELL_CAP,
 };
+use crate::ui::classes::{BTN_SECONDARY, BTN_SECONDARY_SM};
 
 use super::history_panel::HistoryPanel;
 use super::js::js_string;
@@ -415,7 +416,7 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
                     }
                     button {
                         class: if explain_support.is_some() {
-                            "rounded border border-slate-300 dark:border-slate-700 px-2 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100"
+                            BTN_SECONDARY
                         } else {
                             "rounded border border-slate-200 dark:border-slate-800 px-2 py-0.5 text-xs text-slate-400 dark:text-slate-600 cursor-not-allowed"
                         },
@@ -536,9 +537,9 @@ pub fn SqlEditor(id: ConnectionId) -> Element {
                             &run.statements,
                         ) {
                             {
-                                let (text, class) = status.line();
+                                let (text, tone) = status.line();
                                 rsx! {
-                                    p { class: "px-4 py-2 text-xs {class}",
+                                    p { class: "px-4 py-2 text-xs {tone.class()}",
                                         "Export of an earlier result: {text}"
                                     }
                                 }
@@ -571,7 +572,7 @@ fn PanelButton(panel: Signal<EditorPanel>, target: EditorPanel, label: String) -
             class: if panel() == target {
                 "rounded bg-slate-300 dark:bg-slate-700 px-2 py-0.5 text-xs text-slate-900 dark:text-slate-100"
             } else {
-                "rounded border border-slate-300 dark:border-slate-700 px-2 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100"
+                BTN_SECONDARY
             },
             onclick: move |_| {
                 let showing = panel() == target;
@@ -1031,8 +1032,8 @@ fn StatementSection(
                     div { class: "flex-1" }
                     if let Some(status) = export_status.as_ref() {
                         {
-                            let (text, class) = status.line();
-                            rsx! { span { class: "shrink-0 {class}", title: "{text}", "{text}" } }
+                            let (text, tone) = status.line();
+                            rsx! { span { class: "shrink-0 {tone.class()}", title: "{text}", "{text}" } }
                         }
                     }
                     for (format, label) in [
@@ -1041,7 +1042,7 @@ fn StatementSection(
                     ] {
                         button {
                             key: "{label}",
-                            class: "shrink-0 rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                            class: "shrink-0 {BTN_SECONDARY_SM}",
                             title: "Export this result to {label}",
                             onclick: {
                                 let statement = result.clone();

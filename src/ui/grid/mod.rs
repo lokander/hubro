@@ -48,6 +48,7 @@ use crate::db::{
     PageRequest, PreviewInfo, QueryResult, RowIdentity, RowLocator, SortDir, StagedChange,
     TableAccess, TableMeta, Value, FETCH_CELL_MAX_BYTES,
 };
+use crate::ui::classes::{BTN_GHOST, INPUT, SELECT};
 use crate::util::human_bytes;
 
 use super::editing::{editor_kind, CellEditor, EditNav, EditorKind};
@@ -1090,7 +1091,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
     let import_refused: Option<String> =
         access.as_ref().and_then(import_refusal).map(str::to_string);
     // The file the user picked, if the import dialog is open over this grid.
-    let import_file = use_signal(|| Option::<std::path::PathBuf>::None);
+    let mut import_file = use_signal(|| Option::<std::path::PathBuf>::None);
     // The connection's name when it is marked confirm-writes, so
     // the dialog can name it in the confirmation an import has to pass.
     let confirm_connection: Option<String> = state
@@ -1714,7 +1715,7 @@ pub fn DataGrid(id: ConnectionId, table: TableRef) -> Element {
                     path,
                     refusal: import_refused.clone(),
                     confirm_connection: confirm_connection.clone(),
-                    on_close: move |_| import_file.clone().set(None),
+                    on_close: move |_| import_file.set(None),
                 }
             }
         }
@@ -1878,14 +1879,14 @@ fn GridToolbar(
         // sentence naming a line and a column, not a word.
         if let Some(status) = import_status.as_ref() {
             {
-                let (text, class) = status.line();
+                let (text, tone) = status.line();
                 let skipped = import_skipped(status);
                 rsx! {
                     div { class: "flex items-start gap-2 border-b border-slate-200 dark:border-slate-800 px-3 py-1.5 text-xs",
                         // Wraps rather than clips: a failure or a cancelled
                         // pick is a sentence, wider than the row at a normal
                         // window width.
-                        span { class: "min-w-0 break-words font-medium {class}", "{text}" }
+                        span { class: "min-w-0 break-words font-medium {tone.class()}", "{text}" }
                         if let Some(skipped) = skipped {
                             span { class: "min-w-0 flex-1 truncate text-slate-500 dark:text-slate-400",
                                 title: "{skipped}",
@@ -1907,9 +1908,9 @@ fn GridToolbar(
         // in the toolbar row it was the shrinkable item, and at a normal
         // window width "Exported 500000 rows" truncated to nothing — so an
         // export finished with no visible outcome at all.
-        if let Some((text, class, finished)) = export_line {
+        if let Some((text, tone, finished)) = export_line {
             div { class: "flex items-start gap-2 border-b border-slate-200 dark:border-slate-800 px-3 py-1.5 text-xs",
-                span { class: "min-w-0 break-words font-medium {class}", "{text}" }
+                span { class: "min-w-0 break-words font-medium {tone.class()}", "{text}" }
                 div { class: "flex-1" }
                 if finished {
                     button {
@@ -1933,7 +1934,7 @@ fn GridToolbar(
                 }
             }
             select {
-                class: "rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 text-xs text-slate-900 dark:text-slate-300",
+                class: SELECT,
                 onchange: move |evt| filter_column.set(evt.value()),
                 option { value: "", selected: filter_column.read().is_empty(), "column…" }
                 for column in meta.schema_columns.iter() {
@@ -1945,7 +1946,7 @@ fn GridToolbar(
                 }
             }
             select {
-                class: "rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 text-xs text-slate-900 dark:text-slate-300",
+                class: SELECT,
                 onchange: move |evt| {
                     filter_op.set(if evt.value() == "equals" { FilterOp::Equals } else { FilterOp::Contains });
                 },
@@ -1955,7 +1956,7 @@ fn GridToolbar(
             TextInput {
                 // `dv-filter` is the target of the `/` focus shortcut.
                 id: "dv-filter",
-                class: "w-48 rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 font-mono text-xs text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600",
+                class: "w-48 font-mono {INPUT}",
                 placeholder: "filter value",
                 text: "{filter_text}",
                 oninput: move |evt: FormEvent| filter_text.set(evt.value()),
@@ -1989,7 +1990,7 @@ fn GridToolbar(
             div { class: "flex-1" }
             if let Some(status) = copy_status.read().as_ref() {
                 span {
-                    class: "min-w-0 truncate text-xs {status.class()}",
+                    class: "min-w-0 truncate text-xs {status.tone().class()}",
                     title: "{status.text}",
                     "{status.text}"
                 }
@@ -2000,7 +2001,7 @@ fn GridToolbar(
             if let Some((sel_rows, sel_cols, sel_cells)) = selection_summary {
                 div { class: "relative shrink-0",
                     button {
-                        class: "rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                        class: BTN_GHOST,
                         title: "Copy the {sel_cells} selected cell(s) — Ctrl+C copies TSV",
                         onclick: move |_| {
                             let open = *copy_menu.peek();
@@ -2044,7 +2045,7 @@ fn GridToolbar(
             }
             if let Some(export_dialect) = dialect.filter(|_| can_read) {
                 button {
-                    class: "rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                    class: BTN_GHOST,
                     title: "Export the current view (filter + sort, all rows) to CSV",
                     onclick: {
                         let export_table = export_table.clone();
@@ -2053,7 +2054,7 @@ fn GridToolbar(
                     "Export CSV"
                 }
                 button {
-                    class: "rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                    class: BTN_GHOST,
                     title: "Export the current view (filter + sort, all rows) to JSON",
                     onclick: {
                         let export_table = export_table.clone();
@@ -2064,7 +2065,7 @@ fn GridToolbar(
             }
             if can_import {
                 button {
-                    class: "rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100 disabled:opacity-50 disabled:hover:bg-transparent",
+                    class: "{BTN_GHOST} disabled:opacity-50 disabled:hover:bg-transparent",
                     disabled: import_refused.is_some(),
                     title: match import_refused.as_deref() {
                         Some(reason) => reason.to_string(),
@@ -2083,7 +2084,7 @@ fn GridToolbar(
                 class: if detail_open {
                     "flex items-center gap-1 rounded bg-slate-300 dark:bg-slate-700 px-2 py-1 text-xs text-slate-900 dark:text-slate-100"
                 } else {
-                    "flex items-center gap-1 rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100"
+                    "flex items-center gap-1 {BTN_GHOST}"
                 },
                 title: "Show the focused row as a form (Ctrl+D)",
                 onclick: move |_| state.set_row_detail(id, !detail_open),
@@ -2091,7 +2092,7 @@ fn GridToolbar(
                 "Row detail"
             }
             button {
-                class: "flex items-center gap-1 rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                class: "flex items-center gap-1 {BTN_GHOST}",
                 title: "Re-run the current query",
                 onclick: move |_| state.bump_grid_refresh(id, &refresh_table.key()),
                 RefreshCw { size: 12 }

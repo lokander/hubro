@@ -8,6 +8,7 @@
 //! test without rendering anything.
 
 use super::*;
+use crate::ui::classes::BTN_SECONDARY_SM;
 
 /// One cell prepared for rendering.
 #[derive(Debug, Clone, PartialEq)]
@@ -1258,7 +1259,7 @@ pub(super) fn CopyRawButton(value: Value) -> Element {
     rsx! {
         div { class: "mb-1 flex justify-end",
             button {
-                class: "rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                class: BTN_SECONDARY_SM,
                 title: "Copy the raw value (not the formatted view)",
                 onclick: move |_| write_clipboard(&raw_cell_text(&value)),
                 "Copy raw"

@@ -17,6 +17,7 @@ use dioxus::prelude::*;
 
 use crate::db::ConnectionId;
 use crate::history::{HistoryEntry, HistoryStore, HISTORY_CAP};
+use crate::ui::classes::{BTN_SECONDARY, BTN_SECONDARY_SM};
 
 use super::js::write_clipboard;
 use super::notice::{Banner, BannerKind, ConfirmInline, LoadingLine, SearchBox, SidePanel};
@@ -80,7 +81,7 @@ pub(super) fn HistoryPanel(id: ConnectionId, buffer: u64) -> Element {
                     }
                 } else {
                     button {
-                        class: "self-start rounded border border-slate-300 dark:border-slate-700 px-2 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                        class: "self-start {BTN_SECONDARY}",
                         disabled: !store_ready,
                         onclick: move |_| confirm_clear.set(true),
                         "Clear history"
@@ -216,7 +217,7 @@ fn HistoryRow(
             }
             div { class: "mt-1 flex gap-1 pl-4",
                 button {
-                    class: "rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                    class: BTN_SECONDARY_SM,
                     onclick: move |_| state.load_sql_text(id, buffer, sql_for_load.clone()),
                     "Load"
                 }
@@ -231,7 +232,7 @@ fn HistoryRow(
                     "Run"
                 }
                 button {
-                    class: "rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                    class: BTN_SECONDARY_SM,
                     onclick: move |_| write_clipboard(&sql_for_copy),
                     "Copy"
                 }

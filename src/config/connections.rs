@@ -210,6 +210,32 @@ pub enum BackendKind {
     SqlServer,
 }
 
+impl BackendKind {
+    /// The engine's name as the UI writes it: the connection list's badge,
+    /// the form headings and the Add buttons.
+    pub fn label(self) -> &'static str {
+        match self {
+            BackendKind::Sqlite => "SQLite",
+            BackendKind::Postgres => "Postgres",
+            BackendKind::SqlServer => "SQL Server",
+        }
+    }
+
+    /// The connection list's badge for this engine, in both themes. Kept
+    /// beside [`Self::label`] so a new engine gets both or fails to compile,
+    /// the way [`ConnectionColor::css`] and [`ConnectionColor::label`] pair.
+    /// The badge renders the label in lower case.
+    pub fn badge_classes(self) -> &'static str {
+        match self {
+            BackendKind::Postgres => "rounded bg-cyan-100 dark:bg-cyan-900/50 px-1.5 py-0.5 text-xs lowercase text-cyan-700 dark:text-cyan-300",
+            BackendKind::SqlServer => "rounded bg-red-100 dark:bg-red-900/50 px-1.5 py-0.5 text-xs lowercase text-red-700 dark:text-red-300",
+            // A step darker than the row's hover shade; a step lighter and the
+            // badge disappeared into it.
+            BackendKind::Sqlite => "rounded bg-slate-300 dark:bg-slate-700 px-1.5 py-0.5 text-xs lowercase text-slate-600 dark:text-slate-300",
+        }
+    }
+}
+
 impl From<BackendKind> for Dialect {
     /// A saved connection's backend and an open connection's SQL dialect name
     /// the same three engines, so converting lets both address one per-engine

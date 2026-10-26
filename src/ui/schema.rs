@@ -14,6 +14,7 @@ use crate::db::{
     schema_edit_refusal, unreadable_reason, ColumnMeta, ConnectionId, DdlObject, DdlSource,
     Generated, RowCount, SchemaOp, TableKind, TableMeta, TypeDetail,
 };
+use crate::ui::classes::BTN_SECONDARY_SM;
 use crate::util::{human_bytes, human_count};
 
 use super::js::write_clipboard;
@@ -144,7 +145,7 @@ fn SchemaBody(id: ConnectionId, meta: TableMeta) -> Element {
                 // it describes rather than in a toolbar, so it is obvious
                 // *what* the DDL will be for.
                 button {
-                    class: "ml-auto rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                    class: "ml-auto {BTN_SECONDARY_SM}",
                     onclick: move |_| showing_ddl.set(Some(DdlObject::Object)),
                     "Show DDL"
                 }
@@ -234,7 +235,7 @@ fn SchemaBody(id: ConnectionId, meta: TableMeta) -> Element {
                                     }
                                 }
                                 button {
-                                    class: "ml-auto rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                                    class: "ml-auto {BTN_SECONDARY_SM}",
                                     onclick: {
                                         let name = index.name.clone();
                                         move |_| showing_ddl.set(Some(DdlObject::Index(name.clone())))
@@ -339,7 +340,7 @@ fn SchemaAction(
             class: match (refusal.is_some(), destructive) {
                 (true, _) => "rounded border border-slate-200 dark:border-slate-800 px-1.5 py-0.5 text-xs text-slate-400 dark:text-slate-600 cursor-not-allowed",
                 (false, true) => "rounded border border-rose-300 dark:border-rose-800 px-1.5 py-0.5 text-xs text-rose-700 dark:text-rose-300 hover:bg-rose-100 dark:hover:bg-rose-950/50",
-                (false, false) => "rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                (false, false) => BTN_SECONDARY_SM,
             },
             disabled: refusal.is_some(),
             title: refusal.unwrap_or(""),
@@ -469,7 +470,7 @@ fn TableStatsLine(id: ConnectionId, table: ReadSignal<TableRef>) -> Element {
                 }
             }
             button {
-                class: "ml-auto shrink-0 rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100 disabled:opacity-50",
+                class: "ml-auto shrink-0 {BTN_SECONDARY_SM} disabled:opacity-50",
                 disabled: counting(),
                 title: "Runs SELECT COUNT(*) against this object — a full scan on a large table",
                 onclick: move |_| {
@@ -581,7 +582,7 @@ fn DdlOverlay(
 fn CopyDdlButton(text: String) -> Element {
     rsx! {
         button {
-            class: "shrink-0 rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+            class: "shrink-0 {BTN_SECONDARY_SM}",
             onclick: move |_| write_clipboard(&text),
             "Copy"
         }

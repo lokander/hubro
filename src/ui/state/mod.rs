@@ -71,6 +71,7 @@ use crate::db::{
 };
 use crate::history::{HistoryStore, SaveOutcome};
 use crate::tunnel::{HostKeyInfo, Tunnel, TunnelAuth, TunnelConfig, TunnelError};
+use crate::ui::classes::Tone;
 use crate::ui::notice::{deliberate, Armed, Gesture, SPINNER_DELAY};
 use crate::ui::stage::TableStage;
 
@@ -704,7 +705,7 @@ pub fn grid_export_line(
     tables: &HashMap<ConnectionId, TableRef>,
     id: ConnectionId,
     shown: &TableRef,
-) -> Option<(String, &'static str, bool)> {
+) -> Option<(String, Tone, bool)> {
     let status = statuses.get(&(id, ExportPane::Grid))?;
     let finished = *status != ExportStatus::Running;
     let (text, class) = status.line();
@@ -741,22 +742,16 @@ pub fn run_retires_sql_export(
 }
 
 impl ExportStatus {
-    /// The toolbar line for this status: display text plus a Tailwind color
-    /// class. Shared by the grid and SQL-editor export controls.
-    pub fn line(&self) -> (String, &'static str) {
+    /// The toolbar line for this status: display text plus the [`Tone`] it
+    /// reads in. Shared by the grid and SQL-editor export controls.
+    pub fn line(&self) -> (String, Tone) {
         match self {
-            ExportStatus::Running => (
-                "Exporting…".to_string(),
-                "text-slate-500 dark:text-slate-400",
-            ),
+            ExportStatus::Running => ("Exporting…".to_string(), Tone::Muted),
             ExportStatus::Done { rows } => (
                 format!("Exported {rows} row{}", if *rows == 1 { "" } else { "s" }),
-                "text-emerald-700 dark:text-emerald-400",
+                Tone::Ok,
             ),
-            ExportStatus::Failed(err) => (
-                format!("Export failed: {err}"),
-                "text-red-600 dark:text-red-400",
-            ),
+            ExportStatus::Failed(err) => (format!("Export failed: {err}"), Tone::Error),
         }
     }
 }
@@ -789,21 +784,18 @@ pub enum SavedStatus {
 }
 
 impl SavedStatus {
-    /// The panel line for this status: display text plus a Tailwind color
-    /// class, in the shape [`ExportStatus::line`] established.
-    pub fn line(&self) -> (String, &'static str) {
+    /// The panel line for this status: display text plus the [`Tone`] it
+    /// reads in, in the shape [`ExportStatus::line`] established.
+    pub fn line(&self) -> (String, Tone) {
         match self {
             // "Updated" rather than "Saved" when something was overwritten:
             // the user is entitled to know a name they reused was already
             // taken.
             SavedStatus::Saved { name, replaced } => (
                 format!("{} “{name}”", if *replaced { "Updated" } else { "Saved" }),
-                "text-emerald-700 dark:text-emerald-400",
+                Tone::Ok,
             ),
-            SavedStatus::Failed(err) => (
-                format!("Save failed: {err}"),
-                "text-red-600 dark:text-red-400",
-            ),
+            SavedStatus::Failed(err) => (format!("Save failed: {err}"), Tone::Error),
         }
     }
 }
@@ -3504,9 +3496,9 @@ mod tests {
         }
         .line();
         assert_eq!(replaced, "Updated “Counts”");
-        let (failed, class) = SavedStatus::Failed("disk full".into()).line();
+        let (failed, tone) = SavedStatus::Failed("disk full".into()).line();
         assert_eq!(failed, "Save failed: disk full");
-        assert!(class.contains("red"));
+        assert_eq!(tone, Tone::Error);
     }
 
     #[test]

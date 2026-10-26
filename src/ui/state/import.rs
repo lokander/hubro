@@ -12,6 +12,7 @@
 //! that is still showing the page fetched before them.
 
 use super::*;
+use crate::ui::classes::Tone;
 
 /// Progress of the most recent import on one connection.
 ///
@@ -34,20 +35,17 @@ pub enum ImportStatus {
 }
 
 impl ImportStatus {
-    /// The toolbar line for this status: display text plus a Tailwind color
-    /// class, mirroring [`ExportStatus::line`].
+    /// The toolbar line for this status: display text plus the [`Tone`] it
+    /// reads in, mirroring [`ExportStatus::line`].
     ///
     /// A completed import with skipped rows is deliberately *not* green: it
     /// succeeded, but rows the user expected are missing, and that has to
     /// read as something to look at rather than as a clean result. The same
     /// goes for values that took their column's default: the table now holds
     /// something the file did not say.
-    pub fn line(&self) -> (String, &'static str) {
+    pub fn line(&self) -> (String, Tone) {
         match self {
-            ImportStatus::Running { table } => (
-                format!("Importing into {table}…"),
-                "text-slate-500 dark:text-slate-400",
-            ),
+            ImportStatus::Running { table } => (format!("Importing into {table}…"), Tone::Muted),
             ImportStatus::Done(report) => {
                 let mut text = format!(
                     "Imported {} row{}",
@@ -70,22 +68,19 @@ impl ImportStatus {
                     ));
                 }
                 let color = if report.skipped_rows > 0 || report.defaulted_cells > 0 {
-                    "text-amber-700 dark:text-amber-400"
+                    Tone::Warn
                 } else {
-                    "text-emerald-700 dark:text-emerald-400"
+                    Tone::Ok
                 };
                 (text, color)
             }
-            ImportStatus::Failed(err) => (
-                format!("Import failed: {err}"),
-                "text-red-600 dark:text-red-400",
-            ),
+            ImportStatus::Failed(err) => (format!("Import failed: {err}"), Tone::Error),
             ImportStatus::Cancelled { table } => (
                 format!(
                     "Import into {table} cancelled: the table was closed while its file picker \
                      was open. Nothing was imported — open {table} and pick the file again."
                 ),
-                "text-amber-700 dark:text-amber-400",
+                Tone::Warn,
             ),
         }
     }
@@ -280,7 +275,7 @@ mod tests {
             defaulted_cells: 0,
         });
         assert_eq!(clean.line().0, "Imported 1 row");
-        assert!(clean.line().1.contains("emerald"));
+        assert_eq!(clean.line().1, Tone::Ok);
 
         // A partial import must not read as a clean one: rows the user
         // expected are missing.
@@ -294,7 +289,7 @@ mod tests {
             defaulted_cells: 0,
         });
         assert_eq!(partial.line().0, "Imported 3 rows, skipped 1");
-        assert!(partial.line().1.contains("amber"), "{}", partial.line().1);
+        assert_eq!(partial.line().1, Tone::Warn);
         assert_eq!(partial.report().map(|r| r.skipped.len()), Some(1));
 
         // Values the file left empty that took their column's default are
@@ -310,11 +305,7 @@ mod tests {
             defaulted.line().0,
             "Imported 5 rows; 4 empty values took their column's default"
         );
-        assert!(
-            defaulted.line().1.contains("amber"),
-            "{}",
-            defaulted.line().1
-        );
+        assert_eq!(defaulted.line().1, Tone::Warn);
         let one = ImportStatus::Done(ImportReport {
             inserted_rows: 2,
             skipped: vec![SkippedRow {
@@ -331,7 +322,7 @@ mod tests {
 
         let failed = ImportStatus::Failed("line 4: nope".into());
         assert!(failed.line().0.starts_with("Import failed:"));
-        assert!(failed.line().1.contains("red"));
+        assert_eq!(failed.line().1, Tone::Error);
     }
 
     #[tokio::test]

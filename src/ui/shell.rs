@@ -9,6 +9,7 @@ use dioxus_icons::lucide::{Moon, Sun, SunMoon, X};
 use crate::cli::Startup;
 use crate::config::{load_settings, save_window_geometry, ConnectionColor, Theme, WindowGeometry};
 use crate::db::{ConnectionId, Dialect, WriteProtection};
+use crate::ui::classes::{BTN_GHOST, BTN_PRIMARY};
 
 use super::connections::ConnectionsScreen;
 use super::editor::SqlEditor;
@@ -281,7 +282,7 @@ fn QuitConfirmDialog() -> Element {
                         "Cancel"
                     }
                     button {
-                        class: "rounded bg-rose-600 px-4 py-2 text-sm font-medium text-white hover:bg-rose-500",
+                        class: "{BTN_PRIMARY} bg-rose-600 hover:bg-rose-500",
                         onclick: move |_| {
                             // Stop the re-show loop, re-arm a real close, then
                             // request it. `close()` routes through the same
@@ -342,7 +343,7 @@ fn update_geometry(latest: &mut Signal<WindowGeometry>, window: &DesktopService)
 /// ([`AppState::report_settings_write`]).
 #[component]
 fn WindowPersistence() -> Element {
-    let state = use_context::<AppState>();
+    let mut state = use_context::<AppState>();
     let window = use_window();
     let mut latest = use_signal(|| read_geometry(&window));
 
@@ -419,7 +420,7 @@ fn WindowPersistence() -> Element {
                 // (the `_` arm below re-shows the just-hidden window).
                 if state.any_dirty() {
                     window.set_close_behavior(WindowCloseBehaviour::WindowHides);
-                    state.confirm_quit.clone().set(true);
+                    state.confirm_quit.set(true);
                 } else {
                     window.set_close_behavior(WindowCloseBehaviour::WindowCloses);
                 }
@@ -662,7 +663,7 @@ fn ThemeToggle() -> Element {
     };
     rsx! {
         button {
-            class: "ml-auto flex items-center gap-1 rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+            class: "ml-auto flex items-center gap-1 {BTN_GHOST}",
             title: "Theme (click to cycle System / Light / Dark)",
             aria_label: "Toggle theme",
             onclick: move |_| state.set_theme(theme.next()),

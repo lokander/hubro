@@ -24,6 +24,7 @@
 //! that generated it would have been refused for.
 
 use super::*;
+use crate::ui::classes::Tone;
 
 /// Progress of the most recent schema edit on one connection.
 #[derive(Debug, Clone, PartialEq)]
@@ -40,19 +41,13 @@ pub enum SchemaEditStatus {
 }
 
 impl SchemaEditStatus {
-    /// The pane's status line: display text plus a Tailwind colour class,
+    /// The pane's status line: display text plus the [`Tone`] it reads in,
     /// mirroring [`ImportStatus::line`].
-    pub fn line(&self) -> (String, &'static str) {
+    pub fn line(&self) -> (String, Tone) {
         match self {
-            SchemaEditStatus::Running { label } => {
-                (format!("{label}…"), "text-slate-500 dark:text-slate-400")
-            }
-            SchemaEditStatus::Done { label } => {
-                (label.clone(), "text-emerald-700 dark:text-emerald-400")
-            }
-            SchemaEditStatus::Failed(err) => {
-                (format!("Failed: {err}"), "text-red-600 dark:text-red-400")
-            }
+            SchemaEditStatus::Running { label } => (format!("{label}…"), Tone::Muted),
+            SchemaEditStatus::Done { label } => (label.clone(), Tone::Ok),
+            SchemaEditStatus::Failed(err) => (format!("Failed: {err}"), Tone::Error),
         }
     }
 
@@ -417,10 +412,10 @@ mod tests {
         };
         assert!(!done.is_running());
         assert_eq!(done.line().0, "Dropped table orders");
-        assert!(done.line().1.contains("emerald"));
+        assert_eq!(done.line().1, Tone::Ok);
 
         let failed = SchemaEditStatus::Failed("no such table".into());
         assert_eq!(failed.error(), Some("no such table"));
-        assert!(failed.line().1.contains("red"));
+        assert_eq!(failed.line().1, Tone::Error);
     }
 }

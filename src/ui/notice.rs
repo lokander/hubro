@@ -16,6 +16,7 @@ use dioxus_icons::lucide::{Info, TriangleAlert, X};
 use super::js::{focus_on_mount, take_overlay_focus};
 use super::text_field::TextInput;
 use crate::db::TableKind;
+use crate::ui::classes::INPUT;
 
 /// The severity of a [`Banner`], picking its icon and color scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -469,7 +470,7 @@ pub fn SearchBox(placeholder: String, search: Signal<String>) -> Element {
     let mut draft = use_signal(String::new);
     rsx! {
         TextInput {
-            class: "w-full rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 text-xs text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600",
+            class: "w-full {INPUT}",
             placeholder,
             text: "{draft}",
             oninput: move |evt: FormEvent| {

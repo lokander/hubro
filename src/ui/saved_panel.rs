@@ -16,6 +16,7 @@ use dioxus::prelude::*;
 
 use crate::db::ConnectionId;
 use crate::history::SavedQuery;
+use crate::ui::classes::{BTN_SECONDARY, BTN_SECONDARY_SM, INPUT};
 
 use super::history_panel::use_store_query;
 use super::js::write_clipboard;
@@ -31,7 +32,7 @@ pub(super) fn SavedQueriesPanel(
     /// The buffer a save takes its text from — the one on screen.
     buffer: u64,
 ) -> Element {
-    let state = use_context::<AppState>();
+    let mut state = use_context::<AppState>();
     // The committed filter, set on Enter like the history panel's.
     let search = use_signal(String::new);
     let mut showing_form = use_signal(|| false);
@@ -62,7 +63,7 @@ pub(super) fn SavedQueriesPanel(
                     }
                 } else {
                     button {
-                        class: "self-start rounded border border-slate-300 dark:border-slate-700 px-2 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100 disabled:opacity-50",
+                        class: "self-start {BTN_SECONDARY} disabled:opacity-50",
                         disabled: !store_ready || buffer_empty,
                         title: if buffer_empty {
                             "Write something in the editor first"
@@ -70,7 +71,7 @@ pub(super) fn SavedQueriesPanel(
                             "Save what is in the editor under a name"
                         },
                         onclick: move |_| {
-                            state.saved_status.clone().write().remove(&id);
+                            state.saved_status.write().remove(&id);
                             showing_form.set(true);
                         },
                         "Save current query"
@@ -78,8 +79,8 @@ pub(super) fn SavedQueriesPanel(
                 }
                 if let Some(status) = status.as_ref() {
                     {
-                        let (text, class) = status.line();
-                        rsx! { span { class: "text-xs {class}", "{text}" } }
+                        let (text, tone) = status.line();
+                        rsx! { span { class: "text-xs {tone.class()}", "{text}" } }
                     }
                 }
                 SearchBox { placeholder: "Search saved queries (Enter)", search }
@@ -155,7 +156,7 @@ fn SaveForm(id: ConnectionId, buffer: u64, on_close: EventHandler<()>) -> Elemen
     rsx! {
         div { class: "flex flex-col gap-1.5",
             TextInput {
-                class: "w-full rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 text-xs text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600",
+                class: "w-full {INPUT}",
                 placeholder: "Name",
                 "autofocus": "true",
                 text: "{name}",
@@ -169,7 +170,7 @@ fn SaveForm(id: ConnectionId, buffer: u64, on_close: EventHandler<()>) -> Elemen
                 },
             }
             TextInput {
-                class: "w-full rounded border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 px-2 py-1 text-xs text-slate-900 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-600",
+                class: "w-full {INPUT}",
                 placeholder: "Description (optional)",
                 text: "{description}",
                 oninput: move |evt: FormEvent| description.set(evt.value()),
@@ -254,7 +255,7 @@ fn SavedRow(id: ConnectionId, entry: SavedQuery) -> Element {
                     "Open"
                 }
                 button {
-                    class: "rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                    class: BTN_SECONDARY_SM,
                     onclick: move |_| write_clipboard(&sql_for_copy),
                     "Copy"
                 }
@@ -269,7 +270,7 @@ fn SavedRow(id: ConnectionId, entry: SavedQuery) -> Element {
                     }
                 } else {
                     button {
-                        class: "rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100",
+                        class: BTN_SECONDARY_SM,
                         onclick: move |_| confirm_delete.set(true),
                         "Delete"
                     }
