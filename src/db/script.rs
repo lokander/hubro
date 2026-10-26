@@ -1886,18 +1886,14 @@ trait StatementExecutor: Sized {
     /// Runs the script's last statement, a read, and lets go of the hold with
     /// it — so a hold that would otherwise wait for the rest of a cut-short
     /// result can close instead. Called only where
-    /// [`Self::ENDS_WITH_FINAL_READ`]; by default, the read and then
-    /// [`Self::end`].
+    /// [`Self::ENDS_WITH_FINAL_READ`]. No default: a hold that ends with its
+    /// final read says how, rather than inheriting "read, then end".
     async fn finish_with_read(
-        mut self,
+        self,
         sql: &str,
         max_rows: u64,
         cell_cap: usize,
-    ) -> (Result<Capped, DbError>, Self::Ended) {
-        let read = self.read(sql, max_rows, cell_cap).await;
-        let ended = self.end(read.is_err()).await;
-        (read, ended)
-    }
+    ) -> (Result<Capped, DbError>, Self::Ended);
 }
 
 /// The sequential run: every statement on the one connection the run holds,
@@ -1996,6 +1992,17 @@ impl StatementExecutor for ScriptTx<'_> {
         } else {
             TxEnded::RolledBack(self.rollback().await)
         }
+    }
+
+    /// Never called: the atomic run's last read is reported before its
+    /// commit (`ENDS_WITH_FINAL_READ` is `false`).
+    async fn finish_with_read(
+        self,
+        _: &str,
+        _: u64,
+        _: usize,
+    ) -> (Result<Capped, DbError>, TxEnded) {
+        unreachable!("an atomic run does not end with its final read")
     }
 }
 
@@ -5744,6 +5751,15 @@ mod statement_loop {
         async fn end(self, failed: bool) -> bool {
             self.0.borrow_mut().push(format!("end failed={failed}"));
             failed
+        }
+
+        async fn finish_with_read(
+            self,
+            _: &str,
+            _: u64,
+            _: usize,
+        ) -> (Result<Capped, DbError>, bool) {
+            unreachable!("Fake does not end with its final read")
         }
     }
 
