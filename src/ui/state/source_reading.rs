@@ -68,7 +68,7 @@ pub(super) fn collapsed(code: &str) -> String {
 pub(super) fn negated(code: &str, names: &[&str]) -> Option<String> {
     code.match_indices('!').find_map(|(at, _)| {
         let rest = code[at + 1..].trim_start_matches(['*', '&', '(']);
-        let rest = ["prompt.", "self.", "state.", "acquired."]
+        let rest = ["prompt.", "self.", "state.", "acquired.", "evt."]
             .iter()
             .find_map(|receiver| rest.strip_prefix(receiver))
             .unwrap_or(rest);

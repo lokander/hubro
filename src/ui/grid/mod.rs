@@ -810,10 +810,13 @@ fn GridToolbar(
             select {
                 class: SELECT,
                 onchange: move |evt| {
-                    filter_op.set(if evt.value() == "equals" { FilterOp::Equals } else { FilterOp::Contains });
+                    if let Ok(op) = evt.value().parse() {
+                        filter_op.set(op);
+                    }
                 },
-                option { value: "contains", "contains" }
-                option { value: "equals", "equals" }
+                for op in FilterOp::ALL {
+                    option { value: op.as_str(), {op.as_str()} }
+                }
             }
             TextInput {
                 // `dv-filter` is the target of the `/` focus shortcut.

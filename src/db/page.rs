@@ -348,6 +348,34 @@ pub enum FilterOp {
     Equals,
 }
 
+impl FilterOp {
+    /// Every operator, in the order the filter bar lists them.
+    pub const ALL: [FilterOp; 2] = [FilterOp::Contains, FilterOp::Equals];
+
+    /// The filter bar's name for the operator — its option's value and
+    /// label, and what [`FilterOp::from_str`](std::str::FromStr::from_str)
+    /// reads back.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FilterOp::Contains => "contains",
+            FilterOp::Equals => "equals",
+        }
+    }
+}
+
+impl std::str::FromStr for FilterOp {
+    type Err = String;
+
+    /// Reads an operator's name back; anything else is an error rather than
+    /// a quiet `contains`.
+    fn from_str(value: &str) -> Result<FilterOp, String> {
+        FilterOp::ALL
+            .into_iter()
+            .find(|op| op.as_str() == value)
+            .ok_or_else(|| format!("unknown filter operator `{value}`"))
+    }
+}
+
 /// The active grid filter. Two shapes share one WHERE-clause builder:
 ///
 /// - [`Filter::Column`] is the manual filter bar — one column compared with
@@ -687,6 +715,17 @@ fn escape_like(needle: &str, dialect: Dialect) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_filter_operator_reads_back_from_its_name() {
+        for op in FilterOp::ALL {
+            assert_eq!(op.as_str().parse(), Ok(op), "{op:?}");
+        }
+        assert_eq!("equals".parse(), Ok(FilterOp::Equals));
+        assert_eq!("contains".parse(), Ok(FilterOp::Contains));
+        assert!("Equals".parse::<FilterOp>().is_err());
+        assert!("".parse::<FilterOp>().is_err());
+    }
 
     fn base() -> PageRequest {
         PageRequest {

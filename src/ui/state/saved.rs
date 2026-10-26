@@ -196,8 +196,8 @@ impl AppState {
     }
 
     /// Moves a group one step up or down the display order.
-    pub fn move_saved_group(self, name: &str, up: bool) {
-        self.mutate_saved(|saved| saved.move_group(name, up));
+    pub fn move_saved_group(self, name: &str, step: GroupStep) {
+        self.mutate_saved(|saved| saved.move_group(name, step));
     }
 
     /// Files a saved connection under a group, or ungroups it with

@@ -21,7 +21,7 @@ use crate::ui::classes::{BTN_SECONDARY, BTN_SECONDARY_SM, INPUT};
 use super::history_panel::use_store_query;
 use super::js::write_clipboard;
 use super::notice::{Banner, BannerKind, ConfirmInline, LoadingLine, SearchBox, SidePanel};
-use super::state::AppState;
+use super::state::{AppState, SaveScope};
 use super::text_field::TextInput;
 
 /// Right-side panel listing the queries saved for this connection plus the
@@ -149,7 +149,11 @@ fn SaveForm(id: ConnectionId, buffer: u64, on_close: EventHandler<()>) -> Elemen
             name_value,
             (!description_value.is_empty()).then_some(description_value),
             state.sql_buffer_text(id, buffer),
-            *global.peek(),
+            if *global.peek() {
+                SaveScope::Global
+            } else {
+                SaveScope::Connection
+            },
         );
         on_close.call(());
     };
