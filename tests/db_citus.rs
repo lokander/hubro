@@ -139,6 +139,8 @@ async fn citus_hides_its_own_shard_tables_from_the_catalog() {
         leaked.is_empty(),
         "shard tables leaked into the tree: {leaked:?}"
     );
+
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -164,6 +166,8 @@ async fn citus_own_views_in_public_are_marked_internal() {
     let tables = pool.introspect().await.unwrap();
     assert_eq!(find(&tables, &orders).internal, None);
     assert_eq!(find(&tables, &notes).internal, None);
+
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -195,6 +199,8 @@ async fn distributed_reference_and_local_tables_all_introspect_alike() {
         .expect("fk to the reference table");
     assert_eq!(fk.columns, ["country"]);
     assert_eq!(fk.referenced_table, countries);
+
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -214,6 +220,8 @@ async fn distributed_table_pages_sorts_and_filters_across_shards() {
         ..common::page(orders.clone())
     };
     assert_pages_sorts_and_filters(&pool, &request, Expected::MoreThan(50)).await;
+
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -245,10 +253,12 @@ async fn distributed_rows_edit_through_the_distribution_key() {
         },
     )
     .await;
+
+    pool.close().await;
 }
 
 #[tokio::test]
-async fn changing_the_distribution_column_is_refused_with_citus_own_message() {
+async fn changing_the_distribution_column_is_refused_by_the_server() {
     let Some(url) = test_url() else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     let (orders, _, _) = fresh_cluster(&pool, "distcol").await;
@@ -277,12 +287,14 @@ async fn changing_the_distribution_column_is_refused_with_citus_own_message() {
     )
     .await
     .expect_err("citus should refuse to move a row between shards");
-    // Citus's own words are "modifying the partition value of rows is not
-    // allowed" — it calls the distribution column the partition value.
-    let message = format!("{err:?}").to_lowercase();
+    // The server's refusal, passed through as a query failure: not one hubro
+    // made up front (that would read "not supported here"), and not a row
+    // count hubro rejected afterwards ("write aborted"). Citus's own words
+    // ("modifying the partition value of rows is not allowed", in 14) follow
+    // the prefix, and are not asserted: they are Citus's to reword.
     assert!(
-        message.contains("partition value"),
-        "the refusal should carry Citus's reason, got: {message}"
+        err.message.starts_with("query failed: "),
+        "the refusal should be the server's, got: {err:?}"
     );
     // And the failure names which staged change died, so a batch of edits
     // points at the offending row rather than failing anonymously.
@@ -306,6 +318,8 @@ async fn changing_the_distribution_column_is_refused_with_citus_own_message() {
         .await
         .unwrap();
     assert_eq!(page.rows.len(), 1, "the original row should still be there");
+
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -349,6 +363,8 @@ async fn reference_table_edits_like_an_ordinary_table() {
     .await
     .unwrap();
     assert_eq!(counts.deleted_rows, 1);
+
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -381,6 +397,8 @@ async fn fk_navigation_crosses_from_distributed_to_reference() {
         .unwrap();
     assert_eq!(page.rows.len(), 1);
     assert_eq!(page.rows[0][0], Value::Text("se".into()));
+
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -416,6 +434,7 @@ async fn v1_certificate_failure_says_what_to_do() {
                 "sslmode=require connected without TLS"
             );
             eprintln!("skipping: this server has a certificate rustls accepts");
+            pool.close().await;
             return;
         }
         Err(err) => err,
@@ -512,50 +531,50 @@ async fn scripts_and_exports_span_distributed_and_reference_tables() {
     let text = String::from_utf8(csv).unwrap();
     assert!(text.starts_with("id,country,total"), "{text:.40}");
 
-    pool.query_unbounded(&format!("DELETE FROM {orders} WHERE id = 90001"))
-        .await
-        .unwrap();
-    pool.query_unbounded(&format!("DELETE FROM {countries} WHERE code = 'is'"))
-        .await
-        .unwrap();
+    pool.close().await;
 }
 
-#[tokio::test]
-async fn shards_are_marked_internal_when_citus_stops_hiding_them() {
-    let Some(url) = test_url() else { return };
-    let pool = DbPool::open_postgres(&url).await.unwrap();
+/// A database of its own named `db`, with Citus told to show every shard to
+/// the client, and three distributed tables whose shards then appear: a plain
+/// table in `public`, one in a schema outside the search path
+/// (`shard_name()` qualifies those, so its answer is not a bare relname), and
+/// one whose name is long enough that Citus hashes and truncates the shard
+/// names instead of appending to them. Each shape broke a different draft of
+/// the shard rule.
+///
+/// `citus.show_shards_for_app_name_prefixes` is a documented knob, and
+/// widening it puts every shard table in front of the client: a 26-table
+/// database reports 290. Shards are not extension members and not partitions,
+/// so none of the three internal-object rules (extension schemas, extension
+/// members, partitions) catch them — hence the `pg_dist_shard` pass these
+/// tests pin. The setting is per-database, which is why the database is the
+/// test's own rather than the one its siblings read. Dropped at the start
+/// (`WITH (FORCE)` clears a leftover from a crashed run), never at the end.
+///
+/// Hands back the [`FIXTURE_DDL`] guard, to be held for the whole test, the
+/// pool on the new database, everything it introspects, the three parents'
+/// names, and the shards: every table in those schemas that isn't a parent.
+/// Views are left out because Citus's own `citus_tables`/`citus_schemas` live
+/// in `public` and are internal for a different reason, so they'd inflate the
+/// count without being shards.
+///
+/// The shard count is checked against `pg_dist_shard` here rather than in
+/// either test, because neither test means anything without it: with three
+/// shard families in play, a bound loose enough to be safe is also loose
+/// enough for a whole family to vanish unnoticed.
+async fn shards_shown(pool: &DbPool, url: &str, db: &str) -> ShardsShown {
+    let guard = FIXTURE_DDL.lock().await;
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"),
+        format!("CREATE DATABASE {db}"),
+        format!("ALTER DATABASE {db} SET citus.show_shards_for_app_name_prefixes TO '*'"),
+    ] {
+        pool.query_unbounded(&sql).await.unwrap();
+    }
 
-    // `citus.show_shards_for_app_name_prefixes` is a documented knob, and
-    // widening it puts every shard table in front of the client: a 26-table
-    // database reports 290. Shards are not extension members and not
-    // partitions, so none of the three internal-object rules (extension
-    // schemas, extension members, partitions) catch them — hence the
-    // `pg_dist_shard` pass this pins.
-    //
-    // The setting is per-database, so this test needs one of its own rather
-    // than changing what the sibling tests see. `DROP ... WITH (FORCE)`
-    // clears a leftover from a crashed run.
-    let _guard = FIXTURE_DDL.lock().await;
-    let db = "hubro_citus_shardvis";
-    pool.query_unbounded(&format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"))
+    let shard_pool = DbPool::open_postgres(&common::with_database(url, db))
         .await
         .unwrap();
-    pool.query_unbounded(&format!("CREATE DATABASE {db}"))
-        .await
-        .unwrap();
-    pool.query_unbounded(&format!(
-        "ALTER DATABASE {db} SET citus.show_shards_for_app_name_prefixes TO '*'"
-    ))
-    .await
-    .unwrap();
-
-    let shard_url = common::with_database(&url, db);
-    let shard_pool = DbPool::open_postgres(&shard_url).await.unwrap();
-    // Three shapes that each broke a different draft of the shard rule: a
-    // plain table in `public`, one in a schema outside the search path
-    // (`shard_name()` qualifies those, so its answer is not a bare relname),
-    // and one whose name is long enough that Citus hashes and truncates the
-    // shard names instead of appending to them.
     let long_name = format!("t_{}", "x".repeat(60));
     for sql in [
         "CREATE EXTENSION citus".to_string(),
@@ -573,20 +592,18 @@ async fn shards_are_marked_internal_when_citus_stops_hiding_them() {
     }
 
     let tables = shard_pool.introspect().await.unwrap();
-    let parents = ["visible_shards", "orders", long_name.as_str()];
-    // Every table in these schemas that isn't one of the three parents is a
-    // shard. Views are excluded because Citus's own `citus_tables`/
-    // `citus_schemas` live in `public` and are internal for a different
-    // reason — they'd inflate the count without being shards.
-    let shards: Vec<&TableMeta> = tables
+    let parents = [
+        "visible_shards".to_string(),
+        "orders".to_string(),
+        long_name,
+    ];
+    let shards: Vec<TableMeta> = tables
         .iter()
         .filter(|t| t.kind == TableKind::Table)
-        .filter(|t| !parents.contains(&t.name.as_str()))
+        .filter(|t| !parents.contains(&t.name))
         .filter(|t| t.schema.as_deref() == Some("public") || t.schema.as_deref() == Some("sales"))
+        .cloned()
         .collect();
-    // Against `pg_dist_shard` rather than a loose lower bound: with three
-    // shard families in play, a bound wide enough to be safe is also wide
-    // enough for a whole family to vanish unnoticed.
     let expected = shard_pool
         .query_unbounded("SELECT count(*) FROM pg_dist_shard")
         .await
@@ -598,9 +615,33 @@ async fn shards_are_marked_internal_when_citus_stops_hiding_them() {
     assert_eq!(
         shards.len(),
         expected,
-        "every shard should be visible for this test to mean anything"
+        "every shard should be visible for these tests to mean anything"
     );
-    for shard in &shards {
+    ShardsShown {
+        _guard: guard,
+        pool: shard_pool,
+        tables,
+        parents,
+        shards,
+    }
+}
+
+/// What [`shards_shown`] built.
+struct ShardsShown {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+    pool: DbPool,
+    tables: Vec<TableMeta>,
+    parents: [String; 3],
+    shards: Vec<TableMeta>,
+}
+
+#[tokio::test]
+async fn shards_are_marked_internal_when_citus_stops_hiding_them() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let shown = shards_shown(&pool, &url, "hubro_citus_shardvis").await;
+
+    for shard in &shown.shards {
         assert_eq!(
             shard.internal,
             Some(Internal::Extension("citus".into())),
@@ -611,23 +652,34 @@ async fn shards_are_marked_internal_when_citus_stops_hiding_them() {
     }
     // Shards outside `public` are the case a bare-name rule misses entirely.
     assert!(
-        shards.iter().any(|t| t.schema.as_deref() == Some("sales")),
+        shown
+            .shards
+            .iter()
+            .any(|t| t.schema.as_deref() == Some("sales")),
         "the sales-schema shards should be among them"
     );
 
-    // The tables they shard are the user's, and stay visible.
-    for parent in parents {
-        let meta = tables
+    shown.pool.close().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn the_tables_citus_shards_stay_the_users_while_their_shards_show() {
+    let Some(url) = test_url() else { return };
+    let pool = DbPool::open_postgres(&url).await.unwrap();
+    let shown = shards_shown(&pool, &url, "hubro_citus_shardparents").await;
+
+    for parent in &shown.parents {
+        let meta = shown
+            .tables
             .iter()
-            .find(|t| t.name == parent)
+            .find(|t| &t.name == parent)
             .unwrap_or_else(|| panic!("{parent} missing"));
         assert_eq!(meta.internal, None, "{parent} is the user's table");
     }
 
-    shard_pool.close().await;
-    pool.query_unbounded(&format!("DROP DATABASE {db} WITH (FORCE)"))
-        .await
-        .unwrap();
+    shown.pool.close().await;
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -697,7 +749,5 @@ async fn a_user_table_cannot_be_hidden_by_impersonating_a_shard_name() {
     );
 
     shadow_pool.close().await;
-    pool.query_unbounded(&format!("DROP DATABASE {db} WITH (FORCE)"))
-        .await
-        .unwrap();
+    pool.close().await;
 }

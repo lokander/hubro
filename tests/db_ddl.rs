@@ -28,7 +28,9 @@
 mod common;
 
 use common::FixtureDb;
-use hubro::db::{split_statements, DbPool, DdlObject, DdlSource, TableKind, TableMeta, Value};
+use hubro::db::{
+    split_statements, DbError, DbPool, DdlObject, DdlSource, TableKind, TableMeta, Value,
+};
 
 fn table<'a>(tables: &'a [TableMeta], schema: Option<&str>, name: &str) -> &'a TableMeta {
     tables
@@ -62,19 +64,27 @@ async fn probe(pool: &DbPool, sql: &str) -> Vec<Vec<Value>> {
         .rows
 }
 
-/// Asserts that `sql` violates a constraint on the rebuilt table. A `CHECK`
-/// that survived as *text* but no longer *rejects* anything would pass every
+/// Asserts that the rebuilt table accepts `accepted` and rejects `rejected`,
+/// two inserts that differ in the value a constraint is about (and in a
+/// unique code, so the first cannot block the second). A `CHECK` that
+/// survived as *text* but no longer *rejects* anything would pass every
 /// metadata comparison in this file.
-async fn assert_rejected(pool: &DbPool, sql: &str) {
+///
+/// The contrast is what says the constraint did the rejecting, rather than
+/// the server's wording: a statement that fails for any other reason fails
+/// its accepted twin too.
+async fn assert_rejected(pool: &DbPool, accepted: &str, rejected: &str) {
+    pool.query_unbounded(accepted).await.unwrap_or_else(|e| {
+        panic!("the rebuilt table refused a row it must accept: {e}\n{accepted}")
+    });
     let err = pool
-        .query_unbounded(sql)
+        .query_unbounded(rejected)
         .await
         .err()
-        .unwrap_or_else(|| panic!("the rebuilt table accepted a row it must reject:\n{sql}"));
-    let message = err.to_string().to_lowercase();
+        .unwrap_or_else(|| panic!("the rebuilt table accepted a row it must reject:\n{rejected}"));
     assert!(
-        message.contains("constraint") || message.contains("check"),
-        "rejected, but not by a constraint: {err}"
+        matches!(err, DbError::Query(_)),
+        "expected the server's refusal, got: {err:?}"
     );
 }
 
@@ -437,6 +447,8 @@ async fn postgres_table_ddl_round_trips_through_the_server() {
     run_one(&pool, "INSERT INTO ddl_parent_trip (label) VALUES ('p')").await;
     assert_rejected(
         &pool,
+        "INSERT INTO ddl_child_trip (parent_id, code, amount) \
+         SELECT id, 'w', 1 FROM ddl_parent_trip LIMIT 1",
         "INSERT INTO ddl_child_trip (parent_id, code, amount) \
          SELECT id, 'x', -1 FROM ddl_parent_trip LIMIT 1",
     )
@@ -847,6 +859,8 @@ async fn sqlserver_table_ddl_round_trips_through_the_server() {
     // And the rebuilt CHECK still rejects what it was written to reject.
     assert_rejected(
         &pool,
+        "INSERT INTO dbo.ddl_child_trip (parent_id, code, amount) \
+         SELECT TOP 1 id, N'z', 1 FROM dbo.ddl_parent_trip",
         "INSERT INTO dbo.ddl_child_trip (parent_id, code, amount) \
          SELECT TOP 1 id, N'y', -1 FROM dbo.ddl_parent_trip",
     )

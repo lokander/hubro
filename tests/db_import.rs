@@ -689,8 +689,13 @@ async fn postgres_a_server_side_failure_also_rolls_the_whole_import_back() {
         )
         .await
         .unwrap_err();
+        // hubro's half of the report: a statement the server refused (not a
+        // value hubro could not coerce, which would name its file line), with
+        // a rollback hubro confirmed (no "could not confirm" suffix). The
+        // server's own words follow the prefix and are its to reword.
+        assert_eq!(err.line, None, "{mode:?}: {err:?}");
         assert!(
-            err.message.contains("duplicate key") || err.message.contains("unique"),
+            err.message.starts_with("query failed: ") && !err.message.contains("could not confirm"),
             "{mode:?}: {}",
             err.message
         );

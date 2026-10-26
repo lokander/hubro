@@ -597,11 +597,6 @@ async fn yugabyte_refuses_concurrent_ddl_without_corrupting_anything() {
     // unrecognised.
     for outcome in [&a, &b] {
         if let Err(error) = outcome {
-            let message = error.message().to_lowercase();
-            assert!(
-                message.contains("concurrent update") || message.contains("catalog"),
-                "a DDL conflict should name itself, got: {message}"
-            );
             assert!(
                 error.is_transient(),
                 "a serialization failure should classify as transient, got: {error:?}"

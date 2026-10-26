@@ -365,50 +365,67 @@ async fn sqlserver_introspection_covers_identity_computed_rowversion_and_default
     pool.close().await;
 }
 
-#[tokio::test]
-async fn sqlserver_introspection_covers_indexes_fks_and_views() {
-    let Some((url, mut turn)) = session().await else {
-        return;
-    };
-    let pool = DbPool::open_mssql(&url).await.unwrap();
-    run_all(
-        &pool,
-        &[
-            "DROP VIEW IF EXISTS dbo.intro_child_codes",
-            "DROP TABLE IF EXISTS dbo.intro_children",
-            "DROP TABLE IF EXISTS dbo.intro_parents",
-            "DROP TABLE IF EXISTS dbo.intro_filtered_only",
-            "CREATE TABLE dbo.intro_parents (
+/// The objects the introspection tests below read, each name led by `p`: a
+/// composite-key parent; a child with an identity PK, a multi-column FK to the
+/// parent, a unique and a filtered unique index; a view over the child; and a
+/// table whose only unique index is filtered. A prefix per test lets the tests
+/// run side by side, so each claim fails on its own instead of hiding behind
+/// the first one that broke. Dropped at the start only.
+async fn intro_fixture(pool: &DbPool, p: &str) {
+    let statements = [
+        format!("DROP VIEW IF EXISTS dbo.{p}_child_codes"),
+        format!("DROP TABLE IF EXISTS dbo.{p}_children"),
+        format!("DROP TABLE IF EXISTS dbo.{p}_parents"),
+        format!("DROP TABLE IF EXISTS dbo.{p}_filtered_only"),
+        format!(
+            "CREATE TABLE dbo.{p}_parents (
                 region nvarchar(10) NOT NULL,
                 slot int NOT NULL,
                 label nvarchar(50) NULL,
-                CONSTRAINT pk_intro_parents PRIMARY KEY (region, slot)
-            )",
-            "CREATE TABLE dbo.intro_children (
-                id int IDENTITY(1,1) NOT NULL CONSTRAINT pk_intro_children PRIMARY KEY,
+                CONSTRAINT pk_{p}_parents PRIMARY KEY (region, slot)
+            )"
+        ),
+        format!(
+            "CREATE TABLE dbo.{p}_children (
+                id int IDENTITY(1,1) NOT NULL CONSTRAINT pk_{p}_children PRIMARY KEY,
                 region nvarchar(10) NOT NULL,
                 slot int NOT NULL,
                 code nvarchar(20) NOT NULL,
                 nickname nvarchar(20) NULL,
-                CONSTRAINT fk_intro_children_parent FOREIGN KEY (region, slot)
-                    REFERENCES dbo.intro_parents (region, slot)
-            )",
-            "CREATE UNIQUE INDEX ux_intro_children_code ON dbo.intro_children (code)",
-            "CREATE UNIQUE INDEX ux_intro_children_nickname ON dbo.intro_children (nickname) \
-             WHERE nickname IS NOT NULL",
-            // CREATE VIEW must lead its own batch, which the driver's RPC
-            // path can't provide — EXEC() gives it one.
-            "EXEC('CREATE VIEW dbo.intro_child_codes AS \
-             SELECT code FROM dbo.intro_children')",
-            "CREATE TABLE dbo.intro_filtered_only (code nvarchar(20) NOT NULL)",
-            "CREATE UNIQUE INDEX ux_intro_filtered_only ON dbo.intro_filtered_only (code) \
-             WHERE code <> N''",
-        ],
-    )
-    .await;
+                CONSTRAINT fk_{p}_children_parent FOREIGN KEY (region, slot)
+                    REFERENCES dbo.{p}_parents (region, slot)
+            )"
+        ),
+        format!("CREATE UNIQUE INDEX ux_{p}_children_code ON dbo.{p}_children (code)"),
+        format!(
+            "CREATE UNIQUE INDEX ux_{p}_children_nickname ON dbo.{p}_children (nickname) \
+             WHERE nickname IS NOT NULL"
+        ),
+        // CREATE VIEW must lead its own batch, which the driver's RPC path
+        // can't provide — EXEC() gives it one.
+        format!(
+            "EXEC('CREATE VIEW dbo.{p}_child_codes AS \
+             SELECT code FROM dbo.{p}_children')"
+        ),
+        format!("CREATE TABLE dbo.{p}_filtered_only (code nvarchar(20) NOT NULL)"),
+        format!(
+            "CREATE UNIQUE INDEX ux_{p}_filtered_only ON dbo.{p}_filtered_only (code) \
+             WHERE code <> N''"
+        ),
+    ];
+    let statements: Vec<&str> = statements.iter().map(String::as_str).collect();
+    run_all(pool, &statements).await;
+}
 
-    // Composite PK in declaration order.
-    let parents = introspect_table(&mut turn, &pool, "intro_parents").await;
+#[tokio::test]
+async fn sqlserver_a_composite_primary_key_keeps_its_declaration_order() {
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    intro_fixture(&pool, "ipk").await;
+
+    let parents = introspect_table(&mut turn, &pool, "ipk_parents").await;
     let pk: Vec<&str> = parents
         .primary_key()
         .iter()
@@ -416,28 +433,58 @@ async fn sqlserver_introspection_covers_indexes_fks_and_views() {
         .collect();
     assert_eq!(pk, ["region", "slot"]);
 
-    // Unique vs filtered-unique indexes: a filtered index maps to `partial`
-    // and must never serve as a row identity.
-    let children = introspect_table(&mut turn, &pool, "intro_children").await;
-    assert!(children
-        .indexes
-        .iter()
-        .any(|i| i.name == "ux_intro_children_code"
-            && i.unique
-            && !i.partial
-            && i.columns == ["code"]));
-    assert!(children
-        .indexes
-        .iter()
-        .any(|i| i.name == "ux_intro_children_nickname" && i.unique && i.partial));
+    pool.close().await;
+}
 
-    // Multi-column FK with ordering, referenced schema, and explicit
-    // referenced columns (SQL Server always records them).
+#[tokio::test]
+async fn sqlserver_a_filtered_unique_index_introspects_as_partial() {
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    intro_fixture(&pool, "iidx").await;
+
+    // Unique vs filtered-unique indexes: a filtered index maps to `partial`.
+    let children = introspect_table(&mut turn, &pool, "iidx_children").await;
+    assert!(
+        children
+            .indexes
+            .iter()
+            .any(|i| i.name == "ux_iidx_children_code"
+                && i.unique
+                && !i.partial
+                && i.columns == ["code"]),
+        "{:?}",
+        children.indexes
+    );
+    assert!(
+        children
+            .indexes
+            .iter()
+            .any(|i| i.name == "ux_iidx_children_nickname" && i.unique && i.partial),
+        "{:?}",
+        children.indexes
+    );
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_a_multi_column_foreign_key_keeps_its_order_and_referenced_columns() {
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    intro_fixture(&pool, "ifk").await;
+
+    // With ordering, referenced schema, and explicit referenced columns (SQL
+    // Server always records them).
+    let children = introspect_table(&mut turn, &pool, "ifk_children").await;
     let fk = children
         .foreign_keys
         .iter()
-        .find(|fk| fk.referenced_table == "intro_parents")
-        .unwrap();
+        .find(|fk| fk.referenced_table == "ifk_parents")
+        .expect("the children -> parents foreign key");
     assert_eq!(fk.columns, ["region", "slot"]);
     assert_eq!(fk.referenced_schema.as_deref(), Some("dbo"));
     assert_eq!(
@@ -445,7 +492,18 @@ async fn sqlserver_introspection_covers_indexes_fks_and_views() {
         [Some("region".to_string()), Some("slot".to_string())]
     );
 
-    // The PK wins as row identity even with a unique index present.
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_the_primary_key_wins_row_identity_over_a_unique_index() {
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    intro_fixture(&pool, "iid").await;
+
+    let children = introspect_table(&mut turn, &pool, "iid_children").await;
     assert_eq!(
         detect_row_identity(&children, Dialect::SqlServer),
         Some(RowIdentity::PrimaryKey {
@@ -453,27 +511,72 @@ async fn sqlserver_introspection_covers_indexes_fks_and_views() {
         })
     );
 
-    // Views introspect with their own kind and columns, and are read-only.
-    let view = introspect_table(&mut turn, &pool, "intro_child_codes").await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_a_view_introspects_with_its_kind_and_columns_and_no_row_identity() {
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    intro_fixture(&pool, "iview").await;
+
+    let view = introspect_table(&mut turn, &pool, "iview_child_codes").await;
     assert_eq!(view.kind, TableKind::View);
     let view_columns: Vec<&str> = view.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(view_columns, ["code"]);
     assert!(detect_row_identity(&view, Dialect::SqlServer).is_none());
 
-    // A table whose only unique index is filtered has no safe row identity.
-    let filtered_only = introspect_table(&mut turn, &pool, "intro_filtered_only").await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_a_filtered_unique_index_never_serves_as_row_identity() {
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    intro_fixture(&pool, "ifilt").await;
+
+    let filtered_only = introspect_table(&mut turn, &pool, "ifilt_filtered_only").await;
     assert!(
         detect_row_identity(&filtered_only, Dialect::SqlServer).is_none(),
         "a filtered unique index must not address rows"
     );
 
-    // Capabilities: full at the connection level, resolved per
-    // object, with each narrowing carrying its own reason.
+    pool.close().await;
+}
+
+// Capabilities: full at the connection level, resolved per object, with each
+// narrowing carrying its own reason.
+
+#[tokio::test]
+async fn sqlserver_a_keyed_table_resolves_the_full_capability_set() {
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    intro_fixture(&pool, "icaps").await;
+
     assert_eq!(pool.backend_capabilities(), Capabilities::FULL);
+    let children = introspect_table(&mut turn, &pool, "icaps_children").await;
     let children_access = pool.backend_access(&children);
     assert_eq!(children_access.caps, Capabilities::FULL);
     assert_eq!(children_access.restriction, None);
 
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_a_view_narrows_to_read_only_but_still_reads_and_pages() {
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    intro_fixture(&pool, "iro").await;
+
+    let view = introspect_table(&mut turn, &pool, "iro_child_codes").await;
     let view_access = pool.backend_access(&view);
     assert!(!view_access.can_mutate());
     assert_eq!(view_access.restriction, Some(Restriction::View));
@@ -481,6 +584,18 @@ async fn sqlserver_introspection_covers_indexes_fks_and_views() {
     assert!(view_access.caps.read_query);
     assert!(view_access.caps.offset_paging);
 
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_a_table_with_only_a_filtered_unique_index_narrows_for_no_row_identity() {
+    let Some((url, mut turn)) = session().await else {
+        return;
+    };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    intro_fixture(&pool, "inorow").await;
+
+    let filtered_only = introspect_table(&mut turn, &pool, "inorow_filtered_only").await;
     let filtered_access = pool.backend_access(&filtered_only);
     assert!(!filtered_access.can_mutate());
     assert_eq!(
@@ -488,16 +603,6 @@ async fn sqlserver_introspection_covers_indexes_fks_and_views() {
         Some(Restriction::NoRowIdentity)
     );
 
-    run_all(
-        &pool,
-        &[
-            "DROP VIEW dbo.intro_child_codes",
-            "DROP TABLE dbo.intro_children",
-            "DROP TABLE dbo.intro_parents",
-            "DROP TABLE dbo.intro_filtered_only",
-        ],
-    )
-    .await;
     pool.close().await;
 }
 

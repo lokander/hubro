@@ -84,6 +84,8 @@ async fn timescale_hypertable_introspects_as_an_ordinary_table() {
         "expected Timescale's implicit time index, got {:?}",
         table.indexes
     );
+
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -164,6 +166,8 @@ async fn timescale_internal_objects_are_attributed_to_the_extension() {
             "{table:?}"
         );
     }
+
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -183,6 +187,8 @@ async fn timescale_hypertable_pages_sorts_and_filters_across_chunks() {
         ..common::page(readings.clone())
     };
     assert_pages_sorts_and_filters(&pool, &request, Expected::Exactly(17)).await;
+
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -213,6 +219,8 @@ async fn timescale_hypertable_rows_edit_through_the_composite_key() {
         },
     )
     .await;
+
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -263,9 +271,7 @@ async fn timescale_continuous_aggregate_is_a_readable_read_only_view() {
         .unwrap();
     assert!(!page.rows.is_empty(), "the aggregate should have rows");
 
-    pool.query_unbounded(&format!("DROP MATERIALIZED VIEW {agg}"))
-        .await
-        .unwrap();
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -326,9 +332,7 @@ async fn timescale_hypertable_without_a_primary_key_refuses_editing() {
         .unwrap();
     assert_eq!(page.rows.len(), 5);
 
-    pool.query_unbounded("DROP TABLE readings_nokey CASCADE")
-        .await
-        .unwrap();
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -365,9 +369,7 @@ async fn timescale_objects_carry_the_engines_own_vocabulary() {
     // An ordinary table in the same database gets no label at all.
     assert_eq!(find(&tables, &sensors).kind_label, None);
 
-    pool.query_unbounded(&format!("DROP MATERIALIZED VIEW {agg}"))
-        .await
-        .unwrap();
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -400,10 +402,5 @@ async fn an_extensions_table_in_an_ordinary_schema_is_still_internal() {
     // ...while the user's own table in that same schema stays the user's.
     assert_eq!(find(&tables, "ext_neighbour").internal, None);
 
-    pool.query_unbounded("DROP TABLE ext_neighbour")
-        .await
-        .unwrap();
-    pool.query_unbounded("DROP EXTENSION pg_buffercache")
-        .await
-        .unwrap();
+    pool.close().await;
 }
