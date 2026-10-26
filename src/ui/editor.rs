@@ -2108,9 +2108,18 @@ mod tests {
 
         let pool =
             DbPool::Sqlite(sqlx::sqlite::SqlitePool::connect_lazy("sqlite::memory:").unwrap());
-        let id = ConnectionRegistry::default().insert("t.db", pool, WriteProtection::Open);
+        let id = ConnectionRegistry::default().insert("t.db", pool.clone(), WriteProtection::Open);
         let mut dom = VirtualDom::new_with_props(Sections, SectionsProps { id });
         let state = provide_state(&dom);
+        // Open in the state's own registry too, under the same id (a fresh
+        // registry's first): what an export records about a tab is kept only
+        // while the tab is open.
+        let open = dom.in_runtime(|| {
+            let mut registry = state.registry;
+            let open = registry.write().insert("t.db", pool, WriteProtection::Open);
+            open
+        });
+        assert_eq!(open, id);
         let shown = dom.in_runtime(|| Shown(Signal::new_in_scope(Vec::new(), ScopeId::ROOT)));
         dom.provide_root_context(shown);
         dom.rebuild(&mut NoOpMutations);
