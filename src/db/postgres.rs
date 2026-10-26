@@ -2854,7 +2854,7 @@ fn attach_columns(
 }
 
 /// Each index row onto its table, consecutive rows of one index becoming its
-/// columns in order ([`push_index_column`]).
+/// columns in order ([`super::schema::push_index_row`]).
 fn attach_indexes(
     tables: &mut [TableMeta],
     table_index: &HashMap<(String, String), usize>,
