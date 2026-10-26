@@ -94,7 +94,7 @@ async fn snapshot(pool: &DbPool, table: &TableMeta, order_by: &str) -> Vec<Vec<S
         },
         format_args!("\"{order_by}\"")
     );
-    let result = pool.query(&sql).await.unwrap();
+    let result = pool.query_unbounded(&sql).await.unwrap();
     result
         .rows
         .iter()
@@ -153,7 +153,7 @@ async fn sqlite_import_returns_its_connection_to_the_pool() {
     .unwrap();
     assert_eq!(report.inserted_rows, 1);
     assert_eq!(
-        pool.query(marker).await.unwrap().rows,
+        pool.query_unbounded(marker).await.unwrap().rows,
         vec![vec![Value::Integer(1)]],
         "a committed import closed its connection instead of returning it"
     );
@@ -167,7 +167,7 @@ async fn sqlite_import_returns_its_connection_to_the_pool() {
     .await
     .expect_err("the last row cannot be coerced");
     assert_eq!(
-        pool.query(marker).await.unwrap().rows,
+        pool.query_unbounded(marker).await.unwrap().rows,
         vec![vec![Value::Integer(1)]],
         "a rolled-back import closed its connection instead of returning it"
     );
@@ -918,7 +918,7 @@ async fn mssql_import_counts_its_own_rows_not_the_triggers() {
     );
     // The trigger ran, so its rows were in the response the guard read.
     let audit = pool
-        .query("SELECT COUNT(*) FROM dbo.import_audit")
+        .query_unbounded("SELECT COUNT(*) FROM dbo.import_audit")
         .await
         .unwrap();
     assert_eq!(audit.rows, vec![vec![Value::Integer(3)]]);
@@ -1074,7 +1074,7 @@ async fn postgres_a_range_column_takes_the_literal_the_server_accepts() {
     // range as `<int4range>`, so `SELECT *` would say nothing about the value
     // that landed.
     let stored = pool
-        .query("SELECT span::text, days::text FROM import_ranges")
+        .query_unbounded("SELECT span::text, days::text FROM import_ranges")
         .await
         .unwrap();
     assert_eq!(stored.rows[0][0], Value::Text("[1,10)".into()));
@@ -1411,7 +1411,7 @@ async fn postgres_an_empty_field_in_a_not_null_column_takes_its_default() {
     // id, created_at and seq on the first row; id and seq on the second.
     assert_eq!(report.defaulted_cells, 5);
     let stored = pool
-        .query(
+        .query_unbounded(
             "SELECT id, seq, created_at IS NOT NULL, \
              created_at = '2024-01-01 00:00:00+00' FROM import_events ORDER BY seq",
         )

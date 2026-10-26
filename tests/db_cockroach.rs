@@ -132,7 +132,7 @@ async fn fresh_fixture(pool: &DbPool, suffix: &str) -> (String, String) {
              SELECT g, s.id, g * 1.5 FROM generate_series(1, 8) g CROSS JOIN {sensors} s"
         ),
     ] {
-        pool.query(&sql).await.unwrap();
+        pool.query_unbounded(&sql).await.unwrap();
     }
     (readings, sensors)
 }
@@ -391,13 +391,13 @@ async fn cockroach_table_without_a_declared_key_is_still_editable_through_its_ro
     // with a unique default, not a physical locator that a VACUUM or a
     // rewrite can reassign. So it arrives as an ordinary primary key and the
     // table is genuinely editable.
-    pool.query("DROP TABLE IF EXISTS crdb_nokey CASCADE")
+    pool.query_unbounded("DROP TABLE IF EXISTS crdb_nokey CASCADE")
         .await
         .unwrap();
-    pool.query("CREATE TABLE crdb_nokey (a int, b text)")
+    pool.query_unbounded("CREATE TABLE crdb_nokey (a int, b text)")
         .await
         .unwrap();
-    pool.query("INSERT INTO crdb_nokey (a, b) VALUES (1, 'one'), (2, 'two')")
+    pool.query_unbounded("INSERT INTO crdb_nokey (a, b) VALUES (1, 'one'), (2, 'two')")
         .await
         .unwrap();
 
@@ -424,7 +424,9 @@ async fn cockroach_table_without_a_declared_key_is_still_editable_through_its_ro
         "rowid has a unique_rowid() default and must never be a required insert column"
     );
 
-    pool.query("DROP TABLE crdb_nokey CASCADE").await.unwrap();
+    pool.query_unbounded("DROP TABLE crdb_nokey CASCADE")
+        .await
+        .unwrap();
     pool.close().await;
 }
 
@@ -435,10 +437,10 @@ async fn cockroach_view_is_readable_but_never_editable() {
     let (readings, _) = fresh_fixture(&pool, "view").await;
     let view = format!("{readings}_warm");
 
-    pool.query(&format!("DROP VIEW IF EXISTS {view}"))
+    pool.query_unbounded(&format!("DROP VIEW IF EXISTS {view}"))
         .await
         .unwrap();
-    pool.query(&format!(
+    pool.query_unbounded(&format!(
         "CREATE VIEW {view} AS SELECT id, temperature FROM {readings} WHERE temperature > 3"
     ))
     .await
@@ -470,7 +472,9 @@ async fn cockroach_view_is_readable_but_never_editable() {
         .unwrap();
     assert!(!page.rows.is_empty(), "the view should have rows");
 
-    pool.query(&format!("DROP VIEW {view}")).await.unwrap();
+    pool.query_unbounded(&format!("DROP VIEW {view}"))
+        .await
+        .unwrap();
     pool.close().await;
 }
 
@@ -512,13 +516,13 @@ async fn cockroach_script_dml_rolls_back_but_its_ddl_does_not() {
     // default therefore stands; if this test ever starts failing because the
     // CREATE TABLE *did* roll back, that trade has been revisited (or
     // Cockroach changed its default) and the header above needs updating.
-    pool.query("DROP TABLE IF EXISTS crdb_script_ddl CASCADE")
+    pool.query_unbounded("DROP TABLE IF EXISTS crdb_script_ddl CASCADE")
         .await
         .unwrap();
-    pool.query("DROP TABLE IF EXISTS crdb_script_dml CASCADE")
+    pool.query_unbounded("DROP TABLE IF EXISTS crdb_script_dml CASCADE")
         .await
         .unwrap();
-    pool.query("CREATE TABLE crdb_script_dml (id int PRIMARY KEY)")
+    pool.query_unbounded("CREATE TABLE crdb_script_dml (id int PRIMARY KEY)")
         .await
         .unwrap();
 
@@ -540,7 +544,7 @@ async fn cockroach_script_dml_rolls_back_but_its_ddl_does_not() {
     // survives. That is the sharp edge — the escape isn't limited to the DDL
     // statement, it takes every write before it along.
     let rows = pool
-        .query("SELECT count(*) FROM crdb_script_dml")
+        .query_unbounded("SELECT count(*) FROM crdb_script_dml")
         .await
         .unwrap();
     assert_eq!(
@@ -551,7 +555,7 @@ async fn cockroach_script_dml_rolls_back_but_its_ddl_does_not() {
 
     // ...as does the schema change itself.
     let survivors = pool
-        .query(
+        .query_unbounded(
             "SELECT count(*) FROM information_schema.tables \
              WHERE table_name = 'crdb_script_ddl'",
         )
@@ -563,10 +567,10 @@ async fn cockroach_script_dml_rolls_back_but_its_ddl_does_not() {
         "known gap: Cockroach auto-commits DDL out of the transaction"
     );
 
-    pool.query("DROP TABLE IF EXISTS crdb_script_ddl CASCADE")
+    pool.query_unbounded("DROP TABLE IF EXISTS crdb_script_ddl CASCADE")
         .await
         .unwrap();
-    pool.query("DROP TABLE crdb_script_dml CASCADE")
+    pool.query_unbounded("DROP TABLE crdb_script_dml CASCADE")
         .await
         .unwrap();
     pool.close().await;
@@ -584,13 +588,13 @@ async fn cockroach_reports_a_full_rollback_when_the_script_never_reached_its_ddl
     // rolls back completely — a warning about surviving schema changes would
     // describe a table that does not exist, which is the same false claim as
     // calling a committed schema change rolled back, pointing the other way.
-    pool.query("DROP TABLE IF EXISTS crdb_unreached_ddl CASCADE")
+    pool.query_unbounded("DROP TABLE IF EXISTS crdb_unreached_ddl CASCADE")
         .await
         .unwrap();
-    pool.query("DROP TABLE IF EXISTS crdb_unreached_dml CASCADE")
+    pool.query_unbounded("DROP TABLE IF EXISTS crdb_unreached_dml CASCADE")
         .await
         .unwrap();
-    pool.query("CREATE TABLE crdb_unreached_dml (id int PRIMARY KEY)")
+    pool.query_unbounded("CREATE TABLE crdb_unreached_dml (id int PRIMARY KEY)")
         .await
         .unwrap();
 
@@ -610,7 +614,7 @@ async fn cockroach_reports_a_full_rollback_when_the_script_never_reached_its_ddl
 
     // ...and the database agrees on both halves.
     let rows = pool
-        .query("SELECT count(*) FROM crdb_unreached_dml")
+        .query_unbounded("SELECT count(*) FROM crdb_unreached_dml")
         .await
         .unwrap();
     assert_eq!(
@@ -619,7 +623,7 @@ async fn cockroach_reports_a_full_rollback_when_the_script_never_reached_its_ddl
         "the INSERT rolled back — no DDL ran to commit it early"
     );
     let survivors = pool
-        .query(
+        .query_unbounded(
             "SELECT count(*) FROM information_schema.tables \
              WHERE table_name = 'crdb_unreached_ddl'",
         )
@@ -631,7 +635,7 @@ async fn cockroach_reports_a_full_rollback_when_the_script_never_reached_its_ddl
         "the table was never created"
     );
 
-    pool.query("DROP TABLE crdb_unreached_dml CASCADE")
+    pool.query_unbounded("DROP TABLE crdb_unreached_dml CASCADE")
         .await
         .unwrap();
     pool.close().await;
@@ -652,17 +656,17 @@ async fn cockroach_counts_a_failing_ddl_as_having_escaped_the_rollback() {
     // Resolving over the statements strictly before the failure would report
     // "no changes were applied" for exactly this shape, which is the old bug
     // of reporting committed DDL as rolled back, returning by a narrower route.
-    pool.query("DROP TABLE IF EXISTS crdb_boundary_dup CASCADE")
+    pool.query_unbounded("DROP TABLE IF EXISTS crdb_boundary_dup CASCADE")
         .await
         .unwrap();
-    pool.query("DROP TABLE IF EXISTS crdb_boundary_dml CASCADE")
+    pool.query_unbounded("DROP TABLE IF EXISTS crdb_boundary_dml CASCADE")
         .await
         .unwrap();
-    pool.query("CREATE TABLE crdb_boundary_dml (id int PRIMARY KEY)")
+    pool.query_unbounded("CREATE TABLE crdb_boundary_dml (id int PRIMARY KEY)")
         .await
         .unwrap();
     // Already present, so the script's CREATE TABLE is the statement that fails.
-    pool.query("CREATE TABLE crdb_boundary_dup (id int PRIMARY KEY)")
+    pool.query_unbounded("CREATE TABLE crdb_boundary_dup (id int PRIMARY KEY)")
         .await
         .unwrap();
 
@@ -682,7 +686,7 @@ async fn cockroach_counts_a_failing_ddl_as_having_escaped_the_rollback() {
     // The database agrees: the INSERT survived a rollback that claimed nothing
     // about it either way.
     let rows = pool
-        .query("SELECT count(*) FROM crdb_boundary_dml")
+        .query_unbounded("SELECT count(*) FROM crdb_boundary_dml")
         .await
         .unwrap();
     assert_eq!(
@@ -691,10 +695,10 @@ async fn cockroach_counts_a_failing_ddl_as_having_escaped_the_rollback() {
         "the autocommit fired before the failing DDL and took the INSERT with it"
     );
 
-    pool.query("DROP TABLE crdb_boundary_dup CASCADE")
+    pool.query_unbounded("DROP TABLE crdb_boundary_dup CASCADE")
         .await
         .unwrap();
-    pool.query("DROP TABLE crdb_boundary_dml CASCADE")
+    pool.query_unbounded("DROP TABLE crdb_boundary_dml CASCADE")
         .await
         .unwrap();
     pool.close().await;
@@ -711,13 +715,13 @@ async fn cockroach_serial_is_unique_but_not_sequential() {
     // inserted row to have id 1 — a test fixture, a filter typed by habit —
     // finds nothing. hubro needs no change for it: what the backend actually
     // depends on is that the column is auto-assigned, which it is.
-    pool.query("DROP TABLE IF EXISTS crdb_serial CASCADE")
+    pool.query_unbounded("DROP TABLE IF EXISTS crdb_serial CASCADE")
         .await
         .unwrap();
-    pool.query("CREATE TABLE crdb_serial (id serial PRIMARY KEY, name text)")
+    pool.query_unbounded("CREATE TABLE crdb_serial (id serial PRIMARY KEY, name text)")
         .await
         .unwrap();
-    pool.query("INSERT INTO crdb_serial (name) VALUES ('a'), ('b')")
+    pool.query_unbounded("INSERT INTO crdb_serial (name) VALUES ('a'), ('b')")
         .await
         .unwrap();
 
@@ -735,7 +739,7 @@ async fn cockroach_serial_is_unique_but_not_sequential() {
     );
 
     let rows = pool
-        .query("SELECT id FROM crdb_serial ORDER BY id")
+        .query_unbounded("SELECT id FROM crdb_serial ORDER BY id")
         .await
         .unwrap();
     let ids: Vec<i64> = rows.rows.iter().map(|row| integer(&row[0])).collect();
@@ -745,7 +749,9 @@ async fn cockroach_serial_is_unique_but_not_sequential() {
         "serial values are unique_rowid()-shaped, not 1 and 2: {ids:?}"
     );
 
-    pool.query("DROP TABLE crdb_serial CASCADE").await.unwrap();
+    pool.query_unbounded("DROP TABLE crdb_serial CASCADE")
+        .await
+        .unwrap();
     pool.close().await;
 }
 
@@ -783,7 +789,7 @@ async fn cockroach_keeps_no_statistics_this_can_read_so_the_pane_stays_empty() {
         16
     );
 
-    pool.query(&format!("DROP TABLE IF EXISTS {readings} CASCADE"))
+    pool.query_unbounded(&format!("DROP TABLE IF EXISTS {readings} CASCADE"))
         .await
         .unwrap();
     pool.close().await;
@@ -831,7 +837,7 @@ async fn cockroach_real_keys_are_re_addressed_by_their_shortest_spelling() {
             body(0)
         ),
     ] {
-        pool.query(&sql)
+        pool.query_unbounded(&sql)
             .await
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
@@ -855,7 +861,7 @@ async fn cockroach_real_keys_are_re_addressed_by_their_shortest_spelling() {
         precise.join("\n")
     );
 
-    pool.query("DROP TABLE real_refs, real_keys, real_precise")
+    pool.query_unbounded("DROP TABLE real_refs, real_keys, real_precise")
         .await
         .unwrap();
     pool.close().await;
@@ -905,7 +911,7 @@ async fn cockroach_values_past_the_rust_types_read_and_address_their_rows() {
     ];
     let select: Vec<&str> = shown.iter().map(|(expr, _)| *expr).collect();
     let result = pool
-        .query(&format!("SELECT {}", select.join(", ")))
+        .query_unbounded(&format!("SELECT {}", select.join(", ")))
         .await
         .unwrap();
     for (n, (expr, text)) in shown.iter().enumerate() {
@@ -940,10 +946,10 @@ async fn cockroach_values_past_the_rust_types_read_and_address_their_rows() {
     let mut failures = Vec::new();
     for (slug, type_name, literals) in keys {
         let table = format!("wide_key_{slug}");
-        pool.query(&format!("DROP TABLE IF EXISTS {table}"))
+        pool.query_unbounded(&format!("DROP TABLE IF EXISTS {table}"))
             .await
             .unwrap();
-        pool.query(&format!(
+        pool.query_unbounded(&format!(
             "CREATE TABLE {table} (k {type_name} PRIMARY KEY, body text, tag text)"
         ))
         .await
@@ -953,7 +959,7 @@ async fn cockroach_values_past_the_rust_types_read_and_address_their_rows() {
             .enumerate()
             .map(|(n, lit)| format!("({lit}, '{n}:' || repeat('x', 5000), 't')"))
             .collect();
-        pool.query(&format!("INSERT INTO {table} VALUES {}", rows.join(", ")))
+        pool.query_unbounded(&format!("INSERT INTO {table} VALUES {}", rows.join(", ")))
             .await
             .unwrap_or_else(|e| panic!("{slug}: {e}"));
         let tables = pool.introspect().await.unwrap();
@@ -969,7 +975,7 @@ async fn cockroach_values_past_the_rust_types_read_and_address_their_rows() {
 /// fails the read instead.
 async fn crdb_open_transactions(pool: &DbPool) -> Vec<String> {
     let reads: Vec<_> = (0..4)
-        .map(|_| pool.query("SELECT *, pg_sleep(0.2) FROM [SHOW TRANSACTION STATUS]"))
+        .map(|_| pool.query_unbounded("SELECT *, pg_sleep(0.2) FROM [SHOW TRANSACTION STATUS]"))
         .collect();
     futures_util::future::join_all(reads)
         .await
@@ -993,7 +999,9 @@ async fn cockroach_script_keeps_its_own_transaction_on_one_session() {
     let pool = DbPool::open_postgres(&url).await.unwrap();
     pool.execute("DROP TABLE IF EXISTS own_tx").await.unwrap();
     pool.execute("CREATE TABLE own_tx (a INT8)").await.unwrap();
-    let opens: Vec<_> = (0..4).map(|_| pool.query("SELECT pg_sleep(0.2)")).collect();
+    let opens: Vec<_> = (0..4)
+        .map(|_| pool.query_unbounded("SELECT pg_sleep(0.2)"))
+        .collect();
     for open in futures_util::future::join_all(opens).await {
         open.unwrap();
     }
@@ -1024,7 +1032,10 @@ async fn cockroach_script_keeps_its_own_transaction_on_one_session() {
         pids.iter().all(|pid| *pid == pids[0]),
         "every statement must run in one session, got {pids:?}"
     );
-    let rows = pool.query("SELECT count(*) FROM own_tx").await.unwrap();
+    let rows = pool
+        .query_unbounded("SELECT count(*) FROM own_tx")
+        .await
+        .unwrap();
     assert_eq!(
         rows.rows[0][0],
         Value::Integer(0),
@@ -1054,7 +1065,10 @@ async fn cockroach_script_keeps_its_own_transaction_on_one_session() {
         })
     );
     assert_eq!(crdb_open_transactions(&pool).await, Vec::<String>::new());
-    let rows = pool.query("SELECT count(*) FROM own_tx").await.unwrap();
+    let rows = pool
+        .query_unbounded("SELECT count(*) FROM own_tx")
+        .await
+        .unwrap();
     assert_eq!(rows.rows[0][0], Value::Integer(0));
 
     pool.execute("DROP TABLE own_tx").await.unwrap();
@@ -1081,7 +1095,7 @@ async fn cockroach_a_row_returning_statement_that_commits_is_not_reported_rolled
     let outcome = run_script(&pool, pool.backend_capabilities(), &statements, |_| {}).await;
     assert_eq!(outcome, Ok(ScriptDone::default()));
     let rows = pool
-        .query("SELECT count(*) FROM show_commit")
+        .query_unbounded("SELECT count(*) FROM show_commit")
         .await
         .unwrap();
     assert_eq!(
@@ -1112,7 +1126,7 @@ async fn cockroach_a_script_whose_show_commit_timestamp_commits_is_not_wrapped()
     );
     let outcome = run_script(&pool, pool.backend_capabilities(), &statements, |_| {}).await;
     let rows = pool
-        .query("SELECT a FROM show_commit_wrapped ORDER BY a")
+        .query_unbounded("SELECT a FROM show_commit_wrapped ORDER BY a")
         .await
         .unwrap();
     let err = outcome.unwrap_err();

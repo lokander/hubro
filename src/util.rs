@@ -86,6 +86,8 @@ pub fn push_hex(out: &mut String, bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn hex_is_two_lowercase_digits_a_byte() {
         let mut out = String::from("x");
@@ -99,8 +101,6 @@ mod tests {
             assert_eq!(super::hex_digits(byte), *format!("{byte:02x}").as_bytes());
         }
     }
-
-    use super::*;
 
     #[test]
     fn search_folds_case_beyond_ascii() {

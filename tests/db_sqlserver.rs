@@ -76,7 +76,7 @@ async fn session() -> Option<(String, Turn)> {
 /// Fixture DDL and drops route through here.
 async fn run_all(pool: &DbPool, statements: &[&str]) {
     for sql in statements {
-        pool.query(sql)
+        pool.query_unbounded(sql)
             .await
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
@@ -133,7 +133,7 @@ async fn sqlserver_connects_and_validates_with_a_round_trip() {
     // open_mssql itself validates with a SELECT 1 round-trip.
     let pool = DbPool::open_mssql(&url).await.unwrap();
     assert_eq!(pool.dialect(), Dialect::SqlServer);
-    let result = pool.query("SELECT 1").await.unwrap();
+    let result = pool.query_unbounded("SELECT 1").await.unwrap();
     assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
     pool.close().await;
 }
@@ -150,7 +150,7 @@ async fn a_connection_the_server_killed_while_idle_is_not_handed_to_the_next_que
     let pool = DbPool::open_mssql(&url).await.unwrap();
     let admin = DbPool::open_mssql(&url).await.unwrap();
     // open_mssql leaves exactly one idle connection; this query reuses it.
-    let spid = pool.query("SELECT @@SPID").await.unwrap();
+    let spid = pool.query_unbounded("SELECT @@SPID").await.unwrap();
     let [row] = spid.rows.as_slice() else {
         panic!("{spid:?}")
     };
@@ -161,7 +161,7 @@ async fn a_connection_the_server_killed_while_idle_is_not_handed_to_the_next_que
     // A connection used within the last second is reused unchecked, so let
     // it idle past that first.
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-    let result = pool.query("SELECT 1").await;
+    let result = pool.query_unbounded("SELECT 1").await;
     assert_eq!(
         result.map(|r| r.rows).map_err(|e| e.to_string()),
         Ok(vec![vec![Value::Integer(1)]]),
@@ -233,7 +233,7 @@ async fn sqlserver_only_a_refused_password_is_a_credential_rejection() {
     let wrong_and_missing_url = mssql_url_with_password(&missing, "definitely-wrong").unwrap();
     for login in [&outsider, &disabled] {
         admin
-            .query(&format!(
+            .query_unbounded(&format!(
                 "IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
                  CREATE LOGIN [{login}] WITH PASSWORD = '{PASSWORD}', CHECK_POLICY = OFF"
             ))
@@ -241,7 +241,7 @@ async fn sqlserver_only_a_refused_password_is_a_credential_rejection() {
             .unwrap();
     }
     admin
-        .query(&format!("ALTER LOGIN [{disabled}] DISABLE"))
+        .query_unbounded(&format!("ALTER LOGIN [{disabled}] DISABLE"))
         .await
         .unwrap();
 
@@ -271,7 +271,10 @@ async fn sqlserver_only_a_refused_password_is_a_credential_rejection() {
     // Dropped before any assertion can panic: a login outlives the test
     // binary, and nothing else sweeps them.
     for login in [&outsider, &disabled] {
-        admin.query(&format!("DROP LOGIN [{login}]")).await.unwrap();
+        admin
+            .query_unbounded(&format!("DROP LOGIN [{login}]"))
+            .await
+            .unwrap();
     }
     admin.close().await;
 
@@ -634,7 +637,7 @@ async fn sqlserver_rich_types_render_correctly() {
     .await;
 
     let result = pool
-        .query("SELECT * FROM dbo.rich_types_probe ORDER BY id")
+        .query_unbounded("SELECT * FROM dbo.rich_types_probe ORDER BY id")
         .await
         .unwrap();
     assert_eq!(result.rows.len(), 1);
@@ -752,7 +755,7 @@ async fn sqlserver_staged_edits_round_trip_and_identity_stays_server_assigned() 
     // The server assigned the inserted row's identity value (3 — the next
     // IDENTITY value after the two seed rows).
     let result = pool
-        .query("SELECT id, title, qty FROM dbo.staged_items ORDER BY id")
+        .query_unbounded("SELECT id, title, qty FROM dbo.staged_items ORDER BY id")
         .await
         .unwrap();
     assert_eq!(
@@ -832,7 +835,7 @@ async fn sqlserver_staged_row_count_mismatch_rolls_the_batch_back() {
     );
 
     let result = pool
-        .query("SELECT title FROM dbo.staged_guard WHERE id = 1")
+        .query_unbounded("SELECT title FROM dbo.staged_guard WHERE id = 1")
         .await
         .unwrap();
     assert_eq!(result.rows[0][0], Value::Text("first".into()));
@@ -931,7 +934,7 @@ async fn sqlserver_guarded_writes_count_the_statement_not_its_triggers() {
     assert_eq!(counts.deleted_rows, 1);
 
     let result = pool
-        .query("SELECT id, title FROM dbo.trig_items ORDER BY id")
+        .query_unbounded("SELECT id, title FROM dbo.trig_items ORDER BY id")
         .await
         .unwrap();
     assert_eq!(
@@ -946,7 +949,7 @@ async fn sqlserver_guarded_writes_count_the_statement_not_its_triggers() {
     // 4 for the update, 3 for the insert, 3 for the delete — and the nested
     // trigger copied each of them.
     let audit = pool
-        .query(
+        .query_unbounded(
             "SELECT (SELECT COUNT(*) FROM dbo.trig_audit), \
              (SELECT COUNT(*) FROM dbo.trig_audit_copy)",
         )
@@ -1040,7 +1043,7 @@ async fn sqlserver_a_trigger_row_cannot_vouch_for_an_edit_that_matched_nothing()
     );
     // Rolled back: the trigger's own row went with it.
     let log = pool
-        .query("SELECT COUNT(*) FROM dbo.trig_vouch_log")
+        .query_unbounded("SELECT COUNT(*) FROM dbo.trig_vouch_log")
         .await
         .unwrap();
     assert_eq!(log.rows, vec![vec![Value::Integer(0)]]);
@@ -1127,7 +1130,10 @@ async fn sqlserver_a_script_cannot_turn_row_counts_off_for_later_writes() {
         }
         // The pool hands out the connection returned last, so these ran on
         // the one the script had used while runs still returned theirs.
-        let options = pool.query("SELECT @@OPTIONS & 512").await.unwrap();
+        let options = pool
+            .query_unbounded("SELECT @@OPTIONS & 512")
+            .await
+            .unwrap();
         assert_eq!(
             options.rows,
             vec![vec![Value::Integer(0)]],
@@ -1204,7 +1210,7 @@ async fn sqlserver_an_instead_of_trigger_refuses_editing_before_anything_is_writ
         err.message
     );
     let unchanged = pool
-        .query("SELECT title FROM dbo.trig_instead WHERE id = 1")
+        .query_unbounded("SELECT title FROM dbo.trig_instead WHERE id = 1")
         .await
         .unwrap();
     assert_eq!(unchanged.rows, vec![vec![Value::Text("first".into())]]);
@@ -1224,7 +1230,7 @@ async fn sqlserver_an_instead_of_trigger_refuses_editing_before_anything_is_writ
     .expect("the trigger's update must not count twice");
     assert_eq!(counts.updated_rows, 1);
     let result = pool
-        .query("SELECT id, title FROM dbo.trig_instead ORDER BY id")
+        .query_unbounded("SELECT id, title FROM dbo.trig_instead ORDER BY id")
         .await
         .unwrap();
     assert_eq!(
@@ -1355,7 +1361,7 @@ async fn sqlserver_script_go_batches_split_and_execute() {
 
     // The multi-statement script ran atomically and committed as a unit.
     let count = pool
-        .query("SELECT COUNT(*) FROM dbo.script_go_probe")
+        .query_unbounded("SELECT COUNT(*) FROM dbo.script_go_probe")
         .await
         .unwrap();
     assert_eq!(count.rows[0][0], Value::Integer(1));
@@ -1398,7 +1404,7 @@ async fn sqlserver_script_errors_roll_the_whole_script_back() {
 
     // Nothing survived — not even the CREATE TABLE (DDL is transactional).
     let gone = pool
-        .query("SELECT OBJECT_ID(N'dbo.script_rb_probe')")
+        .query_unbounded("SELECT OBJECT_ID(N'dbo.script_rb_probe')")
         .await
         .unwrap();
     assert_eq!(gone.rows[0][0], Value::Null);
@@ -1477,7 +1483,7 @@ async fn sqlserver_script_creates_modules_that_must_lead_a_batch() {
     assert_eq!(err.statement_index, 1);
     assert_eq!(err.rollback, Rollback::Full);
     let gone = pool
-        .query("SELECT OBJECT_ID(N'dbo.script_lead_gone')")
+        .query_unbounded("SELECT OBJECT_ID(N'dbo.script_lead_gone')")
         .await
         .unwrap();
     assert_eq!(
@@ -1635,7 +1641,7 @@ async fn sqlserver_empty_results_keep_their_column_headers() {
     .await;
 
     let sql = "SELECT id, name FROM dbo.empty_headers WHERE 1 = 0";
-    let empty = pool.query(sql).await.unwrap();
+    let empty = pool.query_unbounded(sql).await.unwrap();
     assert!(empty.rows.is_empty());
     let names: Vec<&str> = empty.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["id", "name"]);
@@ -1662,7 +1668,7 @@ async fn sqlserver_every_read_path_keeps_only_the_first_result_set() {
     let sql = "SELECT 1 AS a UNION ALL SELECT 2; SELECT 3 AS b";
     let first = vec![vec![Value::Integer(1)], vec![Value::Integer(2)]];
 
-    let result = pool.query(sql).await.unwrap();
+    let result = pool.query_unbounded(sql).await.unwrap();
     assert_eq!(
         result
             .columns
@@ -2359,7 +2365,7 @@ async fn sqlserver_variant_keys_are_refused_rather_than_missed() {
         let pool = &pool;
         async move {
             let sql = format!("SELECT COUNT(*) FROM dbo.variant_keys WHERE k = {predicate}");
-            pool.query(&sql).await.unwrap().rows[0][0].clone()
+            pool.query_unbounded(&sql).await.unwrap().rows[0][0].clone()
         }
     };
     assert_eq!(
@@ -2566,7 +2572,7 @@ async fn sqlserver_key_types_re_address_under_a_british_login() {
     );
     let british = DbPool::open_mssql(&british_url).await.unwrap();
     // The session really reads dates day-first, or this proves nothing.
-    let language = british.query("SELECT @@LANGUAGE").await.unwrap();
+    let language = british.query_unbounded("SELECT @@LANGUAGE").await.unwrap();
     assert_eq!(language.rows[0][0], Value::Text("British".into()));
 
     let mut failures = Vec::new();
@@ -2623,7 +2629,7 @@ const MSSQL_SLOW: &str = "WAITFOR DELAY '00:00:00.200'; SELECT 1";
 /// slow enough that each needs a connection of its own.
 async fn mssql_open_transactions(pool: &DbPool) -> Vec<Value> {
     let reads: Vec<_> = (0..4)
-        .map(|_| pool.query("WAITFOR DELAY '00:00:00.200'; SELECT @@TRANCOUNT"))
+        .map(|_| pool.query_unbounded("WAITFOR DELAY '00:00:00.200'; SELECT @@TRANCOUNT"))
         .collect();
     futures_util::future::join_all(reads)
         .await
@@ -2678,7 +2684,10 @@ async fn sqlserver_script_keeps_its_own_transaction_on_one_session() {
         [&Value::Integer(0), &Value::Integer(1), &Value::Integer(0)],
         "BEGIN TRAN must open the transaction the statements after it run in"
     );
-    let rows = pool.query("SELECT count(*) FROM dbo.own_tx").await.unwrap();
+    let rows = pool
+        .query_unbounded("SELECT count(*) FROM dbo.own_tx")
+        .await
+        .unwrap();
     assert_eq!(
         rows.rows[0][0],
         Value::Integer(0),
@@ -2738,7 +2747,7 @@ async fn sqlserver_script_left_inside_its_transaction_is_rolled_back_and_says_so
     pool.close().await;
     let fresh = DbPool::open_mssql(&url).await.unwrap();
     let edits = fresh
-        .query("SELECT count(*) FROM dbo.left_open_edit")
+        .query_unbounded("SELECT count(*) FROM dbo.left_open_edit")
         .await
         .unwrap();
     assert_eq!(
@@ -2747,7 +2756,7 @@ async fn sqlserver_script_left_inside_its_transaction_is_rolled_back_and_says_so
         "every edit must be kept"
     );
     let left = fresh
-        .query("SELECT count(*) FROM dbo.left_open")
+        .query_unbounded("SELECT count(*) FROM dbo.left_open")
         .await
         .unwrap();
     assert_eq!(left.rows[0][0], Value::Integer(0));
@@ -2792,7 +2801,7 @@ async fn sqlserver_script_failing_inside_its_transaction_rolls_it_back() {
     );
     assert_eq!(mssql_open_transactions(&pool).await, Vec::<Value>::new());
     let rows = pool
-        .query("SELECT count(*) FROM dbo.failed_tx")
+        .query_unbounded("SELECT count(*) FROM dbo.failed_tx")
         .await
         .unwrap();
     assert_eq!(rows.rows[0][0], Value::Integer(0));
@@ -2842,7 +2851,7 @@ async fn sqlserver_cancelled_script_does_not_return_its_transaction_to_the_pool(
     // Nor with the temp table the run created at session scope.
     let probes: Vec<_> = (0..4)
         .map(|_| {
-            pool.query(
+            pool.query_unbounded(
                 "WAITFOR DELAY '00:00:00.200'; \
                  SELECT CAST(CASE WHEN OBJECT_ID('tempdb..#cancelled') IS NULL THEN 0 ELSE 1 END AS int)",
             )
@@ -2867,7 +2876,7 @@ async fn sqlserver_cancelled_script_does_not_return_its_transaction_to_the_pool(
     pool.close().await;
     let fresh = DbPool::open_mssql(&url).await.unwrap();
     let edits = fresh
-        .query("SELECT count(*) FROM dbo.cancelled_tx_edit")
+        .query_unbounded("SELECT count(*) FROM dbo.cancelled_tx_edit")
         .await
         .unwrap();
     assert_eq!(
@@ -2876,7 +2885,7 @@ async fn sqlserver_cancelled_script_does_not_return_its_transaction_to_the_pool(
         "every edit must be kept"
     );
     let cancelled = fresh
-        .query("SELECT count(*) FROM dbo.cancelled_tx")
+        .query_unbounded("SELECT count(*) FROM dbo.cancelled_tx")
         .await
         .unwrap();
     assert_eq!(cancelled.rows[0][0], Value::Integer(0));
@@ -2971,7 +2980,7 @@ async fn sqlserver_script_ending_in_a_capped_read_does_not_wait_for_the_rest() {
     );
     assert_eq!(mssql_open_transactions(&pool).await, Vec::<Value>::new());
     let rows = pool
-        .query("SELECT count(*) FROM dbo.capped_tx")
+        .query_unbounded("SELECT count(*) FROM dbo.capped_tx")
         .await
         .unwrap();
     assert_eq!(rows.rows[0][0], Value::Integer(0));
@@ -3012,7 +3021,7 @@ async fn sqlserver_a_batch_led_by_select_that_ends_or_opens_a_transaction_is_rep
     )
     .await;
     let rows = pool
-        .query("SELECT count(*) FROM dbo.select_led")
+        .query_unbounded("SELECT count(*) FROM dbo.select_led")
         .await
         .unwrap();
     assert_eq!(
@@ -3033,7 +3042,7 @@ async fn sqlserver_a_batch_led_by_select_that_ends_or_opens_a_transaction_is_rep
     )
     .await;
     let rows = pool
-        .query("SELECT count(*) FROM dbo.select_led")
+        .query_unbounded("SELECT count(*) FROM dbo.select_led")
         .await
         .unwrap();
     assert_eq!(
@@ -3093,7 +3102,7 @@ async fn sqlserver_capped_row_returning_write_keeps_its_write() {
         common::script_outcome(&outcome)
     );
     let rows = pool
-        .query("SELECT count(*) FROM dbo.capped_write")
+        .query_unbounded("SELECT count(*) FROM dbo.capped_write")
         .await
         .unwrap();
     assert_eq!(rows.rows[0][0], Value::Integer(30_000), "through a script");
@@ -3104,7 +3113,7 @@ async fn sqlserver_capped_row_returning_write_keeps_its_write() {
         .unwrap();
     assert!(truncated);
     let rows = pool
-        .query("SELECT count(*) FROM dbo.capped_write_pool")
+        .query_unbounded("SELECT count(*) FROM dbo.capped_write_pool")
         .await
         .unwrap();
     assert_eq!(rows.rows[0][0], Value::Integer(30_000), "through the pool");
@@ -3232,7 +3241,7 @@ async fn sqlserver_atomic_script_that_ends_hubros_transaction_is_not_reported_ro
         run_all(&pool, &["DELETE FROM dbo.ended_tx"]).await;
         let err = mssql_script(&pool, &sql).await.unwrap_err();
         let rows = pool
-            .query("SELECT a FROM dbo.ended_tx ORDER BY a")
+            .query_unbounded("SELECT a FROM dbo.ended_tx ORDER BY a")
             .await
             .unwrap();
         let kept: Vec<Vec<Value>> = kept.into_iter().map(|n| vec![Value::Integer(n)]).collect();
@@ -3291,7 +3300,7 @@ async fn sqlserver_edits_a_committing_trigger_kept_are_not_reported_unapplied() 
         .unwrap_err();
     assert_eq!(index, None, "{error}");
     let rows = pool
-        .query("SELECT a FROM dbo.edit_trigger_commit ORDER BY a")
+        .query_unbounded("SELECT a FROM dbo.edit_trigger_commit ORDER BY a")
         .await
         .unwrap();
     assert_eq!(
@@ -3618,7 +3627,7 @@ async fn sqlserver_a_temp_table_batch_that_loses_the_transaction_stops_the_scrip
             "{sql:?}: {outcomes:?}"
         );
         let rows = pool
-            .query("SELECT count(*) FROM dbo.lost_tx")
+            .query_unbounded("SELECT count(*) FROM dbo.lost_tx")
             .await
             .unwrap();
         assert_eq!(rows.rows[0][0], Value::Integer(0), "{sql:?}: a row escaped");

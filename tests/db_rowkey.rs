@@ -157,13 +157,13 @@ async fn sqlite_staged_writes_commit_through_the_full_key() {
     .unwrap();
     assert_eq!(counts.updated_rows, 1);
     let check = pool
-        .query("SELECT title FROM albums WHERE artist_id = 1 AND seq = 2")
+        .query_unbounded("SELECT title FROM albums WHERE artist_id = 1 AND seq = 2")
         .await
         .unwrap();
     assert_eq!(check.rows[0][0], Value::Text("Renamed".into()));
     // The sibling row of the same artist was not touched.
     let sibling = pool
-        .query("SELECT title FROM albums WHERE artist_id = 1 AND seq = 1")
+        .query_unbounded("SELECT title FROM albums WHERE artist_id = 1 AND seq = 1")
         .await
         .unwrap();
     assert_eq!(sibling.rows[0][0], Value::Text("First".into()));
@@ -181,7 +181,10 @@ async fn sqlite_staged_writes_commit_through_the_full_key() {
     .await
     .unwrap();
     assert_eq!(counts.deleted_rows, 1);
-    let count = pool.query("SELECT COUNT(*) FROM albums").await.unwrap();
+    let count = pool
+        .query_unbounded("SELECT COUNT(*) FROM albums")
+        .await
+        .unwrap();
     assert_eq!(count.rows[0][0], Value::Integer(2));
 
     pool.close().await;
@@ -211,12 +214,12 @@ async fn sqlite_over_matching_write_rolls_back() {
     }
     // The transaction rolled back: no row was clobbered.
     let check = pool
-        .query("SELECT COUNT(*) FROM albums WHERE title = 'clobbered'")
+        .query_unbounded("SELECT COUNT(*) FROM albums WHERE title = 'clobbered'")
         .await
         .unwrap();
     assert_eq!(check.rows[0][0], Value::Integer(0));
     let titles = pool
-        .query("SELECT title FROM albums WHERE artist_id = 1 ORDER BY seq")
+        .query_unbounded("SELECT title FROM albums WHERE artist_id = 1 ORDER BY seq")
         .await
         .unwrap();
     assert_eq!(titles.rows[0][0], Value::Text("First".into()));
@@ -260,7 +263,7 @@ async fn sqlite_rowid_identity_edits_a_keyless_table() {
     .unwrap();
     assert_eq!(counts.updated_rows, 1);
     let check = pool
-        .query("SELECT rowid, body FROM notes ORDER BY rowid")
+        .query_unbounded("SELECT rowid, body FROM notes ORDER BY rowid")
         .await
         .unwrap();
     assert_eq!(check.rows[0][1], Value::Text("edited".into()));
@@ -295,7 +298,7 @@ async fn postgres_detection_on_real_introspection_output() {
         "CREATE TABLE rowkey.keyless (data text)",
         "CREATE VIEW rowkey.pk_view AS SELECT id FROM rowkey.with_pk",
     ] {
-        pool.query(sql).await.unwrap();
+        pool.query_unbounded(sql).await.unwrap();
     }
 
     let tables = pool.introspect().await.unwrap();
@@ -364,20 +367,20 @@ async fn postgres_invalid_index_is_not_introspected() {
         "CREATE TABLE rowkey_invalid.dups (email text NOT NULL)",
         "INSERT INTO rowkey_invalid.dups VALUES ('dup@x'), ('dup@x')",
     ] {
-        pool.query(sql).await.unwrap();
+        pool.query_unbounded(sql).await.unwrap();
     }
     // CREATE UNIQUE INDEX CONCURRENTLY over duplicate data fails partway
     // and deterministically leaves an INVALID index entry behind (Postgres
     // documents that the failed index remains and must be dropped
     // manually). An invalid index guarantees nothing — introspection must
     // not surface it, or row identity could trust a broken index.
-    pool.query(
+    pool.query_unbounded(
         "CREATE UNIQUE INDEX CONCURRENTLY rowkey_invalid_uniq ON rowkey_invalid.dups (email)",
     )
     .await
     .expect_err("unique index over duplicates must fail");
     let exists = pool
-        .query(
+        .query_unbounded(
             "SELECT ix.indisvalid::text FROM pg_index ix \
              JOIN pg_class i ON i.oid = ix.indexrelid \
              WHERE i.relname = 'rowkey_invalid_uniq'",
@@ -418,7 +421,7 @@ async fn postgres_staged_writes_guard_and_commit() {
         "INSERT INTO rowkey_exec.albums VALUES
             (1, 1, 'First'), (1, 2, 'Second'), (2, 1, 'Solo')",
     ] {
-        pool.query(sql).await.unwrap();
+        pool.query_unbounded(sql).await.unwrap();
     }
     let tables = pool.introspect().await.unwrap();
     let albums = find(&tables, Some("rowkey_exec"), "albums").clone();
@@ -441,7 +444,7 @@ async fn postgres_staged_writes_guard_and_commit() {
     .unwrap();
     assert_eq!(counts.updated_rows, 1);
     let check = pool
-        .query("SELECT title FROM rowkey_exec.albums WHERE artist_id = 1 AND seq = 2")
+        .query_unbounded("SELECT title FROM rowkey_exec.albums WHERE artist_id = 1 AND seq = 2")
         .await
         .unwrap();
     assert_eq!(check.rows[0][0], Value::Text("Renamed".into()));
@@ -462,7 +465,7 @@ async fn postgres_staged_writes_guard_and_commit() {
         other => panic!("expected RowCountMismatch, got {other:?}"),
     }
     let check = pool
-        .query("SELECT COUNT(*) FROM rowkey_exec.albums WHERE title = 'clobbered'")
+        .query_unbounded("SELECT COUNT(*) FROM rowkey_exec.albums WHERE title = 'clobbered'")
         .await
         .unwrap();
     assert_eq!(check.rows[0][0], Value::Integer(0));
@@ -481,7 +484,7 @@ async fn postgres_staged_writes_guard_and_commit() {
     .unwrap();
     assert_eq!(counts.deleted_rows, 1);
     let count = pool
-        .query("SELECT COUNT(*) FROM rowkey_exec.albums")
+        .query_unbounded("SELECT COUNT(*) FROM rowkey_exec.albums")
         .await
         .unwrap();
     assert_eq!(count.rows[0][0], Value::Integer(2));

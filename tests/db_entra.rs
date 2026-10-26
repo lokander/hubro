@@ -123,7 +123,7 @@ impl Rig {
             .await
             .unwrap();
         self.admin
-            .query(&format!(
+            .query_unbounded(&format!(
                 "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity \
                  WHERE usename = '{role}'"
             ))
@@ -180,7 +180,7 @@ async fn postgres_entra_logins_after_the_first_token_expires_use_a_renewed_one()
         .await
         .unwrap_or_else(|e| panic!("a login after renewal failed: {e}"));
     assert_eq!(rig.calls.load(Ordering::SeqCst), 1);
-    pool.query("SELECT 1").await.unwrap();
+    pool.query_unbounded("SELECT 1").await.unwrap();
 
     // The renewed token expires, and its refresh token is refused: the run
     // fails saying to reconnect, rather than with the server's password error.
@@ -253,7 +253,7 @@ async fn postgres_entra_renewal_task_keeps_the_grid_logging_in_and_ends_with_its
         .unwrap();
     rig.expire_first_token().await;
     assert!(
-        pool.query("SELECT 1").await.is_err(),
+        pool.query_unbounded("SELECT 1").await.is_err(),
         "a login with the old token succeeded, so nothing below is tested"
     );
 
@@ -263,7 +263,7 @@ async fn postgres_entra_renewal_task_keeps_the_grid_logging_in_and_ends_with_its
         "the task did not renew the token"
     );
     assert_eq!(rig.calls.load(Ordering::SeqCst), 1);
-    pool.query("SELECT 1")
+    pool.query_unbounded("SELECT 1")
         .await
         .unwrap_or_else(|e| panic!("the grid's login after the task renewed failed: {e}"));
 

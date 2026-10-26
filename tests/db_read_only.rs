@@ -53,7 +53,7 @@ async fn last_value(pool: &DbPool, sequence: &str) -> Value {
         Dialect::Postgres | Dialect::Sqlite => format!("SELECT last_value FROM {sequence}"),
     };
     let result = pool
-        .query(&sql)
+        .query_unbounded(&sql)
         .await
         .unwrap_or_else(|e| panic!("{sql}: {e}"));
     result.rows[0][0].clone()
@@ -466,7 +466,7 @@ async fn citus_writes_through_run_command_on_coordinator_despite_the_marking() {
         .await
         .expect("nothing in the read-only transaction refuses a write made elsewhere");
     let rows = pool
-        .query(&format!("SELECT count(*) FROM {t}"))
+        .query_unbounded(&format!("SELECT count(*) FROM {t}"))
         .await
         .unwrap();
     assert_eq!(
@@ -499,7 +499,7 @@ async fn sessions_running_the_long_read(pool: &DbPool) -> Value {
              WHERE pid <> pg_backend_pid() AND state = 'active' AND {running}"
         ),
     };
-    pool.query(&sql).await.unwrap().rows[0][0].clone()
+    pool.query_unbounded(&sql).await.unwrap().rows[0][0].clone()
 }
 
 /// A marked connection's read that the row cap cut short is not read to its
@@ -705,7 +705,7 @@ async fn assert_browsing_does_not_write(var: &str, pool: &DbPool, every_browse_w
         // business — CockroachDB plans `COUNT(*)` over the view without
         // calling `nextval` — and a browse that does not write has nothing
         // to refuse.
-        pool.query(&format!("SELECT setval('{s}', 1)"))
+        pool.query_unbounded(&format!("SELECT setval('{s}', 1)"))
             .await
             .unwrap();
         browse(pool, full, &view, how)
@@ -713,7 +713,7 @@ async fn assert_browsing_does_not_write(var: &str, pool: &DbPool, every_browse_w
             .unwrap_or_else(|e| panic!("{var}: {how:?} failed unmarked: {e:?}"));
         let writes = last_value(pool, &s).await != reset;
 
-        pool.query(&format!("SELECT setval('{s}', 1)"))
+        pool.query_unbounded(&format!("SELECT setval('{s}', 1)"))
             .await
             .unwrap();
         let marked_read = browse(pool, marked, &view, how).await;
@@ -887,7 +887,7 @@ async fn a_sqlite_read_cannot_load_an_extension() {
     std::fs::File::create(&path).unwrap();
     let pool = DbPool::open_sqlite(&path).await.unwrap();
     let refused = pool
-        .query("SELECT load_extension('hubro_no_such_extension')")
+        .query_unbounded("SELECT load_extension('hubro_no_such_extension')")
         .await
         .expect_err("load_extension ran");
     assert!(

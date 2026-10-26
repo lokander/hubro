@@ -958,15 +958,17 @@ impl DbPool {
     /// Runs a free-form read query, buffered **whole**: no row cap, no cell
     /// cap. A zero-row result still carries its column headers.
     ///
-    /// **Not for the app.** No caller in `src/` outside tests uses it, and
-    /// none should: everything the app reads is bounded — the SQL editor's
-    /// statements go through [`run_script`](super::script::run_script)'s
+    /// **Not for the app**, which the name says at every call site: no
+    /// caller in `src/` outside a test module uses it
+    /// (`only_tests_read_unbounded` fails otherwise), and none should:
+    /// everything the app reads is bounded — the SQL editor's statements go
+    /// through [`run_script`](super::script::run_script)'s
     /// capped reads ([`MAX_QUERY_ROWS`], [`QUERY_CELL_CAP`]), the grid
     /// through [`Self::fetch_page_bounded`]. It stays `pub` solely for the
     /// integration tests in `tests/`, which read back small fixtures through
     /// it, as [`Self::backend_access`] does for unmarked writes; a use in
     /// `src/` would be an unbounded read of whatever the statement returns.
-    pub async fn query(&self, sql: &str) -> Result<QueryResult, DbError> {
+    pub async fn query_unbounded(&self, sql: &str) -> Result<QueryResult, DbError> {
         match self {
             DbPool::Sqlite(pool) => sqlite::query(pool, sql).await,
             DbPool::Postgres(pg) => postgres::query(pg.pool(), sql).await,
@@ -1682,6 +1684,38 @@ impl ConnectionRegistry {
 
 #[cfg(test)]
 mod tests {
+    /// [`DbPool::query_unbounded`] reads a whole result with no cap, so the
+    /// app must not reach it: outside test modules, nothing in `src/` names
+    /// it but its own definition. Read through
+    /// `source_scan::code_outside_test_modules`, so a comment or a test that
+    /// names it is no failure, and code after a test module is still read.
+    #[test]
+    fn only_tests_read_unbounded() {
+        use crate::source_scan::{code_outside_test_modules, names_ident, rust_files};
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let files = rust_files(&src);
+        assert!(
+            files.len() > 50,
+            "found only {} files under src",
+            files.len()
+        );
+        const DEFINITION: &str = "pub async fn query_unbounded(";
+        let mut defined = 0;
+        for file in &files {
+            let code = code_outside_test_modules(&std::fs::read_to_string(file).unwrap());
+            defined += code.matches(DEFINITION).count();
+            assert!(
+                !names_ident(&code.replace(DEFINITION, ""), "query_unbounded"),
+                "{}: reads a result unbounded outside a test",
+                file.display()
+            );
+        }
+        assert_eq!(
+            defined, 1,
+            "the definition this test exempts moved or was renamed"
+        );
+    }
+
     use super::*;
 
     #[test]

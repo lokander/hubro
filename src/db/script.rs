@@ -5254,7 +5254,7 @@ mod read_only_backstop {
 
     async fn scalar(pool: &DbPool, sql: &str) -> Value {
         let result = pool
-            .query(sql)
+            .query_unbounded(sql)
             .await
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
         result.rows[0][0].clone()

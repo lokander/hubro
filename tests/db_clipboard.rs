@@ -36,7 +36,10 @@ async fn read_rows(pool: &DbPool, table: &str) -> Vec<Vec<Value>> {
     let sql = format!(
         "SELECT \"id\", \"name\", \"note\", \"weight\", \"data\" FROM \"{table}\" ORDER BY \"id\""
     );
-    let QueryResult { rows, .. } = pool.query(&sql).await.expect("read back the copied rows");
+    let QueryResult { rows, .. } = pool
+        .query_unbounded(&sql)
+        .await
+        .expect("read back the copied rows");
     rows
 }
 
@@ -187,7 +190,7 @@ async fn postgres_generated_inserts_carry_non_finite_floats() {
     }
 
     let back = pool
-        .query("SELECT x FROM clip_floats ORDER BY id")
+        .query_unbounded("SELECT x FROM clip_floats ORDER BY id")
         .await
         .unwrap();
     let floats: Vec<f64> = back

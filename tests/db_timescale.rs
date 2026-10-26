@@ -59,7 +59,7 @@ async fn fresh_hypertable(pool: &DbPool, suffix: &str) -> (String, String) {
              CROSS JOIN {sensors} s"
         ),
     ] {
-        pool.query(&sql).await.unwrap();
+        pool.query_unbounded(&sql).await.unwrap();
     }
     (readings, sensors)
 }
@@ -128,7 +128,7 @@ async fn timescale_internal_objects_are_attributed_to_the_extension() {
     // This fixture's own chunks by name, so the assertion below doesn't
     // lean on chunks another test in this binary happened to leave behind.
     let mine = pool
-        .query(
+        .query_unbounded(
             "SELECT chunk_name FROM timescaledb_information.chunks \
              WHERE hypertable_name = 'readings_marked'",
         )
@@ -323,17 +323,17 @@ async fn timescale_continuous_aggregate_is_a_readable_read_only_view() {
     let (readings, _) = fresh_hypertable(&pool, "cagg").await;
     let agg = format!("{readings}_daily");
 
-    pool.query(&format!("DROP MATERIALIZED VIEW IF EXISTS {agg}"))
+    pool.query_unbounded(&format!("DROP MATERIALIZED VIEW IF EXISTS {agg}"))
         .await
         .unwrap();
-    pool.query(&format!(
+    pool.query_unbounded(&format!(
         "CREATE MATERIALIZED VIEW {agg} WITH (timescaledb.continuous) AS
          SELECT time_bucket('1 day', time) AS bucket, sensor_id, avg(temperature) AS avg_temp
          FROM {readings} GROUP BY bucket, sensor_id WITH NO DATA"
     ))
     .await
     .unwrap();
-    pool.query(&format!(
+    pool.query_unbounded(&format!(
         "CALL refresh_continuous_aggregate('{agg}', NULL, NULL)"
     ))
     .await
@@ -367,7 +367,7 @@ async fn timescale_continuous_aggregate_is_a_readable_read_only_view() {
         .unwrap();
     assert!(!page.rows.is_empty(), "the aggregate should have rows");
 
-    pool.query(&format!("DROP MATERIALIZED VIEW {agg}"))
+    pool.query_unbounded(&format!("DROP MATERIALIZED VIEW {agg}"))
         .await
         .unwrap();
 }
@@ -384,20 +384,22 @@ async fn timescale_hypertable_without_a_primary_key_refuses_editing() {
     // between chunks under compression, so a ctid captured a moment ago can
     // address a different row. Browsing and the script tab still work; only
     // editing is refused, with a reason.
-    pool.query("DROP TABLE IF EXISTS readings_nokey CASCADE")
+    pool.query_unbounded("DROP TABLE IF EXISTS readings_nokey CASCADE")
         .await
         .unwrap();
-    pool.query(
+    pool.query_unbounded(
         "CREATE TABLE readings_nokey (
             time timestamptz NOT NULL, sensor_id int NOT NULL, temperature double precision
         )",
     )
     .await
     .unwrap();
-    pool.query("SELECT create_hypertable('readings_nokey', by_range('time', INTERVAL '1 day'))")
-        .await
-        .unwrap();
-    pool.query(
+    pool.query_unbounded(
+        "SELECT create_hypertable('readings_nokey', by_range('time', INTERVAL '1 day'))",
+    )
+    .await
+    .unwrap();
+    pool.query_unbounded(
         "INSERT INTO readings_nokey \
          SELECT ts, 1, 20.0 \
          FROM generate_series('2026-01-01'::timestamptz,'2026-01-04'::timestamptz, INTERVAL '6 hours') ts",
@@ -431,7 +433,7 @@ async fn timescale_hypertable_without_a_primary_key_refuses_editing() {
         .unwrap();
     assert_eq!(page.rows.len(), 5);
 
-    pool.query("DROP TABLE readings_nokey CASCADE")
+    pool.query_unbounded("DROP TABLE readings_nokey CASCADE")
         .await
         .unwrap();
 }
@@ -443,10 +445,10 @@ async fn timescale_objects_carry_the_engines_own_vocabulary() {
     let (readings, sensors) = fresh_hypertable(&pool, "label").await;
     let agg = format!("{readings}_daily");
 
-    pool.query(&format!("DROP MATERIALIZED VIEW IF EXISTS {agg}"))
+    pool.query_unbounded(&format!("DROP MATERIALIZED VIEW IF EXISTS {agg}"))
         .await
         .unwrap();
-    pool.query(&format!(
+    pool.query_unbounded(&format!(
         "CREATE MATERIALIZED VIEW {agg} WITH (timescaledb.continuous) AS
          SELECT time_bucket('1 day', time) AS bucket, sensor_id, avg(temperature) AS avg_temp
          FROM {readings} GROUP BY bucket, sensor_id WITH NO DATA"
@@ -470,7 +472,7 @@ async fn timescale_objects_carry_the_engines_own_vocabulary() {
     // An ordinary table in the same database gets no label at all.
     assert_eq!(find(&tables, &sensors).kind_label, None);
 
-    pool.query(&format!("DROP MATERIALIZED VIEW {agg}"))
+    pool.query_unbounded(&format!("DROP MATERIALIZED VIEW {agg}"))
         .await
         .unwrap();
 }
@@ -483,17 +485,17 @@ async fn an_extensions_table_in_an_ordinary_schema_is_still_internal() {
     // The case the schema-level rule alone would miss: `pg_buffercache`
     // installs its view into `public`, exactly as PostGIS does with
     // `spatial_ref_sys`. Attribution is per object as well as per schema.
-    pool.query("CREATE EXTENSION IF NOT EXISTS pg_buffercache")
+    pool.query_unbounded("CREATE EXTENSION IF NOT EXISTS pg_buffercache")
         .await
         .unwrap();
     // This test's own table in the same schema, so the contrast below rests
     // on a table this test created rather than on whatever a sibling test
     // happened to leave behind — the tests in this binary run concurrently
     // against one database, and each must also pass run on its own.
-    pool.query("DROP TABLE IF EXISTS ext_neighbour")
+    pool.query_unbounded("DROP TABLE IF EXISTS ext_neighbour")
         .await
         .unwrap();
-    pool.query("CREATE TABLE ext_neighbour (id int PRIMARY KEY)")
+    pool.query_unbounded("CREATE TABLE ext_neighbour (id int PRIMARY KEY)")
         .await
         .unwrap();
 
@@ -505,6 +507,10 @@ async fn an_extensions_table_in_an_ordinary_schema_is_still_internal() {
     // ...while the user's own table in that same schema stays the user's.
     assert_eq!(find(&tables, "ext_neighbour").internal, None);
 
-    pool.query("DROP TABLE ext_neighbour").await.unwrap();
-    pool.query("DROP EXTENSION pg_buffercache").await.unwrap();
+    pool.query_unbounded("DROP TABLE ext_neighbour")
+        .await
+        .unwrap();
+    pool.query_unbounded("DROP EXTENSION pg_buffercache")
+        .await
+        .unwrap();
 }

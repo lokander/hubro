@@ -96,7 +96,7 @@ async fn fresh_cluster(pool: &DbPool, suffix: &str) -> (String, String, String) 
         format!("CREATE TABLE {notes} (id serial PRIMARY KEY, body text)"),
         format!("INSERT INTO {notes} (body) VALUES ('alpha'),('beta')"),
     ] {
-        pool.query(&sql).await.unwrap();
+        pool.query_unbounded(&sql).await.unwrap();
     }
     (orders, countries, notes)
 }
@@ -117,7 +117,7 @@ async fn citus_hides_its_own_shard_tables_from_the_catalog() {
     // The shards are real tables in `public` — this is a single-node cluster,
     // so they live right beside the table they shard.
     let shards = pool
-        .query(&format!(
+        .query_unbounded(&format!(
             "SELECT count(*) FROM pg_dist_shard WHERE logicalrelid = '{orders}'::regclass"
         ))
         .await
@@ -490,7 +490,7 @@ async fn v1_certificate_failure_says_what_to_do() {
             // started accepting certificates it should reject, would also
             // land here and would otherwise skip silently.
             let ssl = pool
-                .query("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
+                .query_unbounded("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
                 .await
                 .unwrap();
             // Postgres booleans decode as text here on purpose, so that a
@@ -565,7 +565,7 @@ async fn scripts_and_exports_span_distributed_and_reference_tables() {
     let _ = tx.rollback().await;
 
     let survived = pool
-        .query(&format!("SELECT count(*) FROM {orders} WHERE id = 90001"))
+        .query_unbounded(&format!("SELECT count(*) FROM {orders} WHERE id = 90001"))
         .await
         .unwrap();
     assert_eq!(
@@ -574,7 +574,7 @@ async fn scripts_and_exports_span_distributed_and_reference_tables() {
         "the rolled-back delete should not have stuck"
     );
     let greenland = pool
-        .query(&format!(
+        .query_unbounded(&format!(
             "SELECT count(*) FROM {countries} WHERE code = 'gl'"
         ))
         .await
@@ -597,10 +597,10 @@ async fn scripts_and_exports_span_distributed_and_reference_tables() {
     let text = String::from_utf8(csv).unwrap();
     assert!(text.starts_with("id,country,total"), "{text:.40}");
 
-    pool.query(&format!("DELETE FROM {orders} WHERE id = 90001"))
+    pool.query_unbounded(&format!("DELETE FROM {orders} WHERE id = 90001"))
         .await
         .unwrap();
-    pool.query(&format!("DELETE FROM {countries} WHERE code = 'is'"))
+    pool.query_unbounded(&format!("DELETE FROM {countries} WHERE code = 'is'"))
         .await
         .unwrap();
 }
@@ -622,11 +622,13 @@ async fn shards_are_marked_internal_when_citus_stops_hiding_them() {
     // clears a leftover from a crashed run.
     let _guard = FIXTURE_DDL.lock().await;
     let db = "hubro_citus_shardvis";
-    pool.query(&format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"))
+    pool.query_unbounded(&format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"))
         .await
         .unwrap();
-    pool.query(&format!("CREATE DATABASE {db}")).await.unwrap();
-    pool.query(&format!(
+    pool.query_unbounded(&format!("CREATE DATABASE {db}"))
+        .await
+        .unwrap();
+    pool.query_unbounded(&format!(
         "ALTER DATABASE {db} SET citus.show_shards_for_app_name_prefixes TO '*'"
     ))
     .await
@@ -652,7 +654,7 @@ async fn shards_are_marked_internal_when_citus_stops_hiding_them() {
         format!("CREATE TABLE {long_name} (id bigint PRIMARY KEY)"),
         format!("SELECT create_distributed_table('{long_name}', 'id')"),
     ] {
-        shard_pool.query(&sql).await.unwrap();
+        shard_pool.query_unbounded(&sql).await.unwrap();
     }
 
     let tables = shard_pool.introspect().await.unwrap();
@@ -671,7 +673,7 @@ async fn shards_are_marked_internal_when_citus_stops_hiding_them() {
     // shard families in play, a bound wide enough to be safe is also wide
     // enough for a whole family to vanish unnoticed.
     let expected = shard_pool
-        .query("SELECT count(*) FROM pg_dist_shard")
+        .query_unbounded("SELECT count(*) FROM pg_dist_shard")
         .await
         .unwrap();
     let expected = match &expected.rows[0][0] {
@@ -708,7 +710,7 @@ async fn shards_are_marked_internal_when_citus_stops_hiding_them() {
     }
 
     shard_pool.close().await;
-    pool.query(&format!("DROP DATABASE {db} WITH (FORCE)"))
+    pool.query_unbounded(&format!("DROP DATABASE {db} WITH (FORCE)"))
         .await
         .unwrap();
 }
@@ -726,11 +728,13 @@ async fn a_user_table_cannot_be_hidden_by_impersonating_a_shard_name() {
     // only behind the knob the sibling test widens.
     let _guard = FIXTURE_DDL.lock().await;
     let db = "hubro_citus_shadow";
-    pool.query(&format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"))
+    pool.query_unbounded(&format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"))
         .await
         .unwrap();
-    pool.query(&format!("CREATE DATABASE {db}")).await.unwrap();
-    pool.query(&format!(
+    pool.query_unbounded(&format!("CREATE DATABASE {db}"))
+        .await
+        .unwrap();
+    pool.query_unbounded(&format!(
         "ALTER DATABASE {db} SET search_path TO decoy, public"
     ))
     .await
@@ -747,12 +751,12 @@ async fn a_user_table_cannot_be_hidden_by_impersonating_a_shard_name() {
         "SELECT create_distributed_table('public.pub', 'id')",
         "CREATE SCHEMA decoy",
     ] {
-        shadow_pool.query(sql).await.unwrap();
+        shadow_pool.query_unbounded(sql).await.unwrap();
     }
 
     // Name a decoy table after one of the real shards.
     let victim = shadow_pool
-        .query(
+        .query_unbounded(
             "SELECT pg_catalog.shard_name(logicalrelid, shardid) \
              FROM pg_dist_shard ORDER BY shardid LIMIT 1",
         )
@@ -763,7 +767,7 @@ async fn a_user_table_cannot_be_hidden_by_impersonating_a_shard_name() {
         other => panic!("expected a shard name, got {other:?}"),
     };
     shadow_pool
-        .query(&format!("CREATE TABLE decoy.{victim} (id bigint)"))
+        .query_unbounded(&format!("CREATE TABLE decoy.{victim} (id bigint)"))
         .await
         .unwrap();
 
@@ -778,7 +782,7 @@ async fn a_user_table_cannot_be_hidden_by_impersonating_a_shard_name() {
     );
 
     shadow_pool.close().await;
-    pool.query(&format!("DROP DATABASE {db} WITH (FORCE)"))
+    pool.query_unbounded(&format!("DROP DATABASE {db} WITH (FORCE)"))
         .await
         .unwrap();
 }

@@ -30,10 +30,10 @@ async fn test_url() -> Option<String> {
 }
 
 async fn fresh_fixture(pool: &DbPool, table: &str) {
-    pool.query(&format!("DROP TABLE IF EXISTS {table}"))
+    pool.query_unbounded(&format!("DROP TABLE IF EXISTS {table}"))
         .await
         .unwrap();
-    pool.query(&format!(
+    pool.query_unbounded(&format!(
         "CREATE TABLE {table} (
             id serial PRIMARY KEY,
             name text NOT NULL,
@@ -43,7 +43,7 @@ async fn fresh_fixture(pool: &DbPool, table: &str) {
     ))
     .await
     .unwrap();
-    pool.query(&format!(
+    pool.query_unbounded(&format!(
         "INSERT INTO {table} (name, weight, data) VALUES
             ('apple', 1.5, '\\x0102'),
             ('banana', NULL, NULL),
@@ -132,7 +132,7 @@ async fn a_server_sent_serialization_failure_classifies_as_transient() {
     );
 
     // And the classification is the code's, not every failure's.
-    let other = pool.query("SELECT 1 / 0").await.unwrap_err();
+    let other = pool.query_unbounded("SELECT 1 / 0").await.unwrap_err();
     assert!(!other.is_transient(), "{other:?}");
 
     pool.close().await;
@@ -266,7 +266,7 @@ async fn same_named_pk_and_fk_constraints_do_not_confuse_pk_detection() {
             CONSTRAINT samename FOREIGN KEY (ref) REFERENCES pkbug.t1 (id)
         )",
     ] {
-        pool.query(sql).await.unwrap();
+        pool.query_unbounded(sql).await.unwrap();
     }
 
     let tables = pool.introspect().await.unwrap();
@@ -350,11 +350,11 @@ async fn postgres_rich_types_render_correctly() {
             int4range(1, 5)
         )",
     ] {
-        pool.query(sql).await.unwrap();
+        pool.query_unbounded(sql).await.unwrap();
     }
 
     let result = pool
-        .query("SELECT * FROM rich_types ORDER BY id")
+        .query_unbounded("SELECT * FROM rich_types ORDER BY id")
         .await
         .unwrap();
     assert_eq!(result.rows.len(), 1);
@@ -434,7 +434,7 @@ async fn postgres_character_types_render_as_their_text() {
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
     let result = pool
-        .query(
+        .query_unbounded(
             "SELECT 'ab'::char(3) AS fixed, \
                     ARRAY['a', 'bc', NULL]::char(2)[] AS fixed_array, \
                     'r'::\"char\" AS byte, \
@@ -496,13 +496,13 @@ async fn postgres_undecodable_cells_degrade_without_erroring_the_page() {
             'still here'
         )",
     ] {
-        pool.query(sql).await.unwrap();
+        pool.query_unbounded(sql).await.unwrap();
     }
 
     // The whole row (page) must render despite the hostile cells — no Err,
     // and certainly no panic.
     let result = pool
-        .query("SELECT * FROM degrade_cells ORDER BY id")
+        .query_unbounded("SELECT * FROM degrade_cells ORDER BY id")
         .await
         .unwrap();
     assert_eq!(result.rows.len(), 1);
@@ -584,17 +584,17 @@ async fn postgres_only_a_refused_password_is_a_credential_rejection() {
     forbidden.set_password(Some(PASSWORD)).unwrap();
     let wrong_and_missing_url = url_with_password(&missing, "definitely-wrong").unwrap();
     admin
-        .query(&format!("DROP ROLE IF EXISTS {role}"))
+        .query_unbounded(&format!("DROP ROLE IF EXISTS {role}"))
         .await
         .unwrap();
     admin
-        .query(&format!("CREATE ROLE {role} LOGIN PASSWORD '{PASSWORD}'"))
+        .query_unbounded(&format!("CREATE ROLE {role} LOGIN PASSWORD '{PASSWORD}'"))
         .await
         .unwrap();
     // This binary's own database, which nothing else connects to as anyone
     // but the superuser the suite runs as — and a superuser ignores CONNECT.
     admin
-        .query(&format!(
+        .query_unbounded(&format!(
             "REVOKE CONNECT ON DATABASE \"{database}\" FROM PUBLIC"
         ))
         .await
@@ -617,12 +617,15 @@ async fn postgres_only_a_refused_password_is_a_credential_rejection() {
     // Undone before any assertion can panic: a role outlives the test binary,
     // and nothing else sweeps them.
     admin
-        .query(&format!(
+        .query_unbounded(&format!(
             "GRANT CONNECT ON DATABASE \"{database}\" TO PUBLIC"
         ))
         .await
         .unwrap();
-    admin.query(&format!("DROP ROLE {role}")).await.unwrap();
+    admin
+        .query_unbounded(&format!("DROP ROLE {role}"))
+        .await
+        .unwrap();
     admin.close().await;
 
     for (what, err) in kept {
@@ -673,7 +676,7 @@ async fn postgres_multi_schema_introspection_has_parity_metadata() {
         // No PK and no usable unique index: nothing addresses one row.
         "CREATE TABLE warehouse.keyless (a integer, b text)",
     ] {
-        pool.query(sql).await.unwrap();
+        pool.query_unbounded(sql).await.unwrap();
     }
 
     let tables = pool.introspect().await.unwrap();
@@ -876,7 +879,7 @@ async fn postgres_values_read_as_the_server_prints_them() {
         .map(|expr| format!("{expr}, ({expr})::text"))
         .collect();
     let result = pool
-        .query(&format!("SELECT {}", select.join(", ")))
+        .query_unbounded(&format!("SELECT {}", select.join(", ")))
         .await
         .unwrap();
     let row = &result.rows[0];
@@ -898,7 +901,7 @@ async fn postgres_values_read_as_the_server_prints_them() {
     ];
     let select: Vec<&str> = in_utc.iter().map(|(expr, _)| *expr).collect();
     let result = pool
-        .query(&format!("SELECT {}", select.join(", ")))
+        .query_unbounded(&format!("SELECT {}", select.join(", ")))
         .await
         .unwrap();
     for (n, (expr, shown)) in in_utc.iter().enumerate() {
@@ -913,10 +916,10 @@ async fn postgres_values_read_as_the_server_prints_them() {
 async fn postgres_bounded_page_previews_large_text_and_bytea() {
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
-    pool.query("DROP TABLE IF EXISTS bounded_docs")
+    pool.query_unbounded("DROP TABLE IF EXISTS bounded_docs")
         .await
         .unwrap();
-    pool.query(
+    pool.query_unbounded(
         "CREATE TABLE bounded_docs (
             id integer PRIMARY KEY,
             small_note text,
@@ -927,7 +930,7 @@ async fn postgres_bounded_page_previews_large_text_and_bytea() {
     .await
     .unwrap();
     // A 50 000-char text and a 40 000-byte bytea.
-    pool.query(
+    pool.query_unbounded(
         "INSERT INTO bounded_docs (id, small_note, big_text, payload) VALUES
             (1, 'hi', repeat('A', 50000), decode(repeat('00', 40000), 'hex')),
             (2, 'yo', 'short enough', decode('0102', 'hex'))",
@@ -989,7 +992,7 @@ async fn postgres_bounded_page_previews_large_text_and_bytea() {
         panic!("expected full text");
     }
     // Deleted underneath the grid: an error, never a NULL value.
-    pool.query("DELETE FROM bounded_docs WHERE id = 1")
+    pool.query_unbounded("DELETE FROM bounded_docs WHERE id = 1")
         .await
         .unwrap();
     match pool
@@ -1000,7 +1003,7 @@ async fn postgres_bounded_page_previews_large_text_and_bytea() {
         other => panic!("a deleted row's cell must not load: {other:?}"),
     }
 
-    pool.query("DROP TABLE IF EXISTS bounded_docs")
+    pool.query_unbounded("DROP TABLE IF EXISTS bounded_docs")
         .await
         .unwrap();
     pool.close().await;
@@ -1054,7 +1057,7 @@ async fn postgres_empty_results_keep_their_column_headers() {
     fresh_fixture(&pool, "fruits_empty").await;
 
     let sql = "SELECT id, name FROM fruits_empty WHERE false";
-    let empty = pool.query(sql).await.unwrap();
+    let empty = pool.query_unbounded(sql).await.unwrap();
     assert!(empty.rows.is_empty());
     let names: Vec<&str> = empty.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["id", "name"]);
@@ -1110,7 +1113,7 @@ async fn postgres_temporary_tables_are_not_listed() {
         .unwrap();
     for attempt in 0..2 {
         let probe = pool
-            .query(
+            .query_unbounded(
                 "SELECT 1 FROM information_schema.tables \
                  WHERE table_name = 'temp_unlisted' AND table_type = 'LOCAL TEMPORARY'",
             )
@@ -1138,12 +1141,16 @@ async fn postgres_temporary_tables_are_not_listed() {
 async fn postgres_introspection_resolves_enum_variants_and_array_columns() {
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
-    pool.query("DROP TABLE IF EXISTS enum_intro").await.unwrap();
-    pool.query("DROP TYPE IF EXISTS intro_mood").await.unwrap();
-    pool.query("CREATE TYPE intro_mood AS ENUM ('sad', 'ok', 'happy')")
+    pool.query_unbounded("DROP TABLE IF EXISTS enum_intro")
         .await
         .unwrap();
-    pool.query(
+    pool.query_unbounded("DROP TYPE IF EXISTS intro_mood")
+        .await
+        .unwrap();
+    pool.query_unbounded("CREATE TYPE intro_mood AS ENUM ('sad', 'ok', 'happy')")
+        .await
+        .unwrap();
+    pool.query_unbounded(
         "CREATE TABLE enum_intro (
             id serial PRIMARY KEY,
             feeling intro_mood,
@@ -1191,8 +1198,8 @@ async fn postgres_introspection_resolves_enum_variants_and_array_columns() {
     assert_eq!(col("plain").type_detail, TypeDetail::Plain);
     assert_eq!(col("id").type_detail, TypeDetail::Plain);
 
-    pool.query("DROP TABLE enum_intro").await.unwrap();
-    pool.query("DROP TYPE intro_mood").await.unwrap();
+    pool.query_unbounded("DROP TABLE enum_intro").await.unwrap();
+    pool.query_unbounded("DROP TYPE intro_mood").await.unwrap();
     pool.close().await;
 }
 
@@ -1203,20 +1210,22 @@ async fn postgres_introspection_resolves_enum_variants_and_array_columns() {
 async fn postgres_quoted_camelcase_enum_saves_through_the_staged_cast() {
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
-    pool.query("DROP TABLE IF EXISTS camel_intro")
+    pool.query_unbounded("DROP TABLE IF EXISTS camel_intro")
         .await
         .unwrap();
-    pool.query("DROP SCHEMA IF EXISTS camel_ns CASCADE")
+    pool.query_unbounded("DROP SCHEMA IF EXISTS camel_ns CASCADE")
         .await
         .unwrap();
-    pool.query("CREATE SCHEMA camel_ns").await.unwrap();
-    pool.query(r#"CREATE TYPE camel_ns."Mood" AS ENUM ('sad', 'happy')"#)
+    pool.query_unbounded("CREATE SCHEMA camel_ns")
         .await
         .unwrap();
-    pool.query(r#"CREATE TABLE camel_intro (id int PRIMARY KEY, m camel_ns."Mood")"#)
+    pool.query_unbounded(r#"CREATE TYPE camel_ns."Mood" AS ENUM ('sad', 'happy')"#)
         .await
         .unwrap();
-    pool.query("INSERT INTO camel_intro VALUES (1, 'sad')")
+    pool.query_unbounded(r#"CREATE TABLE camel_intro (id int PRIMARY KEY, m camel_ns."Mood")"#)
+        .await
+        .unwrap();
+    pool.query_unbounded("INSERT INTO camel_intro VALUES (1, 'sad')")
         .await
         .unwrap();
 
@@ -1253,13 +1262,17 @@ async fn postgres_quoted_camelcase_enum_saves_through_the_staged_cast() {
     .unwrap();
     assert_eq!(applied.updated_rows, 1);
     let after = pool
-        .query("SELECT m::text FROM camel_intro WHERE id = 1")
+        .query_unbounded("SELECT m::text FROM camel_intro WHERE id = 1")
         .await
         .unwrap();
     assert_eq!(after.rows[0][0], Value::Text("happy".into()));
 
-    pool.query("DROP TABLE camel_intro").await.unwrap();
-    pool.query("DROP SCHEMA camel_ns CASCADE").await.unwrap();
+    pool.query_unbounded("DROP TABLE camel_intro")
+        .await
+        .unwrap();
+    pool.query_unbounded("DROP SCHEMA camel_ns CASCADE")
+        .await
+        .unwrap();
     pool.close().await;
 }
 
@@ -1277,14 +1290,16 @@ async fn postgres_quoted_camelcase_enum_saves_through_the_staged_cast() {
 async fn bit_and_char_columns_save_through_the_staged_cast() {
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
-    pool.query("DROP TABLE IF EXISTS bit_intro").await.unwrap();
-    pool.query(
+    pool.query_unbounded("DROP TABLE IF EXISTS bit_intro")
+        .await
+        .unwrap();
+    pool.query_unbounded(
         "CREATE TABLE bit_intro (id int PRIMARY KEY, mask bit(4), flags bit varying(8), \
          code character(3))",
     )
     .await
     .unwrap();
-    pool.query("INSERT INTO bit_intro VALUES (1, B'0000', B'0', 'aaa')")
+    pool.query_unbounded("INSERT INTO bit_intro VALUES (1, B'0000', B'0', 'aaa')")
         .await
         .unwrap();
 
@@ -1331,7 +1346,7 @@ async fn bit_and_char_columns_save_through_the_staged_cast() {
     assert_eq!(applied.updated_rows, 1);
 
     let after = pool
-        .query("SELECT mask::text, flags::text, code FROM bit_intro WHERE id = 1")
+        .query_unbounded("SELECT mask::text, flags::text, code FROM bit_intro WHERE id = 1")
         .await
         .unwrap();
     assert_eq!(after.rows[0][0], Value::Text("1010".into()));
@@ -1341,7 +1356,7 @@ async fn bit_and_char_columns_save_through_the_staged_cast() {
     // what a `::character` cast would have done.
     assert_eq!(after.rows[0][2], Value::Text("xyz".into()));
 
-    pool.query("DROP TABLE bit_intro").await.unwrap();
+    pool.query_unbounded("DROP TABLE bit_intro").await.unwrap();
     pool.close().await;
 }
 
@@ -1357,16 +1372,23 @@ async fn bit_and_char_columns_save_through_the_staged_cast() {
 async fn bit_values_are_readable_and_a_bit_key_round_trips() {
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
-    pool.query("DROP TABLE IF EXISTS bit_key").await.unwrap();
-    pool.query("CREATE TABLE bit_key (m bit(4) PRIMARY KEY, label text, wide bit varying(64))")
+    pool.query_unbounded("DROP TABLE IF EXISTS bit_key")
         .await
         .unwrap();
-    pool.query("INSERT INTO bit_key VALUES (B'1010', 'a', B'110011001100')")
+    pool.query_unbounded(
+        "CREATE TABLE bit_key (m bit(4) PRIMARY KEY, label text, wide bit varying(64))",
+    )
+    .await
+    .unwrap();
+    pool.query_unbounded("INSERT INTO bit_key VALUES (B'1010', 'a', B'110011001100')")
         .await
         .unwrap();
 
     // Read: the value itself, not a marker.
-    let read = pool.query("SELECT m, wide FROM bit_key").await.unwrap();
+    let read = pool
+        .query_unbounded("SELECT m, wide FROM bit_key")
+        .await
+        .unwrap();
     assert_eq!(
         read.rows[0][0],
         Value::Text("1010".into()),
@@ -1401,12 +1423,12 @@ async fn bit_values_are_readable_and_a_bit_key_round_trips() {
     );
 
     let after = pool
-        .query("SELECT label FROM bit_key WHERE m = B'1010'")
+        .query_unbounded("SELECT label FROM bit_key WHERE m = B'1010'")
         .await
         .unwrap();
     assert_eq!(after.rows[0][0], Value::Text("b".into()));
 
-    pool.query("DROP TABLE bit_key").await.unwrap();
+    pool.query_unbounded("DROP TABLE bit_key").await.unwrap();
     pool.close().await;
 }
 
@@ -1414,13 +1436,15 @@ async fn bit_values_are_readable_and_a_bit_key_round_trips() {
 async fn partition_children_are_internal_but_their_parent_is_not() {
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
-    pool.query("DROP TABLE IF EXISTS parted_intro CASCADE")
+    pool.query_unbounded("DROP TABLE IF EXISTS parted_intro CASCADE")
         .await
         .unwrap();
-    pool.query("CREATE TABLE parted_intro (id int, at date NOT NULL) PARTITION BY RANGE (at)")
-        .await
-        .unwrap();
-    pool.query(
+    pool.query_unbounded(
+        "CREATE TABLE parted_intro (id int, at date NOT NULL) PARTITION BY RANGE (at)",
+    )
+    .await
+    .unwrap();
+    pool.query_unbounded(
         "CREATE TABLE parted_intro_2026_01 PARTITION OF parted_intro \
          FOR VALUES FROM ('2026-01-01') TO ('2026-02-01')",
     )
@@ -1444,7 +1468,9 @@ async fn partition_children_are_internal_but_their_parent_is_not() {
         Some(Internal::Partition)
     );
 
-    pool.query("DROP TABLE parted_intro CASCADE").await.unwrap();
+    pool.query_unbounded("DROP TABLE parted_intro CASCADE")
+        .await
+        .unwrap();
     pool.close().await;
 }
 
@@ -1503,7 +1529,7 @@ async fn table_stats_estimate_rows_only_once_something_has_measured_them() {
         );
     }
 
-    pool.query("ANALYZE stats_intro").await.unwrap();
+    pool.query_unbounded("ANALYZE stats_intro").await.unwrap();
     let after = pool.fetch_table_stats(&meta).await.unwrap();
     assert_eq!(
         after.rows,
@@ -1522,7 +1548,9 @@ async fn table_stats_estimate_rows_only_once_something_has_measured_them() {
     );
     assert_ne!(after.rows, Some(RowCount::Exact(4)));
 
-    pool.query("DROP TABLE stats_intro").await.unwrap();
+    pool.query_unbounded("DROP TABLE stats_intro")
+        .await
+        .unwrap();
     pool.close().await;
 }
 
@@ -1533,15 +1561,17 @@ async fn a_view_reports_no_size_because_it_occupies_none() {
     // The dependents come down first: `fresh_fixture` drops without CASCADE,
     // so a leftover view from an interrupted run would otherwise pin the base
     // table and fail the setup rather than the assertion.
-    pool.query("DROP VIEW IF EXISTS stats_view").await.unwrap();
-    pool.query("DROP MATERIALIZED VIEW IF EXISTS stats_matview")
+    pool.query_unbounded("DROP VIEW IF EXISTS stats_view")
+        .await
+        .unwrap();
+    pool.query_unbounded("DROP MATERIALIZED VIEW IF EXISTS stats_matview")
         .await
         .unwrap();
     fresh_fixture(&pool, "stats_base").await;
-    pool.query("CREATE VIEW stats_view AS SELECT * FROM stats_base")
+    pool.query_unbounded("CREATE VIEW stats_view AS SELECT * FROM stats_base")
         .await
         .unwrap();
-    pool.query("CREATE MATERIALIZED VIEW stats_matview AS SELECT * FROM stats_base")
+    pool.query_unbounded("CREATE MATERIALIZED VIEW stats_matview AS SELECT * FROM stats_base")
         .await
         .unwrap();
 
@@ -1578,11 +1608,11 @@ async fn a_view_reports_no_size_because_it_occupies_none() {
         4
     );
 
-    pool.query("DROP VIEW stats_view").await.unwrap();
-    pool.query("DROP MATERIALIZED VIEW stats_matview")
+    pool.query_unbounded("DROP VIEW stats_view").await.unwrap();
+    pool.query_unbounded("DROP MATERIALIZED VIEW stats_matview")
         .await
         .unwrap();
-    pool.query("DROP TABLE stats_base").await.unwrap();
+    pool.query_unbounded("DROP TABLE stats_base").await.unwrap();
     pool.close().await;
 }
 
@@ -1590,19 +1620,19 @@ async fn a_view_reports_no_size_because_it_occupies_none() {
 async fn an_exact_count_ignores_a_quoted_name_and_a_non_public_schema() {
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
-    pool.query("CREATE SCHEMA IF NOT EXISTS \"stats sch\"")
+    pool.query_unbounded("CREATE SCHEMA IF NOT EXISTS \"stats sch\"")
         .await
         .unwrap();
-    pool.query("DROP TABLE IF EXISTS \"stats sch\".\"odd.name\"")
+    pool.query_unbounded("DROP TABLE IF EXISTS \"stats sch\".\"odd.name\"")
         .await
         .unwrap();
-    pool.query("CREATE TABLE \"stats sch\".\"odd.name\" (id int)")
+    pool.query_unbounded("CREATE TABLE \"stats sch\".\"odd.name\" (id int)")
         .await
         .unwrap();
-    pool.query("INSERT INTO \"stats sch\".\"odd.name\" VALUES (1), (2)")
+    pool.query_unbounded("INSERT INTO \"stats sch\".\"odd.name\" VALUES (1), (2)")
         .await
         .unwrap();
-    pool.query("ANALYZE \"stats sch\".\"odd.name\"")
+    pool.query_unbounded("ANALYZE \"stats sch\".\"odd.name\"")
         .await
         .unwrap();
 
@@ -1626,10 +1656,12 @@ async fn an_exact_count_ignores_a_quoted_name_and_a_non_public_schema() {
     let stats = pool.fetch_table_stats(&meta).await.unwrap();
     assert_eq!(stats.rows, Some(RowCount::Estimated(2)));
 
-    pool.query("DROP TABLE \"stats sch\".\"odd.name\"")
+    pool.query_unbounded("DROP TABLE \"stats sch\".\"odd.name\"")
         .await
         .unwrap();
-    pool.query("DROP SCHEMA \"stats sch\"").await.unwrap();
+    pool.query_unbounded("DROP SCHEMA \"stats sch\"")
+        .await
+        .unwrap();
     pool.close().await;
 }
 
@@ -1637,10 +1669,10 @@ async fn an_exact_count_ignores_a_quoted_name_and_a_non_public_schema() {
 async fn an_analyzed_empty_table_reports_zero_rows_rather_than_nothing() {
     let Some(url) = test_url().await else { return };
     let pool = DbPool::open_postgres(&url).await.unwrap();
-    pool.query("DROP TABLE IF EXISTS stats_empty")
+    pool.query_unbounded("DROP TABLE IF EXISTS stats_empty")
         .await
         .unwrap();
-    pool.query("CREATE TABLE stats_empty (id int, name text)")
+    pool.query_unbounded("CREATE TABLE stats_empty (id int, name text)")
         .await
         .unwrap();
 
@@ -1649,7 +1681,7 @@ async fn an_analyzed_empty_table_reports_zero_rows_rather_than_nothing() {
     let meta = meta_of(&pool, "stats_empty").await;
     assert_eq!(pool.fetch_table_stats(&meta).await.unwrap().rows, None);
 
-    pool.query("ANALYZE stats_empty").await.unwrap();
+    pool.query_unbounded("ANALYZE stats_empty").await.unwrap();
     let stats = pool.fetch_table_stats(&meta).await.unwrap();
 
     // The state this exists for. ANALYZE measured the table and found no rows,
@@ -1674,7 +1706,9 @@ async fn an_analyzed_empty_table_reports_zero_rows_rather_than_nothing() {
         0
     );
 
-    pool.query("DROP TABLE stats_empty").await.unwrap();
+    pool.query_unbounded("DROP TABLE stats_empty")
+        .await
+        .unwrap();
     pool.close().await;
 }
 
@@ -1696,7 +1730,7 @@ async fn postgres_explains_a_query_as_a_structured_plan() {
         sql,
         "EXPLAIN (FORMAT JSON) SELECT name FROM fruits_plan WHERE weight > 1 ORDER BY name"
     );
-    let result = pool.query(&sql).await.unwrap();
+    let result = pool.query_unbounded(&sql).await.unwrap();
 
     // The whole point of the structured path: a real server's output parses
     // into a tree, not into the raw-text fallback. A `FORMAT JSON` column that
@@ -1729,7 +1763,9 @@ async fn postgres_explains_a_query_as_a_structured_plan() {
     assert_eq!(tree.total_cost, tree.root.total_cost.unwrap());
     assert!(rows.iter().any(|(_, node)| node.expensive));
 
-    pool.query("DROP TABLE fruits_plan").await.unwrap();
+    pool.query_unbounded("DROP TABLE fruits_plan")
+        .await
+        .unwrap();
     pool.close().await;
 }
 
@@ -1760,7 +1796,7 @@ async fn postgres_a_plan_larger_than_the_display_cap_still_parses() {
     let plan = explain_statement("SELECT * FROM big_plan", support);
 
     // The fixture is only worth something if its plan is past the cap.
-    let whole = pool.query(&plan).await.unwrap();
+    let whole = pool.query_unbounded(&plan).await.unwrap();
     let Value::Text(json) = &whole.rows[0][0] else {
         panic!("{whole:?}");
     };
@@ -1837,7 +1873,7 @@ async fn postgres_a_plan_larger_than_the_display_cap_still_parses() {
 /// The `fruits_guard` names, in id order — what "did the statement run?" is
 /// asked of.
 async fn guard_names(pool: &DbPool) -> Vec<String> {
-    pool.query("SELECT name FROM fruits_guard ORDER BY id")
+    pool.query_unbounded("SELECT name FROM fruits_guard ORDER BY id")
         .await
         .unwrap()
         .rows
@@ -1861,7 +1897,7 @@ async fn postgres_explain_analyze_of_a_write_cannot_slip_past_the_gate() {
         "UPDATE fruits_guard SET name = 'planned'",
         pool.explain_support().unwrap(),
     );
-    pool.query(&planned).await.unwrap();
+    pool.query_unbounded(&planned).await.unwrap();
     assert_eq!(
         guard_names(&pool).await,
         before,
@@ -1904,7 +1940,9 @@ async fn postgres_explain_analyze_of_a_write_cannot_slip_past_the_gate() {
         .iter()
         .all(|name| name == "analyzed"));
 
-    pool.query("DROP TABLE fruits_guard").await.unwrap();
+    pool.query_unbounded("DROP TABLE fruits_guard")
+        .await
+        .unwrap();
     pool.close().await;
 }
 
@@ -1943,7 +1981,7 @@ async fn postgres_accepts_every_explain_header_hubro_tolerates() {
         "EXPLAIN /* just looking */ ANALYZE",
     ] {
         let sql = format!("{header} SELECT 1");
-        pool.query(&sql)
+        pool.query_unbounded(&sql)
             .await
             .unwrap_or_else(|e| panic!("postgres rejected {sql:?}: {e}"));
         // And hubro reads it as what it is: a plan of a read.
@@ -2173,16 +2211,16 @@ async fn create_key_type_fixtures(pool: &DbPool, schema: &str) {
         format!("CREATE SCHEMA {schema}"),
         format!("CREATE TYPE {schema}.mood AS ENUM ('happy', 'Sad')"),
     ] {
-        pool.query(&sql).await.unwrap();
+        pool.query_unbounded(&sql).await.unwrap();
     }
     for (slug, type_name, literals) in PG_KEY_TYPES {
         let type_name = type_name.replace("{schema}", schema);
-        pool.query(&format!(
+        pool.query_unbounded(&format!(
             "CREATE TABLE {schema}.k_{slug} (k {type_name} PRIMARY KEY, body text, tag text)"
         ))
         .await
         .unwrap();
-        pool.query(&format!(
+        pool.query_unbounded(&format!(
             "CREATE TABLE {schema}.fk_{slug} (
                 ref {type_name} REFERENCES {schema}.k_{slug} (k), expect text)"
         ))
@@ -2193,7 +2231,7 @@ async fn create_key_type_fixtures(pool: &DbPool, schema: &str) {
             .enumerate()
             .map(|(n, lit)| format!("({lit}, '{n}:' || repeat('x', 5000), 't')"))
             .collect();
-        pool.query(&format!(
+        pool.query_unbounded(&format!(
             "INSERT INTO {schema}.k_{slug} VALUES {}",
             rows.join(", ")
         ))
@@ -2204,7 +2242,7 @@ async fn create_key_type_fixtures(pool: &DbPool, schema: &str) {
             .enumerate()
             .map(|(n, lit)| format!("({lit}, '{n}:')"))
             .collect();
-        pool.query(&format!(
+        pool.query_unbounded(&format!(
             "INSERT INTO {schema}.fk_{slug} VALUES {}",
             refs.join(", ")
         ))
@@ -2230,7 +2268,7 @@ async fn create_key_type_fixtures(pool: &DbPool, schema: &str) {
         ),
         format!("INSERT INTO {schema}.fk_composite VALUES (1e20, 'x', '0:'), (1e20, 'y', '1:')"),
     ] {
-        pool.query(&sql).await.unwrap();
+        pool.query_unbounded(&sql).await.unwrap();
     }
 }
 
@@ -2276,7 +2314,9 @@ async fn postgres_every_key_type_reads_and_writes_the_same_row() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 
-    pool.query("DROP SCHEMA addr_keys CASCADE").await.unwrap();
+    pool.query_unbounded("DROP SCHEMA addr_keys CASCADE")
+        .await
+        .unwrap();
     pool.close().await;
 }
 
@@ -2295,7 +2335,7 @@ async fn postgres_a_key_read_as_text_still_sorts_by_its_type() {
         "INSERT INTO range_sort VALUES ('[10,20)', '{\"b\": 1}'), ('[9,10)', '{\"c\": 1}'), \
          ('[100,200)', '{\"a\": 1}')",
     ] {
-        pool.query(sql).await.unwrap();
+        pool.query_unbounded(sql).await.unwrap();
     }
     let table = pool
         .introspect()
@@ -2331,7 +2371,7 @@ async fn postgres_a_key_read_as_text_still_sorts_by_its_type() {
         .await
         .expect("a json column sorts by its preview's text");
     assert_eq!(page.result.rows[0][0], Value::Text("[100,200)".into()));
-    pool.query("DROP TABLE range_sort").await.unwrap();
+    pool.query_unbounded("DROP TABLE range_sort").await.unwrap();
     pool.close().await;
 }
 
@@ -2365,7 +2405,7 @@ async fn saves_by_text_key_land_on_their_rows(
     };
     let tags = || async {
         let read = pool
-            .query(&format!("SELECT v, tag FROM {table} ORDER BY v"))
+            .query_unbounded(&format!("SELECT v, tag FROM {table} ORDER BY v"))
             .await
             .unwrap();
         read.rows
@@ -2420,7 +2460,7 @@ async fn postgres_a_role_default_never_respells_a_key_for_another_session() {
     let Some(url) = test_url().await else { return };
     let setup = DbPool::open_postgres(&url).await.unwrap();
     let who = setup
-        .query("SELECT quote_ident(current_user), quote_ident(current_database())")
+        .query_unbounded("SELECT quote_ident(current_user), quote_ident(current_database())")
         .await
         .unwrap();
     let (Value::Text(role), Value::Text(database)) = (&who.rows[0][0], &who.rows[0][1]) else {
@@ -2442,7 +2482,7 @@ async fn postgres_a_role_default_never_respells_a_key_for_another_session() {
         .await;
     for setting in ["DateStyle", "IntervalStyle", "lc_monetary"] {
         setup
-            .query(&format!("{scope} RESET {setting}"))
+            .query_unbounded(&format!("{scope} RESET {setting}"))
             .await
             .unwrap();
     }
@@ -2470,13 +2510,13 @@ async fn role_default_body(url: &str, scope: &str) {
          (ARRAY['-1 days -02:00:00']::interval[], 'minus', 't'), \
          (ARRAY['-1 days +02:00:00']::interval[], 'plus', 't')",
     ] {
-        pool.query(sql).await.unwrap();
+        pool.query_unbounded(sql).await.unwrap();
     }
     // Both sessions of the pool exist before the default changes.
     let probe = "SELECT pg_backend_pid()::int8, current_setting('DateStyle'), \
                  current_setting('IntervalStyle'), current_setting('lc_monetary'), \
                  pg_sleep(0.3)::text";
-    let (a, b) = tokio::join!(pool.query(probe), pool.query(probe));
+    let (a, b) = tokio::join!(pool.query_unbounded(probe), pool.query_unbounded(probe));
     let (a, b) = (a.unwrap().rows[0].clone(), b.unwrap().rows[0].clone());
     let before = [a[0].clone(), b[0].clone()];
     // What the pool's sessions were given, and another installed locale for
@@ -2493,7 +2533,7 @@ async fn role_default_body(url: &str, scope: &str) {
         format!("{scope} SET IntervalStyle = 'sql_standard'"),
         format!("{scope} SET lc_monetary = '{other}'"),
     ] {
-        pool.query(&sql).await.unwrap();
+        pool.query_unbounded(&sql).await.unwrap();
     }
     // A script's connection is closed after its run, so the next pair of
     // reads finds one old session and opens one new one.
@@ -2501,7 +2541,7 @@ async fn role_default_body(url: &str, scope: &str) {
     run_script(&pool, caps, &["SELECT 1".to_string()], |_| {})
         .await
         .unwrap();
-    let (a, b) = tokio::join!(pool.query(probe), pool.query(probe));
+    let (a, b) = tokio::join!(pool.query_unbounded(probe), pool.query_unbounded(probe));
     let after = [a.unwrap().rows[0].clone(), b.unwrap().rows[0].clone()];
     assert!(
         after.iter().any(|session| !before.contains(&session[0])),
@@ -2521,7 +2561,7 @@ async fn role_default_body(url: &str, scope: &str) {
     let mut failures = saves_by_text_key_land_on_their_rows(&pool, "role_dates", 4).await;
     failures.extend(saves_by_text_key_land_on_their_rows(&pool, "role_intervals", 4).await);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-    pool.query("DROP TABLE role_dates, role_intervals")
+    pool.query_unbounded("DROP TABLE role_dates, role_intervals")
         .await
         .unwrap();
     pool.close().await;
@@ -2545,7 +2585,7 @@ async fn postgres_a_scripts_datestyle_never_respells_a_key_for_another_session()
         "INSERT INTO style_keys VALUES \
          ('[2024-02-01,2024-02-03)', 'feb', 't'), ('[2024-01-02,2024-03-02)', 'jan', 't')",
     ] {
-        pool.query(sql).await.unwrap();
+        pool.query_unbounded(sql).await.unwrap();
     }
     // Both ways a script runs: a lone statement on a held connection (the
     // sequential path, which closes it explicitly), and several in hubro's
@@ -2569,7 +2609,7 @@ async fn postgres_a_scripts_datestyle_never_respells_a_key_for_another_session()
     // Every session the pool holds: two reads kept open at once cannot share
     // a connection on a pool of two.
     let style = "SELECT current_setting('DateStyle'), pg_sleep(0.3)::text";
-    let (a, b) = tokio::join!(pool.query(style), pool.query(style));
+    let (a, b) = tokio::join!(pool.query_unbounded(style), pool.query_unbounded(style));
     for session in [a.unwrap(), b.unwrap()] {
         assert_eq!(
             session.rows[0][0],
@@ -2584,7 +2624,7 @@ async fn postgres_a_scripts_datestyle_never_respells_a_key_for_another_session()
     let failures = saves_by_text_key_land_on_their_rows(&pool, "style_keys", 6).await;
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 
-    pool.query("DROP TABLE style_keys").await.unwrap();
+    pool.query_unbounded("DROP TABLE style_keys").await.unwrap();
     pool.close().await;
 }
 
@@ -2604,7 +2644,9 @@ async fn postgres_every_key_type_jumps_to_the_row_it_references() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 
-    pool.query("DROP SCHEMA fk_keys CASCADE").await.unwrap();
+    pool.query_unbounded("DROP SCHEMA fk_keys CASCADE")
+        .await
+        .unwrap();
     pool.close().await;
 }
 
@@ -2638,7 +2680,7 @@ async fn postgres_jumps_from_differently_typed_sources_share_no_statement() {
         "CREATE TABLE mixed_fk.d_dbl (pid double precision REFERENCES mixed_fk.pdbl, expect text)",
         "INSERT INTO mixed_fk.d_dbl VALUES (2.5, '1:')",
     ] {
-        pool.query(sql)
+        pool.query_unbounded(sql)
             .await
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
@@ -2664,7 +2706,9 @@ async fn postgres_jumps_from_differently_typed_sources_share_no_statement() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 
-    pool.query("DROP SCHEMA mixed_fk CASCADE").await.unwrap();
+    pool.query_unbounded("DROP SCHEMA mixed_fk CASCADE")
+        .await
+        .unwrap();
     pool.close().await;
 }
 
@@ -2682,7 +2726,7 @@ async fn postgres_writes_of_differently_typed_values_share_no_statement() {
         "CREATE TABLE mixed_writes (id int PRIMARY KEY, f double precision, n numeric)",
         "INSERT INTO mixed_writes VALUES (1, 0, 0), (2, 0, 0)",
     ] {
-        pool.query(sql).await.unwrap();
+        pool.query_unbounded(sql).await.unwrap();
     }
     let tables = pool.introspect().await.unwrap();
     let table = tables
@@ -2718,7 +2762,7 @@ async fn postgres_writes_of_differently_typed_values_share_no_statement() {
                 .unwrap_or_else(|e| panic!("round {round}, row {id}: {e}"));
         }
         let rows = pool
-            .query("SELECT f, n::text FROM mixed_writes ORDER BY id")
+            .query_unbounded("SELECT f, n::text FROM mixed_writes ORDER BY id")
             .await
             .unwrap()
             .rows;
@@ -2732,7 +2776,9 @@ async fn postgres_writes_of_differently_typed_values_share_no_statement() {
         );
     }
 
-    pool.query("DROP TABLE mixed_writes").await.unwrap();
+    pool.query_unbounded("DROP TABLE mixed_writes")
+        .await
+        .unwrap();
     pool.close().await;
 }
 
@@ -2748,11 +2794,13 @@ async fn postgres_contains_filter_is_a_substring_search_whatever_the_needle_hold
             common::like_hostile_rows("")
         ),
     ] {
-        pool.query(&sql).await.unwrap();
+        pool.query_unbounded(&sql).await.unwrap();
     }
     let mismatches = common::contains_filter_mismatches(&pool, None, "like_hostile").await;
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
-    pool.query("DROP TABLE like_hostile").await.unwrap();
+    pool.query_unbounded("DROP TABLE like_hostile")
+        .await
+        .unwrap();
     pool.close().await;
 }
 
@@ -2817,7 +2865,7 @@ async fn postgres_a_do_instead_rule_refuses_editing_before_anything_is_written()
         "CREATE RULE rule_also_log AS ON UPDATE TO rule_also \
          DO ALSO INSERT INTO rule_log VALUES (2)",
     ] {
-        pool.query(sql)
+        pool.query_unbounded(sql)
             .await
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
@@ -2860,13 +2908,13 @@ async fn postgres_a_do_instead_rule_refuses_editing_before_anything_is_written()
         err.message
     );
     let unchanged = pool
-        .query("SELECT name FROM rule_redirected WHERE id = 1")
+        .query_unbounded("SELECT name FROM rule_redirected WHERE id = 1")
         .await
         .unwrap();
     assert_eq!(unchanged.rows, vec![vec![Value::Text("first".into())]]);
 
-    pool.query("DROP VIEW rule_view").await.unwrap();
-    pool.query("DROP TABLE rule_redirected, rule_also, rule_log")
+    pool.query_unbounded("DROP VIEW rule_view").await.unwrap();
+    pool.query_unbounded("DROP TABLE rule_redirected, rule_also, rule_log")
         .await
         .unwrap();
     pool.close().await;

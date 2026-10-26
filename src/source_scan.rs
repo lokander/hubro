@@ -228,9 +228,62 @@ pub(crate) fn code_outside_test_modules(text: &str) -> String {
     without_comments(&shipped(text))
 }
 
+/// Every `.rs` file under `dir`, recursively, in no particular order.
+pub(crate) fn rust_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// Whether `code` names the identifier `name` anywhere, on identifier
+/// boundaries: a path, an import, an alias all name it; a longer identifier
+/// containing it does not.
+pub(crate) fn names_ident(code: &str, name: &str) -> bool {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    code.match_indices(name).any(|(at, word)| {
+        let before = code[..at].chars().next_back();
+        let after = code[at + word.len()..].chars().next();
+        !before.is_some_and(ident) && !after.is_some_and(ident)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_identifier_is_named_only_on_its_own_boundaries() {
+        assert!(names_ident("use crate::db::{Reading as R};", "Reading"));
+        assert!(names_ident("pool.query_unbounded(sql)", "query_unbounded"));
+        assert!(!names_ident(
+            "let reading = c.browse(); ReadingsTable",
+            "Reading"
+        ));
+        assert!(!names_ident("fn query_unbounded_ish()", "query_unbounded"));
+    }
+
+    #[test]
+    fn every_rust_file_under_a_directory_is_found() {
+        let ui = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui");
+        let files = rust_files(&ui);
+        assert!(
+            files.iter().any(|f| f.ends_with("ui/state/mod.rs")),
+            "{files:?}"
+        );
+        assert!(files
+            .iter()
+            .all(|f| f.extension().is_some_and(|e| e == "rs")));
+    }
 
     #[test]
     fn a_test_module_is_dropped_and_what_follows_it_is_read() {

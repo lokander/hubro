@@ -49,7 +49,7 @@ async fn run_ok(engine: &str, pool: &DbPool, caps: Capabilities, sql: &str) {
 
 async fn one(pool: &DbPool, sql: &str) -> Value {
     let result = pool
-        .query(sql)
+        .query_unbounded(sql)
         .await
         .unwrap_or_else(|e| panic!("{sql}: {e}"));
     result.rows[0][0].clone()
@@ -177,7 +177,7 @@ async fn assert_pg_session_state_stays_in_its_run(engine: &PgEngine, url: &str) 
     // CockroachDB refuses the statement, which is no leak.
     one(&pool, "SELECT 1").await;
     if run(&pool, caps, "DISCARD ALL").await.is_empty() {
-        if let Err(e) = pool.query("SELECT 1").await {
+        if let Err(e) = pool.query_unbounded("SELECT 1").await {
             leaks.push(format!("a query after a script's DISCARD ALL failed: {e}"));
         }
     }

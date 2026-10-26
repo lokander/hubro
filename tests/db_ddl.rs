@@ -41,7 +41,7 @@ fn table<'a>(tables: &'a [TableMeta], schema: Option<&str>, name: &str) -> &'a T
 /// same reason `tests/db_sqlserver.rs` does: tiberius' execute path wraps the
 /// batch, and `CREATE VIEW` has to be the first statement of its own batch.
 async fn run_one(pool: &DbPool, sql: &str) {
-    pool.query(sql)
+    pool.query_unbounded(sql)
         .await
         .unwrap_or_else(|e| panic!("running DDL failed: {e}\n---\n{sql}"));
 }
@@ -56,7 +56,7 @@ async fn run_ddl(pool: &DbPool, sql: &str) {
 
 /// Every cell of the first result row, for catalog probes.
 async fn probe(pool: &DbPool, sql: &str) -> Vec<Vec<Value>> {
-    pool.query(sql)
+    pool.query_unbounded(sql)
         .await
         .unwrap_or_else(|e| panic!("probe failed: {e}\n---\n{sql}"))
         .rows
@@ -67,7 +67,7 @@ async fn probe(pool: &DbPool, sql: &str) -> Vec<Vec<Value>> {
 /// metadata comparison in this file.
 async fn assert_rejected(pool: &DbPool, sql: &str) {
     let err = pool
-        .query(sql)
+        .query_unbounded(sql)
         .await
         .err()
         .unwrap_or_else(|| panic!("the rebuilt table accepted a row it must reject:\n{sql}"));
