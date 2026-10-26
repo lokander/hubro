@@ -671,6 +671,7 @@ mod tests {
         // text misses it wherever the wrap fell — and each kind of secret has
         // its call.
         let mut calls = Vec::new();
+        let mut every_call = 0;
         for (file, source) in super::super::source_reading::all_sources() {
             let code = crate::source_scan::code_outside_test_modules(&source);
             if file != "ui/state/secrets_policy.rs" {
@@ -681,27 +682,52 @@ mod tests {
                     );
                 }
             }
+            // Every call, whatever its argument: one built from a variable
+            // would escape the literal-argument count below.
+            every_call += code
+                .match_indices("keyring_store_failed(")
+                .filter(|(at, _)| {
+                    let before = &code[..*at];
+                    !before.ends_with("fn ")
+                        && !before
+                            .chars()
+                            .next_back()
+                            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                })
+                .count();
             for (at, _) in code.match_indices("keyring_store_failed(\"") {
                 let what = &code[at + "keyring_store_failed(\"".len()..];
                 calls.push(what[..what.find('"').unwrap()].to_string());
             }
         }
+        assert_eq!(
+            every_call, 3,
+            "a refused-store notice is raised outside the three gates"
+        );
         calls.sort();
         assert_eq!(
             calls,
             ["the SSH key passphrase", "the password", "the sign-in"]
         );
 
-        // And each notice is raised exactly when the store failed, as
-        // written (whitespace removed, so a rustfmt wrap is no failure).
-        let flows: String = super::super::source_reading::connect_code()
-            .split_whitespace()
-            .collect();
+        // And each notice is raised exactly when its own store failed: the
+        // store call, the binding its result is read through, the gate and
+        // the notice, as written — comments out and whitespace removed, so a
+        // rustfmt wrap is no failure.
+        let flows: String =
+            crate::source_scan::without_comments(&super::super::source_reading::connect_code())
+                .split_whitespace()
+                .collect();
         for gate in [
-            "ifstore.is_err(){self.connect_error.set(Some(keyring_store_failed(\"thepassword\")));",
-            ".await.is_err(){self.connect_error.set(Some(keyring_store_failed(\"theSSHkeypassphrase\")));",
-            "RefreshKeyringOutcome::StoreRefused(refresh)=>{self.session_passwords.write().insert(entra_secret_key(url),refresh);self.connect_error.set(Some(keyring_store_failed(\"thesign-in\")));",
-            "Ok(())=>RefreshKeyringOutcome::Applied,Err(_)=>RefreshKeyringOutcome::StoreRefused(refresh),",
+            "letstore=crate::secrets::store_password_async(url.clone(),password.clone()).await;\
+             ifstore.is_err(){self.connect_error.set(Some(keyring_store_failed(\"thepassword\")));",
+            "ifcrate::secrets::store_password_async(key,passphrase).await.is_err(){\
+             self.connect_error.set(Some(keyring_store_failed(\"theSSHkeypassphrase\")));",
+            "matchcrate::secrets::store_password_async(key,refresh.clone()).await{\
+             Ok(())=>RefreshKeyringOutcome::Applied,Err(_)=>RefreshKeyringOutcome::StoreRefused(refresh),}",
+            "matchapply_refresh_keyring(url,placed).await{",
+            "RefreshKeyringOutcome::StoreRefused(refresh)=>{self.session_passwords.write().insert(entra_secret_key(url),refresh);\
+             self.connect_error.set(Some(keyring_store_failed(\"thesign-in\")));",
         ] {
             assert!(
                 flows.contains(gate),
