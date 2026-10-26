@@ -42,6 +42,7 @@ mod tabs;
 pub use backend::ServerBackend;
 pub use import::{ImportRequest, ImportStatus};
 pub use schema_edit::{after_edit, SchemaEditRequest, SchemaEditStatus};
+use tabs::finish_in;
 pub use tabs::{Slot, TabState};
 
 use std::collections::HashMap;

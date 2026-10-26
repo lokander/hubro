@@ -199,7 +199,7 @@ impl AppState {
         // Releases the task handle too — nothing to cancel once the outcome
         // is in, and a stale handle would let a later close "cancel" a task
         // that has already committed.
-        if !self.import_status.write().finish(&id, generation) {
+        if !finish_in(self.import_status, &id, generation) {
             return;
         }
         let status = match outcome {

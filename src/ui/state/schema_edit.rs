@@ -190,7 +190,7 @@ impl AppState {
         outcome: Result<(), String>,
         request: &SchemaEditRequest,
     ) {
-        if !self.schema_edits.write().finish(&id, generation) {
+        if !finish_in(self.schema_edits, &id, generation) {
             return;
         }
         let status = match outcome {

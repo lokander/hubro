@@ -390,8 +390,12 @@ impl AppState {
         let task = spawn_forever(async move {
             let started = std::time::Instant::now();
             let result = run_script(&pool, caps, &statements, |statement| {
-                if let Some(run) = self.sql_runs.write().current_mut(&(id, buffer), generation) {
-                    run.statements.push(SharedStatement::new(statement));
+                // Peeked first, so a stale run's progress wakes no reader.
+                if self.sql_runs.peek().is_current(&(id, buffer), generation) {
+                    if let Some(run) = self.sql_runs.write().current_mut(&(id, buffer), generation)
+                    {
+                        run.statements.push(SharedStatement::new(statement));
+                    }
                 }
             })
             .await;
@@ -406,11 +410,10 @@ impl AppState {
                 self.record_history(id, script, success, error_text).await;
             });
             // Stale-run guard: a newer run (or a close) owns the slot now.
-            let mut runs = self.sql_runs.write();
-            if !runs.finish(&(id, buffer), generation) {
+            if !finish_in(self.sql_runs, &(id, buffer), generation) {
                 return;
             }
-            if let Some(run) = runs.status_mut(&(id, buffer)) {
+            if let Some(run) = self.sql_runs.write().status_mut(&(id, buffer)) {
                 run.status = status;
             }
         });
@@ -728,15 +731,14 @@ impl AppState {
         generation: u64,
         outcome: Result<u64, String>,
     ) {
-        let mut statuses = self.export_status.write();
-        if !statuses.finish(&slot, generation) {
+        if !finish_in(self.export_status, &slot, generation) {
             return;
         }
         let status = match outcome {
             Ok(rows) => ExportStatus::Done { rows },
             Err(err) => ExportStatus::Failed(err),
         };
-        statuses.set(slot, status);
+        self.export_status.write().set(slot, status);
     }
 }
 
