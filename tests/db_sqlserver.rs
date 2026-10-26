@@ -90,7 +90,19 @@ async fn run_all(pool: &DbPool, statements: &[&str]) {
 async fn introspect_table(turn: &mut Turn, pool: &DbPool, name: &str) -> TableMeta {
     turn.0 = None;
     let tables = {
-        let _catalog = CATALOG.write().await;
+        // Every other test gives the catalog up within seconds, at its end or
+        // at its own introspection, so a minute means one never will: a test
+        // waiting, while it holds its turn, on something that cannot finish
+        // until this does. Said loudly rather than left to hang the run.
+        let _catalog = tokio::time::timeout(std::time::Duration::from_secs(60), CATALOG.write())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "waited a minute for the catalog: some test is holding its turn \
+                     while it waits on something that needs this introspection to \
+                     finish first (DDL held open on another connection, say)"
+                )
+            });
         pool.introspect().await.unwrap()
     };
     turn.0 = Some(CATALOG.read().await);
@@ -3114,11 +3126,14 @@ async fn sqlserver_capped_row_returning_write_keeps_its_write() {
 /// value when written back.
 #[tokio::test]
 async fn sqlserver_a_real_reads_as_its_shortest_decimal_and_writes_back_unchanged() {
-    let Some((url, _turn)) = session().await else {
+    let Some((url, mut turn)) = session().await else {
         return;
     };
     let pool = DbPool::open_mssql(&url).await.unwrap();
-    let failures = common::real_round_trip_failures(&pool, "real_trip").await;
+    let failures = common::real_round_trip_failures(&pool, "real_trip", async |name| {
+        introspect_table(&mut turn, &pool, &name).await
+    })
+    .await;
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     pool.close().await;
 }

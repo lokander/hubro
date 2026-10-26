@@ -1204,7 +1204,16 @@ pub const REAL_VALUES: &[(&str, &str)] = &[
 /// with the value exactly as read; the server then compares the two tables
 /// column for column. Plain `int`/`real` DDL, so it runs unchanged on
 /// PostgreSQL, CockroachDB and SQL Server.
-pub async fn real_round_trip_failures(pool: &DbPool, prefix: &str) -> Vec<String> {
+///
+/// `introspect` returns the named table's metadata. It is the caller's,
+/// because how a suite may introspect is the suite's business: SQL Server's
+/// has to take its catalog turn first. Nothing in `tests/common` calls
+/// `introspect()` itself (`tests/engine_urls.rs` pins that).
+pub async fn real_round_trip_failures(
+    pool: &DbPool,
+    prefix: &str,
+    introspect: impl AsyncFnOnce(String) -> hubro::db::TableMeta,
+) -> Vec<String> {
     use hubro::db::{apply_staged, detect_row_identity, StagedChange, Value};
     let (src, dst) = (format!("{prefix}_src"), format!("{prefix}_dst"));
     for table in [&src, &dst] {
@@ -1229,11 +1238,7 @@ pub async fn real_round_trip_failures(pool: &DbPool, prefix: &str) -> Vec<String
         .await
         .unwrap();
     let mut failures = Vec::new();
-    let tables = pool.introspect().await.unwrap();
-    let target = tables
-        .iter()
-        .find(|t| t.name == dst)
-        .unwrap_or_else(|| panic!("{dst} missing from introspection"));
+    let target = &introspect(dst.clone()).await;
     let identity = detect_row_identity(target, pool.dialect()).expect("a keyed table");
     let access = pool.backend_access(target);
     for (row, (literal, shown)) in read.rows.iter().zip(REAL_VALUES) {
@@ -1289,7 +1294,14 @@ pub async fn real_round_trip_failures(pool: &DbPool, prefix: &str) -> Vec<String
 /// unchanged and typed as `1e400`, it must stay that number — `1e400` parses
 /// as an infinite `f64`, and treating that as typed infinity saved
 /// `Infinity` over it — and typed into the float column it must be refused.
-pub async fn non_finite_edit_failures(pool: &DbPool, prefix: &str) -> Vec<String> {
+///
+/// `introspect` returns the named table's metadata, as for
+/// [`real_round_trip_failures`].
+pub async fn non_finite_edit_failures(
+    pool: &DbPool,
+    prefix: &str,
+    introspect: impl AsyncFnOnce(String) -> hubro::db::TableMeta,
+) -> Vec<String> {
     use hubro::db::{apply_staged, detect_row_identity, RowLocator, StagedChange, Value};
     use hubro::ui::editing::{editor_kind, parse_input};
     pool.query(&format!("DROP TABLE IF EXISTS {prefix}"))
@@ -1305,11 +1317,7 @@ pub async fn non_finite_edit_failures(pool: &DbPool, prefix: &str) -> Vec<String
     ))
     .await
     .unwrap();
-    let tables = pool.introspect().await.unwrap();
-    let table = tables
-        .iter()
-        .find(|t| t.name == prefix)
-        .unwrap_or_else(|| panic!("{prefix} missing from introspection"));
+    let table = &introspect(prefix.to_string()).await;
     let identity = detect_row_identity(table, pool.dialect()).expect("a keyed table");
     let access = pool.backend_access(table);
     let shown = pool
