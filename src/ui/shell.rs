@@ -578,7 +578,6 @@ fn TabBar() -> Element {
     let active = *state.active.read();
     // Owned copies so the loop can hand ids/names to event handlers.
     let tabs: Vec<TabEntry> = {
-        let colors = state.connection_colors.read();
         state
             .registry
             .read()
@@ -587,7 +586,7 @@ fn TabBar() -> Element {
                 id: c.id,
                 name: c.name.clone(),
                 dialect: c.pool.dialect(),
-                color: colors.get(&c.id).copied(),
+                color: state.connection_color(c.id),
                 protection: c.protection,
             })
             .collect()
@@ -686,7 +685,7 @@ fn ConnectionView(id: ConnectionId) -> Element {
     };
     // Its SSH session ended under it: say so above every pane, since every
     // pane's own errors would otherwise be all there is to go on.
-    let lost = state.lost_tunnels.read().get(&id).cloned();
+    let lost = state.lost_tunnel(id);
     let (selected, pane) = {
         let tab_ui = state.tab_ui.read();
         let ui = tab_ui.get(&id);

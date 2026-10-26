@@ -436,14 +436,7 @@ impl AppState {
             .collect();
         for id in ids {
             self.registry.write().set_protection(id, protection);
-            match color {
-                Some(color) => {
-                    self.connection_colors.write().insert(id, color);
-                }
-                None => {
-                    self.connection_colors.write().remove(&id);
-                }
-            }
+            self.tab_mut(id, |tab| tab.color = color);
         }
     }
 }

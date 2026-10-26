@@ -158,7 +158,7 @@ impl AppState {
         drop(staged);
         // A confirmation parked over changes that no longer exist
         // would otherwise sit there offering to apply nothing.
-        self.pending_saves.write().remove(&(id, table.key()));
+        self.tab_mut(id, |tab| tab.pending_saves.remove(&table.key()));
         self.nav_guard.set(None);
     }
 
@@ -252,14 +252,16 @@ impl AppState {
     /// [`Self::confirm_pending_save`] calls back in to do the work. Nothing
     /// is staged, unstaged or sent in the meantime, so dismissing costs the
     /// user nothing.
-    pub fn save_staged(mut self, id: ConnectionId, table: &TableRef, gesture: Gesture) {
-        let key = (id, table.key());
+    pub fn save_staged(self, id: ConnectionId, table: &TableRef, gesture: Gesture) {
+        let key = table.key();
         // The parked intent is consumed first either way: `save_action`
         // decides whether it still authorizes *these* changes, and a stale
         // one is replaced rather than honoured. Taken before the empty-stage
         // return so an emptied stage can't strand a banner offering to apply
         // nothing.
-        let parked = self.pending_saves.write().remove(&key);
+        let parked = self
+            .tab_mut(id, |tab| tab.pending_saves.remove(&key))
+            .flatten();
         let current = match self.table_stage(id, table) {
             Some(stage) if !stage.is_empty() => stage.changes(),
             _ => return,
@@ -269,13 +271,13 @@ impl AppState {
         match action {
             SaveAction::Apply => self.apply_staged_now(id, table),
             SaveAction::Park => {
-                self.pending_saves.write().insert(key, Armed::new(current));
+                self.tab_mut(id, |tab| tab.pending_saves.insert(key, Armed::new(current)));
             }
             // Put back as it was, park time and all, so a deliberate later
             // press still confirms it.
             SaveAction::Wait => {
                 if let Some(parked) = parked {
-                    self.pending_saves.write().insert(key, parked);
+                    self.tab_mut(id, |tab| tab.pending_saves.insert(key, parked));
                 }
             }
         }
@@ -291,15 +293,14 @@ impl AppState {
     }
 
     /// Dismisses the write-protection save banner; the staged changes stay.
-    pub fn dismiss_pending_save(mut self, id: ConnectionId, table: &TableRef) {
-        self.pending_saves.write().remove(&(id, table.key()));
+    pub fn dismiss_pending_save(self, id: ConnectionId, table: &TableRef) {
+        self.tab_mut(id, |tab| tab.pending_saves.remove(&table.key()));
     }
 
     /// Whether this table's save is waiting on the write-protection prompt.
     pub fn save_awaiting_confirmation(&self, id: ConnectionId, table_key: &str) -> bool {
-        self.pending_saves
-            .read()
-            .contains_key(&(id, table_key.to_string()))
+        self.tab(id, |tab| tab.pending_saves.contains_key(table_key))
+            .unwrap_or(false)
     }
 
     /// This connection's write protection, defaulting to `Open` for a
