@@ -230,11 +230,18 @@ async fn cockroach_refuses_writes_the_gate_cannot_see() {
     pool.close().await;
 }
 
+/// Held by every test here that runs DDL on YugabyteDB, which refuses
+/// concurrent schema changes: measured, the browsing test's `CREATE VIEW`
+/// beside this one's `CREATE SEQUENCE` failed the latter with "could not
+/// serialize access due to concurrent update".
+static YUGABYTE_DDL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn yugabyte_refuses_writes_the_gate_cannot_see() {
     let Some(url) = url("HUBRO_YUGABYTE_TEST_URL") else {
         return;
     };
+    let _ddl = YUGABYTE_DDL.lock().await;
     let pool = DbPool::open_postgres(&url).await.unwrap();
     assert_invisible_writes_are_refused("HUBRO_YUGABYTE_TEST_URL", &pool).await;
     pool.close().await;
@@ -832,6 +839,7 @@ async fn browsing_a_writing_view_on_a_marked_yugabyte_connection_is_refused() {
     let Some(url) = url("HUBRO_YUGABYTE_TEST_URL") else {
         return;
     };
+    let _ddl = YUGABYTE_DDL.lock().await;
     let pool = DbPool::open_postgres(&url).await.unwrap();
     assert_browsing_does_not_write("HUBRO_YUGABYTE_TEST_URL", &pool).await;
     assert_marked_browsing_reads("HUBRO_YUGABYTE_TEST_URL", &pool).await;
