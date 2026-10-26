@@ -270,24 +270,19 @@ pub(super) fn rebinds(code: &str, ident: &str) -> bool {
 
 /// Every `.rs` file under `src/`, as `(path relative to src, contents)`.
 pub(super) fn all_sources() -> Vec<(String, String)> {
-    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                walk(&path, root, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                let rel = path
-                    .strip_prefix(root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                out.push((rel, std::fs::read_to_string(&path).unwrap()));
-            }
-        }
-    }
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut out = Vec::new();
-    walk(&root, &root, &mut out);
+    let out: Vec<(String, String)> = crate::source_scan::rust_files(&root)
+        .into_iter()
+        .map(|path| {
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = std::fs::read_to_string(&path).unwrap();
+            (rel, text)
+        })
+        .collect();
     assert!(
         out.len() > 20,
         "found only {} source files under {root:?}",
