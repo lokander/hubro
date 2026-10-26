@@ -1863,7 +1863,7 @@ mod tests {
                 "rfd::AsyncFileDialog",
             ),
             (
-                include_str!("../editor.rs"),
+                include_str!("../editor/results.rs"),
                 "spawn_result_export",
                 "pick_export_path(",
             ),
