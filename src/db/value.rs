@@ -182,6 +182,24 @@ pub(crate) struct Capped {
     pub(crate) rest: RestOfRead,
 }
 
+/// A capped read from a path with no rest of its own to report: SQLite's and
+/// SQL Server's reads that are not a script's last statement. `Ran` holds for
+/// both, measured through `run_script`:
+///
+/// - **SQLite** never reads the rest (dropping the statement stops it), but
+///   nothing past the cap has anything to do: a read cannot write, and a
+///   write that returns rows makes every change in its first step (SQLite's
+///   documented `RETURNING` behaviour). A `WITH … INSERT … RETURNING` of
+///   20,000 rows cut at 10,000 kept all 20,000.
+/// - **SQL Server**'s held connection keeps the abandoned response, and
+///   tiberius reads it to its end before the connection's next request: an
+///   `INSERT` in the rest of a capped batch ran (counted by the next
+///   statement). What that read meets is not reported, though: a `SELECT
+///   1/0` in the rest of a capped batch left the script `Ok` — the rest ran,
+///   and its error was lost.
+///
+/// A last read on either engine reports its own rest
+/// (`sqlserver::finish_script_conn_with_read`, `ScriptConn::finish_with_read`).
 impl From<(QueryResult, bool)> for Capped {
     fn from((result, truncated): (QueryResult, bool)) -> Self {
         Capped {
