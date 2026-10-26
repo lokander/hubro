@@ -516,6 +516,29 @@ fn enclosing_fn(toks: &[Tok], at: usize) -> Option<String> {
     best.map(|(_, name)| name)
 }
 
+/// Whether a call to `introspect` starts at token `at`, as a method
+/// (`pool.introspect()`) or by path (`DbPool::introspect(pool)`).
+fn calls_introspect(toks: &[Tok], at: usize) -> bool {
+    (is_punct(toks.get(at), ".") || is_punct(toks.get(at), "::"))
+        && is_ident(toks.get(at + 1), "introspect")
+        && is_punct(toks.get(at + 2), "(")
+}
+
+#[test]
+fn an_introspect_call_is_found_however_it_is_spelled() {
+    for (src, calls) in [
+        ("pool.introspect().await", true),
+        ("DbPool::introspect(&pool).await", true),
+        ("pool . introspect ( )", true),
+        ("introspect_table(&mut turn, &pool, name)", false),
+        ("fn introspect() {}", false),
+    ] {
+        let toks: Vec<Tok> = tokens(src).into_iter().map(|(t, _)| t).collect();
+        let found = (0..toks.len()).any(|at| calls_introspect(&toks, at));
+        assert_eq!(found, calls, "{src}");
+    }
+}
+
 #[test]
 fn tests_common_never_introspects_on_its_own() {
     // How a suite may introspect is the suite's business: SQL Server's must
@@ -528,9 +551,7 @@ fn tests_common_never_introspects_on_its_own() {
         let toks: Vec<Tok> = tokens(&src).into_iter().map(|(t, _)| t).collect();
         for at in 0..toks.len() {
             assert!(
-                !(is_punct(toks.get(at), ".")
-                    && is_ident(toks.get(at + 1), "introspect")
-                    && is_punct(toks.get(at + 2), "(")),
+                !calls_introspect(&toks, at),
                 "{} calls introspect() in {:?}: take the TableMeta, or an introspect \
                  closure, from the suite instead",
                 path.display(),
@@ -603,10 +624,7 @@ fn every_sqlserver_test_holds_its_catalog_turn_until_it_ends() {
                 "mssql_test_url is read outside session()"
             );
         }
-        if is_punct(toks.get(at), ".")
-            && is_ident(toks.get(at + 1), "introspect")
-            && is_punct(toks.get(at + 2), "(")
-        {
+        if calls_introspect(&toks, at) {
             assert!(
                 introspect_table.contains(&at),
                 "introspect() is called outside introspect_table"
