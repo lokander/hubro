@@ -16,8 +16,8 @@ const MAX_RENDERED_ROWS: usize = 500;
 /// statement made is undone without one (measured,
 /// `postgres::knows_whether_written`). A statement stopped where nothing it
 /// did could have lasted anyway (`RestOfRead::Stopped`) gets the plain line,
-/// and one still being read after the run (`RestOfRead::Unconfirmed`) says
-/// its outcome is not known.
+/// and one read after the run (`RestOfRead::Unconfirmed`) says its outcome
+/// is not known.
 fn truncation_notice(rest: RestOfRead) -> String {
     let notice = format!(
         "Result truncated — showing the first {MAX_QUERY_ROWS} rows to keep memory bounded. \
@@ -32,9 +32,9 @@ fn truncation_notice(rest: RestOfRead) -> String {
              settings or notifications it made are undone too."
         ),
         RestOfRead::Unconfirmed => format!(
-            "{notice} The rest is still being read after the run ended, and its outcome \
-             is not reported: if it fails, everything the statement did is undone, \
-             including any rows it wrote."
+            "{notice} The rest of this result was read after the run ended, and its \
+             outcome isn't reported. If the statement wrote anything and the rest failed, \
+             its writes were undone."
         ),
     }
 }
@@ -586,8 +586,17 @@ mod tests {
         // what a failure would cost.
         let unconfirmed = truncation_notice(RestOfRead::Unconfirmed);
         assert!(unconfirmed.starts_with(&ran));
-        assert!(unconfirmed.contains("its outcome is not reported"));
-        assert!(unconfirmed.contains("everything the statement did is undone"));
+        // Shown on every capped last read on these engines, plain reads
+        // included, and after the background read has finished: so it leads
+        // with the condition, speaks of the past, and claims only the writes
+        // a failure undoes (a call outside the transaction is not).
+        assert!(unconfirmed.ends_with(
+            "The rest of this result was read after the run ended, and its outcome isn't \
+             reported. If the statement wrote anything and the rest failed, its writes were \
+             undone."
+        ));
+        assert!(!unconfirmed.contains("still"));
+        assert!(!unconfirmed.contains("everything the statement did"));
     }
 
     /// Without a dialect the banner states no count at all, rather than one

@@ -831,7 +831,11 @@ async fn a_capped_read_failing_after_the_run_is_not_claimed_to_have_run() {
     assert_eq!(results, [(true, hubro::db::RestOfRead::Unconfirmed)]);
     // The background read meets the error and the statement is undone. Its
     // rows are uncommitted until then, so the count is read only once no
-    // session is running the statement any more.
+    // session is running the statement any more. That moment is the end of
+    // the rest: hubro closes the connection after the background read
+    // (`postgres::drain_then_close`), and a closed session leaves
+    // `pg_stat_activity`, so zero sessions means the statement has ended,
+    // committed or undone, and the count is final.
     let mut running = Value::Null;
     for _ in 0..300 {
         running = pool
