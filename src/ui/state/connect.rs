@@ -364,7 +364,12 @@ pub(super) fn keyring_sign_in_redeemable(
 /// the old one was remembered. A fresh sign-in is fresh consent, kept where
 /// its card's answer says whatever was signed out before it — including the
 /// connect's own forgetting of a refused token, which the browser sign-in
-/// that follows it exists to replace.
+/// that follows it exists to replace. So a browser sign-in begun before a
+/// "Sign out" click and finished after it is kept too, as the fresh consent
+/// it is. The click is rarely reachable then: once the connect's progress
+/// shows, a row whose connect came from the sign-in card offers no actions at
+/// all (only a connect started from the list offers Cancel), so only the
+/// moment before the progress appears leaves "Sign out" on screen.
 pub(super) fn kept_after_sign_in(redeemed_at: Option<u64>, now: u64) -> bool {
     redeemed_at.is_none_or(|began| began == now)
 }
