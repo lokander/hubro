@@ -281,9 +281,11 @@ fn continuation_quote(bytes: &[u8], from: usize) -> Option<usize> {
 /// T-SQL requires one after a `MERGE` (error 10713 without it). The server
 /// takes the kept `;` on every route a statement can go by — measured through
 /// `sp_executesql` (the MERGE test), a plain batch (`BEGIN TRAN;`) and a
-/// checked one (`SELECT … INTO #r;`) — and every consumer that reads the text
-/// is pinned to decide the same with or without it. The other dialects still
-/// drop it: none of their statements needs one.
+/// checked one (`SELECT … INTO #r;`) — and the decisions made from the text
+/// are unit-tested with and without it: the gate's charge, the route, the
+/// transaction-control match, whether a script is wrapped, and whether a final
+/// read may be cut off. The other dialects still drop it: none of their
+/// statements needs one.
 pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<String> {
     let bytes = sql.as_bytes();
     let mut statements = Vec::new();
@@ -5030,10 +5032,23 @@ mod tests {
                 "CREATE FULLTEXT INDEX ON t (a) KEY INDEX pk",
             ],
         ] {
-            assert!(
-                !wraps(Dialect::SqlServer, &stmts(&script)),
-                "{script:?} can't run in a transaction on SQL Server"
-            );
+            // Each statement keeps its `;` from the splitter on SQL Server,
+            // which must not change the decision.
+            let terminated: Vec<String> = script.iter().map(|s| format!("{s};")).collect();
+            for script in [stmts(&script), terminated] {
+                assert!(
+                    !wraps(Dialect::SqlServer, &script),
+                    "{script:?} can't run in a transaction on SQL Server"
+                );
+            }
+        }
+        // A script that holds its own transaction is not wrapped in hubro's,
+        // with or without the terminators the splitter keeps.
+        for script in [
+            stmts(&["BEGIN TRAN", "INSERT INTO t VALUES (1)", "COMMIT"]),
+            stmts(&["BEGIN TRAN;", "INSERT INTO t VALUES (1);", "COMMIT;"]),
+        ] {
+            assert!(!wraps(Dialect::SqlServer, &script), "{script:?}");
         }
         // The same statements don't decline wrapping for the wrong dialect
         // reasons on SQL Server: ordinary DDL/DML still wraps.
