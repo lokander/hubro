@@ -307,8 +307,9 @@ fn RunStatusLine(status: RunStatus, statement_count: usize, dialect: Option<Dial
                     Rollback::AlreadyEnded => format!(
                         "Script stopped after {elapsed_ms} ms, but its transaction had already \
                          ended: the script committed it, or the server rolled it back (the error \
-                         says which). Hubro rolled nothing back, so what ran before it ended — \
-                         part of the failing statement included — may stand.",
+                         says which). Hubro rolled nothing back, so what ran may stand: \
+                         everything before it ended, and the failing batch's statements after \
+                         it ended too, which ran outside any transaction.",
                     ),
                     // The claim this exists to stop hubro making:
                     // the rollback was real, but it did not reach the schema

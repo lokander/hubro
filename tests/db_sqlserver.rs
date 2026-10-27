@@ -2373,8 +2373,8 @@ async fn sqlserver_offers_no_plan_view_rather_than_a_dangerous_one() {
     // T-SQL has no `EXPLAIN` statement. Its estimated plan comes
     // from `SET SHOWPLAN_XML ON`, a session setting that must stand alone in
     // its batch and makes the *next* batch return a plan instead of running
-    // it. Hubro's script path runs each statement but transaction control as
-    // its own `sp_executesql`, where a `SET` does not outlive the statement,
+    // it. Hubro's script path runs each GO batch as one call, most through
+    // `sp_executesql`, where a `SET` does not outlive the batch,
     // and closes the run's connection when the run ends — so nothing it runs
     // can rely on the setting covering the statement after it. Getting that
     // wrong executes a statement the user asked only to have explained, so

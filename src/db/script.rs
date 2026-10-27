@@ -1269,10 +1269,12 @@ pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
 /// (`SELECT [o'brien] * INTO t2 FROM t`) must not invert string tracking
 /// and hide the `INTO`, and `SELECT [into]` must not over-prompt.
 pub fn needs_confirmation(sql: &str, dialect: Dialect) -> bool {
-    // Not folded over a SQL Server batch's statements, unlike
-    // [`statement_needs`]: it would change no answer. A batch led by anything
-    // but a read is confirmed, and one led by a read is scanned whole for an
-    // embedded write, which finds one in any statement of it.
+    // A SQL Server batch, when any of its statements does — as each was
+    // confirmed when split at `;`. Unfolded, a batch led by a read is only
+    // scanned for embedded writes, and `SELECT 1; COMMIT` went unconfirmed.
+    if let Some(statements) = batch_statements(sql, dialect) {
+        return statements.iter().any(|s| needs_confirmation(s, dialect));
+    }
     confirmation_needed(sql, &strip_strings_and_comments(sql, dialect), dialect)
 }
 
@@ -1692,7 +1694,9 @@ fn rows_outcomes(dialect: Dialect, capped: Capped) -> Vec<(StatementOutcome, boo
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rollback {
     /// Nothing was undone. The sequential autocommit path, or a failure
-    /// before the transaction opened — statements before the failure stand.
+    /// before the transaction opened — what ran stands: the statements before
+    /// the failing one, and on SQL Server any after the error in the same
+    /// batch, which the server runs on past most errors.
     None,
     /// The atomic path found hubro's transaction already over when it went
     /// to roll back ([`RolledBack::Nothing`]): a statement committed it (a
@@ -2674,8 +2678,9 @@ fn tsql_statement_route(sql: &str, held_for_run: bool) -> TsqlRoute {
 /// ([`RowsAffected::Unreported`]) says so rather than stating a wrong one.
 ///
 /// One `SET` is let through where it cannot be a session option: an
-/// `UPDATE`'s own clause — the grammar has exactly one — and a variable's
-/// assignment (`SET @x = …`), which lasts the batch. A second `SET` is
+/// `UPDATE`'s own clause — its grammar has exactly one, except `UPDATE
+/// STATISTICS`, which has none — and a variable's assignment (`SET @x = …`),
+/// which lasts the batch. A second `SET` is
 /// another statement written without a `;` (`UPDATE t SET a = 1 SET NOEXEC
 /// ON`), and anything else holding one is turned away. A false "no" costs
 /// only the temp table's life past its batch; what guards hubro's
@@ -2698,13 +2703,25 @@ fn plain_batch_safe(sql: &str) -> bool {
         .count();
     match sets {
         0 => true,
-        1 => match leading_words(&stripped, 1).first().map(String::as_str) {
-            Some("update") => true,
-            Some("set") => stripped.trim_start()["set".len()..]
-                .trim_start()
-                .starts_with('@'),
-            _ => false,
-        },
+        1 => {
+            let words = leading_words(&stripped, 2);
+            match words.first().map(String::as_str) {
+                // `UPDATE STATISTICS` has no SET clause of its own: measured,
+                // `UPDATE STATISTICS #t SET NOCOUNT ON` is two statements,
+                // and the option outlived the batch.
+                Some("update") => words.get(1).map(String::as_str) != Some("statistics"),
+                // Only `SET` leading the text, and `@` straight after it:
+                // anything before the word (which `leading_words` skips) is
+                // not a variable's assignment.
+                Some("set") => {
+                    let lead = stripped.trim_start();
+                    lead.get(.."set".len())
+                        .is_some_and(|word| word.eq_ignore_ascii_case("set"))
+                        && lead["set".len()..].trim_start().starts_with('@')
+                }
+                _ => false,
+            }
+        }
         _ => false,
     }
 }
@@ -3811,6 +3828,10 @@ mod tests {
         assert_eq!(needs("SELECT 1; SELECT 2"), StatementNeeds::default());
         assert!(needs_confirmation("SELECT 1; UPDATE t SET a = 1", ms));
         assert!(!needs_confirmation("SELECT 1; SELECT 2", ms));
+        // Confirmed as when each statement was its own: a read leading the
+        // batch does not excuse what follows it.
+        assert!(needs_confirmation("SELECT 1; COMMIT", ms));
+        assert!(needs_confirmation("SELECT 1; SET NOCOUNT ON", ms));
 
         // A batch is read when any statement returns rows: a variable declared
         // then read is a read.
@@ -3874,6 +3895,16 @@ mod tests {
                 (Rpc, Rpc),
             ),
             ("CREATE TABLE #t (a int); SET XACT_ABORT ON", (Rpc, Rpc)),
+            // `UPDATE STATISTICS` has no SET of its own: this one is a
+            // session option.
+            (
+                "CREATE TABLE #t (a int); UPDATE STATISTICS #t SET NOCOUNT ON",
+                (Rpc, Rpc),
+            ),
+            // Anything before a leading SET is not an assignment — and is
+            // no reason to panic on a byte offset.
+            ("CREATE TABLE #t (a int); «»SET @x = 1", (Rpc, Rpc)),
+            ("CREATE TABLE #t (a int); 😀SET @x = 1", (Rpc, Rpc)),
             (
                 "CREATE TABLE #t (a int); ALTER TABLE #t ADD CONSTRAINT c DEFAULT 0 FOR a",
                 (CheckedBatch, Rpc),
