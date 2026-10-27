@@ -1581,6 +1581,19 @@ async fn sqlserver_a_batch_claims_no_more_than_one_call_can_vouch_for() {
         .await,
         ["no count".to_string()]
     );
+    // The same with no `;`: one piece to the splitter, three statements to
+    // the server.
+    fresh().await;
+    assert_eq!(
+        mssql_script_outcomes(
+            &pool,
+            "INSERT INTO dbo.batch_claim_probe VALUES (1), (2), (3) \
+             SET NOCOUNT ON \
+             INSERT INTO dbo.batch_claim_probe VALUES (4)"
+        )
+        .await,
+        ["no count".to_string()]
+    );
     fresh().await;
     assert_eq!(
         mssql_script_outcomes(
@@ -4110,7 +4123,8 @@ async fn sqlserver_script_temp_tables_last_the_run() {
         (
             "CREATE TABLE #n (a int) SET NOCOUNT ON\nGO\n\
              DECLARE @v TABLE (a int) INSERT INTO @v VALUES (1), (2)",
-            vec![affected(0), affected(2)],
+            // Text that touches NOCOUNT states no count of its own.
+            vec![none(), affected(2)],
         ),
         // Transaction control beside a creator: the script holds its own
         // transaction, so it is never wrapped in hubro's, and this COMMIT has

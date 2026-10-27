@@ -1110,17 +1110,19 @@ enum BatchCounts {
     /// A batch of several: their counts are only ever a total
     /// ([`RowsAffected::Summed`]) — one count alone is not the batch's.
     Several,
-    /// A batch of several that turns `NOCOUNT` on or off: some statements
-    /// may have sent no count, so not even a total is known.
-    SeveralUnderNocount,
+    /// Text that turns `NOCOUNT` on or off: some statements may have sent no
+    /// count, so not even a total is known. Whatever the split says — `INSERT
+    /// … SET NOCOUNT ON INSERT …` with no `;` is one piece and three
+    /// statements.
+    UnderNocount,
 }
 
 impl BatchCounts {
     fn of(sql: &str) -> Self {
-        if split_tsql_statements(sql).len() < 2 {
+        if sql.to_ascii_lowercase().contains("nocount") {
+            BatchCounts::UnderNocount
+        } else if split_tsql_statements(sql).len() < 2 {
             BatchCounts::One
-        } else if sql.to_ascii_lowercase().contains("nocount") {
-            BatchCounts::SeveralUnderNocount
         } else {
             BatchCounts::Several
         }
@@ -1172,8 +1174,8 @@ fn script_rows_affected(counts: &[u64], batch: BatchCounts) -> RowsAffected {
         }
         // Statements under it send no count, so even a sum is short.
         // Measured in review: `INSERT` of 5 rows, `SET NOCOUNT ON`, `INSERT`
-        // of 2 came back as one count, 5.
-        BatchCounts::SeveralUnderNocount => return RowsAffected::Unreported,
+        // of 2 came back as one count, 5 — with or without a `;` between.
+        BatchCounts::UnderNocount => return RowsAffected::Unreported,
         BatchCounts::One => {}
     }
     match counts {
