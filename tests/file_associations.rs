@@ -75,9 +75,9 @@ fn plist_without_comments() -> String {
 ///
 /// A short scanner instead of a plist parser: the file is checked in, its
 /// shape is known, and the alternative is a dependency in the shipped tree for
-/// one test. (A parser is not merely unnecessary here but unavailable —
-/// `--package-types` in the header comment makes the file malformed XML, which
-/// strict parsers reject and macOS accepts.)
+/// one test. (release.yml's `verify` job, which has Python's `plistlib` to
+/// hand, parses the file properly, and so also fails a release whose plist is
+/// not well-formed.)
 ///
 /// Two things this deliberately does *not* do, both of which let a stale
 /// version pass as current: read comments (a `<string>` inside the header
@@ -503,6 +503,73 @@ fn the_info_plist_records_the_dx_version_it_was_mirrored_from() {
          release.yml bundles with {pinned} — they disagree, so the mirror was \
          not re-derived when dx moved"
     );
+}
+
+/// Every way the XML comments in `source` make it malformed, one line each:
+/// a comment that is never closed, one whose body holds a double hyphen, and
+/// one whose body ends in a hyphen (`--->`). The XML spec forbids all three,
+/// and they are the only part of well-formedness these files are at risk of
+/// losing — their markup is short and fixed, their comments are long prose
+/// that quotes command lines.
+fn xml_comment_problems(source: &str) -> Vec<String> {
+    let line_of = |offset: usize| source[..offset].matches('\n').count() + 1;
+    let mut problems = Vec::new();
+    let mut from = 0;
+    while let Some(open) = source[from..].find("<!--") {
+        let start = from + open + "<!--".len();
+        let Some(len) = source[start..].find("-->") else {
+            problems.push(format!("line {}: comment is never closed", line_of(start)));
+            break;
+        };
+        let body = &source[start..start + len];
+        if let Some(at) = body.find("--") {
+            problems.push(format!(
+                "line {}: comment contains a double hyphen",
+                line_of(start + at)
+            ));
+        }
+        if body.ends_with('-') {
+            problems.push(format!(
+                "line {}: comment ends in a hyphen",
+                line_of(start + len)
+            ));
+        }
+        from = start + len + "-->".len();
+    }
+    problems
+}
+
+#[test]
+fn the_xml_packaging_files_have_no_comment_a_strict_parser_rejects() {
+    // dx copies Info.plist into the bundle verbatim, and every macOS release
+    // up to 0.8.0 shipped one that was malformed XML: its header comment
+    // quoted a command-line flag, and a double hyphen is illegal inside a
+    // comment. macOS's own plist reader tolerates that; `plutil`, Python's
+    // `plistlib` and xmllint do not, and the code-signing and notarization
+    // steps a signed release would add are the likeliest to be strict. The
+    // WiX fragment is held to the same rule because the MSI toolchain
+    // parses it as XML too.
+    for (path, source) in [
+        ("packaging/macos/Info.plist", INFO_PLIST),
+        ("packaging/windows/file-associations.wxs", WIX_FRAGMENT),
+    ] {
+        let problems = xml_comment_problems(source);
+        assert!(
+            problems.is_empty(),
+            "{path} is not well-formed XML:\n  {}\nReword the comment; quote a \
+             flag by name rather than with its dashes",
+            problems.join("\n  ")
+        );
+    }
+
+    // The check has to be able to fire, or a green run says nothing.
+    assert_eq!(
+        xml_comment_problems("<!-- `dx bundle --package-types macos` -->").len(),
+        1
+    );
+    assert_eq!(xml_comment_problems("<!-- trailing --->").len(), 1);
+    assert_eq!(xml_comment_problems("<a/><!-- never closed").len(), 1);
+    assert!(xml_comment_problems("<!-- a - b --><!-- c -->").is_empty());
 }
 
 #[test]
