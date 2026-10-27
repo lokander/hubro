@@ -278,9 +278,12 @@ fn continuation_quote(bytes: &[u8], from: usize) -> Option<usize> {
 /// [`BodyTracker`] for what counts as a body on each dialect.
 ///
 /// On SQL Server a statement keeps the `;` it was split on, and only there:
-/// T-SQL requires one after a `MERGE` (error 10713 without it), and the text
-/// the user wrote, terminator included, is what SSMS sends. The other
-/// dialects still drop it: none of their statements needs one.
+/// T-SQL requires one after a `MERGE` (error 10713 without it). The server
+/// takes the kept `;` on every route a statement can go by — measured through
+/// `sp_executesql` (the MERGE test), a plain batch (`BEGIN TRAN;`) and a
+/// checked one (`SELECT … INTO #r;`) — and every consumer that reads the text
+/// is pinned to decide the same with or without it. The other dialects still
+/// drop it: none of their statements needs one.
 pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<String> {
     let bytes = sql.as_bytes();
     let mut statements = Vec::new();
@@ -5134,7 +5137,11 @@ mod tests {
             "ROLLBACK TRANSACTION",
             "/* lead */ ROLLBACK TRAN -- done",
         ] {
-            assert!(tsql_is_transaction_control(sql), "{sql:?}");
+            // A SQL Server statement keeps its `;` from the splitter, so each
+            // case must route the same with one.
+            for sql in [sql.to_string(), format!("{sql};")] {
+                assert!(tsql_is_transaction_control(&sql), "{sql:?}");
+            }
         }
         for sql in [
             // A name slot holding a statement: measured, a SET inside EXEC()
@@ -5152,7 +5159,9 @@ mod tests {
             "-- BEGIN TRAN\nSELECT 1",
             "INSERT INTO t VALUES (1)",
         ] {
-            assert!(!tsql_is_transaction_control(sql), "{sql:?}");
+            for sql in [sql.to_string(), format!("{sql};")] {
+                assert!(!tsql_is_transaction_control(&sql), "{sql:?}");
+            }
         }
     }
 
@@ -5230,22 +5239,34 @@ mod tests {
 
     #[test]
     fn a_temp_table_is_created_by_a_plain_batch_only_on_a_runs_own_connection() {
-        let creates = "CREATE TABLE #t (a int)";
-        // A checked batch, and only on a run's own connection.
-        assert_eq!(tsql_route(creates, true), TsqlRoute::CheckedBatch);
-        assert_eq!(tsql_route(creates, false), TsqlRoute::Rpc);
+        // Every case runs again with the `;` a SQL Server statement keeps from
+        // the splitter: a terminator must never change a route.
+        let terminated = |sql: &str| [sql.to_string(), format!("{sql};")];
+        for creates in terminated("CREATE TABLE #t (a int)") {
+            // A checked batch, and only on a run's own connection.
+            assert_eq!(
+                tsql_route(&creates, true),
+                TsqlRoute::CheckedBatch,
+                "{creates:?}"
+            );
+            assert_eq!(tsql_route(&creates, false), TsqlRoute::Rpc, "{creates:?}");
+        }
         // What must be a plain batch is one wherever it runs.
         for sql in ["CREATE VIEW v AS SELECT 1 AS a", "BEGIN TRAN", "COMMIT"] {
-            assert_eq!(tsql_route(sql, true), TsqlRoute::Batch, "{sql:?}");
-            assert_eq!(tsql_route(sql, false), TsqlRoute::Batch, "{sql:?}");
+            for sql in terminated(sql) {
+                assert_eq!(tsql_route(&sql, true), TsqlRoute::Batch, "{sql:?}");
+                assert_eq!(tsql_route(&sql, false), TsqlRoute::Batch, "{sql:?}");
+            }
         }
         for sql in [
             "INSERT INTO #t VALUES (1)",
             "SELECT * FROM #t",
             "SET NOCOUNT ON",
         ] {
-            assert_eq!(tsql_route(sql, true), TsqlRoute::Rpc, "{sql:?}");
-            assert_eq!(tsql_route(sql, false), TsqlRoute::Rpc, "{sql:?}");
+            for sql in terminated(sql) {
+                assert_eq!(tsql_route(&sql, true), TsqlRoute::Rpc, "{sql:?}");
+                assert_eq!(tsql_route(&sql, false), TsqlRoute::Rpc, "{sql:?}");
+            }
         }
     }
 
@@ -5329,7 +5350,14 @@ mod tests {
     #[test]
     fn only_a_read_that_cannot_touch_the_transaction_or_write_may_be_cut_off() {
         let pg = |sql| final_read_may_close(sql, Dialect::Postgres);
-        let ms = |sql| final_read_may_close(sql, Dialect::SqlServer);
+        // A SQL Server statement keeps its `;` from the splitter, so each case
+        // there must decide the same with one.
+        let ms = |sql: &str| {
+            let plain = final_read_may_close(sql, Dialect::SqlServer);
+            let terminated = final_read_may_close(&format!("{sql};"), Dialect::SqlServer);
+            assert_eq!(plain, terminated, "{sql:?} with and without its `;`");
+            plain
+        };
         for sql in [
             "SELECT * FROM big",
             "with t as (select 1) select * from t",
