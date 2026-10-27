@@ -1039,7 +1039,7 @@ async fn run_statement(
 
 /// What a script statement's counts say about the rows it affected — unlike
 /// [`statement_rows`], which takes the last count as the statement's own.
-/// A script statement is the text between two separators (`;` or `GO`), and
+/// A script statement is the text up to a separator (its own `;`, or a `GO`), and
 /// that can be several T-SQL statements — an `EXEC`, a `BEGIN … END`, an
 /// `IF`, statements written without semicolons — whose counts arrive as the
 /// same `DONEINPROC` token as their triggers'. tiberius 0.13 keeps the token
