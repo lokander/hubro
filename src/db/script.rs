@@ -260,13 +260,57 @@ fn continuation_quote(bytes: &[u8], from: usize) -> Option<usize> {
     }
 }
 
-/// Splits a script into individual statements on `;`, respecting quoted
-/// strings and identifiers, comments, and dollar quotes, each by the
-/// dialect's own rules — see [`region_at`]. A trailing statement without a semicolon is
-/// kept; statements that are empty (only whitespace and/or comments) are
-/// skipped.
+/// Splits a script into the units a run sends: on SQL Server its GO batches,
+/// elsewhere its statements, split on `;` ([`split_into`] says how).
 ///
-/// On SQL Server, `GO` also separates statements. `GO` is a client-side
+/// **A SQL Server batch is sent whole**, as SSMS and sqlcmd send it: a
+/// variable lives exactly as long as the batch that declares it, so
+/// `DECLARE @x int = 1; INSERT INTO t VALUES (@x)` split at its `;` failed
+/// the `INSERT` with error 137 (measured), and runs as one batch. What hubro
+/// decides from a unit's text — what the gate charges, whether the script is
+/// wrapped, how a batch is sent — it decides over the batch's statements
+/// ([`split_tsql_statements`]), each as it decided before.
+pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<String> {
+    split_into(sql, dialect, dialect != Dialect::SqlServer)
+}
+
+/// A SQL Server batch's statements, split on `;` as well as `GO` — what each
+/// per-statement decision over a batch is folded from (see
+/// [`split_statements`]). A single statement splits into itself.
+pub fn split_tsql_statements(sql: &str) -> Vec<String> {
+    split_into(sql, Dialect::SqlServer, true)
+}
+
+/// A SQL Server batch's statements when it holds more than one, for a
+/// decision to fold over; `None` for one statement, and on every other
+/// dialect, whose units are single statements already.
+fn batch_statements(sql: &str, dialect: Dialect) -> Option<Vec<String>> {
+    if dialect != Dialect::SqlServer {
+        return None;
+    }
+    let statements = split_tsql_statements(sql);
+    (statements.len() > 1).then_some(statements)
+}
+
+/// Whether a unit returns rows — a SQL Server batch when any of its
+/// statements does, so a batch that declares a variable and then reads it is
+/// read, not run for its counts.
+fn returns_rows(sql: &str, dialect: Dialect) -> bool {
+    match batch_statements(sql, dialect) {
+        Some(statements) => statements
+            .iter()
+            .any(|s| classify_statement(s, dialect).returns_rows()),
+        None => classify_statement(sql, dialect).returns_rows(),
+    }
+}
+
+/// Splits a script on `GO` (SQL Server) and, when `semicolons`, on `;`,
+/// respecting quoted strings and identifiers, comments, and dollar quotes,
+/// each by the dialect's own rules — see [`region_at`]. A trailing statement
+/// without a semicolon is kept; statements that are empty (only whitespace
+/// and/or comments) are skipped.
+///
+/// On SQL Server, `GO` separates batches. `GO` is a client-side
 /// batch separator (SSMS/sqlcmd), not T-SQL: it only counts when it stands
 /// alone on its own line (leading whitespace allowed), optionally followed
 /// by a repeat count — `GO 5` is treated as a plain separator with the
@@ -286,7 +330,7 @@ fn continuation_quote(bytes: &[u8], from: usize) -> Option<usize> {
 /// transaction-control match, whether a script is wrapped, and whether a final
 /// read may be cut off. The other dialects still drop it: none of their
 /// statements needs one.
-pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<String> {
+fn split_into(sql: &str, dialect: Dialect, semicolons: bool) -> Vec<String> {
     let bytes = sql.as_bytes();
     let mut statements = Vec::new();
     let mut body = BodyTracker::new(dialect);
@@ -363,7 +407,7 @@ pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<String> {
                     }
                     match bytes[i] {
                         b';' => {
-                            if body.feed(BodyToken::Semicolon) {
+                            if body.feed(BodyToken::Semicolon) && semicolons {
                                 if significant {
                                     // SQL Server keeps the `;` it was split
                                     // on: T-SQL requires one after a MERGE.
@@ -1124,6 +1168,16 @@ pub struct StatementNeeds {
 /// instead. **On SQL Server it is still the only line** — T-SQL has no
 /// read-only mode to fall back on.
 pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
+    // A SQL Server batch needs what any of its statements does.
+    if let Some(statements) = batch_statements(sql, dialect) {
+        return statements.iter().map(|s| statement_needs(s, dialect)).fold(
+            StatementNeeds::default(),
+            |a, b| StatementNeeds {
+                mutate: a.mutate || b.mutate,
+                ddl: a.ddl || b.ddl,
+            },
+        );
+    }
     // Stripped once here; every scan below works on the stripped form.
     // Each helper used to re-strip the same statement, up to ~6
     // times per capability check.
@@ -1215,6 +1269,10 @@ pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
 /// (`SELECT [o'brien] * INTO t2 FROM t`) must not invert string tracking
 /// and hide the `INTO`, and `SELECT [into]` must not over-prompt.
 pub fn needs_confirmation(sql: &str, dialect: Dialect) -> bool {
+    // A SQL Server batch, when any of its statements does.
+    if let Some(statements) = batch_statements(sql, dialect) {
+        return statements.iter().any(|s| needs_confirmation(s, dialect));
+    }
     confirmation_needed(sql, &strip_strings_and_comments(sql, dialect), dialect)
 }
 
@@ -2096,8 +2154,11 @@ fn step(ends_with_final_read: bool, reads: bool, is_last: bool) -> Step {
 
 /// The statement loop every script run goes through: each statement in
 /// order through `exec`, reporting each outcome to `on_result`, **stopping
-/// at the first failure** — nothing after a failed statement runs, in any
+/// at the first failure** — no statement after a failed one is sent, in any
 /// mode — and then letting go of the hold, told whether a statement failed.
+/// A SQL Server unit is a whole batch, though, and the server decides what
+/// runs inside one: it carries on past most errors, so statements after the
+/// error in the same batch may have run.
 /// Returns the failure (its index and error) and how letting go went.
 ///
 /// Reads stream through the row cap so a huge result never buffers in full;
@@ -2114,7 +2175,7 @@ async fn run_statements<E: StatementExecutor>(
     let mut ended = None;
     let mut failure = None;
     for (statement_index, statement) in statements.iter().enumerate() {
-        let reads = classify_statement(statement, dialect).returns_rows();
+        let reads = returns_rows(statement, dialect);
         let cap = cell_cap(statement, dialect);
         let outcome = match step(E::ENDS_WITH_FINAL_READ, reads, statement_index == last) {
             Step::FinishWithRead => {
@@ -2380,6 +2441,19 @@ fn atomic_rollback(
 /// the offending statement. A non-transactional backend falls back to the
 /// sequential autocommit path rather than failing.
 pub fn wrap_atomically(caps: Capabilities, dialect: Dialect, statements: &[String]) -> bool {
+    // Over the statements a SQL Server batch holds, not the batches: one
+    // batch of two INSERTs is two statements that commit apart unless
+    // wrapped, and a batch's BEGIN TRAN is the script's own transaction.
+    let flattened: Vec<String>;
+    let statements = if dialect == Dialect::SqlServer {
+        flattened = statements
+            .iter()
+            .flat_map(|s| split_tsql_statements(s))
+            .collect();
+        &flattened[..]
+    } else {
+        statements
+    };
     caps.transactions
         && statements.len() > 1
         && !statements.iter().any(|s| {
@@ -2555,12 +2629,83 @@ pub(crate) enum TsqlRoute {
 /// `ALTER TABLE`, `CREATE INDEX`). Never on a pooled connection: the table
 /// would outlive the statement there and reach whoever borrows it next.
 pub(crate) fn tsql_route(sql: &str, held_for_run: bool) -> TsqlRoute {
+    let Some(statements) = batch_statements(sql, Dialect::SqlServer) else {
+        return tsql_statement_route(sql, held_for_run);
+    };
+    // A batch of several statements: a plain batch if any one needs it —
+    // bare transaction control is the script's own transaction, which a
+    // script holding never runs inside hubro's ([`wrap_atomically`] sees the
+    // same statement), and a module refuses `sp_executesql`.
+    if statements
+        .iter()
+        .any(|s| tsql_leads_own_batch(s) || tsql_is_transaction_control(s))
+    {
+        return TsqlRoute::Batch;
+    }
+    // A checked plain batch when a statement creates a temp table, so the
+    // table outlasts the batch as it outlasts the statement alone — and only
+    // while nothing else in the batch would carry past it
+    // ([`plain_batch_safe`]).
+    if held_for_run
+        && statements.iter().any(|s| tsql_creates_temp_table(s))
+        && statements.iter().all(|s| plain_batch_safe(s))
+    {
+        return TsqlRoute::CheckedBatch;
+    }
+    TsqlRoute::Rpc
+}
+
+/// [`tsql_route`] for one statement.
+fn tsql_statement_route(sql: &str, held_for_run: bool) -> TsqlRoute {
     if tsql_leads_own_batch(sql) || tsql_is_transaction_control(sql) {
         TsqlRoute::Batch
     } else if held_for_run && tsql_creates_temp_table(sql) {
         TsqlRoute::CheckedBatch
     } else {
         TsqlRoute::Rpc
+    }
+}
+
+/// Whether a statement may share a checked plain batch with a temp table's
+/// creator: nothing in it outlasts the batch or reaches the transaction —
+/// the `SET`, transaction and opaque words [`tsql_creates_temp_table`] turns
+/// a creator away for. Unlike there, a write may: a batch is reported as a
+/// whole, and a plain batch reporting no count
+/// ([`RowsAffected::Unreported`]) says so rather than stating a wrong one.
+///
+/// One `SET` is let through where it cannot be a session option: an
+/// `UPDATE`'s own clause — the grammar has exactly one — and a variable's
+/// assignment (`SET @x = …`), which lasts the batch. A second `SET` is
+/// another statement written without a `;` (`UPDATE t SET a = 1 SET NOEXEC
+/// ON`), and anything else holding one is turned away. A false "no" costs
+/// only the temp table's life past its batch; what guards hubro's
+/// transaction is the check after the batch ([`TsqlRoute::CheckedBatch`]).
+fn plain_batch_safe(sql: &str) -> bool {
+    let stripped = strip_strings_and_comments(sql, Dialect::SqlServer);
+    if has_opaque_word(Dialect::SqlServer, &stripped)
+        || has_word(&stripped, |word| {
+            matches!(
+                word.to_ascii_lowercase().as_str(),
+                "commit" | "rollback" | "tran" | "transaction"
+            )
+        })
+    {
+        return false;
+    }
+    let sets = stripped
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|word| word.eq_ignore_ascii_case("set"))
+        .count();
+    match sets {
+        0 => true,
+        1 => match leading_words(&stripped, 1).first().map(String::as_str) {
+            Some("update") => true,
+            Some("set") => stripped.trim_start()["set".len()..]
+                .trim_start()
+                .starts_with('@'),
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -3009,11 +3154,13 @@ mod tests {
             );
         }
         for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
+            let sql = "BEGIN TRANSACTION; UPDATE t SET a = 1; COMMIT; SELECT 2";
             assert_eq!(
-                split_statements(
-                    "BEGIN TRANSACTION; UPDATE t SET a = 1; COMMIT; SELECT 2",
-                    dialect
-                ),
+                // SQL Server's statements: its units are whole batches.
+                match dialect {
+                    Dialect::SqlServer => split_mssql(sql),
+                    _ => split_statements(sql, dialect),
+                },
                 // SQL Server keeps the terminator it split on.
                 {
                     let end = if dialect == Dialect::SqlServer {
@@ -3053,7 +3200,12 @@ mod tests {
         // nothing open.
         for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
             assert_eq!(
-                split_statements("SELECT CASE WHEN a THEN 1 END FROM t; SELECT 2", dialect),
+                match dialect {
+                    Dialect::SqlServer =>
+                        split_mssql("SELECT CASE WHEN a THEN 1 END FROM t; SELECT 2"),
+                    _ =>
+                        split_statements("SELECT CASE WHEN a THEN 1 END FROM t; SELECT 2", dialect),
+                },
                 [
                     if dialect == Dialect::SqlServer {
                         "SELECT CASE WHEN a THEN 1 END FROM t;"
@@ -3611,10 +3763,13 @@ mod tests {
         // spins forever on one and SQL Server runs straight past it.
         for dialect in [Lite, Pg, Ms] {
             let statements = split_statements("SELECT 1;\0DELETE FROM t", dialect);
+            // SQL Server sends the script as one batch, so the batch is
+            // refused; elsewhere, the second statement.
+            let at = if dialect == Ms { 0 } else { 1 };
             for (name, caps) in caps_sets {
                 assert_eq!(
                     script_refusal(caps, &statements, dialect),
-                    Some((1, NUL_IN_SCRIPT)),
+                    Some((at, NUL_IN_SCRIPT)),
                     "{dialect:?} under {name}"
                 );
             }
@@ -3646,8 +3801,125 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_sql_server_batch_is_decided_over_its_statements() {
+        let ms = Dialect::SqlServer;
+        let needs = |sql| statement_needs(sql, ms);
+        // The gate charges a batch for any of its statements.
+        assert!(needs("SELECT 1; DELETE FROM t").mutate);
+        assert!(needs("SELECT 1; DROP TABLE t").ddl);
+        assert_eq!(needs("SELECT 1; SELECT 2"), StatementNeeds::default());
+        assert!(needs_confirmation("SELECT 1; UPDATE t SET a = 1", ms));
+        assert!(!needs_confirmation("SELECT 1; SELECT 2", ms));
+
+        // A batch is read when any statement returns rows: a variable declared
+        // then read is a read.
+        assert!(returns_rows("DECLARE @x int = 1; SELECT @x", ms));
+        assert!(!returns_rows(
+            "DECLARE @x int = 1; INSERT INTO t VALUES (@x)",
+            ms
+        ));
+
+        // Wrapping counts statements, not batches.
+        let wraps = |batches: &[&str]| {
+            wrap_atomically(
+                Capabilities::FULL,
+                ms,
+                &batches.iter().map(|b| b.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        assert!(wraps(&[
+            "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)"
+        ]));
+        assert!(!wraps(&["INSERT INTO t VALUES (1)"]));
+        assert!(!wraps(&["BEGIN TRAN; INSERT INTO t VALUES (1); COMMIT"]));
+        assert!(!wraps(&[
+            "INSERT INTO t VALUES (1); BACKUP DATABASE db TO DISK = 'x'"
+        ]));
+
+        // How a batch is sent: a plain batch when any statement needs one, a
+        // checked one for a temp table among plain-batch-safe statements —
+        // writes included — on a run's own connection, `sp_executesql`
+        // otherwise.
+        let routes = |sql: &str| (tsql_route(sql, true), tsql_route(sql, false));
+        use TsqlRoute::{Batch, CheckedBatch, Rpc};
+        for (sql, want) in [
+            ("BEGIN TRAN; INSERT INTO t VALUES (1)", (Batch, Batch)),
+            ("INSERT INTO t VALUES (1); COMMIT", (Batch, Batch)),
+            (
+                "CREATE TABLE #t (a int); INSERT INTO #t VALUES (1)",
+                (CheckedBatch, Rpc),
+            ),
+            (
+                "SELECT 1 AS a INTO #s; UPDATE #s SET a = 2; SELECT a FROM #s",
+                (CheckedBatch, Rpc),
+            ),
+            ("CREATE TABLE #t (a int); SET NOCOUNT ON", (Rpc, Rpc)),
+            // An UPDATE's own SET, and a variable's, carry nothing past the
+            // batch; a second SET is a session option hiding behind one.
+            (
+                "CREATE TABLE #t (a int); UPDATE #t SET a = 1",
+                (CheckedBatch, Rpc),
+            ),
+            (
+                "DECLARE @x int; SET @x = 1; CREATE TABLE #t (a int)",
+                (CheckedBatch, Rpc),
+            ),
+            (
+                "CREATE TABLE #t (a int); UPDATE #t SET a = 1 SET NOEXEC ON",
+                (Rpc, Rpc),
+            ),
+            (
+                "CREATE TABLE #t (a int); SET @x = 1 SET NOEXEC ON",
+                (Rpc, Rpc),
+            ),
+            ("CREATE TABLE #t (a int); SET XACT_ABORT ON", (Rpc, Rpc)),
+            (
+                "CREATE TABLE #t (a int); ALTER TABLE #t ADD CONSTRAINT c DEFAULT 0 FOR a",
+                (CheckedBatch, Rpc),
+            ),
+            ("CREATE TABLE #t (a int); EXEC p", (Rpc, Rpc)),
+            ("CREATE TABLE #t (a int); SAVE TRANSACTION s", (Rpc, Rpc)),
+            (
+                "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)",
+                (Rpc, Rpc),
+            ),
+            ("DECLARE @x int = 1; SELECT @x", (Rpc, Rpc)),
+        ] {
+            assert_eq!(routes(sql), want, "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn a_sql_server_script_is_sent_as_its_go_batches() {
+        let ms = |sql| split_statements(sql, Dialect::SqlServer);
+        // A batch is everything between GO lines, `;`s and all — what SSMS
+        // sends, and what keeps a DECLAREd variable in scope.
+        assert_eq!(
+            ms("DECLARE @x int = 1;\nINSERT INTO t VALUES (@x);\nGO\nSELECT 2;\nSELECT 3"),
+            [
+                "DECLARE @x int = 1;\nINSERT INTO t VALUES (@x);",
+                "SELECT 2;\nSELECT 3"
+            ]
+        );
+        // A GO only counts alone on its line, as before.
+        assert_eq!(
+            ms("SELECT 'GO'; SELECT 1 -- GO"),
+            ["SELECT 'GO'; SELECT 1 -- GO"]
+        );
+        // Empty batches leave nothing behind.
+        assert_eq!(ms("GO\n;\nGO\nSELECT 1\nGO"), ["SELECT 1"]);
+        // Every other dialect still splits on `;`.
+        assert_eq!(
+            split_statements("SELECT 1; SELECT 2", Dialect::Postgres),
+            ["SELECT 1", "SELECT 2"]
+        );
+    }
+
+    /// A SQL Server script's statements, `;` and `GO` both splitting — the
+    /// split every per-statement decision over a batch folds from.
     fn split_mssql(sql: &str) -> Vec<String> {
-        split_statements(sql, Dialect::SqlServer)
+        split_tsql_statements(sql)
     }
 
     #[test]

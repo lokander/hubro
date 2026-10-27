@@ -2061,6 +2061,32 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_checked_batch_that_turns_noexec_on_is_refused_by_its_own_check() {
+        // A checked batch's words keep `SET` out of it; this is what stands
+        // behind them if one got in. Under `NOEXEC ON` the check's own query
+        // compiles and does not run, so it answers nothing — and an unknown
+        // state is a change, never a vouch.
+        let Some(pool) = test_pool() else { return };
+        let mut conn = pool.acquire().await.unwrap();
+        let out = conn
+            .request(async |c| {
+                run_batch(c, "BEGIN TRAN").await?;
+                checked_batch(c, TsqlRoute::CheckedBatch, async |c| {
+                    run_batch(c, "SET NOEXEC ON").await
+                })
+                .await
+            })
+            .await;
+        let checked = settle(&mut conn, out).unwrap();
+        assert!(
+            matches!(checked, Err(TransactionChanged { after: None, .. })),
+            "{checked:?}"
+        );
+        conn.discard();
+        pool.close().await;
+    }
+
     #[test]
     fn tunneled_config_keeps_the_logical_host_for_tls() {
         // A tunneled connect parses the rewritten URL (dialing
