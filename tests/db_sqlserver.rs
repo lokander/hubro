@@ -1456,6 +1456,48 @@ async fn sqlserver_script_merge_keeps_its_required_terminator() {
 }
 
 #[tokio::test]
+async fn sqlserver_script_reports_every_result_set_of_a_statement() {
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    // A statement with two result sets and no `;` between them, then a plain
+    // read: the second is numbered as the script's second statement, not its
+    // third result.
+    let sql = "SELECT 1 AS a SELECT 2 AS b;\nSELECT 3 AS c";
+    let statements = split_statements(sql, pool.dialect());
+    assert_eq!(statements.len(), 2);
+    let mut results = Vec::new();
+    run_script(&pool, pool.backend_capabilities(), &statements, |r| {
+        results.push(r)
+    })
+    .await
+    .expect("the script should run to completion");
+
+    let shape: Vec<(usize, Option<(usize, usize)>, Vec<Vec<Value>>)> = results
+        .iter()
+        .map(|r| {
+            let rows = match &r.outcome {
+                StatementOutcome::Rows(rows) => rows.rows.clone(),
+                other => panic!("expected rows, got {other:?}"),
+            };
+            (r.statement, r.set.map(|s| (s.index, s.count)), rows)
+        })
+        .collect();
+    let one = |v: i64| vec![vec![Value::Integer(v)]];
+    assert_eq!(
+        shape,
+        [
+            (0, Some((0, 2)), one(1)),
+            (0, Some((1, 2)), one(2)),
+            (1, None, one(3)),
+        ]
+    );
+
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn sqlserver_script_go_batches_split_and_execute() {
     let Some((url, _turn)) = session().await else {
         return;

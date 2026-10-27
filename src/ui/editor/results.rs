@@ -138,7 +138,7 @@ pub(super) fn RunResults(
                         if run.explain {
                             PlanSection {
                                 key: "{index}",
-                                index: index + 1,
+                                index: statement.statement + 1,
                                 structured: structured_plans,
                                 result: statement.clone(),
                             }
@@ -147,7 +147,7 @@ pub(super) fn RunResults(
                                 key: "{index}",
                                 id,
                                 buffer: active,
-                                index: index + 1,
+                                index: statement.statement + 1,
                                 result: statement.clone(),
                                 late: run
                                     .late_rest
@@ -173,7 +173,7 @@ pub(super) fn RunResults(
                             }
                         }
                     }
-                    RunStatusLine { status: run.status.clone(), statement_count: run.statements.len() }
+                    RunStatusLine { status: run.status.clone(), statement_count: statements_reported(&run.statements) }
                 },
             }
         }
@@ -195,6 +195,22 @@ pub(super) fn writes_to_confirm(statements: &[String], dialect: Option<Dialect>)
             .filter(|s| needs_confirmation(s, dialect))
             .count(),
     )
+}
+
+/// How many statements a run's results came from. A statement that returned
+/// several result sets reports one result per set, and counts once.
+fn statements_reported(results: &[SharedStatement]) -> usize {
+    results
+        .iter()
+        .filter(|result| result.set.is_none_or(|set| set.index == 0))
+        .count()
+}
+
+/// The header's note on which of its statement's result sets a result is,
+/// when the statement returned more than one — the section number is the
+/// statement's, so it repeats.
+fn set_label(set: Option<SetOf>) -> Option<String> {
+    set.map(|set| format!("result {} of {}", set.index + 1, set.count))
 }
 
 /// The script-level footer: running indicator, total elapsed time (shown
@@ -420,6 +436,9 @@ fn StatementSection(
             p { class: "flex items-baseline gap-2 bg-slate-100 dark:bg-slate-900/60 px-4 py-1.5 text-xs",
                 span { class: "font-mono text-slate-500", "{index}" }
                 span { class: "min-w-0 truncate font-mono text-slate-900 dark:text-slate-300", "{result.preview}" }
+                if let Some(label) = set_label(result.set) {
+                    span { class: "shrink-0 text-slate-500", "{label}" }
+                }
                 span { class: "shrink-0 text-cyan-700 dark:text-cyan-400", "— {summary}" }
                 if exportable {
                     div { class: "flex-1" }
@@ -727,6 +746,8 @@ mod tests {
 
     fn rows_statement(preview: &str) -> SharedStatement {
         SharedStatement::new(crate::db::StatementResult {
+            statement: 0,
+            set: None,
             preview: preview.into(),
             outcome: StatementOutcome::Rows(crate::db::QueryResult {
                 columns: vec![crate::db::ColumnInfo { name: "a".into() }],
@@ -735,6 +756,33 @@ mod tests {
             truncated: false,
             rest: crate::db::RestOfRead::Ran,
         })
+    }
+
+    #[test]
+    fn a_statement_with_several_result_sets_is_one_statement() {
+        let result = |statement: usize, set: Option<(usize, usize)>| {
+            SharedStatement::new(crate::db::StatementResult {
+                statement,
+                set: set.map(|(index, count)| SetOf { index, count }),
+                ..(*rows_statement("SELECT 1")).clone()
+            })
+        };
+        // `SELECT 1 AS a SELECT 2 AS b; SELECT 3`: three results, two
+        // statements.
+        let run = [
+            result(0, Some((0, 2))),
+            result(0, Some((1, 2))),
+            result(1, None),
+        ];
+        assert_eq!(statements_reported(&run), 2);
+        assert_eq!(statements_reported(&run[..1]), 1);
+        assert_eq!(statements_reported(&[]), 0);
+
+        assert_eq!(set_label(None), None);
+        assert_eq!(
+            set_label(Some(SetOf { index: 1, count: 3 })).as_deref(),
+            Some("result 2 of 3")
+        );
     }
 
     /// The whole wire of a SQL-result export's status line, through the real

@@ -568,6 +568,7 @@ where
         false
     };
     Ok(Capped {
+        earlier: Vec::new(),
         result: QueryResult {
             columns,
             rows: out_rows,
