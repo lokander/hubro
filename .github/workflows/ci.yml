@@ -64,7 +64,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Two Postgres servers for the engine suites, so the Linux leg runs them
       # instead of skipping them: db_postgres and the shared suites (db_ddl,

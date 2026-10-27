@@ -44,7 +44,7 @@ jobs:
     name: Verify version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -100,12 +100,17 @@ jobs:
   linux:
     name: Bundle Linux (deb + AppImage)
     needs: verify
-    runs-on: ubuntu-latest
+    # Pinned, not -latest: the deb and AppImage link against this image's glibc
+    # and WebKitGTK, so this image's Ubuntu release sets the oldest one the
+    # bundles run on. ubuntu-latest began moving to 26.04 in October 2026, which
+    # would have raised that floor past 24.04 LTS without anyone deciding to.
+    # Moving this is a support decision, not a maintenance bump.
+    runs-on: ubuntu-24.04
     steps:
       # On a dispatch run, build the tag named in the input rather than the
       # branch the run was started from; on a tag push, `inputs.tag` is empty
       # and this is the tag ref as usual.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -157,7 +162,7 @@ jobs:
           ls -la artifacts
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-bundles
           path: artifacts/*
@@ -171,7 +176,7 @@ jobs:
     # README documents the xattr / Open Anyway workaround).
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -200,7 +205,7 @@ jobs:
           ls -la artifacts
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: macos-bundles
           path: artifacts/*
@@ -216,7 +221,7 @@ jobs:
     # on windows-latest images.
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -254,7 +259,7 @@ jobs:
           Get-ChildItem artifacts
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-bundles
           path: artifacts/*
@@ -270,13 +275,13 @@ jobs:
       contents: write
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           # `github.ref_name` is the tag on a push run and the dispatch branch
           # otherwise, so a dispatch has to name the tag explicitly.
