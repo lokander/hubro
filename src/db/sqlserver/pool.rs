@@ -1103,10 +1103,10 @@ async fn run_statement(
 
 /// What a script statement's counts say about the rows it affected — unlike
 /// [`statement_rows`], which takes the last count as the statement's own.
-/// A script statement is the text up to a separator (its own `;`, or a `GO`), and
-/// that can be several T-SQL statements — an `EXEC`, a `BEGIN … END`, an
-/// `IF`, statements written without semicolons — whose counts arrive as the
-/// same `DONEINPROC` token as their triggers'. tiberius 0.13 keeps the token
+/// A script unit is a whole GO batch, which can hold several T-SQL statements
+/// (an `EXEC`, a `BEGIN … END`, an `IF`, statements with or without a `;`
+/// between them), whose counts arrive as the same `DONEINPROC` token as their
+/// triggers'. tiberius 0.13 keeps the token
 /// kinds to itself (`ExecuteResult` is a bare `Vec<u64>`; `TokenDone` is not
 /// exported), and they would not help: through `sp_executesql` every count
 /// is a `DONEINPROC`, the statement's own and its triggers' alike. So no rule
@@ -1756,7 +1756,8 @@ pub async fn rollback_tx(mut tx: MssqlTx) -> RolledBack {
 /// ([`ScriptConn`](crate::db::registry::ScriptConn)). Measured before: `USE`,
 /// `SET CONTEXT_INFO`, `EXECUTE AS USER` and `sp_getapplock @LockOwner =
 /// 'Session'` outlived the run on its pooled connection (most `SET` options
-/// did not: each statement is its own `sp_executesql`). `sp_reset_connection`
+/// did not: each batch is its own `sp_executesql`, unless it is sent as a
+/// plain batch, whose `SET`s hold for the rest of the run). `sp_reset_connection`
 /// is not something a TDS client can call, so there is no reset to send.
 /// The server rolls back any transaction left open when the session goes.
 pub struct MssqlScriptConn {
