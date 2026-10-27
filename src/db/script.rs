@@ -276,6 +276,11 @@ fn continuation_quote(bytes: &[u8], from: usize) -> Option<usize> {
 ///
 /// A `;` inside a routine or trigger body does not split either — see
 /// [`BodyTracker`] for what counts as a body on each dialect.
+///
+/// On SQL Server a statement keeps the `;` it was split on, and only there:
+/// T-SQL requires one after a `MERGE` (error 10713 without it), and the text
+/// the user wrote, terminator included, is what SSMS sends. The other
+/// dialects still drop it: none of their statements needs one.
 pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<String> {
     let bytes = sql.as_bytes();
     let mut statements = Vec::new();
@@ -355,7 +360,14 @@ pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<String> {
                         b';' => {
                             if body.feed(BodyToken::Semicolon) {
                                 if significant {
-                                    statements.push(sql[start..i].trim().to_string());
+                                    // SQL Server keeps the `;` it was split
+                                    // on: T-SQL requires one after a MERGE.
+                                    let end = if dialect == Dialect::SqlServer {
+                                        i + 1
+                                    } else {
+                                        i
+                                    };
+                                    statements.push(sql[start..end].trim().to_string());
                                 }
                                 start = i + 1;
                                 significant = false;
@@ -2957,18 +2969,26 @@ mod tests {
                     "BEGIN TRANSACTION; UPDATE t SET a = 1; COMMIT; SELECT 2",
                     dialect
                 ),
-                [
-                    "BEGIN TRANSACTION",
-                    "UPDATE t SET a = 1",
-                    "COMMIT",
-                    "SELECT 2"
-                ],
+                // SQL Server keeps the terminator it split on.
+                {
+                    let end = if dialect == Dialect::SqlServer {
+                        ";"
+                    } else {
+                        ""
+                    };
+                    [
+                        format!("BEGIN TRANSACTION{end}"),
+                        format!("UPDATE t SET a = 1{end}"),
+                        format!("COMMIT{end}"),
+                        "SELECT 2".to_string(),
+                    ]
+                },
                 "{dialect:?}"
             );
         }
         assert_eq!(
             split_mssql("BEGIN TRAN; DELETE FROM t; ROLLBACK TRAN"),
-            ["BEGIN TRAN", "DELETE FROM t", "ROLLBACK TRAN"]
+            ["BEGIN TRAN;", "DELETE FROM t;", "ROLLBACK TRAN"]
         );
         // T-SQL's other BEGIN statements open no block either.
         assert_eq!(
@@ -2978,9 +2998,9 @@ mod tests {
                  SELECT 2"
             ),
             [
-                "BEGIN DISTRIBUTED TRANSACTION",
-                "BEGIN DIALOG CONVERSATION @h FROM SERVICE s TO SERVICE 't'",
-                "BEGIN CONVERSATION TIMER (@h) TIMEOUT = 5",
+                "BEGIN DISTRIBUTED TRANSACTION;",
+                "BEGIN DIALOG CONVERSATION @h FROM SERVICE s TO SERVICE 't';",
+                "BEGIN CONVERSATION TIMER (@h) TIMEOUT = 5;",
                 "SELECT 2"
             ]
         );
@@ -2989,7 +3009,14 @@ mod tests {
         for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer] {
             assert_eq!(
                 split_statements("SELECT CASE WHEN a THEN 1 END FROM t; SELECT 2", dialect),
-                ["SELECT CASE WHEN a THEN 1 END FROM t", "SELECT 2"],
+                [
+                    if dialect == Dialect::SqlServer {
+                        "SELECT CASE WHEN a THEN 1 END FROM t;"
+                    } else {
+                        "SELECT CASE WHEN a THEN 1 END FROM t"
+                    },
+                    "SELECT 2"
+                ],
                 "{dialect:?}"
             );
         }
@@ -3009,7 +3036,7 @@ mod tests {
         );
         assert_eq!(
             split_mssql("CREATE OR ALTER PROC p AS SELECT 1; SELECT 2;\nGO\nEXEC p;"),
-            ["CREATE OR ALTER PROC p AS SELECT 1; SELECT 2;", "EXEC p"]
+            ["CREATE OR ALTER PROC p AS SELECT 1; SELECT 2;", "EXEC p;"]
         );
         assert_eq!(
             split_mssql("ALTER TRIGGER tr ON t AFTER INSERT AS BEGIN UPDATE u SET n = n + 1; END;"),
@@ -3037,7 +3064,7 @@ mod tests {
         assert_eq!(
             split_mssql("DROP PROCEDURE IF EXISTS p; CREATE PROCEDURE p AS SELECT 1; SELECT 2"),
             [
-                "DROP PROCEDURE IF EXISTS p",
+                "DROP PROCEDURE IF EXISTS p;",
                 "CREATE PROCEDURE p AS SELECT 1; SELECT 2"
             ]
         );
@@ -3050,7 +3077,7 @@ mod tests {
                 "IF 1 = 1 BEGIN SELECT 1; SELECT 2; END ELSE BEGIN SELECT 3; END; SELECT 4"
             ),
             [
-                "IF 1 = 1 BEGIN SELECT 1; SELECT 2; END ELSE BEGIN SELECT 3; END",
+                "IF 1 = 1 BEGIN SELECT 1; SELECT 2; END ELSE BEGIN SELECT 3; END;",
                 "SELECT 4"
             ]
         );
@@ -3061,7 +3088,7 @@ mod tests {
             ),
             [
                 "BEGIN TRY SELECT 1/0; END TRY BEGIN CATCH SELECT \
-                 CASE WHEN 1 = 1 THEN 'x' END; END CATCH",
+                 CASE WHEN 1 = 1 THEN 'x' END; END CATCH;",
                 "SELECT 2"
             ]
         );
@@ -3073,9 +3100,9 @@ mod tests {
                  WHILE 1 = 0 BEGIN END CONVERSATION @h; SELECT 3; END; SELECT 4"
             ),
             [
-                "BEGIN BEGIN TRAN; SELECT 1; COMMIT; END",
-                "SELECT 2",
-                "WHILE 1 = 0 BEGIN END CONVERSATION @h; SELECT 3; END",
+                "BEGIN BEGIN TRAN; SELECT 1; COMMIT; END;",
+                "SELECT 2;",
+                "WHILE 1 = 0 BEGIN END CONVERSATION @h; SELECT 3; END;",
                 "SELECT 4"
             ]
         );
@@ -3083,13 +3110,13 @@ mod tests {
         // for nothing.
         assert_eq!(
             split_mssql("SELECT @begin, [begin], 'begin', #begin; SELECT 2"),
-            ["SELECT @begin, [begin], 'begin', #begin", "SELECT 2"]
+            ["SELECT @begin, [begin], 'begin', #begin;", "SELECT 2"]
         );
         // A keyword spelled at the end of a longer identifier is not one
         // (measured: `Ébegin` is a legal name on SQL Server).
         assert_eq!(
             split_mssql("SELECT 1 AS Ébegin; SELECT 2"),
-            ["SELECT 1 AS Ébegin", "SELECT 2"]
+            ["SELECT 1 AS Ébegin;", "SELECT 2"]
         );
         // SQL Server takes Unicode whitespace as whitespace (measured with
         // U+00A0 and U+3000), so it separates keywords like a space does.
@@ -3099,8 +3126,8 @@ mod tests {
                  BEGIN\u{a0}TRAN; SELECT 2"
             ),
             [
-                "IF 1 = 1 BEGIN\u{a0}SELECT 1;\u{3000}END",
-                "BEGIN\u{a0}TRAN",
+                "IF 1 = 1 BEGIN\u{a0}SELECT 1;\u{3000}END\u{a0};",
+                "BEGIN\u{a0}TRAN;",
                 "SELECT 2"
             ]
         );
@@ -3108,25 +3135,25 @@ mod tests {
         // word after it is a keyword (measured: `0xAUPDATE` ran an UPDATE)…
         assert_eq!(
             split_mssql("SELECT 1BEGIN SELECT 1; END; SELECT 2"),
-            ["SELECT 1BEGIN SELECT 1; END", "SELECT 2"]
+            ["SELECT 1BEGIN SELECT 1; END;", "SELECT 2"]
         );
         // A hex literal takes every hex letter, so `0x1BEGIN` is `0x1BE`, then
         // `GIN` — no BEGIN. (BEGIN, CASE and END all start with a hex letter.)
         assert_eq!(
             split_mssql("SELECT 0x1BEGIN; SELECT 2"),
-            ["SELECT 0x1BEGIN", "SELECT 2"]
+            ["SELECT 0x1BEGIN;", "SELECT 2"]
         );
         // …but a digit inside a variable, temp table or other name starts no
         // number, so nothing in it is a keyword (measured: `@1begin` and
         // `#1begin` are legal names).
         assert_eq!(
             split_mssql("SELECT @1begin, #1begin, x1begin, x$1begin; SELECT 2"),
-            ["SELECT @1begin, #1begin, x1begin, x$1begin", "SELECT 2"]
+            ["SELECT @1begin, #1begin, x1begin, x$1begin;", "SELECT 2"]
         );
         // An unclosed block cannot swallow the next batch: GO ends it.
         assert_eq!(
             split_mssql("BEGIN SELECT 1;\nGO\nSELECT 2; SELECT 3"),
-            ["BEGIN SELECT 1;", "SELECT 2", "SELECT 3"]
+            ["BEGIN SELECT 1;", "SELECT 2;", "SELECT 3"]
         );
     }
 
@@ -3498,8 +3525,22 @@ mod tests {
             .iter()
             .map(|&(dialect, sql, needs)| (dialect, sql, needs))
             .chain(opaque.iter().map(|(d, sql, n)| (*d, sql.as_str(), *n)));
+        // SQL Server statements keep the `;` they were split on, so each case
+        // there runs again with one: a terminator must never change a charge.
+        let cases = cases.flat_map(|(dialect, sql, needs)| {
+            let terminated = (dialect == Ms).then(|| format!("{sql};"));
+            std::iter::once((dialect, sql.to_string(), needs))
+                .chain(terminated.map(|sql| (dialect, sql, needs)))
+        });
         for (dialect, sql, (mutate, ddl)) in cases {
+            let sql = sql.as_str();
             let statements = split_statements(sql, dialect);
+            if dialect == Ms && sql.ends_with(';') {
+                assert!(
+                    statements.last().is_some_and(|s| s.ends_with(';')),
+                    "{sql:?} should reach the gate with its terminator, split as {statements:?}"
+                );
+            }
             let charged = statements.iter().map(|s| statement_needs(s, dialect)).fold(
                 StatementNeeds::default(),
                 |a, b| StatementNeeds {
@@ -3586,7 +3627,7 @@ mod tests {
         // GO after a semicolon-terminated statement adds nothing.
         assert_eq!(
             split_mssql("SELECT 1;\nGO\nSELECT 2"),
-            ["SELECT 1", "SELECT 2"]
+            ["SELECT 1;", "SELECT 2"]
         );
         // Consecutive GO lines produce no empty statements.
         assert_eq!(split_mssql("GO\nGO\nSELECT 1\nGO\nGO"), ["SELECT 1"]);
@@ -3632,22 +3673,22 @@ mod tests {
         // A `;` inside brackets is identifier text, not a separator.
         assert_eq!(
             split_mssql("SELECT [a;b] FROM t; SELECT 2"),
-            ["SELECT [a;b] FROM t", "SELECT 2"]
+            ["SELECT [a;b] FROM t;", "SELECT 2"]
         );
         // `--` and `/*` inside brackets start no comment: the `;` after the
         // identifier still splits instead of being swallowed to end of line.
         assert_eq!(
             split_mssql("SELECT [a--b]; SELECT 2"),
-            ["SELECT [a--b]", "SELECT 2"]
+            ["SELECT [a--b];", "SELECT 2"]
         );
         assert_eq!(
             split_mssql("SELECT [a/*b]; SELECT 2"),
-            ["SELECT [a/*b]", "SELECT 2"]
+            ["SELECT [a/*b];", "SELECT 2"]
         );
         // Quotes inside brackets are plain characters.
         assert_eq!(
             split_mssql("SELECT [a'b]; SELECT 2"),
-            ["SELECT [a'b]", "SELECT 2"]
+            ["SELECT [a'b];", "SELECT 2"]
         );
     }
 
@@ -3657,11 +3698,11 @@ mod tests {
         // the real closing bracket still splits.
         assert_eq!(
             split_mssql("SELECT [a]]b]; SELECT 2"),
-            ["SELECT [a]]b]", "SELECT 2"]
+            ["SELECT [a]]b];", "SELECT 2"]
         );
         assert_eq!(
             split_mssql("SELECT [a]];b]; SELECT 2"),
-            ["SELECT [a]];b]", "SELECT 2"]
+            ["SELECT [a]];b];", "SELECT 2"]
         );
     }
 
@@ -3681,20 +3722,20 @@ mod tests {
         // A '[' in a string is literal text — the following `;` still splits.
         assert_eq!(
             split_mssql("SELECT '['; SELECT 2"),
-            ["SELECT '['", "SELECT 2"]
+            ["SELECT '[';", "SELECT 2"]
         );
         assert_eq!(
             split_mssql("SELECT \"[\"; SELECT 2"),
-            ["SELECT \"[\"", "SELECT 2"]
+            ["SELECT \"[\";", "SELECT 2"]
         );
         // Likewise inside line and block comments.
         assert_eq!(
             split_mssql("SELECT 1 -- [\n; SELECT 2"),
-            ["SELECT 1 -- [", "SELECT 2"]
+            ["SELECT 1 -- [\n;", "SELECT 2"]
         );
         assert_eq!(
             split_mssql("SELECT 1 /* [ */; SELECT 2"),
-            ["SELECT 1 /* [ */", "SELECT 2"]
+            ["SELECT 1 /* [ */;", "SELECT 2"]
         );
     }
 
