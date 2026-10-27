@@ -11,9 +11,11 @@
   ours.
 
   MIRRORED FROM dx 0.7.10, `create_macos_info_plist` in
-  dioxus-cli/src/bundler/macos.rs — the function `dx bundle --package-types
-  macos` reaches, via `bundle_macos_app`. That is the only plist generator that
-  applies here; dioxus-cli has several others, for widget extensions,
+  dioxus-cli/src/bundler/macos.rs — the function `dx bundle` reaches, via
+  `bundle_macos_app`, when asked for the macos package type. (The flag that
+  asks is not quoted here: a double hyphen is illegal inside an XML comment,
+  and tests/file_associations.rs fails on one.) That is the only plist
+  generator that applies here; dioxus-cli has several others, for widget extensions,
   frameworks and iOS, and those write keys this bundle neither gets nor wants
   (CFBundleSupportedPlatforms is one of them). The function is byte-identical
   in dx 0.7.9 and 0.7.10.
