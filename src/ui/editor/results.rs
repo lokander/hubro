@@ -105,16 +105,12 @@ pub(super) fn RunResults(
             if let Some(write_count) = pending_writes {
                 div { class: "flex items-center gap-3 border-b border-amber-300 dark:border-amber-900/50 bg-amber-100 dark:bg-amber-950/30 px-4 py-2",
                     span { class: "text-sm text-amber-700 dark:text-amber-300",
-                        if let Some(target) = confirm_target.clone() {
-                            if write_count == 1 {
-                                "Run 1 write statement against \"{target}\"?"
-                            } else {
-                                "Run {write_count} write statements against \"{target}\"?"
+                        {
+                            let writes = writes_phrase(write_count, dialect);
+                            match confirm_target.clone() {
+                                Some(target) => format!("Run {writes} against \"{target}\"?"),
+                                None => format!("This script contains {writes}. Run anyway?"),
                             }
-                        } else if write_count == 1 {
-                            "This script contains 1 write statement. Run anyway?"
-                        } else {
-                            "This script contains {write_count} write statements. Run anyway?"
                         }
                     }
                     button {
@@ -177,7 +173,11 @@ pub(super) fn RunResults(
                             }
                         }
                     }
-                    RunStatusLine { status: run.status.clone(), statement_count: statements_reported(&run.statements) }
+                    RunStatusLine {
+                        status: run.status.clone(),
+                        statement_count: statements_reported(&run.statements),
+                        dialect,
+                    }
                 },
             }
         }
@@ -199,6 +199,29 @@ pub(super) fn writes_to_confirm(statements: &[String], dialect: Option<Dialect>)
             .filter(|s| needs_confirmation(s, dialect))
             .count(),
     )
+}
+
+/// `n` of what a run sends: SQL Server's GO batches, every other engine's
+/// statements. A SQL Server script of three statements and no GO is one
+/// batch, and "1 statement" would undercount what ran.
+fn units(n: usize, dialect: Option<Dialect>) -> String {
+    match (dialect == Some(Dialect::SqlServer), n == 1) {
+        (true, true) => "1 batch".to_string(),
+        (true, false) => format!("{n} batches"),
+        (false, true) => "1 statement".to_string(),
+        (false, false) => format!("{n} statements"),
+    }
+}
+
+/// The confirmation banner's count of what writes: on SQL Server whole
+/// batches, which may each hold several writes ([`units`]).
+fn writes_phrase(n: usize, dialect: Option<Dialect>) -> String {
+    match (dialect == Some(Dialect::SqlServer), n == 1) {
+        (true, true) => "1 batch that writes".to_string(),
+        (true, false) => format!("{n} batches that write"),
+        (false, true) => "1 write statement".to_string(),
+        (false, false) => format!("{n} write statements"),
+    }
 }
 
 /// How many statements a run's results came from. A statement that returned
@@ -224,7 +247,7 @@ fn set_label(set: Option<SetOf>) -> Option<String> {
 /// The script-level footer: running indicator, total elapsed time (shown
 /// once per run), or the failure block.
 #[component]
-fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
+fn RunStatusLine(status: RunStatus, statement_count: usize, dialect: Option<Dialect>) -> Element {
     match status {
         RunStatus::Running => rsx! {
             LoadingLine { label: "Running…" }
@@ -235,11 +258,7 @@ fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
             connection_closed,
         } => rsx! {
             p { class: "px-4 py-2 text-xs text-slate-500",
-                if statement_count == 1 {
-                    "1 statement in {elapsed_ms} ms"
-                } else {
-                    "{statement_count} statements in {elapsed_ms} ms"
-                }
+                "{units(statement_count, dialect)} in {elapsed_ms} ms"
             }
             // Every statement succeeded, and still none of what the script did
             // inside its transaction is in the database — the one thing a
@@ -771,6 +790,20 @@ mod tests {
             truncated: false,
             rest: crate::db::RestOfRead::Ran,
         })
+    }
+
+    #[test]
+    fn sql_server_counts_batches_and_the_rest_statements() {
+        let ms = Some(Dialect::SqlServer);
+        let pg = Some(Dialect::Postgres);
+        assert_eq!(units(1, ms), "1 batch");
+        assert_eq!(units(3, ms), "3 batches");
+        assert_eq!(units(1, pg), "1 statement");
+        assert_eq!(units(2, None), "2 statements");
+        assert_eq!(writes_phrase(1, ms), "1 batch that writes");
+        assert_eq!(writes_phrase(2, ms), "2 batches that write");
+        assert_eq!(writes_phrase(1, pg), "1 write statement");
+        assert_eq!(writes_phrase(2, pg), "2 write statements");
     }
 
     #[test]
