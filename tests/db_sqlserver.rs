@@ -1865,7 +1865,7 @@ async fn sqlserver_hubros_own_read_paths_keep_only_the_first_result_set() {
     let (result, truncated) = tx.query_capped(sql, 100).await.unwrap();
     assert_eq!(result.rows, first);
     assert!(!truncated);
-    tx.rollback().await;
+    let _ = tx.rollback().await;
 
     pool.close().await;
 }
