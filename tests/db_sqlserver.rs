@@ -3081,10 +3081,10 @@ async fn sqlserver_a_batch_led_by_select_that_ends_or_opens_a_transaction_is_rep
     );
     assert!(
         matches!(&outcome, Err(e) if e.statement_index == 0
-            && e.error.to_string().contains("(code: 266")
-            && e.rollback == Rollback::OpenTransaction(OpenTransaction {
-                schema_changes_kept: false
-            })),
+        && e.error.to_string().contains("(code: 266")
+        && e.rollback == Rollback::OpenTransaction(OpenTransaction {
+            schema_changes_kept: false
+        })),
         "a transaction the batch opened must be rolled back and said to be: {}",
         common::script_outcome(&outcome)
     );
@@ -3167,9 +3167,10 @@ async fn sqlserver_an_error_in_the_rest_of_a_capped_read_fails_its_statement() {
     // read on its held connection. tiberius reads it before the next request
     // by raw packets, without decoding a token, and its result stream reports
     // a server error only once the whole response is read — so an error past
-    // the cap reached nobody. Measured before the fix: every script below
-    // finished `Ok`; the atomic ones committed the rows logged around the
-    // failed `INSERT`, and the sequential one ran its own `COMMIT`.
+    // the cap reached nobody. Measured before the fix: every script below but
+    // the `XACT_ABORT` one finished `Ok`; the atomic ones committed the rows
+    // logged around the failed `INSERT`, and the sequential one ran its own
+    // `COMMIT`.
     let Some((url, _turn)) = session().await else {
         return;
     };
@@ -3263,38 +3264,32 @@ async fn sqlserver_an_error_in_the_rest_of_a_capped_read_fails_its_statement() {
             Rollback::AlreadyEnded,
         ),
     ];
-    let mut lost = Vec::new();
+    // Every case is run and every mismatch said, so one failure does not hide
+    // how the others went.
+    let mut wrong = Vec::new();
     for (script, index, words, rollback) in cases {
         let outcome = mssql_script(&pool, &script).await;
-        assert_eq!(mssql_open_transactions(&pool).await, Vec::<Value>::new());
+        let open = mssql_open_transactions(&pool).await;
         let rows = pool
             .query_unbounded("SELECT count(*) FROM dbo.rest_err_log")
             .await
             .unwrap();
         run_all(&pool, &["DELETE FROM dbo.rest_err_log"]).await;
-        let error = match &outcome {
-            Err(error) => error,
-            Ok(_) => {
-                lost.push(format!(
-                    "{script}\n  {}, {:?} logged",
-                    common::script_outcome(&outcome),
-                    rows.rows[0][0]
-                ));
-                continue;
-            }
-        };
-        assert_eq!(error.statement_index, index, "{script}: {error:?}");
-        assert!(
-            error.error.to_string().contains(words),
-            "{script}: {error:?}"
-        );
-        assert_eq!(error.rollback, rollback, "{script}: {error:?}");
-        assert_eq!(rows.rows[0][0], Value::Integer(0), "{script}");
+        let as_expected = matches!(&outcome, Err(e) if e.statement_index == index
+            && e.error.to_string().contains(words)
+            && e.rollback == rollback);
+        if !as_expected || rows.rows[0][0] != Value::Integer(0) || !open.is_empty() {
+            wrong.push(format!(
+                "{script}\n  {}; {:?} logged; open: {open:?}",
+                common::script_outcome(&outcome),
+                rows.rows[0][0]
+            ));
+        }
     }
     assert!(
-        lost.is_empty(),
-        "an error past the cap was lost:\n{}",
-        lost.join("\n")
+        wrong.is_empty(),
+        "expected each script to fail at its capped read:\n{}",
+        wrong.join("\n")
     );
     // The pool's capped read reads the rest of a batch that may write, and
     // the rest's error is the read's.
@@ -3319,6 +3314,10 @@ fn sqlserver_reading_the_rest_of_a_capped_read_leaves_the_thread_to_others() {
     // the next statement, by hubro, on the thread the run is polled on — the
     // SQL tab's is the UI thread. Here the rest is endless, on a single
     // thread like the UI's, and the run must be abortable in a moment.
+    //
+    // This pins that the run stays abortable, not `read_rest`'s turns:
+    // measured, with the turns removed it still passes — against this
+    // source tiberius's read returns `Pending` often enough on its own.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

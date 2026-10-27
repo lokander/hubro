@@ -922,10 +922,12 @@ enum Rest {
 /// statement it belongs to — as a Postgres-wire read's error past the cap
 /// does (`sqlx_common::read_rest`).
 ///
-/// The rows are dropped as they come, with a [`turn`]
-/// for the thread every [`DRAIN_TURN_EVERY`]: over localhost the next row is
-/// always waiting, so without one the whole rest is read in one poll, on the
-/// UI thread a script runs on, and a click on Cancel waits for it.
+/// The rows are dropped as they come, with a [`turn`] for the thread every
+/// [`DRAIN_TURN_EVERY`] — the Postgres-wire path's pacing, where a rest read
+/// in one poll was measured to hold the UI thread for 44 s. Here it is a
+/// bound, not a measured fix: an endless SQL Server rest stayed abortable
+/// without the turns (`tests/db_sqlserver.rs`, `…_leaves_the_thread_to_others`),
+/// tiberius's read returning `Pending` on its own.
 async fn read_rest(mut stream: tiberius::QueryStream<'_>, rest: Rest) -> Result<bool, TdsError> {
     if rest == Rest::Leave {
         return Ok(true);
