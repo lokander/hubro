@@ -1426,6 +1426,36 @@ async fn sqlserver_only_an_enabled_instead_of_trigger_on_a_table_restricts_it() 
 }
 
 #[tokio::test]
+async fn sqlserver_script_merge_keeps_its_required_terminator() {
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.script_merge_probe",
+            "CREATE TABLE dbo.script_merge_probe (id int NOT NULL)",
+        ],
+    )
+    .await;
+
+    let sql = "MERGE dbo.script_merge_probe AS t USING (VALUES (1)) AS s (id) ON t.id = s.id \
+               WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id);";
+    let statements = split_statements(sql, pool.dialect());
+    let outcome = run_script(&pool, pool.backend_capabilities(), &statements, |_| {}).await;
+    outcome.expect("a MERGE must end in `;`, and SSMS sends it with one");
+    let rows = pool
+        .query_unbounded("SELECT id FROM dbo.script_merge_probe")
+        .await
+        .unwrap();
+    assert_eq!(rows.rows, vec![vec![Value::Integer(1)]]);
+
+    run_all(&pool, &["DROP TABLE dbo.script_merge_probe"]).await;
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn sqlserver_script_go_batches_split_and_execute() {
     let Some((url, _turn)) = session().await else {
         return;
