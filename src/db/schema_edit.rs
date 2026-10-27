@@ -808,11 +808,13 @@ mod tests {
         for dialect in DIALECTS {
             for op in every_op() {
                 let sql = schema_op_sql(dialect, &meta, &op);
-                assert_eq!(
-                    split_statements(&sql, dialect).len(),
-                    1,
-                    "{dialect:?} {op:?}: {sql}"
-                );
+                // On SQL Server a unit is a whole GO batch; the statements
+                // inside it are what must number one.
+                let statements = match dialect {
+                    Dialect::SqlServer => crate::db::script::split_tsql_statements(&sql),
+                    _ => split_statements(&sql, dialect),
+                };
+                assert_eq!(statements.len(), 1, "{dialect:?} {op:?}: {sql}");
                 assert!(sql.ends_with(';'), "{dialect:?} {op:?}: {sql}");
             }
         }

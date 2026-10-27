@@ -19,7 +19,8 @@ mod common;
 
 use common::FixtureDb;
 use hubro::db::{
-    render_copy, split_statements, CopyBlock, CopyFormat, DbPool, Dialect, QueryResult, Value,
+    render_copy, split_statements, split_tsql_statements, CopyBlock, CopyFormat, DbPool, Dialect,
+    QueryResult, Value,
 };
 
 /// The columns every fixture below carries, in order.
@@ -56,7 +57,12 @@ async fn paste_inserts(pool: &DbPool, dialect: Dialect, table: &str, rows: &[Vec
     };
     let script = render_copy(&block, CopyFormat::Insert, Some(dialect))
         .expect("INSERT renders whenever a dialect is given");
-    let statements = split_statements(&script, dialect);
+    // Statements, not units: SQL Server sends the script as one batch, and
+    // what this hunts is a `;` split tearing a value.
+    let statements = match dialect {
+        Dialect::SqlServer => split_tsql_statements(&script),
+        _ => split_statements(&script, dialect),
+    };
     assert_eq!(
         statements.len(),
         rows.len(),

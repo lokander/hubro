@@ -1426,6 +1426,102 @@ async fn sqlserver_only_an_enabled_instead_of_trigger_on_a_table_restricts_it() 
 }
 
 #[tokio::test]
+async fn sqlserver_script_declared_variable_lasts_its_whole_go_batch() {
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.script_declare_probe",
+            "CREATE TABLE dbo.script_declare_probe (id int NOT NULL)",
+        ],
+    )
+    .await;
+
+    let sql = "DECLARE @x int = 7;\nINSERT INTO dbo.script_declare_probe VALUES (@x);";
+    let statements = split_statements(sql, pool.dialect());
+    let outcome = run_script(&pool, pool.backend_capabilities(), &statements, |_| {}).await;
+    outcome.expect("SSMS runs this text as one batch, so @x is in scope for the INSERT");
+    let rows = pool
+        .query_unbounded("SELECT id FROM dbo.script_declare_probe")
+        .await
+        .unwrap();
+    assert_eq!(rows.rows, vec![vec![Value::Integer(7)]]);
+
+    run_all(&pool, &["DROP TABLE dbo.script_declare_probe"]).await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlserver_a_batch_runs_on_past_a_statement_error() {
+    // T-SQL carries on past most statement errors within a batch, as SSMS
+    // shows: the statement after a duplicate key still runs. Hubro sends the
+    // batch whole, so the same holds here — and a report must not say
+    // nothing after the error ran.
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    let kept = |pool: &DbPool| {
+        let pool = pool.clone();
+        async move {
+            pool.query_unbounded("SELECT id FROM dbo.batch_error_probe ORDER BY id")
+                .await
+                .unwrap()
+                .rows
+        }
+    };
+    let fresh = |pool: &DbPool| {
+        let pool = pool.clone();
+        async move {
+            run_all(
+                &pool,
+                &[
+                    "DROP TABLE IF EXISTS dbo.batch_error_probe",
+                    "CREATE TABLE dbo.batch_error_probe (id int PRIMARY KEY)",
+                ],
+            )
+            .await
+        }
+    };
+    let failing = "INSERT INTO dbo.batch_error_probe VALUES (1);\n\
+                   INSERT INTO dbo.batch_error_probe VALUES (1);\n\
+                   INSERT INTO dbo.batch_error_probe VALUES (2);";
+    let ints = |v: &[i64]| {
+        v.iter()
+            .map(|&n| vec![Value::Integer(n)])
+            .collect::<Vec<_>>()
+    };
+
+    // Sequential (the script holds a transaction of its own elsewhere): the
+    // batch fails, and the INSERT after the error has run and is kept.
+    fresh(&pool).await;
+    let script = format!("BEGIN TRAN\nGO\nCOMMIT\nGO\n{failing}");
+    assert_eq!(
+        mssql_script_outcomes(&pool, &script).await,
+        [
+            "no count".to_string(),
+            "no count".to_string(),
+            "statement 2 failed [None] code 2627 line 2".to_string(),
+        ]
+    );
+    assert_eq!(kept(&pool).await, ints(&[1, 2]));
+
+    // Atomic: the same batch in hubro's transaction, rolled back whole.
+    fresh(&pool).await;
+    assert_eq!(
+        mssql_script_outcomes(&pool, failing).await,
+        ["statement 0 failed [Full] code 2627 line 2".to_string()]
+    );
+    assert_eq!(kept(&pool).await, ints(&[]));
+
+    run_all(&pool, &["DROP TABLE dbo.batch_error_probe"]).await;
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn sqlserver_script_merge_keeps_its_required_terminator() {
     let Some((url, _turn)) = session().await else {
         return;
@@ -1461,10 +1557,9 @@ async fn sqlserver_script_reports_every_result_set_of_a_statement() {
         return;
     };
     let pool = DbPool::open_mssql(&url).await.unwrap();
-    // A statement with two result sets and no `;` between them, then a plain
-    // read: the second is numbered as the script's second statement, not its
-    // third result.
-    let sql = "SELECT 1 AS a SELECT 2 AS b;\nSELECT 3 AS c";
+    // A batch with two result sets, then a batch with one: the second is
+    // numbered as the script's second unit, not its third result.
+    let sql = "SELECT 1 AS a SELECT 2 AS b;\nGO\nSELECT 3 AS c";
     let statements = split_statements(sql, pool.dialect());
     assert_eq!(statements.len(), 2);
     let mut results = Vec::new();
@@ -1739,8 +1834,10 @@ async fn sqlserver_script_creates_a_procedure_with_a_multi_statement_body() {
                  INSERT INTO dbo.script_proc_probe VALUES (4);\n\
                END;\n\
                SELECT id FROM dbo.script_proc_probe ORDER BY id";
+    // Three batches: the procedure's body runs to its batch's end, and the
+    // last batch — EXEC, IF block and SELECT — is one call.
     let statements = split_statements(sql, pool.dialect());
-    assert_eq!(statements.len(), 5, "{statements:#?}");
+    assert_eq!(statements.len(), 3, "{statements:#?}");
 
     let mut results = Vec::new();
     run_script(&pool, pool.backend_capabilities(), &statements, |r| {
@@ -1748,7 +1845,8 @@ async fn sqlserver_script_creates_a_procedure_with_a_multi_statement_body() {
     })
     .await
     .expect("the script should run to completion");
-    match &results[4].outcome {
+    assert_eq!(results.len(), 3, "{results:#?}");
+    match &results[2].outcome {
         StatementOutcome::Rows(rows) => assert_eq!(
             rows.rows,
             vec![
@@ -3839,15 +3937,47 @@ async fn sqlserver_script_temp_tables_last_the_run() {
     // no count.
     let none = || "no count".to_string();
     let cases = [
-        // Atomic: several statements, none managing a transaction.
+        // Atomic: several batches, none managing a transaction. A batch is
+        // one call, so these are each their own batch: the table outlives
+        // its batch.
         (
-            "CREATE TABLE #t (a int); INSERT INTO #t VALUES (1), (2); SELECT count(*) FROM #t",
+            "CREATE TABLE #t (a int)\nGO\nINSERT INTO #t VALUES (1), (2)\nGO\n\
+             SELECT count(*) FROM #t",
             vec![none(), affected(2), rows(2)],
         ),
         // `SELECT … INTO` is a read here, and goes the same way.
         (
-            "SELECT 7 AS a INTO #s; UPDATE #s SET a = 8; SELECT a FROM #s",
+            "SELECT 7 AS a INTO #s\nGO\nUPDATE #s SET a = 8\nGO\nSELECT a FROM #s",
             vec![none(), affected(1), rows(8)],
+        ),
+        // A batch that creates the table and writes to it is one checked
+        // plain batch, so the table lasts past it — and, a plain batch, it
+        // reports no count for its write.
+        (
+            "CREATE TABLE #tw (a int); INSERT INTO #tw VALUES (1), (2)\nGO\n\
+             SELECT count(*) FROM #tw",
+            vec![none(), rows(2)],
+        ),
+        // The whole script one batch: it reads, so it reports its rows.
+        (
+            "CREATE TABLE #tb (a int); INSERT INTO #tb VALUES (1), (2); SELECT count(*) FROM #tb",
+            vec![rows(2)],
+        ),
+        // A batch holding its own transaction is a plain batch, its table
+        // the session's.
+        (
+            "BEGIN TRAN; CREATE TABLE #qb (a int); INSERT INTO #qb VALUES (4); COMMIT\nGO\n\
+             SELECT a FROM #qb",
+            vec![none(), rows(4)],
+        ),
+        // A SET in the batch keeps it on `sp_executesql`: the SET lapses with
+        // the call, and the table goes with it.
+        (
+            "CREATE TABLE #sb (a int); SET NOCOUNT ON\nGO\nSELECT a FROM #sb",
+            vec![
+                affected(0),
+                "statement 1 failed [Full] code 208 line 1".to_string(),
+            ],
         ),
         // A bracketed name, and the usual guard around a create.
         (
@@ -3858,13 +3988,13 @@ async fn sqlserver_script_temp_tables_last_the_run() {
         // Sequential, through the read path: `SELECT … INTO` on the script's
         // own connection rather than in hubro's transaction.
         (
-            "BEGIN TRAN; COMMIT; SELECT 5 AS a INTO #r; SELECT a FROM #r",
+            "BEGIN TRAN\nGO\nCOMMIT\nGO\nSELECT 5 AS a INTO #r\nGO\nSELECT a FROM #r",
             vec![none(), none(), none(), rows(5)],
         ),
         // Sequential: the script manages its own transaction.
         (
-            "BEGIN TRAN; CREATE TABLE #q (a int); INSERT INTO #q VALUES (4); COMMIT; \
-             SELECT a FROM #q",
+            "BEGIN TRAN\nGO\nCREATE TABLE #q (a int)\nGO\nINSERT INTO #q VALUES (4)\nGO\n\
+             COMMIT\nGO\nSELECT a FROM #q",
             vec![none(), none(), affected(1), none(), rows(4)],
         ),
         // An error in a plain batch names its line within the statement, as
@@ -3899,9 +4029,15 @@ async fn sqlserver_script_temp_tables_last_the_run() {
             vec!["statement 0 failed [AlreadyEnded] code 266 line 0".to_string()],
         ),
     ];
+    // Every case's outcome, so one mismatch does not hide the rest.
+    let mut wrong = Vec::new();
     for (sql, want) in cases {
-        assert_eq!(mssql_script_outcomes(&pool, sql).await, want, "{sql:?}");
+        let got = mssql_script_outcomes(&pool, sql).await;
+        if got != want {
+            wrong.push(format!("{sql:?}\n  got:  {got:?}\n  want: {want:?}"));
+        }
     }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     assert_eq!(mssql_open_transactions(&pool).await, Vec::<Value>::new());
     pool.close().await;
 }

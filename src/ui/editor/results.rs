@@ -271,9 +271,14 @@ fn RunStatusLine(status: RunStatus, statement_count: usize) -> Element {
                     Rollback::Full => {
                         format!("Script rolled back after {elapsed_ms} ms — no changes were applied.")
                     }
+                    // Not "earlier statements": a SQL Server batch is sent
+                    // whole, and the server runs on past most errors in it
+                    // (measured, `sqlserver_a_batch_runs_on_past_a_statement_error`).
                     Rollback::None => format!(
                         "Script stopped after {elapsed_ms} ms; hubro rolled nothing back, so \
-                         earlier statements stand unless the server undid them itself.",
+                         what ran stands unless the server undid it itself. On SQL Server that \
+                         can include statements after the error in the same batch: the server \
+                         runs on past most errors in a batch.",
                     ),
                     Rollback::ConnectionClosed => format!(
                         "Script stopped after {elapsed_ms} ms, and hubro could not check what \
