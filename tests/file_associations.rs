@@ -34,7 +34,10 @@
 //! is verified by running the script extracted from the workflow against
 //! mutated fixtures, and by a throwaway tag pushed when the gate landed (a tag
 //! that could not match, which failed `verify` and skipped every bundle and the
-//! publish).
+//! publish). The same goes for its other job, refusing a plist that is not
+//! well-formed XML: nothing here pins that `verify` parses the file, and the
+//! comment check below covers only the part of well-formedness these files'
+//! prose is likeliest to break.
 
 use hubro::cli::DATABASE_EXTENSIONS;
 
@@ -508,9 +511,10 @@ fn the_info_plist_records_the_dx_version_it_was_mirrored_from() {
 /// Every way the XML comments in `source` make it malformed, one line each:
 /// a comment that is never closed, one whose body holds a double hyphen, and
 /// one whose body ends in a hyphen (`--->`). The XML spec forbids all three,
-/// and they are the only part of well-formedness these files are at risk of
-/// losing — their markup is short and fixed, their comments are long prose
-/// that quotes command lines.
+/// and they are the part of well-formedness these files are likeliest to lose:
+/// their markup is short and fixed, their comments are long prose that quotes
+/// command lines. Not the whole of it — a bare `&` in a value would break the
+/// file too, and only `verify`'s parse would see that.
 fn xml_comment_problems(source: &str) -> Vec<String> {
     let line_of = |offset: usize| source[..offset].matches('\n').count() + 1;
     let mut problems = Vec::new();
@@ -544,9 +548,10 @@ fn the_xml_packaging_files_have_no_comment_a_strict_parser_rejects() {
     // dx copies Info.plist into the bundle verbatim, and every macOS release
     // up to 0.8.0 shipped one that was malformed XML: its header comment
     // quoted a command-line flag, and a double hyphen is illegal inside a
-    // comment. macOS's own plist reader tolerates that; `plutil`, Python's
-    // `plistlib` and xmllint do not, and the code-signing and notarization
-    // steps a signed release would add are the likeliest to be strict. The
+    // comment. macOS's own plist reader tolerates that; Python's `plistlib`
+    // and xmllint were measured to reject it, and the code-signing and
+    // notarization steps a signed release would add are the likeliest to be
+    // strict. The
     // WiX fragment is held to the same rule because the MSI toolchain
     // parses it as XML too.
     for (path, source) in [
@@ -569,6 +574,9 @@ fn the_xml_packaging_files_have_no_comment_a_strict_parser_rejects() {
     );
     assert_eq!(xml_comment_problems("<!-- trailing --->").len(), 1);
     assert_eq!(xml_comment_problems("<a/><!-- never closed").len(), 1);
+    // A problem after the first comment, where every comment but the
+    // plist's header sits.
+    assert_eq!(xml_comment_problems("<!-- ok --><!-- a -- b -->").len(), 1);
     assert!(xml_comment_problems("<!-- a - b --><!-- c -->").is_empty());
 }
 
