@@ -208,6 +208,12 @@ impl PendingRest {
 /// what became of the rest.
 #[derive(Debug)]
 pub(crate) struct Capped {
+    /// Result sets the statement returned before `result`, each whole: only
+    /// the last one kept can be cut short. Empty on every engine but SQL
+    /// Server, where one statement can return several — `SELECT 1 AS a
+    /// SELECT 2 AS b` (`sqlserver::pool::read_sets`).
+    pub(crate) earlier: Vec<QueryResult>,
+    /// The last result set kept, the one `truncated` and `rest` are about.
     pub(crate) result: QueryResult,
     pub(crate) truncated: bool,
     pub(crate) rest: RestOfRead,
@@ -235,6 +241,7 @@ pub(crate) struct Capped {
 impl From<(QueryResult, bool)> for Capped {
     fn from((result, truncated): (QueryResult, bool)) -> Self {
         Capped {
+            earlier: Vec::new(),
             result,
             truncated,
             rest: RestOfRead::Ran,

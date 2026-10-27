@@ -203,9 +203,9 @@ impl ScriptTx<'_> {
             ScriptTx::Postgres { tx, pg, reads } => {
                 postgres::transaction_capped_read(tx, pg, reads, sql, max_rows, cell_cap).await
             }
-            ScriptTx::SqlServer(tx) => sqlserver::query_capped_conn(tx, sql, max_rows, cell_cap)
-                .await
-                .map(Capped::from),
+            ScriptTx::SqlServer(tx) => {
+                sqlserver::query_capped_conn(tx, sql, max_rows, cell_cap).await
+            }
         }
     }
 
@@ -546,9 +546,7 @@ impl ScriptConn {
                 postgres::writable_capped_read(conn, pg, session, sql, max_rows, cell_cap).await
             }
             HeldConn::SqlServer(conn) => {
-                sqlserver::query_capped_script_conn(conn, sql, max_rows, cell_cap)
-                    .await
-                    .map(Capped::from)
+                sqlserver::query_capped_script_conn(conn, sql, max_rows, cell_cap).await
             }
         }
     }

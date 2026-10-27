@@ -989,6 +989,8 @@ mod tests {
     async fn a_run_retires_a_finished_sql_export_from_its_own_tab_only() {
         let (dom, state, id) = state_with_connection();
         let statement = SharedStatement::new(StatementResult {
+            statement: 0,
+            set: None,
             preview: "SELECT 1".into(),
             outcome: StatementOutcome::Rows(crate::db::QueryResult {
                 columns: Vec::new(),
@@ -1084,6 +1086,8 @@ mod tests {
     fn late_run(preview: &str) -> SqlRun {
         SqlRun {
             statements: vec![SharedStatement::new(StatementResult {
+                statement: 0,
+                set: None,
                 preview: preview.into(),
                 outcome: StatementOutcome::Rows(crate::db::QueryResult::default()),
                 truncated: true,
@@ -1127,6 +1131,8 @@ mod tests {
         let (dom, mut state, id) = state_with_connection();
         let unconfirmed = |preview: &str| {
             SharedStatement::new(StatementResult {
+                statement: 0,
+                set: None,
                 preview: preview.into(),
                 outcome: StatementOutcome::Rows(crate::db::QueryResult::default()),
                 truncated: true,

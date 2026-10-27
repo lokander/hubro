@@ -2999,6 +2999,8 @@ mod tests {
 
     fn rows_statement() -> SharedStatement {
         SharedStatement::new(StatementResult {
+            statement: 0,
+            set: None,
             preview: "SELECT 1".into(),
             outcome: StatementOutcome::Rows(crate::db::QueryResult {
                 columns: Vec::new(),

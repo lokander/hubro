@@ -1572,10 +1572,18 @@ fn read_outcome(dialect: Dialect, result: QueryResult) -> StatementOutcome {
     }
 }
 
-/// One executed statement: its preview (for the result header) plus its
-/// outcome.
+/// One executed statement's result: its preview (for the result header) plus
+/// its outcome. A statement that returned several result sets — on SQL Server
+/// one statement can — reports one of these per set, in order, sharing
+/// `statement` and told apart by `set`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatementResult {
+    /// Which statement of the script this came from, 0-based — the same
+    /// numbering a failure's `statement_index` uses.
+    pub statement: usize,
+    /// Which of the statement's result sets this is, when it returned more
+    /// than one; `None` for every statement that returned one result.
+    pub set: Option<SetOf>,
     pub preview: String,
     pub outcome: StatementOutcome,
     /// True when a read hit the [`MAX_QUERY_ROWS`] fetch cap and its result
@@ -1588,14 +1596,29 @@ pub struct StatementResult {
     pub rest: RestOfRead,
 }
 
-/// A read's outcome as a run reports it: its rows, whether the row cap cut
-/// it short, and whether its rest was then stopped.
-fn rows_outcome(dialect: Dialect, capped: Capped) -> (StatementOutcome, bool, RestOfRead) {
-    (
-        read_outcome(dialect, capped.result),
-        capped.truncated,
-        capped.rest,
-    )
+/// Where one result set falls among its statement's: the `index`th (0-based)
+/// of `count`, which is always more than one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetOf {
+    pub index: usize,
+    pub count: usize,
+}
+
+/// A read's outcome as a run reports it: one entry per result set, each with
+/// its rows, whether the row cap cut it short, and whether its rest was then
+/// stopped. Only the last set can be either; the sets before it were read
+/// whole.
+fn rows_outcomes(dialect: Dialect, capped: Capped) -> Vec<(StatementOutcome, bool, RestOfRead)> {
+    capped
+        .earlier
+        .into_iter()
+        .map(|set| (read_outcome(dialect, set), false, RestOfRead::Ran))
+        .chain(std::iter::once((
+            read_outcome(dialect, capped.result),
+            capped.truncated,
+            capped.rest,
+        )))
+        .collect()
 }
 
 /// What a failed script's rollback actually undid — the state the editor
@@ -2097,28 +2120,37 @@ async fn run_statements<E: StatementExecutor>(
                     .finish_with_read(statement, MAX_QUERY_ROWS, cap)
                     .await;
                 ended = Some(end);
-                read.map(|capped| rows_outcome(dialect, capped))
+                read.map(|capped| rows_outcomes(dialect, capped))
             }
             Step::Read => exec
                 .as_mut()
                 .expect("held until the last statement")
                 .read(statement, MAX_QUERY_ROWS, cap)
                 .await
-                .map(|capped| rows_outcome(dialect, capped)),
+                .map(|capped| rows_outcomes(dialect, capped)),
             Step::Write => exec
                 .as_mut()
                 .expect("held until the last statement")
                 .write(statement)
                 .await
-                .map(|affected| (StatementOutcome::Affected(affected), false, RestOfRead::Ran)),
+                .map(|affected| {
+                    vec![(StatementOutcome::Affected(affected), false, RestOfRead::Ran)]
+                }),
         };
         match outcome {
-            Ok((outcome, truncated, rest)) => on_result(StatementResult {
-                preview: statement_preview(statement),
-                outcome,
-                truncated,
-                rest,
-            }),
+            Ok(sets) => {
+                let count = sets.len();
+                for (index, (outcome, truncated, rest)) in sets.into_iter().enumerate() {
+                    on_result(StatementResult {
+                        statement: statement_index,
+                        set: (count > 1).then_some(SetOf { index, count }),
+                        preview: statement_preview(statement),
+                        outcome,
+                        truncated,
+                        rest,
+                    });
+                }
+            }
             Err(error) => {
                 failure = Some((statement_index, error));
                 break;
