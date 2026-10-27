@@ -44,6 +44,7 @@ use crate::db::registry::RolledBack;
 use crate::db::script::{
     final_read_may_close, statement_needs, tsql_route, RowsAffected, TsqlRoute,
 };
+use crate::db::sqlx_common::{turn, DRAIN_CHECK_ROWS, DRAIN_TURN_EVERY};
 use crate::db::staged::CheckedStatement;
 use crate::db::value::{cap_value, ColumnInfo, QueryResult, Value};
 
@@ -826,8 +827,16 @@ async fn run_query(
     // No caps: `u64::MAX`/`usize::MAX` make both bounds unreachable, so this
     // is the capped read with its two limiters switched off rather than a
     // second copy of the same loop.
-    let (result, _, abandoned) =
-        run_query_capped(client, sql, params, false, u64::MAX, usize::MAX).await?;
+    let (result, _, abandoned) = run_query_capped(
+        client,
+        sql,
+        params,
+        false,
+        Rest::Leave,
+        u64::MAX,
+        usize::MAX,
+    )
+    .await?;
     Ok((result, abandoned))
 }
 
@@ -846,14 +855,15 @@ trait RowSink {
 /// ([`tsql_route`]); the rows come back the same either way.
 ///
 /// Returns the sink and whether the stream was abandoned with data still
-/// unread — the sink stopped early, or a second result set arrived. Only the
-/// first is read, which mirrors the sqlx backends, where one statement yields
-/// one result.
+/// unread — the sink stopped early, or a second result set arrived, and
+/// `rest` said to leave it. Only the first set is kept, which mirrors the
+/// sqlx backends, where one statement yields one result.
 async fn read_first_result_set<S: RowSink>(
     client: &mut TdsClient,
     sql: &str,
     params: &[Value],
     batch: bool,
+    rest: Rest,
     start: impl FnOnce(Option<&[Column]>) -> Result<S, TdsError>,
 ) -> Result<(S, bool), TdsError> {
     let mut stream = if batch {
@@ -871,17 +881,65 @@ async fn read_first_result_set<S: RowSink>(
             QueryItem::Metadata(_) => {
                 result_sets += 1;
                 if result_sets > 1 {
-                    return Ok((sink, true));
+                    return read_rest(stream, rest).await.map(|left| (sink, left));
                 }
             }
             QueryItem::Row(row) => {
                 if sink.row(&row)?.is_break() {
-                    return Ok((sink, true));
+                    return read_rest(stream, rest).await.map(|left| (sink, left));
                 }
             }
         }
     }
     Ok((sink, false))
+}
+
+/// What [`read_first_result_set`] does with the rest of a response it stops
+/// reading early — rows past the cap, or a result set after the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rest {
+    /// Leave it on the stream. Only for a connection that is discarded
+    /// after: whatever is left would otherwise be read by the connection's
+    /// next request, which is where its error is lost ([`read_rest`]).
+    Leave,
+    /// Read it to its end here, and fail with the first error it holds.
+    Read,
+}
+
+/// Reads the rest of a response as `rest` says. Returns whether anything was
+/// left unread.
+///
+/// **The rest is read by hubro, never by tiberius**, because tiberius loses
+/// its errors. tiberius reads what a result stream left behind at the start
+/// of the connection's next request (`flush_stream`), as raw packets with no
+/// token decoded, so an ERROR token in it is discarded; and the stream itself
+/// holds a server error back until the whole response has been read
+/// (`TokenStream` keeps the first as `last_error` and returns it at the end).
+/// Measured before: a capped batch ending in `SELECT 1/0`, with `SELECT 2`
+/// after it, finished `Ok`; a failed `INSERT` past the cap of an atomic
+/// script's read was committed with the rest of the script; and a script's
+/// own `COMMIT` after one ran. Read here, the error fails the read — the
+/// statement it belongs to — as a Postgres-wire read's error past the cap
+/// does (`sqlx_common::read_rest`).
+///
+/// The rows are dropped as they come, with a [`turn`]
+/// for the thread every [`DRAIN_TURN_EVERY`]: over localhost the next row is
+/// always waiting, so without one the whole rest is read in one poll, on the
+/// UI thread a script runs on, and a click on Cancel waits for it.
+async fn read_rest(mut stream: tiberius::QueryStream<'_>, rest: Rest) -> Result<bool, TdsError> {
+    if rest == Rest::Leave {
+        return Ok(true);
+    }
+    let mut read = 0u64;
+    let mut since_turn = Instant::now();
+    while stream.try_next().await?.is_some() {
+        read += 1;
+        if read.is_multiple_of(DRAIN_CHECK_ROWS) && since_turn.elapsed() >= DRAIN_TURN_EVERY {
+            turn().await;
+            since_turn = Instant::now();
+        }
+    }
+    Ok(false)
 }
 
 /// Runs a parameterized non-row statement via the driver's RPC path,
@@ -1186,8 +1244,10 @@ pub async fn execute(pool: &MssqlPool, sql: &str) -> Result<RowsAffected, DbErro
 /// the *next* query on that connection, which for a huge result would defer
 /// the whole download to some innocent later query — so the connection is
 /// discarded instead (one reconnect is far cheaper). Unless the statement may
-/// write: a write that returns rows ends only once its response is read, so
-/// then the rest is read here.
+/// write: a write that returns rows (`INSERT … OUTPUT`, or a batch that
+/// writes after a long SELECT) only finishes once its response has been read
+/// — discarding the connection aborted it — so then the rest is read here,
+/// and an error it ends in is the read's ([`read_rest`]).
 pub async fn query_capped(
     pool: &MssqlPool,
     sql: &str,
@@ -1195,23 +1255,19 @@ pub async fn query_capped(
     max_rows: u64,
     cell_cap: usize,
 ) -> Result<(QueryResult, bool), DbError> {
+    let needs = statement_needs(sql, crate::db::sql::Dialect::SqlServer);
+    let rest = if needs.mutate || needs.ddl {
+        Rest::Read
+    } else {
+        Rest::Leave
+    };
     let mut conn = pool.acquire().await?;
     let result = conn
-        .request(async |c| run_query_capped(c, sql, params, false, max_rows, cell_cap).await)
+        .request(async |c| run_query_capped(c, sql, params, false, rest, max_rows, cell_cap).await)
         .await;
     let (result, truncated, abandoned) = settle(&mut conn, result)?;
-    if truncated || abandoned {
-        let needs = statement_needs(sql, crate::db::sql::Dialect::SqlServer);
-        if needs.mutate || needs.ddl {
-            // A write that returns rows (`INSERT … OUTPUT`, or a batch that
-            // writes after a long SELECT) only finishes once its response has
-            // been read; discarding the connection here aborted it. Read the
-            // rest, and report an error it ends in.
-            let drained = conn.request(async |c| run_batch(c, "SELECT 1").await).await;
-            settle(&mut conn, drained)?;
-        } else {
-            conn.discard();
-        }
+    if abandoned {
+        conn.discard();
     }
     Ok((result, truncated))
 }
@@ -1219,8 +1275,9 @@ pub async fn query_capped(
 /// [`query_capped`] against the connection held by a script transaction — the
 /// read path for statements inside an atomically-wrapped script. No
 /// bound params: scripts are raw text. Unlike the pool path, a truncated read
-/// keeps the connection (discarding it would kill the open transaction); the
-/// deferred drain of the abandoned rows is the price of atomicity.
+/// keeps the connection (discarding it would kill the open transaction), so
+/// the rest of its response is read before the read returns ([`read_rest`]):
+/// it runs either way, and an error in it is this statement's.
 pub async fn query_capped_conn(
     tx: &mut MssqlTx,
     sql: &str,
@@ -1249,12 +1306,12 @@ async fn query_capped_held(
     let result = conn
         .request(async |c| {
             checked_batch(c, route, async |c| {
-                run_query_capped(c, sql, &[], batch, max_rows, cell_cap).await
+                run_query_capped(c, sql, &[], batch, Rest::Read, max_rows, cell_cap).await
             })
             .await
         })
         .await;
-    let (result, truncated, _abandoned) = settle(conn, result)?.map_err(|c| c.error())?;
+    let (result, truncated, _) = settle(conn, result)?.map_err(|c| c.error())?;
     Ok((result, truncated))
 }
 
@@ -1262,16 +1319,18 @@ async fn query_capped_held(
 /// most `max_rows` rows and capping each cell to `cell_cap` bytes. The first
 /// bool is whether rows existed past the cap; the second is whether the
 /// stream was abandoned with data still unread (extra result set — the row
-/// cap breaking early always leaves data, so `truncated` implies it).
+/// cap breaking early always leaves data, so `truncated` implies it, unless
+/// `rest` read it).
 async fn run_query_capped(
     client: &mut TdsClient,
     sql: &str,
     params: &[Value],
     batch: bool,
+    rest: Rest,
     max_rows: u64,
     cell_cap: usize,
 ) -> Result<(QueryResult, bool, bool), TdsError> {
-    let (rows, abandoned) = read_first_result_set(client, sql, params, batch, |columns| {
+    let (rows, abandoned) = read_first_result_set(client, sql, params, batch, rest, |columns| {
         Ok(CappedRows {
             columns: columns.map(column_infos).unwrap_or_default(),
             rows: Vec::new(),
@@ -1678,7 +1737,7 @@ pub async fn finish_script_conn_with_read(
     let read = held
         .request(async |c| {
             checked_batch(c, route, async |c| {
-                run_query_capped(c, sql, &[], batch, max_rows, cell_cap).await
+                run_query_capped(c, sql, &[], batch, Rest::Leave, max_rows, cell_cap).await
             })
             .await
         })
@@ -1731,19 +1790,20 @@ pub async fn export(
     // settled after the stream is dropped.
     let outcome = conn
         .request(async |c| {
-            let (mut rows, abandoned) = read_first_result_set(c, sql, params, false, |columns| {
-                let columns = columns
-                    .map(|columns| columns.iter().map(|c| c.name().to_string()).collect())
-                    .unwrap_or_default();
-                let mut sink = ExportSink::new(format, columns);
-                sink.begin(out).map_err(io_to_tds)?;
-                Ok(ExportRows {
-                    sink,
-                    out,
-                    written: 0,
+            let (mut rows, abandoned) =
+                read_first_result_set(c, sql, params, false, Rest::Leave, |columns| {
+                    let columns = columns
+                        .map(|columns| columns.iter().map(|c| c.name().to_string()).collect())
+                        .unwrap_or_default();
+                    let mut sink = ExportSink::new(format, columns);
+                    sink.begin(out).map_err(io_to_tds)?;
+                    Ok(ExportRows {
+                        sink,
+                        out,
+                        written: 0,
+                    })
                 })
-            })
-            .await?;
+                .await?;
             rows.sink.end(rows.out).map_err(io_to_tds)?;
             Ok((rows.written, abandoned))
         })

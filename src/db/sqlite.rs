@@ -1721,6 +1721,11 @@ mod tests {
         "commit_tx",
         "rollback_tx",
         "SqlxBackend",
+        // The pacing for reading the rest of a cut-short result, which SQL
+        // Server's backend shares: a sleep and two numbers.
+        "turn",
+        "DRAIN_CHECK_ROWS",
+        "DRAIN_TURN_EVERY",
     ];
 
     /// The generic sqlx paths this file calls with text. They do take text,
