@@ -33,9 +33,9 @@ fn truncation_notice(rest: RestOfRead, late: Option<&LateRest>) -> String {
         ),
         RestOfRead::Unconfirmed => match late {
             None => format!(
-                "{notice} The rest of this result was read after the run ended, and its \
-                 outcome isn't reported. If the statement wrote anything and the rest failed, \
-                 its writes were undone."
+                "{notice} The rest of this result is still being read after the run ended; \
+                 this note will say how it ends. If the statement wrote anything and the rest \
+                 fails, its writes are undone."
             ),
             Some(LateRest::Finished) => format!(
                 "{notice} The rest of this result was read after the run ended and finished."
@@ -609,15 +609,16 @@ mod tests {
         let unconfirmed = truncation_notice(RestOfRead::Unconfirmed, None);
         assert!(unconfirmed.starts_with(&ran));
         // Shown on every capped last read on these engines, plain reads
-        // included, and after the background read has finished: so it leads
-        // with the condition, speaks of the past, and claims only the writes
-        // a failure undoes (a call outside the transaction is not).
+        // included, until the background read ends and the note is replaced:
+        // so it leads with the condition, says the outcome is still to come,
+        // and claims only the writes a failure undoes (a call outside the
+        // transaction is not).
         assert!(unconfirmed.ends_with(
-            "The rest of this result was read after the run ended, and its outcome isn't \
-             reported. If the statement wrote anything and the rest failed, its writes were \
-             undone."
+            "The rest of this result is still being read after the run ended; this note will \
+             say how it ends. If the statement wrote anything and the rest fails, its writes \
+             are undone."
         ));
-        assert!(!unconfirmed.contains("still"));
+        assert!(!unconfirmed.contains("isn't reported"));
         assert!(!unconfirmed.contains("everything the statement did"));
         // Once the background read has ended, the notice says how: finished,
         // or failed with the server's error and the writes undone, or not

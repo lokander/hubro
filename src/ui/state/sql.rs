@@ -421,16 +421,28 @@ impl AppState {
                 run.status = status;
             }
             // The last read's rest is still being read: say how it ended once
-            // it has. A task of its own, so the run is over now and its handle
-            // released; spawn_forever, so it outlives the editor.
+            // it has.
             if let Some(pending) = pending {
-                spawn_forever(async move {
-                    let outcome = pending.outcome().await;
-                    self.land_late_rest(id, buffer, generation, outcome);
-                });
+                self.watch_late_rest(id, buffer, generation, pending);
             }
         });
         self.sql_runs.write().attach((id, buffer), task);
+    }
+
+    /// Waits for the outcome of a rest read after the run, then lands it
+    /// ([`Self::land_late_rest`]). A task of its own, so the run is over and
+    /// its handle released; spawn_forever, so it outlives the editor.
+    fn watch_late_rest(
+        self,
+        id: ConnectionId,
+        buffer: u64,
+        generation: u64,
+        pending: crate::db::PendingRest,
+    ) {
+        spawn_forever(async move {
+            let outcome = pending.outcome().await;
+            self.land_late_rest(id, buffer, generation, outcome);
+        });
     }
 
     /// Puts a late rest's outcome on the statement it belongs to, when the
@@ -1005,6 +1017,87 @@ mod tests {
     }
 
     use crate::db::OpenTransaction;
+
+    /// A late outcome for a connection whose tab has closed is dropped: the
+    /// connection left the registry while its run's slot still matched.
+    #[tokio::test]
+    async fn a_late_rest_for_a_closed_tab_is_dropped() {
+        use crate::db::LateRest;
+        let (dom, mut state, id) = state_with_connection();
+        dom.in_runtime(|| {
+            let generation = state.claim_run_slot(id, 0, late_run("SELECT f()"));
+            let mut registry = state.registry;
+            registry.write().remove(id);
+            state.land_late_rest(id, 0, generation, LateRest::Finished);
+            assert_eq!(state.sql_runs.peek()[&(id, 0)].late_rest, None);
+        });
+    }
+
+    /// The run's watcher lands the outcome on its own run once it arrives —
+    /// driven through the runtime with a stand-in for the background read.
+    /// `execute_script` hands its watcher the run's own generation, pinned
+    /// below as written.
+    #[tokio::test]
+    async fn a_watched_rest_resolves_its_own_run() {
+        use crate::db::{LateRest, PendingRest};
+        let (mut dom, state, id) = state_with_connection();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        dom.in_runtime(|| {
+            let mut state = state;
+            let generation = state.claim_run_slot(id, 0, late_run("SELECT f()"));
+            state.watch_late_rest(id, 0, generation, PendingRest(receiver));
+        });
+        assert_eq!(
+            dom.in_runtime(|| state.sql_runs.peek()[&(id, 0)].late_rest.clone()),
+            None
+        );
+        sender.send(LateRest::Failed("boom".into())).unwrap();
+        let landed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while dom
+                .in_runtime(|| state.sql_runs.peek()[&(id, 0)].late_rest.clone())
+                .is_none()
+            {
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), dom.wait_for_work())
+                        .await;
+            }
+        })
+        .await;
+        assert!(landed.is_ok(), "the outcome never landed");
+        assert_eq!(
+            dom.in_runtime(|| state.sql_runs.peek()[&(id, 0)].late_rest.clone()),
+            Some((0, LateRest::Failed("boom".into())))
+        );
+        let shipped =
+            crate::source_scan::code_only(&crate::source_scan::shipped(include_str!("sql.rs")));
+        assert_eq!(
+            shipped.matches("self.watch_late_rest(").count(),
+            1,
+            "execute_script watches its rest once"
+        );
+        assert!(shipped.contains(
+            "if let Some(pending) = pending { self.watch_late_rest(id, buffer, generation, pending); }"
+        ));
+    }
+
+    /// A finished run whose one statement's rest is still being read.
+    fn late_run(preview: &str) -> SqlRun {
+        SqlRun {
+            statements: vec![SharedStatement::new(StatementResult {
+                preview: preview.into(),
+                outcome: StatementOutcome::Rows(crate::db::QueryResult::default()),
+                truncated: true,
+                rest: crate::db::RestOfRead::Unconfirmed,
+            })],
+            status: RunStatus::Done {
+                elapsed_ms: 1,
+                rolled_back: None,
+                connection_closed: false,
+            },
+            explain: false,
+            late_rest: None,
+        }
+    }
 
     /// The gate a late rest's outcome passes: the run it came from, still
     /// current, in an open tab, and finished.

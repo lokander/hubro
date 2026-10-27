@@ -1064,16 +1064,43 @@ pub(super) fn drain_then_close(
 }
 
 /// How the rest of a read ended, from the ping that read it to its end
-/// ([`drain_then_close`]). The server's own error ended the statement, and
-/// undid it with its writes. Any other error — the connection lost, a
+/// ([`drain_then_close`]). An error the server sent ended the statement and
+/// undid it with its writes — unless its code says the outcome is not known
+/// ([`server_error_undoes`]). Any other error — the connection lost, a
 /// protocol failure — leaves unknown whether the statement had finished by
-/// then. Over plain data so a test can execute it.
+/// then. The server's message loses a trailing period, since the notice
+/// carries on after it. Over plain data so a test can execute it.
 pub(super) fn late_rest(ping: Result<(), sqlx::Error>) -> super::value::LateRest {
     use super::value::LateRest;
     match ping {
         Ok(()) => LateRest::Finished,
-        Err(sqlx::Error::Database(error)) => LateRest::Failed(error.to_string()),
+        Err(sqlx::Error::Database(error)) if !server_error_undoes(error.code().as_deref()) => {
+            LateRest::Unknown
+        }
+        Err(sqlx::Error::Database(error)) => {
+            LateRest::Failed(error.message().trim_end_matches('.').to_string())
+        }
         Err(_) => LateRest::Unknown,
+    }
+}
+
+/// Whether an error the server sent while the rest of a read was read
+/// establishes that the statement was undone. Not every one does:
+///
+/// - SQLSTATE class `08`, connection exception, is what a proxy or pooler
+///   sends when it loses the upstream, which says nothing about whether the
+///   statement finished there;
+/// - CockroachDB's `40003`, "statement completion unknown" (a result is
+///   ambiguous), says so in its name.
+///
+/// Every other error ended the statement, and its implicit transaction
+/// aborted with it: a `22012`, a cancel's `57014`, an administrator's
+/// `57P01`. An error with no code is the server's own too.
+fn server_error_undoes(sqlstate: Option<&str>) -> bool {
+    match sqlstate {
+        Some(code) if code.starts_with("08") => false,
+        Some("40003") => false,
+        _ => true,
     }
 }
 
@@ -3664,16 +3691,19 @@ mod tests {
         use super::late_rest;
         use crate::db::LateRest;
         #[derive(Debug)]
-        struct ServerSaid;
+        struct ServerSaid(Option<&'static str>, &'static str);
         impl std::fmt::Display for ServerSaid {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("division by zero")
+                f.write_str(self.1)
             }
         }
         impl std::error::Error for ServerSaid {}
         impl sqlx::error::DatabaseError for ServerSaid {
             fn message(&self) -> &str {
-                "division by zero"
+                self.1
+            }
+            fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+                self.0.map(Into::into)
             }
             fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
                 self
@@ -3688,11 +3718,37 @@ mod tests {
                 sqlx::error::ErrorKind::Other
             }
         }
+        let server = |code, message| {
+            late_rest(Err(sqlx::Error::Database(Box::new(ServerSaid(
+                code, message,
+            )))))
+        };
         assert_eq!(late_rest(Ok(())), LateRest::Finished);
+        // Errors that ended the statement, undoing it.
+        for (code, message) in [
+            (Some("22012"), "division by zero"),
+            (Some("57014"), "canceling statement due to user request"),
+            (
+                Some("57P01"),
+                "terminating connection due to administrator command",
+            ),
+            (None, "a server error with no code"),
+        ] {
+            assert_eq!(
+                server(code, message),
+                LateRest::Failed(message.into()),
+                "{code:?}"
+            );
+        }
+        // A trailing period goes, as the notice carries on after it.
         assert_eq!(
-            late_rest(Err(sqlx::Error::Database(Box::new(ServerSaid)))),
-            LateRest::Failed("division by zero".into())
+            server(Some("23505"), "duplicate key."),
+            LateRest::Failed("duplicate key".into())
         );
+        // Errors that say nothing of whether the statement finished.
+        for code in ["08006", "08003", "08000", "40003"] {
+            assert_eq!(server(Some(code), "lost"), LateRest::Unknown, "{code}");
+        }
         for lost in [
             sqlx::Error::Io(std::io::Error::other("connection reset")),
             sqlx::Error::PoolClosed,
