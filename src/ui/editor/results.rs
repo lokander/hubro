@@ -45,9 +45,10 @@ fn truncation_notice(rest: RestOfRead, late: Option<&LateRest>) -> String {
                  statement wrote anything, its writes were undone."
             ),
             Some(LateRest::Unknown) => format!(
-                "{notice} The rest of this result was read after the run ended, and the \
-                 connection was lost before it reported, so its outcome is unknown. If the \
-                 statement wrote anything, its writes may have been undone."
+                "{notice} The rest of this result was read after the run ended, but hubro \
+                 could not learn whether it finished (the connection was lost, or the server \
+                 could not say). If the statement wrote anything, its writes may have been \
+                 undone."
             ),
         },
     }
@@ -637,9 +638,14 @@ mod tests {
              statement wrote anything, its writes were undone."
         ));
         let unknown = truncation_notice(RestOfRead::Unconfirmed, Some(&LateRest::Unknown));
-        assert!(unknown.contains("its outcome is unknown"));
-        assert!(unknown.contains("may have been undone"));
-        assert!(!unknown.contains("finished") && !unknown.contains("failed"));
+        // Covers both ways an outcome goes unknown: a lost connection, and a
+        // server that says it cannot tell (CockroachDB's `40003`).
+        assert!(unknown.ends_with(
+            "The rest of this result was read after the run ended, but hubro could not learn \
+             whether it finished (the connection was lost, or the server could not say). If \
+             the statement wrote anything, its writes may have been undone."
+        ));
+        assert!(!unknown.contains("and finished") && !unknown.contains("failed after"));
         // A late outcome speaks only for an unconfirmed rest.
         for rest in [
             RestOfRead::Ran,
