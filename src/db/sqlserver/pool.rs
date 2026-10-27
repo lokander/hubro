@@ -881,12 +881,14 @@ async fn read_first_result_set<S: RowSink>(
             QueryItem::Metadata(_) => {
                 result_sets += 1;
                 if result_sets > 1 {
-                    return read_rest(stream, rest).await.map(|left| (sink, left));
+                    let read = rest != Rest::Leave;
+                    return read_rest(stream, read).await.map(|left| (sink, left));
                 }
             }
             QueryItem::Row(row) => {
                 if sink.row(&row)?.is_break() {
-                    return read_rest(stream, rest).await.map(|left| (sink, left));
+                    let read = rest == Rest::Read;
+                    return read_rest(stream, read).await.map(|left| (sink, left));
                 }
             }
         }
@@ -899,15 +901,22 @@ async fn read_first_result_set<S: RowSink>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Rest {
     /// Leave it on the stream. Only for a connection that is discarded
-    /// after: whatever is left would otherwise be read by the connection's
-    /// next request, which is where its error is lost ([`read_rest`]).
+    /// after, and only for hubro's own SQL (catalog reads, exports): whatever
+    /// is left would otherwise be read by the connection's next request,
+    /// which is where its error is lost ([`read_rest`]).
     Leave,
+    /// Leave the rows past the row cap — the statement is reported cut short
+    /// there, and its connection is discarded — but read a result set after
+    /// the first to its end, failing with the first error it holds. A batch
+    /// like `SELECT 1 AS a SELECT 1/0` is not cut short at all: measured,
+    /// leaving its second set reported a lone run of it `Ok`.
+    AtCap,
     /// Read it to its end here, and fail with the first error it holds.
     Read,
 }
 
-/// Reads the rest of a response as `rest` says. Returns whether anything was
-/// left unread.
+/// Reads the rest of a response to its end if `read`, else leaves it.
+/// Returns whether anything was left unread.
 ///
 /// **The rest is read by hubro, never by tiberius**, because tiberius loses
 /// its errors. tiberius reads what a result stream left behind at the start
@@ -926,10 +935,10 @@ enum Rest {
 /// [`DRAIN_TURN_EVERY`] — the Postgres-wire path's pacing, where a rest read
 /// in one poll was measured to hold the UI thread for 44 s. Here it is a
 /// bound, not a measured fix: an endless SQL Server rest stayed abortable
-/// without the turns (`tests/db_sqlserver.rs`, `…_leaves_the_thread_to_others`),
+/// without the turns (`tests/db_sqlserver.rs`, `…_stays_abortable_while_the_rest_…`),
 /// tiberius's read returning `Pending` on its own.
-async fn read_rest(mut stream: tiberius::QueryStream<'_>, rest: Rest) -> Result<bool, TdsError> {
-    if rest == Rest::Leave {
+async fn read_rest(mut stream: tiberius::QueryStream<'_>, read: bool) -> Result<bool, TdsError> {
+    if !read {
         return Ok(true);
     }
     let mut read = 0u64;
@@ -1241,11 +1250,12 @@ pub async fn execute(pool: &MssqlPool, sql: &str) -> Result<RowsAffected, DbErro
 /// with table or value size. Returns the (bounded) result and
 /// whether more rows existed beyond the cap.
 ///
-/// A truncated read (or an abandoned second result set) leaves the rest of
-/// the server's response mid-stream; tiberius would silently drain it before
-/// the *next* query on that connection, which for a huge result would defer
-/// the whole download to some innocent later query — so the connection is
-/// discarded instead (one reconnect is far cheaper). Unless the statement may
+/// A truncated read leaves the rest of the server's response mid-stream;
+/// tiberius would silently drain it before the *next* query on that
+/// connection, which for a huge result would defer the whole download to some
+/// innocent later query — so the connection is discarded instead (one
+/// reconnect is far cheaper). A result set after the first is read to its
+/// end, so its error is the read's ([`Rest::AtCap`]). Unless the statement may
 /// write: a write that returns rows (`INSERT … OUTPUT`, or a batch that
 /// writes after a long SELECT) only finishes once its response has been read
 /// — discarding the connection aborted it — so then the rest is read here,
@@ -1261,7 +1271,7 @@ pub async fn query_capped(
     let rest = if needs.mutate || needs.ddl {
         Rest::Read
     } else {
-        Rest::Leave
+        Rest::AtCap
     };
     let mut conn = pool.acquire().await?;
     let result = conn
@@ -1668,19 +1678,23 @@ pub async fn end_script_conn(conn: &mut MssqlScriptConn) -> Result<bool, DbError
 /// [`ScriptConn::finish_with_read`](crate::db::registry::ScriptConn::finish_with_read).
 ///
 /// Unless [`final_read_may_close`] says the batch can neither touch the
-/// transaction nor write, the read is followed by the ordinary end, which
-/// first reads and discards whatever of the response is left — a batch led by
-/// a `SELECT` can carry `COMMIT`, `BEGIN TRAN` or an `INSERT … OUTPUT`, and
-/// every one of them only finishes once its response has been read.
+/// transaction nor write, the read reads its whole response itself
+/// ([`Rest::Read`]) — a batch led by a `SELECT` can carry `COMMIT`, `BEGIN
+/// TRAN` or an `INSERT … OUTPUT`, every one of them only finishes once its
+/// response has been read, and an error in it is the read's — and is then
+/// followed by the ordinary end.
 ///
 /// Otherwise `@@TRANCOUNT` is read *before* the read. A read the row cap cut
-/// short, or one that left a second result set unread, is then followed by
-/// nothing: tiberius would first drain the rest of the response — measured,
-/// 1.55 s for a capped `SELECT` over 3M rows on localhost, where discarding
-/// the connection takes 100 ms — so the connection is discarded instead, as a
-/// capped read's always was, and the server rolls back whatever was open on
+/// short is then followed by nothing: reading the rest of the response first
+/// measured 1.55 s for a capped `SELECT` over 3M rows on localhost, where
+/// discarding the connection takes 100 ms — so the connection is discarded
+/// instead, as a capped read's always was, the read is reported
+/// [`RestOfRead::Stopped`], and the server rolls back whatever was open on
 /// it. The cost is a reconnect (a TLS login; over an SSH tunnel, a new
-/// channel) the next time the pool needs that connection.
+/// channel) the next time the pool needs that connection. Only the cap leaves
+/// a rest behind ([`Rest::AtCap`]): a result set after the first is read to
+/// its end, so its error is the read's — the batch was not cut short, and
+/// the rest is reported run.
 pub async fn finish_script_conn_with_read(
     conn: &mut MssqlScriptConn,
     sql: &str,
@@ -1739,25 +1753,22 @@ pub async fn finish_script_conn_with_read(
     let read = held
         .request(async |c| {
             checked_batch(c, route, async |c| {
-                run_query_capped(c, sql, &[], batch, Rest::Leave, max_rows, cell_cap).await
+                run_query_capped(c, sql, &[], batch, Rest::AtCap, max_rows, cell_cap).await
             })
             .await
         })
         .await;
     match settle(held, read).and_then(|read| read.map_err(|c| c.error())) {
-        Ok((result, truncated, abandoned)) if truncated || abandoned => {
+        // `Rest::AtCap` leaves a rest only at the cap.
+        Ok((result, true, _)) => {
             held.discard();
             FinishedRead {
                 // Ended with its connection: whatever its rest would have
                 // done is not done, and the editor says so.
                 read: Ok(Capped {
                     result,
-                    truncated,
-                    rest: if truncated {
-                        RestOfRead::Stopped
-                    } else {
-                        RestOfRead::Ran
-                    },
+                    truncated: true,
+                    rest: RestOfRead::Stopped,
                 }),
                 ended: Ok(open),
                 after: AfterRead::Close,
