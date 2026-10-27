@@ -3241,6 +3241,15 @@ async fn sqlserver_an_error_in_the_rest_of_a_capped_read_fails_its_statement() {
             "PRIMARY KEY",
             open,
         ),
+        // A lone statement: the run may close its connection on it, and
+        // leaves its rest only at the cap. Measured before: `Ok`, with the
+        // second set dropped with the connection.
+        (
+            "SELECT 1 AS a\nSELECT 1/0".to_string(),
+            0,
+            "Divide by zero",
+            Rollback::None,
+        ),
         // Not cut short: a second result set is left unread the same way.
         (
             "SELECT 1 AS a SELECT 2 AS b SELECT 1/0\nGO\nSELECT 3".to_string(),
@@ -3291,8 +3300,16 @@ async fn sqlserver_an_error_in_the_rest_of_a_capped_read_fails_its_statement() {
         "expected each script to fail at its capped read:\n{}",
         wrong.join("\n")
     );
-    // The pool's capped read reads the rest of a batch that may write, and
-    // the rest's error is the read's.
+    // The pool's capped read reads a second result set of a pure read to its
+    // end, and the rest of a batch that may write; either's error is the
+    // read's.
+    let second = pool
+        .query_capped("SELECT 1 AS a SELECT 1/0", &[], 10_000)
+        .await;
+    assert!(
+        matches!(&second, Err(e) if e.to_string().contains("Divide by zero")),
+        "{second:?}"
+    );
     let pooled = pool
         .query_capped(&format!("{MSSQL_CAPPED_HEAD} {duplicate}"), &[], 10_000)
         .await;
@@ -3309,7 +3326,7 @@ async fn sqlserver_an_error_in_the_rest_of_a_capped_read_fails_its_statement() {
 }
 
 #[test]
-fn sqlserver_reading_the_rest_of_a_capped_read_leaves_the_thread_to_others() {
+fn sqlserver_a_run_stays_abortable_while_the_rest_of_a_capped_read_is_read() {
     // The rest of a capped read that is not the script's last is read before
     // the next statement, by hubro, on the thread the run is polled on — the
     // SQL tab's is the UI thread. Here the rest is endless, on a single
