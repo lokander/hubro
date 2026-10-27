@@ -1036,17 +1036,17 @@ pub async fn finish_script_conn_with_read(
 /// what the pool sent on a connection's return: sqlx answers it only once
 /// every pending response has been read. The connection keeps its pool slot
 /// until it is closed, as it did while the pool read it. A failure in the
-/// rest is not reported — the statement's own transaction ends with it, as it
-/// always did here — which is why such a read reports its rest
+/// rest ends the statement's own transaction with it, after the run has
+/// reported — which is why such a read reports its rest
 /// [`RestOfRead::Unconfirmed`] (`registry::rest_after`) rather than claiming
-/// it ran.
+/// it ran, and the outcome follows on the returned [`PendingRest`](super::value::PendingRest).
 ///
 /// Unlike every other rest, this one is read by sqlx in one poll — the stream
 /// is gone — so it holds one of the runtime's worker threads until it is
 /// done. Not the thread the run is polled on: a `tokio::spawn`ed task runs on
 /// the worker pool, and the SQL tab's run on the UI thread.
 ///
-/// What the rest met is sent on the returned [`PendingRest`] once it has been
+/// What the rest met is sent on that [`PendingRest`](super::value::PendingRest) once it has been
 /// read ([`late_rest`]), so whoever shows the run can say so; the run does not
 /// wait for it.
 pub(super) fn drain_then_close(

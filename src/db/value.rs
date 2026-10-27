@@ -155,9 +155,10 @@ pub enum RestOfRead {
     /// Still running when the run ended: read on in the background, and its
     /// connection closed after — the last read of a run on an engine that
     /// cannot say whether the statement has written
-    /// (`postgres::knows_whether_written`). What becomes of it there is not
-    /// reported, and an error past the cap undoes everything the statement
-    /// did, rows before the cap included. So this claims nothing about its
+    /// (`postgres::knows_whether_written`). The run reports before it ends,
+    /// and an error past the cap undoes everything the statement did, rows
+    /// before the cap included; how it ended follows later, as a
+    /// [`LateRest`] on a [`PendingRest`]. So this claims nothing about its
     /// writes: measured on YugabyteDB, a `SELECT f(g)` whose function inserts
     /// a row per call and fails at call 15,000 was reported done, with the
     /// error reaching only the background read and none of its rows kept.
