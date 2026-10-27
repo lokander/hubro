@@ -2461,10 +2461,39 @@ pub fn wrap_atomically(caps: Capabilities, dialect: Dialect, statements: &[Strin
     caps.transactions
         && statements.len() > 1
         && !statements.iter().any(|s| {
+            // A T-SQL statement can hold transaction control past its first
+            // word (`IF @@TRANCOUNT > 0 COMMIT`), and one call now covers a
+            // whole batch, so 266 comes only at its end, after the rest has
+            // run outside the transaction (measured in review).
+            if dialect == Dialect::SqlServer && tsql_holds_transaction_control(s) {
+                return true;
+            }
             // Stripped once per statement: both checks only need the
             // stripped form.
             let stripped = strip_strings_and_comments(s, dialect);
             manages_own_transaction(&stripped) || is_non_transactional(dialect, &stripped)
+        })
+}
+
+/// Whether a SQL Server statement holds transaction control anywhere in it:
+/// `COMMIT` or `ROLLBACK`, or `TRAN`/`TRANSACTION` after `BEGIN`, `SAVE` or
+/// `DISTRIBUTED`. Not `SET TRANSACTION ISOLATION LEVEL`, which ends nothing.
+fn tsql_holds_transaction_control(sql: &str) -> bool {
+    let stripped = strip_strings_and_comments(sql, Dialect::SqlServer);
+    let words: Vec<String> = stripped
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    words
+        .iter()
+        .enumerate()
+        .any(|(i, word)| match word.as_str() {
+            "commit" | "rollback" => true,
+            "tran" | "transaction" => {
+                i > 0 && matches!(words[i - 1].as_str(), "begin" | "save" | "distributed")
+            }
+            _ => false,
         })
 }
 
@@ -3856,6 +3885,20 @@ mod tests {
         assert!(!wraps(&["BEGIN TRAN; INSERT INTO t VALUES (1); COMMIT"]));
         assert!(!wraps(&[
             "INSERT INTO t VALUES (1); BACKUP DATABASE db TO DISK = 'x'"
+        ]));
+        // Transaction control past a statement's first word: the batch runs
+        // on past it, so it is the script's own transaction, never wrapped.
+        assert!(!wraps(&[
+            "IF @@TRANCOUNT > 0 COMMIT TRAN; INSERT INTO t VALUES (1)"
+        ]));
+        assert!(!wraps(&[
+            "INSERT INTO u VALUES (7); IF @@TRANCOUNT > 0 ROLLBACK TRAN; INSERT INTO t VALUES (1)"
+        ]));
+        assert!(!wraps(&["INSERT INTO t VALUES (1); IF 1 = 1 BEGIN TRAN"]));
+        // An isolation level ends nothing, and stays wrapped.
+        assert!(wraps(&[
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; INSERT INTO t VALUES (1); \
+             INSERT INTO t VALUES (2)"
         ]));
 
         // How a batch is sent: a plain batch when any statement needs one, a
