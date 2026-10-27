@@ -1269,10 +1269,10 @@ pub fn statement_needs(sql: &str, dialect: Dialect) -> StatementNeeds {
 /// (`SELECT [o'brien] * INTO t2 FROM t`) must not invert string tracking
 /// and hide the `INTO`, and `SELECT [into]` must not over-prompt.
 pub fn needs_confirmation(sql: &str, dialect: Dialect) -> bool {
-    // A SQL Server batch, when any of its statements does.
-    if let Some(statements) = batch_statements(sql, dialect) {
-        return statements.iter().any(|s| needs_confirmation(s, dialect));
-    }
+    // Not folded over a SQL Server batch's statements, unlike
+    // [`statement_needs`]: it would change no answer. A batch led by anything
+    // but a read is confirmed, and one led by a read is scanned whole for an
+    // embedded write, which finds one in any statement of it.
     confirmation_needed(sql, &strip_strings_and_comments(sql, dialect), dialect)
 }
 
