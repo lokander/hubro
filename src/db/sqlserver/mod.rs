@@ -18,7 +18,7 @@ pub use pool::{
     finish_script_conn_with_read, open_mssql, open_mssql_with, query_capped, query_with,
     rollback_tx, MssqlAuth, MssqlPool, MssqlScriptConn, MssqlTx,
 };
-pub(crate) use pool::{query_capped_conn, query_capped_script_conn};
+pub(crate) use pool::{query_capped_conn, query_capped_script_conn, query_first_capped_conn};
 
 use std::collections::HashMap;
 

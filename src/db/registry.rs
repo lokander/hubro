@@ -27,6 +27,13 @@ use super::value::{Capped, QueryResult, RestOfRead, Value};
 /// against a multi-GB table can never buffer the whole result.
 pub const MAX_QUERY_ROWS: u64 = 10_000;
 
+/// The most result sets one statement's read keeps — SQL Server's, the only
+/// engine where a statement returns more than one. Rows are bounded by
+/// [`MAX_QUERY_ROWS`], but a set with no rows costs none of it, and a loop can
+/// return sets without end (`WHILE 1 = 1 SELECT TOP 0 1 AS a`): past this
+/// many, the read is cut short as it is at the row cap.
+pub const MAX_RESULT_SETS: usize = 100;
+
 /// Per-cell byte cap applied while streaming the free-form query path, so a
 /// `SELECT *` returning huge individual cells can't blow memory even within
 /// the row cap. Generous enough to show any reasonable value; the result is
@@ -178,6 +185,11 @@ impl ScriptTx<'_> {
                     postgres::Rest::Read,
                 )
                 .await?
+            }
+            // The script path keeps every result set; this keeps the first,
+            // as the pool's read does.
+            ScriptTx::SqlServer(tx) => {
+                sqlserver::query_first_capped_conn(tx, sql, max_rows, QUERY_CELL_CAP).await?
             }
             _ => self.query_capped_to(sql, max_rows, QUERY_CELL_CAP).await?,
         };

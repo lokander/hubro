@@ -19,9 +19,13 @@ const MAX_RENDERED_ROWS: usize = 500;
 /// and one read after the run (`RestOfRead::Unconfirmed`) says its outcome
 /// is not known.
 fn truncation_notice(rest: RestOfRead, late: Option<&LateRest>) -> String {
+    // The cap is the statement's, not this result's: on SQL Server one
+    // statement can return several result sets, which share it.
     let notice = format!(
-        "Result truncated — showing the first {MAX_QUERY_ROWS} rows to keep memory bounded. \
-         Add a LIMIT or a WHERE clause to narrow it."
+        "Result truncated — hubro keeps at most {MAX_QUERY_ROWS} rows (and \
+         {MAX_RESULT_SETS} result sets) of one statement's results to keep memory bounded, \
+         and this statement returned more than is shown. Add a LIMIT or a WHERE clause to \
+         narrow it."
     );
     match rest {
         RestOfRead::Ran => notice,
@@ -210,7 +214,11 @@ fn statements_reported(results: &[SharedStatement]) -> usize {
 /// when the statement returned more than one — the section number is the
 /// statement's, so it repeats.
 fn set_label(set: Option<SetOf>) -> Option<String> {
-    set.map(|set| format!("result {} of {}", set.index + 1, set.count))
+    set.map(|set| match set.count {
+        Some(count) => format!("result {} of {count}", set.index + 1),
+        // Cut short: the sets after this one were never read.
+        None => format!("result {}", set.index + 1),
+    })
 }
 
 /// The script-level footer: running indicator, total elapsed time (shown
@@ -479,7 +487,9 @@ fn StatementSection(
             }
             match &result.outcome {
                 StatementOutcome::Affected(_) => rsx! {},
-                StatementOutcome::Rows(rows) if rows.rows.is_empty() => rsx! {
+                // Cut short, an empty set is not all the statement returned:
+                // the notice above says so.
+                StatementOutcome::Rows(rows) if rows.rows.is_empty() && !result.truncated => rsx! {
                     p { class: "px-4 py-2 text-sm text-slate-500", "The statement returned no rows." }
                 },
                 StatementOutcome::Rows(_) => rsx! {
@@ -763,7 +773,10 @@ mod tests {
         let result = |statement: usize, set: Option<(usize, usize)>| {
             SharedStatement::new(crate::db::StatementResult {
                 statement,
-                set: set.map(|(index, count)| SetOf { index, count }),
+                set: set.map(|(index, count)| SetOf {
+                    index,
+                    count: Some(count),
+                }),
                 ..(*rows_statement("SELECT 1")).clone()
             })
         };
@@ -780,8 +793,21 @@ mod tests {
 
         assert_eq!(set_label(None), None);
         assert_eq!(
-            set_label(Some(SetOf { index: 1, count: 3 })).as_deref(),
+            set_label(Some(SetOf {
+                index: 1,
+                count: Some(3)
+            }))
+            .as_deref(),
             Some("result 2 of 3")
+        );
+        // Cut short: how many sets followed is not known.
+        assert_eq!(
+            set_label(Some(SetOf {
+                index: 1,
+                count: None
+            }))
+            .as_deref(),
+            Some("result 2")
         );
     }
 

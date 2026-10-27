@@ -40,7 +40,7 @@ use super::{column_infos, decode_row};
 use crate::db::entra::{EntraTokens, Secret};
 use crate::db::error::DbError;
 use crate::db::export::{export_io_err, ExportFormat, ExportSink};
-use crate::db::registry::RolledBack;
+use crate::db::registry::{RolledBack, MAX_RESULT_SETS};
 use crate::db::script::{
     final_read_may_close, statement_needs, tsql_route, RowsAffected, TsqlRoute,
 };
@@ -862,16 +862,28 @@ enum Sets {
     Every,
 }
 
-/// Runs a parameterized query and feeds its result sets to sinks `start`
-/// builds, each from its set's columns (`None`: the batch returned no result
-/// set) and the sinks made before it. The one copy of the TDS result loop:
-/// the buffered, capped and export paths differ only in their sinks. `batch`
-/// sends `sql` as a plain batch, with no parameters, rather than through
-/// `sp_executesql` ([`tsql_route`]); the rows come back the same either way.
-///
-/// Returns the sinks, one per set kept and never none, and whether the stream
-/// was abandoned with data still unread — a sink stopped early, or a second
-/// result set arrived under [`Sets::First`], and `rest` said to leave it.
+/// What [`read_sets`] read: a sink per result set kept, never none.
+struct ReadSets<S> {
+    sinks: Vec<S>,
+    /// Whether the stream was abandoned with data still unread — a sink
+    /// stopped early, a set refused, or a second result set arrived under
+    /// [`Sets::First`] — and `rest` said to leave it.
+    abandoned: bool,
+    /// Whether a result set after the last kept was refused (`next` said
+    /// `Break`): the read was cut short between sets rather than inside one.
+    cut_between_sets: bool,
+}
+
+/// Runs a parameterized query and feeds its result sets to sinks: the first
+/// set's to the one `first` builds from its columns (`None`: the batch
+/// returned no result set), and under [`Sets::Every`] each later set's to one
+/// `next` builds from its columns and the sinks before it — or refuses with
+/// `Break`, which cuts the read short there, as a sink's own `Break` cuts it
+/// inside a set. The one copy of the TDS result loop: the buffered, capped
+/// and export paths differ only in their sinks. `batch` sends `sql` as a
+/// plain batch, with no parameters, rather than through `sp_executesql`
+/// ([`tsql_route`]); the rows come back the same either way.
+#[allow(clippy::too_many_arguments)]
 async fn read_sets<S: RowSink>(
     client: &mut TdsClient,
     sql: &str,
@@ -879,8 +891,9 @@ async fn read_sets<S: RowSink>(
     batch: bool,
     sets: Sets,
     rest: Rest,
-    mut start: impl FnMut(Option<&[Column]>, &[S]) -> Result<S, TdsError>,
-) -> Result<(Vec<S>, bool), TdsError> {
+    first: impl FnOnce(Option<&[Column]>) -> Result<S, TdsError>,
+    mut next: impl FnMut(&[Column], &[S]) -> Result<ControlFlow<(), S>, TdsError>,
+) -> Result<ReadSets<S>, TdsError> {
     let mut stream = if batch {
         debug_assert!(params.is_empty(), "a plain batch binds no parameters");
         client.simple_query(sql).await?
@@ -889,8 +902,7 @@ async fn read_sets<S: RowSink>(
         bind_params(&mut query, params);
         query.query(client).await?
     };
-    let first = start(stream.columns().await?, &[])?;
-    let mut sinks = vec![first];
+    let mut sinks = vec![first(stream.columns().await?)?];
     let mut result_sets = 0usize;
     while let Some(item) = stream.try_next().await? {
         match item {
@@ -898,11 +910,28 @@ async fn read_sets<S: RowSink>(
                 result_sets += 1;
                 if result_sets > 1 {
                     if sets == Sets::First {
+                        // Not a cut: the set is not wanted, so `AtCap` reads
+                        // it to its end for its errors.
                         let read = rest != Rest::Leave;
-                        return read_rest(stream, read).await.map(|left| (sinks, left));
+                        let abandoned = read_rest(stream, read).await?;
+                        return Ok(ReadSets {
+                            sinks,
+                            abandoned,
+                            cut_between_sets: false,
+                        });
                     }
-                    let next = start(Some(metadata.columns()), &sinks)?;
-                    sinks.push(next);
+                    match next(metadata.columns(), &sinks)? {
+                        ControlFlow::Continue(sink) => sinks.push(sink),
+                        ControlFlow::Break(()) => {
+                            let read = rest == Rest::Read;
+                            let abandoned = read_rest(stream, read).await?;
+                            return Ok(ReadSets {
+                                sinks,
+                                abandoned,
+                                cut_between_sets: true,
+                            });
+                        }
+                    }
                 }
             }
             QueryItem::Row(row) => {
@@ -911,12 +940,21 @@ async fn read_sets<S: RowSink>(
                     .expect("the first sink is made before any row");
                 if sink.row(&row)?.is_break() {
                     let read = rest == Rest::Read;
-                    return read_rest(stream, read).await.map(|left| (sinks, left));
+                    let abandoned = read_rest(stream, read).await?;
+                    return Ok(ReadSets {
+                        sinks,
+                        abandoned,
+                        cut_between_sets: false,
+                    });
                 }
             }
         }
     }
-    Ok((sinks, false))
+    Ok(ReadSets {
+        sinks,
+        abandoned: false,
+        cut_between_sets: false,
+    })
 }
 
 /// What [`read_sets`] does with the rest of a response it stops reading early
@@ -928,12 +966,14 @@ enum Rest {
     /// is left would otherwise be read by the connection's next request,
     /// which is where its error is lost ([`read_rest`]).
     Leave,
-    /// Leave the rows past the row cap — the statement is reported cut short
-    /// there, and its connection is discarded — but never a result set after
-    /// the first: under [`Sets::Every`] it is kept, under [`Sets::First`] read
-    /// to its end, either way failing with the first error it holds. A batch
-    /// like `SELECT 1 AS a SELECT 1/0` is not cut short at all: measured,
-    /// leaving its second set reported a lone run of it `Ok`.
+    /// Leave what follows a cut — rows past the row cap, and under
+    /// [`Sets::Every`] every set after one refused at the cap — the statement
+    /// is reported cut short there, and its connection is discarded. A set
+    /// that is not cut is never left: under [`Sets::Every`] it is kept, and
+    /// under [`Sets::First`] read to its end, either way failing with the
+    /// first error it holds. A batch like `SELECT 1 AS a SELECT 1/0` is not
+    /// cut short at all: measured, leaving its second set reported a lone run
+    /// of it `Ok`.
     AtCap,
     /// Read it to its end here, and fail with the first error it holds.
     Read,
@@ -1322,7 +1362,35 @@ pub(crate) async fn query_capped_conn(
     max_rows: u64,
     cell_cap: usize,
 ) -> Result<Capped, DbError> {
-    query_capped_held(&mut tx.conn, tx.discard_after, sql, max_rows, cell_cap).await
+    query_capped_held(
+        &mut tx.conn,
+        tx.discard_after,
+        Sets::Every,
+        sql,
+        max_rows,
+        cell_cap,
+    )
+    .await
+}
+
+/// [`query_capped_conn`] keeping the first result set only, as the pool's
+/// [`query_capped`] does: for a caller holding the transaction itself, which
+/// asks for one result ([`ScriptTx::query_capped`](crate::db::ScriptTx::query_capped)).
+pub(crate) async fn query_first_capped_conn(
+    tx: &mut MssqlTx,
+    sql: &str,
+    max_rows: u64,
+    cell_cap: usize,
+) -> Result<Capped, DbError> {
+    query_capped_held(
+        &mut tx.conn,
+        tx.discard_after,
+        Sets::First,
+        sql,
+        max_rows,
+        cell_cap,
+    )
+    .await
 }
 
 /// [`query_capped_conn`] on any connection held across statements. A
@@ -1332,6 +1400,7 @@ pub(crate) async fn query_capped_conn(
 async fn query_capped_held(
     conn: &mut PooledConn,
     held_for_run: bool,
+    sets: Sets,
     sql: &str,
     max_rows: u64,
     cell_cap: usize,
@@ -1344,17 +1413,7 @@ async fn query_capped_held(
     let result = conn
         .request(async |c| {
             checked_batch(c, route, async |c| {
-                run_query_capped(
-                    c,
-                    sql,
-                    &[],
-                    batch,
-                    Sets::Every,
-                    Rest::Read,
-                    max_rows,
-                    cell_cap,
-                )
-                .await
+                run_query_capped(c, sql, &[], batch, sets, Rest::Read, max_rows, cell_cap).await
             })
             .await
         })
@@ -1390,9 +1449,10 @@ impl CappedRead {
 }
 
 /// Drains a query's row stream into bounded [`QueryResult`]s, keeping at
-/// most `max_rows` rows across every set kept — one budget, so a statement
-/// returning many sets holds no more than one returning a single large one —
-/// and capping each cell to `cell_cap` bytes.
+/// most `max_rows` rows across every set kept — one budget, not one per set —
+/// and at most [`MAX_RESULT_SETS`] sets, and capping each cell to `cell_cap`
+/// bytes. A cut, at either bound, marks the last set kept `truncated`: the
+/// statement returned more after it, rows or sets.
 #[allow(clippy::too_many_arguments)]
 async fn run_query_capped(
     client: &mut TdsClient,
@@ -1404,26 +1464,42 @@ async fn run_query_capped(
     max_rows: u64,
     cell_cap: usize,
 ) -> Result<CappedRead, TdsError> {
-    let (mut kept, abandoned) = read_sets(
+    let sink = |columns: Vec<ColumnInfo>, max_rows: u64| CappedRows {
+        columns,
+        rows: Vec::new(),
+        max_rows,
+        cell_cap,
+        truncated: false,
+    };
+    let read = read_sets(
         client,
         sql,
         params,
         batch,
         sets,
         rest,
+        |columns| {
+            Ok(sink(
+                columns.map(column_infos).unwrap_or_default(),
+                max_rows,
+            ))
+        },
         |columns, before: &[CappedRows]| {
             let used: u64 = before.iter().map(|set| set.rows.len() as u64).sum();
-            Ok(CappedRows {
-                columns: columns.map(column_infos).unwrap_or_default(),
-                rows: Vec::new(),
-                max_rows: max_rows.saturating_sub(used),
-                cell_cap,
-                truncated: false,
+            // A set that would start with the budget spent, or past the most
+            // sets kept, is where the read is cut: never an empty set
+            // reported cut short, which reads as "returned no rows".
+            Ok(if used >= max_rows || before.len() >= MAX_RESULT_SETS {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(sink(column_infos(columns), max_rows - used))
             })
         },
     )
     .await?;
-    let last = kept.pop().expect("read_sets keeps at least one set");
+    let (mut kept, abandoned) = (read.sinks, read.abandoned);
+    let mut last = kept.pop().expect("read_sets keeps at least one set");
+    last.truncated |= read.cut_between_sets;
     let whole = |set: CappedRows| QueryResult {
         columns: set.columns,
         rows: set.rows,
@@ -1714,7 +1790,7 @@ pub(crate) async fn query_capped_script_conn(
     max_rows: u64,
     cell_cap: usize,
 ) -> Result<Capped, DbError> {
-    query_capped_held(&mut conn.conn, true, sql, max_rows, cell_cap).await
+    query_capped_held(&mut conn.conn, true, Sets::Every, sql, max_rows, cell_cap).await
 }
 
 /// Rolls back a transaction the script left open and answers one
@@ -1768,10 +1844,10 @@ pub async fn end_script_conn(conn: &mut MssqlScriptConn) -> Result<bool, DbError
 /// instead, as a capped read's always was, the read is reported
 /// [`RestOfRead::Stopped`], and the server rolls back whatever was open on
 /// it. The cost is a reconnect (a TLS login; over an SSH tunnel, a new
-/// channel) the next time the pool needs that connection. Only the cap leaves
-/// a rest behind ([`Rest::AtCap`]): a result set after the first is read to
-/// its end, so its error is the read's — the batch was not cut short, and
-/// the rest is reported run.
+/// channel) the next time the pool needs that connection. Only a cut leaves a
+/// rest behind ([`Rest::AtCap`]): a result set after the first is kept, so
+/// its error is the read's — the batch is cut short only where the row cap
+/// (or [`MAX_RESULT_SETS`]) falls, inside a set or between two.
 pub async fn finish_script_conn_with_read(
     conn: &mut MssqlScriptConn,
     sql: &str,
@@ -1780,7 +1856,8 @@ pub async fn finish_script_conn_with_read(
 ) -> crate::db::registry::FinishedRead {
     use crate::db::registry::{AfterRead, FinishedRead};
     if !final_read_may_close(sql, crate::db::sql::Dialect::SqlServer) {
-        let read = query_capped_held(&mut conn.conn, true, sql, max_rows, cell_cap).await;
+        let read =
+            query_capped_held(&mut conn.conn, true, Sets::Every, sql, max_rows, cell_cap).await;
         let ended = end_script_conn(conn).await;
         return FinishedRead {
             read,
@@ -1886,17 +1963,14 @@ pub async fn export(
     // settled after the stream is dropped.
     let outcome = conn
         .request(async |c| {
-            // Only the first set is kept, so `start` runs once.
-            let mut out = Some(out);
-            let (mut sets, abandoned) = read_sets(
+            let read = read_sets(
                 c,
                 sql,
                 params,
                 false,
                 Sets::First,
                 Rest::Leave,
-                |columns, _| {
-                    let out = out.take().expect("an export keeps one result set");
+                |columns| {
                     let columns = columns
                         .map(|columns| columns.iter().map(|c| c.name().to_string()).collect())
                         .unwrap_or_default();
@@ -1908,9 +1982,15 @@ pub async fn export(
                         written: 0,
                     })
                 },
+                |_, _| Ok(ControlFlow::Break(())),
             )
             .await?;
-            let mut rows = sets.pop().expect("read_sets keeps at least one set");
+            let abandoned = read.abandoned;
+            let mut rows = read
+                .sinks
+                .into_iter()
+                .next()
+                .expect("read_sets keeps at least one set");
             rows.sink.end(rows.out).map_err(io_to_tds)?;
             Ok((rows.written, abandoned))
         })
@@ -2573,6 +2653,65 @@ mod tests {
         assert!(!truncated);
 
         end_script_conn(&mut conn).await.unwrap();
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_script_read_is_cut_between_sets_rather_than_into_an_empty_one() {
+        let Some(pool) = test_pool() else { return };
+        let mut conn = acquire_script_conn(&pool).await.unwrap();
+        let ints = |values: &[i64]| -> Vec<Vec<Value>> {
+            values.iter().map(|&v| vec![Value::Integer(v)]).collect()
+        };
+        // The first set spends the whole budget: the second is where the
+        // read is cut, not a set reported empty and cut short.
+        let read = query_capped_script_conn(
+            &mut conn,
+            "SELECT a FROM (VALUES (1), (2)) AS v (a) SELECT 3 AS b",
+            2,
+            100,
+        )
+        .await
+        .unwrap();
+        assert!(read.earlier.is_empty());
+        assert_eq!(read.result.rows, ints(&[1, 2]));
+        assert!(read.truncated);
+
+        // Sets with no rows cost none of the budget, so their number is
+        // bounded on its own.
+        let endless = "DECLARE @i int = 0 \
+                       WHILE @i < 500 BEGIN SELECT TOP 0 1 AS a SET @i += 1 END";
+        let read = query_capped_script_conn(&mut conn, endless, 100, 100)
+            .await
+            .unwrap();
+        assert_eq!(read.earlier.len() + 1, MAX_RESULT_SETS);
+        assert!(read.truncated);
+
+        end_script_conn(&mut conn).await.unwrap();
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_final_read_cut_on_a_later_set_keeps_the_sets_before_and_stops_the_rest() {
+        let Some(pool) = test_pool() else { return };
+        let mut conn = acquire_script_conn(&pool).await.unwrap();
+        // A pure read, so the run may close on it (`Rest::AtCap`): cut inside
+        // the second set, the sets before it are kept whole, and the rest is
+        // not run — the connection goes with it.
+        let finished = finish_script_conn_with_read(
+            &mut conn,
+            "SELECT a FROM (VALUES (1), (2)) AS v (a) SELECT b FROM (VALUES (3), (4)) AS v (b)",
+            3,
+            100,
+        )
+        .await;
+        let read = finished.read.unwrap();
+        assert_eq!(read.earlier.len(), 1);
+        assert_eq!(read.earlier[0].rows.len(), 2);
+        assert_eq!(read.result.rows, vec![vec![Value::Integer(3)]]);
+        assert!(read.truncated);
+        assert_eq!(read.rest, RestOfRead::Stopped);
+        assert!(conn.conn.is_discarded());
         pool.close().await;
     }
 

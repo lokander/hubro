@@ -85,7 +85,8 @@ pub use postgres::{
 };
 pub use registry::{
     engine_has_read_only_mode, CellFetch, Connection, ConnectionId, ConnectionRegistry, DbPool,
-    Reading, FETCH_CELL_MAX_BYTES, MAX_QUERY_ROWS, MISSING_ROW, PLAN_CELL_CAP, QUERY_CELL_CAP,
+    Reading, FETCH_CELL_MAX_BYTES, MAX_QUERY_ROWS, MAX_RESULT_SETS, MISSING_ROW, PLAN_CELL_CAP,
+    QUERY_CELL_CAP,
 };
 pub use rowkey::{
     detect_row_identity, key_column_addressable, text_depends_on, KeyRules, KeyTextPinned,

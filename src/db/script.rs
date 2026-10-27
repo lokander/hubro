@@ -1581,8 +1581,10 @@ pub struct StatementResult {
     /// Which statement of the script this came from, 0-based — the same
     /// numbering a failure's `statement_index` uses.
     pub statement: usize,
-    /// Which of the statement's result sets this is, when it returned more
-    /// than one; `None` for every statement that returned one result.
+    /// Which of the statement's result sets this is, when more than one was
+    /// kept. `None` for a statement that returned one result — or that was
+    /// cut short at the row cap inside its first set, past which hubro
+    /// cannot say whether more sets followed.
     pub set: Option<SetOf>,
     pub preview: String,
     pub outcome: StatementOutcome,
@@ -1596,12 +1598,14 @@ pub struct StatementResult {
     pub rest: RestOfRead,
 }
 
-/// Where one result set falls among its statement's: the `index`th (0-based)
-/// of `count`, which is always more than one.
+/// Where one result set falls among its statement's: the `index`th
+/// (0-based) of `count`. `count` is known only when the statement's results
+/// were read whole: a read cut short at the row cap stops before the sets
+/// after the cut, so how many there were is not known, and it is `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SetOf {
     pub index: usize,
-    pub count: usize,
+    pub count: Option<usize>,
 }
 
 /// A read's outcome as a run reports it: one entry per result set, each with
@@ -2139,11 +2143,15 @@ async fn run_statements<E: StatementExecutor>(
         };
         match outcome {
             Ok(sets) => {
-                let count = sets.len();
+                let kept = sets.len();
+                // Only the last set can be cut short, and a cut hides how
+                // many sets came after it.
+                let cut = sets.last().is_some_and(|&(_, truncated, _)| truncated);
+                let count = (!cut).then_some(kept);
                 for (index, (outcome, truncated, rest)) in sets.into_iter().enumerate() {
                     on_result(StatementResult {
                         statement: statement_index,
-                        set: (count > 1).then_some(SetOf { index, count }),
+                        set: (kept > 1).then_some(SetOf { index, count }),
                         preview: statement_preview(statement),
                         outcome,
                         truncated,

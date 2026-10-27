@@ -33,7 +33,7 @@ use hubro::db::{
     Capabilities, CheckedStatement, DbError, DbPool, Dialect, ExportFormat, Filter, Generated,
     OpenTransaction, PageRequest, RestOfRead, Restriction, Rollback, RowCount, RowIdentity,
     RowLocator, RowsAffected, ScriptDone, SortDir, StagedChange, StatementOutcome, TableKind,
-    TableMeta, TypeDetail, Value, INSTEAD_OF_TRIGGER, MISSING_ROW, PREVIEW_BYTES,
+    TableMeta, TypeDetail, Value, INSTEAD_OF_TRIGGER, MAX_QUERY_ROWS, MISSING_ROW, PREVIEW_BYTES,
 };
 
 /// Keeps introspection apart from everything else this binary sends.
@@ -1488,11 +1488,33 @@ async fn sqlserver_script_reports_every_result_set_of_a_statement() {
     assert_eq!(
         shape,
         [
-            (0, Some((0, 2)), one(1)),
-            (0, Some((1, 2)), one(2)),
+            (0, Some((0, Some(2))), one(1)),
+            (0, Some((1, Some(2))), one(2)),
             (1, None, one(3)),
         ]
     );
+
+    // Cut at the row cap inside its second set: the sets after the cut were
+    // never read, so how many there were is not claimed.
+    let rows = |n: u64| {
+        format!("SELECT TOP {n} 1 AS r FROM sys.all_objects AS a CROSS JOIN sys.all_objects AS b")
+    };
+    let cut = [format!(
+        "{} {} SELECT 3 AS c",
+        rows(MAX_QUERY_ROWS / 2 + 1),
+        rows(MAX_QUERY_ROWS)
+    )];
+    let mut results = Vec::new();
+    run_script(&pool, pool.backend_capabilities(), &cut, |r| {
+        results.push(r)
+    })
+    .await
+    .expect("a cut read still runs");
+    let sets: Vec<_> = results
+        .iter()
+        .map(|r| (r.set.map(|s| (s.index, s.count)), r.truncated))
+        .collect();
+    assert_eq!(sets, [(Some((0, None)), false), (Some((1, None)), true)]);
 
     pool.close().await;
 }
@@ -1803,10 +1825,12 @@ async fn sqlserver_empty_results_keep_their_column_headers() {
 }
 
 #[tokio::test]
-async fn sqlserver_every_read_path_keeps_only_the_first_result_set() {
-    // The buffered, capped and export paths share one result loop, which
-    // reads the first result set and stops at the second — one statement,
-    // one result, as on the sqlx backends.
+async fn sqlserver_hubros_own_read_paths_keep_only_the_first_result_set() {
+    // The buffered, capped and export paths, and a held transaction's own
+    // read, share one result loop, which for them reads the first result set
+    // and stops at the second — one result, as on the sqlx backends. A
+    // script's reads keep every set
+    // (`sqlserver_script_reports_every_result_set_of_a_statement`).
     let Some((url, _turn)) = session().await else {
         return;
     };
@@ -1836,6 +1860,12 @@ async fn sqlserver_every_read_path_keeps_only_the_first_result_set() {
         .unwrap();
     assert_eq!(written, 2);
     assert_eq!(String::from_utf8(csv).unwrap(), "a\n1\n2\n");
+
+    let mut tx = pool.begin_script_tx().await.unwrap();
+    let (result, truncated) = tx.query_capped(sql, 100).await.unwrap();
+    assert_eq!(result.rows, first);
+    assert!(!truncated);
+    tx.rollback().await;
 
     pool.close().await;
 }
@@ -3322,7 +3352,8 @@ async fn sqlserver_an_error_in_the_rest_of_a_capped_read_fails_its_statement() {
             "Divide by zero",
             Rollback::None,
         ),
-        // Not cut short: a second result set is left unread the same way.
+        // Not cut short: a second result set is kept and read whole, so the
+        // third's error is the statement's.
         (
             "SELECT 1 AS a SELECT 2 AS b SELECT 1/0\nGO\nSELECT 3".to_string(),
             0,
