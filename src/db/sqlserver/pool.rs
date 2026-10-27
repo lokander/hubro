@@ -1427,11 +1427,12 @@ struct CappedRead {
     earlier: Vec<QueryResult>,
     /// The last set kept, the only one the cap can cut short.
     result: QueryResult,
-    /// Whether rows existed past the cap.
+    /// Whether the read was cut short: rows past the row cap, or a result set
+    /// refused at the row cap or at [`MAX_RESULT_SETS`].
     truncated: bool,
-    /// Whether the stream was abandoned with data still unread (a result set
-    /// after the first under [`Sets::First`] — the row cap breaking early
-    /// always leaves data, so `truncated` implies it, unless `rest` read it).
+    /// Whether the stream was abandoned with data still unread — a cut
+    /// always leaves data, so `truncated` implies it unless `rest` read it,
+    /// and so does a result set after the first under [`Sets::First`].
     abandoned: bool,
 }
 
