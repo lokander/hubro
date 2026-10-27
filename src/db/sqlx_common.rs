@@ -481,10 +481,11 @@ pub(super) enum Rest {
 pub(super) const DRAIN_CHECK_ROWS: u64 = 1024;
 
 /// How long reading the rest of a cut-short result goes between [`turn`]s.
-const DRAIN_TURN_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
+pub(super) const DRAIN_TURN_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Gives everything else on the thread a turn while the rest of a cut-short
-/// result is read.
+/// result is read. SQL Server's rest is read the same way
+/// (`sqlserver::pool::read_rest`).
 ///
 /// The turns are the point. Over localhost a row is always waiting, so the
 /// driver's read never returns `Pending`: measured before, the rest of 200M
@@ -497,7 +498,7 @@ const DRAIN_TURN_EVERY: std::time::Duration = std::time::Duration::from_millis(2
 /// run went on, and a click on Cancel was not seen until the rest had been
 /// read. A 1 ms timer every 20 ms leaves the loop free in between, for about
 /// 5% of the reading time.
-async fn turn() {
+pub(super) async fn turn() {
     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
 }
 

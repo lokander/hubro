@@ -222,12 +222,13 @@ pub(crate) struct Capped {
 ///   write that returns rows makes every change in its first step (SQLite's
 ///   documented `RETURNING` behaviour). A `WITH … INSERT … RETURNING` of
 ///   20,000 rows cut at 10,000 kept all 20,000.
-/// - **SQL Server**'s held connection keeps the abandoned response, and
-///   tiberius reads it to its end before the connection's next request: an
-///   `INSERT` in the rest of a capped batch ran (counted by the next
-///   statement). What that read meets is not reported, though: a `SELECT
-///   1/0` in the rest of a capped batch left the script `Ok` — the rest ran,
-///   and its error was lost.
+/// - **SQL Server**'s held connection keeps the response, and its rest is
+///   read to its end before the read returns (`sqlserver::pool::read_rest`):
+///   an `INSERT` in the rest of a capped batch ran (counted by the next
+///   statement). An error in the rest fails the read, so a rest reported is
+///   one that ran without one. It used to be left for tiberius to read before
+///   the connection's next request, which discards what it reads: a `SELECT
+///   1/0` in the rest of a capped batch left the script `Ok`.
 ///
 /// A last read on either engine reports its own rest
 /// (`sqlserver::finish_script_conn_with_read`, `ScriptConn::finish_with_read`).

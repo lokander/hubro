@@ -3022,6 +3022,13 @@ async fn sqlserver_a_batch_led_by_select_that_ends_or_opens_a_transaction_is_rep
     // before such a batch: a COMMIT in it was reported as a rollback of rows
     // it had committed, and a BEGIN TRAN in it was reported clean while the
     // close discarded its INSERT.
+    //
+    // Through `sp_executesql` both batches also end in error 266 (the RPC
+    // returned with `@@TRANCOUNT` changed), as the same batch led by a write
+    // does. It used to sit behind the second result set, which was left for
+    // tiberius to read, and was lost with it; now the read reads its whole
+    // response, so the batch fails with it — and the outcome still says what
+    // happened to the transaction.
     let Some((url, _turn)) = session().await else {
         return;
     };
@@ -3050,9 +3057,10 @@ async fn sqlserver_a_batch_led_by_select_that_ends_or_opens_a_transaction_is_rep
         Value::Integer(1),
         "the COMMIT committed the row"
     );
-    assert_eq!(
-        outcome,
-        Ok(ScriptDone::default()),
+    assert!(
+        matches!(&outcome, Err(e) if e.statement_index == 2
+            && e.error.to_string().contains("(code: 266")
+            && e.rollback == Rollback::None),
         "a committed transaction must not be reported as rolled back: {}",
         common::script_outcome(&outcome)
     );
@@ -3071,14 +3079,12 @@ async fn sqlserver_a_batch_led_by_select_that_ends_or_opens_a_transaction_is_rep
         Value::Integer(1),
         "the transaction left open is gone"
     );
-    assert_eq!(
-        outcome,
-        Ok(ScriptDone {
-            rolled_back: Some(OpenTransaction {
+    assert!(
+        matches!(&outcome, Err(e) if e.statement_index == 0
+            && e.error.to_string().contains("(code: 266")
+            && e.rollback == Rollback::OpenTransaction(OpenTransaction {
                 schema_changes_kept: false
-            }),
-            connection_closed: false,
-        }),
+            })),
         "a transaction the batch opened must be rolled back and said to be: {}",
         common::script_outcome(&outcome)
     );
@@ -3148,6 +3154,216 @@ async fn sqlserver_capped_row_returning_write_keeps_its_write() {
     )
     .await;
     pool.close().await;
+}
+
+/// More rows than the script path's cap (`MAX_QUERY_ROWS`), so the read is
+/// cut short with the rest of its batch still to come.
+const MSSQL_CAPPED_HEAD: &str = "SELECT TOP (30000) a.object_id FROM sys.all_columns a \
+                                 CROSS JOIN sys.all_columns b";
+
+#[tokio::test]
+async fn sqlserver_an_error_in_the_rest_of_a_capped_read_fails_its_statement() {
+    // The rest of a capped read that is not the script's last statement is
+    // read on its held connection. tiberius reads it before the next request
+    // by raw packets, without decoding a token, and its result stream reports
+    // a server error only once the whole response is read — so an error past
+    // the cap reached nobody. Measured before the fix: every script below
+    // finished `Ok`; the atomic ones committed the rows logged around the
+    // failed `INSERT`, and the sequential one ran its own `COMMIT`.
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    run_all(
+        &pool,
+        &[
+            "DROP TABLE IF EXISTS dbo.rest_err",
+            "DROP TABLE IF EXISTS dbo.rest_err_log",
+            "CREATE TABLE dbo.rest_err (a int PRIMARY KEY)",
+            "CREATE TABLE dbo.rest_err_log (a int)",
+            "INSERT INTO dbo.rest_err VALUES (1)",
+        ],
+    )
+    .await;
+    common::open_several_connections(&pool, MSSQL_SLOW).await;
+    let duplicate = "INSERT INTO dbo.rest_err VALUES (1)";
+    let log = |n: i32| format!("INSERT INTO dbo.rest_err_log VALUES ({n})");
+    let open = Rollback::OpenTransaction(OpenTransaction {
+        schema_changes_kept: false,
+    });
+    // (script, failing statement, the error's words, rollback)
+    let cases = [
+        // Atomic, the issue's case: a read, then another statement.
+        (
+            format!("{MSSQL_CAPPED_HEAD} SELECT 1/0\nGO\nSELECT 2"),
+            0,
+            "Divide by zero",
+            Rollback::Full,
+        ),
+        // Atomic, a write in the rest that fails: nothing after it runs, and
+        // hubro's transaction undoes the statement before it.
+        (
+            format!(
+                "{}\nGO\n{MSSQL_CAPPED_HEAD} {duplicate}\nGO\n{}",
+                log(1),
+                log(2)
+            ),
+            1,
+            "PRIMARY KEY",
+            Rollback::Full,
+        ),
+        // Atomic, the read last: hubro's own COMMIT must not run after it.
+        (
+            format!("{}\nGO\n{MSSQL_CAPPED_HEAD} {duplicate}", log(7)),
+            1,
+            "PRIMARY KEY",
+            Rollback::Full,
+        ),
+        // Sequential (the script's own transaction): its COMMIT must not run.
+        (
+            format!(
+                "BEGIN TRAN\nGO\n{}\nGO\n{MSSQL_CAPPED_HEAD} {duplicate}\nGO\nSELECT 2\nGO\nCOMMIT",
+                log(3)
+            ),
+            2,
+            "PRIMARY KEY",
+            open,
+        ),
+        // Sequential, the script's last statement: a batch that writes is
+        // read to its end before the run ends, and its error is its own.
+        (
+            format!(
+                "BEGIN TRAN\nGO\n{}\nGO\n{MSSQL_CAPPED_HEAD} {duplicate}",
+                log(4)
+            ),
+            2,
+            "PRIMARY KEY",
+            open,
+        ),
+        // Not cut short: a second result set is left unread the same way.
+        (
+            "SELECT 1 AS a SELECT 2 AS b SELECT 1/0\nGO\nSELECT 3".to_string(),
+            0,
+            "Divide by zero",
+            Rollback::Full,
+        ),
+        // `XACT_ABORT` ends hubro's transaction with the error, so the
+        // statement before it is undone by the server rather than by hubro.
+        // Measured before: the error was lost, and the statement after the
+        // read failed in its place, with 3971 ("failed to resume the
+        // transaction").
+        (
+            format!(
+                "{}\nGO\n{MSSQL_CAPPED_HEAD} SET XACT_ABORT ON {duplicate}\nGO\n{}",
+                log(5),
+                log(6)
+            ),
+            1,
+            "PRIMARY KEY",
+            Rollback::AlreadyEnded,
+        ),
+    ];
+    let mut lost = Vec::new();
+    for (script, index, words, rollback) in cases {
+        let outcome = mssql_script(&pool, &script).await;
+        assert_eq!(mssql_open_transactions(&pool).await, Vec::<Value>::new());
+        let rows = pool
+            .query_unbounded("SELECT count(*) FROM dbo.rest_err_log")
+            .await
+            .unwrap();
+        run_all(&pool, &["DELETE FROM dbo.rest_err_log"]).await;
+        let error = match &outcome {
+            Err(error) => error,
+            Ok(_) => {
+                lost.push(format!(
+                    "{script}\n  {}, {:?} logged",
+                    common::script_outcome(&outcome),
+                    rows.rows[0][0]
+                ));
+                continue;
+            }
+        };
+        assert_eq!(error.statement_index, index, "{script}: {error:?}");
+        assert!(
+            error.error.to_string().contains(words),
+            "{script}: {error:?}"
+        );
+        assert_eq!(error.rollback, rollback, "{script}: {error:?}");
+        assert_eq!(rows.rows[0][0], Value::Integer(0), "{script}");
+    }
+    assert!(
+        lost.is_empty(),
+        "an error past the cap was lost:\n{}",
+        lost.join("\n")
+    );
+    // The pool's capped read reads the rest of a batch that may write, and
+    // the rest's error is the read's.
+    let pooled = pool
+        .query_capped(&format!("{MSSQL_CAPPED_HEAD} {duplicate}"), &[], 10_000)
+        .await;
+    assert!(
+        matches!(&pooled, Err(e) if e.to_string().contains("PRIMARY KEY")),
+        "{pooled:?}"
+    );
+    run_all(
+        &pool,
+        &["DROP TABLE dbo.rest_err", "DROP TABLE dbo.rest_err_log"],
+    )
+    .await;
+    pool.close().await;
+}
+
+#[test]
+fn sqlserver_reading_the_rest_of_a_capped_read_leaves_the_thread_to_others() {
+    // The rest of a capped read that is not the script's last is read before
+    // the next statement, by hubro, on the thread the run is polled on — the
+    // SQL tab's is the UI thread. Here the rest is endless, on a single
+    // thread like the UI's, and the run must be abortable in a moment.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let Some((url, _turn)) = session().await else {
+            return;
+        };
+        let pool = DbPool::open_mssql(&url).await.unwrap();
+        let statements = split_statements(
+            &format!("{MSSQL_ENDLESS_READ}\nGO\nSELECT 1"),
+            pool.dialect(),
+        );
+        let run_pool = pool.clone();
+        let started = std::time::Instant::now();
+        let run = tokio::task::spawn_local(async move {
+            run_script(
+                &run_pool,
+                run_pool.backend_capabilities(),
+                &statements,
+                |_| {},
+            )
+            .await
+            .is_ok()
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let woke = started.elapsed();
+        run.abort();
+        let aborted = run.await;
+        let resolved = started.elapsed();
+        assert!(
+            woke < std::time::Duration::from_secs(3),
+            "a 1 s timer beside the run fired after {woke:?}"
+        );
+        assert!(
+            matches!(&aborted, Err(e) if e.is_cancelled()),
+            "the run finished instead of being aborted: {aborted:?}"
+        );
+        assert!(
+            resolved < std::time::Duration::from_secs(5),
+            "abort took effect after {resolved:?}"
+        );
+        pool.close().await;
+    });
 }
 
 /// A `real` once read as the `f32` widened to `f64` — `0.1` showed as
