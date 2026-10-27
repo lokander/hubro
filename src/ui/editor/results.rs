@@ -397,7 +397,8 @@ pub(super) fn rows_affected_line(rows: RowsAffected) -> String {
     match rows {
         RowsAffected::Exact(n) => format!("{n} {} affected", rows_word(n)),
         RowsAffected::Summed(n) => format!(
-            "{n} {} affected in total, any triggers' rows included",
+            "{n} {} affected in total — every count the server sent, added up, which can \
+             include rows triggers wrote and, in a batch, rows written to table variables",
             rows_word(n)
         ),
         RowsAffected::Unreported => "no row count reported".to_string(),
@@ -734,11 +735,13 @@ mod tests {
         assert!(!exact.contains("trigger"), "{exact}");
         assert!(!exact.contains("total"), "{exact}");
 
-        // Several counts added up: says so, and that triggers may be in it.
+        // Several counts added up: says so, and what may be in them — a
+        // trigger's rows, and in a batch, a table variable's.
         let summed = outcome_summary(&StatementOutcome::Affected(RowsAffected::Summed(4)));
         assert!(summed.starts_with("4 rows affected"), "{summed}");
         assert!(summed.contains("in total"), "{summed}");
-        assert!(summed.contains("any triggers"), "{summed}");
+        assert!(summed.contains("triggers"), "{summed}");
+        assert!(summed.contains("table variables"), "{summed}");
 
         // No count: no number, so not "0 rows affected".
         let unreported = outcome_summary(&StatementOutcome::Affected(RowsAffected::Unreported));

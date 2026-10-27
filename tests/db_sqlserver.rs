@@ -1522,6 +1522,96 @@ async fn sqlserver_a_batch_runs_on_past_a_statement_error() {
 }
 
 #[tokio::test]
+async fn sqlserver_a_batch_claims_no_more_than_one_call_can_vouch_for() {
+    // Found by a cold review of batches: one call covers a whole batch, so
+    // what a call used to vouch for per statement it no longer can.
+    let Some((url, _turn)) = session().await else {
+        return;
+    };
+    let pool = DbPool::open_mssql(&url).await.unwrap();
+    let fresh = || async {
+        run_all(
+            &pool,
+            &[
+                "DROP TABLE IF EXISTS dbo.batch_claim_probe",
+                "CREATE TABLE dbo.batch_claim_probe (id int PRIMARY KEY)",
+            ],
+        )
+        .await
+    };
+    let kept = || async {
+        pool.query_unbounded("SELECT id FROM dbo.batch_claim_probe ORDER BY id")
+            .await
+            .unwrap()
+            .rows
+    };
+    let ints = |v: &[i64]| {
+        v.iter()
+            .map(|&n| vec![Value::Integer(n)])
+            .collect::<Vec<_>>()
+    };
+
+    // Transaction control past a statement's first word makes the script its
+    // own: not wrapped, so no atomic claim — the failure says what stands.
+    // Wrapped, the batch ran on past the COMMIT and its rows committed
+    // outside hubro's transaction.
+    fresh().await;
+    assert_eq!(
+        mssql_script_outcomes(
+            &pool,
+            "IF @@TRANCOUNT > 0 COMMIT TRAN;\n\
+             INSERT INTO dbo.batch_claim_probe VALUES (1);\n\
+             INSERT INTO dbo.batch_claim_probe VALUES (1);"
+        )
+        .await,
+        ["statement 0 failed [None] code 2627 line 3".to_string()]
+    );
+    assert_eq!(kept().await, ints(&[1]));
+
+    // One count among several statements is not the batch's: under NOCOUNT
+    // there is no knowing, and otherwise it is a total.
+    fresh().await;
+    assert_eq!(
+        mssql_script_outcomes(
+            &pool,
+            "INSERT INTO dbo.batch_claim_probe VALUES (1), (2), (3), (4), (5);\n\
+             SET NOCOUNT ON;\n\
+             INSERT INTO dbo.batch_claim_probe VALUES (6), (7);"
+        )
+        .await,
+        ["no count".to_string()]
+    );
+    fresh().await;
+    assert_eq!(
+        mssql_script_outcomes(
+            &pool,
+            "DECLARE @v TABLE (a int);\n\
+             INSERT INTO @v VALUES (1), (2), (3);\n\
+             INSERT INTO dbo.batch_claim_probe VALUES (9);"
+        )
+        .await,
+        ["affected 4 in total".to_string()]
+    );
+
+    // A NOEXEC the script turned on in a plain batch lasts the run, and the
+    // end-of-run check then answers nothing: the run says it could not
+    // check, and closed the connection, rather than "nothing was open".
+    fresh().await;
+    let statements = split_statements(
+        "BEGIN TRAN; SET NOEXEC ON\nGO\nINSERT INTO dbo.batch_claim_probe VALUES (1)\nGO\nCOMMIT",
+        pool.dialect(),
+    );
+    let done = run_script(&pool, pool.backend_capabilities(), &statements, |_| {})
+        .await
+        .expect("each batch compiles");
+    assert!(done.connection_closed, "{done:?}");
+    assert_eq!(kept().await, ints(&[]));
+
+    run_all(&pool, &["DROP TABLE dbo.batch_claim_probe"]).await;
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn sqlserver_script_merge_keeps_its_required_terminator() {
     let Some((url, _turn)) = session().await else {
         return;
@@ -3603,10 +3693,11 @@ async fn sqlserver_a_real_reads_as_its_shortest_decimal_and_writes_back_unchange
 
 #[tokio::test]
 async fn sqlserver_atomic_script_that_ends_hubros_transaction_is_not_reported_rolled_back() {
-    // A batch is one statement, so a COMMIT inside it is not seen as the
-    // script managing its own transaction and the script is wrapped in
-    // hubro's. Measured before the fix: every case below was reported
-    // `Rollback::Full` — "no changes were applied" — with rows in the table.
+    // A transaction word anywhere in a script keeps it from being wrapped in
+    // hubro's transaction, so each case here ends that transaction where no
+    // reading of the text can see it: dynamic SQL, or a procedure. Measured
+    // before the fix: every case below was reported `Rollback::Full` — "no
+    // changes were applied" — with rows in the table.
     let Some((url, _turn)) = session().await else {
         return;
     };
@@ -3627,7 +3718,7 @@ async fn sqlserver_atomic_script_that_ends_hubros_transaction_is_not_reported_ro
     let cases = [
         // Error 266 after the COMMIT took effect; nothing left to roll back.
         (
-            format!("{}\nCOMMIT\nGO\n{}", insert(1), insert(2)),
+            format!("{}\nEXEC('COMMIT')\nGO\n{}", insert(1), insert(2)),
             0,
             vec![1],
             Rollback::AlreadyEnded,
@@ -3647,7 +3738,7 @@ async fn sqlserver_atomic_script_that_ends_hubros_transaction_is_not_reported_ro
         // hubro's, and a later failure rolls back only that one.
         (
             format!(
-                "{}\nCOMMIT\nBEGIN TRAN\nGO\n{}\nGO\nSELECT * FROM dbo.no_such_table",
+                "{}\nEXEC('COMMIT BEGIN TRAN')\nGO\n{}\nGO\nSELECT * FROM dbo.no_such_table",
                 insert(1),
                 insert(2)
             ),
@@ -3663,7 +3754,7 @@ async fn sqlserver_atomic_script_that_ends_hubros_transaction_is_not_reported_ro
         // committed row stands.
         (
             format!(
-                "{}\nCOMMIT\nBEGIN TRAN\nGO\n{}\nGO\nSET XACT_ABORT ON\n\
+                "{}\nEXEC('COMMIT BEGIN TRAN')\nGO\n{}\nGO\nSET XACT_ABORT ON\n\
                  BEGIN TRY SELECT 1/0 END TRY BEGIN CATCH END CATCH",
                 insert(1),
                 insert(2)
@@ -3675,7 +3766,7 @@ async fn sqlserver_atomic_script_that_ends_hubros_transaction_is_not_reported_ro
         // A severity-20 error ends the session, so nothing can be asked.
         (
             format!(
-                "{}\nCOMMIT\nBEGIN TRAN\nGO\n{}\nGO\nRAISERROR('boom', 20, 1) WITH LOG",
+                "{}\nEXEC('COMMIT BEGIN TRAN')\nGO\n{}\nGO\nRAISERROR('boom', 20, 1) WITH LOG",
                 insert(1),
                 insert(2)
             ),
@@ -3971,11 +4062,12 @@ async fn sqlserver_script_temp_tables_last_the_run() {
             vec![none(), rows(4)],
         ),
         // A SET in the batch keeps it on `sp_executesql`: the SET lapses with
-        // the call, and the table goes with it.
+        // the call, and the table goes with it. A batch that turns NOCOUNT
+        // on states no count at all.
         (
             "CREATE TABLE #sb (a int); SET NOCOUNT ON\nGO\nSELECT a FROM #sb",
             vec![
-                affected(0),
+                none(),
                 "statement 1 failed [Full] code 208 line 1".to_string(),
             ],
         ),
@@ -4020,13 +4112,14 @@ async fn sqlserver_script_temp_tables_last_the_run() {
              DECLARE @v TABLE (a int) INSERT INTO @v VALUES (1), (2)",
             vec![affected(0), affected(2)],
         ),
-        // Transaction control in hubro's transaction: error 266 is what stops
-        // the script before the statements after it run outside it, and
-        // what reports the transaction as already ended where it happened.
+        // Transaction control beside a creator: the script holds its own
+        // transaction, so it is never wrapped in hubro's, and this COMMIT has
+        // nothing to commit (3902). A creator carrying one is never a plain
+        // batch either (`plain_batch_safe`).
         (
             "CREATE TABLE #c (a int) COMMIT\nGO\n\
              DECLARE @v TABLE (a int) INSERT INTO @v VALUES (1)",
-            vec!["statement 0 failed [AlreadyEnded] code 266 line 0".to_string()],
+            vec!["statement 0 failed [None] code 3902 line 1".to_string()],
         ),
     ];
     // Every case's outcome, so one mismatch does not hide the rest.

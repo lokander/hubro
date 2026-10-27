@@ -42,7 +42,8 @@ use crate::db::error::DbError;
 use crate::db::export::{export_io_err, ExportFormat, ExportSink};
 use crate::db::registry::{RolledBack, MAX_RESULT_SETS};
 use crate::db::script::{
-    final_read_may_close, statement_needs, tsql_route, RowsAffected, TsqlRoute,
+    final_read_may_close, split_tsql_statements, statement_needs, tsql_route, RowsAffected,
+    TsqlRoute,
 };
 use crate::db::sqlx_common::{turn, DRAIN_CHECK_ROWS, DRAIN_TURN_EVERY};
 use crate::db::staged::CheckedStatement;
@@ -1097,7 +1098,32 @@ async fn run_statement(
     } else {
         run_execute(client, sql, &[])
             .await
-            .map(|counts| script_rows_affected(&counts))
+            .map(|counts| script_rows_affected(&counts, BatchCounts::of(sql)))
+    }
+}
+
+/// What [`script_rows_affected`] may read a unit's counts as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchCounts {
+    /// One statement: the rules below.
+    One,
+    /// A batch of several: their counts are only ever a total
+    /// ([`RowsAffected::Summed`]) — one count alone is not the batch's.
+    Several,
+    /// A batch of several that turns `NOCOUNT` on or off: some statements
+    /// may have sent no count, so not even a total is known.
+    SeveralUnderNocount,
+}
+
+impl BatchCounts {
+    fn of(sql: &str) -> Self {
+        if split_tsql_statements(sql).len() < 2 {
+            BatchCounts::One
+        } else if sql.to_ascii_lowercase().contains("nocount") {
+            BatchCounts::SeveralUnderNocount
+        } else {
+            BatchCounts::Several
+        }
     }
 }
 
@@ -1135,7 +1161,21 @@ async fn run_statement(
 ///   `UPDATE` matching nothing whose trigger wrote three anyway, which is
 ///   why only the zeros *before* the last count can be set aside, not every
 ///   zero.
-fn script_rows_affected(counts: &[u64]) -> RowsAffected {
+fn script_rows_affected(counts: &[u64], batch: BatchCounts) -> RowsAffected {
+    match batch {
+        // A count can be any statement's, so none is the batch's own.
+        BatchCounts::Several => {
+            return match counts {
+                [] => RowsAffected::Unreported,
+                counts => RowsAffected::Summed(counts.iter().sum()),
+            };
+        }
+        // Statements under it send no count, so even a sum is short.
+        // Measured in review: `INSERT` of 5 rows, `SET NOCOUNT ON`, `INSERT`
+        // of 2 came back as one count, 5.
+        BatchCounts::SeveralUnderNocount => return RowsAffected::Unreported,
+        BatchCounts::One => {}
+    }
     match counts {
         [] => RowsAffected::Unreported,
         [before @ .., last] if before.iter().all(|&n| n == 0) => RowsAffected::Exact(*last),
@@ -1818,10 +1858,20 @@ pub async fn end_script_conn(conn: &mut MssqlScriptConn) -> Result<bool, DbError
     let ended = held
         .request(async |c| {
             let row = c.simple_query(END_SCRIPT).await?.into_row().await?;
-            Ok::<_, TdsError>(row.and_then(|row| row.get::<i32, _>(0)) == Some(1))
+            Ok::<_, TdsError>(row.and_then(|row| row.get::<i32, _>(0)))
         })
         .await;
-    let ended = settle(held, ended);
+    // No answer is not "nothing was open": measured in review, a script's
+    // `SET NOEXEC ON` (sent in a plain batch, so it lasts the run) makes this
+    // check compile without running, and its transaction stayed open.
+    let ended = settle(held, ended).and_then(|answer| match answer {
+        Some(open) => Ok(open == 1),
+        None => Err(DbError::Query(
+            "the end-of-run check got no answer, so whether the script left a transaction \
+             open is not known"
+                .into(),
+        )),
+    });
     if ended.is_err() {
         held.discard();
     }
@@ -2478,7 +2528,11 @@ mod tests {
             ("SET NOCOUNT ON", &[], RowsAffected::Unreported),
         ];
         for (case, counts, expected) in cases {
-            assert_eq!(script_rows_affected(counts), *expected, "{case}");
+            assert_eq!(
+                script_rows_affected(counts, BatchCounts::One),
+                *expected,
+                "{case}"
+            );
         }
     }
 
