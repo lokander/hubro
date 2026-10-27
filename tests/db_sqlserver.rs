@@ -1474,7 +1474,7 @@ async fn sqlserver_script_reports_every_result_set_of_a_statement() {
     .await
     .expect("the script should run to completion");
 
-    let shape: Vec<(usize, Option<(usize, usize)>, Vec<Vec<Value>>)> = results
+    let shape = results
         .iter()
         .map(|r| {
             let rows = match &r.outcome {
@@ -1483,7 +1483,7 @@ async fn sqlserver_script_reports_every_result_set_of_a_statement() {
             };
             (r.statement, r.set.map(|s| (s.index, s.count)), rows)
         })
-        .collect();
+        .collect::<Vec<_>>();
     let one = |v: i64| vec![vec![Value::Integer(v)]];
     assert_eq!(
         shape,
